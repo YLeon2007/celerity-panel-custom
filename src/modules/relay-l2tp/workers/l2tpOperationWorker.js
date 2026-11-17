@@ -702,7 +702,8 @@ class L2tpOperationWorker {
                 // Recognition requires the actual live held scope, not merely
                 // a persisted lock. Scope exit verifies BEFORE worker settlement.
                 await withLockedPreparation(async () => {
-                    await this.candidateService?.assertConfigWriteAllowed?.(operation.node);
+                    await this.candidateService?.assertConfigWriteAllowed?.(operation.node,
+                        { plan: preparedInstallPlan ?? preparedSyncUsersPlan });
                     if (preparedInstallPlan) {
                         await this.candidateService?.prepareIngress?.({ plan: preparedInstallPlan });
                         candidateContent = await this.buildInstallCandidate(preparedInstallPlan);
@@ -757,7 +758,8 @@ class L2tpOperationWorker {
                 let snapshot;
                 try {
                     snapshot = await withLockedPreparation(async () => {
-                        await this.candidateService?.assertConfigWriteAllowed?.(operation.node);
+                        await this.candidateService?.assertConfigWriteAllowed?.(operation.node,
+                            { plan: preparedSyncUsersPlan });
                         return this.resolveSyncUsersSnapshot({ operation, operationId,
                             plan: preparedSyncUsersPlan });
                     });

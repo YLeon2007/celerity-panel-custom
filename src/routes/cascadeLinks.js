@@ -26,6 +26,7 @@ const {
     createClassicScopedCascadeDeploymentService,
 } = require('../services/classicScopedCascadeDeploymentService');
 const { requireScope } = require('../middleware/auth');
+const { requirePanelCsrf } = require('./panel/csrf');
 const { issueClassicLifecycleGrant } = require('../services/classicLifecycleAuthorization');
 const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
 
@@ -730,6 +731,27 @@ function createCascadeLinksRouter({
         } catch (error) { return sendError(res, error, 'Get job'); }
     });
 
+    if (deploymentEnv.PANEL_DOMAIN === 'test.infograd.online'
+        && deploymentEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1') {
+        router.post('/auto-deploy-jobs/:jobId/settle-unadmitted-preparation', requireScope('nodes:write'), requirePanelCsrf, async (req, res) => {
+            try {
+                if (typeof req.params.jobId !== 'string' || !/^[a-f0-9]{24}$/.test(req.params.jobId)
+                    || !req.body || Array.isArray(req.body) || Object.keys(req.body).join(',') !== 'expectedTopologyRevision') {
+                    throw new RequestValidationError('Invalid unadmitted preparation readback');
+                }
+                const expectedTopologyRevision = normalizeExpectedTopologyRevision(req.body);
+                const job = await getIntentService('settleUnadmittedPreparation').settleUnadmittedPreparation({
+                    jobId: req.params.jobId, expectedTopologyRevision });
+                return res.json({ job, autoDeployJob: job, remoteDispatch: false });
+            } catch (error) {
+                if (error?.code === 'TOPOLOGY_INTENT_RECONCILIATION_UNPROVEN') {
+                    return res.status(409).json({ error: { code: error.code, message: 'Отсутствие принятого применения не подтверждено; состояние сохранено.' } });
+                }
+                return sendError(res, error, 'Unadmitted preparation');
+            }
+        });
+    }
+
     router.get('/port-check', requireScope('nodes:read'), async (req, res) => {
         res.set('Cache-Control', 'no-store');
         const { nodeId, port: rawPort, linkId } = req.query;
@@ -1064,6 +1086,23 @@ function createCascadeLinksRouter({
             for (const key of allowedFields) {
                 if (req.body?.[key] !== undefined) changes[key] = req.body[key];
             }
+            // The editable shipped form uses the same endpoint ID names as
+            // create. Preserve them in the existing structural mutation path;
+            // silently ignoring a requested move can falsely report a no-op.
+            for (const [field, alias] of [['portalNode', 'portalNodeId'], ['bridgeNode', 'bridgeNodeId']]) {
+                const canonical = req.body?.[field];
+                const aliased = req.body?.[alias];
+                if (canonical !== undefined && aliased !== undefined && canonical !== aliased) {
+                    throw new RequestValidationError('Conflicting endpoint identifiers');
+                }
+                const value = aliased !== undefined ? aliased : canonical;
+                if (value !== undefined) {
+                    if (typeof value !== 'string' || !/^[a-f0-9]{24}$/.test(value)) {
+                        throw new RequestValidationError('Invalid endpoint identifier');
+                    }
+                    changes[field] = value;
+                }
+            }
             if (changes.autoDeploy !== undefined) {
                 changes.autoDeploy = normalizeAutoDeploy(changes.autoDeploy);
             }
@@ -1136,7 +1175,7 @@ function createCascadeLinksRouter({
                 const effectiveMode = changes.mode || currentLink.mode || 'reverse';
                 const nodeField = effectiveMode === 'forward' ? 'bridgeNode' : 'portalNode';
                 const conflictingLink = await Link.findOne({
-                    [nodeField]: currentLink[nodeField],
+                    [nodeField]: changes[nodeField] || currentLink[nodeField],
                     tunnelPort: port,
                     active: true,
                     _id: { $ne: req.params.id },

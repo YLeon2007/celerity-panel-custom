@@ -533,6 +533,48 @@ class RemoteAdmissionRepository {
         });
     }
 
+    async reconcileRestoredFailedInstall({ operationId, executionContext, verifyRestored } = {}) {
+        const selected = selectExecutionContext(executionContext);
+        if (!selected || !/^[a-f0-9]{24}$/.test(operationId) || typeof verifyRestored !== 'function') throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+        const operation = await this.L2tpOperation.findOne({ _id: operationId,
+            ...executionContextFilter(selected), kind: 'install', status: 'failed',
+            errorCode: 'ROLLBACK_SYSTEM_FAILED', restoredRollback: { $exists: false } }).lean();
+        if (!operation || operation.step !== 'start_l2tp'
+            || operation.logs.at(-1)?.code !== 'L2TP_ROLLBACK_FAILED') throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+        const lock = await this.NodeOperationLock.findOne({ node: operation.node, operationId,
+            owner: operation.leaseOwner, remoteUncertain: true }).lean();
+        if (!lock?.generation) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+        const proof = await verifyRestored(operation);
+        if (proof?.ok !== true || proof.operationId !== operationId || proof.managedPaths !== 7
+            || proof.firewallRestored !== true || proof.servicesRestored !== true || proof.runnerIdle !== true
+            || !/^[a-f0-9]{64}$/.test(proof.backupSha256) || !/^[a-f0-9]{64}$/.test(proof.sidecarSha256)) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+        await this.transactionRunner(async session => {
+            const { isDeepStrictEqual: same } = require('node:util');
+            const fresh = await this.L2tpOperation.findById(operationId).session(session).lean();
+            const held = await this.NodeOperationLock.findOne({ node: operation.node }).session(session).lean();
+            if (!same(fresh, operation) || !same(held, lock)) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+            const now = new Date();
+            const changed = await this.L2tpOperation.updateOne({ _id: operationId, status: 'failed',
+                errorCode: 'ROLLBACK_SYSTEM_FAILED', restoredRollback: { $exists: false } },
+            { $set: { restoredRollback: { ...proof, verifiedAt: now, lockGeneration: lock.generation } },
+                $push: { logs: { at: now, level: 'info', code: 'L2TP_ROLLBACK_READBACK_RECONCILED', message: 'All backup bytes and runtime effects restored; failed install history retained' } } }, { session });
+            if (changed.matchedCount !== 1) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+            if ((await this.NodeOperationLock.deleteOne({ _id: lock._id, generation: lock.generation,
+                node: operation.node, operationId, remoteUncertain: true }, { session })).deletedCount !== 1) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+            if ((await this.RemoteAdmission.updateOne({ _id: operation.admissionId, operationId,
+                nodeId: String(operation.node), kind: 'install', phase: 'recovery_required',
+                leaseOwner: operation.leaseOwner, ownerGeneration: operation.ownerGeneration },
+            { $set: { phase: 'completed' } }, { session })).matchedCount !== 1) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+            if ((await this.CascadeTopologyState.updateOne({ _id: 'singleton', remoteAdmissionCount: { $gt: 0 },
+                topologyAdmissionCount: 0 }, { $inc: { remoteAdmissionCount: -1 } }, { session })).matchedCount !== 1) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+        });
+        const [after, admission, held] = await Promise.all([this.L2tpOperation.findById(operationId).lean(),
+            this.RemoteAdmission.findById(operation.admissionId).lean(), this.NodeOperationLock.findOne({ node: operation.node }).lean()]);
+        if (after?.restoredRollback?.backupSha256 !== proof.backupSha256 || after.status !== 'failed'
+            || admission?.phase !== 'completed' || held) throw admissionError('L2TP_ROLLBACK_RECONCILIATION_REFUSED');
+        return { operationId, status: 'failed', rollback: 'verified_restored', admission: 'completed', failedHistoryRetained: true };
+    }
+
     async markRecoveryRequired(id) {
         await this.transactionRunner(async session => {
             const changed = await this.RemoteAdmission.updateOne(
@@ -566,8 +608,23 @@ class RemoteAdmissionRepository {
                 status: { $in: ['failed', 'rolled_back'] },
                 admissionId, leaseOwner: owner, ownerGeneration,
             }).session(session).lean();
+            // The ownership guard runs under the acquired lock before preparation
+            // or the first executor step. Keep the failed history; settle only
+            // its exact empty-step/empty-backup veto, never arbitrary progress0.
+            const ownerVetoBeforeDispatch = terminal?.kind === 'install'
+                && terminal.errorCode === 'CLASSIC_CONFIG_WRITE_OWNER_VETO'
+                && terminal.step === '' && terminal.backupId === ''
+                && terminal.logs?.length === 1
+                && terminal.logs[0].code === 'CLASSIC_CONFIG_WRITE_OWNER_VETO';
+            const compilerRefusalBeforeDispatch = terminal?.kind === 'install'
+                && terminal.errorCode === 'COMPILED_TOPOLOGY_MISMATCH'
+                && terminal.attempts === 1 && terminal.startedAt === null
+                && terminal.step === '' && terminal.backupId === ''
+                && terminal.logs?.length === 1
+                && terminal.logs[0].code === 'COMPILED_TOPOLOGY_MISMATCH';
             if (!terminal || terminal.status === 'failed'
-                && (terminal.progress !== 0 || !PRE_REMOTE_FAILURES.has(terminal.errorCode))) {
+                && (terminal.progress !== 0 || !PRE_REMOTE_FAILURES.has(terminal.errorCode)
+                    && !ownerVetoBeforeDispatch && !compilerRefusalBeforeDispatch)) {
                 throw admissionError('REMOTE_ADMISSION_NOT_TERMINAL');
             }
             const lock = await this.NodeOperationLock.findOne({

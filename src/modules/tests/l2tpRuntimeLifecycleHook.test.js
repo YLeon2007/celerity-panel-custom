@@ -289,18 +289,22 @@ test('dormant PROD skips schema writes and module workers despite inherited TEST
     await root.stop();
 });
 
-test('PROD topology opt-in still refuses before schema or host side effects', async () => {
+test('PROD topology opt-in without an accepted physical activation refuses before schema or host side effects', async () => {
     for (const l2tpOptIn of [undefined, 'true']) {
         const flag = 'TOPOLOGY_PRODUCTION_EXECUTION_ENABLED';
         const root = createL2tpRootLifecycle({
             env: { PANEL_DOMAIN: 'lm1.infograd.online', [flag]: 'true',
                 L2TP_PRODUCTION_EXECUTION_ENABLED: l2tpOptIn,
                 L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true' },
+            createTopologyExecutionAuthority(options) {
+                return require('../relay-l2tp/runtime/productionPhysicalAuthority').createRootTopologyExecutionAuthority({ ...options,
+                    read() { throw Object.assign(new Error('OWN absent activation fixture'), { code: 'ENOENT' }); } });
+            },
             createRuntimeLifecycleHook() { assert.fail('must not create host'); },
             createMigrationBootstrap() { throw new Error('premature schema write'); },
             async ensureModelIndexes() { throw new Error('premature index build'); },
         });
-        await assert.rejects(root.startAfterDatabase(), /PRODUCTION_SCHEMA_AUTHORITY_UNAVAILABLE/);
+        await assert.rejects(root.startAfterDatabase(), /PRODUCTION_PHYSICAL_ACTIVATION_REQUIRED/);
         await root.stop();
     }
 });

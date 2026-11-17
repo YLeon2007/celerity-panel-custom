@@ -1,5 +1,56 @@
 # Production admission initialization — dormant maintenance API
 
+## Explicit preparation of an existing legacy singleton
+
+`createProductionAdmissionExistingStatePreparation(options).prepare()` is a separate
+dormant maintenance entry, not a startup repair and not a setter. It reuses the
+initializer's held-maintenance capability, deployment checks, full BSON link pins,
+reviewed index plan, snapshot transaction, exact CAS, single raw majority commit
+and postcommit readback/unknown-retention rules. The old insert-only ten-link
+contract below is unchanged; ten links are NOT an ordinary production constraint.
+
+The accepted challenge has `mode: 'existing-state-counters'` and
+`expectedStateSha256` (the independently pinned COMPLETE existing singleton),
+instead of `initialState`. `acceptedClassicLinks` pins the complete actual classic
+inventory of any size. `acceptedMissingCollections` must be empty: this entry
+cannot create a missing store or singleton, infer absence as zero, adopt native
+ownership, or supply a desired revision/counter value. The finite maintenance
+entry dispatches this mode only through its existing fixed accepted-policy and
+held-authority path; no URI-taking CLI, environment switch or automatic adapter
+is added.
+
+This deliberately narrow migration supports an unowned, history-empty legacy
+state. All reviewed histories AND `topologyconfigowners` must exist as ordinary
+empty-option UUID-pinned collections and contain no rows (even terminal rows
+require separate review). Empty `remoteadmissions` and `topologyoperations`, with
+no queued intents, locks, enrollments/bindings, L2TP operations or groups, establish
+both authoritative admission counts as zero. It refuses any nonzero/non-numeric
+existing counter, missing/invalid core revision, reservation, remote drain,
+dispatch attempt, unknown state field or historical work; it never resets them.
+The complete state pin, catalogs and histories are rechecked before DDL, in the
+transaction and after commit. The existing explicitly reviewed missing-index
+plan may add only necessary indexes; no ordinary startup DDL is introduced.
+
+Only ABSENT `remoteAdmissionCount`/`topologyAdmissionCount` are added. Whole-document
+CAS preserves `_id`, all revisions (including a legitimate revision/deployedRevision
+mismatch), timestamps, version, settled metadata, classic links and unrelated
+collections/users. A repeat with the newly accepted complete-state pin is a
+document-write-free no-op. Active, conflicting, retained or unverifiable state
+refuses rather than erases; unknown commit/readback retains maintenance without
+retry or compensation. External writer exclusion remains indispensable against
+snapshot phantoms. A successful preparation reports `prepared: true`,
+`initialized: false`, `ready: false`, `dormant: true`, its actual `addedFields`
+and complete resulting `stateSha256`; the unchanged read-only
+`verifyProductionStartupSchema` must then pass separately. None of these results
+is native enrollment, execution/adoption permission, or production approval.
+
+Focused real loopback Mongo coverage is in
+`productionAdmissionExistingStateMongo.test.js`: one-link existing state,
+idempotence/partially present counters, whole-record preservation, actual ordinary
+read-only schema check, retained/active/conflicting rows, missing catalogs,
+stale state pin, concurrent CAS winner and separation from the old first-install
+contract. Its maintenance authority is explicitly simulated, not operational proof.
+
 ## Delivered boundary
 
 Two separate modules exist; neither is wired into startup, routes, workers or legacy writers:

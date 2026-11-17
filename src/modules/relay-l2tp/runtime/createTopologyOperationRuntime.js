@@ -212,6 +212,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
             CascadeTopologyState,
             TopologyOperation,
             TopologyConfigOwner: dependencies.TopologyConfigOwner, NodeOperationLock: dependencies.NodeOperationLock,
+            TopologyExecutionBinding: dependencies.TopologyExecutionBinding,
+            TopologyExecutionEnrollment: dependencies.TopologyExecutionEnrollment,
             RemoteAdmission: dependencies.RemoteAdmission,
             ...optional(transactionRunner, 'transactionRunner'),
         });
@@ -269,7 +271,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
         }));
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
-        const userResync = new TopologyUserResync({ HyNode, restrictedRunner: Boolean(preinstalledRunnerAuthority) });
+        const userResync = new TopologyUserResync({ HyNode, restrictedRunner: Boolean(preinstalledRunnerAuthority),
+            preferBoundRunner: Boolean(bindingLifecycle) && ownerEnrollmentEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1' });
         // The runtime always wires the real node runner verifier. Missing
         // execution/model capabilities make the runtime unavailable, not ready.
         const pppGateDependencies = {
@@ -336,18 +339,70 @@ function createTopologyOperationRuntime(dependencies = {}) {
             ...optional(idFactory, 'idFactory'),
             ...optional(onWorkerError, 'onWorkerError'),
         });
-        coordinator.intentOperationAdmission = Object.freeze({ db: CascadeTopologyState.db, queue: input => coordinator.queueIntent(input) });
+        coordinator.intentOperationAdmission = Object.freeze({ db: CascadeTopologyState.db,
+            queue: input => coordinator.queueIntent(input),
+            inspectUnadmittedPreparation: input => coordinator.inspectUnadmittedPreparation(input) });
         coordinator.resolveIntentResources = input => coordinator.resolveIntentResourcesForQueue(input);
         coordinator.attachIngressGate = attachIngressGate;
         coordinator.installedPppReadinessGate = createTopologyPppReadinessGate({ ...pppGateDependencies, readOnly: true });
         Object.assign(coordinator, require('../services/topologySelectedPublicState').createTopologySelectedPublicState({
             topologyRepository, operationRepository, executionContext,
         }));
+        coordinator.readAppliedNodePublication = input => topologyRepository.readAppliedNodePublication({ ...input, executionContext });
         // Internal explicit command only; no HTTP/MCP or automatic startup call.
-        coordinator.enrollTestOwners = () => require('../../../../scripts/test-topology-owner').enrollTestOwners({
-            env: ownerEnrollmentEnv, lifecycle: bindingLifecycle, store: bindingStore,
+        coordinator.enrollTestOwners = ({ resumeOnly = false, onReconciled } = {}) => require('../../../../scripts/test-topology-owner').enrollTestOwners({
+            env: ownerEnrollmentEnv, lifecycle: bindingLifecycle, store: bindingStore, resumeOnly, onReconciled,
             TopologyConfigOwner: dependencies.TopologyConfigOwner,
+            TopologyExecutionEnrollment: dependencies.TopologyExecutionEnrollment,
+            dedicatedModels: { ...dependencies, TopologyCreateIntent: require('../models/topologyCreateIntentModel'),
+                TopologyIntentQueueState: require('../models/topologyIntentQueueStateModel') },
         });
+        if (ownerEnrollmentEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1' && executionContext.target === 'test') {
+            coordinator.settleUndispatchedPreparation = (operationId, onSettled) => require('../services/topologyUndispatchedPreparationSettlement')
+                .settleUndispatchedPreparation({ models: dependencies, selected: topologyRepository, lifecycle: bindingLifecycle, finalizer, operationId, onSettled });
+            operationRepository.claimUndispatchedPreparation = input => require('../repositories/topologyUndispatchedPreparationContinuation')
+                .claimUndispatchedPreparation(dependencies,topologyRepository,bindingLifecycle,input);
+            coordinator.resumeUndispatchedPreparation = (operationId,onSettled) => operationWorker.resumeUndispatchedPreparation(operationId,onSettled);
+            operationRepository.claimClosedSettlement = input => require('../repositories/topologyUndispatchedPreparationContinuation')
+                .claimClosedSettlement(dependencies,topologyRepository,bindingLifecycle,input);
+            coordinator.resumeClosedSettlement = (operationId,onSettled) => operationWorker.resumeClosedSettlement(operationId,onSettled);
+            operationRepository.claimPreparedCommit = input => require('../repositories/topologyUndispatchedPreparationContinuation')
+                .claimPreparedCommit(dependencies,topologyRepository,bindingLifecycle,input);
+            coordinator.resumePreparedCommit = (operationId,onSettled) => operationWorker.resumePreparedCommit(operationId,onSettled);
+            operationRepository.claimBootstrapContinuation = input => require('../repositories/topologyBootstrapContinuation')
+                .claimBootstrapContinuation(dependencies, topologyRepository, input);
+            operationRepository.claimBindingReservationContinuation = input => require('../repositories/topologyBindingReservationContinuation')
+                .claimBindingReservationContinuation(dependencies, topologyRepository, bindingLifecycle, input);
+            coordinator.resumeBindingReservations = (operationId, onSettled) => operationWorker.resumeBindingReservations(operationId, onSettled);
+            operationRepository.claimRetainedVerifyContinuation = input => require('../repositories/topologyRetainedVerifyContinuation')
+                .claimRetainedVerifyContinuation(dependencies,topologyRepository,bindingLifecycle,input);
+            coordinator.resumeRetainedVerification = (operationId,onSettled) => operationWorker.resumeRetainedVerification(operationId,onSettled);
+            coordinator.resumeSettledRuntime = (operationId,onSettled) => operationWorker.resumeSettledRuntime(operationId,onSettled);
+            coordinator.resumeBootstrapPreparation = (operationId, onSettled) => operationWorker.resumeBootstrapPreparation(operationId, onSettled);
+            coordinator.resumeSettledBootstrap = (operationId, onSettled) => require('../services/topologyBootstrapCancellation')
+                .resumeSettledBootstrap({models:dependencies,authority:dependencies.topologyExecutionAuthority,operationId,onSettled});
+            coordinator.cancelBootstrapPreparation = (operationId, onSettled) => require('../services/topologyBootstrapCancellation')
+                .cancelBootstrap({ models: dependencies, authority: dependencies.topologyExecutionAuthority, finalizer, operationId, onSettled });
+        }
+        if (executionContext.target === 'production' && bindingLifecycle) {
+            const productionEntry = require('../services/productionOwnerEntry');
+            let productionEnrollment;
+            coordinator.enrollProductionOwners = async () => {
+                if (!productionEnrollment) productionEnrollment = productionEntry.enrollProductionOwners({
+                    lifecycle: bindingLifecycle, store: bindingStore, models: dependencies });
+                return productionEnrollment;
+            };
+            coordinator.handbackProductionOwners = async acceptedCurrent => productionEntry.handbackProductionOwners({
+                lifecycle: bindingLifecycle, authority: dependencies.topologyExecutionAuthority, models: dependencies,
+                enrollment: await productionEnrollment, acceptedCurrent, env: ownerEnrollmentEnv });
+        }
+        coordinator.readTestEnrollment = async () => {
+            if (ownerEnrollmentEnv.TOPOLOGY_TEST_STARTUP_MODE !== 'dedicated-runtime-v1') throw new Error('TEST_OWNER_CONTEXT_REQUIRED');
+            const rows = await dependencies.TopologyExecutionEnrollment.find({ executionContext: executionContext.hostIdentity })
+                .select('nodeId targetProfile ownerGeneration bootId pristineBootResume').read('primary').readConcern('majority').maxTimeMS(5000).lean();
+            return { status: rows.length ? 'enrolled_requires_runtime_reconciliation' : 'not_enrolled',
+                nodes: rows.map(n => ({ nodeId: n.nodeId, targetProfile: n.targetProfile, enrollmentId: n._id, ownerGeneration: n.ownerGeneration, enrollmentBootId: n.bootId, runtimeBootId: n.pristineBootResume?.bootId ?? n.bootId })) };
+        };
         return coordinator;
     } catch {
         return unavailableTopologyDeploymentService;

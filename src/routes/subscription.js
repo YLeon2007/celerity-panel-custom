@@ -165,7 +165,7 @@ async function getActiveNodesWithCache() {
     return nodes;
 }
 
-async function getActiveNodes(user) {
+async function getActiveNodes(user, withPublicationVersion = false) {
     let nodes = [];
     let settings;
     
@@ -218,6 +218,24 @@ async function getActiveNodes(user) {
         }
     }
 
+    const host = require('../modules/l2tpActiveHostProvider').l2tpActiveHostProvider.getActiveHost();
+    const publication = typeof host?.readAppliedNodePublication === 'function'
+        ? await host.readAppliedNodePublication({ nodeIds: nodes.filter(n => n.type === 'xray').map(n => String(n._id)) })
+        : { nodes: [], version: null };
+    const applied = new Map(publication.nodes.map(n => [n.nodeId, n]));
+    const health = typeof host?.readNodePublicationHealth === 'function' && publication.nodes.length
+        ? new Map((await host.readNodePublicationHealth({ nodes: publication.nodes })).map(n => [n.nodeId, n.healthy]))
+        : new Map();
+    nodes = nodes.map(node => {
+        const source = applied.get(String(node._id));
+        if (!source) return node;
+        const { nodeId, candidateHash, ...fields } = source;
+        // Only a dedicated held physical observation can supersede its absent
+        // legacy agent heartbeat. This is request-local, never a DB online write.
+        return { ...(typeof node.toObject === 'function' ? node.toObject() : node), ...fields,
+            ...(health.has(nodeId) ? { status: health.get(nodeId) === true ? 'online' : 'offline' } : {}) };
+    });
+
     // Filter offline/error nodes flagged by the health checker.
     // Virtual nodes are never pinged (default status='offline') so they bypass.
     if (lb.hideOffline !== false) {
@@ -261,7 +279,7 @@ async function getActiveNodes(user) {
 
     resolveVirtualSources(nodes, user);
 
-    return nodes;
+    return withPublicationVersion ? { nodes, publicationVersion: publication.version } : nodes;
 }
 
 /**
@@ -2913,7 +2931,16 @@ async function serveSubscription(req, res, ctx) {
         ? `${cacheFormatBase}+${routingSelection.variant}`
         : cacheFormatBase;
 
-    const cached = await cache.getSubscription(cacheToken, cacheFormat);
+    // Resolve availability and the trusted settled version before cache lookup.
+    // Versioned keys also fence render/set races with a settlement transition.
+    const { nodes, publicationVersion } = await getActiveNodes(user, true);
+    if (nodes.length === 0) {
+        logger.error(`[Sub] NO SERVERS for user ${user.userId}! Check nodes in panel.`);
+        return res.status(503).type('text/plain').send('# No servers available');
+    }
+    const publicationCacheFormat = publicationVersion
+        ? `${cacheFormat}+applied:${publicationVersion}:${nodes.map(n => String(n._id)).join(',')}` : cacheFormat;
+    const cached = await cache.getSubscription(cacheToken, publicationCacheFormat);
     if (cached) {
         logger.debug(`[Sub] Cache HIT: ${cacheToken}:${cacheFormat}`);
         return sendCachedSubscription(res, cached, format, userAgent, settings, hwidHeaders);
@@ -2921,17 +2948,11 @@ async function serveSubscription(req, res, ctx) {
 
     logger.debug(`[Sub] Cache MISS: token=${cacheToken.substring(0,8)}..., format=${cacheFormat}`);
 
-    const nodes = await getActiveNodes(user);
-    if (nodes.length === 0) {
-        logger.error(`[Sub] NO SERVERS for user ${user.userId}! Check nodes in panel.`);
-        return res.status(503).type('text/plain').send('# No servers available');
-    }
-
     logger.debug(`[Sub] Serving ${nodes.length} nodes to user ${user.userId}`);
 
     const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent, settings?.subscription?.happProviderId || '', routingSelection.routing);
     subscriptionData.routingVariant = routingSelection.variant;
-    await cache.setSubscription(cacheToken, cacheFormat, subscriptionData);
+    await cache.setSubscription(cacheToken, publicationCacheFormat, subscriptionData);
     return sendCachedSubscription(res, subscriptionData, format, userAgent, settings, hwidHeaders);
 }
 

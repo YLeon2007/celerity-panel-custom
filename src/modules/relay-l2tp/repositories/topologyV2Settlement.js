@@ -47,12 +47,13 @@ function checkedTargets(operation, binding, row, enrolled, owner) {
         } else if (owner.legacyAppliedTopology?.links?.some(link => link.mode === 'forward')) refused();
     } catch { refused(); }
 }
-const OWNER_PRIVATE_FIELDS = '+legacyAppliedTopology +profileTargetPin';
+const OWNER_PRIVATE_FIELDS = '+legacyAppliedTopology +profileTargetPin +executionEnrollment';
 const OPERATION_PRIVATE_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
 function ownerFence(owner) {
     return { node: String(owner.node), profile: owner.profile, executionContext: owner.executionContext,
         owner: owner.owner, generation: owner.generation, nodeIdentity: owner.nodeIdentity,
-        originalSnapshot: owner.originalSnapshot, adoptionReceipt: owner.adoptionReceipt };
+        originalSnapshot: owner.originalSnapshot, adoptionReceipt: owner.adoptionReceipt,
+        ...(owner.executionEnrollment === undefined ? {} : { executionEnrollment: owner.executionEnrollment }) };
 }
 function assertOwnerFences(terminal, rows) {
     if (!Array.isArray(terminal?.ownerFences) || !same(terminal.ownerFences, rows.map(({ owner }) => ownerFence(owner)))) refused();
@@ -61,27 +62,68 @@ function assertOwnerFences(terminal, rows) {
 // One attempt, including the commit command. Unknown commit/readback never runs
 // the callback again, rolls back remotely, releases separately, or mints IDs.
 // Driver transaction.transition is pinned compatibility, as in the initializer.
-async function once(repository, work, confirm) {
-    const db = repository.TopologyOperation.db;
-    const session = await db.startSession();
-    let attempted = false, result;
+function traceSettlementFailure(request, phase, error) {
+    // Evidence of this invocation only: no authority, replay or raw error text.
     try {
+        const names = ['Error', 'TypeError', 'ReferenceError', 'MongoServerError', 'MongoNetworkError',
+            'ValidationError', 'CastError', 'StrictModeError'];
+        const codes = ['TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED', 'TOPOLOGY_SELECTED_FINGERPRINT_CHANGED',
+            'TOPOLOGY_SELECTED_PIN_CHANGED', 'APPLIED_BASELINE_REQUIRED', 'TOPOLOGY_PROFILE_TARGET_INVALID'];
+        const safe = { name: names.includes(error?.name) ? error.name : 'Error',
+            code: codes.includes(error?.code) ? error.code : 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' };
+        const file = 'src/modules/relay-l2tp/repositories/topologyV2Settlement.js';
+        const frames = typeof error?.stack === 'string' ? [...error.stack.slice(0, 8192).matchAll(
+            /src\/modules\/relay-l2tp\/repositories\/topologyV2Settlement\.js:(\d{1,6}):(\d{1,6})/g)] : [];
+        if (frames.length) safe.stack = [...new Set(frames.slice(0, 3).map(match => `${file}:${match[1]}:${match[2]}`))].join('\n');
+        require('../../../routes/topologyTestDiagnostics').logTopologyTestFailure({ action: 'topology.settlement', phase,
+            operationId: request.operationId, revision: request.topologyRevision, error: safe });
+    } catch { /* A diagnostic must never replace the primary failure. */ }
+}
+async function once(repository, work, confirm, request, kind) {
+    const db = repository.TopologyOperation.db;
+    let session, attempted = false, result, primary, phase = `${kind}.session`;
+    try {
+        session = await db.startSession();
+        phase = `${kind}.work`;
         if (typeof session.transaction?.transition !== 'function') refused();
         session.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
         result = await work(session);
         if (Date.now() >= DEADLINES.get(session)) refused();
+        phase = `${kind}.commit`;
         attempted = true;
         try {
             const reply = await db.getClient().db('admin').command({ commitTransaction: 1,
                 ...(session.transaction.recoveryToken ? { recoveryToken: session.transaction.recoveryToken } : {}),
                 writeConcern: { w: 'majority', wtimeout: 5000 }, maxTimeMS: 5000 }, { session, ...OPTIONS });
             if (reply.ok !== 1 || reply.writeConcernError || reply.writeErrors?.length || reply.errorLabels?.length) refused();
-        } finally { session.transaction.transition('TRANSACTION_COMMITTED'); }
+        } catch (error) {
+            primary = error;
+            throw error;
+        } finally {
+            try { session.transaction.transition('TRANSACTION_COMMITTED'); }
+            catch (error) {
+                traceSettlementFailure(request, `${kind}.transition`, error);
+                if (!primary) throw error;
+            }
+        }
+        phase = `${kind}.readback`;
         await confirm(result);
     } catch (error) {
-        if (!attempted && session.inTransaction()) await session.abortTransaction().catch(() => {});
+        primary = error;
+        traceSettlementFailure(request, phase, error);
+        try {
+            if (!attempted && session?.inTransaction()) await session.abortTransaction();
+        } catch (abortError) {
+            traceSettlementFailure(request, `${kind}.abort`, abortError);
+        }
         throw error;
-    } finally { await session.endSession(); }
+    } finally {
+        try { if (session) await session.endSession(); }
+        catch (error) {
+            traceSettlementFailure(request, `${kind}.end`, error);
+            if (!primary) throw error;
+        }
+    }
     return result;
 }
 function models(repository) {
@@ -125,7 +167,7 @@ async function checked(repository, request, session, bindings) {
         const row = await repository.TopologyExecutionBinding.findOne({ operationId: request.operationId,
             nodeId: binding.nodeId, targetProfile: binding.targetProfile }).session(session).setOptions(OPTIONS).lean();
         if (!row || !same(record(row), binding) || binding.operationId !== request.operationId
-            || binding.owner !== request.owner || binding.attempt !== operation.attempts
+            || binding.owner !== request.owner || binding.attempt !== require('./topologyRetainedVerifyContinuation').originalExecutionAttempt(operation)
             || binding.executionContext !== context.hostIdentity
             || binding.topologyRevision !== request.topologyRevision || binding.priorDeployedRevision !== request.priorDeployedRevision
             || !['generation', 'attemptId', 'bootId', 'maintenanceId'].every(key => typeof binding[key] === 'string' && UUID.test(binding[key]))
@@ -134,15 +176,17 @@ async function checked(repository, request, session, bindings) {
         if (nodes.length !== 1 || nodes[0].state !== 'committed'
             || nodes[0].targetProfile !== binding.targetProfile || `sha256:${nodes[0].candidateHash}` !== binding.candidateHash
             || nodes[0].backupId !== binding.backupId) refused();
-        const enrolled = await repository.TopologyExecutionEnrollment.findById(row.enrollmentId).session(session).setOptions(OPTIONS).lean();
-        if (!enrolled || ['nodeId', 'targetProfile', 'executionContext', 'bootId', 'maintenanceId', 'ownerGeneration'].some(key => enrolled[key] !== row[key])
+        const alias = await repository.TopologyExecutionEnrollment.findById(row.enrollmentId).session(session).setOptions(OPTIONS).lean();
+        const owner = await repository.TopologyConfigOwner.findOne({ node: binding.nodeId, profile: binding.targetProfile })
+            .select(OWNER_PRIVATE_FIELDS).session(session).setOptions(OPTIONS).lean();
+        const enrolled = require('./topologyExecutionBindingStore').acceptedExecutionEnrollment(alias, owner);
+        if (!enrolled || ['nodeId', 'targetProfile', 'executionContext', 'maintenanceId', 'ownerGeneration'].some(key => enrolled[key] !== row[key])
+            || require('./topologyExecutionBindingStore').enrollmentRuntimeBootId(enrolled) !== row.bootId
             || !same(enrolled.nodeIdentity, row.nodeIdentity) || !same(enrolled.endpoint, row.endpoint)) refused();
         const lock = await repository.NodeOperationLock.findOne({ node: binding.nodeId }).session(session).setOptions(OPTIONS).lean();
         if (!lock || lock.owner !== binding.owner || lock.operationId !== binding.operationId
             || lock.generation !== binding.generation || lock.remoteUncertain !== true
             || !(lock.leaseUntil instanceof Date) || lock.leaseUntil <= new Date()) refused();
-        const owner = await repository.TopologyConfigOwner.findOne({ node: binding.nodeId, profile: binding.targetProfile })
-            .select(OWNER_PRIVATE_FIELDS).session(session).setOptions(OPTIONS).lean();
         if (!owner || !same(owner.executionContext, context) || owner.owner !== 'topology'
             || owner.generation !== row.ownerGeneration || !same(owner.nodeIdentity, row.nodeIdentity)
             || !owner.originalSnapshot || !owner.adoptionReceipt || owner.handbackReceipt !== undefined
@@ -190,7 +234,7 @@ async function begin(repository, request) {
         const current = await majority(repository.TopologyOperation, operationFilter(request), OPERATION_PRIVATE_FIELDS);
         if (!same(current?.v2Terminal, terminal)) refused();
         await confirmRoots(repository, current, terminal);
-    });
+    }, request, 'begin');
 }
 async function fenceSideEffects(repository, operation, effects, session) {
     if (!effects || effects.usersVerified !== true || typeof effects.attachVerified !== 'boolean'
@@ -254,7 +298,7 @@ async function persist(repository, request) {
         const current = await majority(repository.TopologyOperation, operationFilter(request), OPERATION_PRIVATE_FIELDS);
         if (!same(current?.v2Terminal, terminal)) refused();
         await confirmRoots(repository, current, terminal);
-    });
+    }, request, 'persist');
 }
 async function settle(repository, request, publish) {
     return once(repository, async session => {
@@ -285,7 +329,7 @@ async function settle(repository, request, publish) {
                 || owner.lastSettledGeneration !== binding.generation || owner.lastSettledCloseId !== binding.commandIds.close) refused();
         }
         await confirmRoots(repository, operation, result.terminal);
-    });
+    }, request, 'settle');
 }
 async function probe(repository, operationId) {
     models(repository);
@@ -302,7 +346,7 @@ async function probe(repository, operationId) {
             targetProfile: binding.targetProfile });
         if (!same(record(row), binding) || binding.operationId !== operationId
             || binding.executionContext !== operation.executionContext?.hostIdentity
-            || binding.attempt !== operation.attempts) refused();
+            || binding.attempt !== require('./topologyRetainedVerifyContinuation').originalExecutionAttempt(operation)) refused();
         if (terminal.state === 'proven' && (!validTerminalReceipt(terminal.proofs?.[index], binding)
             || terminal.proofs[index].terminalOutcome !== 'verified')) refused();
     }
@@ -322,9 +366,11 @@ async function confirmRoots(repository, operation, terminal) {
         const row = await majority(repository.TopologyExecutionBinding, { operationId: binding.operationId,
             nodeId: binding.nodeId, targetProfile: binding.targetProfile });
         if (!row || !same(record(row), binding)) refused();
-        const enrolled = await majority(repository.TopologyExecutionEnrollment, { _id: row.enrollmentId });
+        const alias = await majority(repository.TopologyExecutionEnrollment, { _id: row.enrollmentId });
         const owner = await majority(repository.TopologyConfigOwner, { node: binding.nodeId, profile: binding.targetProfile }, OWNER_PRIVATE_FIELDS);
-        if (!owner || !enrolled || ['nodeId', 'targetProfile', 'executionContext', 'bootId', 'maintenanceId', 'ownerGeneration'].some(key => enrolled[key] !== row[key])
+        const enrolled = require('./topologyExecutionBindingStore').acceptedExecutionEnrollment(alias, owner);
+        if (!owner || !enrolled || ['nodeId', 'targetProfile', 'executionContext', 'maintenanceId', 'ownerGeneration'].some(key => enrolled[key] !== row[key])
+            || require('./topologyExecutionBindingStore').enrollmentRuntimeBootId(enrolled) !== row.bootId
             || !same(enrolled.nodeIdentity, row.nodeIdentity) || !same(enrolled.endpoint, row.endpoint)
             || owner.owner !== 'topology' || owner.generation !== row.ownerGeneration
             || !same(owner.executionContext, operation.executionContext) || !same(owner.nodeIdentity, row.nodeIdentity)

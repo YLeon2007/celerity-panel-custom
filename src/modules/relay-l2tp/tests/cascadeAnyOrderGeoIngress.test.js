@@ -52,6 +52,9 @@ function assertPolicy(plan) {
     assert.notEqual(rules[0].outboundTag, rules[2].outboundTag, 'geo traffic must not be forced onto default');
     assert.deepEqual(Object.keys(rules[2]).sort(), ['inboundTag', 'outboundTag', 'type']);
     assert.equal(config.routing.domainStrategy, 'IPOnDemand');
+    assert.deepEqual(config.inbounds.find(row => row.tag === 'cascade-mine').sniffing,
+        { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true },
+        'IP-addressed PPP SOCKS traffic needs route-only protocol sniffing for domain geo rules');
     assert.equal(ownedIngressRouteState(plan), 'egress_configured');
 }
 function assertNoExitPolicy(plan, previousPlan) {

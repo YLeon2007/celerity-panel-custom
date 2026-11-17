@@ -18,7 +18,8 @@ declare -Ar PAYLOAD_SHA256=(
     [verify.sh]='e0d42b1a4be2b537da2042967fa13b4d38da6b4bf1c700d8cbcf7184df28491a'
     [commit.sh]='bd846dbaf50051dbdc58d9c3832a9b45b9043579598d1235a97826b231841a1b'
     [rollback.sh]='63620d8d25bc9217875738bba993febc89b6217f7c21de26b7cb2c832ba73091'
-    [install-runtime.sh]='3f315843577198826ab5fe2dd40742f90bbcf5b73c88f799d72f5db19fd1a297'
+    [install-runtime.sh]='7c950349c8f1fefc67c5a3472721290569d8631bd884c3ed83ddba3a695ee313'
+    [ensure-xl2tpd-unit.py]='f38900db3b3b159976d876a3ac6c76e28861bc2a94f1ae00f067b73d0bdd35e1'
     [materialize-nft-candidate.sh]='2ce54eded17460e7a4a0d53748a9f177036b4656e4b6a265f18c32f04c63f6d3'
 )
 readonly RECEIVER_LINK_NAME='celerity-l2tp-artifact-receiver'
@@ -44,6 +45,7 @@ readonly -a PAYLOADS=(
     commit.sh
     rollback.sh
     install-runtime.sh
+    ensure-xl2tpd-unit.py
     materialize-nft-candidate.sh
 )
 TEMPORARY_TARGETS=()

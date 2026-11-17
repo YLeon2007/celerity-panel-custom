@@ -25,6 +25,7 @@
     // Backend cause codes -> Russian UI text. Codes are enum-like and safe to
     // display; free-form backend messages are not trusted (see below).
     const TOPOLOGY_CAUSE_TEXT_RU = Object.freeze({
+        TOPOLOGY_BUSINESS_REENTRY_BLOCKED: 'Повторное включение any-order после бизнес-операций и возврата управления classic временно недоступно. Схема classic продолжает работать; история и пользователи сохранены.',
         CLASSIC_DEPLOY_UNSUPPORTED: 'Classic поддерживает только отдельный Deploy активной reverse-связи',
         CLASSIC_DEPLOY_BUSY: 'Топология занята или не инициализирована — требуется проверка',
         CLASSIC_DEPLOY_NODE_BUSY: 'Один из узлов связи занят другой операцией. Повторите после её завершения.',
@@ -106,7 +107,10 @@
     // finite attempt budget and driven by a self-terminating setTimeout chain,
     // so it can never leave an infinite timer behind.
     const OPERATION_POLL_INTERVAL_MS = 3000;
-    const OPERATION_POLL_MAX_ATTEMPTS = 40; // ~2 minutes, then the 30s loop takes over
+    // Native per-node proof/settlement can exceed the former two-minute UI
+    // window. Keep exact-operation reads finite through a 30-minute budget;
+    // the global topology list is not a substitute for terminal operation proof.
+    const OPERATION_POLL_MAX_ATTEMPTS = 600;
     const TRACKED_OPERATION_STATUSES = ['queued', 'preparing', 'committing', 'rolling_back', 'succeeded'];
 
     function shouldContinueOperationPolling(state = {}) {
@@ -156,6 +160,16 @@
         return outcome + ' — ' + (labels.clientReadinessUnverified || CLIENT_READINESS_UNVERIFIED);
     }
 
+    function renderBusinessReentryRestriction(policy, document) {
+        const notice = document.getElementById('topologyReentryNotice');
+        if (!notice) return;
+        const blocked = policy?.blocked === true && policy.code === 'TOPOLOGY_BUSINESS_REENTRY_BLOCKED';
+        notice.hidden = !blocked;
+        notice.querySelector('button').disabled = true;
+        notice.querySelector('[role="status"]').textContent = blocked
+            ? TOPOLOGY_CAUSE_TEXT_RU.TOPOLOGY_BUSINESS_REENTRY_BLOCKED : '';
+    }
+
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             CREATE_DEFAULT_FINGERPRINT,
@@ -170,6 +184,7 @@
             resolveRealityFingerprint,
             shouldContinueOperationPolling,
             topologyCauseText,
+            renderBusinessReentryRestriction,
         };
     }
 
@@ -419,6 +434,11 @@
     // ==================== DATA LOADING ====================
 
     async function loadTopology() {
+        // A read-only diagnostic; a failed read never enables a previously
+        // disabled action. Backend enrollment independently enforces the ban.
+        fetch('/api/cascade/topology/activation-policy').then(async response => {
+            if (response.ok) renderBusinessReentryRestriction(await response.json(), document);
+        }).catch(() => {});
         showLoading(true);
         setEmptyState(false);
         try {

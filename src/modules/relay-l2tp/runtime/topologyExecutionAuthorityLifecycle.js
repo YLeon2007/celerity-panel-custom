@@ -55,11 +55,73 @@ class TopologyExecutionAuthorityLifecycle {
             if (pending) await pending.catch(() => {});
         }
     }
+    async withTestBootstrapCancellation(request, work) {
+        await this.assertHeld();
+        const state = this.#held.getStore();
+        if (this.#context !== TEST || typeof state.capability.withBootstrapCancellation !== 'function') throw failure();
+        let invoked = false, open = true, pending, result;
+        try {
+            await state.capability.withBootstrapCancellation(request, (proof, externalCheck) => {
+                if (!open || invoked || typeof externalCheck !== 'function') throw failure();
+                invoked = true;
+                const check = async () => { if (!open) throw failure(); await this.assertHeld(); await externalCheck(); if (!open) throw failure(); };
+                pending = (async () => { await check(); result = await work(proof, check); await check(); })();
+                pending.catch(() => {});
+                return pending;
+            });
+            if (!invoked) throw failure();
+            return result;
+        } finally { open = false; if (pending) await pending.catch(() => {}); }
+    }
+    async withTestAbsentSuccessorCancellation(request, work) {
+        await this.assertHeld(); const state=this.#held.getStore();
+        if(this.#context!==TEST||typeof state.capability.withAbsentSuccessorCancellation!=='function')throw failure();
+        let open=true,invoked=false,pending,result;
+        try {
+            await state.capability.withAbsentSuccessorCancellation(request,(proof,externalCheck)=>{
+                if(!open||invoked||typeof externalCheck!=='function')throw failure();invoked=true;
+                const check=async()=>{if(!open)throw failure();await this.assertHeld();await externalCheck();if(!open)throw failure();};
+                pending=(async()=>{await check();result=await work(proof,check);await check();})();pending.catch(()=>{});return pending;
+            });
+            if(!invoked)throw failure();return result;
+        } finally {open=false;if(pending)await pending.catch(()=>{});}
+    }
+    async withTestUndispatchedPreparation(bindings, work) {
+        await this.assertHeld(); const state=this.#held.getStore();
+        if(this.#context!==TEST||typeof state.capability.withUndispatchedPreparation!=='function')throw failure();
+        let open=true,invoked=false,pending,result;
+        try {
+            await state.capability.withUndispatchedPreparation(bindings,(proof,externalCheck)=>{
+                if(!open||invoked||typeof externalCheck!=='function')throw failure();invoked=true;
+                const check=async()=>{if(!open)throw failure();await this.assertHeld();await externalCheck();if(!open)throw failure();};
+                pending=(async()=>{await check();result=await work(proof,check);await check();})();pending.catch(()=>{});return pending;
+            });
+            if(!invoked)throw failure();return result;
+        } finally {open=false;if(pending)await pending.catch(()=>{});}
+    }
+    async withTestRetainedVerifyObservation(bindings, work) {
+        await this.assertHeld();const state=this.#held.getStore();
+        if(this.#context!==TEST||typeof state.capability.withRetainedVerifyObservation!=='function')throw failure();
+        let open=true,invoked=false,pending,result;
+        try {
+            await state.capability.withRetainedVerifyObservation(bindings,(proof,externalCheck)=>{
+                if(!open||invoked||typeof externalCheck!=='function')throw failure();invoked=true;
+                const check=async()=>{if(!open)throw failure();await this.assertHeld();await externalCheck();if(!open)throw failure();};
+                pending=(async()=>{await check();result=await work(proof,check);await check();})();pending.catch(()=>{});return pending;
+            });
+            if(!invoked)throw failure();return result;
+        } finally {open=false;if(pending)await pending.catch(()=>{});}
+    }
     async assertHeld() {
         const state = this.#held.getStore();
         if (!state?.open || state.revoked) throw failure();
         try { await state.capability.assertHeld(); }
-        catch { state.revoked = true; throw failure(); }
+        catch (cause) {
+            state.revoked = true;
+            const error = failure();
+            error.cause = cause;
+            throw error;
+        }
         if (!state.open || state.revoked) throw failure();
     }
     async withVerifiedPreinstalledRunner(challenge, work) {
@@ -155,11 +217,19 @@ class TopologyExecutionAuthorityLifecycle {
     }
     async withCapturedTestOwnerEnrollment(work) {
         if (this.#context !== TEST) throw failure();
+        return this.#withCapturedOwnerEnrollment('withCapturedTestOwnerEnrollment', work);
+    }
+    async withCapturedOwnerEnrollment(work, preflight) {
+        if (this.#context === TEST) throw failure();
+        return this.#withCapturedOwnerEnrollment('withCapturedOwnerEnrollment', work, preflight);
+    }
+    async #withCapturedOwnerEnrollment(method, work, preflight) {
         await this.assertHeld();
         const state = this.#held.getStore();
-        if (typeof state.capability.withCapturedTestOwnerEnrollment !== 'function') {
+        if (typeof state.capability[method] !== 'function') {
             state.revoked = true;
-            throw Object.assign(new Error('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED'), { code: 'TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED' });
+            const code = method === 'withCapturedTestOwnerEnrollment' ? 'TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED' : 'PRODUCTION_ORIGINALS_CAPTURE_REQUIRED';
+            throw Object.assign(new Error(code), { code });
         }
         let invoked = false, finished = false, open = true, pending, result;
         const callback = (plan, externalCheck) => {
@@ -178,10 +248,28 @@ class TopologyExecutionAuthorityLifecycle {
             pending.catch(() => {}); return pending;
         };
         try {
-            await state.capability.withCapturedTestOwnerEnrollment(callback);
+            await state.capability[method](callback, preflight === undefined ? undefined : async (plan, externalCheck, readProfile) => {
+                if (!open || invoked || typeof externalCheck !== 'function') throw failure();
+                const check = async () => { if (!open) throw failure(); await this.assertHeld(); await externalCheck(); await this.assertHeld(); if (!open) throw failure(); };
+                const readClassicProfile = async nodeId => {
+                    await check();
+                    if (typeof readProfile !== 'function') throw failure();
+                    const bytes = await readProfile(nodeId);
+                    await check();
+                    return bytes;
+                };
+                await check(); await preflight(plan, check, readClassicProfile); await check();
+            });
             if (!invoked || !finished) throw failure();
             await this.assertHeld(); return result;
-        } catch { state.revoked = true; throw failure(); }
+        } catch (error) {
+            state.revoked = true;
+            // Informational refusals still revoke the capability; retain their
+            // bounded public diagnostics instead of hiding them as a fence loss.
+            if (['CLASSIC_BASELINE_IMPORT_REFUSED', 'TOPOLOGY_BUSINESS_REENTRY_BLOCKED',
+                'TOPOLOGY_REENTRY_POLICY_UNAVAILABLE'].includes(error?.code)) throw error;
+            throw failure();
+        }
         finally { open = false; if (pending) await pending.catch(() => {}); }
     }
     async withVerifiedAuthority(challenge, work) {

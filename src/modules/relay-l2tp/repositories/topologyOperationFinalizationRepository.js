@@ -213,6 +213,14 @@ class TopologyOperationFinalizationRepository {
         return require('./topologyV2Settlement').probe(this, operationId);
     }
 
+    finalizeBootstrapCancellation(input) {
+        return require('../services/topologyBootstrapCancellation').finalizeBootstrapCancellation(this, input);
+    }
+
+    finalizeUndispatchedPreparation(input) {
+        return require('../services/topologyUndispatchedPreparationSettlement').finalizeUndispatchedPreparation(this, input);
+    }
+
     async rejectUndispatchedSelected(request) {
         assertFinalizationRequest(request);
         if (this.NodeOperationLock?.db !== this.TopologyOperation.db
@@ -308,9 +316,19 @@ class TopologyOperationFinalizationRepository {
         const group = await this.CascadeRouteGroup.findById(path.groupId).session(session).lean();
         const projected = require('../domain/topologyDraft').projectGroups([group])[0];
         if (!same(projected, path.groupBefore)) rejectFinalization();
-        const paths = group.paths.map(entry => entry.pathKey === path.pathKey ? { ...entry, linkIds: path.newPathLinkIds } : entry);
+        const policy = require('../domain/primaryReservePolicy').installedPrimaryReserve(operation.effectiveTopology, path);
+        if (policy && !same(policy.selected?.path.linkIds || [], path.newPathLinkIds)) rejectFinalization();
+        let paths = group.paths.map(entry => entry.pathKey === path.pathKey && !policy ? { ...entry, linkIds: path.newPathLinkIds } : entry);
         if (!paths.some(entry => entry.pathKey === path.pathKey)) paths.push({ pathKey: path.pathKey,
             linkIds: path.newPathLinkIds, priority: 1, enabled: true });
+        const leafDeletion = operation.kind === 'link.delete'
+            ? require('../domain/primaryReservePolicy').selectedReserveLeafDeletion(
+                operation.baselineTopology, projected, path, String(operation.linkId)) : null;
+        if (leafDeletion) {
+            const wanted = operation.effectiveTopology.groups.filter(row => String(row._id ?? row.id) === path.groupId);
+            if (wanted.length !== 1 || !same(leafDeletion.appliedGroup, wanted[0])) rejectFinalization();
+            paths = leafDeletion.desiredGroup.paths;
+        }
         const changed = await this.CascadeRouteGroup.updateOne({ _id: path.groupId, paths: group.paths },
             { $set: { paths } }, { session, runValidators: true });
         const installed = await this.RelayL2tpState.updateOne({ node: path.ownerNodeId, routeGroup: path.groupId,
@@ -345,7 +363,7 @@ class TopologyOperationFinalizationRepository {
         try {
             return await run(async session => {
                 const admission = await this.TopologyOperation.findById(operationId)
-                    .select('heldTopologyAdmission pppWait nodes v2Terminal executionContext topologyRevision priorDeployedRevision idempotencyKey linkId linkIds staged kind admissionFingerprint routeState +admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath')
+                    .select('heldTopologyAdmission pppWait nodes v2Terminal executionContext topologyRevision priorDeployedRevision idempotencyKey linkId linkIds staged kind admissionFingerprint routeState nodeActivation +admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath')
                     .session(session)
                     .lean();
                 if (!admission || (admission.v2Terminal && !settlementSession)
@@ -608,6 +626,7 @@ class TopologyOperationFinalizationRepository {
                 }
 
                 if (scope?.kind !== 'link.delete' && scope?.kind !== 'link.replace'
+                    && !admission?.nodeActivation
                     && scope?.kind !== 'link.attach'
                     && this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
                     const isStagedApply = scope?.kind === 'link.apply' && scope.staged === true;

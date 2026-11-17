@@ -26,6 +26,8 @@ test('classic synchronous UI completion says link applied, keeps readiness unver
     const polls = [];
     const context = { i18n: {}, deployResultMessage: network.deployResultMessage,
         isCompletedClassicDeploymentResult: network.isCompletedClassicDeploymentResult,
+        responseJob: vm.runInNewContext(source.match(/    function responseJob\([\s\S]*?(?=\n    async function handleDraftMutationResponse)/)[0] + '\nresponseJob', { i18n: {} }),
+        TRACKED_OPERATION_STATUSES: ['queued', 'preparing', 'committing', 'rolling_back', 'succeeded'],
         showToast: (message, type) => toasts.push({ message, type }),
         startOperationPolling: op => polls.push(op), startIntentPolling: op => polls.push(op),
         describeTopologyError: () => 'blocked' };
@@ -47,7 +49,9 @@ test('classic synchronous UI completion says link applied, keeps readiness unver
     }
     const before = toasts.length;
     handle({ topologyRevision: 7, autoDeployResult: result }, false);
-    assert.equal(toasts.length, before);
+    assert.equal(toasts.length, before + 1);
+    assert.match(toasts.at(-1).message, /сохранены.*не запускался/i);
+    assert.deepEqual(polls, [], 'save-only feedback must never start deployment polling');
     handle({ autoDeployOperation: { status: 'queued', operationId: 'real-native' } }, true);
     assert.equal(polls.length, 1);
 });
@@ -71,7 +75,13 @@ test('edge readiness fails closed without current explicit client proof', () => 
     assert.match(label({ ...scopedProof, priorDeployedRevision: 7 }, 7, 7), /подтверждена проверкой клиента/i);
     assert.doesNotMatch(label({ status: 'failed', message: '<img src=x onerror=alert(1)>' }, 7, 7), /<img|alert/);
     assert.match(source, /clientReadinessMessage\(d\.clientReadiness, topologyRevision, deployedRevision\)/);
-    assert.match(source, /ele\.data\('clientReadiness', e\.data\.clientReadiness\)/);
+    const projection = source.match(/        for \(const e of edges\) \{[\s\S]*?\n        \}/)[0];
+    const elements = [];
+    vm.runInNewContext(projection, { elements,
+        edges: [{ data: { linkId: 'link', source: 'p', target: 'b', clientReadiness: scopedProof } }],
+        visibleNodeIds: new Set(['p', 'b']), confirmedDeletions: new Set(), listedLinkIds: new Set(['link']),
+        _allLinks: [{ _id: 'link', clientReadiness: undefined }], linkProgress: new Map(), buildEdgeLabel: () => '' });
+    assert.equal(elements[0].data.clientReadiness, undefined, 'fresh inventory must override stale green edge proof');
 });
 
 test('operation polling waits for client verification after execution succeeds', () => {
@@ -87,7 +97,7 @@ test('operation polling waits for client verification after execution succeeds',
 });
 
 test('operation poll does not toast readiness before server verifies it', async () => {
-    const pollSource = source.match(/    let operationPollTimer = null;[\s\S]*?(?=\n    window\._cascadeDeploy =)/)?.[0];
+    const pollSource = source.match(/    const operationPolls = new Map\(\);[\s\S]*?(?=\n    window\._cascadeDeploy =)/)?.[0];
     assert.ok(pollSource, 'operation polling code is available');
     const toasts = [];
     const timers = [];
@@ -104,34 +114,37 @@ test('operation poll does not toast readiness before server verifies it', async 
         setTimeout: fn => { timers.push(fn); return timers.length; },
         clearTimeout: () => {},
         loadTopology: async () => { topologyLoads += 1; },
+        linkProgress: new Map(), deleteTombstones: new Map(), listedLinkIds: new Set(), confirmedDeletions: new Set(),
+        progressMessage: () => '',
         showToast: (message, type) => { toasts.push({ message, type }); },
         i18n: {},
     };
-    const { runOperationPollStep } = vm.runInNewContext(
-        pollSource + '\n({ runOperationPollStep })', context,
+    const { runOperationPollStep, operationPolls } = vm.runInNewContext(
+        pollSource + '\n({ runOperationPollStep, operationPolls })', context,
     );
     const state = { operationId, kind: 'link.apply' };
+    operationPolls.set(operationId, state);
     await runOperationPollStep(state, 0, 0);
     assert.equal(timers.length, 1);
-    assert.equal(topologyLoads, 0);
+    assert.equal(topologyLoads, 1, 'refreshing topology is not readiness confirmation');
     assert.deepEqual(toasts, []);
 
     operation = { status: 'succeeded', clientReadiness: 'verified' };
     await runOperationPollStep(state, 1, 0);
     assert.equal(timers.length, 1);
-    assert.equal(topologyLoads, 1);
+    assert.equal(topologyLoads, 2);
     assert.equal(toasts.length, 1);
     assert.doesNotMatch(toasts[0].message, /не подтверждена/i);
 });
 
 test('operation poll stops on degraded proof or exhausted budget without ready toast', async () => {
-    const pollSource = source.match(/    let operationPollTimer = null;[\s\S]*?(?=\n    window\._cascadeDeploy =)/)?.[0];
+    const pollSource = source.match(/    const operationPolls = new Map\(\);[\s\S]*?(?=\n    window\._cascadeDeploy =)/)?.[0];
     const toasts = [];
     let scheduled = 0;
     let operation = { status: 'succeeded', clientReadiness: 'unverified', clientProofState: 'degraded' };
     const operationId = 'a'.repeat(24);
-    const { runOperationPollStep } = vm.runInNewContext(
-        pollSource + '\n({ runOperationPollStep })', {
+    const { runOperationPollStep, operationPolls } = vm.runInNewContext(
+        pollSource + '\n({ runOperationPollStep, operationPolls })', {
             OPERATION_POLL_INTERVAL_MS: network.OPERATION_POLL_INTERVAL_MS,
             OPERATION_POLL_MAX_ATTEMPTS: network.OPERATION_POLL_MAX_ATTEMPTS,
             shouldContinueOperationPolling: network.shouldContinueOperationPolling,
@@ -140,15 +153,20 @@ test('operation poll stops on degraded proof or exhausted budget without ready t
                 : { ok: false },
             setTimeout: () => { scheduled += 1; return scheduled; },
             loadTopology: async () => {},
+            clearTimeout: () => {},
+            linkProgress: new Map(), deleteTombstones: new Map(), listedLinkIds: new Set(), confirmedDeletions: new Set(),
+            progressMessage: () => '',
             showToast: message => { toasts.push(message); },
             i18n: {},
         },
     );
     const state = { operationId, kind: 'topology.deploy' };
+    operationPolls.set(operationId, state);
     await runOperationPollStep(state, 0, 0);
     assert.equal(scheduled, 0);
     assert.match(toasts[0], /не подтверждена/i);
     operation = { status: 'succeeded', clientReadiness: 'unverified' };
+    operationPolls.set(operationId, state);
     await runOperationPollStep(state, network.OPERATION_POLL_MAX_ATTEMPTS, 0);
     assert.equal(scheduled, 0);
     assert.match(toasts[1], /не подтверждена/i);

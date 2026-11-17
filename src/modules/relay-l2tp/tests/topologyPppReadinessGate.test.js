@@ -68,6 +68,35 @@ test('restricted PPP factory cannot select legacy credentials, shell, bootstrap 
         expectedCredentialRevision: 41, expectedEnabledUserCount: 1 } }]);
 });
 
+test('geo-only staged prefix still requires fenced explicit PPP absence and never grants a missing-state skip', async () => {
+    let state = { node: 'node-r', status: 'not_installed', desiredState: 'absent', secretRevision: 0 };
+    const { gate, calls } = fixture({
+        RelayL2tpState: { findOne: () => ({ select: () => ({ lean: async () => state }) }) },
+        L2tpUser: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        L2tpOperation: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
+    });
+    const staged = { staged: true, nodes: [
+        { node: 'node-p', role: 'portal', nodeRef: 'portal' },
+        { node: 'node-r', role: 'relay', nodeRef: 'relay-1' },
+        { node: 'node-b', role: 'bridge', nodeRef: 'bridge' },
+    ], effectiveTopology: { nodes: [
+        { id: 'node-p', role: 'portal' }, { id: 'node-r', role: 'relay' }, { id: 'node-b', role: 'bridge' },
+    ], links: [
+        { id: 'pr', source: 'node-p', target: 'node-r', mode: 'reverse' },
+        { id: 'geo', source: 'node-r', target: 'node-b', mode: 'reverse', geoRouting: { enabled: true } },
+    ] } };
+    const result = await gate.verifyPlan(staged);
+    assert.equal(result.ok, true); assert.equal(result.verifiedRelayCount, 0);
+    assert.equal(result.skippedRelayCount, undefined, 'no new legacy unfenced terminal skip');
+    assert.deepEqual(result.skippedRelayRevisions, [{ relayNode: 'node-r', state: 'not_installed', desiredState: 'absent', credentialRevision: 0 }]);
+    state = null;
+    assert.deepEqual(await gate.verifyPlan(staged), { ok: false, verifiedRelayCount: 0, reason: 'PPP_NOT_INSTALLED' });
+    state = { node: 'node-r', status: 'not_installed', desiredState: 'absent', secretRevision: 0 };
+    staged.effectiveTopology.links[1].geoRouting.enabled = false;
+    assert.equal((await gate.verifyPlan(staged)).ok, false, 'a ref label alone cannot bless a complete/unknown shape');
+    assert.deepEqual(calls, []);
+});
+
 test('factory opts in to read-only mode without changing default mode', () => {
     const deps = { RelayL2tpState: { findOne() {} }, L2tpUser: { find() {} },
         L2tpOperation: { findOne() {} }, HyNode: { findById() {} }, NodeSSH: class {} };

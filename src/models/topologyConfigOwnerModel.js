@@ -33,6 +33,9 @@ const schema = new mongoose.Schema({
     originalSnapshot: { type: snapshotSchema },
     adoptionReceipt: { type: receiptSchema },
     handbackReceipt: { type: receiptSchema },
+    // Current public-adoption epoch only; permanent alias/history rows are never
+    // rewritten. The binding store installs its fresh held execution attestation.
+    executionEnrollment: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     // Private, exact observed classic descriptors/profile bytes. Written only
     // with adoption, never an invented settled operation or mutable desired.
     // No default: legacy records do not silently become imported baselines.

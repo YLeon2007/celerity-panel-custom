@@ -2,7 +2,9 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { compileTopology } = require('../domain/topologyCompiler');
+// Match the ordinary selected coordinator's configuration compiler. This is
+// configuration intent, not a tunnel/client readiness attestation.
+const { compileConfiguredTopology: compileTopology } = require('../domain/primaryReservePolicy');
 const { deriveAttachTopology, deriveReplacementTopology } = require('../domain/topologyReplacement');
 const { TopologyOperationPlanMaterializer } = require('../services/topologyOperationPlanMaterializer');
 const { composeXrayConfig } = require('../services/xrayConfigComposer');
@@ -157,7 +159,7 @@ for (const kind of ['attach', 'replace']) {
             { groupId: 'shared', pathKey: 'mine', oldLinkId: 'old', newLinkId: 'rb' });
         const { materializer } = reader(data);
         const plan = await materializer.materialize({ ...input(candidate.topology, `link.${kind}`),
-            pinnedSnapshot: { topology: candidate.topology, compiled: candidate.compiled } });
+            pinnedSnapshot: { topology: candidate.topology, compiled: compileTopology(candidate.topology) } });
         assert.equal(plan.staged, true, 'PPP egress completeness is not portal readiness');
         assert.deepEqual([...configs(plan).keys()].sort(), ['b', 'bb', 'pp', 'r', 'rr']);
         for (const [relayId, key, bridgeId] of [['r', 'mine', 'b'], ['rr', 'peer', 'bb']]) {

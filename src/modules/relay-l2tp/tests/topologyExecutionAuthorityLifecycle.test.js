@@ -18,6 +18,19 @@ function simulatedController(executionContext = TEST) {
         revoke() { revoked = true; }, restore() { revoked = false; }, calls: () => calls,
     };
 }
+test('authority primary wave: external assertion retains its exact cause and revocation stays sticky', async () => {
+    const original=Object.assign(Error('LOCAL_CONTROLLER_PRIMARY'),{code:'LOCAL_CONTROLLER_PRIMARY'});
+    let fail=false,escaped;
+    const lifecycle=new Lifecycle({executionContext:TEST,controller:{async withHeldAuthority(_context,work){return work({async assertHeld(){if(fail)throw original;},async withVerifiedAuthority(){}});}}});
+    await assert.rejects(lifecycle.run(async()=>{
+        escaped=()=>lifecycle.assertHeld();fail=true;
+        await assert.rejects(lifecycle.assertHeld(),e=>e.code==='TOPOLOGY_EXECUTION_BINDING_UNPROVEN'&&e.cause===original);
+        fail=false;
+        await assert.rejects(lifecycle.assertHeld(),{code:'TOPOLOGY_EXECUTION_BINDING_UNPROVEN'});
+    }),{code:'TOPOLOGY_EXECUTION_BINDING_UNPROVEN'});
+    await assert.rejects(escaped(),{code:'TOPOLOGY_EXECUTION_BINDING_UNPROVEN'});
+});
+
 test('TEST lifecycle refuses absent, malformed and PROD controllers', () => {
     for (const options of [{}, { executionContext: PROD, controller: simulatedController().controller },
         { executionContext: TEST, controller: true }, { executionContext: { ...TEST, extra: true }, controller: simulatedController().controller }]) {

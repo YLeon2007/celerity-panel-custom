@@ -54,6 +54,8 @@ const query = value => {
 const resolveUsers = node => active.resolveUsers ? active.resolveUsers(node) : users;
 const id = value => String(value?._id ?? value);
 const matches = (row, filter) => Object.entries(filter).every(([key, value]) => {
+    if (key === '$or') return value.some(branch => matches(row, branch));
+    if (key === '$and') return value.every(branch => matches(row, branch));
     if (key === 'paths.linkIds') return row.paths.some(path => path.linkIds.some(linkId => value.$in.map(String).includes(String(linkId))));
     if (value?.$in) return value.$in.map(String).includes(id(row[key]));
     if (value?.$ne !== undefined) return id(row[key]) !== id(value.$ne);
@@ -96,16 +98,28 @@ class SSH {
         await active.assertScope?.(); active.assertHeld(); active.events.push('upload:' + path); active.uploads.push({ content, path });
         if (active.uploadFailure) throw new Error('unknown SFTP');
         if (path === '/usr/local/etc/xray/config.json') active.live = content;
+        if (path === '/usr/local/etc/xray-bridge/config.json') active.liveBridge = content;
     }
     async exec(command) {
         await active.assertScope?.(); active.assertHeld(); active.commands.push(command); active.events.push(command.includes('cat /usr/local/etc/xray/config.json') ? 'live-main' : 'exec');
-        let stdout = command.includes('cat /usr/local/etc/xray/config.json') ? active.live : command.includes('is-active') ? 'active' : '/usr/local/bin/xray';
+        let stdout = command.includes('cat /usr/local/etc/xray/config.json') ? active.live
+            : command.includes('cat /usr/local/etc/xray-bridge/config.json') ? active.liveBridge
+                : command.includes('is-active') ? 'active' : '/usr/local/bin/xray';
         const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
         if (receipt) stdout += '\n' + receipt[0] + '\n';
         return { code: active.restartFailure && command.includes('systemctl restart xray-bridge') ? 1 : 0, stdout, stderr: '' };
     }
 }
 const { createL2tpRootHostDependencies } = require('../../modules/l2tpRuntimeLifecycleHook');
+function seedAppliedForwardProfile() {
+    // Explicit fixture setup, never observation inferred from desired status.
+    const current = JSON.parse(active.live);
+    generator.applyForwardChain(current, active.links.filter(link => link.mode === 'forward' && id(link.portalNode) === NODE), ['vless-in']);
+    require('../classicL2tpConfigComposition').finishClassicConfigRouting(current);
+    active.live = JSON.stringify(current);
+    const incoming = active.links.filter(link => link.mode !== 'forward' && id(link.bridgeNode) === NODE);
+    active.liveBridge = incoming.length ? generator.generateCombinedBridgeConfig(incoming) : null;
+}
 function fixture({ conflict = false, veto = false, uploadFailure = false, restartFailure = false } = {}) {
     const events = [], uploads = [];
     const rows = new Map();
@@ -126,6 +140,7 @@ function fixture({ conflict = false, veto = false, uploadFailure = false, restar
     live.outbounds.push({ tag: 'cascade-main', protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port: cascadePathIngressPort(GROUP, 'main') }] } });
     live.inbounds.push({ tag: 'relay-l2tp-other', protocol: 'dokodemo-door', port: 12346 });
     active = { model, rows, events, uploads, commands: [], links: [upstream, downstream], uploadFailure, restartFailure, live: JSON.stringify(live),
+        liveBridge: generator.generateRelayConfig(upstream, head, [downstream]),
         owners: veto ? [{ node: NODE, profile: 'xray-main', owner: 'topology', executionContext: context, generation: '00000000-0000-4000-8000-000000000001', nodeIdentity: { machineId: 'a'.repeat(32), sshHostKeySha256: 'b'.repeat(64) } }] : [],
         assertHeld() { const row = rows.get(NODE); assert(row && row.remoteUncertain === true
             && (active.teardown ? row.owner.startsWith('simple-uninstall:') : row.owner === 'worker' && row.operationId === 'install-op'),
@@ -231,6 +246,9 @@ test('assembled reverse preparation preserves both existing fan-in upstreams whi
         portalNode: { ...head, _id: '507f1f77bcf86cd799439018', ip: '192.0.2.18' },
         tunnelUuid: '00000000-0000-4000-8000-000000000018' };
     f.links.push(other);
+    // These are existing upstreams, so their actual pre-preparation sidecar
+    // bytes must be present, not merely desired rows marked "online".
+    active.liveBridge = generator.generateRelayConfig(upstream, head, [downstream], [], [{ link: other, portal: other.portalNode }]);
     assert.equal((await assembledRuntime(f).worker.runOnce()).status, 'succeeded');
     const secondary = JSON.parse(f.uploads.find(row => row.path === '/usr/local/etc/xray-bridge/config.json').content);
     assert.equal(secondary.reverse.bridges.length, 2, 'neither existing upstream may be discarded');
@@ -257,6 +275,7 @@ for (const candidateFailure of [false, true]) test(`forward preparation retains 
         aclRules: ['operator-egress(all)'], domain: 'relay.example.invalid', sni: 'relay.example.invalid' });
     const f = fixture(); group.mode = 'forward';
     f.links.splice(1, 1, { ...downstream, mode: 'forward' });
+    seedAppliedForwardProfile();
     // Actual _getUsersForNode implementation, with only its persistence/import
     // seam modeled. No replacement of the group-vs-ungrouped branch under test.
     const filename = require.resolve('../syncService');
@@ -294,6 +313,7 @@ for (const candidateFailure of [false, true]) test(`forward preparation retains 
 test('assembled forward preparation deploys MAIN ingress and candidate rereads that prepared MAIN', async () => {
     const f = fixture(); const priorMode = group.mode; group.mode = 'forward';
     f.links.splice(1, 1, { ...downstream, mode: 'forward' });
+    seedAppliedForwardProfile();
     try {
         assert.equal((await assembledRuntime(f).worker.runOnce()).status, 'succeeded');
         const prepared = f.uploads.find(row => row.path === '/usr/local/etc/xray/config.json');
@@ -385,12 +405,13 @@ test('actual sync composition adds forward path ingress and retains scoped priva
         paths: [{ pathKey: 'main', healthy: true, outboundTag: 'cascade-main' }], selectedPathKey: 'main' },
         tags: { inbound: 'relay-l2tp-' + GROUP, blockOutbound: 'block' }, tproxyPort: 12345 });
     active.live = generator.generateXrayConfigWithApi(relay, users, { fragments: [fragment] });
+    seedAppliedForwardProfile();
     const fs = require('node:fs'), path = require('node:path');
     const filename = path.resolve(__dirname, '../syncService.js');
     const loaded = new Module(filename, module);
     loaded.filename = filename; loaded.paths = Module._nodeModulePaths(path.dirname(filename));
     loaded.require = request => {
-        if (['./configGenerator', './classicL2tpConfigComposition', './classicNodeConfigWrite', './topologyConfigOwnership', './cascadeService'].includes(request)
+        if (['./configGenerator', './classicL2tpConfigComposition', './classicAppliedConfig', './classicNodeConfigWrite', './topologyConfigOwnership', './cascadeService'].includes(request)
             || request.endsWith('/l2tpExecutionAuthorization') || request.endsWith('/l2tpXrayConfigMerge')) return Module.prototype.require.call(loaded, request);
         if (request === './nodeSSH') return SSH;
         if (request.endsWith('/hyNodeModel')) return { updateOne: async () => ({ matchedCount: 1 }) };

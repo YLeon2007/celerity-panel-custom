@@ -3,8 +3,9 @@
 const { createHash } = require('node:crypto');
 const configGenerator = require('../../../services/configGenerator');
 const { composeXrayConfig } = require('./xrayConfigComposer');
-const { compileTopology } = require('../domain/topologyCompiler');
+const { compileConfiguredTopology, primaryReservePolicies } = require('../domain/primaryReservePolicy');
 const { assertProfileTargetPin, assertSelectedProfileTargets, resolveTopologyProfileTarget } = require('./topologyProfileTarget');
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT, matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
 const {
     cascadePathIngressPort,
 } = require('../domain/cascadePathIngress');
@@ -647,6 +648,33 @@ function orderedFanInChain(snapshot, geoLeafLinkIds) {
         outgoing,
         distToSink,
     };
+}
+
+// Only an explicit already-validated priority/failover policy can connect
+// otherwise independent default domains through a standby bridge. Validate
+// each default domain with the existing walkers; a standby is transport, not
+// a geo rule that must share every portal's trunk or own a dedicated bridge.
+function configuredPolicyChainShape(snapshot, standbyLinkIds, staged) {
+    const defaults = { ...snapshot,
+        links: snapshot.links.filter(link => !standbyLinkIds.has(entityId(link))), groups: [] };
+    const chains = connectedSnapshots(defaults).map(component => selectChainShape(component, new Set(), staged));
+    const byId = new Map(snapshot.nodes.map(node => [entityId(node), node]));
+    const orderedNodes = [...new Map(chains.flatMap(chain => chain.orderedNodes).map(entry => [entry.id, entry])).values()];
+    const linked = new Set(orderedNodes.map(entry => entry.id));
+    const targets = new Set();
+    const geoLeafNodes = snapshot.links.filter(link => standbyLinkIds.has(entityId(link))).map(link => {
+        const source = entityId(link.source ?? link.portalNode), target = entityId(link.target ?? link.bridgeNode);
+        if (!linked.has(source) || byId.get(source)?.role !== 'relay'
+            || byId.get(target)?.role !== 'bridge' || targets.has(target)) {
+            throw new FrozenTopologyDeploymentPlanError('NON_LINEAR_TOPOLOGY', 'Invalid explicit standby transport');
+        }
+        targets.add(target);
+        return { id: target, node: byId.get(target), link: { id: entityId(link), link, source, target } };
+    });
+    const modes = new Set(snapshot.links.map(link => link.mode));
+    return { mode: modes.size === 1 ? [...modes][0] : 'mixed',
+        ...(chains.some(chain => chain.staged) ? { staged: true } : {}),
+        orderedNodes, orderedLinks: chains.flatMap(chain => chain.orderedLinks), geoLeafNodes };
 }
 
 /** Decide between the classic linear chain and the fan-in domain shape. */
@@ -1460,7 +1488,7 @@ function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
 function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [], terminalEgressTag = 'direct', linkRefsById }) {
     const byEntryId = (left, right) => left.id.localeCompare(right.id, 'en');
     const geoLeafNodes = chain.geoLeafNodes || [];
-    const allChainNodes = [...chain.orderedNodes, ...geoLeafNodes];
+    const allChainNodes = [...new Map([...chain.orderedNodes, ...geoLeafNodes].map(entry => [entry.id, entry])).values()];
     const nodeConfigsById = new Map(allChainNodes.map(({ id, node }) => [
         id,
         projectNodeConfig(nodeMetadataById.get(id), node, refs.get(id)),
@@ -1541,6 +1569,7 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
 
         // Downstream tunnel artifacts: default link plus geo branches.
         const downstreamArtifacts = [...(downstream ? [downstream] : []), ...branches];
+        if (chain.primaryReserve?.length) downstreamArtifacts.sort(byEntryId);
         for (const entry of downstreamArtifacts) {
             const projected = projectedByEntryId.get(entry.id);
             if (entry.link.mode === 'reverse') {
@@ -1562,16 +1591,26 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
         // upstream transit. Install listeners only: an immediate per-path
         // catch-all here would bypass the geo rules emitted below.
         if (node.role === 'relay' && downstream) {
-            const ingress = relayPathIngress(groups, downstream.id);
+            const policy = chain.primaryReserve?.find(policy => policy.source === id);
+            const ingress = policy ? policy.group.paths.map(path => ({ pathKey: path.pathKey,
+                port: cascadePathIngressPort(policy.groupId, path.pathKey) }))
+                : relayPathIngress(groups, downstream.id);
             if (ingress.length > 0) {
                 configGenerator.applyCascadePathIngress(config, ingress);
-                ingressTags.push(...ingress.map(entry => `cascade-${entry.pathKey}`));
+                if (policy && !policy.selected) {
+                    // A deliberately blocked installed path needs its own first
+                    // rule, ahead of reverse control, and must not also enter
+                    // the shared transit fallback checked by owned ingress.
+                    config.routing.rules.unshift(...ingress.map(entry => ({ type: 'field',
+                        inboundTag: [`cascade-${entry.pathKey}`], outboundTag: 'block' })));
+                } else ingressTags.push(...ingress.map(entry => `cascade-${entry.pathKey}`));
                 ingressByNodeId.set(id, ingress);
             }
         }
 
         // Geo-branch rules first, so branch matches win over the default rule.
         for (const entry of branches) {
+            if (chain.standbyLinkIds?.has(entry.id)) continue;
             if (ingressTags.length === 0) continue;
             const geo = projectGeoRouting(linkMetadataById.get(entry.id)) || {};
             const tag = egressTagOf(entry);
@@ -1607,7 +1646,8 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
             config.routing.rules.push({
                 type: 'field',
                 inboundTag: ingressTags,
-                outboundTag: egressTagOf(downstream),
+                outboundTag: chain.primaryReserve?.some(policy => policy.source === id && !policy.selected)
+                    ? 'block' : egressTagOf(downstream),
             });
         }
 
@@ -1628,7 +1668,7 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
 function mixedDeploymentOrder(chain) {
     const geoLeafNodes = chain.geoLeafNodes || [];
     const allChainNodes = [...chain.orderedNodes, ...geoLeafNodes];
-    const nodeIds = allChainNodes.map(({ id }) => id);
+    const nodeIds = [...new Set(allChainNodes.map(({ id }) => id))];
     const allEntries = [...chain.orderedLinks, ...geoLeafNodes.map(leaf => leaf.link)];
     const deps = new Map(nodeIds.map(id => [id, new Set()])); // node -> nodes deployed earlier
     for (const entry of allEntries) {
@@ -1663,9 +1703,72 @@ function canonicalize(value) {
     );
 }
 
-function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [], previousListeningPorts = [], profileTargetPin }) {
+function preserveBlockedListenerShape(fragment, profile) {
+    const expected = fragment.inbounds[0];
+    const observed = (profile?.inbounds || []).filter(inbound => inbound.tag === expected.tag);
+    if (!observed.length) return;
+    // Preserve observed bytes; do not add sniffing to plain/unrelated ingresses.
+    // Accept only the existing plain and native domain-routing generator forms.
+    const key = value => JSON.stringify(canonicalize(value));
+    const withSniffing = { ...expected,
+        sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true } };
+    if (observed.length !== 1 || ![key(expected), key(withSniffing)].includes(key(observed[0]))) {
+        throw new FrozenTopologyDeploymentPlanError('TOPOLOGY_PROFILE_BASELINE_MISMATCH',
+            'Blocked ingress identity does not match its descriptor');
+    }
+    fragment.inbounds[0] = structuredClone(observed[0]);
+}
+
+function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [], previousListeningPorts = [], profileTargetPin, executionContext, nodeMetadata, blockedPathKey }) {
     const target = profileTargetPin === undefined ? TARGETS_BY_ROLE[node.role]
         : resolveTopologyProfileTarget({ nodeId, role: node.role, targetProfile: profileTargetPin.targetProfile, profileTargetPin });
+    // Retained TEST snapshots must read actual users, including RPC-only users.
+    // Scope the capability to the resolved native bridge profile, never an
+    // imported MAIN target or the classic generator/original profile bytes.
+    if (matchesTopologyExecutionContext(executionContext, TEST_TOPOLOGY_EXECUTION_CONTEXT)
+        && target.targetProfile === 'xray-bridge'
+        && config.inbounds.some(inbound => inbound.protocol === 'vless'
+            && /^(?:bridge-conn-|conn-down-|fwd-|cascade-in-)/.test(inbound.tag || ''))) {
+        const mainPort = assertPort(nodeMetadata?.xray?.apiPort || 61000);
+        const bridgePort = mainPort === 65535 ? 65534 : mainPort + 1;
+        const api = config.inbounds.filter(inbound => inbound.tag === 'API_INBOUND');
+        const conflict = [...config.inbounds.filter(inbound => inbound.tag !== 'API_INBOUND'),
+            { port: nodeMetadata?.port ?? 443 }, ...(nodeMetadata?.xray?.extraInbounds || [])]
+            .some(inbound => inbound.port === bridgePort);
+        if (conflict || (config.api !== undefined || api.length > 0)
+            && !(api.length === 1 && api[0].listen === '127.0.0.1' && api[0].port === bridgePort
+                && api[0].protocol === 'dokodemo-door' && config.api?.tag === 'API'
+                && config.api.services?.includes('HandlerService')
+                && config.routing.rules.some(rule => rule.outboundTag === 'API'
+                    && rule.inboundTag?.length === 1 && rule.inboundTag[0] === 'API_INBOUND'))) {
+            throw new FrozenTopologyDeploymentPlanError('BRIDGE_RUNTIME_API_CONFLICT',
+                'TEST bridge management API must be distinct from the main profile and known listeners');
+        }
+        if (api.length === 0) {
+            // HandlerService lets the retained-profile reader enumerate actual
+            // RPC users; it does not authorize replacing observed user policy.
+            // applyXrayApi supplies MAIN defaults, including a fresh policy.
+            const policy = config.policy;
+            configGenerator.applyXrayApi(config, bridgePort);
+            if (policy === undefined) delete config.policy;
+            else config.policy = policy;
+        }
+        // Keep unconditional PPP refusal ahead of routing policy. The API input
+        // is disjoint, so placing its native-owned route immediately after that
+        // prefix preserves both fail-closed ingress ordering and byte-stability.
+        const apiRule = config.routing.rules.find(row => row.outboundTag === 'API'
+            && row.inboundTag?.length === 1 && row.inboundTag[0] === 'API_INBOUND');
+        config.routing.rules.splice(config.routing.rules.indexOf(apiRule), 1);
+        let apiIndex = 0;
+        while (config.routing.rules[apiIndex] && (() => {
+            const rule = config.routing.rules[apiIndex];
+            return rule.type === 'field' && ['block', 'blackhole'].includes(rule.outboundTag)
+                && rule.inboundTag?.length && rule.inboundTag.every(tag => /^(?:cascade-|relay-l2tp-)/.test(tag))
+                && Object.keys(rule).every(key => ['type', 'inboundTag', 'outboundTag'].includes(key));
+        })()) apiIndex++;
+        config.routing.rules.splice(apiIndex, 0, apiRule);
+        config = composeXrayConfig(config, []);
+    }
     // Tunnel listeners live on the target of forward links and on the source
     // of reverse links (the dialer connects to them).
     const listeningPorts = [...new Set([
@@ -1689,6 +1792,16 @@ function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataByI
         })),
         ...removedPorts.map(port => ({ type: 'port', protocol: 'tcp', port, expectedState: 'absent' })),
     ];
+    // Profile preservation can keep an existing management rule in the first
+    // slot after a delete-to-empty transition. The owned loopback PPP refusal
+    // must still precede every global/reverse selector, including on replay.
+    const blockedIngress = config.routing.rules.find(rule => blockedPathKey !== undefined && rule.type === 'field'
+        && rule.outboundTag === 'block' && rule.inboundTag?.length === 1 && rule.inboundTag[0] === `cascade-${blockedPathKey}`
+        && Object.keys(rule).every(key => ['type', 'inboundTag', 'outboundTag'].includes(key))
+        && config.inbounds.some(inbound => inbound.tag === rule.inboundTag[0]
+            && inbound.tag?.startsWith('cascade-') && inbound.protocol === 'socks' && inbound.listen === '127.0.0.1'));
+    if (blockedIngress) config.routing.rules = [blockedIngress,
+        ...config.routing.rules.filter(rule => rule !== blockedIngress)];
     const bytes = Buffer.from(`${JSON.stringify(canonicalize(config))}\n`, 'utf8');
 
     return {
@@ -1818,23 +1931,32 @@ function isolatedProfileConfig(node, nodeRef) {
 // An empty installed path can retain the previously generated blocked ingress.
 // Recognize only the exact loopback listener AND block rule in the verified
 // role-profile readback, bound to an existing group/key/port descriptor.
-function includeBlockedPathReadback(topology, node, config) {
+function includeBlockedPathReadback(topology, node, config, { baseline = false } = {}) {
     if (node.role !== 'relay' || node.profileConfig === undefined) return;
     const profile = parseGeneratedConfig(node.profileConfig);
     const key = item => JSON.stringify(canonicalize(item));
     for (const group of topology.groups || []) {
         for (const path of group.paths || []) {
-            if (path.enabled === false || path.linkIds.length !== 0) continue;
+            if (path.enabled === false || (!baseline && path.linkIds.length !== 0)) continue;
             const fragment = { inbounds: [], routing: { rules: [] } };
             configGenerator.applyCascadePathIngress(fragment, [{ pathKey: path.pathKey,
                 port: cascadePathIngressPort(entityId(group), path.pathKey), egressTag: 'block' }]);
+            preserveBlockedListenerShape(fragment, profile);
             const inbound = fragment.inbounds[0];
             const rule = fragment.routing.rules[0];
-            if (!config.inbounds.some(current => current.tag === inbound.tag)
-                && profile.inbounds.some(current => key(current) === key(inbound))
-                && profile.routing.rules.some(current => key(current) === key(rule))) {
-                config.inbounds.push(inbound);
-                config.routing.rules.unshift(rule);
+            const actualInbound = profile.inbounds.filter(current => current.tag === inbound.tag);
+            const actualRules = profile.routing.rules.filter(current => current.inboundTag?.includes(inbound.tag));
+            // A configured path can already be blocked because its first apply
+            // had no readiness evidence. Recognize that exact fail-closed native
+            // form, not an inferred healthy route from configured links alone.
+            if (actualInbound.length === 1 && key(actualInbound[0]) === key(inbound)
+                && actualRules.length === 1 && key(actualRules[0]) === key(rule)
+                && profile.routing.rules[0] === actualRules[0]) {
+                const existing = config.inbounds.find(current => current.tag === inbound.tag);
+                if (existing && key(existing) !== key(inbound)) throw new FrozenTopologyDeploymentPlanError(
+                    'TOPOLOGY_PROFILE_BASELINE_MISMATCH', 'Blocked ingress identity does not match its descriptor');
+                if (!existing) config.inbounds.push(inbound);
+                config.routing.rules = [rule, ...config.routing.rules.filter(current => !current.inboundTag?.includes(inbound.tag))];
             }
         }
     }
@@ -1843,6 +1965,38 @@ function includeBlockedPathReadback(topology, node, config) {
 // The selected reader carries exact installed owner/path identity even when
 // its settled path is already empty and descriptors have no profile readback.
 // Do not infer that identity from an arbitrary empty peer path or all relays.
+// Recreate of one explicitly added reserve leaf may reuse its exact retained
+// blocked PPP listener. No general tag deduplication or foreign-port adoption.
+function includeReactivatedBlockedPath(before, after, node, config, installedPath) {
+    if (!installedPath || node.role !== 'relay'
+        || node.id !== installedPath.ownerNodeId || node.profileConfig === undefined) return;
+    const oldGroup = before.groups.find(group => entityId(group) === installedPath.groupId);
+    const nextGroup = after.groups.find(group => entityId(group) === installedPath.groupId);
+    if (!oldGroup || !nextGroup || oldGroup.strategy !== 'priority-failover'
+        || oldGroup.strategy !== nextGroup.strategy || oldGroup.mode !== nextGroup.mode) return;
+    const anchor = oldGroup.paths.find(path => path.pathKey === installedPath.pathKey);
+    const added = nextGroup.paths.filter(path => !oldGroup.paths.some(old => old.pathKey === path.pathKey));
+    const nextAnchor = nextGroup.paths.find(path => path.pathKey === installedPath.pathKey);
+    if (!anchor || anchor.linkIds.length !== 1 || added.length !== 1 || added[0].linkIds.length !== 1
+        || JSON.stringify(anchor.linkIds) !== JSON.stringify(nextAnchor?.linkIds)) return;
+    const path = added[0], link = after.links.find(link => link.id === path.linkIds[0]);
+    if (!link || before.links.some(old => old.id === link.id) || link.source !== node.id
+        || link.geo === true || link.geoRouting?.enabled === true
+        || !after.nodes.some(target => target.id === link.target && target.role === 'bridge')) return;
+    const fragment = { inbounds: [], routing: { rules: [] } };
+    configGenerator.applyCascadePathIngress(fragment, [{ pathKey: path.pathKey,
+        port: cascadePathIngressPort(installedPath.groupId, path.pathKey), egressTag: 'block' }]);
+    preserveBlockedListenerShape(fragment, parseGeneratedConfig(node.profileConfig));
+    const inbound = fragment.inbounds[0], rule = fragment.routing.rules[0];
+    const profile = parseGeneratedConfig(node.profileConfig), key = value => JSON.stringify(canonicalize(value));
+    const actual = profile.inbounds.filter(item => item.tag === inbound.tag);
+    const references = profile.routing.rules.filter(item => item.inboundTag?.includes(inbound.tag) || item.outboundTag === inbound.tag);
+    if (!config.inbounds.some(item => item.tag === inbound.tag) && actual.length === 1 && key(actual[0]) === key(inbound)
+        && references.length === 1 && key(references[0]) === key(rule)) {
+        config.inbounds.push(inbound); config.routing.rules.unshift(rule);
+    }
+}
+
 function includeInstalledEmptyPath(topology, node, config, installedPath) {
     if (!installedPath || node.id !== installedPath.ownerNodeId || node.role !== 'relay') return;
     const group = topology.groups.find(group => entityId(group) === installedPath.groupId);
@@ -1851,6 +2005,7 @@ function includeInstalledEmptyPath(topology, node, config, installedPath) {
     const fragment = { inbounds: [], routing: { rules: [] } };
     configGenerator.applyCascadePathIngress(fragment, [{ pathKey: path.pathKey,
         port: cascadePathIngressPort(entityId(group), path.pathKey), egressTag: 'block' }]);
+    if (node.profileConfig !== undefined) preserveBlockedListenerShape(fragment, parseGeneratedConfig(node.profileConfig));
     const inbound = fragment.inbounds[0], rule = fragment.routing.rules[0];
     const key = value => JSON.stringify(canonicalize(value));
     const existing = config.inbounds.find(item => item.tag === inbound.tag);
@@ -1912,6 +2067,15 @@ function transitionLinkRefs(before, unionLinks) {
     return new Map([...unionLinks.keys()].map(id => {
         const synthetic = `link-${createHash('sha256').update(`celerity-topology-link:${id}`).digest('hex').slice(0, 8)}`;
         const link = previous.get(id);
+        // A verified legacy full-reconcile bridge pins its original canonical
+        // ordinal ref in the private applied descriptor. Desired API fields do
+        // not supply this value; ordinary before-profile verification below
+        // still checks both endpoints, credentials and ordered rules.
+        if (link?.artifactRef !== undefined) {
+            if (!/^link-[1-9]\d*$/.test(link.artifactRef)) throw new FrozenTopologyDeploymentPlanError(
+                'TOPOLOGY_PROFILE_BASELINE_MISMATCH', 'Invalid settled artifact reference');
+            return [id, link.artifactRef];
+        }
         if (link?.mode !== 'reverse') return [id, synthetic];
         const domain = `${id.slice(-8)}.${link.tunnelDomain || 'reverse.tunnel.internal'}`;
         const observed = [profiles.get(link.source)?.reverse?.portals, profiles.get(link.target)?.reverse?.bridges]
@@ -1924,7 +2088,7 @@ function transitionLinkRefs(before, unionLinks) {
 
 // Generate both sides with the existing generators. Stable private link refs
 // keep a surviving tunnel's tags/domain independent of removed siblings.
-function composeDescriptorTransition(before, after, installedPath, selectedOwnerPins) {
+function composeDescriptorTransition(before, after, installedPath, selectedOwnerPins, compiledTopology, executionContext) {
     if (selectedOwnerPins?.some(owner => owner && Object.hasOwn(owner, 'profileTargetPin'))) {
         return composeImportedForwardTransition(before, after, installedPath, selectedOwnerPins);
     }
@@ -1943,15 +2107,15 @@ function composeDescriptorTransition(before, after, installedPath, selectedOwner
     if (new Set([...linkRefs.values()].map(ref => ref.slice(-8))).size !== linkRefs.size) {
         throw new FrozenTopologyDeploymentPlanError('DUPLICATE_LINK_REF', 'Frozen link artifact identities collide');
     }
-    const generate = topology => {
+    const generate = (topology, compiled = compileConfiguredTopology(topology)) => {
         if (topology.links.length === 0) return null;
         return composeFrozenTopologyDeploymentPlan({ snapshot: topology,
             nodeMetadata: topology.nodes, linkMetadata: topology.links,
-            compiledTopology: compileTopology(topology), staged: true,
+            compiledTopology: compiled, staged: true,
             nodeRefsById: refs, linkRefsById: linkRefs, hopByHop: true });
     };
     const oldPlan = generate(before);
-    const newPlan = generate(after);
+    const newPlan = generate(after, compiledTopology);
     const configMap = plan => new Map((plan?.nodes || []).map(node => [node.node,
         parseGeneratedConfig(Buffer.from(node.candidate.bytes).toString('utf8'))]));
     const oldConfigs = configMap(oldPlan);
@@ -1959,8 +2123,9 @@ function composeDescriptorTransition(before, after, installedPath, selectedOwner
     for (const [id, config] of matchedClassicConfigs(before, refs)) oldConfigs.set(id, config);
     for (const [id, node] of beforeNodes) {
         if (!oldConfigs.has(id)) oldConfigs.set(id, isolatedProfileConfig(node, refs.get(id)));
-        includeBlockedPathReadback(before, node, oldConfigs.get(id));
+        includeBlockedPathReadback(before, node, oldConfigs.get(id), { baseline: true });
         includeInstalledEmptyPath(before, node, oldConfigs.get(id), installedPath);
+        includeReactivatedBlockedPath(before, after, node, oldConfigs.get(id), installedPath);
         if (node.profileConfig !== undefined) {
             const profile = parseGeneratedConfig(node.profileConfig);
             const key = value => JSON.stringify(canonicalize(value));
@@ -2034,8 +2199,12 @@ function composeDescriptorTransition(before, after, installedPath, selectedOwner
             config = preserveProfileConfig(profileConfig, oldConfigs.get(id), config,
                 node.role === 'portal' ? clientInboundTags(nodeConfig) : []);
         }
+        if (node.role === 'portal') {
+            preserveReverseTransitDomain(config, id, clientInboundTags(nodeConfig), after);
+        }
         return candidateForNode({ nodeId: id, node, nodeRef: refs.get(id), orderedLinks: entries,
-            linkMetadataById, config: composeXrayConfig(config, []),
+            linkMetadataById, config: composeXrayConfig(config, []), executionContext, nodeMetadata: node,
+            blockedPathKey: installedPath?.ownerNodeId === id ? installedPath.pathKey : undefined,
             previousListeningPorts: before.links
                 .filter(link => (link.mode === 'reverse' ? link.source : link.target) === id)
                 .map(link => assertPort(link.tunnelPort)),
@@ -2138,6 +2307,35 @@ function composeImportedForwardTransition(before, after, installedPath, selected
     return deepFreeze({ schemaVersion: 1, mode: 'forward', ...(after.links.length ? {} : { staged: true }), nodes: result });
 }
 
+// Reverse mux carries the destination, not a previous dispatcher's route-only
+// sniff metadata. Preserve the subscriber's TLS/HTTP hostname in that destination
+// only when a downstream domain branch must select it after a reverse hop.
+// The classic generator, transport listeners and locally selected PPP policy
+// retain their existing destination semantics.
+function preserveReverseTransitDomain(config, sourceId, clientTags, topology, metadata = new Map()) {
+    const pending = [[sourceId, false]], seen = new Set();
+    let required = false;
+    while (pending.length && !required) {
+        const [id, reversed] = pending.pop(), key = `${id}:${reversed}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        for (const link of topology.links.filter(link => entityId(link.source) === id)) {
+            const geo = projectGeoRouting(metadata.get(entityId(link)) || link);
+            if (reversed && geo?.enabled === true && geo.domains.length > 0) {
+                required = true;
+                break;
+            }
+            pending.push([entityId(link.target), reversed || link.mode === 'reverse']);
+        }
+    }
+    if (!required) return;
+    for (const inbound of config.inbounds || []) {
+        if (!clientTags.includes(inbound.tag)) continue;
+        inbound.sniffing = { ...inbound.sniffing, enabled: true,
+            destOverride: inbound.sniffing?.destOverride || ['http', 'tls', 'quic'], routeOnly: false };
+    }
+}
+
 function composeFrozenTopologyDeploymentPlan({
     snapshot,
     nodeMetadata = [],
@@ -2150,6 +2348,7 @@ function composeFrozenTopologyDeploymentPlan({
     installedPath,
     selectedOwnerPins,
     hopByHop = false,
+    executionContext,
 } = {}) {
     if (compiledTopology?.valid !== true || !Array.isArray(compiledTopology.relays)) {
         throw new FrozenTopologyDeploymentPlanError(
@@ -2157,7 +2356,7 @@ function composeFrozenTopologyDeploymentPlan({
             'A valid compiled topology is required',
         );
     }
-    if (baselineTopology !== undefined) return composeDescriptorTransition(baselineTopology, snapshot, installedPath, selectedOwnerPins);
+    if (baselineTopology !== undefined) return composeDescriptorTransition(baselineTopology, snapshot, installedPath, selectedOwnerPins, compiledTopology, executionContext);
     if (selectedOwnerPins?.some(owner => owner && Object.hasOwn(owner, 'profileTargetPin'))) {
         throw new FrozenTopologyDeploymentPlanError('TOPOLOGY_PROFILE_TARGET_INVALID', 'Imported targets require verified descriptors');
     }
@@ -2184,7 +2383,7 @@ function composeFrozenTopologyDeploymentPlan({
             compiledTopology: { valid: true, relays: compiledTopology.relays.filter(relay =>
                 component.nodes.some(node => entityId(node) === entityId(relay.nodeId))) },
             nodeRefsById: refs, linkRefsById: linkRefs,
-            hopByHop,
+            hopByHop, executionContext,
         }));
         return deepFreeze({ schemaVersion: 1,
             mode: new Set(plans.map(plan => plan.mode)).size === 1 ? plans[0].mode : 'mixed',
@@ -2252,7 +2451,14 @@ function composeFrozenTopologyDeploymentPlan({
     // linked nodes only: a detached portal/bridge cannot complete a path, and
     // a geo bridge is not an implicit default exit. Complete graphs keep
     // their existing builders; incomplete endpoints use hop-by-hop routing.
-    const chain = selectChainShape(snapshot, geoLeafLinkIds, staged === true);
+    const primaryReserve = primaryReservePolicies(snapshot, compiledTopology);
+    const standbyLinkIds = new Set(primaryReserve.flatMap(policy => policy.candidates
+        .filter(candidate => candidate !== policy.carrier).map(candidate => candidate.link.id)));
+    const chain = primaryReserve.length > 0 && geoLeafLinkIds.size === 0
+        ? configuredPolicyChainShape(snapshot, standbyLinkIds, staged === true)
+        : selectChainShape(snapshot, new Set([...geoLeafLinkIds, ...standbyLinkIds]), staged === true);
+    chain.primaryReserve = primaryReserve;
+    chain.standbyLinkIds = standbyLinkIds;
     const roleByNodeId = new Map(
         [...chain.orderedNodes, ...chain.geoLeafNodes].map(({ id, node }) => [id, node.role]),
     );
@@ -2314,14 +2520,16 @@ function composeFrozenTopologyDeploymentPlan({
         }
     }
 
-    const refs = nodeRefsById ?? (chain.fanIn === true
+    if (primaryReserve.length > 0 && !linkRefsById) linkRefsById = new Map(snapshot.links.map(link => [entityId(link),
+        `link-${createHash('sha256').update(`celerity-topology-link:${entityId(link)}`).digest('hex').slice(0, 8)}`]));
+    const refs = nodeRefsById ?? (primaryReserve.length > 0 ? componentRefs(snapshot) : chain.fanIn === true
         ? topologyFanInRefs(chain)
         : topologyRefs(chain.orderedNodes, chain.geoLeafNodes));
     // Mixed-mode domains (and fan-in domains with any reverse link) are built
     // hop-by-hop; uniform domains keep their legacy builders. Staged chains
     // are always built hop-by-hop with terminal relays routing unmatched
     // transit to `block`, while explicitly permitted bridges remain exits.
-    const useMixedBuilder = hopByHop === true || chain.staged === true
+    const useMixedBuilder = primaryReserve.length > 0 || hopByHop === true || chain.staged === true
         || chain.mode === 'mixed'
         || (chain.fanIn === true && chain.mode !== 'forward');
     let candidateConfigsById;
@@ -2346,6 +2554,29 @@ function composeFrozenTopologyDeploymentPlan({
             'XRAY_CONFIG_GENERATION_FAILED',
             'Failed to generate a frozen Xray topology candidate',
         );
+    }
+    // PPP arrives at this private SOCKS listener with an IP destination. Its
+    // TLS/HTTP hostname is not SOCKS address metadata, so domain branch rules
+    // otherwise silently fall through to the default exit. Inspect only the
+    // generated owned ingress, for routing only; keep the actual destination
+    // and every existing geo/default/blocked rule unchanged. Classic profiles
+    // and their generator are deliberately not modified here.
+    for (const config of candidateConfigsById.values()) {
+        const domainInputs = new Set((config.routing?.rules || [])
+            .filter(rule => Array.isArray(rule.domain) && rule.domain.length > 0)
+            .flatMap(rule => rule.inboundTag || []));
+        for (const inbound of config.inbounds || []) {
+            if (inbound.protocol === 'socks' && inbound.listen === '127.0.0.1'
+                && inbound.tag?.startsWith('cascade-') && domainInputs.has(inbound.tag)) {
+                inbound.sniffing = { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true };
+            }
+        }
+    }
+    for (const { id, node } of chain.orderedNodes) {
+        if (node.role !== 'portal') continue;
+        const nodeConfig = projectNodeConfig(nodeMetadataById.get(id), node, refs.get(id));
+        preserveReverseTransitDomain(candidateConfigsById.get(id), id,
+            clientInboundTags(nodeConfig), snapshot, linkMetadataById);
     }
     // Deployment order keeps endpoints first for forward chains (bridges
     // before their upstream) and source-first for reverse chains; geo bridges
@@ -2373,6 +2604,8 @@ function composeFrozenTopologyDeploymentPlan({
     const nodes = deploymentOrder.map(({ id, node }) => candidateForNode({
         nodeId: id,
         node,
+        executionContext,
+        nodeMetadata: nodeMetadataById.get(id),
         nodeRef: refs.get(id),
         orderedLinks: allLinkEntries,
         linkMetadataById,

@@ -183,6 +183,14 @@ function createL2tpStartupLifecycle({
             }
             return host.enrollTestOwners();
         },
+        enrollProductionOwners() {
+            if (started || stopped || typeof host.enrollProductionOwners !== 'function') throw new Error('PRODUCTION_OWNER_ENTRY_UNPROVEN');
+            return host.enrollProductionOwners();
+        },
+        handbackProductionOwners(acceptedCurrent) {
+            if (!stopped || typeof host.handbackProductionOwners !== 'function') throw new Error('PRODUCTION_OWNER_ENTRY_UNPROVEN');
+            return host.handbackProductionOwners(acceptedCurrent);
+        },
         start() {
             if (enabled && !started && !stopped) {
                 host.start();

@@ -80,7 +80,7 @@ test('actual PROD panel host reaches held recovery and null claim through the ac
         assert.equal(held, true);
         assert.deepEqual(filter, { _id: 'host-held-null' });
         trace.push('recovery');
-        const query = { read(value) { assert.equal(value, 'primary'); return query; },
+        const query = { select() { return query; }, read(value) { assert.equal(value, 'primary'); return query; },
             readConcern(value) { assert.equal(value, 'majority'); return query; },
             setOptions() { return query; }, async lean() { return null; } };
         return query;
@@ -120,7 +120,7 @@ test('actual PROD panel host reaches held recovery and null claim through the ac
     assert.equal(service.operationWorker.executor.executionProtocolVersion, 2);
     assert.equal(recovery.clientProofWorker, undefined);
     assert.deepEqual(await service.operationWorker.run('host-held-null'), { claimed: false, operationId: 'host-held-null' });
-    assert.deepEqual(trace, ['enter', 'recovery', 'claim', 'claim', 'leave']);
+    assert.deepEqual(trace, ['enter', 'recovery', 'claim', 'leave'], 'V2 never reacquires an existing execution attempt');
     assert.equal(held, false);
 });
 

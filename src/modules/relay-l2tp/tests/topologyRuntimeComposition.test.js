@@ -466,7 +466,7 @@ function heldRuntimeFixture(context = PROD) {
         assert.equal(state.held, true);
         assert.deepEqual(filter, { _id: 'factory-proof-17' });
         trace.push('recovery');
-        const query = { read(value) { assert.equal(value, 'primary'); return query; },
+        const query = { select() { return query; }, read(value) { assert.equal(value, 'primary'); return query; },
             readConcern(value) { assert.equal(value, 'majority'); return query; },
             setOptions() { return query; }, async lean() { return null; } };
         return query;
@@ -480,6 +480,7 @@ function heldRuntimeFixture(context = PROD) {
             assert.deepEqual(filter[key], value);
         }
         assert.deepEqual(filter.v2Terminal, { $exists: false });
+        assert.equal(filter.attempts, 0, 'a native binding never reclaims an existing execution attempt');
         assert.equal(update.$inc.attempts, 1);
         assert.equal(options.runValidators, true);
         state.claims++;
@@ -520,8 +521,8 @@ test('canonical PROD runtime assembles actual held lifecycle/store/default V2 ex
         Object.assign(f.controller.executionContext, context === PROD ? TEST : PROD);
         f.deps.env.PANEL_DOMAIN = 'foreign.invalid';
         assert.deepEqual(await worker.run('factory-proof-17'), { claimed: false, operationId: 'factory-proof-17' });
-        assert.deepEqual(f.trace, ['enter', 'recovery', 'claim', 'claim', 'leave']);
-        assert.equal(f.state.claims, 2, 'real repository executes both context-fenced null CAS paths');
+        assert.deepEqual(f.trace, ['enter', 'recovery', 'claim', 'leave']);
+        assert.equal(f.state.claims, 1, 'native entry performs only the fresh context-fenced claim, never a retry CAS');
         assert.equal(f.state.held, false);
         await assert.rejects(f.options.bindingLifecycle.assertHeld(), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
         const store = f.options.bindingProvisioner;
@@ -537,7 +538,7 @@ test('canonical PROD runtime assembles actual held lifecycle/store/default V2 ex
             code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
         });
         assert.equal(readerCalls, 1, 'default actual executor uses the assembled actual store');
-        assert.deepEqual(f.trace, ['enter', 'recovery', 'claim', 'claim', 'leave'],
+        assert.deepEqual(f.trace, ['enter', 'recovery', 'claim', 'leave'],
             'actual executor/store cannot use authority outside the worker hold');
         assert.equal(worker.pppDriftSync === undefined, context === PROD);
         assert.equal(worker.pppResumeReadinessGate === undefined, context === PROD);

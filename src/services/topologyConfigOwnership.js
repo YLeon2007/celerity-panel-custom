@@ -75,7 +75,8 @@ function handedBackHistory(operation, owners, nodeId, context) {
     const binding = terminal.bindings[index], proof = terminal.proofs[index];
     const expectedFence = { node: nodeId, profile: owner.profile, executionContext: context, owner: 'topology',
         generation: owner.handbackReceipt.fromGeneration, nodeIdentity: owner.nodeIdentity,
-        originalSnapshot: owner.originalSnapshot, adoptionReceipt: owner.adoptionReceipt };
+        originalSnapshot: owner.originalSnapshot, adoptionReceipt: owner.adoptionReceipt,
+        ...(owner.executionEnrollment === undefined ? {} : { executionEnrollment: owner.executionEnrollment }) };
     return same(terminal.ownerFences[index], expectedFence)
         && binding.operationId === String(operation._id) && binding.executionContext === context?.hostIdentity
         && binding.owner === operation.leaseOwner && binding.attempt === operation.attempts

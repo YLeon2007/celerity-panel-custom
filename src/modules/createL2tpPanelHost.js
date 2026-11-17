@@ -87,6 +87,11 @@ function createL2tpPanelHost({
     }
     const testWorkerExecutionAllowed = executionContext?.target === 'test';
     const models = injectedModuleEntry.registerModels();
+    if(healthByPathKey===undefined && topologyEnv.TOPOLOGY_TEST_STARTUP_MODE==='dedicated-runtime-v1'
+        && executionContext?.target==='test' && typeof topologyExecutionAuthority?.readCurrentHealth==='function') {
+        healthByPathKey=require('./relay-l2tp/services/topologyDedicatedTestHealth').createDedicatedTestPathHealth({
+            authority:topologyExecutionAuthority,CascadeLink:injectedCascadeLink,CascadeRouteGroup:models.CascadeRouteGroup});
+    }
     const topologyRuntimeDependencies = {
         HyNode: injectedHyNode,
         CascadeLink: injectedCascadeLink,
@@ -132,6 +137,8 @@ function createL2tpPanelHost({
     // successful install so relay ingress listeners appear without a manual
     // chain sync. Late-bound: the topology runtime is created below.
     const deployTopologyAfterInstall = async () => {
+        // Native topology ingress is settled before install admission below.
+        if (executionContext) return;
         const service = topologyDeploymentService;
         if (!service || typeof service.deploy !== 'function') return;
         if (typeof adapters.stateRepository?.getTopologyRevision !== 'function') return;
@@ -170,6 +177,12 @@ function createL2tpPanelHost({
         createWorkerLifecycle: createLifecycle,
         topologyIngressGate: topologyDeploymentService?.attachIngressGate,
         topologyPppReadinessGate: topologyDeploymentService?.installedPppReadinessGate,
+        prepareTopologyIngress: executionContext ? async input => {
+            const { topologyManagesNodeConfig } = require('../services/topologyConfigOwnership');
+            if (!await topologyManagesNodeConfig({ _id: input.nodeId }, topologyEnv)) return;
+            if (typeof topologyDeploymentService?.prepareL2tpIngress !== 'function') throw new Error('TOPOLOGY_L2TP_INGRESS_UNAVAILABLE');
+            return topologyDeploymentService.prepareL2tpIngress(input);
+        } : undefined,
         runtimeDependencies: {
             operationModel: models.L2tpOperation,
             operationRepository: adapters.operationRepository,
@@ -301,6 +314,16 @@ function createL2tpPanelHost({
     }
 
     executionRuntime = createExecution();
+    const dedicatedActivation = topologyEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1';
+    let dedicatedStarted = false, dedicatedStopped = false, dedicatedEnrollment, activationFailed = false, dedicatedResult, activationConfirmed = false, bootstrapOperationId;
+    const activationId = require('node:crypto').randomUUID();
+    const startConsumers = () => {
+        if (dedicatedStopped) throw new Error('TEST_OWNER_STARTUP_MODE_CONFLICT');
+        const state = executionRuntime.start();
+        topologyRecoveryLifecycle?.start();
+        dedicatedStarted = true;
+        return state;
+    };
 
     return {
         moduleEntry: injectedModuleEntry,
@@ -309,34 +332,114 @@ function createL2tpPanelHost({
         selectedTopologyIntentService: topologyIntentService,
         readLinkApplicationState: topologyDeploymentService?.readLinkApplicationState,
         readPublicOperation: topologyDeploymentService?.readPublicOperation,
-        enrollTestOwners() {
-            if (typeof topologyDeploymentService?.enrollTestOwners !== 'function') {
-                throw new Error('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED');
-            }
-            return topologyDeploymentService.enrollTestOwners();
+        readAppliedNodePublication: topologyDeploymentService?.readAppliedNodePublication,
+        readBusinessReentryRestriction() {
+            if (!executionContext) return Promise.resolve({ blocked: false });
+            return require('./relay-l2tp/services/topologyReentryPolicy').readBusinessReentryRestriction({
+                executionContext, TopologyConfigOwner: models.TopologyConfigOwner,
+                TopologyOperation: models.TopologyOperation, TopologyExecutionBinding: models.TopologyExecutionBinding,
+            });
+        },
+        ...(topologyEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1' && executionContext?.target === 'test'
+            && typeof topologyExecutionAuthority?.readCurrentHealth === 'function' ? {
+                readNodePublicationHealth: require('./relay-l2tp/services/topologyDedicatedTestHealth')
+                    .createDedicatedTestNodeHealth({ authority: topologyExecutionAuthority }),
+            } : {}),
+        beginBootstrapContinuation(operationId, cancel = false) {
+            if (!dedicatedActivation || dedicatedStopped || dedicatedStarted || !/^[a-f0-9]{24}$/.test(operationId)
+                || typeof topologyDeploymentService.resumeBootstrapPreparation !== 'function'
+                || (dedicatedEnrollment && bootstrapOperationId !== operationId)) throw new Error('TEST_BOOTSTRAP_CONTINUATION_UNPROVEN');
+            bootstrapOperationId = operationId;
+            dedicatedEnrollment ??= Promise.resolve().then(async () => {
+                try {
+                    const result = await topologyDeploymentService[cancel === 'undispatched-failure' ? 'settleUndispatchedPreparation' : cancel === 'prepared' ? 'resumePreparedCommit' : cancel === 'closed' ? 'resumeClosedSettlement' : cancel === 'preparation' ? 'resumeUndispatchedPreparation' : cancel === 'runtime' ? 'resumeSettledRuntime' : cancel === 'verification' ? 'resumeRetainedVerification' : cancel === 'bindings' ? 'resumeBindingReservations' : cancel === 'settled' ? 'resumeSettledBootstrap' : cancel ? 'cancelBootstrapPreparation' : 'resumeBootstrapPreparation'](operationId, outcome => {
+                        dedicatedResult = { status: cancel === 'undispatched-failure' ? 'undispatched_failure_settled' : cancel === 'runtime' ? 'settled_runtime_reconciled' : cancel === 'verification' ? 'verification_continued' : cancel === 'bindings' ? 'bindings_continued' : cancel ? 'bootstrap_cancelled' : 'bootstrap_continued', operationId: outcome.operationId, nodes: [] };
+                        if (!dedicatedStopped) startConsumers();
+                    });
+                    if (result.status !== (cancel === 'undispatched-failure' ? 'failed' : cancel && !['bindings', 'verification', 'runtime', 'preparation', 'closed', 'prepared'].includes(cancel) ? 'cancelled' : 'succeeded') || !dedicatedResult) throw new Error('TEST_BOOTSTRAP_CONTINUATION_RETAINED');
+                    activationConfirmed = true;
+                    return result;
+                } catch (error) {
+                    activationFailed = true;
+                    await Promise.allSettled([Promise.resolve().then(() => topologyRecoveryLifecycle?.stop()),
+                        Promise.resolve().then(() => executionRuntime.stop())]);
+                    dedicatedStarted = false;
+                    throw error;
+                }
+            });
+            dedicatedEnrollment.catch(() => {});
+            return { activationId, operationId, status: activationFailed ? 'retained' : 'reconciling' };
+        },
+        beginTestActivation({ resumeOnly = false } = {}) {
+            if (!dedicatedActivation || dedicatedStopped || bootstrapOperationId) throw new Error('TEST_OWNER_STARTUP_MODE_CONFLICT');
+            // Admission is synchronous and bounded; the joined promise is owned
+            // by this host, not by the HTTP socket. Failure is never retried.
+            this.enrollTestOwners({ resumeOnly }).catch(() => {});
+            return { activationId, status: activationConfirmed && dedicatedStarted ? 'active' : activationFailed ? 'retained' : 'reconciling' };
+        },
+        async readTestActivationStatus() {
+            // Bounded local snapshot: GET never starts remote/DB work. A fresh
+            // process explicitly reports unreconciled, never prior HTTP success.
+            return { activationId, status: dedicatedStopped ? 'stopped' : activationConfirmed && dedicatedStarted ? 'active' : activationFailed ? 'retained' : dedicatedEnrollment ? 'reconciling' : 'reconciliation_required',
+                durableStatus: dedicatedResult ? (bootstrapOperationId ? 'bootstrap_operation_settled' : 'enrollment_reconciled') : 'unreconciled',
+                ...(bootstrapOperationId ? { operationId: bootstrapOperationId } : {}),
+                nodes: dedicatedResult?.nodes ?? [] };
+        },
+        async enrollTestOwners({ resumeOnly = false } = {}) {
+            if (typeof topologyDeploymentService?.enrollTestOwners !== 'function') throw new Error('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED');
+            if (!dedicatedActivation) return topologyDeploymentService.enrollTestOwners();
+            if (dedicatedStopped) throw new Error('TEST_OWNER_STARTUP_MODE_CONFLICT');
+            dedicatedEnrollment ??= Promise.resolve().then(async () => {
+                try {
+                    const result = await topologyDeploymentService.enrollTestOwners({ resumeOnly, onReconciled: result => {
+                        dedicatedResult = result;
+                        if (!dedicatedStopped && !dedicatedStarted) startConsumers();
+                    } });
+                    if (!dedicatedResult) throw new Error('TEST_RECONCILIATION_CALLBACK_REQUIRED');
+                    activationConfirmed = true;
+                    return result;
+                } catch (error) {
+                    activationFailed = true;
+                    await Promise.allSettled([Promise.resolve().then(() => topologyRecoveryLifecycle?.stop()),
+                        Promise.resolve().then(() => executionRuntime.stop())]);
+                    dedicatedStarted = false;
+                    throw error;
+                }
+            });
+            return dedicatedEnrollment;
+        },
+        enrollProductionOwners() {
+            if (dedicatedStarted || dedicatedStopped || executionContext?.target !== 'production'
+                || typeof topologyDeploymentService?.enrollProductionOwners !== 'function') throw new Error('PRODUCTION_OWNER_ENTRY_UNPROVEN');
+            return topologyDeploymentService.enrollProductionOwners();
+        },
+        handbackProductionOwners(acceptedCurrent) {
+            if (!dedicatedStopped || executionContext?.target !== 'production'
+                || typeof topologyDeploymentService?.handbackProductionOwners !== 'function') throw new Error('PRODUCTION_OWNER_ENTRY_UNPROVEN');
+            return topologyDeploymentService.handbackProductionOwners(acceptedCurrent);
         },
         repository,
         loadPanelOverview,
         stateManagementService: executionRuntime.runtime.stateManagementService,
         runtime: executionRuntime.runtime,
         start() {
-            const executionState = executionRuntime.start();
-            topologyRecoveryLifecycle?.start();
-            return executionState;
+            if (dedicatedActivation && !dedicatedStarted) return { enabled: true, running: false, activationRequired: true };
+            return startConsumers();
         },
         async stop() {
+            dedicatedStopped = true;
             // Fence BOTH schedules before waiting for either remote invocation.
             // A failing lifecycle must not abandon the other dependency drain.
             const stop = lifecycle => {
                 try { return lifecycle?.stop(); }
                 catch (error) { return Promise.reject(error); }
             };
-            const [recovery, execution] = await Promise.allSettled([
-                stop(topologyRecoveryLifecycle), stop(executionRuntime),
-            ]);
+            const drains = Promise.allSettled([stop(topologyRecoveryLifecycle), stop(executionRuntime)]);
+            if (dedicatedEnrollment) await dedicatedEnrollment.catch(() => {});
+            const [recovery, execution] = await drains;
             if (recovery.status === 'rejected') throw recovery.reason;
             if (execution.status === 'rejected') throw execution.reason;
-            return recovery.value?.drainUncertain === true
+            return recovery.value?.drainUncertain === true || (bootstrapOperationId && activationFailed)
                 ? { ...execution.value, drainUncertain: true }
                 : execution.value;
         },

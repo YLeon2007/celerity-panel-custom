@@ -199,6 +199,7 @@ const l2tpOperationSchema = new mongoose.Schema({
     backupId: { type: String, default: '', trim: true },
     errorCode: { type: String, default: '', trim: true },
     errorMessage: { type: String, default: '' },
+    restoredRollback: { type: mongoose.Schema.Types.Mixed, default: undefined },
     requestedBy: { type: String, default: '', trim: true },
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },

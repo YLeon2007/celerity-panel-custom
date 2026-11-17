@@ -2,6 +2,7 @@
 
 const { selectExecutionContext } = require('../domain/l2tpExecutionAuthorization');
 const { ownedIngressRouteState } = require('./topologyAttachIngressGate');
+const { installedPrimaryReserve } = require('../domain/primaryReservePolicy');
 
 const { createL2tpNodeTransportResolver } = require('./l2tpNodeTransportFactory');
 const { L2tpNodeExecutionResolver } = require('./l2tpNodeExecutionResolver');
@@ -58,8 +59,24 @@ function classifyStagedRelays(nodes, topology) {
     const noPortalInput = singlePortal === 0 && portalNumbers.size === 0;
     const sourceLessSuffix = noPortalInput && defaultBridge === 1;
     const relayOnlyFragment = noPortalInput && defaultBridge === 0 && geoBridgeNumbers.size === 0;
+    // A lone geo outlet gets the display ref "bridge", but is not a default
+    // exit. Prove the exact P->R->geo-B fragment from pinned descriptors, not
+    // that label. It grants NO legacy absent-state skip: every relay still
+    // requires its persisted absent/installed credential and user checks.
+    const geoOnlyPrefix = hasPortalInput && singlePortal === 1 && relayNumbers.size === 1
+        && defaultBridge === 1 && geoBridgeNumbers.size === 0
+        && topology?.nodes?.length === 3 && topology.links?.length === 2
+        && new Set(topology.nodes.map(node => node.id)).size === 3
+        && topology.nodes.every(node => nodes.filter(entry => id(entry.node) === node.id && entry.role === node.role).length === 1)
+        && topology.links.every(link => ['forward', 'reverse'].includes(link.mode))
+        && topology.links.filter(link => topology.nodes.some(node => node.id === link.source && node.role === 'portal')
+            && topology.nodes.some(node => node.id === link.target && node.role === 'relay')
+            && link.geo !== true && link.geoRouting?.enabled !== true).length === 1
+        && topology.links.filter(link => topology.nodes.some(node => node.id === link.source && node.role === 'relay')
+            && topology.nodes.some(node => node.id === link.target && node.role === 'bridge')
+            && (link.geo === true || link.geoRouting?.enabled === true)).length === 1;
     if (relayNumbers.size === 0 || !(hasPortalInput && defaultBridge === 0
-        || sourceLessSuffix || relayOnlyFragment)) return null;
+        || sourceLessSuffix || relayOnlyFragment || geoOnlyPrefix)) return null;
     for (let number = 1; number <= portalNumbers.size; number += 1) {
         if (!portalNumbers.has(number)) return null;
     }
@@ -88,7 +105,59 @@ function classifyStagedRelays(nodes, topology) {
     // for portal traffic, but every installed relay still needs its ordinary
     // credential/user/node readback. Only a bridge-less prefix has a terminal
     // relay at which legacy absent PPP can be explicitly recorded as skipped.
-    return { terminalRelayRef: sourceLessSuffix ? null : `relay-${relayNumbers.size}` };
+    return { terminalRelayRef: sourceLessSuffix || geoOnlyPrefix ? null : `relay-${relayNumbers.size}` };
+}
+
+// A selected component may contain unrelated portal exits. Its display refs
+// are not the installed PPP owner's path, nor authority to skip any relay.
+function classifyOwnedPathRelays(plan) {
+    const topology = plan.effectiveTopology;
+    if (!Array.isArray(topology?.nodes) || !Array.isArray(topology.links)
+        || !Array.isArray(topology.groups) || !Array.isArray(plan.newPathLinkIds)) return null;
+    const nodes = new Map(topology.nodes.map(node => [node.id, node.role]));
+    const links = new Map(topology.links.map(link => [link.id, link]));
+    // A native DELETE also verifies the cleaned profile of an endpoint that
+    // no longer belongs to the effective graph. Only the exact removed edge's
+    // baseline endpoint may be absent; unrelated/foreign plan nodes still fail.
+    const cleanedEndpoint = node => plan.kind === 'link.delete'
+        && !nodes.has(id(node.node))
+        && plan.baselineTopology?.nodes?.filter(before => before.id === id(node.node)
+            && before.role === node.role).length === 1
+        && plan.baselineTopology?.links?.some(link => link.id === plan.linkId
+            && [link.source, link.target].includes(id(node.node)))
+        && !topology.links.some(link => [link.source, link.target].includes(id(node.node)));
+    const owner = plan.nodes.find(node => id(node.node) === plan.ownerNodeId && node.role === 'relay');
+    if (nodes.size !== topology.nodes.length || links.size !== topology.links.length
+        || nodes.get(plan.ownerNodeId) !== 'relay'
+            && !(plan.newPathLinkIds.length === 0 && owner && cleanedEndpoint(owner))
+        || new Set(plan.newPathLinkIds).size !== plan.newPathLinkIds.length
+        || plan.nodes.some(node => nodes.get(id(node.node)) !== node.role && !cleanedEndpoint(node))) return null;
+    const groups = topology.groups.filter(group => id(group._id ?? group.id) === plan.groupId);
+    const policy = installedPrimaryReserve(topology, plan.installedPath);
+    const paths = groups.length === 1 && Array.isArray(groups[0].paths)
+        ? groups[0].paths.filter(path => path.pathKey === (policy ? policy.selected?.path.pathKey : plan.pathKey)) : [];
+    if (policy && !policy.selected ? plan.newPathLinkIds.length !== 0
+        : paths.length !== 1 || paths[0].enabled === false
+            || JSON.stringify(paths[0].linkIds) !== JSON.stringify(plan.newPathLinkIds)) return null;
+    let cursor = null, crossesOwner = false;
+    const visited = new Set();
+    for (const linkId of plan.newPathLinkIds) {
+        const link = links.get(linkId);
+        if (!link || link.geo === true || link.geoRouting?.enabled === true
+            || !['forward', 'reverse'].includes(link.mode)
+            || !nodes.has(link.target) || !['portal', 'relay'].includes(nodes.get(link.source))
+            || cursor !== null && cursor !== link.source || visited.has(link.target)
+            || link.source === link.target
+            || cursor === null && link.source !== plan.ownerNodeId && nodes.get(link.source) !== 'portal') return null;
+        visited.add(link.source); visited.add(link.target);
+        crossesOwner ||= link.source === plan.ownerNodeId;
+        cursor = link.target;
+    }
+    if (plan.newPathLinkIds.length === 0) {
+        if (plan.routeState !== 'no_bridge_exit') return null;
+        return { terminalRelayRef: null };
+    }
+    return crossesOwner && nodes.get(cursor) === 'bridge' ? { terminalRelayRef: null } : null;
 }
 
 class TopologyPppReadinessGate {
@@ -114,14 +183,19 @@ class TopologyPppReadinessGate {
         try {
             if (!Array.isArray(plan?.nodes)) return failed(0);
             const ownerBound = plan.ownerCredentialRevision !== undefined;
-            const blocked = plan.routeState === 'no_bridge_exit';
+            const blocked = ownerBound ? ownedIngressRouteState(plan) === 'no_bridge_exit'
+                : plan.routeState === 'no_bridge_exit';
             // Route incompleteness is independent of PPP installation. Ordinary
             // non-PPP prefixes have no installed group/owner to bind; each relay
             // still passes its persisted user/operation/credential fences below.
             if (ownerBound && (!ownedIngressRouteState(plan)
                 || !Number.isSafeInteger(plan.ownerCredentialRevision) || plan.ownerCredentialRevision < 1
                 || !Number.isSafeInteger(plan.ownerTopologyRevision) || plan.ownerTopologyRevision < 0)) return failed(0);
-            const stagedRelays = plan.staged === true ? classifyStagedRelays(plan.nodes, plan.effectiveTopology) : null;
+            const ownedRelays = ownerBound ? classifyOwnedPathRelays(plan) : null;
+            if (ownerBound && !ownedRelays) return failed(0);
+            const stagedRelays = plan.staged === true
+                ? ownerBound ? ownedRelays : classifyStagedRelays(plan.nodes, plan.effectiveTopology)
+                : null;
             if (plan.staged === true && !stagedRelays && !(blocked && ownerBound)) return failed(0);
             const terminalRelayRef = stagedRelays?.terminalRelayRef;
             for (const node of plan.nodes) {

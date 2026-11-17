@@ -5,6 +5,9 @@ const { common, immutable } = require('./topologyExecutionBindingContract');
 // attestation for first provisioning. It is never inferred from a missing row.
 const schema = new mongoose.Schema({ ...common(),
     provisioningReceipt: { type: mongoose.Schema.Types.Mixed, immutable: true },
+    // Initial enrollment/boot remain immutable. Only the repository's held,
+    // pristine TEST reconciliation can append a separately audited live boot.
+    pristineBootResume: { type: mongoose.Schema.Types.Mixed, immutable: true },
 }, { strict: 'throw', versionKey: false });
 schema.index({ nodeId: 1, targetProfile: 1 }, { unique: true });
 schema.index({ 'nodeIdentity.machineId': 1, targetProfile: 1 }, { unique: true });

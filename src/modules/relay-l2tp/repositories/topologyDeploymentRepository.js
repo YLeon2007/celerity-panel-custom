@@ -6,7 +6,9 @@ const { validTerminalReceipt, UUID } = require('../models/topologyExecutionBindi
 const { durableSelectedTopology, selectedAdmissionFingerprint } = require('./topologyOperationRepository');
 const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { linkDesiredVersion } = require('../services/topologyIntentService');
+const { nodeActivation: normalizeNodeActivation, nodeDesiredVersion } = require('../services/topologyNodeActivation');
 const { verifyImportedProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
+const { primaryReservePolicies } = require('../domain/primaryReservePolicy');
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
 const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -75,8 +77,40 @@ function componentAt(snapshot, nodeId) {
         groups: snapshot.groups.filter(group => groups.has(group._id)) };
 }
 
+function validateEmptyCancelledBootstrap({ operation: op, owner, binding: b, enrollment: e, node, profile, executionContext }) {
+    const c = op?.bootstrapCancellation;
+    if (executionContext?.target !== 'test' || executionContext.hostIdentity !== 'test.infograd.online'
+        || op?.status !== 'failed' || op.heldTopologyAdmission !== false || op.attempts !== 1
+        || op.admissionScope !== 'selected' || op.v2Terminal !== undefined
+        || c?.kind !== 'uncommitted-prepare-validation-cancelled' || !EMPTY_CONFIG_HASHES.has(owner.originalSnapshot.configSha256)
+        || owner.legacyAppliedTopology !== undefined || hasTargetPin(owner)
+        || !matchesTopologyExecutionContext(op.executionContext, executionContext)
+        || !['nodes','links','groups'].every(k => Array.isArray(op.baselineTopology?.[k]) && op.baselineTopology[k].length === 0)
+        || op.admissionFingerprint !== selectedAdmissionFingerprint(op)
+        || !op.selectedOwnerPins?.some(p => p.node === node && p.profile === profile && p.generation === owner.generation
+            && same(p.nodeIdentity, plain(owner.nodeIdentity)) && same(p.originalSnapshot, plain(owner.originalSnapshot))
+            && same(p.adoptionReceipt, plain(owner.adoptionReceipt)))) throw selectedError('TOPOLOGY_CANCELLED_BASELINE_UNPROVEN');
+    const summaries = c.bindings?.filter(x => x.nodeId === node), proofs = c.proofs?.filter(p => p.nodeId === node);
+    const entries = op.nodes?.filter(n => String(n.node) === node && n.targetProfile === profile);
+    if (summaries?.length !== 1 || proofs?.length !== 1 || entries?.length !== 1
+        || !b || !e || String(b._id) !== String(summaries[0].id) || b.operationId !== String(op._id)
+        || !['failed','pending'].includes(entries[0].state) || b.nodeId !== node || b.targetProfile !== profile
+        || b.executionContext !== executionContext.hostIdentity || b.attempt !== 1 || b.owner !== op.leaseOwner
+        || b.ownerGeneration !== owner.generation || b.predecessorGeneration !== 'none'
+        || b.topologyRevision !== owner.lastSettledRevision || b.topologyRevision !== op.topologyRevision
+        || b.generation !== owner.lastSettledGeneration || b.commandIds?.close !== owner.lastSettledCloseId
+        || b.generation !== summaries[0].generation || b.commandIds.close !== summaries[0].closeId
+        || b.candidateHash !== 'sha256:' + entries[0].candidateHash
+        || String(e._id) !== String(b.enrollmentId) || e.nodeId !== node || e.targetProfile !== profile
+        || e.ownerGeneration !== owner.generation || e.executionContext !== executionContext.hostIdentity
+        || require('./topologyExecutionBindingStore').enrollmentRuntimeBootId(e) !== b.bootId
+        || !same(b.nodeIdentity, plain(owner.nodeIdentity)) || !same(e.nodeIdentity, b.nodeIdentity) || !same(e.endpoint, b.endpoint)
+        || !validTerminalReceipt(proofs[0], b) || proofs[0].terminalOutcome !== 'cancelled') throw selectedError('TOPOLOGY_CANCELLED_BASELINE_UNPROVEN');
+    return true;
+}
+
 class TopologyDeploymentRepository {
-    constructor({ snapshotReader, CascadeTopologyState, TopologyOperation, TopologyConfigOwner, NodeOperationLock, RemoteAdmission, transactionRunner } = {}) {
+    constructor({ snapshotReader, CascadeTopologyState, TopologyOperation, TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment, NodeOperationLock, RemoteAdmission, transactionRunner } = {}) {
         if (!snapshotReader || typeof snapshotReader.readDraft !== 'function') {
             throw new TypeError('Topology deployment repository requires snapshotReader.readDraft');
         }
@@ -94,6 +128,8 @@ class TopologyDeploymentRepository {
         this.transactionRunner = runTransaction;
         this.TopologyOperation = TopologyOperation;
         this.TopologyConfigOwner = TopologyConfigOwner;
+        this.TopologyExecutionBinding = TopologyExecutionBinding;
+        this.TopologyExecutionEnrollment = TopologyExecutionEnrollment;
         this.NodeOperationLock = NodeOperationLock;
         this.RemoteAdmission = RemoteAdmission;
         this.db = CascadeTopologyState.db;
@@ -112,7 +148,9 @@ class TopologyDeploymentRepository {
             .select(`${LINK_METADATA_SELECT} tunnelUuid active name priority lifecycle`), session).lean();
         const target = linkRows.find(row => String(row._id) === scope.linkId);
         if (!target) throw selectedError('CASCADE_LINK_NOT_FOUND');
-        const version = linkDesiredVersion(target);
+        const activation = scope.nodeActivation === undefined ? undefined : normalizeNodeActivation(scope.nodeActivation);
+        if (activation && scope.kind !== 'link.apply') throw selectedError('INVALID_TOPOLOGY_INTENT');
+        const version = activation ? nodeDesiredVersion(nodeRows.find(row => String(row._id) === activation.nodeId), activation) : linkDesiredVersion(target);
         if (desiredVersion !== undefined && desiredVersion !== version) throw selectedError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
         if (scope.kind === 'link.apply' && target.lifecycle?.state === 'deleting') throw selectedError('CASCADE_LINK_DELETING');
         if (deleteJobId !== undefined && (scope.kind !== 'link.delete' || target.lifecycle?.state !== 'deleting'
@@ -128,10 +166,10 @@ class TopologyDeploymentRepository {
                 delete fields.__v; delete fields.createdAt; delete fields.updatedAt;
                 return { ...fields, id: String(_id), source: String(portalNode), target: String(bridgeNode) };
             }),
-            groups: [], // Only settled policies may be preserved by a link apply.
+            groups: [], // Hydrate only the requested desired link, never peers.
         });
         const catalog = await withSession(this.TopologyConfigOwner.find({}).select(OWNER_TARGET_SELECT), session).lean();
-        const resources = new Set([String(target.portalNode), String(target.bridgeNode)]);
+        const resources = new Set(activation ? [activation.nodeId] : [String(target.portalNode), String(target.bridgeNode)]);
         for (const row of catalog) {
             if (row.lastSettledOperation !== undefined || !Array.isArray(row.legacyAppliedTopology?.links)) continue;
             const old = row.legacyAppliedTopology.links.find(link => link.id === scope.linkId);
@@ -149,10 +187,18 @@ class TopologyDeploymentRepository {
                 resources.add(old.source); resources.add(old.target);
             }
         }
+        const verified = await this.readVerifiedBaseline({ snapshot, executionContext, session, desiredTopology, resources, catalog });
+        return this.selectFromVerifiedBaseline({ ...verified, snapshot, executionContext, session, desiredTopology, scope, activation, version });
+    }
+
+    // Shared read-only applied contract. No desired overlay, admission or proof
+    // policy is performed here; all original baseline checks remain identical.
+    async readVerifiedBaseline({ snapshot, executionContext, session, desiredTopology, resources, catalog }) {
         const baseline = { nodes: [], links: [], groups: [] };
         const visited = new Set();
         const owners = new Map();
         const settledProfiles = new Map();
+        const recoveredFull = new Map();
         const initialImportedGroups = new Map();
         const add = topology => {
             for (const kind of ['nodes', 'links', 'groups']) for (const value of topology[kind]) {
@@ -239,12 +285,38 @@ class TopologyDeploymentRepository {
             }
             const operation = await withSession(this.TopologyOperation.findById(owner.lastSettledOperation)
                 .select(SELECTED_FIELDS), session).lean();
+            if (operation?.bootstrapCancellation !== undefined) {
+                if (this.TopologyExecutionBinding?.db !== this.db || this.TopologyExecutionEnrollment?.db !== this.db) throw selectedError('TOPOLOGY_CANCELLED_BASELINE_UNPROVEN');
+                const summaries = operation.bootstrapCancellation.bindings?.filter(x => x.nodeId === node);
+                if (summaries?.length !== 1) throw selectedError('TOPOLOGY_CANCELLED_BASELINE_UNPROVEN');
+                const binding = await withSession(this.TopologyExecutionBinding.findById(summaries[0].id), session).lean();
+                const enrollment = binding && await withSession(this.TopologyExecutionEnrollment.findById(binding.enrollmentId), session).lean();
+                validateEmptyCancelledBootstrap({ operation, owner, binding, enrollment, node, profile, executionContext });
+                // Terminal cancellation supplies successor-fence provenance, NOT
+                // an applied graph or a committed candidate. Preserve the exact
+                // originally adopted empty baseline and every historical pointer.
+                continue;
+            }
+            let recovered = recoveredFull.get(String(operation?._id));
+            if (!recovered && operation?.kind === 'domain.reconcile' && operation.admissionScope === undefined
+                && operation.effectiveTopology === undefined) {
+                const binding = operation.v2Terminal?.bindings?.find(row => row.nodeId === node);
+                const predecessors = binding && await withSession(this.TopologyOperation.find({ admissionScope: 'selected',
+                    'v2Terminal.bindings': { $elemMatch: { nodeId: node, generation: binding.predecessorGeneration } } })
+                    .select(SELECTED_FIELDS), session).lean();
+                if (predecessors?.length !== 1) throw selectedError();
+                const predecessor = predecessors[0];
+                const topology = require('../services/topologySettledFullReconcile').recoverSettledFullReconcile({
+                    operation, predecessor, owners: catalog, groups: snapshot.groups });
+                recovered = { topology, pins: predecessor.selectedOwnerPins };
+                recoveredFull.set(String(operation._id), recovered);
+            }
             if (!operation || operation.status !== 'succeeded' || operation.heldTopologyAdmission !== false
-                || operation.admissionScope !== 'selected'
                 || !matchesTopologyExecutionContext(operation.executionContext, executionContext)
                 || owner.lastSettledRevision !== operation.topologyRevision
-                || operation.admissionFingerprint !== selectedAdmissionFingerprint(operation)
-                || !operation.selectedOwnerPins?.some(pin => pin.node === node && pin.profile === profile
+                || !recovered && (operation.admissionScope !== 'selected'
+                    || operation.admissionFingerprint !== selectedAdmissionFingerprint(operation))
+                || !(recovered?.pins || operation.selectedOwnerPins)?.some(pin => pin.node === node && pin.profile === profile
                     && pin.generation === owner.generation && same(pin.nodeIdentity, plain(owner.nodeIdentity))
                     && same(pin.originalSnapshot, plain(owner.originalSnapshot))
                     && same(pin.adoptionReceipt, plain(owner.adoptionReceipt))
@@ -269,14 +341,14 @@ class TopologyDeploymentRepository {
                     || binding.operationId !== String(operation._id) || binding.targetProfile !== profile
                     || binding.candidateHash !== `sha256:${entry.candidateHash}` || binding.backupId !== entry.backupId
                     || binding.executionContext !== executionContext.hostIdentity || binding.owner !== operation.leaseOwner
-                    || binding.attempt !== operation.attempts || binding.topologyRevision !== operation.topologyRevision
+                    || binding.attempt !== require('./topologyRetainedVerifyContinuation').originalExecutionAttempt(operation) || binding.topologyRevision !== operation.topologyRevision
                     || binding.priorDeployedRevision !== operation.priorDeployedRevision
                     || binding.generation !== owner.lastSettledGeneration
                     || binding.commandIds?.close !== owner.lastSettledCloseId
                     || !same(binding.profileTargetPin, owner.profileTargetPin)
                     || !validTerminalReceipt(proof, binding) || proof.terminalOutcome !== 'verified') throw selectedError();
             } else if (hasTargetPin(owner) || executionContext.target !== 'test') throw selectedError();
-            const settled = durableSelectedTopology(operation.effectiveTopology);
+            const settled = durableSelectedTopology(recovered?.topology || operation.effectiveTopology);
             const component = componentAt(settled, node);
             // A cleaned detached endpoint is absent from effectiveTopology but
             // its verified candidate remains the current physical profile. Keep
@@ -310,15 +382,31 @@ class TopologyDeploymentRepository {
                 continue;
             }
             const source = await withSession(this.TopologyOperation.findById(owner.lastSettledOperation).select(SELECTED_FIELDS), session).lean();
-            const component = componentAt(durableSelectedTopology(source.effectiveTopology), node.id);
+            const component = componentAt(durableSelectedTopology(recoveredFull.get(String(source._id))?.topology || source.effectiveTopology), node.id);
             if (component.nodes.some(member => owners.get(member.id)?.lastSettledOperation !== owner.lastSettledOperation)) throw selectedError();
         }
         // Apply current bytes only after each component member's independent
         // owner/settlement/terminal checks above. Imported originals remain
         // immutable historical handback evidence, never current readback.
         for (const node of baseline.nodes) if (settledProfiles.has(node.id)) node.profileConfig = settledProfiles.get(node.id);
+        return { baseline, owners, initialImportedGroups };
+    }
+
+    async selectFromVerifiedBaseline({ baseline, owners, initialImportedGroups, snapshot, executionContext, session, desiredTopology, scope, activation, version }) {
+        const verifiedBaselineGroups = plain(baseline.groups);
+        const policyLinks = [...baseline.links.filter(link => link.id !== scope.linkId), ...desiredTopology.links];
+        const policyGroups = scope.kind === 'link.apply' && !activation ? require('../domain/topologyDraft').projectGroups(snapshot?.groups)
+            .filter(group => group.paths.some(path => path.linkIds.includes(scope.linkId))
+                && group.paths.every(path => path.linkIds.every(id => policyLinks.some(link => link.id === id)))) : [];
+        // Refuse duplicate/missing current imported groups with the established
+        // publication code before generic selected-topology normalization runs.
+        for (const id of initialImportedGroups.keys()) if ((snapshot.groups || [])
+            .filter(group => String(group._id ?? group.id) === id).length !== 1) {
+            throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+        }
         let selected = require('../services/topologyOperationCoordinator').selectEffectiveTopology({
-            verifiedBaselineTopology: baseline, desiredTopology, scope,
+            verifiedBaselineTopology: baseline,
+            desiredTopology: { ...desiredTopology, links: policyLinks, groups: policyGroups }, scope,
         });
         const installed = (snapshot?.installedRouteOwners || []).filter(owner => selected.resourceNodeIds.includes(String(owner.nodeId))
             || initialImportedGroups.has(String(owner.groupId)));
@@ -349,7 +437,9 @@ class TopologyDeploymentRepository {
             if (groups.length !== 1 || !same(groups[0], imported.group)) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
             importedGroup = imported.group;
         }
-        if (installed.length) {
+        // Security activation changes no installed path/policy or PPP metadata.
+        // Keep verified applied groups; do not consume saved desired group edits.
+        if (installed.length && !activation) {
             if (installed.length !== 1) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_OWNER_AMBIGUOUS');
             const owner = installed[0];
             if (!owner.pathKey || !Number.isSafeInteger(owner.ownerTopologyRevision)
@@ -358,7 +448,13 @@ class TopologyDeploymentRepository {
                 .find(row => row._id === String(owner.groupId));
             if (!group || new Set(group.paths.map(path => path.pathKey)).size !== group.paths.length) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
             const oldPath = group.paths.find(path => path.pathKey === owner.pathKey);
-            if (oldPath?.enabled === false) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+            const leafDeletion = scope.kind === 'link.delete'
+                ? require('../domain/primaryReservePolicy').selectedReserveLeafDeletion(
+                    { ...baseline, groups: verifiedBaselineGroups }, group, owner, scope.linkId) : null;
+            const policyGroup = leafDeletion ? leafDeletion.appliedGroup : group;
+            const policy = primaryReservePolicies({ ...selected.effectiveTopology, groups: [policyGroup] })
+                .find(policy => policy.source === String(owner.nodeId));
+            if (oldPath?.enabled === false && !policy) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
             const oldPathLinkIds = oldPath?.linkIds || [];
             const effective = plain(selected.effectiveTopology), before = plain(selected.baselineTopology);
             const ownerNode = effective.nodes.find(node => node.id === String(owner.nodeId))
@@ -367,7 +463,7 @@ class TopologyDeploymentRepository {
             if (!effective.nodes.some(node => node.id === ownerNode.id)) effective.nodes.push(ownerNode);
             // All nonempty members must come from the verified applied graph,
             // never mutable desired. Empty owned/peer paths carry no edge authority.
-            if (group.paths.some(path => path.linkIds.some(id => !baseline.links.some(link => link.id === id)))) throw selectedError();
+            if (policyGroup.paths.some(path => path.linkIds.some(id => !(policy ? effective : baseline).links.some(link => link.id === id)))) throw selectedError();
             let cursor = String(owner.nodeId);
             const visited = new Set(), path = [];
             while (!visited.has(cursor)) {
@@ -377,32 +473,68 @@ class TopologyDeploymentRepository {
                 path.push(outgoing[0].id); cursor = outgoing[0].target;
             }
             const complete = (effective.nodes.find(node => node.id === cursor) || baseline.nodes.find(node => node.id === cursor))?.role === 'bridge';
-            const newPathLinkIds = complete ? path : [];
+            const newPathLinkIds = policy ? policy.selected?.path.linkIds || [] : complete ? path : [];
             // An explicit APPLY can extend a valid incomplete prefix too. Keep
             // its installed path empty/blocked until a real bridge suffix exists;
             // frozen candidate + MAIN/PPP proofs still precede publication.
-            const proposed = plain(group);
+            const proposed = plain(policyGroup);
             const owned = proposed.paths.find(path => path.pathKey === owner.pathKey);
-            if (owned) owned.linkIds = newPathLinkIds;
-            else proposed.paths.push({ pathKey: owner.pathKey, linkIds: newPathLinkIds, priority: 1, enabled: true });
-            before.groups = [...before.groups.filter(row => row._id !== group._id), group];
+            if (owned && !policy) owned.linkIds = newPathLinkIds;
+            else if (!owned) proposed.paths.push({ pathKey: owner.pathKey, linkIds: newPathLinkIds, priority: 1, enabled: true });
+
+            before.groups = [...before.groups.filter(row => row._id !== group._id),
+                policy ? verifiedBaselineGroups.find(row => row._id === group._id) || group : group];
             effective.groups = [...effective.groups.filter(row => row._id !== group._id), proposed];
             selected = { ...selected, baselineTopology: before, effectiveTopology: effective,
                 installedPath: { groupId: group._id, pathKey: owner.pathKey, ownerNodeId: String(owner.nodeId),
                     ownerTopologyRevision: owner.ownerTopologyRevision, ownerCredentialRevision: owner.ownerCredentialRevision,
                     oldPathLinkIds, newPathLinkIds, groupBefore: group,
+                    ...(policy ? { preserveGroupPaths: true, selectedPathKey: policy.selected?.path.pathKey ?? null } : {}),
                     kind: scope.kind === 'link.apply' && oldPathLinkIds.length === 0 ? 'link.attach' : scope.kind },
-                routeState: complete ? selected.routeState : 'no_bridge_exit' };
+                routeState: (policy ? Boolean(policy.selected) : complete) ? selected.routeState : 'no_bridge_exit' };
         }
         const selectedOwnerPins = [...owners.values()].filter(owner => selected.resourceNodeIds.includes(String(owner.node)))
             .sort((a, b) => String(a.node).localeCompare(String(b.node), 'en')).map(ownerPin);
+        if (activation && !selectedOwnerPins.some(pin => pin.node === activation.nodeId && pin.profile === activation.targetProfile)) {
+            throw selectedError('TOPOLOGY_PROFILE_TARGET_INVALID');
+        }
         try {
             assertSelectedProfileTargets({ ...selected, executionContext, admissionScope: 'selected', kind: scope.kind,
                 linkId: scope.linkId, linkIds: selected.effectiveTopology.links.map(link => link.id), selectedOwnerPins,
                 nodes: selectedOwnerPins.filter(hasTargetPin).map(owner => ({ node: owner.node, role: owner.profileTargetPin.role,
                     targetProfile: owner.profile, profileTargetPin: owner.profileTargetPin })) });
         } catch { throw selectedError('TOPOLOGY_SELECTED_PIN_CHANGED'); }
-        return { ...selected, desiredVersion: version, selectedOwnerPins };
+        return { ...selected, desiredVersion: version, selectedOwnerPins, verifiedBaselineGroups };
+    }
+
+    // Publication is independent of selectedDesiredVersion: saved-only edits do
+    // not withdraw a still-trusted applied profile. The client-proof reader and
+    // its desired-version guard are deliberately NOT used or changed.
+    async readAppliedNodePublication({ nodeIds, executionContext } = {}) {
+        executionContext = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        if (!executionContext || !this.selectedEnabled || !Array.isArray(nodeIds)
+            || nodeIds.some(id => typeof id !== 'string' || !/^[a-f0-9]{24}$/.test(id))) throw selectedError();
+        return this.transactionRunner(async session => {
+            const catalog = await withSession(this.TopologyConfigOwner.find({}).select(OWNER_TARGET_SELECT), session).lean();
+            const resources = new Set(nodeIds.filter(id => catalog.some(row => String(row.node) === id
+                && row.owner === 'topology' && (row.lastSettledOperation !== undefined || row.legacyAppliedTopology !== undefined))));
+            if (!resources.size) return { nodes: [], version: null };
+            const snapshot = await this.snapshotReader.readDraft(session);
+            const rows = await withSession(this.snapshotReader.HyNode.find({ type: 'xray', active: true,
+                cascadeRole: { $in: ['portal', 'relay', 'bridge'] } }).select('type active cascadeRole'), session).lean();
+            const { baseline, owners } = await this.readVerifiedBaseline({ snapshot, executionContext, session, catalog, resources,
+                desiredTopology: { nodes: rows.map(row => ({ id: String(row._id), role: row.cascadeRole })) } });
+            const nodes = baseline.nodes.filter(node => nodeIds.includes(node.id)).map(node => ({
+                nodeId: node.id, ip: node.ip, domain: node.domain, sni: node.sni, port: node.port, xray: plain(node.xray || {}),
+                ...(typeof node.profileConfig === 'string' ? { candidateHash: createHash('sha256').update(node.profileConfig).digest('hex') } : {}),
+            }));
+            // These pointers change atomically in the existing settled publication
+            // transition. A pre-settlement renderer cannot poison its successor's
+            // cache key, and no separate proof store or invalidation authority exists.
+            const version = createHash('sha256').update(JSON.stringify([...owners.values()]
+                .sort((a, b) => String(a.node).localeCompare(String(b.node), 'en')).map(ownerPin))).digest('hex');
+            return { nodes, version };
+        });
     }
 
     async isSelectedCurrent(operation) {
@@ -416,18 +548,53 @@ class TopologyDeploymentRepository {
                 || owner.generation !== pin.generation || !same(plain(owner.nodeIdentity), pin.nodeIdentity)) return false;
         }
         const link = await this.snapshotReader.CascadeLink.findById(operation.linkId).lean();
-        return Boolean(link && linkDesiredVersion(link) === operation.desiredVersion);
+        return Boolean(link && await require('../services/topologyNodeActivation').selectedDesiredVersion(this.snapshotReader, link, operation.nodeActivation) === operation.desiredVersion);
     }
 
     async verifySelected(operation, session) {
         if (operation.admissionFingerprint !== selectedAdmissionFingerprint(operation)) throw selectedError('TOPOLOGY_SELECTED_FINGERPRINT_CHANGED');
-        const fresh = await this.readSelected({ snapshot: await this.snapshotReader.readDraft(session),
-            scope: { kind: operation.kind === 'link.delete' ? 'link.delete' : 'link.apply', linkId: operation.linkId }, executionContext: operation.executionContext,
-            desiredVersion: operation.desiredVersion, deleteJobId: operation.deleteJobId, session });
+        const fresh = await (operation.kind === 'domain.reconcile' ? this.readIngressPreparation({ snapshot: await this.snapshotReader.readDraft(session),
+            scope: { kind: operation.kind, linkId: operation.linkId, linkIds: operation.linkIds }, executionContext: operation.executionContext,
+            desiredVersion: operation.desiredVersion, session }) : this.readSelected({ snapshot: await this.snapshotReader.readDraft(session),
+            scope: { kind: operation.kind === 'link.delete' ? 'link.delete' : 'link.apply', linkId: operation.linkId,
+                ...(operation.nodeActivation ? { nodeActivation: operation.nodeActivation } : {}) }, executionContext: operation.executionContext,
+            desiredVersion: operation.desiredVersion, deleteJobId: operation.deleteJobId, session }));
         for (const key of ['baselineTopology', 'effectiveTopology', 'resourceNodeIds', 'selectedOwnerPins', 'desiredVersion', 'installedPath']) {
             if (!same(fresh[key], operation[key])) throw selectedError('TOPOLOGY_SELECTED_PIN_CHANGED');
         }
         return fresh;
+    }
+
+    // A settled native component may acquire an already-persisted G/K ingress
+    // before L2TP's node lock is taken. This is an ordinary topology-owned
+    // descriptor transition, not classic access to SIDECAR and not an installed
+    // path cutover. Links/endpoints/modes and existing policies cannot change.
+    async readIngressPreparation({ snapshot, scope, executionContext, session, desiredVersion }) {
+        const selected = await this.readSelected({ snapshot, scope: { kind: 'link.apply', linkId: scope.linkId },
+            executionContext, session, desiredVersion });
+        const before = selected.baselineTopology, after = selected.effectiveTopology;
+        const canonical = links => [...links].sort((a, b) => a.id.localeCompare(b.id, 'en'));
+        if (selected.selectedOwnerPins.some(hasTargetPin)
+            || !same(canonical(before.links), canonical(after.links))
+            || scope.linkIds.length !== before.links.length
+            || before.links.some(link => !scope.linkIds.includes(link.id))) throw selectedError('TOPOLOGY_INGRESS_PREPARATION_CHANGED');
+        const groups = require('../domain/topologyDraft').projectGroups(snapshot.groups)
+            .filter(group => group.paths.some(path => path.linkIds.some(id => scope.linkIds.includes(id))));
+        if (groups.some(group => group.paths.some(path => path.linkIds.some(id => !scope.linkIds.includes(id))))) {
+            throw selectedError('TOPOLOGY_INGRESS_PREPARATION_CHANGED');
+        }
+        // readSelected may derive a future installed-path switch. Preparation
+        // never publishes that switch and must preserve the exact desired path.
+        if (selected.installedPath && !same(selected.installedPath.oldPathLinkIds, selected.installedPath.newPathLinkIds)) {
+            throw selectedError('TOPOLOGY_INGRESS_PREPARATION_CHANGED');
+        }
+        const existing = selected.verifiedBaselineGroups;
+        if (!Array.isArray(existing) || existing.some(group => !groups.some(row => same(row, group)))) {
+            throw selectedError('TOPOLOGY_INGRESS_PREPARATION_CHANGED');
+        }
+        const baselineTopology = { ...before, groups: existing };
+        const effectiveTopology = { ...after, groups };
+        return { ...selected, baselineTopology, effectiveTopology, installedPath: undefined };
     }
 
     async assertSelectedAvailable(resourceNodeIds, session, exceptOperationId, { desiredOnly = false } = {}) {
@@ -596,6 +763,7 @@ class TopologyDeploymentRepository {
 }
 
 module.exports = {
+    validateEmptyCancelledBootstrap,
     TOPOLOGY_STATE_SELECT,
     TopologyDeploymentRepository,
     TopologyDeploymentRepositoryError,

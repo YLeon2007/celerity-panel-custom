@@ -81,6 +81,14 @@ class TopologyOperationFinalizer {
         this.clock = clock;
     }
 
+    finalizeBootstrapCancellation(input) {
+        return this.repository.finalizeBootstrapCancellation({ ...input, now: this.clock.now() });
+    }
+
+    finalizeUndispatchedPreparation(input) {
+        return this.repository.finalizeUndispatchedPreparation({ ...input, now: this.clock.now() });
+    }
+
     async rejectUndispatchedSelected(input) {
         assertFinalizationInput(input);
         return this.repository.rejectUndispatchedSelected({ ...input, now: this.clock.now() });

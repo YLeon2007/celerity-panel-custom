@@ -30,12 +30,13 @@ function delay(ms) {
 }
 
 class TopologyUserResync {
-    constructor({ HyNode, syncService, logger, sleep, attempts, retryDelayMs, restrictedRunner = false } = {}) {
+    constructor({ HyNode, syncService, logger, sleep, attempts, retryDelayMs, restrictedRunner = false, preferBoundRunner = false } = {}) {
         if (!HyNode || typeof HyNode.findById !== 'function') {
             throw new TypeError('TopologyUserResync requires HyNode.findById');
         }
         this.HyNode = HyNode;
         this.restrictedRunner = restrictedRunner === true;
+        this.preferBoundRunner = preferBoundRunner === true;
         this._syncService = syncService;
         this.logger = logger || defaultLogger();
         this.sleep = typeof sleep === 'function' ? sleep : delay;
@@ -68,7 +69,7 @@ class TopologyUserResync {
         return ids;
     }
 
-    async resyncPlan(plan) {
+    async resyncPlan(plan, { readRestored = false } = {}) {
         // Topology operations are deploy-only: undeploy goes through the
         // legacy cascadeService path and never creates a topology operation,
         // so every plan reaching the worker is a deploy.
@@ -97,7 +98,17 @@ class TopologyUserResync {
             if (node.type !== 'xray') {
                 continue;
             }
-            if (this.restrictedRunner) {
+            const preferredUsers = this.preferBoundRunner ? await syncService._getUsersForNode(node) : undefined;
+            if (this.preferBoundRunner && !Array.isArray(preferredUsers)) {
+                failedUsers.push({ node: id, userId: null, reason: 'USER_SNAPSHOT_UNPROVEN' });
+                continue;
+            }
+            // Dedicated native TEST has no unfenced config-persisting agent.
+            // Nonempty assignments must use the existing held runner scope;
+            // missing scope never falls back to the legacy agent. Empty TEST
+            // assignments retain their previous zero-action behavior. The
+            // independently restricted production empty guard is unchanged.
+            if (this.restrictedRunner || this.preferBoundRunner && preferredUsers.length > 0) {
                 try {
                     const { topologyReadinessProfile, invokeTopologyReadiness } = require('./topologyReadinessScope');
                     // Only xray-main was restarted with a clientless candidate.
@@ -110,8 +121,8 @@ class TopologyUserResync {
                             .sort((a, b) => String(a.email).localeCompare(String(b.email)));
                     };
                     const users = snapshot(await syncService._getUsersForNode(node));
-                    const restored = await invokeTopologyReadiness(id, 'restore-users', users);
-                    if (restored?.ok !== true || restored.code !== 'XRAY_USERS_RESTORED' || restored.userCount !== users.length
+                    const restored = await invokeTopologyReadiness(id, readRestored ? 'read-restored-users' : 'restore-users', users);
+                    if (restored?.ok !== true || restored.code !== (readRestored ? 'XRAY_USERS_VERIFIED' : 'XRAY_USERS_RESTORED') || restored.userCount !== users.length
                         || JSON.stringify(snapshot(await syncService._getUsersForNode(node))) !== JSON.stringify(users)) {
                         throw new Error('User restoration unconfirmed');
                     }
@@ -120,6 +131,18 @@ class TopologyUserResync {
                     // No retries or legacy HTTP fallback after an uncertain RPC.
                     failedUsers.push({ node: id, userId: null, reason: 'RESTRICTED_USER_RESTORE_UNCONFIRMED' });
                 }
+                continue;
+            }
+            if (readRestored) {
+                // Dedicated TEST uses preferBoundRunner, not restrictedRunner.
+                // A bridge-profile candidate never restarted MAIN users. Its
+                // zero-assignment branch needs no restoration or user RPC.
+                if (this.preferBoundRunner) {
+                    try {
+                        if (require('./topologyReadinessScope').topologyReadinessProfile(id) === 'xray-bridge') continue;
+                    } catch { /* Missing held scope remains unproven. */ }
+                }
+                failedUsers.push({ node: id, userId: null, reason: 'RETAINED_USER_READBACK_SCOPE_REQUIRED' });
                 continue;
             }
             nodeCount += 1;

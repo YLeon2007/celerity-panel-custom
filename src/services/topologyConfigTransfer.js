@@ -199,8 +199,38 @@ function legacyProfileArtifacts(input, nodeId) {
         }
         generated.push(relay);
     } else {
-        generated.push(JSON.parse(generator.generateCombinedBridgeConfig(incoming)));
-        if (incoming.length === 1) generated.push(JSON.parse(generator.generateBridgeConfig(incoming[0], incoming[0].portalNode)));
+        const combined = JSON.parse(generator.generateCombinedBridgeConfig(incoming));
+        generated.push(combined);
+        // The scoped classic writer seeds the idle bridge with the generated
+        // global safety tail, then inserts tunnel rules before geoip:private
+        // (cascadeService, bootstrap composition). This leaves the IPv6 guard
+        // FIRST, unlike the full generator. Recognize that exact writer output,
+        // not arbitrary observed rule permutations or a desired-as-applied map.
+        const scoped = structuredClone(combined);
+        const tunnelRules = scoped.routing.rules.filter(row => row.domain || row.inboundTag);
+        scoped.routing.rules = scoped.routing.rules.filter(row => !row.domain && !row.inboundTag);
+        const privateGuard = scoped.routing.rules.findIndex(row => row.ip?.includes('geoip:private'));
+        scoped.routing.rules.splice(privateGuard < 0 ? scoped.routing.rules.length : privateGuard, 0, ...tunnelRules);
+        generated.push(scoped);
+        if (incoming.length === 1) {
+            const single = JSON.parse(generator.generateBridgeConfig(incoming[0], incoming[0].portalNode));
+            generated.push(single);
+            // Existing classic shared-profile writes preserve the historical
+            // generic bridge/tunnel tag pair with the combined writer's guard
+            // order. Accept only that exact single-link alias, not arbitrary
+            // tag/rule normalization or a rearrangement of observed globals.
+            const generic = JSON.parse(generator.generateCombinedBridgeConfig(incoming));
+            const suffix = incoming[0].id.slice(-8);
+            const aliases = new Map([[`bridge-${suffix}`,'bridge'],[`tunnel-${suffix}`,'tunnel']]);
+            const alias = tag => aliases.get(tag) || tag;
+            generic.reverse.bridges.forEach(row => { row.tag = alias(row.tag); });
+            generic.outbounds.forEach(row => { row.tag = alias(row.tag); });
+            generic.routing.rules.forEach(row => {
+                if (row.outboundTag) row.outboundTag = alias(row.outboundTag);
+                if (row.inboundTag) row.inboundTag = row.inboundTag.map(alias);
+            });
+            generated.push(generic);
+        }
     }
     const reserved = forward || topology.groups.length ? /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-)/
         : /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-in-)/;
@@ -322,7 +352,7 @@ class TopologyConfigTransfer {
         const nextOwner = action === 'adopt' ? 'topology' : 'classic';
         const query = { node, profile, executionContext: this.executionContext,
             owner: action === 'adopt' ? 'classic' : 'topology', generation };
-        const row = await this.Model.findOne(query).read('primary').readConcern('majority').maxTimeMS(5000).lean();
+        const row = await this.Model.findOne(query, '+executionEnrollment').read('primary').readConcern('majority').maxTimeMS(5000).lean();
         if (!row || !/^[a-f0-9]{32}$/.test(row.nodeIdentity?.machineId)
             || !/^[a-f0-9]{64}$/.test(row.nodeIdentity?.sshHostKeySha256)) {
             throw failure('CONFIG_OWNERSHIP_CONFLICT');
@@ -364,13 +394,21 @@ class TopologyConfigTransfer {
                     owner: nextOwner, generation: binding.nextGeneration, originalSnapshot: readback,
                     adoptionReceipt: receipt, legacyAppliedTopology: legacy,
                 }) : undefined;
+            const reentry = action === 'adopt' && this.executionContext === PROD && row.handbackReceipt !== undefined;
+            const executionEnrollment = reentry ? { kind: 'public-handback-reentry-v1',
+                previousAdoptionReceipt: row.adoptionReceipt, previousHandbackReceipt: row.handbackReceipt,
+                ...(row.executionEnrollment?.enrollment === undefined ? {} : { previousEnrollment: row.executionEnrollment.enrollment }) } : undefined;
             // External verification/remote reads NEVER run inside Mongo retry.
             await this.Model.db.transaction(async session => {
                 if (!scopeOpen) throw failure('CONFIG_TRANSFER_PROOF_INVALID');
                 const fence = { ...query, nodeIdentity: row.nodeIdentity,
-                    ...(action === 'handback' ? { originalSnapshot: row.originalSnapshot, adoptionReceipt: row.adoptionReceipt } : {}) };
+                    ...(action === 'handback' || reentry ? { originalSnapshot: row.originalSnapshot, adoptionReceipt: row.adoptionReceipt } : {}),
+                    ...(reentry ? { handbackReceipt: row.handbackReceipt } : {}),
+                    ...(reentry || row.executionEnrollment !== undefined
+                        ? { executionEnrollment: row.executionEnrollment ?? { $exists: false } } : {}) };
                 const fields = action === 'adopt'
                     ? { originalSnapshot: readback, adoptionReceipt: receipt,
+                        ...(reentry ? { executionEnrollment } : {}),
                         ...(legacy === undefined ? {} : { legacyAppliedTopology: legacy }),
                         ...(profileTargetPin === undefined ? {} : { profileTargetPin }) }
                     : { handbackReceipt: receipt };

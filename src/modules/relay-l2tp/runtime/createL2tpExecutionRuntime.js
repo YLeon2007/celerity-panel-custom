@@ -251,6 +251,7 @@ function createL2tpExecutionRuntime({
     createWorkerLifecycle = createL2tpWorkerLifecycle,
     topologyIngressGate,
     topologyPppReadinessGate,
+    prepareTopologyIngress,
 } = {}) {
     const authorization = Object.freeze({
         executionContext: selectExecutionContext(runtimeDependencies?.executionContext),
@@ -412,6 +413,14 @@ function createL2tpExecutionRuntime({
         userManagementService,
         lockService,
     });
+    runtime.service.reconcileRestoredInstall = operationId => remoteAdmissionRepository.reconcileRestoredFailedInstall({
+        operationId, executionContext: authorization.executionContext,
+        verifyRestored: operation => candidateService.verifyRestoredInstall(operation),
+    });
+    runtime.service.normalizeMainIngress = require('../services/l2tpMainNormalization').createL2tpMainNormalizer({
+        authorization, RelayL2tpState, CascadeRouteGroup, CascadeLink, CascadeTopologyState,
+        L2tpOperation: operationModel, remoteAdmissionRepository, lockService, candidateService, transportResolver, clock,
+    });
     const simpleService = new L2tpSimpleService({
         HyNode,
         RelayL2tpState,
@@ -436,6 +445,7 @@ function createL2tpExecutionRuntime({
         secretKey,
         topologyIngressGate,
         topologyPppReadinessGate,
+        prepareTopologyIngress,
     });
     Object.defineProperty(runtime, 'simpleService', {
         value: simpleService,

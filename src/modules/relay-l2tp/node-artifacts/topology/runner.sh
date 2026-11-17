@@ -139,7 +139,7 @@ def readiness_checks(token, boot, safe, command):
     if base64.urlsafe_b64encode(raw).decode().rstrip('=') != token:
         refuse('INVALID_READINESS', 64)
     value = json.loads(raw, object_pairs_hook=unique)
-    if command == 'restore-users':
+    if command in ('restore-users', 'read-restored-users'):
         if (not isinstance(value, dict) or set(value) != {'bootId', 'snapshotSha256', 'userCount'}
                 or value['bootId'] != boot or not isinstance(value['snapshotSha256'], str)
                 or not re.fullmatch(r'[a-f0-9]{64}', value['snapshotSha256'])
@@ -182,7 +182,7 @@ def verify_ppp(root, value, lock):
     return actual
 
 
-def restore_users(root, value, binding, lock):
+def restore_users(root, value, binding, lock, read_only=False):
     # Runtime-only VLESS user RPC, never config replacement or agent resurrection.
     if binding['targetProfile'] != 'xray-main':
         refuse('USER_PROFILE_UNCHANGED', 64)
@@ -218,8 +218,19 @@ def restore_users(root, value, binding, lock):
             or not any(rule.get('inboundTag') == ['API_INBOUND'] and rule.get('outboundTag') == 'API'
                        for rule in config.get('routing', {}).get('rules', []))):
         refuse('USER_API_UNAVAILABLE')
-    # Nonempty static tunnel clients are never selected as subscription inbounds.
-    targets = [i for i in config['inbounds'] if i.get('protocol') == 'vless' and i.get('settings', {}).get('clients') == []]
+    # Imported classic subscription clients can already be static in the frozen
+    # candidate. Only exact assigned UUID/email pairs qualify; nonempty tunnel
+    # clients (no subscription email) and foreign/mismatched users stay excluded.
+    assigned = {user['email']: user['id'] for user in users}
+    def subscription_inbound(inbound):
+        if inbound.get('protocol') != 'vless':
+            return False
+        clients = inbound.get('settings', {}).get('clients')
+        return isinstance(clients, list) and all(
+            isinstance(client, dict) and client.get('email') in assigned
+            and client.get('id') == assigned[client['email']]
+            and client.get('level', 0) == 0 for client in clients)
+    targets = [inbound for inbound in config['inbounds'] if subscription_inbound(inbound)]
     if not 1 <= len(targets) <= 64 or len({i.get('tag') for i in targets}) != len(targets):
         refuse('USER_INBOUNDS_UNAVAILABLE')
     expected_by_tag = {}
@@ -230,9 +241,13 @@ def restore_users(root, value, binding, lock):
             refuse('USER_INBOUNDS_UNAVAILABLE')
         stream = inbound.get('streamSettings', {})
         flow = 'xtls-rprx-vision' if stream.get('security') in ('tls', 'reality') and stream.get('network', 'tcp') in ('tcp', 'raw') else ''
-        clients = [dict(user, level=0, flow=flow) for user in users]
+        static_emails = {client['email'] for client in inbound['settings']['clients']}
+        clients = [dict(user, level=0, flow=flow) for user in users if user['email'] not in static_emails]
         expected_by_tag[tag] = {user['email']: (user['id'], flow) for user in users}
-        rpc_inbounds.append(dict(inbound, settings=dict(inbound['settings'], clients=clients)))
+        # A candidate restart already materializes its static clients. Do not
+        # re-add them (duplicate AddUser RPC), or rewrite the frozen candidate.
+        if clients:
+            rpc_inbounds.append(dict(inbound, settings=dict(inbound['settings'], clients=clients)))
     executable = root + '/usr/local/bin/xray'
     server = '--server=127.0.0.1:' + str(api[0]['port'])
     deadline = __import__('time').monotonic() + 30
@@ -248,7 +263,8 @@ def restore_users(root, value, binding, lock):
         return result.stdout
     # adu can exit zero on partial RPC errors: NEVER accept exit zero alone.
     # Authoritative readback below compares exact UUID/email/flow for every tag.
-    rpc(['adu', server, '/dev/stdin'], json.dumps(dict(inbounds=rpc_inbounds)).encode())
+    if not read_only and rpc_inbounds:
+        rpc(['adu', server, '/dev/stdin'], json.dumps(dict(inbounds=rpc_inbounds)).encode())
     for tag, expected in expected_by_tag.items():
         response = json.loads(rpc(['inbounduser', server, '-tag=' + tag]), object_pairs_hook=unique)
         if not isinstance(response, dict) or set(response) != {'users'} or not isinstance(response['users'], list):
@@ -265,7 +281,7 @@ def restore_users(root, value, binding, lock):
             actual[user.get('email')] = (account.get('id'), account.get('flow', ''))
         if actual != expected:
             refuse('USER_RPC_UNCONFIRMED')
-    return dict(ok=True, code='XRAY_USERS_RESTORED', userCount=len(users), inboundCount=len(targets))
+    return dict(ok=True, code='XRAY_USERS_VERIFIED' if read_only else 'XRAY_USERS_RESTORED', userCount=len(users), inboundCount=len(targets))
 
 
 def main():
@@ -276,7 +292,7 @@ def main():
         refuse('FENCE_REQUIRED', 64)
     request = dict(zip(names + ['checks'], args[1::2]))
     command = request['command']
-    if command not in ('prepare', 'commit', 'verify', 'rollback', 'close', 'status', 'verify-ppp-users', 'restore-users'):
+    if command not in ('prepare', 'commit', 'verify', 'rollback', 'close', 'status', 'verify-ppp-users', 'restore-users', 'read-restored-users', 'observe-verify'):
         refuse('UNSUPPORTED_FENCED_COMMAND', 64)
     safe = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
     for key in ('operation-id', 'node-id', 'backup-id', 'attempt-id', 'generation', 'predecessor-generation', 'command-id'):
@@ -286,7 +302,7 @@ def main():
         refuse('INVALID_IDENTITY', 65)
     if request['target-profile'] not in ('xray-main', 'xray-bridge') or request['execution-context'] not in ('test.infograd.online', 'lm1.infograd.online'):
         refuse('INVALID_EXECUTION_CONTEXT', 65)
-    if ('checks' in request) != (command in ('verify', 'verify-ppp-users', 'restore-users')):
+    if ('checks' in request) != (command in ('verify', 'verify-ppp-users', 'restore-users', 'read-restored-users', 'observe-verify')):
         refuse('INVALID_ARGUMENTS', 64)
     root = os.environ.get('CELERITY_TOPOLOGY_ROOT', '')
     if root and (not root.startswith('/') or root == '/' or any(p in ('.', '..', '') for p in root.split('/')[1:])):
@@ -367,6 +383,33 @@ def main():
             refuse('UNKNOWN_COMMAND_OUTCOME')
         print(json.dumps(dict(record['receipt'], command='status'), separators=(',', ':')))
         return
+    if command == 'read-restored-users':
+        # Present-tense RPC readback under the exact retained generation. The
+        # completed restore ID is read, never dispatched/replaced/re-journaled.
+        if (binding['executionContext'] != 'test.infograd.online' or binding['targetProfile'] != 'xray-main'
+                or current is None or journal['head'] != generation or current['phase'] != 'verified'
+                or any(r.get('state') != 'completed' for r in current['commands'].values())):
+            refuse('RESTORED_USERS_UNPROVEN')
+        verified = [key for key, r in current['commands'].items() if r.get('command') == 'verify']
+        if len(verified) != 1 or command_id != hashlib.sha256(('topology-readiness-v1:restore-users:' + verified[0]).encode()).hexdigest():
+            refuse('RESTORED_USERS_UNPROVEN')
+        checks, checks_hash = readiness_checks(request['checks'], boot, safe, command)
+        original = current['commands'].get(command_id, {})
+        receipt = original.get('receipt', {})
+        expected = dict(command='restore-users', **binding, commandId=command_id, protocolVersion=2,
+                        completion='completed', phase='verified', ownershipRetained=True,
+                        bootId=boot, checksSha256=checks_hash)
+        result = receipt.get('result', {})
+        if (original.get('command') != 'restore-users' or original.get('state') != 'completed'
+                or set(receipt) != set(expected) | {'result'} or any(receipt.get(k) != v for k, v in expected.items())
+                or result.get('ok') is not True or result.get('code') != 'XRAY_USERS_RESTORED'
+                or result.get('userCount') != checks['userCount']):
+            refuse('RESTORED_USERS_UNPROVEN')
+        actual = restore_users(root, checks, binding, lock, read_only=True)
+        if actual['inboundCount'] != result.get('inboundCount'):
+            refuse('RESTORED_USERS_UNPROVEN')
+        print(json.dumps(dict(expected, command=command, result=actual), separators=(',', ':')))
+        return
     if current is not None and current['phase'] == 'closed':
         refuse('GENERATION_CLOSED')
     if any(command_id in record['commands'] for record in generations.values()):
@@ -386,7 +429,94 @@ def main():
         journal['head'] = generation
     if journal['head'] != generation:
         refuse('STALE_GENERATION')
-    if any(r['state'] != 'completed' for r in current['commands'].values()):
+    if command == 'observe-verify':
+        # A new present-tense observation, NOT replay/completion of the old
+        # verification. No activation payload or rollback is reachable here.
+        if binding['executionContext'] != 'test.infograd.online' or current['phase'] != 'verify-running':
+            refuse('VERIFY_OBSERVATION_UNPROVEN')
+        token = request['checks']
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,8192}', token):
+            refuse('VERIFY_OBSERVATION_UNPROVEN')
+        raw = base64.b64decode(token + '=' * (-len(token) % 4), altchars=b'-_', validate=True)
+        value = json.loads(raw, object_pairs_hook=unique)
+        if (base64.urlsafe_b64encode(raw).decode().rstrip('=') != token or not isinstance(value, dict)
+                or set(value) != {'bootId', 'originalVerifyId', 'prepareId', 'commitId', 'checks'}
+                or value['bootId'] != boot or not isinstance(value['checks'], list) or len(value['checks']) > 64
+                or any(not isinstance(value[k], str) or not safe.fullmatch(value[k]) for k in ('originalVerifyId', 'prepareId', 'commitId'))
+                or command_id != hashlib.sha256(('topology-retained-verify-v1:' + value['originalVerifyId']).encode()).hexdigest()):
+            refuse('VERIFY_OBSERVATION_UNPROVEN')
+        old_id = value['originalVerifyId']
+        if (current['commands'].get(old_id) != dict(command='verify', state='running')
+                or set(current['commands']) != {old_id, value['prepareId'], value['commitId']}):
+            refuse('VERIFY_OBSERVATION_UNPROVEN')
+        for label, phase in [('prepare', 'prepared'), ('commit', 'committed')]:
+            identifier = value[label + 'Id']; record = current['commands'].get(identifier, {})
+            receipt = record.get('receipt', {})
+            if (record.get('state') != 'completed' or record.get('command') != label
+                    or any(receipt.get(k) != v for k, v in binding.items())
+                    or any(receipt.get(k) != v for k, v in dict(ok=True, command=label, commandId=identifier,
+                        completedCommand=label, phase=phase, completion='completed', protocolVersion=2, bootId=boot).items())):
+                refuse('VERIFY_OBSERVATION_UNPROVEN')
+        config = root + '/usr/local/etc/' + ('xray' if binding['targetProfile'] == 'xray-main' else 'xray-bridge') + '/config.json'
+        backup = state + '/backups/' + binding['backupId'] + '/' + binding['targetProfile']
+        operation = state + '/operations/' + binding['operationId'] + '/' + binding['targetProfile']
+        metadata = ''.join(k + '=' + binding[k] + '\n' for k in ('operationId', 'nodeId', 'candidateHash', 'backupId', 'targetProfile')).encode()
+        if any(profile_bytes(p + '/receipt.fields') != metadata for p in (operation, backup)):
+            refuse('VERIFY_METADATA_CHANGED')
+        if ('sha256:' + hashlib.sha256(profile_bytes(config) or b'').hexdigest() != binding['candidateHash']
+                or profile_bytes(operation + '/candidate.json') != profile_bytes(config)):
+            refuse('VERIFY_ACTIVE_CANDIDATE_CHANGED')
+        peer = root + '/usr/local/etc/' + ('xray-bridge' if binding['targetProfile'] == 'xray-main' else 'xray') + '/config.json'
+        if profile_bytes(peer) != checked_peer_snapshot(backup):
+            refuse('PEER_PROFILE_CHANGED')
+        service = 'xray.service' if binding['targetProfile'] == 'xray-main' else 'xray-bridge.service'
+        for check in value['checks']:
+            if not isinstance(check, dict):
+                refuse('VERIFY_OBSERVATION_UNPROVEN')
+            if check.get('type') == 'service':
+                if check != dict(type='service', serviceUnit=service, expectedState='active'):
+                    refuse('VERIFY_OBSERVATION_UNPROVEN')
+            elif check.get('type') == 'port':
+                if (set(check) != {'type', 'port', 'protocol', 'expectedState'} or type(check['port']) is not int
+                        or not 1 <= check['port'] <= 65535 or check['protocol'] != 'tcp' or check['expectedState'] != 'listening'):
+                    refuse('VERIFY_OBSERVATION_UNPROVEN')
+                p = subprocess.run([root + '/usr/bin/ss', '-H', '-ltn', 'sport = :' + str(check['port'])],
+                                   capture_output=True, pass_fds=(lock,), timeout=10)
+                if p.returncode or p.stderr or not p.stdout.strip():
+                    refuse('VERIFY_LISTENER_UNPROVEN')
+            else:
+                refuse('VERIFY_OBSERVATION_UNPROVEN')
+        # The original prepare tested these exact candidate bytes. Test the
+        # active bytes again using ordinary Xray validation, never run/restart.
+        p = subprocess.run([root + '/usr/local/bin/xray', 'run', '-test', '-config', config],
+                           env={'PATH':'/usr/bin:/bin', 'XRAY_LOCATION_ASSET':root + '/usr/local/share/xray'},
+                           capture_output=True, pass_fds=(lock,), timeout=20)
+        if p.returncode:
+            refuse('VERIFY_ACTIVE_CANDIDATE_INVALID')
+        p = subprocess.run([root + '/usr/bin/systemctl', 'show', '--property=Job', '--property=ActiveState', '--property=SubState', '--', service],
+                           capture_output=True, pass_fds=(lock,), timeout=10)
+        if p.returncode or p.stderr or set(p.stdout.decode().splitlines()) != {'Job=', 'ActiveState=active', 'SubState=running'}:
+            refuse('SYSTEMD_COMPLETION_UNPROVEN')
+        if profile_bytes(peer) != checked_peer_snapshot(backup) or 'sha256:' + hashlib.sha256(profile_bytes(config) or b'').hexdigest() != binding['candidateHash']:
+            refuse('VERIFY_ACTIVE_CANDIDATE_CHANGED')
+        receipt = dict(ok=True, command=command, **binding, commandId=command_id, protocolVersion=2,
+                       completion='completed', phase='verified', terminal=False, ownershipRetained=True,
+                       terminalOutcome='not-terminal', bootId=boot, systemdJob='completed', serviceState='active:running',
+                       completedCommand=command, originalVerifyId=old_id, commitId=value['commitId'],
+                       checksSha256=hashlib.sha256(raw).hexdigest(),
+                       journalBeforeSha256=hashlib.sha256(profile_bytes(journal_path)).hexdigest())
+        current['commands'][command_id] = dict(command=command, state='completed', receipt=receipt)
+        current['verifyObservation'] = command_id
+        current['phase'] = 'verified'; current['serviceState'] = 'active:running'
+        durable(fence, journal)
+        print(json.dumps(receipt, separators=(',', ':')))
+        return
+    observation = current['commands'].get(current.get('verifyObservation'), {}).get('receipt', {})
+    observed_old = observation.get('originalVerifyId') if (
+        observation.get('command') == 'observe-verify' and observation.get('phase') == 'verified'
+        and observation.get('bootId') == boot and all(observation.get(k) == v for k, v in binding.items())
+        and current['phase'] == 'verified' and command in ('close', 'verify-ppp-users', 'restore-users')) else None
+    if any(r['state'] != 'completed' and not (k == observed_old and r == dict(command='verify', state='running')) for k, r in current['commands'].items()):
         refuse('UNKNOWN_COMMAND_OUTCOME')
     if command in ('verify-ppp-users', 'restore-users'):
         if current['phase'] != 'verified':

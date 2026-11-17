@@ -36,6 +36,7 @@ function fixture(options = {}) {
     const db = { async transaction(work) { options.beforeTransaction?.({ rows, state, count: ++transactions }); return work({ fixture: true }); } };
     const models = {};
     for (const [name, data] of Object.entries(rows)) models[name] = { db,
+        findById: id => query(() => data.find(row => row._id === String(id))),
         find: filter => query(() => data.filter(row => match(row, filter))),
         exists: filter => query(() => data.some(row => match(row, filter))),
         async create() {}, async updateOne(filter, update) {

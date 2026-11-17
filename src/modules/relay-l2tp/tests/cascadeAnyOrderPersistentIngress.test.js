@@ -59,6 +59,9 @@ for (const modes of [['reverse', 'reverse', 'reverse', 'reverse'], ['forward', '
             const installedListener = ingress(configs(plan).get('r1'))[0];
             const peer = structuredClone(before.groups[0].paths[1]);
             for (const removed of order) {
+                // Match the ordinary selected reader's preceding committed
+                // candidate, including exact domain-routing listener bytes.
+                for (const node of before.nodes) node.profileConfig = configs(plan).get(node.id);
                 const after = structuredClone(before);
                 after.links = after.links.filter(link => link.id !== removed);
                 after.groups[0].paths[0].linkIds = [];
@@ -74,7 +77,7 @@ for (const modes of [['reverse', 'reverse', 'reverse', 'reverse'], ['forward', '
                     assert.ok(geo.every(rule => rule.outboundTag !== 'block' && !rule.inboundTag.includes('cascade-mine')));
                 }
                 assert.deepEqual({ before, after }, saved);
-                before = after; // no invented profile readback: actual selected descriptors can omit it
+                before = after;
             }
         });
     }

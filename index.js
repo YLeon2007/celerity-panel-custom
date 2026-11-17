@@ -481,6 +481,7 @@ app.use('/api/nodes', requireAuth, nodesRoutes);
 app.use('/api/cascade/route-groups', requireAuth, cascadeRouteGroupsRoutes);
 app.use('/api/cascade/topology-transfer-drafts', topologyTransferDraftsRoutes);
 app.use('/api/cascade/topology', cascadeTopologyDeployRoutes);
+app.use('/api/cascade/topology-test', require('./src/routes/topologyTestActivation').createTopologyTestActivationRouter());
 app.use('/api/cascade', requireAuth, cascadeRoutes);
 app.use('/api/mcp', requireAuth, mcpRoutes);
 app.use('/api/groups', requireAuth, groupsRoutes);

@@ -63,6 +63,7 @@ test('assembled runtime binds the real worker claim to selected host despite lat
         dependencies.TopologyOperation.findOne = filter => {
             probes.push(filter);
             return {
+                select() { return this; },
                 read(value) { assert.equal(value, 'primary'); return this; },
                 readConcern(value) { assert.equal(value, 'majority'); return this; },
                 setOptions(value) {
@@ -92,7 +93,8 @@ test('assembled runtime binds the real worker claim to selected host despite lat
         } else {
             assert.deepEqual(probes, [{ _id: 'operation-1' }]);
             assert.deepEqual(result, { claimed: false, operationId: 'operation-1' });
-            assert.equal(calls.length, 2);
+            assert.equal(calls.length, 1, 'V2 null claim never reclaims a previous execution attempt');
+            assert.equal(calls[0].filter.attempts, 0);
             for (const { filter, options } of calls) {
                 assert.equal(filter['executionContext.target'], TEST.target);
                 assert.equal(filter['executionContext.hostIdentity'], TEST.hostIdentity);

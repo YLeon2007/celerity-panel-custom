@@ -585,7 +585,7 @@ test('PUT updates allowlisted settings through the versioned draft boundary with
                 geoip: ['private'],
             },
             autoRedeploy: true,
-            portalNode: 'attacker-controlled',
+            deployedRevision: 'attacker-controlled',
             createdAt: 'attacker-controlled',
         },
     });

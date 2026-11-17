@@ -212,6 +212,23 @@ function createMaterializer(rows = metadataRows()) {
     };
 }
 
+test('scoped ingress reconcile accepts an existing R-to-B component without inventing a portal', async () => {
+    const snapshot = pinnedSnapshot(), rows = metadataRows();
+    snapshot.topology.nodes = snapshot.topology.nodes.filter(n => n.role !== 'portal');
+    snapshot.topology.links = snapshot.topology.links.filter(l => l.id === 'relay-bridge');
+    snapshot.topology.groups[0].paths[0].linkIds = ['relay-bridge'];
+    rows.nodes = rows.nodes.filter(n => n.cascadeRole !== 'portal');
+    rows.links = rows.links.filter(l => l._id === 'relay-bridge');
+    snapshot.compiled = require('../domain/primaryReservePolicy').compileConfiguredTopology(snapshot.topology);
+    const { materializer } = createMaterializer(rows);
+    const result = await materializer.materialize({ target: 'test', hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+        operationKind: 'domain.reconcile', pinnedSnapshot: snapshot });
+    assert.equal(result.nodes.length, 2);
+    const relay = result.nodes.find(n => n.role === 'relay');
+    const config = JSON.parse(Buffer.from(relay.candidate.bytes).toString());
+    assert.ok(config.inbounds.some(n => n.tag === 'cascade-main' && n.protocol === 'socks'));
+});
+
 function createSessionReadModel(rows, label, events, { failSession, failRead, omitSession } = {}) {
     const calls = [];
     return {
@@ -263,7 +280,7 @@ function isDeepFrozen(value) {
     return Object.isFrozen(value) && Object.values(value).every(isDeepFrozen);
 }
 
-test('materializes the exact production pair through the real frozen plan composer', async () => {
+test('production and TEST keep identical data-plane candidates except the explicit TEST bridge management API', async () => {
     const { materializer } = createMaterializer();
     const productionPlan = await materializer.materialize({
         target: 'production', hostIdentity: 'lm1.infograd.online', pinnedSnapshot: pinnedSnapshot(),
@@ -272,7 +289,27 @@ test('materializes the exact production pair through the real frozen plan compos
         target: 'test', hostIdentity: 'test.infograd.online', pinnedSnapshot: pinnedSnapshot(),
     });
     assert.equal(isDeepFrozen(productionPlan), true);
-    assert.deepEqual(productionPlan, testPlan);
+    for (const production of productionPlan.nodes) {
+        const selected = testPlan.nodes.find(node => node.node === production.node);
+        const actual = JSON.parse(Buffer.from(selected.candidate.bytes));
+        const expected = JSON.parse(Buffer.from(production.candidate.bytes));
+        if (production.role === 'relay') {
+            const api = actual.inbounds.filter(inbound => inbound.tag === 'API_INBOUND');
+            assert.deepEqual(api, [{ listen: '127.0.0.1', port: 61003, protocol: 'dokodemo-door',
+                settings: { address: '127.0.0.1' }, tag: 'API_INBOUND' }]);
+            assert.deepEqual(actual.api, { services: ['HandlerService', 'StatsService'], tag: 'API' });
+            assert.deepEqual(actual.stats, {});
+            assert.deepEqual(actual.routing.rules.filter(rule => rule.outboundTag === 'API'),
+                [{ inboundTag: ['API_INBOUND'], outboundTag: 'API', type: 'field' }]);
+            actual.inbounds = actual.inbounds.filter(inbound => inbound.tag !== 'API_INBOUND');
+            actual.routing.rules = actual.routing.rules.filter(rule => rule.outboundTag !== 'API');
+            delete actual.api; delete actual.stats;
+        }
+        assert.deepEqual(actual, expected, 'management capability must not change data-plane policy or identities');
+        const { candidate: _pc, ...productionFields } = production;
+        const { candidate: _tc, ...testFields } = selected;
+        assert.deepEqual(testFields, productionFields);
+    }
 });
 
 test('materializes one deterministic frozen test plan from allowlisted snapshot reads', async () => {
@@ -302,7 +339,8 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
     const relay = JSON.parse(Buffer.from(plan.nodes[1].candidate.bytes).toString('utf8'));
     const bridge = JSON.parse(Buffer.from(plan.nodes[2].candidate.bytes).toString('utf8'));
     assert(portal.inbounds.some(inbound => inbound.tag === 'API_INBOUND'));
-    assert.equal(relay.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), false);
+    assert.deepEqual(relay.inbounds.filter(inbound => inbound.tag === 'API_INBOUND'),
+        [{ listen: '127.0.0.1', port: 61003, protocol: 'dokodemo-door', settings: { address: '127.0.0.1' }, tag: 'API_INBOUND' }]);
     assert.equal(bridge.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), false);
     // Route groups survive projection: the relay candidate carries a per-path
     // socks ingress for the enabled path routed through its downstream link.

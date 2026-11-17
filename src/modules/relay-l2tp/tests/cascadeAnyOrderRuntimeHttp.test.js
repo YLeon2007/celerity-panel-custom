@@ -22,6 +22,8 @@ test('default host publishes the SAME real selected service and DB-only joined r
         assert.equal(dependencies.prepareIngress, undefined, 'no remote preparation callback inside legacy consumer transaction');
         assert.equal(typeof host.readPublicOperation, 'function');
         assert.equal(typeof host.readLinkApplicationState, 'function');
+        assert.equal(typeof host.readAppliedNodePublication, 'function');
+        assert.deepEqual(await host.readAppliedNodePublication({ nodeIds: [] }), { nodes: [], version: null });
         assert.deepEqual(f.calls, []);
     } finally { await host.stop(); }
 });

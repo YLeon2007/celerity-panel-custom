@@ -79,7 +79,7 @@ test('worker requires and freezes an exact host-selected context; PROD cannot ac
         } else {
             assert.deepEqual(result, { claimed: false, operationId: 'operation-1' });
             assert.deepEqual(calls, [{ claim: { operationId: 'operation-1', executionContext: TEST,
-                owner: 'worker', leaseMs: 30000, now: NOW } }]);
+                owner: 'worker', leaseMs: 30000, now: NOW, preserveExecutionAttempt: false } }]);
         }
     }
 });

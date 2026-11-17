@@ -110,7 +110,8 @@ async function withHeldL2tpNodeConfigWrite({ lock: acquiredLock, lockService, cl
             throw Object.assign(failure('CLASSIC_CONFIG_WRITE_ADMISSION_UNCERTAIN'), { remoteOutcomeUncertain: true });
         }
     }
-    const scope = { active: true, uncertain: false, pending: 0, standaloneAdmissionId: admissionId, verify: async () => {
+    const scope = { active: true, uncertain: false, pending: 0, standaloneAdmissionId: admissionId,
+        operationId: lock.operationId, owner: lock.owner, verify: async () => {
         if (!scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
         if (admissionId !== undefined) {
             const admission = await admissionRepository.RemoteAdmission.findOne({ _id: admissionId })
@@ -151,7 +152,8 @@ async function assertHeldL2tpNodeConfigWrite(nodeId) {
     const scope = heldWrites.getStore()?.get(String(nodeId));
     if (!scope?.verify || !scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
     await scope.verify();
-    return Object.freeze({ standaloneAdmissionId: scope.standaloneAdmissionId });
+    return Object.freeze({ standaloneAdmissionId: scope.standaloneAdmissionId,
+        operationId: scope.operationId, owner: scope.owner });
 }
 
 async function assertClassicNodeConfigWriteHeld(nodeId) {

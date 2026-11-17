@@ -4,6 +4,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const QUEUE_ID = 'create-v1'; // One counter/order namespace for legacy and versioned intents.
 const INTENT_KINDS = new Set(['link.create', 'link.apply', 'link.delete']);
+const { nodeActivation: normalizeNodeActivation, selectedDesiredVersion } = require('./topologyNodeActivation');
 // Health, timestamps, lifecycle markers and applied proofs are not desired config.
 const DESIRED_LINK_FIELDS = Object.freeze(['name', 'mode', 'portalNode', 'bridgeNode',
     'tunnelUuid', 'tunnelPort', 'tunnelDomain', 'tunnelProtocol', 'tunnelSecurity', 'tunnelTransport',
@@ -71,7 +72,9 @@ function publicIntent(row) {
         ...(row.operationId ? { operationId: String(row.operationId), topologyRevision: row.topologyRevision } : {}),
         ...(row.createdLinkId ? { createdLinkId: String(row.createdLinkId) } : {}),
         ...(row.errorCode ? { errorCode: row.errorCode } : {}),
+        ...(row.unadmittedPreparation ? { unadmittedPreparation: row.unadmittedPreparation } : {}),
         ...(row.version === 2 ? { version: 2, kind: row.kind, linkId: String(row.linkId),
+            ...(row.nodeActivation ? { nodeActivation: row.nodeActivation } : {}),
             desiredVersion: row.desiredVersion, desiredSaved: true, phase: row.status === 'waiting' ? 'waiting' : row.status,
             ...(row.waitingReason ? { waitingReason: row.waitingReason } : {}) } : {}),
     };
@@ -107,6 +110,69 @@ class TopologyIntentService {
             'executionContext.target': this.#executionContext.target,
             'executionContext.hostIdentity': this.#executionContext.hostIdentity }).lean().then(publicIntent);
     }
+    async settleUnadmittedPreparation({ jobId, expectedTopologyRevision } = {}) {
+        const unproven = () => intentError('TOPOLOGY_INTENT_RECONCILIATION_UNPROVEN');
+        const { TopologyOperation, NodeOperationLock, intentOperationAdmission } = this.dependencies;
+        if (this.#executionContext.target !== 'test' || this.#executionContext.hostIdentity !== 'test.infograd.online'
+            || typeof jobId !== 'string' || !/^[a-f0-9]{24}$/.test(jobId) || !Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0
+            || TopologyOperation?.db !== this.CascadeTopologyState.db || NodeOperationLock?.db !== this.CascadeTopologyState.db
+            || intentOperationAdmission?.db !== this.CascadeTopologyState.db
+            || typeof intentOperationAdmission.inspectUnadmittedPreparation !== 'function') throw unproven();
+        await this.transactionRunner(async session => {
+            const row = await this.TopologyCreateIntent.findOne({ _id: jobId,
+                'executionContext.target': this.#executionContext.target,
+                'executionContext.hostIdentity': this.#executionContext.hostIdentity }).session(session).lean();
+            if (row?.status === 'failed' && ['INVALID_TOPOLOGY_DEPLOYMENT', 'TOPOLOGY_INTENT_PREPARE_FAILED'].includes(row.errorCode)
+                && row.unadmittedPreparation?.revision === expectedTopologyRevision) return;
+            if (!row || row.version !== 2 || row.kind !== 'link.apply' || row.status !== 'blocked'
+                || row.errorCode !== 'TOPOLOGY_INTENT_PREPARE_UNCERTAIN' || row.operationId || row.operationIdempotencyKey
+                || row.leaseOwner || row.leaseUntil || !Number.isSafeInteger(row.generation) || row.generation < 1
+                || row.acceptanceRevision !== expectedTopologyRevision || row.unadmittedPreparation) throw unproven();
+            // The consumer atomically binds the admitted operation to this job
+            // before any dispatch. Refuse ANY prior history of this new link;
+            // this is not recovery of a bound or potentially running command.
+            const lid = String(row.linkId);
+            if (await TopologyOperation.findOne({ $or: [{ linkId: lid }, { linkIds: lid },
+                { 'effectiveTopology.links.id': lid }, { 'baselineTopology.links.id': lid }] }).session(session).lean()
+                || await NodeOperationLock.findOne({ node: { $in: row.resourceNodeIds } }).session(session).lean()) throw unproven();
+            const stateFilter = { _id: 'singleton', revision: expectedTopologyRevision,
+                topologyAdmissionCount: 0, remoteAdmissionCount: 0,
+                replacementReservation: { $exists: false }, remoteDrain: { $exists: false } };
+            if (!await this.CascadeTopologyState.findOne(stateFilter).session(session).lean()) throw unproven();
+            const link = await this.CascadeLink.findById(row.linkId).session(session).lean();
+            if (!link || linkDesiredVersion(link) !== row.desiredVersion || link.lifecycle) throw unproven();
+            const observed = await intentOperationAdmission.inspectUnadmittedPreparation({ linkId: lid,
+                desiredVersion: row.desiredVersion, session });
+            // A corrected, never-admitted six-node first preparation can also
+            // be settled as failed. This is a fresh valid preflight, not a
+            // fabricated explanation of its historical unknown error.
+            const nowValid = observed?.status === 'valid' && row.attempts === 1 && row.generation === 1
+                && row.resourceNodeIds?.length === 6;
+            if ((!nowValid && (observed?.status !== 'refused' || observed.code !== 'INVALID_TOPOLOGY_DEPLOYMENT'
+                || observed.causeCode !== 'MULTIPLE_DEFAULT_EGRESS')) || observed.revision !== expectedTopologyRevision
+                || JSON.stringify(observed.resourceNodeIds) !== JSON.stringify(row.resourceNodeIds)) throw unproven();
+            const terminalCode = nowValid ? 'TOPOLOGY_INTENT_PREPARE_FAILED' : observed.code;
+            const proof = { originalErrorCode: row.errorCode, observedCauseCode: nowValid ? 'VALID_PREFLIGHT_NO_ADMISSION' : observed.causeCode,
+                revision: expectedTopologyRevision, generation: row.generation, confirmedAt: new Date() };
+            const updated = await this.TopologyCreateIntent.updateOne({ _id: row._id, status: row.status,
+                generation: row.generation, errorCode: row.errorCode, operationId: { $exists: false },
+                desiredVersion: row.desiredVersion }, { $set: { status: 'failed', errorCode: terminalCode,
+                    unadmittedPreparation: proof } }, { session });
+            if (updated.matchedCount !== 1) throw unproven();
+            const counter = await this.TopologyIntentQueueState.updateOne({ _id: QUEUE_ID, outstanding: { $gt: 0 } },
+                { $inc: { outstanding: -1 } }, { session });
+            const state = await this.CascadeTopologyState.updateOne(stateFilter,
+                { $inc: { stateTransitionRevision: 1 } }, { session });
+            if (counter.matchedCount !== 1 || state.matchedCount !== 1) throw unproven();
+        });
+        const confirmed = await this.TopologyCreateIntent.findOne({ _id: jobId,
+            'executionContext.target': this.#executionContext.target,
+            'executionContext.hostIdentity': this.#executionContext.hostIdentity })
+            .read('primary').readConcern('majority').maxTimeMS(5000).lean();
+        if (confirmed?.status !== 'failed' || !['INVALID_TOPOLOGY_DEPLOYMENT', 'TOPOLOGY_INTENT_PREPARE_FAILED'].includes(confirmed.errorCode)
+            || confirmed.unadmittedPreparation?.revision !== expectedTopologyRevision || confirmed.operationId) throw unproven();
+        return publicIntent(confirmed);
+    }
     accept(input = {}) {
         if (input.version === 2) return this.acceptVersioned(input);
         if (input.version !== undefined && input.version !== 1) return Promise.reject(intentError('INVALID_TOPOLOGY_INTENT_VERSION'));
@@ -116,8 +182,12 @@ class TopologyIntentService {
     // v2 create and explicit apply+changes accept normalized user fields BEFORE
     // credential generation. Ordinary apply/delete retain their content-pin API.
     // prepareLink is an optional LOCAL credential generator, never a remote preflight.
-    async acceptVersioned({ kind, expectedTopologyRevision, requestKey, link, linkId, desiredVersion, changes, payloadHash } = {}) {
+    async acceptVersioned({ kind, expectedTopologyRevision, requestKey, link, linkId, desiredVersion, changes, payloadHash, nodeActivation } = {}) {
         if (!INTENT_KINDS.has(kind) || payloadHash !== undefined) throw intentError('INVALID_TOPOLOGY_INTENT');
+        if (nodeActivation !== undefined) {
+            nodeActivation = normalizeNodeActivation(nodeActivation);
+            if (kind !== 'link.apply' || changes !== undefined || this.dependencies.HyNode?.db !== this.CascadeLink.db) throw intentError('INVALID_TOPOLOGY_INTENT');
+        }
         if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) throw intentError('INVALID_TOPOLOGY_REVISION');
         if (typeof requestKey !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestKey)) throw intentError('INVALID_IDEMPOTENCY_KEY');
         let normalized, normalizedChanges;
@@ -137,7 +207,7 @@ class TopologyIntentService {
             }
             if (editing) normalizedChanges = normalizedLinkChanges(this.CascadeLink, changes);
         }
-        const fingerprint = digest({ version: 2, kind, ...(normalized ? { link: normalized }
+        const fingerprint = digest({ version: 2, kind, ...(nodeActivation ? { nodeActivation } : {}), ...(normalized ? { link: normalized }
             : editing ? { linkId, changes: normalizedChanges } : { linkId, desiredVersion }) });
         if (Buffer.byteLength(JSON.stringify(normalized || normalizedChanges || {})) > 32768) throw intentError('TOPOLOGY_INTENT_PAYLOAD_TOO_LARGE');
         const findExisting = async (session, confirmDurable = false) => {
@@ -247,9 +317,9 @@ class TopologyIntentService {
                             || linkDesiredVersion(persisted) !== linkDesiredVersion(candidate)) throw intentError('TOPOLOGY_INTENT_DRAFT_BINDING_INVALID');
                         target = persisted;
                         desiredVersion = linkDesiredVersion(target);
-                    } else if (linkDesiredVersion(target) !== desiredVersion) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
+                    } else if (await selectedDesiredVersion(this.dependencies, target, nodeActivation, session) !== desiredVersion) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
                 }
-                const resourceNodeIds = resourceIds(await this.dependencies.resolveIntentResources({ kind, link: target, desiredVersion, session }));
+                const resourceNodeIds = resourceIds(await this.dependencies.resolveIntentResources({ kind, link: target, desiredVersion, nodeActivation, session }));
                 if (kind === 'link.delete') {
                     // CascadeLink's lifecycle schema is separately owned. Never substitute
                     // draft deletion for a same-connection operation-owned tombstone.
@@ -263,6 +333,7 @@ class TopologyIntentService {
                 const [row] = await this.TopologyCreateIntent.create([{
                     _id: jobId, executionContext: this.#executionContext, requestKey, version: 2, kind,
                     linkId, desiredVersion, resourceNodeIds, payloadHash: fingerprint,
+                    ...(nodeActivation ? { nodeActivation } : {}),
                     payload: { kind, linkId, desiredVersion, ...(editing ? { changes: normalizedChanges } : {}) }, ordinal: counted.ordinal,
                     ...(kind === 'link.create' ? { createdLinkId: linkId } : {}),
                     acceptanceRevision: expectedTopologyRevision, status: 'waiting', attempts: 0, generation: 0,

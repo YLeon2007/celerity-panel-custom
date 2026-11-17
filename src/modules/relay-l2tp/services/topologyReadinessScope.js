@@ -21,7 +21,7 @@ async function invokeTopologyReadiness(nodeId, command, payload) {
             commandId: readinessCommandId(command, binding.commandIds.verify), bootId: binding.bootId };
         await scope.assertCurrent();
         current(nodeId);
-        const body = command === 'restore-users' ? { users: payload.map(user => ({ ...user })) } : { expectation: { ...payload } };
+        const body = ['restore-users', 'read-restored-users'].includes(command) ? { users: payload.map(user => ({ ...user })) } : { expectation: { ...payload } };
         const result = await entry.invoke(command, { ...request, ...body });
         await scope.assertCurrent();
         current(nodeId);

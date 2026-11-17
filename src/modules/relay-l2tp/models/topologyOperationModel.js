@@ -139,6 +139,10 @@ const topologyOperationSchema = new mongoose.Schema({
     executionContext: executionContextField(),
     // Durable closure intent/proofs; blocks reclaim even after lease expiry.
     v2Terminal: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    undispatchedPreparationContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
+    undispatchedPreparationSettlement: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
+    closedSettlementContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
+    preparedCommitContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     // Dormant binding-store CAS nonce; never defaults/adopts a legacy operation.
     executionBindingCheck: { type: String },
     idempotencyKey: { type: String, immutable: true },
@@ -179,11 +183,22 @@ const topologyOperationSchema = new mongoose.Schema({
     baselineTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     effectiveTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     desiredVersion: { type: String, match: DIGEST_PATTERN, immutable: true, select: false },
+    nodeActivation: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true,
+        validate(value) { if (value === undefined) return true; try { require('../services/topologyNodeActivation').nodeActivation(value); return this.kind === 'link.apply' && this.admissionScope === 'selected'; } catch { return false; } } },
     selectedOwnerPins: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     installedPath: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     routeState: { type: String, immutable: true, enum: ['complete', 'no_portal_input', 'no_bridge_exit', 'policy_ambiguous'] },
     // Committing but unpublished; topology admission stays held during PPP sync.
     pppWait: { type: pppWaitSchema, default: undefined },
+    // Dedicated TEST only: exact pre-dispatch bootstrap continuation retains
+    // the original failed node states/finish time, command IDs and generations.
+    bootstrapCancellation: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    bootstrapContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    // One explicit TEST continuation of existing, physically un-dispatched locks.
+    bindingReservationContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    // Fresh verification provenance; original UNKNOWN command is never rewritten.
+    retainedVerifyContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    retainedVerifyClosureContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined },
     status: {
         type: String,
         enum: OPERATION_STATUSES,

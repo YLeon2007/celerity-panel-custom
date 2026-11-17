@@ -537,8 +537,8 @@ test('assembled terminal recovery is read-only and never provisions or bootstrap
     assert.deepEqual(f.runnerExecutions.map(command => runnerRequest(command).command), ['status']);
 });
 
-test('actual PROD worker refuses before claim even with server authority supplied', async t => {
-    const f = await fixture(t, undefined, PROD), id = await f.operation(17);
-    assert.equal((await f.worker.run(id)).errorCode, 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN');
-    assert.equal((await models.TopologyOperation.findById(id).lean()).attempts, 0); assert.deepEqual(f.events, []);
+test('canonical PROD refuses an undeclared TEST controller before worker composition or operation creation', async t => {
+    await assert.rejects(fixture(t, undefined, PROD), /operation worker/);
+    assert.equal(await models.TopologyOperation.countDocuments(), 0);
+    assert.equal(await models.TopologyExecutionBinding.countDocuments(), 0);
 });

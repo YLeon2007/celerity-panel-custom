@@ -24,6 +24,7 @@ function fixture({ snapshot = {}, onAcquire } = {}) {
     const query = value => ({ select() { return this; }, session() { return this; }, async lean() { return structuredClone(value); } });
     const collection = key => ({
         find() { return query(state[key]); },
+        findById(id) { return query(state[key].find(row => row._id === id) || null); },
         async create(rows) { trace.push(['create', key]); state[key].push(...rows); },
         async updateOne({ _id }, { $set }) {
             trace.push(['update', key]);

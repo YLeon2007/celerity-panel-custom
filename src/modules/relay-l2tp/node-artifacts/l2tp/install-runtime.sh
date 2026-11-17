@@ -55,6 +55,18 @@ for package in "${REQUIRED_PACKAGES[@]}"; do
     fi
 done
 
+# Minimal systemd guests may intentionally lack the SysV generator even with
+# xl2tpd already installed. Add only a missing native unit, never reinstall the
+# package or replace a loaded/generated/operator-owned unit.
+if [[ "$(systemctl show xl2tpd.service --value -p LoadState 2>/dev/null || true)" == 'not-found' ]]; then
+    if ! python3 "$(dirname -- "${BASH_SOURCE[0]}")/ensure-xl2tpd-unit.py" \
+        || ! systemctl daemon-reload >/dev/null 2>&1; then
+        emit_error 'RUNTIME_XL2TPD_UNIT_FAILED'
+        exit 70
+    fi
+    changed=$((changed + 1))
+fi
+
 # Debian's stock /etc/ipsec.conf no longer includes /etc/ipsec.d/*.conf,
 # which would leave the managed conn unloaded — enforce it idempotently.
 readonly IPSEC_CONF='/etc/ipsec.conf'

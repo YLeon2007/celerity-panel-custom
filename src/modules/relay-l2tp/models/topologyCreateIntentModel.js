@@ -11,6 +11,8 @@ const schema = new mongoose.Schema({
     linkId: { type: mongoose.Schema.Types.ObjectId, ref: 'CascadeLink', immutable: true,
         required() { return this.version === 2; } },
     // Content-addressed configuration version, not Mongoose's non-incremented __v.
+    nodeActivation: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true,
+        validate(value) { if (value === undefined) return true; try { require('../services/topologyNodeActivation').nodeActivation(value); return this.version === 2 && this.kind === 'link.apply'; } catch { return false; } } },
     desiredVersion: { type: String, match: /^[a-f0-9]{64}$/, immutable: true,
         required() { return this.version === 2; } },
     // Refreshable planning hint before admission; bound operation resources never change.
@@ -36,6 +38,15 @@ const schema = new mongoose.Schema({
     createdLinkId: { type: mongoose.Schema.Types.ObjectId,
         required() { return this.version === 2 && this.kind === 'link.create'; } },
     errorCode: String,
+    // Explicit no-admission settlement retains the original unknown label;
+    // the newly observed refusal is not substituted for historical causality.
+    unadmittedPreparation: { type: new mongoose.Schema({
+        originalErrorCode: { type: String, enum: ['TOPOLOGY_INTENT_PREPARE_UNCERTAIN'], required: true },
+        observedCauseCode: { type: String, enum: ['MULTIPLE_DEFAULT_EGRESS', 'VALID_PREFLIGHT_NO_ADMISSION'], required: true },
+        revision: { type: Number, min: 0, required: true },
+        generation: { type: Number, min: 1, required: true },
+        confirmedAt: { type: Date, required: true },
+    }, { _id: false }), default: undefined },
     waitingReason: String,
 }, { timestamps: true });
 schema.index({ requestKey: 1 }, { unique: true });

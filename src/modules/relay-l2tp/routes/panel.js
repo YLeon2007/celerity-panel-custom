@@ -254,6 +254,19 @@ function createL2tpRouter({
         return false;
     }
 
+    router.post('/l2tp/nodes/:id/normalize-main-ingress', requireAuth, requireOnboarding, csrf, rateLimiter, async (req, res) => {
+        if (!req.body || Array.isArray(req.body) || Object.keys(req.body).length) return res.status(400).json({ error: { code: 'INVALID_REQUEST' } });
+        try { return res.json(await l2tpService.normalizeMainIngress(req.params.id)); }
+        catch (error) { return res.status(409).json({ error: { code: error.code || 'MAIN_NORMALIZATION_REFUSED' },
+            ...(error.operationId ? { operationId: error.operationId } : {}) }); }
+    });
+
+    router.post('/l2tp/operations/:id/reconcile-rollback', requireAuth, requireOnboarding, csrf, rateLimiter, async (req, res) => {
+        if (!req.body || Array.isArray(req.body) || Object.keys(req.body).length) return res.status(400).json({ error: { code: 'INVALID_REQUEST' } });
+        try { return res.json(await l2tpService.reconcileRestoredInstall(req.params.id)); }
+        catch { return res.status(409).json({ error: { code: 'L2TP_ROLLBACK_RECONCILIATION_REFUSED' } }); }
+    });
+
     router.get(
         '/l2tp/simple/overview',
         requireAuth,

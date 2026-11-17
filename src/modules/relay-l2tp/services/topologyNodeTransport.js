@@ -227,9 +227,30 @@ class TopologyNodeTransport {
         return parseReceipt(result, command, request);
     }
 
-    async restoreUsers(request) {
+    async observeVerify(request, statusOnly = false) {
+        const { observation, ...binding } = structuredClone(request || {});
+        assertBasePlan(binding);
+        if (!validVerifyObservation(observation, binding)) throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid verify observation');
+        const command=statusOnly?'status':'observe-verify';
+        const result = await this.#invokeArtifact(TOPOLOGY_NODE_RUNNER_PATH, { command, ...binding,
+            ...(statusOnly?{completedCommand:'observe-verify'}:{observation}) });
+        let p;
+        try { p=JSON.parse(result.stdout); } catch { throw new TopologyNodeTransportError('INVALID_RECEIPT', 'Unconfirmed observation'); }
+        if (result.code!==0 || result.stderr!=='' || result.stdout!==JSON.stringify(p)+'\n'
+            || !hasExactKeys(p,[...RECEIPT_KEYS,'originalVerifyId','commitId','checksSha256','journalBeforeSha256'].sort())
+            || BASE_KEYS.some(k=>p[k]!==binding[k]) || p.command!==command || p.completedCommand!=='observe-verify'
+            || p.ok!==true || p.protocolVersion!==2 || p.completion!=='completed' || p.phase!=='verified' || p.terminal!==false
+            || p.ownershipRetained!==true || p.terminalOutcome!=='not-terminal' || p.systemdJob!=='completed' || p.serviceState!=='active:running'
+            || p.bootId!==observation.bootId || p.originalVerifyId!==observation.originalVerifyId || p.commitId!==observation.commitId
+            || p.checksSha256!==createHash('sha256').update(JSON.stringify(observation)).digest('hex')
+            || !/^[a-f0-9]{64}$/.test(p.journalBeforeSha256)) throw new TopologyNodeTransportError('INVALID_RECEIPT','Unconfirmed observation');
+        return Object.freeze(p);
+    }
+
+    async restoreUsers(request, readOnly = false) {
         const { bootId, users, ...binding } = request || {};
         assertBasePlan(binding);
+        if (readOnly && binding.executionContext !== 'test.infograd.online') throw new TopologyNodeTransportError('INVALID_PLAN', 'TEST user readback required');
         const { validReadiness, parseReadinessReceipt } = require('./topologyReadinessProtocol');
         if (!hasExactKeys(request, [...BASE_KEYS, 'bootId', 'users'].sort())
             || binding.targetProfile !== 'xray-main' || !Array.isArray(users) || users.length < 1 || users.length > 4096
@@ -242,11 +263,14 @@ class TopologyNodeTransport {
         const snapshot = `${JSON.stringify({ users: users.map(({ id, email }) => ({ id, email })) })}\n`;
         const readiness = { bootId, snapshotSha256: createHash('sha256').update(snapshot).digest('hex'), userCount: users.length };
         if (!validReadiness('restore-users', readiness)) throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid user snapshot');
-        const invocation = { command: 'restore-users', ...binding, readiness, snapshot };
+        const command = readOnly ? 'read-restored-users' : 'restore-users';
+        const invocation = { command, ...binding, readiness, snapshot };
         try {
-            return parseReadinessReceipt(await this.#invokeArtifact(TOPOLOGY_NODE_RUNNER_PATH, invocation), 'restore-users', invocation);
+            return parseReadinessReceipt(await this.#invokeArtifact(TOPOLOGY_NODE_RUNNER_PATH, invocation), command, invocation);
         } catch { throw new TopologyNodeTransportError('INVALID_RECEIPT', 'Unconfirmed user restoration'); }
     }
+
+    readRestoredUsers(request) { return this.restoreUsers(request, true); }
 
     async verifyPppUsers(request) {
         const { bootId, expectation, ...binding } = request || {};
@@ -292,7 +316,15 @@ class TopologyNodeTransport {
     }
 }
 
+function validVerifyObservation(o,b) {
+    return b.executionContext==='test.infograd.online' && hasExactKeys(o,['bootId','checks','commitId','originalVerifyId','prepareId'])
+        && ['bootId','commitId','originalVerifyId','prepareId'].every(k=>typeof o[k]==='string'&&SAFE_ID_PATTERN.test(o[k]))
+        && new Set([o.commitId,o.originalVerifyId,o.prepareId]).size===3 && validChecks(o.checks,b.targetProfile)
+        && o.checks.every(c=>c.expectedState!=='absent')
+        && b.commandId===createHash('sha256').update('topology-retained-verify-v1:'+o.originalVerifyId).digest('hex');
+}
 module.exports = {
+    validVerifyObservation,
     TOPOLOGY_NODE_ARTIFACT_ID,
     TOPOLOGY_NODE_COMMANDS,
     TOPOLOGY_NODE_RUNNER_PATH,

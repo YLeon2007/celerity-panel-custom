@@ -117,11 +117,28 @@ function createL2tpRuntimeLifecycleHook({
     if (startWorkers) lifecycle.start();
     if (typeof hostDependencies.topologyExecutionAuthority?.close === 'function') {
         const stop = lifecycle.stop.bind(lifecycle);
-        let stopping;
-        return { ...lifecycle, stop() {
-            if (!stopping) stopping = Promise.resolve().then(stop).finally(() => hostDependencies.topologyExecutionAuthority.close());
-            return stopping;
-        } };
+        let stopping, originalDrain;
+        return { ...lifecycle,
+            // Internal finite migration caller only: use the SAME consumer stop/join
+            // without destroying the sole retained original holder before handback.
+            drainForOriginalHandback() {
+                if (!originalDrain) originalDrain = Promise.resolve().then(stop).then(state => {
+                    if (state?.stopped !== true || state.running !== false || state.drainUncertain === true) {
+                        throw new Error('TEST_ORIGINAL_CONSUMER_DRAIN_UNPROVEN');
+                    }
+                    hostDependencies.topologyExecutionAuthority.drainOriginals();
+                });
+                return originalDrain;
+            },
+            async handbackProductionOriginals(acceptedCurrent) {
+                await this.drainForOriginalHandback();
+                return lifecycle.handbackProductionOwners(acceptedCurrent);
+            },
+            stop() {
+                if (!stopping) stopping = Promise.resolve().then(stop).finally(() => hostDependencies.topologyExecutionAuthority.close());
+                return stopping;
+            },
+        };
     }
     return lifecycle;
 }
@@ -167,7 +184,7 @@ function createL2tpRootHostDependencies({
     renderPage = require('../routes/panel').renderL2tpPage,
     clock = { now: () => new Date() },
     topologyHealthMaxStalenessMs = DEFAULT_MAX_STALENESS_MS,
-    createTopologyExecutionAuthority = require('./relay-l2tp/runtime/testPhysicalController').createRootTestPhysicalAuthority,
+    createTopologyExecutionAuthority = require('./relay-l2tp/runtime/productionPhysicalAuthority').createRootTopologyExecutionAuthority,
     topologyExecutionAuthority,
     workerId = `panel-${process.pid}`,
     leaseMs = ROOT_LEASE_MS,
@@ -211,6 +228,7 @@ function createL2tpRootHostDependencies({
             fragmentProvider: injectedFragmentProvider = fragmentProvider,
         } = {}) {
             const { withHeldL2tpNodeConfigWrite, assertHeldL2tpNodeConfigWrite } = require('../services/classicNodeConfigWrite');
+            const preparation = new (require('node:async_hooks').AsyncLocalStorage)();
             const resolveExecutionNode = async nodeId => {
                 await assertHeldL2tpNodeConfigWrite(nodeId);
                 // The same held node also feeds the existing full MAIN writer.
@@ -223,32 +241,70 @@ function createL2tpRootHostDependencies({
                     || node.active !== true || node.cascadeRole !== 'relay') throw new Error('NODE_EXECUTION_UNAVAILABLE');
                 return node;
             };
+            const readConfig = async (nodeId, profile) => {
+                const executionNode = await resolveExecutionNode(nodeId);
+                const ssh = new NodeSSH(executionNode);
+                try {
+                    await ssh.connect();
+                    await assertHeldL2tpNodeConfigWrite(nodeId);
+                    const path = profile === 'xray-bridge'
+                        ? '/usr/local/etc/xray-bridge/config.json' : '/usr/local/etc/xray/config.json';
+                    const current = await ssh.exec(`cat ${path}`);
+                    if (current?.code !== 0 || typeof current.stdout !== 'string') throw new Error('CURRENT_XRAY_CONFIG_UNAVAILABLE');
+                    await assertHeldL2tpNodeConfigWrite(nodeId);
+                    return current.stdout;
+                } finally { ssh.disconnect(); }
+            };
+            const { createTopologyL2tpInstallComposition, composeTopologyL2tpMainFragment } = require('./relay-l2tp/services/topologyL2tpInstallComposition');
+            const topologyInstall = createTopologyL2tpInstallComposition({ env: configWriteEnv, HyNode, readConfig });
             const service = new L2tpXrayCandidateService({
                 configGenerator: injectedConfigGenerator,
                 userResolver,
                 nodeResolver,
                 fragmentProvider: injectedFragmentProvider,
                 currentConfigResolver: async ({ node }) => {
-                    const executionNode = await resolveExecutionNode(node._id);
-                    const ssh = new NodeSSH(executionNode);
-                    try {
-                        await ssh.connect();
-                        await assertHeldL2tpNodeConfigWrite(node._id);
-                        const current = await ssh.exec('cat /usr/local/etc/xray/config.json');
-                        if (current?.code !== 0 || typeof current.stdout !== 'string') throw new Error('CURRENT_XRAY_CONFIG_UNAVAILABLE');
-                        await assertHeldL2tpNodeConfigWrite(node._id);
-                        return current.stdout;
-                    } finally { ssh.disconnect(); }
+                    const current = await readConfig(node._id, 'xray-main');
+                    // Only a positively authorized topology first-install may
+                    // normalize an actually empty MAIN. Classic sparse refusal stays.
+                    if (preparation.getStore()?.topology && Object.keys(JSON.parse(current)).length === 0) {
+                        return { inbounds: [], outbounds: [], routing: { rules: [] } };
+                    }
+                    return current;
                 },
             });
-            service.withLockedPreparation = withHeldL2tpNodeConfigWrite;
-            service.assertConfigWriteAllowed = async nodeId => {
+            service.withLockedPreparation = (request, callback) => withHeldL2tpNodeConfigWrite(request,
+                () => preparation.run({}, callback));
+            service.verifyRestoredInstall = async operation => {
+                const node = await HyNode.findById(operation.node).select([
+                    'type', 'active', 'cascadeRole', 'ip', 'ssh.port', 'ssh.username', 'ssh.privateKey', 'ssh.password',
+                ].join(' ')).lean();
+                if (!node || node.type !== 'xray' || node.active !== true || node.cascadeRole !== 'relay') return { ok: false };
+                const ssh = new NodeSSH(node);
+                try {
+                    await ssh.connect();
+                    const result = await ssh.exec('python3 -', { timeout: 20000,
+                        stdin: require('./relay-l2tp/services/l2tpRestoredInstallReadback').restoredInstallProbe(String(operation._id)) });
+                    return result?.code === 0 && result.stderr === '' ? JSON.parse(result.stdout) : { ok: false };
+                } finally { ssh.disconnect(); }
+            };
+            service.transformFragment = async ({ fragment }) => {
+                const topology = preparation.getStore()?.topology;
+                return topology ? composeTopologyL2tpMainFragment({ fragment, ...topology }) : fragment;
+            };
+            service.assertConfigWriteAllowed = async (nodeId, request) => {
                 const { topologyManagesNodeConfig } = require('../services/topologyConfigOwnership');
                 if (await topologyManagesNodeConfig({ _id: nodeId }, configWriteEnv)) {
-                    throw Object.assign(new Error('CLASSIC_CONFIG_WRITE_OWNER_VETO'), { code: 'CLASSIC_CONFIG_WRITE_OWNER_VETO' });
+                    await topologyInstall.authorize(String(nodeId), request);
                 }
             };
             service.prepareIngress = async ({ plan }) => {
+                const { topologyManagesNodeConfig } = require('../services/topologyConfigOwnership');
+                if (await topologyManagesNodeConfig({ _id: plan.relayId }, configWriteEnv)) {
+                    const scope = preparation.getStore();
+                    if (!scope) throw new Error('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+                    scope.topology = await topologyInstall.prepare(plan);
+                    return;
+                }
                 const relay = await resolveExecutionNode(plan.relayId);
                 const CascadeRouteGroup = require('./relay-l2tp/models/cascadeRouteGroupModel');
                 const CascadeLink = require('../models/cascadeLinkModel');
@@ -283,6 +339,23 @@ function createL2tpRootHostDependencies({
                         additionalUpstreams: incoming.slice(1).map(row => ({ link: row, portal: row.portalNode })),
                     }) !== true) reject();
                 }
+            };
+            service.prepareNormalization = async ({ plan }) => {
+                const scope = preparation.getStore();
+                if (!scope) throw new Error('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+                scope.topology = await topologyInstall.prepare(plan, { normalization: true });
+            };
+            service.normalizationReadback = async nodeId => {
+                const node = await resolveExecutionNode(nodeId), ssh = new NodeSSH(node);
+                try {
+                    await ssh.connect();
+                    await assertHeldL2tpNodeConfigWrite(nodeId);
+                    const result = await ssh.exec('python3 -I -B -', { timeout: 20000, stdin:
+                        require('./relay-l2tp/services/l2tpMainNormalization').normalizationProbe() });
+                    if (result?.code !== 0 || result.stderr !== '') throw new Error('MAIN_NORMALIZATION_READBACK_FAILED');
+                    await assertHeldL2tpNodeConfigWrite(nodeId);
+                    return JSON.parse(result.stdout);
+                } finally { ssh.disconnect(); }
             };
             return service;
         },
@@ -321,8 +394,11 @@ function createL2tpRootLifecycle({
     createHostDependencies = createL2tpRootHostDependencies,
     createRuntimeLifecycleHook = createL2tpRuntimeLifecycleHook,
     activeHostProvider = l2tpActiveHostProvider,
+    createTopologyExecutionAuthority = require('./relay-l2tp/runtime/productionPhysicalAuthority').createRootTopologyExecutionAuthority,
+    productionDatabase = () => require('mongoose').connection.db,
 } = {}) {
     let lifecycle;
+    let productionAuthority;
     let startPromise;
     let stopPromise;
     let stopRequested = false;
@@ -351,7 +427,27 @@ function createL2tpRootLifecycle({
                     parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
                     const productionHost = isProductionSchemaHost(env);
                     if (productionHost && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true') {
-                        throw new TypeError('PRODUCTION_SCHEMA_AUTHORITY_UNAVAILABLE');
+                        const authority = productionAuthority = createTopologyExecutionAuthority({ env });
+                        if (!authority) throw new TypeError('PRODUCTION_PHYSICAL_ACTIVATION_REQUIRED');
+                        try {
+                            const { verifyProductionStartupSchema } = require('./relay-l2tp/services/productionAdmissionReadiness');
+                            const { isDeepStrictEqual } = require('node:util');
+                            await authority.withHeldAuthority(PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT, capability =>
+                                verifyProductionStartupSchema({ db: productionDatabase(), accepted: authority.admission,
+                                    scope: { async assertHeld(challenge) {
+                                        if (!isDeepStrictEqual(challenge, authority.admission)) throw new Error('PRODUCTION_ADMISSION_SCOPE_LOST');
+                                        await capability.assertHeld();
+                                    } } }));
+                            if (stopRequested) { authority.close(); return undefined; }
+                            // Same producer, original epoch and models. No generic
+                            // migration/DDL, TEST controller or L2TP-only flag gate.
+                            lifecycle = createRuntimeLifecycleHook({ env, activeHostProvider, startWorkers: false,
+                                createHostDependencies: options => createHostDependencies({ ...options, topologyExecutionAuthority: authority }) });
+                            await lifecycle.enrollProductionOwners();
+                            if (stopRequested) { await lifecycle.stop(); return undefined; }
+                            lifecycle.start();
+                            return lifecycle;
+                        } catch (error) { await lifecycle?.stop(); authority.close(); throw error; }
                     }
                     // L2TP has its own explicit PROD authorization; it does not
                     // activate topology execution or inherit the TEST bypass.
@@ -375,6 +471,11 @@ function createL2tpRootLifecycle({
                 });
             }
             return startPromise;
+        },
+        async handbackProductionOriginalsAfterDatabase(acceptedCurrent) {
+            if (startPromise === undefined || !productionAuthority || stopRequested) throw new Error('PRODUCTION_OWNER_ENTRY_UNPROVEN');
+            await startPromise;
+            return lifecycle.handbackProductionOriginals(acceptedCurrent);
         },
         stop() {
             stopRequested = true;

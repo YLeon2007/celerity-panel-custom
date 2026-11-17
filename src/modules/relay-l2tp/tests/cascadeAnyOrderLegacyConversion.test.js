@@ -86,7 +86,11 @@ function regenerate(f, { single = false, reality = false } = {}) {
         config.inbounds.push(structuredClone(current.inbounds.find(inbound => inbound.tag === 'unrelated-client')));
         config.outbounds.push({ tag: 'unrelated-out', protocol: 'blackhole' });
         config.routing.rules.push({ type: 'field', inboundTag: ['unrelated-client'], outboundTag: 'unrelated-out' });
-        config.policy = structuredClone(current.policy);
+        config.policy = { ...structuredClone(current.policy),
+            levels: { ...structuredClone(current.policy.levels),
+                0: { ...structuredClone(current.policy.levels[0]), connIdle: 37 },
+                5: { handshake: 12 } },
+            system: { statsInboundUplink: false } };
         config.log = { loglevel: 'warning', access: '/dummy/retained.log' };
         node.profileConfig = JSON.stringify(config, null, 2) + '\n';
         f.physical.get(node.id).config = node.profileConfig;

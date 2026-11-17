@@ -3,6 +3,7 @@ const { randomUUID } = require('node:crypto');
 const { QUEUE_ID, intentError, INTENT_KINDS, resourceIds, linkDesiredVersion } = require('./topologyIntentService');
 const { matchesTopologyOperationExecutionContext, matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const TERMINAL = new Set(['succeeded', 'failed', 'rolled_back']);
+const { nodeActivation: normalizeNodeActivation, selectedDesiredVersion } = require('./topologyNodeActivation');
 const RESOURCE_BUSY = new Set(['TOPOLOGY_DEPLOY_BUSY', 'TOPOLOGY_ADMISSION_UNAVAILABLE',
     'CLASSIC_DEPLOY_NODE_BUSY', 'NODE_OPERATION_LOCK_CONFLICT']);
 function baselineIds(links, link) {
@@ -55,6 +56,8 @@ class TopologyIntentConsumer {
         }
     }
     assertBinding(row) {
+        if (row.nodeActivation !== undefined && (row.version !== 2 || row.kind !== 'link.apply'
+            || !normalizeNodeActivation(row.nodeActivation))) throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
         if (row.version === 2 && (!INTENT_KINDS.has(row.kind)
             || !/^[a-f0-9]{24}$/.test(String(row.linkId))
             || typeof row.desiredVersion !== 'string' || !/^[a-f0-9]{64}$/.test(row.desiredVersion)
@@ -94,10 +97,10 @@ class TopologyIntentConsumer {
                 if (row.version !== 2 || row.operationId || row.status === 'blocked'
                     || (row.status === 'claimed' && row.leaseUntil > this.clock.now())) continue;
                 const link = await this.dependencies.CascadeLink.findById(row.linkId).session(session).lean();
-                if (!link || linkDesiredVersion(link) !== row.desiredVersion) continue;
+                if (!link || await selectedDesiredVersion(this.dependencies, link, row.nodeActivation, session) !== row.desiredVersion) continue;
                 if (typeof this.dependencies.resolveIntentResources !== 'function') throw intentError('TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE');
                 const fresh = resourceIds(await this.dependencies.resolveIntentResources({
-                    kind: row.kind, link, desiredVersion: row.desiredVersion, session,
+                    kind: row.kind, link, desiredVersion: row.desiredVersion, nodeActivation: row.nodeActivation, session,
                 }));
                 if (JSON.stringify(fresh) !== JSON.stringify(row.resourceNodeIds)) {
                     const updated = await this.TopologyCreateIntent.updateOne(this.fence(row), { $set: { resourceNodeIds: fresh } }, { session });
@@ -186,6 +189,7 @@ class TopologyIntentConsumer {
             || operation.kind !== (intent.kind === 'link.delete' ? 'link.delete' : 'link.apply')
             || String(operation.linkId) !== String(intent.linkId)
             || operation.desiredVersion !== intent.desiredVersion
+            || JSON.stringify(operation.nodeActivation) !== JSON.stringify(intent.nodeActivation)
             || JSON.stringify(resourceIds(operation.resourceNodeIds)) !== JSON.stringify(intent.resourceNodeIds)) {
             throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
         }
@@ -197,10 +201,10 @@ class TopologyIntentConsumer {
             if (!intent) throw intentError('TOPOLOGY_INTENT_FENCE_LOST');
             this.assertContext(intent); this.assertBinding(intent);
             const link = await this.dependencies.CascadeLink.findById(intent.linkId).session(session).lean();
-            if (!link || linkDesiredVersion(link) !== intent.desiredVersion) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
+            if (!link || await selectedDesiredVersion(this.dependencies, link, intent.nodeActivation, session) !== intent.desiredVersion) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
             if (typeof this.dependencies.resolveIntentResources !== 'function') throw intentError('TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE');
             const freshResources = resourceIds(await this.dependencies.resolveIntentResources({
-                kind: intent.kind, link, desiredVersion: intent.desiredVersion, session,
+                kind: intent.kind, link, desiredVersion: intent.desiredVersion, nodeActivation: intent.nodeActivation, session,
             }));
             if (JSON.stringify(freshResources) !== JSON.stringify(intent.resourceNodeIds)) throw intentError('TOPOLOGY_INTENT_RESOURCE_SCOPE_CHANGED');
             const current = await this.CascadeTopologyState.findOne({ _id: 'singleton',
@@ -214,9 +218,23 @@ class TopologyIntentConsumer {
             const queued = await admission.queue({ session, transactionRunner: work => work(session),
                 executionContext: this.#executionContext, intentId: String(intent._id),
                 mutation: { kind: intent.kind === 'link.delete' ? 'link.delete' : 'link.apply',
-                    linkId: String(intent.linkId), desiredVersion: intent.desiredVersion },
+                    linkId: String(intent.linkId), desiredVersion: intent.desiredVersion,
+                    ...(intent.nodeActivation ? { nodeActivation: intent.nodeActivation } : {}) },
                 expectedTopologyRevision: current.revision, resourceNodeIds: freshResources,
             });
+            if (queued?.desiredOnly === true) {
+                if (intent.kind !== 'link.delete' || queued.kind !== 'link.delete' || queued.status !== 'succeeded'
+                    || queued.linkId !== String(intent.linkId) || queued.deleteJobId !== String(intent._id)
+                    || queued.topologyRevision !== current.revision || queued.operationId !== undefined) throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
+                const updated = await this.TopologyCreateIntent.updateOne({ ...this.fence(row, 'claimed'),
+                    leaseUntil: { $eq: row.leaseUntil, $gt: this.clock.now() } }, {
+                    $set: { status: 'succeeded' }, $inc: { attempts: 1 },
+                    $unset: { leaseOwner: '', leaseUntil: '', errorCode: '', waitingReason: '' },
+                }, { session });
+                if (updated.matchedCount !== 1) throw intentError('TOPOLOGY_INTENT_FENCE_LOST');
+                await this.releaseOutstanding(session);
+                return queued;
+            }
             const operation = await this.TopologyOperation.findById(queued?.operationId)
                 .select('+admissionScope +resourceNodeIds +desiredVersion').session(session).lean();
             if (!operation) throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
@@ -311,7 +329,13 @@ class TopologyIntentConsumer {
                 'TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE', 'TOPOLOGY_INTENT_ADMISSION_UNAVAILABLE']);
             const attempts = row.attempts + (busy ? 0 : 1);
             const exhausted = retryable && attempts >= this.maxAttempts;
-            const failed = rejected.has(error?.code) || exhausted;
+            // A typed plan-validation refusal aborts the joined admission
+            // transaction before any operation can dispatch. It is a known
+            // refusal, not an unknown remote outcome or an automatic retry.
+            const validationRefusal = !retryable
+                && error instanceof require('./topologyOperationCoordinator').TopologyOperationCoordinatorError
+                && error.code === 'INVALID_TOPOLOGY_DEPLOYMENT';
+            const failed = rejected.has(error?.code) || validationRefusal || exhausted;
             const status = busy || (retryable && !exhausted) ? 'waiting' : failed ? 'failed' : 'blocked';
             await this.transactionRunner(async session => {
                 const updated = await this.TopologyCreateIntent.updateOne(this.fence(row, 'claimed'), {

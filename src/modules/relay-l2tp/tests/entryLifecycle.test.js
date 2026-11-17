@@ -15,6 +15,7 @@ const LIFECYCLE_EXPORTS = [
     'registerRoutes',
     'createTopologyTransferDraftService',
     'createTopologyDeploymentService',
+    'isClassicProductionDeploymentEnabled',
     'createTopologyIntentService',
 ];
 
@@ -438,6 +439,7 @@ test('root deployment factory exposes only the exact opted-in queued composition
     class SnapshotRepository {
         constructor(dependencies) {
             calls.push({ kind: 'snapshot', dependencies });
+            this.CascadeLink = dependencies.CascadeLink;
         }
 
         async readDraft() {}
@@ -445,6 +447,7 @@ test('root deployment factory exposes only the exact opted-in queued composition
     class DeploymentRepository {
         constructor(dependencies) {
             calls.push({ kind: 'deployment', dependencies });
+            this.snapshotReader = dependencies.snapshotReader;
         }
 
         async pinTopology() {}
@@ -461,6 +464,7 @@ test('root deployment factory exposes only the exact opted-in queued composition
     class OperationRepository {
         constructor(dependencies) {
             calls.push({ kind: 'operationRepository', dependencies });
+            this.model = dependencies.model;
         }
 
         async createFrozen() {}

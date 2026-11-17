@@ -33,6 +33,8 @@ const queryCascadeSchema = z.object({
 });
 
 const manageCascadeSchema = z.object({
+    requestKey: z.string().min(1).max(128).optional()
+        .describe('Stable caller idempotency key required for native delete acceptance; poll the returned job'),
     expectedTopologyRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional()
         .describe('Required for create/update/delete; exact revision from the topology draft'),
     action: z.enum(['create', 'update', 'delete', 'deploy', 'undeploy', 'reconnect']),
@@ -212,6 +214,24 @@ async function manageCascade(args, emit) {
             if (!id) throw new Error('id is required for delete');
             const link = await CascadeLink.findById(id);
             if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
+            const selectedService = require('../../modules/l2tpActiveHostProvider').l2tpActiveHostProvider.getActiveHost()?.selectedTopologyIntentService;
+            const nativeConfigured = process.env.TOPOLOGY_TEST_EXECUTION_ENABLED === 'true'
+                || process.env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true';
+            if (!isClassicProductionDeploymentConfigured(process.env) && (nativeConfigured || typeof selectedService?.accept === 'function')) {
+                // The same supervised selected intent path as HTTP. A raw draft
+                // delete cannot prove an applied tunnel absent or own cleanup.
+                const service = selectedService;
+                if (typeof service?.accept !== 'function') throw Object.assign(new Error('Selected intent runtime is unavailable'),
+                    { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
+                if (!parsed.requestKey) throw Object.assign(new Error('Native delete requires a caller requestKey'),
+                    { code: 'TOPOLOGY_INTENT_KEY_REQUIRED' });
+                const job = await service.accept({ version: 2, kind: 'link.delete', expectedTopologyRevision,
+                    requestKey: parsed.requestKey, linkId: id,
+                    desiredVersion: require('../../modules/relay-l2tp/services/topologyIntentService').linkDesiredVersion(link) });
+                await invalidateCascadeCache();
+                return { success: true, accepted: true,
+                    ...require('../../routes/cascadeLinks').acceptedIntentResponse(job) };
+            }
             const deletionService = isClassicProductionDeploymentConfigured(process.env)
                 ? getClassicTopologyCoordinator() : getDraftWriteService();
             if (typeof deletionService?.deleteLink !== 'function') {

@@ -11,7 +11,57 @@ function assertTestContext(env) {
         throw failure('TEST_OWNER_CONTEXT_REQUIRED');
     }
 }
-async function enrollTestOwners({ env, lifecycle, store, TopologyConfigOwner } = {}) {
+async function initializeDedicatedTestState(models, check, physicalPlan) {
+    const State = models.CascadeTopologyState;
+    const absentRelays = [];
+    await check();
+    await State.db.transaction(async session => {
+        absentRelays.length = 0;
+        const state = await State.findById('singleton').session(session).setOptions({ maxTimeMS: 5000 }).lean();
+        if (state) {
+            if (!['revision','deployedRevision','remoteAdmissionCount','topologyAdmissionCount'].every(k => Number.isSafeInteger(state[k]) && state[k] >= 0)
+                || state.remoteDrain || state.replacementReservation) throw failure('TEST_ADMISSION_STATE_RECONCILE_REQUIRED');
+            return; // Never reset/repair existing counters or desired state.
+        }
+        for (const name of ['CascadeLink','CascadeRouteGroup','RelayL2tpState','TopologyOperation','TopologyExecutionBinding',
+            'NodeOperationLock','RemoteAdmission','L2tpOperation','TopologyCreateIntent','TopologyIntentQueueState']) {
+            if (await models[name].findOne({}).session(session).setOptions({ maxTimeMS: 5000 }).lean()) throw failure('TEST_ADMISSION_STATE_NOT_EMPTY');
+        }
+        if (physicalPlan !== undefined) {
+            if (!Array.isArray(physicalPlan.nodes) || !physicalPlan.nodes.length
+                || ['HyNode','L2tpUser','L2tpOperation','RelayL2tpState'].some(name => models[name]?.db !== State.db)) {
+                throw failure('TEST_PPP_ABSENCE_UNPROVEN');
+            }
+            for (const pin of physicalPlan.nodes) {
+                const node = await models.HyNode.findById(pin.nodeId).select('_id cascadeRole')
+                    .session(session).setOptions({ maxTimeMS: 5000 }).lean();
+                if (!node || String(node._id) !== pin.nodeId) throw failure('TEST_PPP_ABSENCE_UNPROVEN');
+                if (node.cascadeRole !== 'relay') continue;
+                if (pin.l2tpUnconfigured !== true
+                    || await models.L2tpUser.findOne({ relayNode: pin.nodeId }).session(session).setOptions({ maxTimeMS: 5000 }).lean()
+                    || await models.L2tpOperation.findOne({ node: pin.nodeId }).session(session).setOptions({ maxTimeMS: 5000 }).lean()) {
+                    throw failure('TEST_PPP_ABSENCE_UNPROVEN');
+                }
+                absentRelays.push(pin.nodeId);
+            }
+            await check();
+            if (absentRelays.length) await models.RelayL2tpState.insertMany(absentRelays.map(node => ({
+                node, desiredState: 'absent', status: 'not_installed', secretRevision: 0,
+            })), { session });
+        }
+        await State.create([{ _id: 'singleton', revision: 0, deployedRevision: 0, stateTransitionRevision: 0,
+            replacementEpoch: 0, remoteAdmissionCount: 0, topologyAdmissionCount: 0 }], { session });
+    }, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
+    await check();
+    const confirmed = await State.findById('singleton').read('primary').readConcern('majority').maxTimeMS(5000).lean();
+    if (!confirmed || !['revision','deployedRevision','remoteAdmissionCount','topologyAdmissionCount'].every(k => Number.isSafeInteger(confirmed[k]) && confirmed[k] >= 0)) throw failure('TEST_ADMISSION_STATE_UNCONFIRMED');
+    for (const node of absentRelays) {
+        const state = await models.RelayL2tpState.findOne({ node }).read('primary').readConcern('majority').maxTimeMS(5000).lean();
+        if (state?.status !== 'not_installed' || state.desiredState !== 'absent' || state.secretRevision !== 0) throw failure('TEST_PPP_ABSENCE_UNCONFIRMED');
+    }
+    await check();
+}
+async function enrollTestOwners({ env, lifecycle, store, TopologyConfigOwner, TopologyExecutionEnrollment, dedicatedModels, resumeOnly = false, onReconciled } = {}) {
     assertTestContext(env);
     if (typeof lifecycle?.withCapturedTestOwnerEnrollment !== 'function') {
         throw failure('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED');
@@ -25,6 +75,21 @@ async function enrollTestOwners({ env, lifecycle, store, TopologyConfigOwner } =
         const enrolled = [];
         for (const pin of plan.nodes) {
             await check();
+            if (env.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1') {
+                const owner = await TopologyConfigOwner.findOne({ node: pin.nodeId, profile: pin.targetProfile }).read('primary').readConcern('majority').maxTimeMS(5000).lean();
+                const existing = await TopologyExecutionEnrollment.findOne({ nodeId: pin.nodeId, targetProfile: pin.targetProfile }).read('primary').readConcern('majority').maxTimeMS(5000).lean();
+                if (owner || existing || resumeOnly) {
+                    if (!owner || !existing || owner.owner !== 'topology') throw failure('TEST_ENROLLMENT_RECONCILE_REQUIRED');
+                    const { proofRef, ...snapshot } = pin.originalSnapshot;
+                    const result = await store.verifyPristineEnrollment(freeze({ nodeId: pin.nodeId, targetProfile: pin.targetProfile,
+                        endpoint: pin.endpoint, nodeIdentity: pin.nodeIdentity, bootId: pin.bootId,
+                        predecessorGeneration: 'none', ownerGeneration: owner.generation }), snapshot);
+                    await check();
+                    enrolled.push({ nodeId: pin.nodeId, targetProfile: pin.targetProfile, enrollmentId: result.enrollmentId, ownerGeneration: owner.generation,
+                        enrollmentBootId: existing.bootId, runtimeBootId: result.bootId });
+                    continue;
+                }
+            }
             const classic = await transfer.initializeClassic({ node: pin.nodeId, profile: pin.targetProfile, nodeIdentity: pin.nodeIdentity });
             await check();
             const adopted = await transfer.adopt({ node: pin.nodeId, profile: pin.targetProfile,
@@ -37,7 +102,10 @@ async function enrollTestOwners({ env, lifecycle, store, TopologyConfigOwner } =
             enrolled.push({ nodeId: pin.nodeId, targetProfile: pin.targetProfile, enrollmentId: result.enrollmentId,
                 ownerGeneration: adopted.generation });
         }
-        return freeze({ status: 'enrolled', executionContext: TEST, nodes: enrolled });
+        if (env.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1') await initializeDedicatedTestState(dedicatedModels, check, plan);
+        const result = freeze({ status: 'enrolled', executionContext: TEST, nodes: enrolled });
+        if (onReconciled) { await check(); await onReconciled(result); }
+        return result;
     }));
 }
 async function main(argv = process.argv.slice(2)) {
@@ -75,4 +143,64 @@ if (require.main === module) main().then(code => { process.exitCode = code; }, (
     // Driver/controller exceptions can contain credentials or secret file bytes.
     process.stderr.write('TEST_OWNER_ENROLLMENT_REFUSED_RETAINED\n'); process.exitCode = 1;
 });
-module.exports = { enrollTestOwners, assertTestContext, main };
+// Late-added, still-pristine dedicated relay. This is the same explicit absent
+// PPP epoch as first startup, not installation or missing-row recovery. No
+// operation may be active, and the original enrolled runtime must remain exact.
+async function initializePristineDedicatedRelayAbsence({ env, models, lifecycle, nodeId }) {
+    assertTestContext(env);
+    const { isDeepStrictEqual: same } = require('node:util');
+    const { randomUUID } = require('node:crypto');
+    const { enrollmentRuntimeBootId } = require('../src/modules/relay-l2tp/repositories/topologyExecutionBindingStore');
+    const refuse = () => { throw failure('TEST_PRISTINE_RELAY_ABSENCE_UNPROVEN'); };
+    if (env.TOPOLOGY_TEST_STARTUP_MODE !== 'dedicated-runtime-v1' || !/^[a-f0-9]{24}$/.test(nodeId || '')
+        || typeof lifecycle?.run !== 'function' || typeof lifecycle.withTestRetainedVerifyObservation !== 'function') refuse();
+    const options = { maxTimeMS: 5000, timeoutMS: 5000 }, db = models.CascadeTopologyState.db;
+    if (['HyNode','TopologyConfigOwner','TopologyExecutionEnrollment','TopologyExecutionBinding','TopologyOperation','NodeOperationLock','RelayL2tpState','L2tpUser','L2tpOperation'].some(k => models[k]?.db !== db)) refuse();
+    const q = (M, f, s, select) => { let r = M.findOne(f); if (select) r = r.select(select); return (s ? r.session(s) : r.read('primary').readConcern('majority')).setOptions(options).lean(); };
+    return lifecycle.run(async () => {
+        const load = async session => {
+            const state = await q(models.CascadeTopologyState, { _id:'singleton' }, session);
+            const e = await q(models.TopologyExecutionEnrollment, { nodeId, targetProfile:'xray-bridge' }, session);
+            const o = await q(models.TopologyConfigOwner, { node:nodeId, profile:'xray-bridge' }, session, '+legacyAppliedTopology +profileTargetPin');
+            const n = await q(models.HyNode, { _id:nodeId }, session, '_id active type cascadeRole ip ssh.port ssh.username');
+            if (!state || state.topologyAdmissionCount !== 0 || state.remoteAdmissionCount !== 0 || state.remoteDrain || state.replacementReservation
+                || !e || e.executionContext !== TEST.hostIdentity || e.predecessorGeneration !== 'none'
+                || !o || !same(o.executionContext,TEST) || o.owner !== 'topology' || o.generation !== e.ownerGeneration
+                || !same(o.nodeIdentity,e.nodeIdentity) || !o.originalSnapshot || o.adoptionReceipt?.toGeneration !== o.generation
+                || ['lastSettledOperation','lastSettledGeneration','lastSettledCloseId','legacyAppliedTopology','profileTargetPin','handbackReceipt'].some(k => o[k] !== undefined)
+                || !n || n.type !== 'xray' || n.active !== true || n.cascadeRole !== 'relay' || n.ip !== e.endpoint.ip
+                || n.ssh.port !== e.endpoint.port || n.ssh.username !== e.endpoint.username) refuse();
+            for (const [M,f] of [[models.TopologyExecutionBinding,{nodeId}],[models.TopologyOperation,{heldTopologyAdmission:true}],
+                [models.NodeOperationLock,{}],[models.RelayL2tpState,{node:nodeId}],[models.L2tpUser,{relayNode:nodeId}],[models.L2tpOperation,{node:nodeId}]]) if (await q(M,f,session)) refuse();
+            return {state,e,o,n};
+        };
+        const root = await load();
+        const enrolled = { ...root.e, bootId:enrollmentRuntimeBootId(root.e) };
+        return lifecycle.withTestRetainedVerifyObservation([enrolled], async (physical, check) => {
+            const p = physical.nodes?.[0], current = p?.current?.['xray-bridge'];
+            const { source, ...snapshot } = current || {};
+            if (physical.nodes.length !== 1 || p.nodeId !== nodeId || p.bootId !== enrolled.bootId || p.runnerIdle !== true
+                || p.journal !== null || p.l2tpUnconfigured !== true || source !== 'node-readback' || !same(snapshot,root.o.originalSnapshot)) refuse();
+            await check(); const s = await db.startSession(), nonce = randomUUID(); let attempted = false;
+            try {
+                s.startTransaction({readConcern:{level:'snapshot'},writeConcern:{w:'majority'},readPreference:'primary'});
+                if (!same(await load(s),root)) refuse();
+                const {updatedAt:ignored,...owner}=root.o;
+                const nodeFence={_id:root.n._id,active:true,type:'xray',cascadeRole:'relay',ip:root.e.endpoint.ip,'ssh.port':root.e.endpoint.port,'ssh.username':root.e.endpoint.username};
+                for (const [M,f] of [[models.TopologyConfigOwner,owner],[models.HyNode,nodeFence]])
+                    if ((await M.updateOne(f,{$set:{executionBindingCheck:nonce}},{session:s,...options,runValidators:true})).matchedCount !== 1) refuse();
+                await models.RelayL2tpState.insertMany([{node:nodeId,desiredState:'absent',status:'not_installed',secretRevision:0}],{session:s,...options});
+                if ((await models.CascadeTopologyState.updateOne(root.state,{$inc:{stateTransitionRevision:1}},{session:s,...options,runValidators:true})).matchedCount !== 1) refuse();
+                await check(); attempted=true;
+                try { const r=await db.getClient().db('admin').command({commitTransaction:1,writeConcern:{w:'majority',wtimeout:5000},maxTimeMS:5000},{session:s,...options});if(r.ok!==1||r.writeConcernError||r.errorLabels?.length)refuse(); }
+                finally { s.transaction.transition('TRANSACTION_COMMITTED'); }
+            } catch (e) { if(!attempted&&s.inTransaction())await s.abortTransaction().catch(()=>{});throw e; }
+            finally { await s.endSession(); }
+            const state = await q(models.RelayL2tpState,{node:nodeId});
+            if(state?.status !== 'not_installed' || state.desiredState !== 'absent' || state.secretRevision !== 0)refuse();
+            for(const[M,f]of[[models.TopologyConfigOwner,{_id:root.o._id,generation:root.o.generation,executionBindingCheck:nonce}],[models.HyNode,{_id:nodeId,executionBindingCheck:nonce}]])if(!await q(M,f))refuse();
+            await check();return {nodeId,status:'not_installed',desiredState:'absent',credentialRevision:0,installed:false,physicalPristineAbsence:true};
+        });
+    });
+}
+module.exports = { enrollTestOwners, initializeDedicatedTestState, initializePristineDedicatedRelayAbsence, assertTestContext, main };

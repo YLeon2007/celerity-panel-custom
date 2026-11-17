@@ -16,7 +16,7 @@ const TARGET_PROFILE_BY_ROLE = Object.freeze({
     bridge: 'xray-bridge',
 });
 const { READINESS_COMMANDS, validReadiness } = require('./topologyReadinessProtocol');
-const COMMANDS = new Set([...Object.values(TOPOLOGY_NODE_COMMANDS), ...READINESS_COMMANDS]);
+const COMMANDS = new Set([...Object.values(TOPOLOGY_NODE_COMMANDS), ...READINESS_COMMANDS, 'observe-verify']);
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CANDIDATE_HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const SERVICE_BY_TARGET_PROFILE = Object.freeze({
@@ -83,8 +83,9 @@ function assertRunnerRequest(runnerPath, request, binding) {
     const checksRequired = request?.command === TOPOLOGY_NODE_COMMANDS.VERIFY;
     const statusRequired = request?.command === TOPOLOGY_NODE_COMMANDS.STATUS;
     const readinessRequired = READINESS_COMMANDS.includes(request?.command);
-    const restoreRequired = request?.command === 'restore-users';
-    const expectedKeys = readinessRequired ? [...BASE_RUNNER_REQUEST_KEYS, 'readiness', ...(restoreRequired ? ['snapshot'] : [])].sort() : artifactRequired
+    const restoreRequired = ['restore-users', 'read-restored-users'].includes(request?.command);
+    const observationRequired=request?.command==='observe-verify';
+    const expectedKeys = observationRequired ? [...BASE_RUNNER_REQUEST_KEYS,'observation'].sort() : readinessRequired ? [...BASE_RUNNER_REQUEST_KEYS, 'readiness', ...(restoreRequired ? ['snapshot'] : [])].sort() : artifactRequired
         ? [...BASE_RUNNER_REQUEST_KEYS, 'artifact'].sort()
         : (checksRequired
             ? [...BASE_RUNNER_REQUEST_KEYS, 'checks'].sort()
@@ -97,7 +98,7 @@ function assertRunnerRequest(runnerPath, request, binding) {
         || ['attemptId', 'generation', 'predecessorGeneration', 'commandId'].some(key => !SAFE_ID_PATTERN.test(request[key]) || ['.', '..'].includes(request[key]))
         || request.generation === 'none'
         || request.executionContext !== binding.executionContext
-        || (statusRequired && !['prepare', 'commit', 'verify', 'rollback', 'close'].includes(request.completedCommand))
+        || (statusRequired && !['prepare', 'commit', 'verify', 'rollback', 'close', 'observe-verify'].includes(request.completedCommand))
         || request.nodeId !== binding.nodeId
         || request.targetProfile !== binding.targetProfile
         || !SAFE_ID_PATTERN.test(request.operationId)
@@ -107,7 +108,9 @@ function assertRunnerRequest(runnerPath, request, binding) {
         || (restoreRequired && (request.targetProfile !== 'xray-main' || typeof request.snapshot !== 'string'
             || Buffer.byteLength(request.snapshot) > 4194304
             || createHash('sha256').update(request.snapshot).digest('hex') !== request.readiness?.snapshotSha256))
+        || (request.command === 'read-restored-users' && request.executionContext !== 'test.infograd.online')
         || (readinessRequired && !validReadiness(request.command, request.readiness))
+        || (observationRequired && !require('./topologyNodeTransport').validVerifyObservation(request.observation,request))
         || (checksRequired && !validChecks(request.checks, request.targetProfile))
         || (
             artifactRequired
@@ -148,6 +151,7 @@ function runnerCommand(request) {
     if (READINESS_COMMANDS.includes(request.command)) {
         args.push(`--checks ${Buffer.from(JSON.stringify(request.readiness), 'utf8').toString('base64url')}`);
     }
+    if (request.command==='observe-verify') args.push(`--checks ${Buffer.from(JSON.stringify(request.observation),'utf8').toString('base64url')}`);
     return args.join(' ');
 }
 
@@ -161,7 +165,7 @@ function createArtifactInvoker(nodeSSH, binding) {
                     { stdin: request.artifact.content },
                 );
             }
-            if (request.command === 'restore-users') {
+            if (['restore-users', 'read-restored-users'].includes(request.command)) {
                 return await nodeSSH.exec(runnerCommand(request), { stdin: request.snapshot });
             }
             return await nodeSSH.exec(runnerCommand(request));

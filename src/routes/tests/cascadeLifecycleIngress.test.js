@@ -29,7 +29,7 @@ function query(value) {
     return { populate() { return this; }, sort() { return this; }, select() { return this; },
         lean: async () => value, then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); } };
 }
-async function request(router, method, path, body) {
+async function request(router, method, path, body, headers = {}) {
     const app = express();
     app.use(express.json());
     app.use((req, res, next) => { req.session = { authenticated: true }; next(); });
@@ -37,12 +37,12 @@ async function request(router, method, path, body) {
     const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
     try {
         const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`, {
-            method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+            method, headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
         });
         return { status: response.status, body: await response.json() };
     } finally { await new Promise(resolve => server.close(resolve)); }
 }
-function harness({ env = CLASSIC, insertError, coordinator = {} } = {}) {
+function harness({ env = CLASSIC, insertError, coordinator = {}, intentService } = {}) {
     const calls = { creates: [], updates: [], draftDeletes: [], lifecycleDeletes: [] };
     const rows = [];
     const Link = { find: () => query(rows), findOne: async () => null,
@@ -56,6 +56,7 @@ function harness({ env = CLASSIC, insertError, coordinator = {} } = {}) {
     };
     const router = createCascadeLinksRouter({ Link, Node, deploymentEnv: env,
         topologyDraftWriteService: draft, topologyCoordinator: coordinator,
+        topologyIntentService: intentService,
         maintainAutoL2tpPathsFn: async () => {}, invalidateSubscriptions: async () => {},
         invalidateTopology: async () => {},
     });
@@ -72,6 +73,7 @@ function mcpHarness(options = {}) {
     loaded.filename = filename;
     loaded.paths = Module._nodeModulePaths(require('node:path').dirname(filename));
     loaded.require = name => {
+        if (name === '../../modules/l2tpActiveHostProvider') return { l2tpActiveHostProvider: { getActiveHost: () => ({ selectedTopologyIntentService: options.intentService }) } };
         if (name === '../../models/cascadeLinkModel') return h.Link;
         if (name === '../../models/hyNodeModel') return h.Node;
         if (name === '../../services/cacheService') return { invalidateAllSubscriptions: async () => {} };
@@ -318,23 +320,33 @@ test('HTTP and MCP updates cannot add or replace a durable grant on existing row
     });
 });
 
-test('nonclassic DELETE retains draft-only behavior on HTTP and MCP', async () => {
+test('nonclassic HTTP and MCP DELETE share selected intent acceptance without an unsafe raw draft deletion', async () => {
     const env = { ...CLASSIC, CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false' };
-    const h = harness({ env, coordinator: { deleteLink() { assert.fail('native must not call classic coordinator'); } } });
-    h.rows.push({ _id: ID, name: 'synthetic' });
-    const response = await request(h.router, 'DELETE', `/${ID}`, { expectedTopologyRevision: 7 });
-    assert.equal(response.status, 200);
-    assert.deepEqual(h.calls.draftDeletes, [{ expectedTopologyRevision: 7, linkId: ID }]);
+    const accepted = [];
+    const job = { jobId: '507f1f77bcf86cd799439088', version: 2, kind: 'link.delete', linkId: ID,
+        desiredSaved: true, status: 'waiting', acceptanceRevision: 8 };
+    const intentService = { async accept(input) { accepted.push(input); return job; } };
+    const h = harness({ env, intentService, coordinator: { deleteLink() { assert.fail('native cannot call classic coordinator'); } } });
+    const row = { _id: ID, name: 'synthetic', portalNode: PORTAL, bridgeNode: BRIDGE, mode: 'reverse',
+        active: true, tunnelPort: 12000, tunnelUuid: '00000000-0000-4000-8000-000000000001' };
+    h.rows.push({ ...row });
+    const response = await request(h.router, 'DELETE', `/${ID}`, { expectedTopologyRevision: 7 }, { 'Idempotency-Key': 'native-delete' });
+    assert.equal(response.status, 202); assert.equal(response.body.job.jobId, job.jobId);
+    assert.deepEqual(h.calls.draftDeletes, []); assert.equal(h.rows.length, 1, 'ack is not a cleanup receipt');
     await withEnv(env, async () => {
-        const mcp = mcpHarness();
-        mcp.rows.push({ _id: ID, name: 'synthetic' });
-        const result = await mcp.manageCascade({ action: 'delete', id: ID, expectedTopologyRevision: 7 });
-        assert.equal(result.success, true);
-        assert.deepEqual(mcp.calls.draftDeletes, [{ expectedTopologyRevision: 7, linkId: ID }]);
+        const mcp = mcpHarness({ intentService });
+        mcp.rows.push({ ...row });
+        const result = await mcp.manageCascade({ action: 'delete', id: ID, expectedTopologyRevision: 7, requestKey: 'native-delete' });
+        assert.equal(result.accepted, true); assert.equal(result.job.jobId, job.jobId);
+        assert.deepEqual(mcp.calls.draftDeletes, []); assert.equal(mcp.rows.length, 1);
         assert.equal(mcp.factoryCalls(), 0);
         const deploy = await mcp.manageCascade({ action: 'deploy', id: ID });
         assert.equal(deploy.code, 'REVISION_SAFE_TOPOLOGY_DEPLOY_REQUIRED');
     });
+    assert.equal(accepted.length, 2); assert.deepEqual(accepted[0], accepted[1]);
+    assert.deepEqual(accepted[0], { version: 2, kind: 'link.delete', expectedTopologyRevision: 7,
+        requestKey: 'native-delete', linkId: ID,
+        desiredVersion: require('../../modules/relay-l2tp/services/topologyIntentService').linkDesiredVersion(row) });
 });
 
 test('HTTP save-only classic reverse create persists a server-issued durable grant in the draft insert', async () => {

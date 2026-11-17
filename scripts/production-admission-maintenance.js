@@ -7,7 +7,8 @@ async function main() {
         const { runProductionAdmissionMaintenance } = require('../src/modules/relay-l2tp/runtime/productionAdmissionMaintenanceEntry');
         const result = await runProductionAdmissionMaintenance();
         process.stdout.write(JSON.stringify({ initialized: result.initialized === true, ready: false,
-            dormant: true, holdRequired: true, mode: 'insert-only', stateSha256: result.stateSha256 }) + '\n');
+            dormant: true, holdRequired: true, mode: result.mode, stateSha256: result.stateSha256,
+            ...(result.prepared === true ? { prepared: true, addedFields: result.addedFields } : {}) }) + '\n');
     } catch {
         process.exitCode = 1;
         // A failure can follow a durable insert; false would imply rollback.

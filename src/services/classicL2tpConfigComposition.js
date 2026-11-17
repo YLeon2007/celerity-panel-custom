@@ -1,5 +1,7 @@
 'use strict';
 
+const { isDeepStrictEqual: equal } = require('node:util');
+
 const { cascadePathIngressPort } = require('../modules/relay-l2tp/domain/cascadePathIngress');
 
 function id(value) { return String(value?._id ?? value); }
@@ -27,6 +29,7 @@ function applyClassicL2tpPathIngress(config, { nodeId, groups = [], links = [], 
     const byId = new Map(links.map(link => [id(link), link]));
     const seenTags = new Set((config.inbounds || []).map(row => row.tag));
     const seenPorts = new Set((config.inbounds || []).map(row => row.port));
+    const requestedTags = new Set(), requestedPorts = new Set();
     for (const group of groups) {
         if (group.mode !== mode) continue;
         for (const path of group.paths || []) {
@@ -46,13 +49,23 @@ function applyClassicL2tpPathIngress(config, { nodeId, groups = [], links = [], 
             }
             const tag = `cascade-${path.pathKey}`;
             const port = cascadePathIngressPort(id(group), path.pathKey);
-            if (seenTags.has(tag) || seenPorts.has(port)) throw invalidPath();
+            if (requestedTags.has(tag) || requestedPorts.has(port)) throw invalidPath();
+            requestedTags.add(tag); requestedPorts.add(port);
+            const reuse = seenTags.has(tag) || seenPorts.has(port);
+            if (reuse) {
+                const matching = (config.inbounds || []).filter(row => row.tag === tag || row.port === port);
+                const expected = { tag, listen: '127.0.0.1', port, protocol: 'socks', settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' } };
+                const target = mode === 'reverse' ? `portal-down-${id(pathLinks[start]).slice(-8)}` : `fwd-${id(pathLinks.at(-1)).slice(-8)}`;
+                const rules = config.routing.rules.filter(rule => rule.inboundTag?.includes(tag));
+                if (matching.length !== 1 || !equal(matching[0], expected)
+                    || !equal(rules, [{ type: 'field', inboundTag: [tag], outboundTag: target }])) throw invalidPath();
+            }
             seenTags.add(tag);
             seenPorts.add(port);
             if (mode === 'reverse') {
                 const egressTag = `portal-down-${id(pathLinks[start]).slice(-8)}`;
                 if (!config.reverse?.portals?.some(row => row.tag === egressTag)) throw invalidPath();
-                generator.applyCascadePathIngress(config, [{ pathKey: path.pathKey, port, egressTag }]);
+                if (!reuse) generator.applyCascadePathIngress(config, [{ pathKey: path.pathKey, port, egressTag }]);
             } else {
                 const suffix = pathLinks.slice(start);
                 if (suffix.some(link => !link.bridgeNode?.ip && !link.bridgeNode?.domain)) throw invalidPath();
@@ -65,11 +78,13 @@ function applyClassicL2tpPathIngress(config, { nodeId, groups = [], links = [], 
                 fragment.routing.rules = [{ type: 'field', inboundTag: [tag], outboundTag: `fwd-${id(suffix[suffix.length - 1]).slice(-8)}` }];
                 for (const outbound of fragment.outbounds) {
                     const existing = (config.outbounds || []).find(row => row.tag === outbound.tag);
-                    if (existing && JSON.stringify(existing) !== JSON.stringify(outbound)) throw invalidPath();
+                    if (existing && !equal(existing, outbound)) throw invalidPath();
                     if (!existing) (config.outbounds ||= []).push(outbound);
                 }
-                (config.inbounds ||= []).push(...fragment.inbounds);
-                (config.routing ||= { rules: [] }).rules.push(...fragment.routing.rules);
+                if (!reuse) {
+                    (config.inbounds ||= []).push(...fragment.inbounds);
+                    (config.routing ||= { rules: [] }).rules.push(...fragment.routing.rules);
+                }
             }
         }
     }

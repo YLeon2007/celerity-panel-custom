@@ -5,13 +5,14 @@ const {
 } = require('./frozenTopologyDeploymentPlanComposer');
 const { projectGroups } = require('../domain/topologyDraft');
 const { isDeepStrictEqual } = require('node:util');
+const { installedPrimaryReserve } = require('../domain/primaryReservePolicy');
 
 const { topologyExecutionContext, TOPOLOGY_EXECUTION_CONTEXTS } = require('../domain/topologyExecutionContext');
 const TEST_TOPOLOGY_TARGET = 'test';
 const TEST_TOPOLOGY_HOST_IDENTITY = 'test.infograd.online';
 const SUPPORTED_ROLES = Object.freeze(['portal', 'relay', 'bridge']);
 const SUPPORTED_MODES = Object.freeze(['forward', 'reverse']);
-const STAGED_OPERATION_KINDS = new Set(['link.apply', 'link.attach', 'link.replace', 'link.delete']);
+const STAGED_OPERATION_KINDS = new Set(['link.apply', 'link.attach', 'link.replace', 'link.delete', 'domain.reconcile']);
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const NODE_METADATA_FILTER = Object.freeze({
     type: 'xray',
@@ -38,6 +39,9 @@ const NODE_METADATA_SELECT = Object.freeze([
     'xray.realityDest',
     'xray.realitySni',
     'xray.realityPrivateKey',
+    'xray.realityPublicKey',
+    'xray.fingerprint',
+    'xray.fingerprintPool',
     'xray.realityShortIds',
     'xray.realitySpiderX',
     'xray.wsPath',
@@ -198,6 +202,7 @@ function projectPinnedSnapshot(pinnedSnapshot, operationKind) {
     const groups = projectPinnedGroups(topology.groups);
     const relays = compiled.relays.map(relay => ({
         nodeId: assertSafeId(relay?.nodeId, 'UNSAFE_COMPILED_RELAY_IDENTITY'),
+        ...(relay.routeGroups ? { routeGroups: structuredClone(relay.routeGroups) } : {}),
     })).sort((left, right) => left.nodeId.localeCompare(right.nodeId, 'en'));
 
     return {
@@ -297,6 +302,16 @@ function descriptorInstalledPath(value, before, after) {
     const pathKey = assertSafeId(value?.pathKey, 'TOPOLOGY_INSTALLED_PATH_MISMATCH');
     const ownerNodeId = assertSafeId(value?.ownerNodeId, 'TOPOLOGY_INSTALLED_PATH_MISMATCH');
     const owner = after.nodes.find(node => node.id === ownerNodeId) || before.nodes.find(node => node.id === ownerNodeId);
+    if (value.preserveGroupPaths === true) {
+        const policy = installedPrimaryReserve(after, value);
+        const old = before.groups.find(group => String(group.id ?? group._id) === groupId)
+            ?.paths.find(path => path.pathKey === pathKey);
+        if (owner?.role !== 'relay' || !old || !isDeepStrictEqual(old.linkIds, value.oldPathLinkIds)
+            || !isDeepStrictEqual(policy.selected?.path.linkIds || [], value.newPathLinkIds)) {
+            fail('TOPOLOGY_INSTALLED_PATH_MISMATCH', 'Installed policy must match the frozen descriptors');
+        }
+        return { groupId, pathKey, ownerNodeId };
+    }
     const path = topology => topology.groups.find(group => String(group.id ?? group._id) === groupId)
         ?.paths.find(path => path.pathKey === pathKey);
     const beforeGroup = before.groups.find(group => String(group.id ?? group._id) === groupId);
@@ -360,6 +375,7 @@ class TopologyOperationPlanMaterializer {
             }
             return composeFrozenTopologyDeploymentPlan({
                 ...input,
+                executionContext: topologyExecutionContext(target, hostIdentity),
                 snapshot: after,
                 nodeMetadata: after.nodes,
                 linkMetadata: after.links,
@@ -415,6 +431,7 @@ class TopologyOperationPlanMaterializer {
 
         return composeFrozenTopologyDeploymentPlan({
             ...input,
+            executionContext: topologyExecutionContext(target, hostIdentity),
             nodeMetadata: projectNodeMetadata(nodeRows),
             linkMetadata: projectLinkMetadata(linkRows),
         });

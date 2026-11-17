@@ -2419,3 +2419,54 @@ test('last HyNode majority delivery cannot outlive either exact lease or confirm
         assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
     });
 });
+
+// Real Mongo race from fresh TEST f2b8...: an ordinary same-owner heartbeat
+// renews Lock after the binding snapshot and before its CAS (Mongo 112).
+for (const fault of ['one-renewal', 'continuous-renewal', 'foreign-winner']) test(`known-aborted binding revalidation race: ${fault}`, async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment);
+    const binding = await store.createBinding(expected);
+    const originalBinding = await models.Binding.findOne().lean();
+    const update = models.Lock.updateOne;
+    let renewals = 0, conflicts = 0, callbackCount = 0;
+    models.Lock.updateOne = async function(filter, changes, options) {
+        if (options?.session && (fault === 'continuous-renewal' || renewals === 0)) {
+            renewals++;
+            if (fault === 'foreign-winner') {
+                await models.Lock.collection.updateOne({ node: new mongoose.Types.ObjectId(NODE) }, { $set: { owner: 'foreign-winner', generation: randomUUID() } });
+            } else {
+                const repository = new NodeOperationLockRepository({ model: models.Lock });
+                assert.equal(await repository.renewLease({ node: NODE, owner: expected.owner,
+                    operationId: expected.operationId, generation: expected.generation,
+                    now: new Date(), leaseUntil: new Date(Date.now() + 180000 + renewals) }), true);
+            }
+        }
+        try { return await update.call(this, filter, changes, options); }
+        catch (error) {
+            if (error.code === 112) { conflicts++; assert.equal(error.hasErrorLabel('TransientTransactionError'), true); }
+            throw error;
+        }
+    };
+    try {
+        const run = () => store.withVerifiedBinding(expected, async current => {
+            callbackCount++;
+            assert.deepEqual(current, binding);
+            assert.deepEqual((await store.readVerifiedConnection(expected, binding)).binding, binding);
+            return 'verified';
+        });
+        if (fault === 'one-renewal') {
+            assert.equal(await run(), 'verified');
+            assert.equal(conflicts, 1); assert.equal(renewals, 1); assert.equal(callbackCount, 1);
+        } else {
+            await assert.rejects(run(), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+            assert.equal(callbackCount, 0);
+            assert.ok(conflicts >= 1 && conflicts <= 3, 'known-aborted retries are finite');
+            if (fault === 'continuous-renewal') assert.equal(conflicts, 3);
+        }
+    } finally { models.Lock.updateOne = update; }
+    assert.equal(await models.Binding.countDocuments(), 1, 'no IDs/bindings are reallocated');
+    assert.deepEqual(await models.Binding.findOne().lean(), originalBinding);
+    assert.equal((await models.Operation.findOne().lean()).attempts, 1, 'not an operation replay');
+    assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    assert.equal(await models.Lock.countDocuments(), 1, 'no ownership is released');
+});

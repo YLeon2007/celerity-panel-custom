@@ -234,7 +234,17 @@ function buildCandidate(snapshot, mutation) {
                 { routeGroupId },
             );
         }
-        if ((snapshot.activeRouteGroupIds || []).some(id => entityId(id) === routeGroupId)
+        const prior = groups[groupIndex];
+        const proposed = { ...prior, ...(mutation.changes || {}) };
+        const policyOnly = prior.strategy === 'priority-failover' && prior.paths?.length >= 1
+            && proposed.strategy === prior.strategy && proposed.mode === prior.mode
+            && Array.isArray(proposed.paths) && proposed.paths.length >= 2
+            && prior.paths.every((path, index) => proposed.paths[index]?.pathKey === path.pathKey
+                && isDeepStrictEqual(path.linkIds.map(entityId), proposed.paths[index].linkIds.map(entityId)))
+            && Object.keys(mutation.changes || {}).every(key => ['name', 'mode', 'strategy', 'paths'].includes(key))
+            && require('./primaryReservePolicy').primaryReservePolicies({ nodes: projectNodes(snapshot.nodes),
+                links: projectLinks(snapshot.links), groups: projectGroups([proposed]) }).length === 1;
+        if (!policyOnly && (snapshot.activeRouteGroupIds || []).some(id => entityId(id) === routeGroupId)
             && Object.entries(mutation.changes || {}).some(([key, value]) =>
                 key !== 'name' && changedGroupField(groups[groupIndex], key, value))) {
             // Name is display-only; applied topology needs a replacement operation.

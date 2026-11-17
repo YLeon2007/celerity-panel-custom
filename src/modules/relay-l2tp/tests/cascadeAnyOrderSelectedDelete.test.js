@@ -115,12 +115,15 @@ test('delete identity survives strict schema and malformed tombstone fails befor
     assert.equal(result.status, 'failed'); assert.equal(f.calls.length, 0);
     assert.equal(f.NodeOperationLock.rows.length, 0);
 });
-test('verified no-history pending delete still uses real cleanup/readback protocol', async () => {
+test('verified absent-applied pending delete is DB-only and preserves ownership/history without an invented operation', async () => {
     const f = fixture(); const neighbor = structuredClone(f.CascadeLink.rows[1]);
+    const owners = structuredClone(f.TopologyConfigOwner.rows), history = structuredClone(f.TopologyOperation.rows);
     const queued = await remove(f, id(10));
-    assert.equal((await f.worker.run(queued.operationId)).status, 'succeeded');
+    assert.equal(queued.status, 'succeeded'); assert.equal(queued.desiredOnly, true);
+    assert.equal(queued.operationId, undefined);
     assert.deepEqual(f.CascadeLink.rows, [neighbor]);
-    assert.ok(f.calls.some(([kind]) => kind === 'commit'));
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.TopologyConfigOwner.rows, owners); assert.deepEqual(f.TopologyOperation.rows, history);
 });
 test('same delete job replays after row removal, changed job content is rejected', async () => {
     const f = fixture(); await apply(f, id(10));
@@ -143,8 +146,14 @@ for (const hasHistory of [false, true]) test(`disabled pending delete uses verif
     f.CascadeLink.rows[0].active = false; f.CascadeLink.rows[0].status = 'pending';
     const queued = await remove(f, id(10));
     let reads = 0; f.executor.verify = async () => { reads++; return { ok: true }; };
-    assert.equal((await f.worker.run(queued.operationId)).status, 'succeeded');
-    assert.equal(reads, 2); assert.equal(f.CascadeLink.rows.some(row => row._id === id(10)), false);
+    if (hasHistory) {
+        assert.equal((await f.worker.run(queued.operationId)).status, 'succeeded');
+        assert.equal(reads, 2, 'pending/disabled does not override verified applied history');
+    } else {
+        assert.equal(queued.desiredOnly, true); assert.equal(queued.operationId, undefined);
+        assert.equal(reads, 0); assert.deepEqual(f.calls, []);
+    }
+    assert.equal(f.CascadeLink.rows.some(row => row._id === id(10)), false);
 });
 test('executor-owner absent-listener handoff survives admission, strict schema and actual worker', async () => {
     const f = fixture(); await apply(f, id(10));

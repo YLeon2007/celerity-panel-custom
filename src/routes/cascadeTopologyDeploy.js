@@ -23,6 +23,7 @@ const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const { isCompletedClassicDeploymentResult, isClassicProductionDeploymentConfigured } = require('../services/classicScopedCascadeDeploymentService');
 const { selectLinkApplyBaselineLinkIds, acceptedIntentResponse, readPersistedIntent } = require('./cascadeLinks');
 const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
+const { nodeActivation: normalizeNodeActivation, selectedDesiredVersion } = require('../modules/relay-l2tp/services/topologyNodeActivation');
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 
 const DEFAULT_MODELS = Object.freeze({
@@ -45,6 +46,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CASCADE_LINK_NOT_FOUND', 404],
     ['CASCADE_LINK_DISABLED', 409],
     ['OPERATION_NOT_FOUND', 404],
+    ['APPLIED_BASELINE_REQUIRED', 409],
+    ['TOPOLOGY_CANCELLED_BASELINE_UNPROVEN', 409],
     ['STALE_TOPOLOGY_REVISION', 409],
     ['TOPOLOGY_REPLACEMENT_RESERVED', 409],
     ['TOPOLOGY_DEPLOY_BUSY', 409],
@@ -113,7 +116,7 @@ function normalizeDeployRequest(body) {
         );
     }
     const keys = Object.keys(body);
-    if (keys.some(key => !['expectedTopologyRevision', 'linkId', 'domainLinkId', 'desiredVersion'].includes(key))
+    if (keys.some(key => !['expectedTopologyRevision', 'linkId', 'domainLinkId', 'desiredVersion', 'nodeActivation'].includes(key))
         || (Object.hasOwn(body, 'linkId') && Object.hasOwn(body, 'domainLinkId'))) {
         throw new TopologyDeployRequestError(
             'INVALID_REQUEST',
@@ -131,6 +134,9 @@ function normalizeDeployRequest(body) {
         throw new TopologyDeployRequestError('INVALID_REQUEST', 'Invalid desired link version');
     }
     const expectedTopologyRevision = body.expectedTopologyRevision;
+    if (body.nodeActivation !== undefined && (!body.linkId || body.domainLinkId)) {
+        throw new TopologyDeployRequestError('INVALID_REQUEST', 'Node activation requires an explicit applied anchor');
+    }
     if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) {
         throw new TopologyDeployRequestError(
             'INVALID_TOPOLOGY_REVISION',
@@ -139,6 +145,7 @@ function normalizeDeployRequest(body) {
     }
     return {
         expectedTopologyRevision,
+        ...(body.nodeActivation !== undefined ? { nodeActivation: normalizeNodeActivation(body.nodeActivation) } : {}),
         ...(Object.hasOwn(body, 'linkId') ? { linkId: body.linkId } : {}),
         ...(Object.hasOwn(body, 'domainLinkId') ? { domainLinkId: body.domainLinkId } : {}),
         ...(Object.hasOwn(body, 'desiredVersion') ? { desiredVersion: body.desiredVersion } : {}),
@@ -379,6 +386,22 @@ function createCascadeTopologyDeployRouter({
         req.apiKey ? next() : csrf(req, res, next)
     );
 
+    // Restriction only: absence of a ban is not enrollment or execution proof.
+    // Ordinary classic Deploy and operations in an active native epoch are not gated.
+    router.get('/activation-policy', requireAuth, readScope, operationStatusRateLimiter, async (req, res) => {
+        res.set('Cache-Control', 'no-store');
+        try {
+            const executionContext = require('../modules/relay-l2tp/domain/topologyExecutionContext')
+                .TOPOLOGY_EXECUTION_CONTEXTS.find(context => context.hostIdentity === deploymentEnv.PANEL_DOMAIN);
+            const policy = executionContext ? await require('../modules/relay-l2tp/services/topologyReentryPolicy')
+                .readBusinessReentryRestriction({ executionContext, ...models }) : { blocked: false };
+            return res.json(policy);
+        } catch {
+            return res.status(503).json({ code: 'TOPOLOGY_REENTRY_POLICY_UNAVAILABLE',
+                message: 'Проверка истории повторного включения недоступна.' });
+        }
+    });
+
     // Read-only operation polling for the UI; authenticated, nodes:read
     // scoped, and rate limited — but no CSRF since it never mutates state.
     router.get(
@@ -431,6 +454,10 @@ function createCascadeTopologyDeployRouter({
         async (req, res) => {
             try {
                 const input = normalizeDeployRequest(req.body);
+                if (input.nodeActivation && (isClassicProductionDeploymentConfigured(deploymentEnv)
+                    || deploymentService.requiresL2tpIngressPreparation === false)) {
+                    throw new TopologyDeployRequestError('TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 'Node activation requires native selected runtime');
+                }
                 if (input.linkId && !isClassicProductionDeploymentConfigured(deploymentEnv)
                     && deploymentService.requiresL2tpIngressPreparation !== false) {
                     const service = topologyIntentService === undefined
@@ -450,7 +477,8 @@ function createCascadeTopologyDeployRouter({
                     const job = await service.accept({ version: 2, kind: 'link.apply',
                         expectedTopologyRevision: input.expectedTopologyRevision,
                         requestKey, linkId: input.linkId,
-                        desiredVersion: input.desiredVersion ?? (selected ? linkDesiredVersion(selected) : existing.desiredVersion) });
+                        ...(input.nodeActivation ? { nodeActivation: input.nodeActivation } : {}),
+                        desiredVersion: input.desiredVersion ?? (selected ? await selectedDesiredVersion(models, selected, input.nodeActivation) : existing.desiredVersion) });
                     return res.status(202).json(acceptedIntentResponse(job));
                 }
                 let result;

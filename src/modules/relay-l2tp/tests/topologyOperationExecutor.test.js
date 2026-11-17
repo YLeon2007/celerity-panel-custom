@@ -10,6 +10,30 @@ const {
     TopologyOperationExecutorError,
 } = require('../services/topologyOperationExecutor');
 
+test('partial prepare continuation wave: original prepare is restored by exact status only, never replay', async t => {
+    for (const fault of ['none', 'unknown', 'wrong-id', 'wrong-boot']) await t.test(fault, async () => {
+        const { executor, events } = executorFixture({ responseOverrides: { status: {
+            phase: 'prepared', completedCommand: 'prepare', systemdJob: 'not-applicable', serviceState: 'not-applicable',
+            ...(fault === 'unknown' ? { completion: 'unknown' } : {}),
+            ...(fault === 'wrong-id' ? { commandId: 'foreign' } : {}),
+            ...(fault === 'wrong-boot' ? { bootId: 'foreign' } : {}),
+        } } });
+        const node = frozenNode();
+        const binding = fixtureReader().rows.get(node.node);
+        const rehydrated = await executor.rehydrate({ ...prepareContext(node), backupId: binding.backupId });
+        const context = lifecycleContext(rehydrated, node);
+        if (fault === 'none') assert.equal((await executor.restoreCompletedPrepare(context)).ok, true);
+        else await assert.rejects(executor.restoreCompletedPrepare(context));
+        const dispatched = events.filter(e => e.method === 'transport').map(e => e.request);
+        assert.deepEqual(dispatched.map(r => r.command), ['status']);
+        assert.equal(dispatched[0].commandId, binding.commandIds.prepare);
+        if (fault !== 'none') {
+            await assert.rejects(executor.commit(context));
+            assert.equal(events.filter(e => e.method === 'transport').length, 1, 'refused status cannot authorize commit');
+        }
+    });
+});
+
 test('real V2 worker settles only after held proofs and keeps failure recovery read-only', async t => {
     for (const fault of ['none', 'users', 'ppp', 'close', 'persist', 'settle']) await t.test(fault, async () => {
         const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
@@ -976,4 +1000,30 @@ test('ownership lost during node resolution cannot enter bootstrap', async () =>
     const { executor, events } = executorFixture({ onResolve(reader) { reader.rows.clear(); } });
     await assert.rejects(executor.prepare(prepareContext()));
     assert.deepEqual(events.map(event => event.method), ['resolve']);
+});
+
+// Error-boundary regressions only: these inject an independent refusal locally.
+// They do not establish the discarded historical fb935 inner cause.
+for (const boundary of ['prepare', 'terminal']) test(`independent connection refusal retains private original cause at ${boundary}`, async () => {
+    const { executor, events, reader } = executorFixture();
+    let context;
+    if (boundary === 'terminal') {
+        context = lifecycleContext(await executor.prepare(prepareContext()));
+        await executor.commit(context);
+        await executor.verify(context);
+        await executor.terminalBindings([context]);
+    }
+    const before = events.length;
+    const primary = Object.assign(new Error('PRIVATE_CONNECTION_TRANSACTION_PRIMARY'), { code: 112 });
+    reader.readVerifiedConnection = async () => { throw primary; };
+    let work = false;
+    await assert.rejects(boundary === 'prepare' ? executor.prepare(prepareContext())
+        : executor.withVerifiedMutationScope([context], () => { work = true; }), error => {
+        assert.equal(error.code, 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN');
+        assert.strictEqual(error.cause, primary);
+        if (boundary === 'prepare') assert.equal(error.remoteOutcomeUncertain, false);
+        return true;
+    });
+    assert.equal(work, false);
+    assert.equal(events.length, before, 'no remote lookup, command or auxiliary writer after independent refusal');
 });

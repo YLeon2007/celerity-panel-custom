@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const { isDeepStrictEqual } = require('node:util');
 const { projectGroups } = require('../domain/topologyDraft');
 const { ownedIngressRouteState } = require('./topologyAttachIngressGate');
+const { installedPrimaryReserve } = require('../domain/primaryReservePolicy');
 const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
 const {
     DefaultChainPathError,
@@ -262,6 +263,7 @@ class L2tpSimpleService {
         secretKey = null,
         topologyIngressGate,
         topologyPppReadinessGate,
+        prepareTopologyIngress,
     } = {}) {
         if (!HyNode || typeof HyNode.find !== 'function' || typeof HyNode.findById !== 'function') {
             throw new TypeError('L2TP simple service requires the HyNode model');
@@ -322,6 +324,7 @@ class L2tpSimpleService {
         }
         this.topologyIngressGate = topologyIngressGate;
         this.topologyPppReadinessGate = topologyPppReadinessGate;
+        this.prepareTopologyIngress = prepareTopologyIngress;
     }
 
     revealAccountPassword(passwordEncrypted) {
@@ -645,6 +648,7 @@ class L2tpSimpleService {
             && ids.every(id => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id))
             && new Set(ids).size === ids.length;
         const routeState = ownedIngressRouteState(plan);
+        const policy = installedPrimaryReserve(plan.effectiveTopology, plan.installedPath);
         if (!frozen(plan) || !routeState || typeof plan.operationId !== 'string' || !plan.operationId
             || !Number.isSafeInteger(plan.topologyRevision) || plan.topologyRevision < 0
             || !Number.isSafeInteger(plan.ownerTopologyRevision) || plan.ownerTopologyRevision < 0
@@ -674,22 +678,34 @@ class L2tpSimpleService {
             }
             const path = group.paths.find(path => path.pathKey === plan.pathKey);
             const absentAttach = !path && plan.kind === 'link.attach' && plan.oldPathLinkIds.length === 0;
-            if (!absentAttach && (!path || path.enabled === false || !Array.isArray(path.linkIds)
+            if (!absentAttach && (!path || path.enabled === false && !policy || !Array.isArray(path.linkIds)
                 || !isDeepStrictEqual(path.linkIds.map(entityId), plan.oldPathLinkIds))) {
                 throw simpleError('INGRESS_PATH_CONFLICT', 'Installed ingress path changed');
             }
             return { state: matches[0], group };
         };
         const before = await readOwner();
-        const proposed = projectGroups([before.group])[0];
+        let proposed = projectGroups([before.group])[0];
+        const leafDeletion = plan.kind === 'link.delete' && plan.baselineTopology
+            ? require('../domain/primaryReservePolicy').selectedReserveLeafDeletion(
+                plan.baselineTopology, proposed, plan, plan.linkId) : null;
+        if (leafDeletion) {
+            if (!isDeepStrictEqual(proposed, plan.groupBefore)) {
+                throw simpleError('INGRESS_PATH_CONFLICT', 'Frozen reserve-delete group changed');
+            }
+            proposed = leafDeletion.appliedGroup;
+        }
         const ownedPath = proposed.paths.find(path => path.pathKey === plan.pathKey);
-        if (ownedPath) ownedPath.linkIds = [...plan.newPathLinkIds];
-        else proposed.paths.push(projectGroups([{ _id: plan.groupId, paths: [{
+        if (ownedPath && !policy) ownedPath.linkIds = [...plan.newPathLinkIds];
+        else if (!ownedPath) proposed.paths.push(projectGroups([{ _id: plan.groupId, paths: [{
             pathKey: plan.pathKey, linkIds: plan.newPathLinkIds, priority: 1, enabled: true,
         }] }])[0].paths[0]);
         const groups = plan.effectiveTopology.groups.filter(group => entityId(group) === plan.groupId);
         if (groups.length !== 1 || !isDeepStrictEqual(projectGroups(groups)[0], proposed)) {
             throw simpleError('INGRESS_PATH_CONFLICT', 'Only the owned path may change in the prepared group');
+        }
+        if (policy && !isDeepStrictEqual(policy.selected?.path.linkIds || [], plan.newPathLinkIds)) {
+            throw simpleError('INGRESS_PATH_CONFLICT', 'Selected policy suffix changed');
         }
         const nodes = new Map(plan.effectiveTopology.nodes.map(node => [node.id, node.role]));
         const links = new Map(plan.effectiveTopology.links.map(link => [link.id, link]));
@@ -817,6 +833,12 @@ class L2tpSimpleService {
         if (routeGroupId) {
             await this.ensureRelayGroupPath(selectedNodeId, routeGroupId);
         }
+
+        // This topology-owned phase MUST settle before configure/users and
+        // before l2tpService.install acquires remote admission/the L2TP lock.
+        // Missing/non-pristine PPP baselines remain a typed refusal, not a
+        // reason to nest topology admission inside the install worker.
+        await this.prepareTopologyIngress?.({ nodeId: selectedNodeId, routeGroupId });
 
         if (!state || state.desiredState !== 'installed') {
             // Fresh relay or one whose state was reset by uninstall. Reuse the

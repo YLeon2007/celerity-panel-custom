@@ -81,6 +81,16 @@ const scopedFailure = code => Object.assign(new Error(code), { code });
 const scopedHash = text => createHash('sha256').update(text).digest('hex');
 const scopedId = value => String(value?._id || value);
 const shellQuote = text => `'${text.replace(/'/g, `'\\''`)}'`;
+// deployLink marks its exact selected row pending before rebuilding MAIN.
+// In topology-enabled TEST, include only that explicit pending mutation, not
+// neighboring save-only drafts. Ordinary Sync (no selection) stays applied-only.
+function classicExplicitStatusFilter(allowedStatuses, selectedLinkIds = []) {
+    if (!allowedStatuses) return {};
+    if (!Array.isArray(selectedLinkIds)) throw new TypeError('Invalid classic selected link ids');
+    const applied = { status: { $in: allowedStatuses } };
+    const ids = [...new Set(selectedLinkIds.map(String))];
+    return ids.length ? { $or: [applied, { _id: { $in: ids }, status: 'pending' }] } : applied;
+}
 // Compare JSON values without changing array/routing order or disclosing bytes.
 function scopedCanonical(value) {
     if (Array.isArray(value)) return `[${value.map(scopedCanonical).join(',')}]`;
@@ -1500,11 +1510,11 @@ class CascadeService {
      * @param {Array<string>} [allowedStatuses] - Limit links when called by topology-enabled classic Sync
      * @returns {Promise<Array>}
      */
-    async _getForwardChainLinks(startNodeId, excludeSet = new Set(), allowedStatuses) {
+    async _getForwardChainLinks(startNodeId, excludeSet = new Set(), allowedStatuses, selectedLinkIds) {
         const allForwardLinks = (await CascadeLink.find({
             mode: 'forward',
             active: true,
-            ...(allowedStatuses && { status: { $in: allowedStatuses } }),
+            ...classicExplicitStatusFilter(allowedStatuses, selectedLinkIds),
         }).populate('bridgeNode')).filter(l => !excludeSet.has(String(l._id)));
 
         if (allForwardLinks.length === 0) return [];
@@ -1553,18 +1563,21 @@ class CascadeService {
     // ==================== INTERNAL HELPERS ====================
 
     /** Add accepted classic group/path listeners to their existing profile. */
-    async _applyClassicL2tpPathIngress(config, node, { mode, excludeLinkIds = [] } = {}) {
+    async _applyClassicL2tpPathIngress(config, node, { mode, excludeLinkIds = [], appliedLinkIds } = {}) {
         if (node.cascadeRole !== 'relay') return config;
         const excludeSet = new Set(excludeLinkIds.map(String));
+        const applied = appliedLinkIds === undefined ? null : new Set(appliedLinkIds.map(String));
         const outgoing = (await CascadeLink.find({ portalNode: node._id, active: true }))
-            .filter(link => !excludeSet.has(String(link._id)) && (link.mode || 'reverse') === mode);
+            .filter(link => !excludeSet.has(String(link._id)) && (link.mode || 'reverse') === mode
+                && (!applied || applied.has(String(link._id))));
         if (outgoing.length === 0) return config;
         const CascadeRouteGroup = require('../modules/relay-l2tp/models/cascadeRouteGroupModel');
         const groups = (await CascadeRouteGroup.find({
             'paths.linkIds': { $in: outgoing.map(link => link._id) },
         }).lean()).map(group => ({
             ...group,
-            paths: group.paths.filter(path => !path.linkIds.some(linkId => excludeSet.has(String(linkId)))),
+            paths: group.paths.filter(path => !path.linkIds.some(linkId => excludeSet.has(String(linkId)))
+                && (!applied || path.linkIds.some(linkId => outgoing.some(link => String(link._id) === String(linkId))))),
         }));
         if (groups.length === 0) return config;
         const ids = [...new Set(groups.flatMap(group => group.paths.flatMap(path => path.linkIds.map(String))))];
@@ -1587,7 +1600,7 @@ class CascadeService {
         // the persisted link.tunnelUuid, which mismatches the deterministic
         // tunnel credentials the topology composer derives for the other end.
         const allowedStatuses = usesTestTopologyConfig(portalNode) ? APPLIED_LINK_STATUSES : undefined;
-        const statusFilter = allowedStatuses ? { status: { $in: allowedStatuses } } : {};
+        const statusFilter = classicExplicitStatusFilter(allowedStatuses, opts.selectedLinkIds);
         const topologyManaged = await topologyManagesNodeConfig(portalNode);
         if (topologyManaged) {
             if (opts.requireCompletion) throw undeployUncertain('Topology-managed config cannot be removed by the classic writer');
@@ -1626,7 +1639,7 @@ class CascadeService {
         // alone must not suppress an ordinary main-owned reverse portal.
         const hasReverseUpstream = allBridgeLinks.some(link => link.mode !== 'forward');
         const reverseLinks = hasReverseUpstream ? [] : allPortalLinks.filter(l => l.mode !== 'forward');
-        const forwardLinks = await this._getForwardChainLinks(portalNode._id, excludeSet, allowedStatuses);
+        const forwardLinks = await this._getForwardChainLinks(portalNode._id, excludeSet, allowedStatuses, opts.selectedLinkIds);
 
         // Cascade routing applies to ALL client-facing inbounds (main + extras).
         const inboundTags = [
@@ -1677,7 +1690,10 @@ class CascadeService {
                         ? await readClassicProfile(ssh, BRIDGE, { allowAbsent: true }) : null;
                     const selection = selectClassicMain({ node: portalNode, current, bridgeCurrent, portalLinks, hopLinks,
                         forwardLinks: candidates, ...opts });
-                    finalConfig = JSON.stringify(selection.compose(JSON.parse(configStr)), null, 2);
+                    const composed = selection.compose(JSON.parse(configStr));
+                    await this._applyClassicL2tpPathIngress(composed, portalNode, { ...opts, mode: 'forward',
+                        appliedLinkIds: selection.forward.map(link => String(link._id)) });
+                    finalConfig = JSON.stringify(composed, null, 2);
                 }
                 if (allowedStatuses && portalNode.type === 'xray' && portalNode.cascadeRole === 'relay') {
                     const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
@@ -1754,6 +1770,8 @@ class CascadeService {
             const selection = selectClassicBridge({ current, links: candidates, downstreamLinks,
                 allowEmpty: !!opts.excludeLinkIds?.length, ...opts });
             const composed = selection.compose();
+            await this._applyClassicL2tpPathIngress(composed, bridgeNode, { ...opts, mode: 'reverse',
+                appliedLinkIds: selection.downstreamLinks.map(link => String(link._id)) });
             if (!selection.links.length && !composed.inbounds?.length) {
                 await ssh.exec('systemctl stop xray-bridge && systemctl disable xray-bridge');
                 return true;

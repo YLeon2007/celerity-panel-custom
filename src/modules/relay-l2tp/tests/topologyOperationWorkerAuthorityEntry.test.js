@@ -47,7 +47,7 @@ function fixture(context = PROD) {
                 await lifecycle.assertHeld();
                 assert.ok(request.executionContext === context);
                 assert.deepEqual(request, { executionContext: context, operationId: OPERATION,
-                    owner: 'authority-worker', leaseMs: 30000, now: NOW });
+                    owner: 'authority-worker', leaseMs: 30000, now: NOW, preserveExecutionAttempt: true });
                 trace.push('held claim');
                 return null;
             } },

@@ -353,6 +353,47 @@ test('terminal completion refuses a still-owned node lock, even after operation 
     assert.equal(f.state.remoteAdmissionCount, 0);
 });
 
+test('exact first-install owner veto before any step closes its admission, not a dispatched/uncertain failure', async () => {
+    for (const mutation of [null, op => op.step = 'install_runtime', op => op.backupId = 'backup',
+        op => op.progress = 1, op => op.errorCode = 'REMOTE_COMMAND_OUTCOME_UNCERTAIN']) {
+        const f = fixture();
+        const admissionId = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+        Object.assign(f.records.get(admissionId), { phase: 'recovery_required', operationId: 'veto-op',
+            leaseOwner: 'worker-1', ownerGeneration: 2 });
+        const op = { _id: 'veto-op', node: 'relay-1', kind: 'install', status: 'failed',
+            errorCode: 'CLASSIC_CONFIG_WRITE_OWNER_VETO', progress: 0, step: '', backupId: '',
+            logs: [{ code: 'CLASSIC_CONFIG_WRITE_OWNER_VETO' }], admissionId, leaseOwner: 'worker-1', ownerGeneration: 2 };
+        mutation?.(op); f.operations.set('veto-op', op);
+        const input = { admissionId, operationId: 'veto-op', nodeId: 'relay-1', owner: 'worker-1', ownerGeneration: 2, kind: 'install' };
+        if (mutation) {
+            await assert.rejects(f.repository.completeTerminalOperation(input), { code: 'REMOTE_ADMISSION_NOT_TERMINAL' });
+            assert.equal(f.state.remoteAdmissionCount, 1);
+        } else {
+            assert.equal(await f.repository.completeTerminalOperation(input), true);
+            assert.equal(f.state.remoteAdmissionCount, 0); assert.equal(op.status, 'failed');
+        }
+    }
+});
+
+test('exact first-attempt pre-dispatch compiler refusal settles only its own terminal admission', async () => {
+    for (const mutation of [null, op=>op.step='backup', op=>op.backupId='backup', op=>op.progress=1,
+        op=>op.startedAt=new Date(), op=>op.attempts=2, op=>op.logs=[],
+        op=>op.logs.push({code:'COMPILED_TOPOLOGY_MISMATCH'}), op=>op.logs[0].code='OTHER',
+        op=>op.errorCode='REMOTE_COMMAND_OUTCOME_UNCERTAIN']) {
+        const f=fixture(),admissionId=await f.repository.acquireInstall({nodeId:'relay-1'});
+        Object.assign(f.records.get(admissionId),{phase:'recovery_required',operationId:'compiler-op',leaseOwner:'worker-1',ownerGeneration:2});
+        const op={_id:'compiler-op',node:'relay-1',kind:'install',status:'failed',errorCode:'COMPILED_TOPOLOGY_MISMATCH',
+            progress:0,step:'',backupId:'',startedAt:null,attempts:1,logs:[{code:'COMPILED_TOPOLOGY_MISMATCH'}],
+            admissionId,leaseOwner:'worker-1',ownerGeneration:2};
+        mutation?.(op);f.operations.set('compiler-op',op);
+        const before=JSON.stringify(op),input={admissionId,operationId:'compiler-op',nodeId:'relay-1',owner:'worker-1',ownerGeneration:2,kind:'install'};
+        if(mutation){await assert.rejects(f.repository.completeTerminalOperation(input),{code:'REMOTE_ADMISSION_NOT_TERMINAL'});assert.equal(f.state.remoteAdmissionCount,1);}
+        else{assert.equal(await f.repository.completeTerminalOperation(input),true);assert.equal(f.state.remoteAdmissionCount,0);
+            await assert.rejects(f.repository.completeTerminalOperation(input),{code:'REMOTE_ADMISSION_NOT_ACTIVE'});assert.equal(f.state.remoteAdmissionCount,0);}
+        assert.equal(JSON.stringify(op),before,'failed operation history is immutable during disposition');
+    }
+});
+
 test('failed rollback cannot be counted as a completed remote operation', async () => {
     const f = fixture();
     const admissionId = await f.repository.acquireInstall({ nodeId: 'relay-1' });

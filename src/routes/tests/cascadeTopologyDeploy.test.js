@@ -1109,7 +1109,7 @@ test('operation status endpoint returns only the strict public projection', asyn
     const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
     assert.equal(response.status, 200);
     assert.deepEqual(projections, [
-        'status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion',
+        'status topologyRevision priorDeployedRevision kind linkId idempotencyKey executionContext heldTopologyAdmission admissionFingerprint routeState clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion +clientProofFingerprint +clientProofCredentialDigest',
         'admissionScope kind linkId waitingReason failedNodeId heldTopologyAdmission pppWait.relayNode',
     ]);
     assert.deepEqual(response.body, {
@@ -1148,7 +1148,7 @@ test('operation status exposes verified client proof only for a live scoped revi
     });
     assert.deepEqual(stateCalls, ['singleton', 'revision deployedRevision']);
     assert.deepEqual(projections, [
-        'status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion',
+        'status topologyRevision priorDeployedRevision kind linkId idempotencyKey executionContext heldTopologyAdmission admissionFingerprint routeState clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion +clientProofFingerprint +clientProofCredentialDigest',
         'admissionScope kind linkId waitingReason failedNodeId heldTopologyAdmission pppWait.relayNode',
     ]);
     assert.doesNotMatch(JSON.stringify(response.body), /secret|candidate|nodes|clientProofReason/);

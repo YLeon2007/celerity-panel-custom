@@ -19,7 +19,8 @@ test('network UI consumes and tracks the versioned cascade-link snapshot', () =>
     assert.match(NETWORK_SOURCE, /function applyLinkSnapshot\(snapshot\)/);
     assert.match(NETWORK_SOURCE, /topologyRevision = snapshot\.topologyRevision;/);
     assert.match(NETWORK_SOURCE, /deployedRevision = snapshot\.deployedRevision;/);
-    assert.match(NETWORK_SOURCE, /_allLinks = snapshot\.links;/);
+    assert.match(NETWORK_SOURCE, /_allLinks = snapshot\.links\.map\(link => deleteTombstones\.has\(link\._id\)/);
+    assert.match(NETWORK_SOURCE, /listedLinkIds = new Set\(snapshot\.links\.map\(link => link\._id\)\)/);
     assert.match(NETWORK_SOURCE, /applyLinkSnapshot\(await linksRes\.json\(\)\)/);
 });
 
@@ -36,8 +37,8 @@ test('network UI sends the tracked topology revision with create, update, and de
 });
 
 test('network UI refreshes a stale snapshot on 409 without replaying the mutation', () => {
-    assert.match(NETWORK_SOURCE, /async function handleDraftMutationResponse\(response\)/);
-    const handlerStart = NETWORK_SOURCE.indexOf('async function handleDraftMutationResponse(response)');
+    assert.match(NETWORK_SOURCE, /async function handleDraftMutationResponse\(response, expectedKind, expectedLinkId\)/);
+    const handlerStart = NETWORK_SOURCE.indexOf('async function handleDraftMutationResponse(response, expectedKind, expectedLinkId)');
     const handlerEnd = NETWORK_SOURCE.indexOf('\n    async function', handlerStart + 1);
     const handlerSource = NETWORK_SOURCE.slice(handlerStart, handlerEnd);
     assert.match(handlerSource, /if \(response\.status === 409\) \{[\s\S]*?await loadTopology\(\);[\s\S]*?return null;/);

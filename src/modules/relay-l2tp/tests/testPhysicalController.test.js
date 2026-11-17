@@ -207,8 +207,8 @@ test('disabled/wrong/missing private authority performs zero reads or SSH and wr
         { L2TP_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST.hostIdentity, TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' }]) {
         assert.equal(api.createRootTestPhysicalAuthority({ env, read() { reads++; assert.fail('private config read'); }, openChannel() { opens++; } }), undefined);
     }
-    assert.equal(api.createRootTestPhysicalAuthority({ env: { L2TP_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST.hostIdentity },
-        read() { reads++; throw Object.assign(new Error('absent'), { code: 'ENOENT' }); }, openChannel() { opens++; } }), undefined);
+    assert.throws(() => api.createRootTestPhysicalAuthority({ env: { L2TP_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST.hostIdentity },
+        read() { reads++; throw Object.assign(new Error('absent'), { code: 'ENOENT' }); }, openChannel() { opens++; } }), { code: 'TOPOLOGY_TEST_ACTIVATION_REQUIRED' });
     assert.equal(reads, 1); assert.equal(opens, 0);
     const controller = api.createTestPhysicalController({ config: (() => { const c = pins(); c.host.guard.owner = c.host.owner; return c; })(), openChannel() { opens++; } });
     await assert.rejects(() => controller.withHeldAuthority({ target: 'production', hostIdentity: 'lm1.infograd.online' }, () => {}));

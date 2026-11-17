@@ -52,7 +52,7 @@ test('install.sh pins every shipped L2TP payload to its actual digest', () => {
         createHash('sha256').update(readFileSync(path.join(directory, name))).digest('hex'),
     ]));
     assert.deepEqual(pins, actual);
-    assert.equal(payloads.length, 18);
+    assert.equal(payloads.length, 19);
 });
 
 test('skips upload when the installed runner digest matches', async () => {

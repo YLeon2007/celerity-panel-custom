@@ -105,7 +105,26 @@ function createDeleteIntentWriter({ CascadeLink: Link = CascadeLink } = {}) {
             if (!session) throw new TypeError('Delete marker requires the admission transaction session');
             const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
             const current = await Link.findById(linkId).session(session).lean();
-            if (!current || current.lifecycle || linkDesiredVersion(current) !== desiredVersion) return { matchedCount: 0 };
+            if (!current || linkDesiredVersion(current) !== desiredVersion) return { matchedCount: 0 };
+            if (current.lifecycle) {
+                // A fresh explicit DELETE may supersede only a terminal local
+                // validation refusal whose admission transaction never bound an
+                // operation. Preserve that failed job; never retry UNKNOWN work.
+                const { TopologyCreateIntent: Intent, TopologyOperation: Operation, NodeOperationLock: Lock } = Link.db.models || {};
+                if (current.lifecycle.state !== 'deleting' || current.lifecycle.desiredVersion !== desiredVersion
+                    || [Intent, Operation, Lock].some(Model => !Model || Model.db !== Link.db)) return { matchedCount: 0 };
+                const prior = await Intent.findById(current.lifecycle.deleteJobId).session(session).lean();
+                if (!prior || prior.version !== 2 || prior.kind !== 'link.delete' || prior.status !== 'failed'
+                    || prior.errorCode !== 'INVALID_TOPOLOGY_DEPLOYMENT' || prior.attempts !== 1
+                    || String(prior.linkId) !== String(linkId) || prior.desiredVersion !== desiredVersion
+                    || prior.operationId !== undefined || prior.operationIdempotencyKey !== undefined
+                    || prior.leaseOwner || prior.leaseUntil || !prior.resourceNodeIds?.length
+                    || await Operation.findOne({ kind: 'link.delete', linkId: String(linkId) }).session(session).lean()
+                    || await Lock.findOne({ node: { $in: prior.resourceNodeIds } }).session(session).lean()) return { matchedCount: 0 };
+                return Link.updateOne({ _id: linkId, lifecycle: current.lifecycle }, {
+                    $set: { lifecycle: { state: 'deleting', deleteJobId: jobId, desiredVersion } },
+                }, { session, runValidators: true });
+            }
             return Link.updateOne({ _id: linkId, lifecycle: { $exists: false } }, {
                 $set: { lifecycle: { state: 'deleting', deleteJobId: jobId, desiredVersion } },
             }, { session, runValidators: true });

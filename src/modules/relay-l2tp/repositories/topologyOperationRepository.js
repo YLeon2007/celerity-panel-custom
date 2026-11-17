@@ -59,7 +59,7 @@ const CLAIM_PROJECTION = Object.freeze({
     heldTopologyAdmission: 1,
     pppWait: 1,
     admissionScope: 1, resourceNodeIds: 1, baselineTopology: 1, effectiveTopology: 1,
-    desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1, deleteJobId: 1, installedPath: 1,
+    desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1, deleteJobId: 1, installedPath: 1, nodeActivation: 1,
     'nodes.node': 1,
     'nodes.nodeRef': 1,
     'nodes.role': 1,
@@ -223,7 +223,7 @@ function selectedAdmissionFingerprint(operation) {
                 targetProfile: node.targetProfile, profileTargetPin: node.profileTargetPin }) : TARGET_BY_ROLE[node.role]) })).map(durableNodeMetadata);
     const fields = ['executionContext', 'idempotencyKey', 'topologyRevision', 'priorDeployedRevision', 'kind',
         'linkId', 'linkIds', 'staged', 'admissionScope', 'resourceNodeIds', 'baselineTopology', 'effectiveTopology',
-        'selectedOwnerPins', 'desiredVersion', 'routeState', 'deleteJobId', 'installedPath'];
+        'selectedOwnerPins', 'desiredVersion', 'routeState', 'deleteJobId', 'installedPath', 'nodeActivation'];
     const value = { operationId: String(operation.operationId ?? operation._id), nodes: metadata,
         ...Object.fromEntries(fields.filter(key => operation[key] !== undefined).map(key => [key, operation[key]])) };
     return require('node:crypto').createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
@@ -270,7 +270,7 @@ class TopologyOperationRepository {
         resourceNodeIds,
         baselineTopology,
         effectiveTopology,
-        desiredVersion, selectedOwnerPins, routeState, deleteJobId, installedPath,
+        desiredVersion, selectedOwnerPins, routeState, deleteJobId, installedPath, nodeActivation,
         session,
     }) {
         const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
@@ -318,6 +318,13 @@ class TopologyOperationRepository {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
+        if (nodeActivation !== undefined) {
+            nodeActivation = require('../services/topologyNodeActivation').nodeActivation(nodeActivation);
+            if (kind !== 'link.apply' || admissionScope !== 'selected'
+                || !metadata.some(n => operationId(n.node) === nodeActivation.nodeId && n.targetProfile === nodeActivation.targetProfile)) {
+                throw new TypeError('Node activation requires exact selected profile');
+            }
+        }
         const selected = durableSelectedOperationScope({ admissionScope, resourceNodeIds,
             baselineTopology, effectiveTopology, kind, linkId, linkIds, nodes: metadata });
         if (new Set(metadata.map(node => operationId(node.node))).size !== metadata.length) {
@@ -342,6 +349,7 @@ class TopologyOperationRepository {
             priorDeployedRevision,
             ...selected,
             ...(admissionScope === 'selected' ? { desiredVersion, selectedOwnerPins, routeState,
+                ...(nodeActivation ? { nodeActivation } : {}),
                 ...(kind === 'link.delete' ? { deleteJobId } : {}), ...(installedPath ? { installedPath } : {}) } : {}),
             ...(scoped ? { kind, linkId, linkIds: [...linkIds],
                 ...(kind === 'link.apply' ? { staged } : {}),
@@ -549,7 +557,7 @@ class TopologyOperationRepository {
         return result.matchedCount === 1 ? (verified ? 'verified' : 'unverified') : null;
     }
 
-    async claim({ operationId: id, owner, leaseMs, now, executionContext }) {
+    async claim({ operationId: id, owner, leaseMs, now, executionContext, preserveExecutionAttempt = false }) {
         const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
         if (!matchesTopologyExecutionContext(executionContext, context)) {
             throw new TypeError('Topology operation claim requires a trusted execution context');
@@ -563,6 +571,7 @@ class TopologyOperationRepository {
         };
         const claimed = await this.model.findOneAndUpdate({
             _id: id,
+            ...(preserveExecutionAttempt ? { attempts: 0 } : {}),
             ...topologyOperationClaimBindingFilter(context),
             admissionScope: { $in: [null, 'selected'] },
             v2Terminal: { $exists: false },
@@ -592,6 +601,11 @@ class TopologyOperationRepository {
             $inc: { attempts: 1 },
         }, options);
         if (claimed) return claimed;
+
+        // An immutable native binding is an execution claim, not a scheduler
+        // retry. Only a separately proved continuation may rejoin it. Do not
+        // mutate the attempt counter before the worker's fail-closed review.
+        if (preserveExecutionAttempt) return null;
 
         return this.model.findOneAndUpdate({
             _id: id,

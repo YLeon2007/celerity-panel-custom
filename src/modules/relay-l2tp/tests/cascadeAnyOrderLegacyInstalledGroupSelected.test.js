@@ -62,7 +62,7 @@ test('phase B public imported G2: selected baseline and installed path retain ex
     assert.deepEqual(selected.baselineTopology, f.topology);
     assert.deepEqual(selected.installedPath, { groupId: id(60), pathKey: 'legacy-main', ownerNodeId: id(2),
         ownerTopologyRevision: 7, ownerCredentialRevision: 41, oldPathLinkIds: [id(11)], newPathLinkIds: [id(11)],
-        groupBefore: f.topology.groups[0], kind: 'link.apply' });
+        groupBefore: f.topology.groups[0], kind: 'link.apply', preserveGroupPaths: true, selectedPathKey: 'legacy-main' });
     assert.deepEqual(selected.effectiveTopology.groups, f.topology.groups);
     assert.deepEqual(selected.resourceNodeIds, f.topology.nodes.map(node => node.id));
     assert.deepEqual(await f.read(), selected, 'same-session repeat has exact equality');

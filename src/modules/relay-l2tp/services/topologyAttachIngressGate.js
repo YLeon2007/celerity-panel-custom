@@ -98,7 +98,10 @@ function ownedIngressRouteState(plan) {
         || !validIdentity(plan.ownerNodeId) || !Array.isArray(plan.nodes)) return null;
     const owners = plan.nodes.filter(node => node?.node === plan.ownerNodeId && node.role === 'relay');
     if (owners.length !== 1) return null;
-    const blocked = plan.routeState === 'no_bridge_exit';
+    // Component readiness describes every ingress, not this installed owner's
+    // suffix. Deleting a disjoint upstream hop can leave PPP egress intact.
+    const blocked = plan.routeState === 'no_bridge_exit'
+        && Array.isArray(plan.newPathLinkIds) && plan.newPathLinkIds.length === 0;
     // APPLY may legitimately prepare an incomplete installed route, and a later
     // DELETE may keep a previously emptied path blocked. Candidate blocking is
     // proved here; the service checks actual old membership, owner and epochs.
@@ -107,7 +110,9 @@ function ownedIngressRouteState(plan) {
         || !Array.isArray(plan.effectiveTopology?.links)
         || plan.effectiveTopology.links.some(link => link.id === plan.linkId) === (plan.kind === 'link.delete'))) return null;
     if (!blocked && plan.routeState !== undefined
-        && !['complete', 'no_portal_input'].includes(plan.routeState)) return null;
+        && !['complete', 'no_portal_input', 'no_bridge_exit'].includes(plan.routeState)) return null;
+    if (!blocked && plan.routeState === 'no_bridge_exit'
+        && (!Array.isArray(plan.newPathLinkIds) || plan.newPathLinkIds.length === 0)) return null;
     return routeToIngress(owners[0].candidate, cascadePathIngressTag(plan.pathKey),
         cascadePathIngressPort(plan.groupId, plan.pathKey), { blocked, owned: true })
         ? blocked ? 'no_bridge_exit' : 'egress_configured' : null;
@@ -205,7 +210,8 @@ class TopologyAttachIngressGate {
             await ssh.connect();
             const result = await ssh.exec('python3 -', {
                 stdin: mainProbeScript(`relay-l2tp-${plan.groupId}`, tag, port,
-                    { blocked: plan.routeState === 'no_bridge_exit' }),
+                    { blocked: owned ? ownedIngressRouteState(plan) === 'no_bridge_exit'
+                        : plan.routeState === 'no_bridge_exit' }),
                 timeout: 10000,
             });
             verified = result?.code === 0 && result.stdout === '1\n' && result.stderr === '';
@@ -218,4 +224,4 @@ class TopologyAttachIngressGate {
     }
 }
 
-module.exports = { TopologyAttachIngressGate, mainProbeScript, ownedIngressRouteState };
+module.exports = { TopologyAttachIngressGate, mainProbeScript, ownedIngressRouteState, routeToIngress };

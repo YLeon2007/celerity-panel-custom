@@ -399,8 +399,19 @@ function createRootTestPhysicalAuthority({ env = process.env, read = privateRead
     if (env.L2TP_EXECUTION_ENABLED !== 'true' || env.TOPOLOGY_TEST_EXECUTION_ENABLED !== 'true'
         || env.PANEL_DOMAIN !== TEST.hostIdentity || env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
         || env.L2TP_PRODUCTION_EXECUTION_ENABLED === 'true') return undefined;
+    if (env.TOPOLOGY_TEST_STARTUP_MODE !== undefined) {
+        if (env.TOPOLOGY_TEST_STARTUP_MODE !== 'dedicated-runtime-v1') {
+            throw Object.assign(new Error('TOPOLOGY_TEST_STARTUP_MODE_INVALID'), { code: 'TOPOLOGY_TEST_STARTUP_MODE_INVALID' });
+        }
+        return require('./dedicatedTestAuthority').createRootDedicatedTestAuthority({ env, read });
+    }
     let raw;
-    try { raw = read(CONFIG); } catch (error) { if (error.code === 'ENOENT') return undefined; refuse(); }
+    try { raw = read(CONFIG); } catch (error) {
+        if (error.code === 'ENOENT') {
+            throw Object.assign(new Error('TOPOLOGY_TEST_ACTIVATION_REQUIRED'), { code: 'TOPOLOGY_TEST_ACTIVATION_REQUIRED' });
+        }
+        refuse();
+    }
     need(typeof ownerEnrollment === 'boolean');
     let config, inventory;
     try {

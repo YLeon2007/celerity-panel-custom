@@ -584,7 +584,10 @@ class SyncService {
                         const bridgeCurrent = portalLinks.some(link => link.mode !== 'forward') && hopLinks.some(link => link.mode !== 'forward')
                             ? await readClassicProfile(ssh, BRIDGE, { allowAbsent: true }) : null;
                         const selection = selectClassicMain({ node, current, bridgeCurrent, portalLinks, hopLinks, forwardLinks });
-                        configContent = JSON.stringify(selection.compose(JSON.parse(configContent)), null, 2);
+                        const composed = selection.compose(JSON.parse(configContent));
+                        await require('./cascadeService')._applyClassicL2tpPathIngress(composed, node, { mode: 'forward',
+                            appliedLinkIds: selection.forward.map(link => String(link._id)) });
+                        configContent = JSON.stringify(composed, null, 2);
                     } else {
                     // Preserve the existing exact paired-TEST compatibility
                     // policy; ordinary classic writers use installed bytes above.

@@ -524,11 +524,19 @@ for (const ingress of ['HTTP', 'MCP']) {
             const syncService = require('../../services/syncService');
             const configGenerator = require('../../services/configGenerator');
             let writerAlive = false;
+            const observed = { inbounds: [], outbounds: [], routing: { rules: [] } };
+            const appliedLink = await CascadeLink.findById(linkId).populate('portalNode bridgeNode').lean();
+            configGenerator.applyReversePortal(observed, [appliedLink], ['vless-in']);
+            let liveMain = JSON.stringify(observed);
+            let liveBridge = configGenerator.generateCombinedBridgeConfig([appliedLink]);
             t.mock.method(syncService, '_getUsersForNode', async () => []);
             t.mock.method(configGenerator, 'generateXrayConfigWithApi', () => JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } }));
             t.mock.method(NodeSSH.prototype, 'connect', async () => {});
             t.mock.method(NodeSSH.prototype, 'disconnect', () => {});
-            t.mock.method(NodeSSH.prototype, 'uploadContent', async () => {});
+            t.mock.method(NodeSSH.prototype, 'uploadContent', async (content, file) => {
+                if (file === '/usr/local/etc/xray/config.json') liveMain = content;
+                if (file === '/usr/local/etc/xray-bridge/config.json') liveBridge = content;
+            });
             t.mock.method(NodeSSH.prototype, 'exec', async command => {
                 remoteCalls++;
                 const owned = await models.CascadeTopologyState.findById('singleton').lean();
@@ -538,8 +546,10 @@ for (const ingress of ['HTTP', 'MCP']) {
                     if (outcome === 'timeout') throw new Error('local simulated exec timeout; remote writer still alive');
                     return { stdout: '', stderr: '' }; // close without exit/receipt
                 }
-                const marker = command.match(/C3_LEGACY_DONE_[a-f0-9]+/)[0];
-                return { code: 0, stdout: `\n${marker}\n`, stderr: '' };
+                const marker = command.match(/C3_LEGACY_DONE_[a-f0-9]+/)?.[0];
+                const body = command.includes('cat /usr/local/etc/xray/config.json') ? liveMain
+                    : command.includes('cat /usr/local/etc/xray-bridge/config.json') ? liveBridge : '';
+                return { code: 0, stdout: body + (marker ? `\n${marker}\n` : ''), stderr: '' };
             });
             if (ingress === 'HTTP') {
                 const response = await httpUndeploy();

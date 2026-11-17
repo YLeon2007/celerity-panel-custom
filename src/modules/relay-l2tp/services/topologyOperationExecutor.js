@@ -392,7 +392,7 @@ class TopologyOperationExecutor {
         });
         let durable;
         try { durable = await reader.readVerified(expected); }
-        catch { throw unprovenBinding(); }
+        catch (cause) { const error=unprovenBinding();error.cause=cause;throw error; }
         if (!hasExactKeys(durable, recordKeys(durable)) || !isDeepFrozen(durable)
             || Object.hasOwn(expected, 'profileTargetPin') !== Object.hasOwn(durable, 'profileTargetPin')
             || Object.entries(expected).some(([key, value]) => !same(durable[key], value))
@@ -410,7 +410,13 @@ class TopologyOperationExecutor {
             // It must freshly verify this accepted binding and its still-held
             // maintenance scope, including endpoint + physical SSH-key enrollment.
             authority = await this.#executionBindingReader.readVerifiedConnection(expected, durable);
-        } catch { throw unprovenBinding(); }
+        } catch (cause) {
+            // Preserve the private primary behind this fail-closed boundary.
+            // The public code and the independent connection predicate stay fixed.
+            const error = unprovenBinding();
+            error.cause = cause;
+            throw error;
+        }
         if (!hasExactKeys(authority, ['binding', 'connection']) || !isDeepFrozen(authority)
             || !sameRecord(authority.binding, durable)
             || !validTrustedConnection(authority.connection)
@@ -647,6 +653,7 @@ class TopologyOperationExecutor {
                             try {
                                 if (command === 'verify-ppp-users') return await state.transport.verifyPppUsers(request);
                                 if (command === 'restore-users') return await state.transport.restoreUsers(request);
+                                if (command === 'read-restored-users' && this.#hostIdentity === 'test.infograd.online') return await state.transport.readRestoredUsers(request);
                                 throw unprovenBinding();
                             } finally { state.busy = false; }
                         } };
@@ -708,6 +715,15 @@ class TopologyOperationExecutor {
         });
     }
 
+    async readClosedTerminal(context) {
+        const state=this.#preparedBinding(context);
+        if(this.#hostIdentity!=='test.infograd.online'||state.phase!=='verify'||state.busy||state.uncertain||state.terminal)throw unprovenBinding();
+        const durable=(await this.#proveBinding(context,state.binding,state.binding.durable)).durable;
+        const proof=await this.probeTerminalBinding(durable,context.node.role);
+        // Brand only the real authenticated original close-ID status response.
+        state.terminal=true;TERMINAL_PROOFS.add(proof);return proof;
+    }
+
     // Exact terminal readback; ownership settlement belongs to Mongo, not SSH.
     async close(context) {
         const state = this.#preparedBinding(context);
@@ -754,6 +770,57 @@ class TopologyOperationExecutor {
             wrapped.cause = error;
             throw wrapped;
         } finally { state.busy = false; }
+    }
+
+    async observeRetainedVerify(context, statusOnly = false) {
+        const state=this.#preparedBinding(context);
+        if (state.busy || state.uncertain || state.terminal || this.#hostIdentity!=='test.infograd.online') throw unprovenBinding();
+        state.busy=true;
+        try {
+            const binding=await this.#proveBinding(context,state.binding,state.binding.durable),b=binding.durable;
+            const request=transportRequest(binding,'verify');
+            const {checks,...base}=request;
+            const proof=await state.transport.observeVerify({...base,
+                commandId:createHash('sha256').update('topology-retained-verify-v1:'+b.commandIds.verify).digest('hex'),
+                observation:{bootId:b.bootId,originalVerifyId:b.commandIds.verify,prepareId:b.commandIds.prepare,commitId:b.commandIds.commit,checks}},statusOnly);
+            await this.#proveBinding(context,binding,b);
+            // Dedicated acceptance of new current-state evidence; never feed a
+            // fabricated original verify receipt into assertReceipt.
+            state.phase='verify';return proof;
+        } catch(e) { state.uncertain=true;throw e; }
+        finally {state.busy=false;}
+    }
+
+    async restoreCompletedPrepare(context) {
+        const state = this.#preparedBinding(context);
+        if (state.busy || state.uncertain || state.terminal || this.#hostIdentity !== 'test.infograd.online') throw unprovenBinding();
+        state.busy = true;
+        try {
+            const binding = await this.#proveBinding(context, state.binding, state.binding.durable);
+            const receipt = await state.transport.status({ ...transportRequest(binding, 'prepare'), completedCommand: 'prepare' });
+            // Only a fresh authenticated status of the ORIGINAL completed ID,
+            // never a replayed prepare or a caller-supplied completion receipt.
+            const proof = assertReceipt({ ...receipt, command: 'prepare' }, 'prepare', binding);
+            await this.#proveBinding(context, binding, binding.durable);
+            state.phase = 'prepare';
+            return proof;
+        } catch (error) { state.uncertain = true; throw error; }
+        finally { state.busy = false; }
+    }
+
+    async restoreCompletedVerify(context) {
+        const state=this.#preparedBinding(context);
+        if(state.busy||state.uncertain||state.terminal||this.#hostIdentity!=='test.infograd.online')throw unprovenBinding();
+        state.busy=true;
+        try{
+            const b=await this.#proveBinding(context,state.binding,state.binding.durable);
+            const {checks:ignored,...request}=transportRequest(b,'verify');
+            const receipt=await state.transport.status({...request,completedCommand:'verify'});
+            // Do not replay the known verify. Adapt only the command discriminator
+            // of an exact completed native status for this original immutable ID.
+            const proof=assertReceipt({...receipt,command:'verify'},'verify',b);
+            await this.#proveBinding(context,b,b.durable);state.phase='verify';return proof;
+        }catch(e){state.uncertain=true;throw e;}finally{state.busy=false;}
     }
 
     commit(context) {

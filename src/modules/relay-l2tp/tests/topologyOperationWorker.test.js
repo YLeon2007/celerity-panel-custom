@@ -285,6 +285,65 @@ function createWorker({
     });
 }
 
+test('partial prepare continuation wave: worker keeps original prepared nodes and only dispatches absent pending prepare', async t => {
+    for (const fault of ['none', 'unknown-status']) await t.test(fault, async () => {
+        const operation = durableOperation();
+        Object.assign(operation, { status: 'preparing', attempts: 1, leaseOwner: 'worker-1', heldTopologyAdmission: true,
+            leaseUntil: new Date(NOW.getTime() + 30000),
+            undispatchedPreparationContinuation: { locks: operation.nodes.map(n => ({ node: n.node, generation: 'original-' + n.node })) } });
+        operation.nodes[0].state = 'prepared'; operation.nodes[0].backupId = 'original-backup';
+        const calls = [], repository = createRepository(operation);
+        repository.claimUndispatchedPreparation = async () => operation;
+        const executor = {
+            executionProtocolVersion: 2,
+            async rehydrate(c) { calls.push(['rehydrate', c.node.node]); return { ok: true, backupId: c.backupId, prepared: Object.freeze({ original: true }) }; },
+            async restoreCompletedPrepare(c) { calls.push(['status-prepare', c.node.node]); if (fault !== 'none') throw Error('unknown original status'); return { ok: true }; },
+            async prepare(c) { calls.push(['prepare', c.node.node]); return { backupId: 'new-backup', prepared: Object.freeze({ pending: true }) }; },
+            async commit(c) { calls.push(['commit', c.node.node]); return { ok: true }; },
+            async verify() { return { ok: true }; },
+            async cleanupPrepared() { throw Error('never cleanup original prepare'); }, async rollback() { throw Error('never replay'); },
+        };
+        const worker = new TopologyOperationWorker({ executionContext: TEST_CONTEXT, workerId: 'worker-1', leaseMs: 30000,
+            clock: { now: () => new Date(NOW) }, operationRepository: repository, executor,
+            finalizer: { async finalizeSucceeded() { throw Error('legacy forbidden'); } },
+            bindingProvisioner: { executionContext: TEST_CONTEXT, async reserveBinding() { throw Error('no binding allocation'); } },
+            bindingLifecycle: { executionContext: TEST_CONTEXT, async run(f) { return f(); }, async assertHeld() {} },
+            lockService: { async acquire() { throw Error('no new lock generation'); }, async renew() { return { ok: true }; }, async release() { throw Error('no raw release'); } },
+        });
+        worker.completeV2 = async (_plan, _id, prepared) => { assert.equal(prepared.length, 2); return { status: 'succeeded' }; };
+        const result = await worker.resumeUndispatchedPreparation(operation._id);
+        assert.equal(result.status, fault === 'none' ? 'succeeded' : 'preparing', JSON.stringify(result));
+        assert.deepEqual(calls.filter(c => c[0] === 'prepare').map(c => c[1]), fault === 'none' ? [operation.nodes[1].node] : []);
+        assert.equal(repository.calls.some(c => c.method === 'recordNode' && c.request.node === operation.nodes[0].node && c.request.state === 'prepared'), false);
+        assert.equal(repository.calls.some(c => c.method === 'finishClaimed'), false);
+        assert.equal(operation.attempts, 1);
+        if (fault !== 'none') assert.equal(operation.nodes[0].state, 'prepared');
+    });
+});
+
+test('verified prefix wave: worker never replays completed prepare commit or verify', async t => {
+    for(const fault of ['none','unknown-status'])await t.test(fault,async()=>{
+        const operation=durableTopologyOperation(['relay','bridge','portal']),calls=[];
+        Object.assign(operation,{status:'committing',attempts:1,leaseOwner:'worker-1',leaseUntil:new Date(NOW.getTime()+30000),heldTopologyAdmission:true,
+            preparedCommitContinuation:{observed:operation.nodes.map((n,i)=>({nodeId:n.node,phase:i===2?'prepared':'verified'})),locks:operation.nodes.map(n=>({node:n.node,generation:'original-'+n.node}))}});
+        operation.nodes.forEach((n,i)=>{n.state=i===2?'prepared':'committed';n.backupId='original-'+n.node;});
+        const repository=createRepository(operation);repository.claimPreparedCommit=async()=>operation;
+        const executor={executionProtocolVersion:2,
+            async prepare(){throw Error('completed prepare cannot replay');},async cleanupPrepared(){throw Error('no cleanup replay');},async rollback(){throw Error('no rollback replay');},
+            async rehydrate(c){return {ok:true,backupId:c.backupId,prepared:Object.freeze({original:true})};},
+            async restoreCompletedVerify(c){calls.push(['status-verify',c.node.node]);if(fault!=='none')throw Error('unknown original verify status');return {ok:true};},
+            async restoreCompletedPrepare(c){calls.push(['status-prepare',c.node.node]);return {ok:true};},
+            async commit(c){calls.push(['commit',c.node.node]);return {ok:true};},async verify(c){calls.push(['verify',c.node.node]);return {ok:true};}};
+        const worker=new TopologyOperationWorker({executionContext:TEST_CONTEXT,operationRepository:repository,executor,workerId:'worker-1',leaseMs:30000,clock:{now:()=>new Date(NOW)},
+            finalizer:{async finalizeSucceeded(){throw Error('legacy forbidden');}},bindingProvisioner:{executionContext:TEST_CONTEXT,async reserveBinding(){throw Error('no new binding');}},
+            bindingLifecycle:{executionContext:TEST_CONTEXT,async run(f){return f();},async assertHeld(){}},lockService:{async acquire(){throw Error('no new generation');},async renew(){return {ok:true};},async release(){throw Error('no raw release');}}});
+        worker.completeV2=async(_p,_id,prepared)=>{assert.equal(prepared.length,3);return {status:'succeeded'};};
+        const result=await worker.resumePreparedCommit(operation._id);assert.equal(result.status,fault==='none'?'succeeded':'committing');
+        assert.deepEqual(calls.filter(c=>c[0]==='commit'||c[0]==='verify'),fault==='none'?[['commit',operation.nodes[2].node],['verify',operation.nodes[2].node]]:[]);
+        assert.equal(operation.attempts,1);assert.equal(repository.calls.some(c=>c.method==='finishClaimed'),false);
+    });
+});
+
 test('worker without test-only execution permission rejects before claim, lock, or executor', async () => {
     const repository = createRepository();
     const calls = [];

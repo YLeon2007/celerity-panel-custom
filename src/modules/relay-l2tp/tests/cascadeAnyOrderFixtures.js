@@ -318,6 +318,14 @@ function semanticLinks(links) {
         .sort((left, right) => left.name.localeCompare(right.name));
 }
 function expectApplied(response, label) {
+    if (response.settled) {
+        assert.equal(response.status, 202, 'native HTTP acceptance remains asynchronous');
+        assert.ok(response.body.job?.jobId, 'native acceptance must expose its actual durable job');
+        assert.equal(response.settled.status, 'succeeded', label);
+        assert.equal(response.settled.heldTopologyAdmission, false, label);
+        assert.equal(response.settled.linkId, createdId(response), label);
+        return;
+    }
     assert.equal(response.body.autoDeployStatus, undefined,
         `${label}: accepted draft is NOT applied; ${response.body.autoDeployError?.code || response.body.error?.code}`);
     assert.ok(response.body.autoDeployResult?.status === 'succeeded'
@@ -353,5 +361,93 @@ async function seedAppliedGraph(h, graph) {
     }
     return new Map(links.map(link => [link.name, link._id]));
 }
-module.exports = { MAIN, TRANSIT, IDS, GRAPHS, CREATION_CASES, permutations, createHarness,
+// Reuse the existing ordinary native host/HTTP/job/worker fixture for native
+// acceptance. Persistence/executor effects remain explicitly modeled, just as
+// in RuntimeHttp/ExtendedLifecycle; this is not remote traffic/SSH evidence.
+async function createNativeHarness(t) {
+    const runtime = require('./cascadeAnyOrderRuntimeFixture');
+    const f = runtime.fixture({ roles: ['portal', 'relay', 'bridge', 'bridge'] });
+    const names = ['P', 'R', 'B1', 'B2'];
+    f.data.HyNode.forEach((node, i) => { node._id = IDS[names[i]]; node.name = names[i]; });
+    f.data.TopologyConfigOwner.forEach((owner, i) => { owner.node = IDS[names[i]]; });
+    f.data.RelayL2tpState.push({ node: IDS.R, status: 'not_installed', desiredState: 'absent', secretRevision: 0 });
+    const host = f.host(); runtime.provider.installActiveHost(host);
+    t.after(async () => { runtime.provider.clearActiveHost(host); await host.stop(); });
+    const http = runtime.app(f), calls = { core: [], failures: [], transport: f.calls, writes: [], diagnostics: [] };
+    // This map is a view of modeled committed candidates, never a filesystem
+    // readback. Untargeted MAIN client profiles are a separate preserved peer.
+    const files = new Map();
+    for (const node of f.data.HyNode) {
+        files.set(`${node._id}:${MAIN}`, node.cascadeRole === 'portal' ? '{}' : JSON.stringify(mainProfile()));
+        files.set(`${node._id}:${TRANSIT}`, '{}');
+    }
+    const users = Object.fromEntries(f.data.HyNode.map((node, i) => [node._id,
+        [{ userId: 'saved-user-' + names[i], xrayUuid: `00000000-0000-4000-8000-${String(i + 1).padStart(12, '0')}` }]]));
+    const artifactSuffixes = new Map();
+    const originalUsers = copy(users), worker = f.deployments[0].operationWorker;
+    worker.userResync._syncService = { _getUsersForNode: async node => copy(users[node._id]),
+        addXrayUser: async (node, user) => { assert.deepEqual(user, originalUsers[node._id][0]); return true; } };
+    const commit = worker.executor.commit.bind(worker.executor);
+    worker.executor.commit = async input => {
+        const result = await commit(input);
+        const file = input.node.targetProfile === 'xray-main' ? MAIN : TRANSIT;
+        files.set(`${input.node.node}:${file}`, Buffer.from(input.node.candidate.bytes).toString());
+        calls.writes.push({ nodeId: input.node.node, file });
+        return result;
+    };
+    let nonce = 0;
+    async function invoke(method, route, body, key) {
+        return runtime.request(http, method, route, body, key || `native-fixture-${++nonce}`);
+    }
+    async function finish(response) {
+        if (response.status !== 202 || !response.body.job) return response;
+        host.start();
+        const jobId = response.body.job.jobId;
+        for (let i = 0; i < 12; i++) {
+            await runtime.settleTick(f);
+            if (['succeeded', 'failed', 'blocked'].includes(f.data.TopologyCreateIntent.find(row => row._id === jobId)?.status)) break;
+        }
+        const polled = await invoke('GET', `/links/auto-deploy-jobs/${jobId}`);
+        assert.equal(polled.status, 200);
+        assert.equal(polled.body.job.status, 'succeeded', JSON.stringify({ job: polled.body.job,
+            operations: f.data.TopologyOperation.map(op => ({ kind: op.kind, status: op.status, errorCode: op.errorCode,
+                error: op.error, nodes: op.nodes.map(node => ({ role: node.role, state: node.state })) })), errors: f.errors }));
+        if (!polled.body.job.operationId) {
+            assert.equal(polled.body.job.kind, 'link.delete');
+            assert.equal(f.data.CascadeLink.some(link => link._id === polled.body.job.linkId), false);
+            return { ...response, desiredOnly: true, linkId: polled.body.job.linkId };
+        }
+        const operation = f.data.TopologyOperation.find(row => row._id === polled.body.job.operationId);
+        assert.equal(operation?.status, 'succeeded');
+        assert.equal(operation.heldTopologyAdmission, false);
+        if (operation.kind === 'link.apply') {
+            const link = f.data.CascadeLink.find(row => row._id === operation.linkId);
+            const listeners = operation.nodes.flatMap(node => JSON.parse(Buffer.from(node.candidate.bytes)).inbounds || [])
+                .filter(inbound => inbound.port === link.tunnelPort && /^(?:bridge-conn-|fwd-hop-|cascade-in-)/.test(inbound.tag || ''));
+            assert.equal(listeners.length, 1, 'applied link has exactly one actual generated listener');
+            artifactSuffixes.set(operation.linkId, listeners[0].tag.slice(-8));
+        }
+        if (!calls.core.some(row => row.operationId === operation._id)) calls.core.push({ method: operation.kind,
+            operationId: operation._id, linkId: operation.linkId, baselineLinkIds: operation.baselineTopology.links.map(link => link.id) });
+        assert.deepEqual(users, originalUsers);
+        // Preserve the real HTTP ack; expose observed durable completion separately.
+        return { ...response, settled: copy(operation), linkId: response.body.linkId || operation.linkId };
+    }
+    const state = () => f.data.CascadeTopologyState[0];
+    return { native: true, rows: f.data, files, calls, state, users, originalUsers, artifactSuffixes,
+        create(edge, autoDeploy = false, mode = 'reverse') {
+            return invoke('POST', '/links', { expectedTopologyRevision: state().revision, name: edge.key,
+                portalNodeId: IDS[edge.source], bridgeNodeId: IDS[edge.target], mode, tunnelPort: edge.port,
+                tunnelSecurity: 'none', tunnelTransport: 'tcp', priority: edge.priority, geoRouting: edge.geoRouting,
+                autoDeploy }).then(finish);
+        },
+        deploy(linkId) { return invoke('POST', '/topology/deploy', { expectedTopologyRevision: state().revision, linkId },
+            `deploy-${linkId}-${state().revision}`).then(finish); },
+        remove(linkId) { return invoke('DELETE', '/links/' + linkId, { expectedTopologyRevision: state().revision },
+            `delete-${linkId}-${state().revision}`).then(finish); },
+        async snapshot() { const response = await invoke('GET', '/links'); assert.equal(response.status, 200); return response.body; },
+    };
+}
+function createdId(response) { return response.body.createdLinkId || response.body.linkId || response.linkId; }
+module.exports = { MAIN, TRANSIT, IDS, GRAPHS, CREATION_CASES, permutations, createHarness, createNativeHarness, createdId,
     semanticLinks, expectApplied, seedAppliedGraph, copy };

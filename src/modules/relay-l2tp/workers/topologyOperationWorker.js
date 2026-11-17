@@ -23,8 +23,7 @@ function traceWorkerFailure(plan, operationId, phase, error, nodeId) {
     logTopologyTestFailure({ action: 'topology.worker', phase,
         revision: plan?.topologyRevision, linkId: plan?.linkId,
         operationId, nodeId: nodeId && String(nodeId),
-        error: { code: error?.code || 'TOPOLOGY_DEPLOYMENT_FAILED',
-            causeCode: error?.causeCode, errors: error?.errors } });
+        error });
 }
 
 const EXECUTOR_METHODS = Object.freeze([
@@ -105,7 +104,7 @@ function validChecks(checks, target) {
     });
 }
 
-function durableNodePlan(metadata) {
+function durableNodePlan(metadata, bootstrapOriginal) {
     const node = entityId(metadata?.node);
     let target;
     try {
@@ -118,7 +117,9 @@ function durableNodePlan(metadata) {
     if (!SAFE_ID_PATTERN.test(node)
         || !DURABLE_NODE_STATES.has(state)
         || typeof backupId !== 'string'
-        || (state === 'pending' ? backupId !== '' : !SAFE_ID_PATTERN.test(backupId))
+        || (state === 'pending' ? backupId !== '' && !(bootstrapOriginal?.state === 'failed'
+            && bootstrapOriginal.node === node && bootstrapOriginal.backupId === backupId && SAFE_ID_PATTERN.test(backupId))
+            : !SAFE_ID_PATTERN.test(backupId))
         || !target
         || !validNodeRef(metadata.role, metadata.nodeRef)
         || metadata.targetProfile !== target.targetProfile
@@ -148,7 +149,7 @@ function durableNodePlan(metadata) {
     };
 }
 
-function durablePlan(operation, operationId) {
+function durablePlan(operation, operationId, bootstrapContinuation = false) {
     if (!operation
         || entityId(operation) !== operationId
         || !ACTIVE_OPERATION_STATUSES.has(operation.status)
@@ -160,7 +161,8 @@ function durablePlan(operation, operationId) {
         || operation.nodes.length === 0) {
         throw new TypeError('Invalid durable topology operation');
     }
-    const nodes = operation.nodes.map(durableNodePlan);
+    const nodes = operation.nodes.map(metadata => durableNodePlan(metadata, bootstrapContinuation
+        ? operation.bootstrapContinuation?.originalNodes?.find(n => n.node === entityId(metadata.node)) : undefined));
     if (new Set(nodes.map(node => node.node)).size !== nodes.length) {
         throw new TypeError('Invalid durable topology operation');
     }
@@ -415,6 +417,7 @@ class TopologyOperationWorker {
         let inFlight = null;
         let renewalError = null;
         let stopped = false;
+        let paused = false;
 
         const clear = () => {
             if (intervalId === undefined) return;
@@ -422,7 +425,7 @@ class TopologyOperationWorker {
             intervalId = undefined;
         };
         const tick = () => {
-            if (stopped || renewalError) return inFlight || Promise.resolve();
+            if (stopped || paused || renewalError) return inFlight || Promise.resolve();
             if (inFlight) return inFlight;
             inFlight = this.renew(operationId)
                 .then(leaseUntil => this.renewLocks(operationId, lockedNodeIds)
@@ -463,6 +466,22 @@ class TopologyOperationWorker {
                 return result;
             },
             renew: renewOwned,
+            // Join our own periodic DB writer around a bounded terminal CAS.
+            // No transaction retry or lease extension: the normal live lease
+            // remains the deadline checked by the finalizer.
+            exclusive: async work => {
+                paused = true;
+                clear();
+                if (inFlight) await inFlight;
+                assertOwned();
+                const leaseUntil = await this.renew(operationId);
+                await this.renewLocks(operationId, lockedNodeIds);
+                try { return await work(leaseUntil); }
+                finally {
+                    paused = false;
+                    if (!stopped && !renewalError) intervalId = this.timer.setInterval(tick, this.renewalIntervalMs);
+                }
+            },
             stop: async () => {
                 stopped = true;
                 clear();
@@ -1101,7 +1120,7 @@ class TopologyOperationWorker {
             ...(fenceReleased ? {} : { drainUncertain: true }) };
     }
 
-    async completeV2(plan, operationId, prepared, heartbeat, acquiredNodeIds) {
+    async completeV2(plan, operationId, prepared, heartbeat, acquiredNodeIds, existingClosure = false, closedStatusOnly = false, readRestored = false) {
         const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
         if (!(this.executor instanceof TopologyOperationExecutor)
             || !this.userResync || !this.pppReadinessGate
@@ -1115,10 +1134,17 @@ class TopologyOperationWorker {
             const bindings = await this.executor.terminalBindings(contexts);
             let request = { operationId, owner: this.workerId, leaseUntil: await heartbeat.renew(),
                 topologyRevision: plan.topologyRevision, priorDeployedRevision: plan.priorDeployedRevision };
-            if (!await this.finalizer.beginV2Closure({ ...request, bindings })) throw new Error('Closure intent unconfirmed');
+            if(existingClosure){
+                const current=await this.finalizer.probeV2Settlement({operationId});
+                if(current?.status!=='committing'||current.retained!==true||current.terminal.state!=='closing'
+                    ||current.terminal.proofs.length!==0||current.terminal.sideEffects!==undefined||!same(current.terminal.bindings,bindings))throw Error('Closure continuation unconfirmed');
+            }else {
+                if (typeof heartbeat.exclusive !== 'function') throw new Error('Closure heartbeat join unavailable');
+                if (!await heartbeat.exclusive(leaseUntil => this.finalizer.beginV2Closure({ ...request, leaseUntil, bindings }))) throw new Error('Closure intent unconfirmed');
+            }
             const sideEffects = await heartbeat.run(() => this.executor.withVerifiedMutationScope(contexts, async assertCurrent => {
                 await assertCurrent();
-                if ((await this.userResync.resyncPlan(plan))?.ok !== true) throw new Error('User proof unconfirmed');
+                if ((await this.userResync.resyncPlan(plan, { readRestored }))?.ok !== true) throw new Error('User proof unconfirmed');
                 await assertCurrent();
                 const installed = plan.installedPath ? await this.prepareInstalledIngress(plan) : null;
                 const ppp = installed ? { ok: true, relayRevisions: installed.relayRevisions,
@@ -1137,16 +1163,18 @@ class TopologyOperationWorker {
                     ...(installed ? { installedIngressProof: installed } : {}) };
             }));
             const proofs = [];
-            for (const context of contexts) proofs.push(await heartbeat.run(() => this.executor.close(context)));
-            request = { ...request, leaseUntil: await heartbeat.renew() };
-            await this.#bindingLifecycle?.assertHeld();
-            if (!await this.finalizer.persistV2TerminalProofs({ ...request, proofs, sideEffects })) throw new Error('Proof persistence unconfirmed');
-            // Join all renewal before the single transaction deletes exact locks.
-            // There is no release call or remote rollback, including on failure.
-            const leaseUntil = await heartbeat.renew();
+            for (const context of contexts) proofs.push(await heartbeat.run(() => closedStatusOnly ? this.executor.readClosedTerminal(context) : this.executor.close(context)));
+            // Join the periodic writer BEFORE capturing the exact lease used by
+            // both terminal CAS transactions. An authority read may span a tick;
+            // allowing that tick afterwards invalidates our own request fence.
             await heartbeat.stop();
             await this.#bindingLifecycle?.assertHeld();
-            if (!await this.finalizer.finalizeV2Succeeded({ ...request, leaseUntil })) throw new Error('Settlement unconfirmed');
+            const leaseUntil = await this.renew(operationId);
+            await this.renewLocks(operationId, acquiredNodeIds);
+            request = { ...request, leaseUntil };
+            if (!await this.finalizer.persistV2TerminalProofs({ ...request, proofs, sideEffects })) throw new Error('Proof persistence unconfirmed');
+            // No release call, retry or remote rollback, including on failure.
+            if (!await this.finalizer.finalizeV2Succeeded(request)) throw new Error('Settlement unconfirmed');
             acquiredNodeIds.length = 0;
             return { claimed: true, operationId, status: 'succeeded' };
         } catch (error) {
@@ -1171,6 +1199,128 @@ class TopologyOperationWorker {
         return proof;
     }
 
+    async resumeBootstrapPreparation(operationIdentity, onSettled) {
+        if (this.executionContext.target !== 'test' || !this.#bindingLifecycle
+            || typeof this.operationRepository.claimBootstrapContinuation !== 'function'
+            || !(this.executor instanceof require('../services/topologyOperationExecutor').TopologyOperationExecutor)) {
+            throw new Error('TEST_BOOTSTRAP_CONTINUATION_UNPROVEN');
+        }
+        return this.#bindingLifecycle.run(() => this.#bindingLifecycle.withCapturedTestOwnerEnrollment(async (plan, check) => {
+            if (!plan.nodes?.length || plan.nodes.some(n => n.bootstrapPristine !== true)) throw new Error('TEST_BOOTSTRAP_CONTINUATION_UNPROVEN');
+            await check();
+            const result = await this.#runHeld(operationIdentity, { plan, check });
+            if (result.status === 'succeeded' && onSettled) { await check(); await onSettled(result); }
+            return result;
+        }));
+    }
+
+    async resumePreparedCommit(operationIdentity,onSettled) {
+        if(this.executionContext.target!=='test'||!this.#bindingLifecycle
+            ||typeof this.operationRepository.claimPreparedCommit!=='function')throw Error('TEST_PREPARED_COMMIT_UNPROVEN');
+        return this.#bindingLifecycle.run(async()=>{
+            const result=await this.#runHeld(operationIdentity,undefined,false,false,false,false,true);
+            if(result.status==='succeeded'&&onSettled)await onSettled(result);return result;
+        });
+    }
+
+    async resumeClosedSettlement(operationIdentity,onSettled) {
+        if(this.executionContext.target!=='test'||!this.#bindingLifecycle
+            ||typeof this.operationRepository.claimClosedSettlement!=='function')throw Error('TEST_CLOSED_SETTLEMENT_UNPROVEN');
+        return this.#bindingLifecycle.run(async()=>{
+            const result=await this.#runHeld(operationIdentity,undefined,false,false,false,true);
+            if(result.status==='succeeded'&&onSettled)await onSettled(result);return result;
+        });
+    }
+
+    async resumeUndispatchedPreparation(operationIdentity,onSettled) {
+        if(this.executionContext.target!=='test'||!this.#bindingLifecycle
+            ||typeof this.operationRepository.claimUndispatchedPreparation!=='function')throw Error('TEST_UNDISPATCHED_PREPARATION_UNPROVEN');
+        return this.#bindingLifecycle.run(async()=>{
+            const result=await this.#runHeld(operationIdentity,undefined,false,false,true);
+            if(result.status==='succeeded'&&onSettled)await onSettled(result);return result;
+        });
+    }
+
+    async resumeBindingReservations(operationIdentity, onSettled) {
+        if (this.executionContext.target !== 'test' || !this.#bindingLifecycle
+            || typeof this.operationRepository.claimBindingReservationContinuation !== 'function') throw new Error('TEST_BINDING_RESERVATION_CONTINUATION_UNPROVEN');
+        return this.#bindingLifecycle.run(async () => {
+            const result = await this.#runHeld(operationIdentity, undefined, true);
+            if (result.status === 'succeeded' && onSettled) await onSettled(result);
+            return result;
+        });
+    }
+
+    // Startup-only readback: unlike recovery entrypoints this has NO path to
+    // claim, prepare, commit, verify, close, or repair a historical operation.
+    async resumeSettledRuntime(operationIdentity, onSettled) {
+        if (this.executionContext.target !== 'test' || !this.#bindingLifecycle) throw Error('TEST_SETTLED_RUNTIME_UNPROVEN');
+        return this.#bindingLifecycle.run(async () => {
+            const settled = await this.finalizer.probeV2Settlement({ operationId: entityId(operationIdentity) });
+            if (settled?.status !== 'succeeded' || settled.retained !== false || settled.terminal?.state !== 'proven') throw Error('TEST_SETTLED_RUNTIME_UNPROVEN');
+            await this.#bindingLifecycle.withTestRetainedVerifyObservation(settled.terminal.bindings, async (physical, check) => {
+                for (let i = 0; i < settled.terminal.bindings.length; i++) {
+                    const b = settled.terminal.bindings[i], p = physical.nodes.find(n => n.nodeId === b.nodeId), g = p?.journal?.generations?.[b.generation];
+                    if (p?.journal?.head !== b.generation || g?.phase !== 'closed' || p.bootId !== b.bootId || p.runnerIdle !== true
+                        || !same({ ...g.commands[b.commandIds.close]?.receipt, command: 'status' }, settled.terminal.proofs[i])
+                        || p.current[b.targetProfile].configSha256 !== b.candidateHash.slice(7)) throw Error('TEST_SETTLED_RUNTIME_UNPROVEN');
+                }
+                await check();
+            });
+            const result = { claimed: false, operationId: entityId(operationIdentity), status: 'succeeded', readOnly: true };
+            if (onSettled) await onSettled(result);
+            return result;
+        });
+    }
+
+    async resumeRetainedVerification(operationIdentity,onSettled) {
+        if(this.executionContext.target!=='test'||!this.#bindingLifecycle
+            ||typeof this.operationRepository.claimRetainedVerifyContinuation!=='function'
+            ||typeof this.executor.observeRetainedVerify!=='function')throw Error('TEST_RETAINED_VERIFY_UNPROVEN');
+        return this.#bindingLifecycle.run(async()=>{
+            const settled=await this.finalizer.probeV2Settlement({operationId:entityId(operationIdentity)});
+            if(settled?.status==='succeeded'&&settled.retained===false&&settled.terminal.state==='proven'){
+                await this.#bindingLifecycle.withTestRetainedVerifyObservation(settled.terminal.bindings,async(physical,check)=>{
+                    for(let i=0;i<settled.terminal.bindings.length;i++){
+                        const b=settled.terminal.bindings[i],p=physical.nodes.find(n=>n.nodeId===b.nodeId),g=p?.journal?.generations?.[b.generation];
+                        if(p?.journal?.head!==b.generation||g?.phase!=='closed'||p.bootId!==b.bootId||p.runnerIdle!==true
+                            ||!same({...g.commands[b.commandIds.close]?.receipt,command:'status'},settled.terminal.proofs[i])
+                            ||p.current[b.targetProfile].configSha256!==b.candidateHash.slice(7))throw Error('TEST_RETAINED_VERIFY_UNPROVEN');
+                    }
+                    await check();
+                });
+                const result={claimed:false,operationId:entityId(operationIdentity),status:'succeeded'};
+                if(onSettled)await onSettled(result);return result;
+            }
+            const result=await this.#runHeld(operationIdentity,undefined,false,true);
+            if(result.status==='succeeded'&&onSettled)await onSettled(result);return result;
+        });
+    }
+
+    async continueRetainedVerification(plan,operation,nodes,heartbeat,acquiredNodeIds) {
+        const prepared=[],closing=Boolean(operation.retainedVerifyClosureContinuation);
+        const beforeClosure=operation.retainedVerifyContinuation?.kind==='verified-before-closure-reclaimed-claim-v1';
+        const original=['original-verified-all-five-before-normal-closure-v1',
+            'original-verified-delete-before-normal-closure-v1',
+            'original-verified-reserve-delete-before-normal-closure-v1'].includes(operation.retainedVerifyClosureContinuation?.kind);
+        for(let i=0;i<nodes.length;i++){
+            const node=nodes[i],metadata=operation.nodes[i];
+            const r=await heartbeat.run(()=>this.executor.rehydrate(this.context(plan,node,undefined,metadata.backupId)));
+            if(r?.ok!==true||r.backupId!==metadata.backupId||!Object.isFrozen(r.prepared))throw Error('TEST_RETAINED_VERIFY_UNPROVEN');
+            const context=this.context(plan,node,r.prepared,r.backupId);
+            if(original||beforeClosure)await heartbeat.run(()=>this.executor.restoreCompletedVerify(context));
+            else if(i===0)await heartbeat.run(()=>this.executor.observeRetainedVerify(context,closing));
+            else if(closing)await heartbeat.run(()=>this.executor.restoreCompletedVerify(context));
+            else {
+                if((await heartbeat.run(()=>this.executor.commit(context)))?.ok!==true)throw Error('TEST_RETAINED_VERIFY_UNPROVEN');
+                if(!await this.operationRepository.recordNode({operationId:plan.operationId,owner:this.workerId,now:this.clock.now(),node:node.node,state:'committed'}))throw new LeaseLostError();
+                if((await heartbeat.run(()=>this.executor.verify(context)))?.ok!==true)throw Error('TEST_RETAINED_VERIFY_UNPROVEN');
+            }
+            prepared.push({node,prepared:r.prepared,backupId:r.backupId});
+        }
+        return await this.completeV2(plan,plan.operationId,prepared,heartbeat,acquiredNodeIds,closing,false,original);
+    }
+
     async run(operationIdentity) {
         if (!this.#bindingLifecycle) return this.#runHeld(operationIdentity);
         try { return await this.#bindingLifecycle.run(() => this.#runHeld(operationIdentity)); }
@@ -1180,7 +1330,7 @@ class TopologyOperationWorker {
         }
     }
 
-    async #runHeld(operationIdentity) {
+    async #runHeld(operationIdentity, bootstrapContinuation, bindingReservationContinuation = false, retainedVerification = false, undispatchedPreparation = false, closedSettlement = false, preparedCommit = false) {
         const operationId = entityId(operationIdentity);
         if (!SAFE_ID_PATTERN.test(operationId)) {
             throw new TypeError('Topology operation worker requires an operation id');
@@ -1207,7 +1357,7 @@ class TopologyOperationWorker {
         const acquiredNodeIds = [];
         try {
             if (this.#bindingLifecycle) await this.#bindingLifecycle.assertHeld();
-            if (this.#retainExecutionOwnership && typeof this.finalizer.probeV2Settlement === 'function') {
+            if (!retainedVerification && !closedSettlement && !preparedCommit && this.#retainExecutionOwnership && typeof this.finalizer.probeV2Settlement === 'function') {
                 let recovery;
                 try { recovery = await this.finalizer.probeV2Settlement({ operationId }); }
                 catch {
@@ -1233,13 +1383,18 @@ class TopologyOperationWorker {
             // Recovery is awaited; an earlier held observation cannot authorize
             // the claim after revocation or an early-returning controller.
             if (this.#bindingLifecycle) await this.#bindingLifecycle.assertHeld();
-            const operation = await this.operationRepository.claim({
-                executionContext: this.executionContext,
-                operationId,
-                owner: this.workerId,
-                leaseMs: this.leaseMs,
-                now: this.clock.now(),
-            });
+            const operation = await (preparedCommit
+                ? this.operationRepository.claimPreparedCommit({operationId,owner:this.workerId,leaseMs:this.leaseMs,now:this.clock.now()}) : closedSettlement
+                ? this.operationRepository.claimClosedSettlement({operationId,owner:this.workerId,leaseMs:this.leaseMs,now:this.clock.now()}) : undispatchedPreparation
+                ? this.operationRepository.claimUndispatchedPreparation({operationId,owner:this.workerId,leaseMs:this.leaseMs,now:this.clock.now()}) : retainedVerification
+                ? this.operationRepository.claimRetainedVerifyContinuation({operationId,owner:this.workerId,leaseMs:this.leaseMs,now:this.clock.now()}) : bindingReservationContinuation
+                ? this.operationRepository.claimBindingReservationContinuation({ operationId, owner:this.workerId,
+                    leaseMs:this.leaseMs, now:this.clock.now() }) : bootstrapContinuation
+                ? this.operationRepository.claimBootstrapContinuation({ operationId, owner: this.workerId,
+                    leaseMs: this.leaseMs, now: this.clock.now(), ...bootstrapContinuation })
+                : this.operationRepository.claim({ executionContext: this.executionContext, operationId,
+                    owner: this.workerId, leaseMs: this.leaseMs, now: this.clock.now(),
+                    preserveExecutionAttempt: this.#retainExecutionOwnership }));
             if (!operation) return { claimed: false, operationId };
             // A malformed returned binding is not authority to terminalize or
             // release anything. Validate before plans, heartbeats, locks or runners.
@@ -1256,7 +1411,7 @@ class TopologyOperationWorker {
                     errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
             }
             try {
-                plan = durablePlan(operation, operationId);
+                plan = durablePlan(operation, operationId, Boolean(bootstrapContinuation));
                 nodes = orderedPlanNodes(plan);
                 entries = this.durableEntries(operation, nodes);
             } catch (error) {
@@ -1286,6 +1441,49 @@ class TopologyOperationWorker {
                     errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
             }
             heartbeat = this.createLeaseHeartbeat(operationId, acquiredNodeIds);
+            if(preparedCommit){
+                for(const lock of operation.preparedCommitContinuation.locks)acquiredNodeIds.push({...lock});
+                this.#executionFences.set(plan,new Map(acquiredNodeIds.map(({node,generation})=>[node,Object.freeze({owner:this.workerId,attempt:operation.attempts,generation})])));
+                const prepared=[];
+                try {
+                    for(let i=0;i<nodes.length;i++){
+                        const node=nodes[i],metadata=operation.nodes[i],r=await heartbeat.run(()=>this.executor.rehydrate(this.context(plan,node,undefined,metadata.backupId)));
+                        if(r?.ok!==true||r.backupId!==metadata.backupId)throw Error('TEST_PREPARED_COMMIT_UNPROVEN');
+                        const context=this.context(plan,node,r.prepared,r.backupId);
+                        const original=operation.preparedCommitContinuation.observed.find(p=>p.nodeId===node.node);
+                        if(!original||!['prepared','committed','verified'].includes(original.phase))throw Error('TEST_PREPARED_COMMIT_UNPROVEN');
+                        if(original.phase==='prepared'){
+                            if((await heartbeat.run(()=>this.executor.restoreCompletedPrepare(context)))?.ok!==true)throw Error('TEST_PREPARED_COMMIT_UNPROVEN');
+                            if((await heartbeat.run(()=>this.executor.commit(context)))?.ok!==true)throw Error('TEST_PREPARED_COMMIT_UNPROVEN');
+                            if(!await this.operationRepository.recordNode({operationId,owner:this.workerId,now:this.clock.now(),node:node.node,state:'committed'}))throw new LeaseLostError();
+                        }
+                        if(original.phase==='verified'){
+                            if((await heartbeat.run(()=>this.executor.restoreCompletedVerify(context)))?.ok!==true)throw Error('TEST_PREPARED_COMMIT_UNPROVEN');
+                        }else if((await heartbeat.run(()=>this.executor.verify(context)))?.ok!==true)throw Error('TEST_PREPARED_COMMIT_UNPROVEN');
+                        prepared.push({node,prepared:r.prepared,backupId:r.backupId});
+                    }
+                    return await this.completeV2(plan,operationId,prepared,heartbeat,acquiredNodeIds);
+                } catch(error){traceWorkerFailure(plan,operationId,'worker.prepared-continuation',error);return {claimed:true,operationId,status:'committing',stopped:true,drainUncertain:true,errorCode:'TEST_PREPARED_COMMIT_UNPROVEN'};}
+            }
+            if(closedSettlement){
+                for(const lock of operation.closedSettlementContinuation.locks)acquiredNodeIds.push({...lock});
+                this.#executionFences.set(plan,new Map(acquiredNodeIds.map(({node,generation})=>[node,Object.freeze({owner:this.workerId,attempt:operation.attempts,generation})])));
+                const prepared=[];
+                for(let i=0;i<nodes.length;i++){
+                    const node=nodes[i],metadata=operation.nodes[i],r=await heartbeat.run(()=>this.executor.rehydrate(this.context(plan,node,undefined,metadata.backupId)));
+                    if(r?.ok!==true||r.backupId!==metadata.backupId)throw Error('TEST_CLOSED_SETTLEMENT_UNPROVEN');
+                    await heartbeat.run(()=>this.executor.restoreCompletedVerify(this.context(plan,node,r.prepared,r.backupId)));
+                    prepared.push({node,prepared:r.prepared,backupId:r.backupId});
+                }
+                // Join before #runHeld finally stops the live heartbeat.
+                return await this.completeV2(plan,operationId,prepared,heartbeat,acquiredNodeIds,true,true);
+            }
+            if(retainedVerification) {
+                for(const lock of (operation.retainedVerifyClosureContinuation??operation.retainedVerifyContinuation).locks)acquiredNodeIds.push({...lock});
+                const executionAttempt=require('../repositories/topologyRetainedVerifyContinuation').originalExecutionAttempt(operation);
+                this.#executionFences.set(plan,new Map(acquiredNodeIds.map(({node,generation})=>[node,Object.freeze({owner:this.workerId,attempt:executionAttempt,generation})])));
+                return await this.continueRetainedVerification(plan,operation,nodes,heartbeat,acquiredNodeIds);
+            }
             if (operation.pppWait) {
                 resumeWait = operation.pppWait;
                 return await this.resumePppWait(
@@ -1303,7 +1501,16 @@ class TopologyOperationWorker {
             }
             const lockNodes = operation.admissionScope === 'selected'
                 ? operation.resourceNodeIds.map(node => ({ node })) : nodes;
-            const lockErrorCode = await this.acquireLocks(operationId, lockNodes, acquiredNodeIds);
+            if (bootstrapContinuation) {
+                for (const lock of operation.bootstrapContinuation.locks) acquiredNodeIds.push({ ...lock });
+            }
+            if (bindingReservationContinuation) {
+                for (const lock of operation.bindingReservationContinuation.locks) acquiredNodeIds.push({ ...lock });
+            }
+            if (undispatchedPreparation) {
+                for (const lock of operation.undispatchedPreparationContinuation.locks) acquiredNodeIds.push({ ...lock });
+            }
+            const lockErrorCode = bootstrapContinuation || bindingReservationContinuation || undispatchedPreparation ? null : await this.acquireLocks(operationId, lockNodes, acquiredNodeIds);
             if (lockErrorCode) {
                 traceWorkerFailure(plan, operationId, 'worker.lock', { code: lockErrorCode });
                 // Nothing has dispatched in this acquisition attempt, even for
@@ -1348,7 +1555,7 @@ class TopologyOperationWorker {
                 node, Object.freeze({ owner: this.workerId, attempt: operation.attempts, generation }),
             ])));
 
-            if (this.#bindingProvisioner) {
+            if (this.#bindingProvisioner && !bootstrapContinuation && !undispatchedPreparation) {
                 // Recovery is diagnostic only: never provision fresh IDs after any
                 // prior prepared/committed state, attempt reclaim or uncertain write.
                 if (operation.attempts !== 1 || entries.some(entry => entry.state !== 'pending')) {
@@ -1362,7 +1569,7 @@ class TopologyOperationWorker {
                         const candidateHash = `sha256:${node.candidateHash}`;
                         const backupId = `topology-${createHash('sha256').update([operationId, node.node,
                             candidateHash, node.targetProfile].join('\0')).digest('hex')}`;
-                        await heartbeat.run(() => this.#bindingProvisioner.reserveBinding(Object.freeze({
+                        await heartbeat.exclusive(() => this.#bindingProvisioner.reserveBinding(Object.freeze({
                             executionContext: this.executionContext.hostIdentity, operationId, nodeId: node.node,
                             candidateHash, backupId, targetProfile: node.targetProfile,
                             ...(Object.hasOwn(node, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(node.profileTargetPin) } : {}),
@@ -1370,13 +1577,14 @@ class TopologyOperationWorker {
                             ...context.executionFence,
                         })));
                     }
-                } catch {
+                } catch (error) {
+                    traceWorkerFailure(plan, operationId, 'worker.binding-reservation', error);
                     return { claimed: true, operationId, status: 'preparing', stopped: true, drainUncertain: true,
                         errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
                 }
             }
 
-            if (entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
+            if (!undispatchedPreparation && entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
                 const cleaned = await this.cleanupExpiredPreparation(
                     plan,
                     operationId,
@@ -1392,6 +1600,14 @@ class TopologyOperationWorker {
                 for (const node of nodes) {
                     preparingNode = node;
                     await this.renew(operationId);
+                    const retained = undispatchedPreparation && entries.find(entry => entry.node.node === node.node && entry.state === 'prepared');
+                    if (retained) {
+                        const result = await heartbeat.run(() => this.executor.rehydrate(this.context(plan, node, undefined, retained.backupId)));
+                        if (result?.ok !== true || result.backupId !== retained.backupId) throw new Error('TEST_PARTIAL_PREPARATION_UNPROVEN');
+                        await heartbeat.run(() => this.executor.restoreCompletedPrepare(this.context(plan, node, result.prepared, result.backupId)));
+                        prepared.push({ node, prepared: result.prepared, backupId: result.backupId });
+                        continue;
+                    }
                     const result = await heartbeat.run(
                         () => this.executor.prepare(this.context(plan, node)),
                     );
@@ -1413,7 +1629,14 @@ class TopologyOperationWorker {
             } catch (error) {
                 if (error instanceof LeaseLostError) throw error;
                 logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}${error?.cause ? ` (cause: ${error.cause?.message || error.cause})` : ''}`);
-                traceWorkerFailure(plan, operationId, 'worker.prepare', error);
+                traceWorkerFailure(plan, operationId, 'worker.prepare', error, preparingNode?.node);
+                if (undispatchedPreparation && entries.some(entry => entry.node.node === preparingNode?.node && entry.state === 'prepared')) {
+                    // Rehydration/status is read-only. A refused observation is
+                    // not permission to replace a proven original prepare with
+                    // a failed label, dispatch cleanup, or replay that command.
+                    return { claimed: true, operationId, status: 'preparing', stopped: true,
+                        drainUncertain: true, errorCode: error?.code || 'TEST_PARTIAL_PREPARATION_UNPROVEN' };
+                }
                 if (this.#retainExecutionOwnership
                     && error?.code === 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN') {
                     // Missing durable binding authority is not permission to dispatch,

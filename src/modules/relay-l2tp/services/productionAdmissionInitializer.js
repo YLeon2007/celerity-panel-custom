@@ -53,10 +53,10 @@ function exactKeys(value, keys) {
 }
 function same(a, b) { return fingerprint(a) === fingerprint(b); }
 
-function createProductionAdmissionInitializer({ db, serverContext, expectedDatabaseName,
+function createAdmissionPreparation({ db, serverContext, expectedDatabaseName,
     expectedDeployment, acceptedClassicLinks, initialState, acceptedManifestSha256,
     maintenanceAuthority, maintenanceGeneration, acceptedMissingCollections = [],
-    acceptedOfflineClassicLinkIds = [] } = {}) {
+    acceptedOfflineClassicLinkIds = [], expectedStateSha256 } = {}, existingState = false) {
     if (serverContext !== PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT
         || typeof expectedDatabaseName !== 'string' || !expectedDatabaseName
         || db?.databaseName !== expectedDatabaseName || !db?.client
@@ -72,19 +72,21 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
             || !Object.hasOwn(INDEXES, entry.name) || !exactKeys(entry.options, [])
             || Object.getPrototypeOf(entry.options) !== Object.prototype)
         || new Set(acceptedMissingCollections.map(entry => entry.name)).size !== acceptedMissingCollections.length
-        || !Array.isArray(acceptedClassicLinks) || acceptedClassicLinks.length !== 10
+        || !Array.isArray(acceptedClassicLinks) || (!existingState && acceptedClassicLinks.length !== 10)
         || acceptedClassicLinks.some(pin => !exactKeys(pin, ['id', 'sha256'])
             || typeof pin.id !== 'string' || !/^[a-f0-9]{24}$/.test(pin.id)
             || typeof pin.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(pin.sha256))
-        || new Set(acceptedClassicLinks.map(pin => pin.id)).size !== 10
+        || new Set(acceptedClassicLinks.map(pin => pin.id)).size !== acceptedClassicLinks.length
         || !Array.isArray(acceptedOfflineClassicLinkIds)
         || acceptedOfflineClassicLinkIds.some(id => typeof id !== 'string'
             || !acceptedClassicLinks.some(pin => pin.id === id))
         || new Set(acceptedOfflineClassicLinkIds).size !== acceptedOfflineClassicLinkIds.length
-        || !exactKeys(initialState, STATE_KEYS) || initialState._id !== 'singleton'
+        || (existingState ? initialState !== undefined || acceptedMissingCollections.length !== 0
+            || typeof expectedStateSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedStateSha256)
+            : !exactKeys(initialState, STATE_KEYS) || initialState._id !== 'singleton'
         || STATE_KEYS.slice(1).some(key => !Number.isSafeInteger(initialState[key]) || initialState[key] < 0)
         || initialState.revision !== initialState.deployedRevision
-        || initialState.remoteAdmissionCount !== 0 || initialState.topologyAdmissionCount !== 0) {
+        || initialState.remoteAdmissionCount !== 0 || initialState.topologyAdmissionCount !== 0)) {
         fail('PRODUCTION_INITIALIZATION_INPUT_REFUSED');
     }
     // A trusted server dependency, never a request field/boolean or default adapter.
@@ -98,7 +100,8 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
         // An existing offline link must be independently pinned and explicitly accepted.
         ...(acceptedOfflineClassicLinkIds.length
             ? { acceptedOfflineClassicLinkIds: [...acceptedOfflineClassicLinkIds] } : {}),
-        initialState: { ...initialState }, manifestSha256: acceptedManifestSha256,
+        ...(existingState ? { mode: 'existing-state-counters', expectedStateSha256 }
+            : { initialState: { ...initialState } }), manifestSha256: acceptedManifestSha256,
         acceptedMissingCollections: acceptedMissingCollections.map(entry => ({ name: entry.name, options: {} })) });
     let attempted = false;
     return Object.freeze({ async initialize() {
@@ -140,13 +143,16 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     }
                 }
                 const expectedMissing = challenge.acceptedMissingCollections.map(entry => entry.name);
+                // Existing-state preparation deliberately supports only an unowned,
+                // history-empty legacy state. Missing stores are NOT proof of zero.
+                const catalogNames = [...Object.keys(INDEXES), ...(existingState ? ['topologyconfigowners'] : [])];
                 async function catalog(missing = []) {
-                    const rows = await guarded(() => db.listCollections({ name: { $in: Object.keys(INDEXES) } }, BUDGET).toArray());
-                    if (rows.length !== Object.keys(INDEXES).length - missing.length
+                    const rows = await guarded(() => db.listCollections({ name: { $in: catalogNames } }, BUDGET).toArray());
+                    if (rows.length !== catalogNames.length - missing.length
                         || rows.some(row => missing.includes(row.name) || row.type !== 'collection'
                             || Object.keys(row.options || {}).length || !(row.info?.uuid instanceof mongo.Binary)
                             || row.info.uuid.sub_type !== 4 || row.info.uuid.length() !== 16)
-                        || Object.keys(INDEXES).some(name => !missing.includes(name) && !rows.some(row => row.name === name))) {
+                        || catalogNames.some(name => !missing.includes(name) && !rows.some(row => row.name === name))) {
                         fail('PRODUCTION_INITIALIZATION_CATALOG_REFUSED');
                     }
                     return rows.map(row => ({ name: row.name, uuid: row.info.uuid })).sort((a, b) => a.name.localeCompare(b.name));
@@ -260,18 +266,21 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     return additions;
                 }
                 async function inventory(options, expectedState, missing = []) {
-                    const links = await guarded(() => db.collection('cascadelinks').find({}, options).sort({ _id: 1 }).limit(11).toArray());
-                    if (links.length !== 10 || links.filter(row => row.mode === 'reverse').length !== 8
-                        || links.filter(row => row.mode === 'forward').length !== 2
+                    const links = await guarded(() => db.collection('cascadelinks').find({}, options).sort({ _id: 1 })
+                        .limit(challenge.acceptedClassicLinks.length + 1).toArray());
+                    if (links.length !== challenge.acceptedClassicLinks.length
+                        || (!existingState && (links.filter(row => row.mode === 'reverse').length !== 8
+                            || links.filter(row => row.mode === 'forward').length !== 2))
                         || links.some(row => !(row._id instanceof mongo.ObjectId) || !(row.portalNode instanceof mongo.ObjectId)
                             || !(row.bridgeNode instanceof mongo.ObjectId) || row.active !== true
+                            || !['reverse', 'forward'].includes(row.mode)
                             || !(['online', 'deployed'].includes(row.status)
                                 || (row.status === 'offline'
                                     && challenge.acceptedOfflineClassicLinkIds?.includes(String(row._id))))
                             || !challenge.acceptedClassicLinks.some(pin => pin.id === String(row._id) && pin.sha256 === fingerprint(row)))) {
                         fail('PRODUCTION_INITIALIZATION_PIN_DRIFT');
                     }
-                    for (const name of HISTORY) {
+                    for (const name of [...HISTORY, ...(existingState ? ['topologyconfigowners'] : [])]) {
                         // Absence is independently accepted catalog state, never inferred empty history.
                         if (missing.includes(name)) continue;
                         if ((await guarded(() => db.collection(name).find({}, options).limit(1).toArray())).length) {
@@ -280,6 +289,23 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     }
                     if (missing.includes('cascadetopologystates')) return;
                     const states = await guarded(() => db.collection('cascadetopologystates').find({}, options).limit(2).toArray());
+                    if (existingState) {
+                        const state = states[0];
+                        // Counts are established from the COMPLETE empty authoritative
+                        // histories above, not defaults, link count or deployed revision.
+                        // Any retained/terminal row conservatively needs separate review.
+                        if (states.length !== 1 || state._id !== 'singleton'
+                            || fingerprint(state) !== (expectedState ? fingerprint(expectedState) : challenge.expectedStateSha256)
+                            || STATE_KEYS.slice(1, 5).some(key => !Number.isSafeInteger(state[key]) || state[key] < 0)
+                            || state.deployedRevision > state.revision
+                            || Object.keys(state).some(key => ![...STATE_KEYS, '__v', 'createdAt', 'updatedAt',
+                                'classicLifecycleLastSettlement'].includes(key))
+                            || ['remoteAdmissionCount', 'topologyAdmissionCount'].some(key =>
+                                Object.hasOwn(state, key) && state[key] !== 0)) {
+                            fail('PRODUCTION_INITIALIZATION_EXISTING_STATE_REFUSED');
+                        }
+                        return state;
+                    }
                     if (expectedState ? states.length !== 1 || !same(states[0], expectedState) : states.length !== 0) {
                         fail(expectedState ? 'PRODUCTION_INITIALIZATION_READBACK_MISMATCH' : 'PRODUCTION_INITIALIZATION_STATE_PRESENT');
                     }
@@ -402,20 +428,39 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     session = db.client.startSession({ causalConsistency: false });
                     if (typeof session.transaction?.transition !== 'function') fail('PRODUCTION_INITIALIZATION_DRIVER_REFUSED');
                     session.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
-                    await inventory({ ...BUDGET, session });
-                    await guarded(() => db.collection('cascadetopologystates').insertOne({ ...challenge.initialState },
-                        { session, ...BUDGET }));
+                    const before = await inventory({ ...BUDGET, session });
+                    const added = existingState ? Object.fromEntries(['remoteAdmissionCount', 'topologyAdmissionCount']
+                        .filter(key => !Object.hasOwn(before, key)).map(key => [key, 0])) : undefined;
+                    const confirmedState = existingState ? { ...before, ...added } : challenge.initialState;
+                    if (existingState) {
+                        if (Object.keys(added).length) {
+                            // Exact whole-document CAS also rejects new foreign fields.
+                            // Native driver: no model defaults, timestamps, upsert or revision writes.
+                            const changed = await guarded(() => db.collection('cascadetopologystates').updateOne({
+                                _id: 'singleton', $expr: { $eq: ['$$ROOT', { $literal: before }] },
+                            }, { $set: added }, { session, ...BUDGET }));
+                            if (changed.matchedCount !== 1 || changed.modifiedCount !== 1) {
+                                fail('PRODUCTION_INITIALIZATION_EXISTING_STATE_REFUSED');
+                            }
+                        }
+                    } else {
+                        await guarded(() => db.collection('cascadetopologystates').insertOne({ ...challenge.initialState },
+                            { session, ...BUDGET }));
+                    }
                     await check();
                     commitAttempted = true;
                     await guarded(() => finishOnce('commitTransaction', 'TRANSACTION_COMMITTED'));
                     await deploymentCheck();
-                    await inventory(MAJORITY, challenge.initialState);
+                    await inventory(MAJORITY, confirmedState);
                     if ((await planIndexes()).length || !same(baseline, await catalog())) fail('PRODUCTION_INITIALIZATION_SCHEMA_DRIFT');
                     await guarded(() => session.endSession());
                     session = undefined;
                     await check();
-                    result = Object.freeze({ initialized: true, ready: false, dormant: true,
-                        mode: 'insert-only', stateSha256: fingerprint(challenge.initialState) });
+                    result = Object.freeze(existingState ? { prepared: true, initialized: false, ready: false, dormant: true,
+                        mode: 'existing-state-counters', addedFields: Object.freeze(Object.keys(added)),
+                        stateSha256: fingerprint(confirmedState) }
+                        : { initialized: true, ready: false, dormant: true,
+                            mode: 'insert-only', stateSha256: fingerprint(challenge.initialState) });
                     completed = true;
                     return result;
                 } catch (error) {
@@ -450,4 +495,10 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
     } });
 }
 
-module.exports = { createProductionAdmissionInitializer, REVIEWED_MANIFEST, REVIEWED_MANIFEST_SHA256 };
+function createProductionAdmissionInitializer(options) { return createAdmissionPreparation(options); }
+function createProductionAdmissionExistingStatePreparation(options) {
+    const initializer = createAdmissionPreparation(options, true);
+    return Object.freeze({ prepare: initializer.initialize });
+}
+module.exports = { createProductionAdmissionInitializer, createProductionAdmissionExistingStatePreparation,
+    REVIEWED_MANIFEST, REVIEWED_MANIFEST_SHA256 };

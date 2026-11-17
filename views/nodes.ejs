@@ -378,6 +378,10 @@ function nodeMetaFor(node) {
 <div id="viewNetwork" style="display:none">
     <link rel="stylesheet" href="/css/network.min.css">
     <div class="network-page">
+        <div id="topologyReentryNotice" hidden>
+            <button type="button" class="btn btn-sm btn-outline" disabled>Повторно включить any-order</button>
+            <span role="status"></span>
+        </div>
         <div class="network-container">
             <div id="cy" class="cytoscape-canvas"></div>
 

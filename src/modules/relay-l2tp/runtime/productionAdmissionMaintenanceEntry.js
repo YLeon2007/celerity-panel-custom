@@ -20,11 +20,15 @@ async function runAccepted({ config, authority, createClient }) {
             await client.connect();
             await check();
             // Native DB only, no models, auto-DDL, app pools, workers or consumers.
-            const { createProductionAdmissionInitializer } = require('../services/productionAdmissionInitializer');
-            const initializer = createProductionAdmissionInitializer({ db: client.db(challenge.databaseName),
+            const { createProductionAdmissionInitializer, createProductionAdmissionExistingStatePreparation }
+                = require('../services/productionAdmissionInitializer');
+            const existing = challenge.mode === 'existing-state-counters';
+            const create = existing ? createProductionAdmissionExistingStatePreparation : createProductionAdmissionInitializer;
+            const initializer = create({ db: client.db(challenge.databaseName),
                 serverContext: PROD, expectedDatabaseName: challenge.databaseName,
                 expectedDeployment: challenge.deployment, acceptedClassicLinks: challenge.acceptedClassicLinks,
                 initialState: challenge.initialState, acceptedManifestSha256: challenge.manifestSha256,
+                expectedStateSha256: challenge.expectedStateSha256,
                 maintenanceGeneration: challenge.maintenanceGeneration,
                 acceptedMissingCollections: challenge.acceptedMissingCollections,
                 acceptedOfflineClassicLinkIds: challenge.acceptedOfflineClassicLinkIds,
@@ -33,7 +37,7 @@ async function runAccepted({ config, authority, createClient }) {
                     if (!equal(same, challenge)) fail();
                     await check(); const value = await work(scope); await check(); return value;
                 } } });
-            result = await initializer.initialize();
+            result = await (existing ? initializer.prepare() : initializer.initialize());
             await check();
         } catch (error) { primary = error; }
         finally {

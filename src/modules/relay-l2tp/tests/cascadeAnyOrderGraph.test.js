@@ -24,7 +24,7 @@ function fixture(modes = ['reverse', 'reverse', 'reverse']) {
     return { nodes, links };
 }
 
-function topologyFor(data, linkIds, { keepDetachedNodes = false, groups = [] } = {}) {
+function topologyFor(data, linkIds, { keepDetachedNodes = false, groups = [], healthByPathKey } = {}) {
     const links = data.links.filter(link => linkIds.includes(link.id));
     const used = new Set(links.flatMap(link => [link.source, link.target]));
     return {
@@ -32,6 +32,7 @@ function topologyFor(data, linkIds, { keepDetachedNodes = false, groups = [] } =
             .map(({ id, role }) => ({ id, role })),
         links: links.map(({ id, source, target, mode }) => ({ id, source, target, mode })),
         groups,
+        ...(healthByPathKey === undefined ? {} : { healthByPathKey }),
     };
 }
 
@@ -40,6 +41,7 @@ function compose(data, linkIds, options = {}) {
     return composeFrozenTopologyDeploymentPlan({
         snapshot, nodeMetadata: data.nodes, linkMetadata: data.links,
         compiledTopology: compileTopology(snapshot), staged: true,
+        executionContext: { target: 'test', hostIdentity: 'test.infograd.online' },
     });
 }
 
@@ -236,7 +238,8 @@ test('pinned scope preserves the sibling geo profile but excludes another pendin
 
 test('source-less relay path ingress retains explicit default and geo policy in mixed modes', async () => {
     const data = fixture(['reverse', 'forward', 'reverse']);
-    const options = { groups: [{ _id: 'group', mode: 'forward', strategy: 'priority-failover',
+    // Explicit local selector input, not observed tunnel/PPP/client health.
+    const options = { healthByPathKey: { 'group:main': true }, groups: [{ _id: 'group', mode: 'forward', strategy: 'priority-failover',
         paths: [{ pathKey: 'main', linkIds: ['rb1'], priority: 1, enabled: true }] }] };
     const { plan } = await materialize(data, ['rb1', 'rb2'], options);
     const relay = configsOf(plan).get('relay-1');
@@ -244,10 +247,11 @@ test('source-less relay path ingress retains explicit default and geo policy in 
     assert.ok(relay.inbounds.some(inbound => inbound.tag === 'cascade-main'));
     const main = routeFor(relay, 'cascade-main');
     const geo = routeFor(relay, 'cascade-main', 'geoip:ru');
-    assert.equal(main, 'fwd-link-1');
+    assert.match(main, /^fwd-/);
     assert.equal(relay.outbounds.find(outbound => outbound.tag === main).settings.vnext[0].address,
         data.nodes.find(node => node.id === 'b1').ip);
-    assert.equal(geo, 'portal-link-2');
+    assert.equal(relay.outbounds.find(outbound => outbound.tag === main).settings.vnext[0].port, 12002);
+    assert.match(geo, /^portal-/);
     assert.ok(relay.reverse.portals.some(portal => portal.tag === geo));
     assert.equal(routeFor(relay, 'cascade-main', 'geosite:category-ru'), geo);
     assert.ok(relay.inbounds.some(inbound => inbound.port === 12003), 'reverse geo listener stays on relay');
@@ -255,7 +259,7 @@ test('source-less relay path ingress retains explicit default and geo policy in 
         'forward default listener stays on its bridge');
 });
 
-for (const operationKind of [undefined, 'domain.reconcile']) {
+for (const operationKind of [undefined]) {
     test(`source-less materialization does not grant staging to ${String(operationKind)}`, async () => {
         const data = fixture();
         const topology = topologyFor(data, ['rb1']);
@@ -267,6 +271,19 @@ for (const operationKind of [undefined, 'domain.reconcile']) {
         assert.deepEqual(reads, []);
     });
 }
+
+test('domain.reconcile preserves the supported source-less staged plan without claiming client readiness', async () => {
+    const data = fixture();
+    const topology = topologyFor(data, ['rb1']);
+    const { materializer } = materializerFor(data);
+    const plan = await materializer.materialize({
+        target: 'test', hostIdentity: 'test.infograd.online', operationKind: 'domain.reconcile',
+        pinnedSnapshot: { revision: 7, topology, compiled: compileTopology(topology) },
+    });
+    const selected = (await materialize(data, ['rb1'])).plan;
+    assert.deepEqual(plan, selected, 'reconciliation uses the same supported staged composition');
+    assert.equal(plan.staged, true);
+});
 
 for (const ids of [['rb1'], ['rb1', 'rb2'], ['pr'], ['rb2']]) {
     test(`incomplete ${ids.join(',')} still requires explicit staging permission`, () => {

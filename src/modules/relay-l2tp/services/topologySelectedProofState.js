@@ -73,7 +73,7 @@ async function readSettledSelectedOperation(repository, expected) {
         if (repository.NodeOperationLock?.exists && await repository.NodeOperationLock.exists({ node: { $in: operation.resourceNodeIds } })) return null;
         const link = await repository.snapshotReader.CascadeLink.findById(operation.linkId).lean();
         if (operation.kind === 'link.delete' ? link != null
-            : !link || link.lifecycle?.state === 'deleting' || linkDesiredVersion(link) !== operation.desiredVersion) return null;
+            : !link || link.lifecycle?.state === 'deleting' || await require('./topologyNodeActivation').selectedDesiredVersion(repository.snapshotReader, link, operation.nodeActivation) !== operation.desiredVersion) return null;
         return operation;
     } catch { return null; }
 }

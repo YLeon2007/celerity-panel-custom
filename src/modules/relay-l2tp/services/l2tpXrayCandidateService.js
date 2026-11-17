@@ -199,7 +199,9 @@ class L2tpXrayCandidateService {
         const snapshot = buildSnapshot(plan, node);
         let fragment;
         try {
-            fragment = deepFreeze(this.fragmentProvider(snapshot));
+            fragment = this.fragmentProvider(snapshot);
+            if (this.transformFragment) fragment = await this.transformFragment({ fragment, plan });
+            fragment = deepFreeze(fragment);
         } catch {
             fail('XRAY_CONFIG_GENERATION_FAILED', 'Failed to generate the Xray candidate');
         }

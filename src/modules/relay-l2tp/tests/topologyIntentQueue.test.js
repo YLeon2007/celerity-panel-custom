@@ -28,7 +28,8 @@ function createIntentService(dependencies = models) {
             topologyStateModel: models.CascadeTopologyState, selectedTopologyRepository: deployment }),
         planMaterializer: input.planMaterializer || new TopologyOperationPlanMaterializer(input) });
     return moduleEntry.createTopologyIntentService({ ...input,
-        prepareLink: input.prepareLink ?? require('../../../routes/cascadeLinks').prepareIntentLink,
+        prepareLink: input.prepareLink ?? (async link => require('../../../routes/cascadeLinks')
+            .prepareIntentLink(link, await input.HyNode.findById(link.bridgeNode).lean())),
         intentDraftWriter: draft.createIntentDraftWriter({ selectedTopologyRepository: deployment }),
         intentOperationAdmission: { db: models.CascadeTopologyState.db, queue: request => coordinator.queueIntent(request) },
         resolveIntentResources: request => coordinator.resolveIntentResourcesForQueue(request) });
@@ -112,7 +113,8 @@ async function reset(context = TEST_CONTEXT) {
     // mutation guards. Reset only the isolated fixture via its raw collections.
     for (const model of Object.values(models)) await model.collection.deleteMany({});
     await models.CascadeTopologyState.create({ _id: 'singleton', revision: 7, deployedRevision: 5, topologyAdmissionCount: 0, remoteAdmissionCount: 0 });
-    await models.HyNode.collection.insertMany(ids.map((_id, index) => ({ _id: new mongoose.Types.ObjectId(_id), type: 'xray', active: true, cascadeRole: ['portal', 'portal', 'relay', 'bridge', 'bridge'][index], ip: `192.0.2.${index + 1}`, domain: `node-${index}.test`, port: 443, xray: { security: 'none', transport: 'tcp', inboundTag: 'vless-in', apiPort: 10085 } })));
+    // Keep MAIN/bridge management listeners disjoint from the 10086+ tunnel fixtures.
+    await models.HyNode.collection.insertMany(ids.map((_id, index) => ({ _id: new mongoose.Types.ObjectId(_id), type: 'xray', active: true, cascadeRole: ['portal', 'portal', 'relay', 'bridge', 'bridge'][index], ip: `192.0.2.${index + 1}`, domain: `node-${index}.test`, port: 443, xray: { security: 'none', transport: 'tcp', inboundTag: 'vless-in', apiPort: 20085 } })));
     await adoptedEmptyBaseline(context);
     // Explicit absent/non-PPP transit. Missing state is not completed-chain readiness.
     await models.RelayL2tpState.collection.insertOne({ node: new mongoose.Types.ObjectId(ids[2]),
@@ -122,7 +124,9 @@ function link(index) {
     const pairs = [[0, 2], [1, 2], [2, 3], [2, 4]];
     const [source, target] = pairs[index];
     return { _id: new mongoose.Types.ObjectId(), name: `rapid-${index + 1}`, mode: index % 2 ? 'reverse' : 'forward',
-        portalNode: ids[source], bridgeNode: ids[target], tunnelUuid: `local-test-${index}`, tunnelPort: 10086 + index,
+        portalNode: ids[source], bridgeNode: ids[target],
+        tunnelUuid: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`, tunnelPort: 10086 + index,
+        tunnelSecurity: 'none', tunnelTransport: 'tcp', tunnelProtocol: 'vless',
         autoDeploy: true, ...(index === 3 ? { geoRouting: { enabled: true, geoip: ['ru'] } } : {}) };
 }
 async function adoptedEmptyBaseline(context) {

@@ -27,9 +27,12 @@ function query(value) {
         lean: async () => structuredClone(value) };
 }
 function matches(row, filter) {
-    return row && Object.entries(filter).every(([key, value]) =>
-        value && typeof value === 'object' && Object.hasOwn(value, '$gt')
-            ? row[key] > value.$gt : row[key] === value);
+    return row && Object.entries(filter).every(([key, value]) => {
+        const actual = key.split('.').reduce((part, name) => part?.[name], row);
+        if (value instanceof Date) return actual instanceof Date && +actual === +value;
+        return value && typeof value === 'object' && Object.hasOwn(value, '$gt')
+            ? actual > value.$gt : actual === value;
+    });
 }
 function update(row, filter, change) {
     if (!matches(row, filter)) return { matchedCount: 0 };
@@ -63,7 +66,7 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
             node('node-c', 'bridge', 'bridge')] };
     const topology = { _id: 'singleton', deployedRevision: 5, topologyAdmissionCount: 1,
         stateTransitionRevision: 0 };
-    const intent = { executionContext, operationIdempotencyKey: idempotencyKey, _id: 'intent-head', operationId: operation._id, status: 'admitted', generation: 1,
+    const intent = { version: 1, executionContext, operationIdempotencyKey: idempotencyKey, _id: 'intent-head', operationId: operation._id, status: 'admitted', generation: 1,
         topologyRevision: 7, priorDeployedRevision: 5, admissionFingerprint: operation.admissionFingerprint };
     const queue = { _id: QUEUE_ID, outstanding: 2 };
     const db = { async startSession() { assert.fail('negative paths must not start V2 closure'); } };
