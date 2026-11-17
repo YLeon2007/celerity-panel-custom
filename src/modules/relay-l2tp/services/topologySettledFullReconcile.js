@@ -13,6 +13,7 @@ const fail = () => { throw Object.assign(new Error('Settled full reconcile basel
 // predecessor synthesis or read-time metadata hydration supplies this evidence.
 function recoverFrozenFullReconcile({ operation: op, owners }) {
     const { selectedAdmissionFingerprint } = require('../repositories/topologyOperationRepository');
+    const { projectNodes, projectLinks, projectGroups } = require('../domain/topologyDraft');
     if (!op || (op.kind !== undefined && op.kind !== 'domain.reconcile') || op.admissionScope !== undefined || op.effectiveTopology !== undefined
         || op.status !== 'succeeded' || op.heldTopologyAdmission !== false || op.v2Terminal?.state !== 'proven'
         || op.admissionFingerprint !== selectedAdmissionFingerprint(op)) fail();
@@ -20,7 +21,12 @@ function recoverFrozenFullReconcile({ operation: op, owners }) {
     const generated = require('./frozenTopologyDeploymentPlanComposer').composeFrozenTopologyDeploymentPlan({
         snapshot: topology, staged: op.kind === 'domain.reconcile', executionContext: op.executionContext,
         nodeMetadata: topology.nodes, linkMetadata: topology.links,
-        compiledTopology: require('../domain/topologyCompiler').compileTopology({ ...topology, healthByPathKey: {} }),
+        // Identical compiler/projection to admission, including configured
+        // relay ingress and geo branches. A bare compile changes actual bytes.
+        compiledTopology: require('../domain/primaryReservePolicy').compileConfiguredTopology({
+            nodes: projectNodes(topology.nodes), links: projectLinks(topology.links),
+            groups: projectGroups(topology.groups), healthByPathKey: {},
+        }),
     });
     if (op.nodes.length !== topology.nodes.length || generated.nodes.length !== op.nodes.length
         || (op.kind !== undefined && (topology.links.length !== op.linkIds?.length || topology.links.some(link => !op.linkIds.includes(link.id))))

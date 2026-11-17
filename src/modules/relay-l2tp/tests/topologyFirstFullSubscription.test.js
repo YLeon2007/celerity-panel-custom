@@ -17,13 +17,18 @@ function replaceModule(t, name, exports) {
 test('first public FullSync -> V2 settlement -> actual subscription uses its frozen applied graph without a selected predecessor', async t => {
 
     const f = fixture();
-    f.HyNode.rows.splice(0, 2); f.HyNode.rows.splice(1, 1);
-    f.HyNode.rows.push({ _id: id(2), role: 'bridge', cascadeRole: 'bridge', type: 'xray', active: true,
-        ip: '192.0.2.2', port: 443, xray: { security: 'none', transport: 'tcp' } });
-    f.CascadeLink.rows.splice(1, 1);
-    Object.assign(f.CascadeLink.rows[0], { portalNode: id(3), bridgeNode: id(2), status: 'deployed' });
-    f.TopologyConfigOwner.rows.splice(0, f.TopologyConfigOwner.rows.length,
-        ...f.TopologyConfigOwner.rows.filter(o => [id(2), id(3)].includes(o.node)));
+    // Exact live shape: portal -> relay -> default bridge plus a geo leaf,
+    // and the relay's installed-group ingress. A bare compiler is not equivalent.
+    f.CascadeLink.rows.splice(0, f.CascadeLink.rows.length,
+        { _id: id(10), portalNode: id(3), bridgeNode: id(1), mode: 'reverse', active: true, status: 'deployed', tunnelPort: 23451, tunnelSecurity: 'none', tunnelTransport: 'tcp' },
+        { _id: id(11), portalNode: id(1), bridgeNode: id(4), mode: 'reverse', active: true, status: 'deployed', tunnelPort: 23452, tunnelSecurity: 'none', tunnelTransport: 'tcp' },
+        { _id: id(12), portalNode: id(1), bridgeNode: id(2), mode: 'reverse', active: true, status: 'deployed', tunnelPort: 23453, tunnelSecurity: 'none', tunnelTransport: 'tcp', geoRouting: { enabled: true, domains: ['domain:example.ru'], geoip: [] } });
+    f.CascadeRouteGroup.rows.push({ _id: id(60), mode: 'reverse', strategy: 'priority-failover',
+        paths: [{ pathKey: 'main', linkIds: [id(11)], priority: 1, enabled: true }] });
+    f.RelayL2tpState.rows.push({ node: id(1), status: 'installed', desiredState: 'installed',
+        secretRevision: 2, routeGroup: id(60), activePathKey: 'main', appliedTopologyRevision: 3 });
+    f.deployment.snapshotReader.readDraft = async () => ({ revision: f.CascadeTopologyState.rows[0].revision,
+        deployedRevision: 3, nodes: structuredClone(f.HyNode.rows), links: structuredClone(f.CascadeLink.rows), groups: structuredClone(f.CascadeRouteGroup.rows) });
     const portal = f.HyNode.rows.find(n => n._id === id(3));
     Object.assign(portal, { name: 'preserved portal', status: 'online' });
     const user = { _id: id(90), userId: 'preserved-user', username: 'preserved-user', enabled: true,
@@ -83,7 +88,8 @@ test('first public FullSync -> V2 settlement -> actual subscription uses its fro
         f.NodeOperationLock.rows.push({ node: entry.node, generation: binding.generation, operationId: op._id,
             owner: op.leaseOwner, leaseUntil, remoteUncertain: true });
     }
-    op.v2Terminal = { state: 'proven', bindings, proofs, ownerFences, sideEffects: { usersVerified: true, attachVerified: false, pppProof: [] } };
+    op.v2Terminal = { state: 'proven', bindings, proofs, ownerFences, sideEffects: { usersVerified: true, attachVerified: false,
+        pppProof: [{ relayNode: id(1), credentialRevision: 2 }] } };
     // Exact node/enrollment serialization for the real V2 finalizer, not direct
     // writes to settled pointers or success flags.
 
