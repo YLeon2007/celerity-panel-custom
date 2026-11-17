@@ -46,3 +46,16 @@ test('TEST handback restores before real transfer and retains alias/business his
  assert.equal(rows[0].lastSettledOperation,'preserved-business-history');assert.deepEqual(aliases,before);
  assert.equal((await require('../services/topologyReentryPolicy').readOwnerReentryRestriction(rows[0])).code,'TOPOLOGY_BUSINESS_REENTRY_BLOCKED');
 });
+test('existing callback honors inactive/disabled systemctl exits without restarting an originally stopped service', () => {
+ const fs=require('node:fs'),{spawnSync}=require('node:child_process');
+ const source=fs.readFileSync(require.resolve('../../../../scripts/test-topology-owner'),'utf8');
+ const line=source.split('\n').find(line=>line.includes('const python = `'));
+ const expression=line.slice(line.indexOf('= ')+2).trim().replace(/;$/,'');
+ const python=Function('payload','return '+expression)({profile:'xray-main',expected:{serviceActive:'inactive',serviceEnabled:'disabled'},backupId:null,write:true});
+ const block=python.slice(python.indexOf('try:\n')+5,python.indexOf('except BaseException:')).split('\n').map(line=>line.startsWith(' ')?line.slice(1):line).join('\n');
+ // Only the command-adapter contract is substituted. Execute the actual
+ // generated callback verification block, never a real systemctl mutation.
+ const check=`import json,sys,types\nblock=json.loads(sys.stdin.read())\ncalls=[]\ndef run(args,**kw):\n calls.append(args)\n action=args[1]\n return types.SimpleNamespace(returncode=3 if action=='is-active' else 1 if action=='is-enabled' else 0,stdout='inactive\\n' if action=='is-active' else 'disabled\\n' if action=='is-enabled' else '')\nns={'subprocess':types.SimpleNamespace(run=run,DEVNULL=-3),'service':'xray','expected':{'serviceActive':'inactive','serviceEnabled':'disabled','configSha256':'original'},'cfg':types.SimpleNamespace(read_bytes=lambda:b'original'),'sha':lambda b:'original'}\nexec(block,ns)\nassert calls[0]==['systemctl','stop','xray']\nprint('exact inactive/disabled callback contract PASS')\n`;
+ const result=spawnSync('python3',['-I','-B','-c',check],{input:JSON.stringify(block),encoding:'utf8'});
+ assert.equal(result.status,0,result.stderr);assert.match(result.stdout,/callback contract PASS/);
+});
