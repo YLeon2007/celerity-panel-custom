@@ -14,6 +14,9 @@ from pathlib import Path
 import re
 import select
 import socket
+import stat
+import struct
+import subprocess
 import sys
 import time
 
@@ -33,6 +36,66 @@ def require_cgroup2(fd):
     need(libc.fstatfs(fd, ctypes.byref(buffer)) == 0 and buffer[0] == 0x63677270)
 
 
+_MASK_STATE = {'LoadState': 'masked', 'UnitFileState': 'masked', 'ActiveState': 'inactive',
+               'SubState': 'dead', 'MainPID': '0', 'ControlPID': '0'}
+
+
+def _properties(unit):
+    result = subprocess.run(['/usr/bin/systemctl', 'show', '--no-pager',
+                             '--property=' + ','.join(['Id', 'ControlGroup', *_MASK_STATE]), '--', unit],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=1, check=True, env={'LC_ALL': 'C', 'PATH': '/usr/bin:/bin'})
+    pairs = [line.split('=', 1) for line in result.stdout.decode('ascii').splitlines()]
+    need(len(pairs) == len(_MASK_STATE) + 2 and all(len(x) == 2 for x in pairs))
+    return dict(pairs)
+
+
+def check_masked_writer(pin, root, cgroup_root, uid, properties=_properties):
+    # A mask prevents future starts. Neither it nor an empty cgroup alone
+    # establishes that an already running writer has stopped.
+    need(exact(pin, 'unit cgroup') and isinstance(pin['unit'], str)
+         and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]{0,179}\.service', pin['unit'])
+         and pin['cgroup'] == '/system.slice/' + pin['unit'])
+    unit = pin['unit']
+    directory = trusted(root / 'etc/systemd/system', uid, root)
+    mask = directory / unit
+    st = mask.lstat()
+    need(st.st_uid == uid and stat.S_ISLNK(st.st_mode) and os.readlink(mask) == '/dev/null')
+    state = properties(unit)
+    need(state == {'Id': unit, 'ControlGroup': state.get('ControlGroup'), **_MASK_STATE}
+         and state['ControlGroup'] in ('', pin['cgroup']))
+    parent = trusted(cgroup_root / 'system.slice', uid, cgroup_root)
+    group = parent / unit
+    try:
+        fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        need(state['ControlGroup'] == '')
+        return
+    try:
+        if cgroup_root == Path('/sys/fs/cgroup'):
+            require_cgroup2(fd)
+        with os.fdopen(os.open('cgroup.events', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)) as events:
+            need(dict(line.split() for line in events).get('populated') == '0')
+        original, current = os.fstat(fd), group.lstat()
+        need((original.st_dev, original.st_ino) == (current.st_dev, current.st_ino))
+    finally:
+        os.close(fd)
+
+
+def check_runtime_peer(conn, pidfd):
+    # The reconnectable contract is private to the installed runtime observer,
+    # never the finite admission/initialization helper. Pin the actual Unix
+    # connecting task (SO_PEERPIDFD), not a reopened historical PID.
+    pid, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    need(pid > 1 and uid == 0 and not select.select([pidfd], [], [], 0)[0])
+    proc = Path('/proc') / str(pid)
+    script = '/usr/local/libexec/c3-production-physical.py'
+    trusted(script)
+    need(proc.joinpath('cmdline').read_bytes() == b'/usr/bin/python3\0-I\0-B\0' + os.fsencode(script) + b'\0'
+         and os.path.samefile(proc / 'exe', '/usr/bin/python3')
+         and not select.select([pidfd], [], [], 0)[0])
+
+
 class ExclusionGuard:
     def __init__(self, policy, *, owner_uid=0, trusted_root=Path('/'),
                  cgroup_root=Path('/sys/fs/cgroup'), allow_empty_for_test=False):
@@ -42,12 +105,14 @@ class ExclusionGuard:
         self.empty_test = allow_empty_for_test
         self.listener = None
         try:
-            need(exact(policy, 'version generation holderId bootId challengeSha256 scopes lock journal socket')
-                 and type(policy['version']) is int and policy['version'] == 1 and _codec.uuid_ok(policy['generation'])
-                 and _codec.uuid_ok(policy['holderId']) and _codec.uuid_ok(policy['bootId'])
+            need(type(policy.get('version')) is int and policy['version'] in (1, 2))
+            runtime = policy['version'] == 2
+            inventory = 'maskedWriters' if runtime else 'scopes'
+            need(exact(policy, 'version generation holderId bootId challengeSha256 lock journal socket ' + inventory)
+                 and all(_codec.uuid_ok(policy[k]) for k in ('generation', 'holderId', 'bootId'))
                  and isinstance(policy['challengeSha256'], str) and re.fullmatch('[a-f0-9]{64}', policy['challengeSha256'])
-                 and isinstance(policy['scopes'], list) and 1 <= len(policy['scopes']) <= 64
-                 and len({pin['path'] for pin in policy['scopes']}) == len(policy['scopes']))
+                 and isinstance(policy[inventory], list) and 1 <= len(policy[inventory]) <= 64
+                 and len({pin['unit' if runtime else 'path'] for pin in policy[inventory]}) == len(policy[inventory]))
             for name in ('lock', 'journal', 'socket'):
                 trusted(Path(policy[name]).parent, self.uid, self.root, private=True)
             self.journal = os.open(policy['journal'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -63,7 +128,7 @@ class ExclusionGuard:
             raise
 
     def _record(self):
-        raw = canonical({'version': 1, 'generation': self.policy['generation'],
+        raw = canonical({'version': self.policy['version'], 'generation': self.policy['generation'],
                          'holderId': self.policy['holderId'], 'state': 'unknown-retained'}) + b'\n'
         need(os.write(self.journal, raw) == len(raw))
         os.fsync(self.journal)
@@ -77,6 +142,10 @@ class ExclusionGuard:
         try:
             need(not self.closed and not self.poisoned
                  and Path('/proc/sys/kernel/random/boot_id').read_text().strip() == self.policy['bootId'])
+            if self.policy['version'] == 2:
+                for pin in self.policy['maskedWriters']:
+                    check_masked_writer(pin, self.root, self.cgroup_root, self.uid)
+                return
             for pin in self.policy['scopes']:
                 need(exact(pin, 'path device inode processes'))
                 group = trusted(pin['path'], self.uid, self.cgroup_root)
@@ -150,6 +219,7 @@ class ExclusionGuard:
                  and re.fullmatch('[a-f0-9]{64}', request['nonce'])
                  and request['verb'] in ('attach', 'check', 'retain')
                  and all(request[key] == self.policy[key] for key in ('generation', 'holderId', 'challengeSha256')))
+            need(self.policy['version'] == 1 or request['verb'] != 'retain')
             need((request['verb'] == 'attach') != attached)
             attached = True
             frame_started = None
@@ -160,6 +230,21 @@ class ExclusionGuard:
             else:
                 conn.sendall(reply)
             self.check()
+
+    def serve_runtime_observer(self, conn):
+        # Linux SO_PEERPIDFD; no numeric-PID fallback on older kernels.
+        fd = conn.getsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_PEERPIDFD', 77))
+        try:
+            os.set_inheritable(fd, False)
+            check_runtime_peer(conn, fd)
+            self.serve_connection(conn)
+            # Clean socket EOF alone does not mean the helper (or its copy of
+            # the flock FD) has exited. Never accept concurrently with it.
+            while not select.select([fd], [], [], 0.1)[0]:
+                self.check()
+            self.check()
+        finally:
+            os.close(fd)
 
     def serve(self):
         # No unlink/rebind recovery: an existing socket/journal is never adopted.
@@ -177,10 +262,13 @@ class ExclusionGuard:
                 except socket.timeout:
                     continue
                 with conn:
-                    need(not used)
-                    used = True  # no reattach/retry, even after a clean observer EOF
                     conn.settimeout(2)
-                    self.serve_connection(conn)
+                    if self.policy['version'] == 2:
+                        self.serve_runtime_observer(conn)
+                    else:
+                        need(not used)
+                        used = True  # v1 maintenance is strictly one-use
+                        self.serve_connection(conn)
             except BaseException:
                 self.poisoned = True
                 # Remain resident with actual OFD retained after ambiguity.

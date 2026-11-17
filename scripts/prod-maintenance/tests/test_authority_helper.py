@@ -108,6 +108,87 @@ class ProtocolTest(unittest.TestCase):
                                       cgroup_root=self.root, allow_empty_for_test=True)
         return module, guard, group, accepted
 
+    def test_runtime_guard_accepts_only_persistent_stopped_writer_mask(self):
+        from unittest.mock import patch
+        module, guard, _, _ = self.make_guard()
+        self.addCleanup(guard.close)
+        name = 'retired.service'
+        masks = self.root / 'etc/systemd/system'
+        for directory in (masks.parent.parent, masks.parent, masks): directory.mkdir(mode=0o700)
+        leaf = masks / name; leaf.symlink_to('/dev/null')
+        cg = self.root / 'system.slice' / name; cg.parent.mkdir(mode=0o700)
+        pin = {'unit': name, 'cgroup': '/system.slice/' + name}
+        props = dict(Id=name, LoadState='masked', UnitFileState='masked', ActiveState='inactive',
+                     SubState='dead', MainPID='0', ControlPID='0', ControlGroup='')
+        def check():
+            module.check_masked_writer(pin, self.root, self.root, os.getuid(), lambda unit: props)
+        check()
+        for key, bad in [('Id','other.service'), ('UnitFileState','masked-runtime'), ('ActiveState','active'),
+                         ('MainPID','88'), ('ControlPID','1'), ('SubState','running'), ('ControlGroup','/other')]:
+            with self.subTest(key=key), patch.dict(props, {key:bad}), self.assertRaises(Exception): check()
+        cg.mkdir(); (cg/'cgroup.events').write_text('populated 1\nfrozen 1\n')
+        with self.assertRaises(Exception): check()
+        (cg/'cgroup.events').write_text('populated 0\nfrozen 0\n'); check()
+        leaf.unlink()
+        with self.assertRaises(Exception): check()
+        leaf.symlink_to('/dev/zero')
+        with self.assertRaises(Exception): check()
+
+    def test_v2_runtime_policy_rechecks_every_mask_and_latches_loss(self):
+        from unittest.mock import patch
+        m, first, _, legacy = self.make_guard()
+        first.close()
+        runtime = dict(legacy, version=2, maskedWriters=[{'unit':'old.service','cgroup':'/system.slice/old.service'}],
+                       lock=str(self.root/'runtime.lock'), journal=str(self.root/'runtime.journal'), socket=str(self.root/'runtime.sock'))
+        del runtime['scopes']
+        checks = []
+        with patch.object(m, 'check_masked_writer', side_effect=lambda pin,*args:checks.append(pin)) as observe:
+            g = m.ExclusionGuard(runtime, owner_uid=os.getuid(), trusted_root=self.root, cgroup_root=self.root)
+            self.addCleanup(g.close)
+            self.assertEqual(checks, runtime['maskedWriters'])
+            g.check(); self.assertEqual(checks, runtime['maskedWriters']*2)
+            observe.side_effect = RuntimeError('mask lost')
+            with self.assertRaises(Exception): g.check()
+            observe.side_effect = None
+            with self.assertRaises(Exception): g.check()
+
+    def test_runtime_observer_eof_does_not_admit_successor_while_peer_is_alive(self):
+        from unittest.mock import patch
+        m, g, _, _ = self.make_guard()
+        self.addCleanup(g.close)
+        # Real Unix peer and kernel pidfd. The accepted helper argv is modeled;
+        # the child is deliberately kept alive after closing the observer socket.
+        path = str(self.root / 'test-runtime.sock')
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        listener.bind(path); listener.listen(1); listener.settimeout(3)
+        client = subprocess.Popen([sys.executable, '-I', '-B', '-c',
+            "import socket,sys; s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);"
+            "s.close();print('closed',flush=True);sys.stdin.buffer.read(1)", path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            conn, _ = listener.accept()
+            with conn, patch.object(m, 'check_runtime_peer') as identity, patch.object(g, 'serve_connection') as exchange:
+                returned, entered = threading.Event(), threading.Event()
+                faults = []
+                def run():
+                    try: g.serve_runtime_observer(conn)
+                    except BaseException as exc: faults.append(exc)
+                    finally: returned.set()
+                exchange.side_effect = lambda c: entered.set()
+                t = threading.Thread(target=run, daemon=True); t.start()
+                self.assertEqual(client.stdout.readline(), b'closed\n')
+                self.assertTrue(entered.wait(2)); self.assertFalse(returned.wait(0.15))
+                self.assertIsNone(client.poll())
+                client.stdin.close(); self.assertEqual(client.wait(timeout=3), 0)
+                self.assertTrue(returned.wait(2)); t.join(2)
+                self.assertFalse(faults); identity.assert_called_once(); exchange.assert_called_once_with(conn)
+                self.assertFalse(g.poisoned); g.check()
+        finally:
+            if not client.stdin.closed: client.stdin.close()
+            if client.poll() is None: client.kill()
+            client.wait(timeout=3); client.stdout.close()
+
     def test_real_guard_supplies_same_ofd_and_latches_frozen_scope_drift(self):
         module, guard, group, accepted = self.make_guard()
         try:
