@@ -289,7 +289,15 @@ test('dormant PROD skips schema writes and module workers despite inherited TEST
     await root.stop();
 });
 
-test('PROD topology opt-in without an accepted physical activation refuses before schema or host side effects', async () => {
+test('PROD topology opt-in without an accepted physical activation refuses before schema or host side effects', async t => {
+    // The ordinary root now reads policy before opening any producer. Model
+    // only this DB IO as no prior handback; keep the actual activation refusal.
+    const reads = [];
+    t.mock.method(require('../../models/topologyConfigOwnerModel'), 'find', filter => {
+        reads.push(filter);
+        return { select() { return this; }, read() { return this; }, readConcern() { return this; },
+            maxTimeMS() { return this; }, async lean() { return []; } };
+    });
     for (const l2tpOptIn of [undefined, 'true']) {
         const flag = 'TOPOLOGY_PRODUCTION_EXECUTION_ENABLED';
         const root = createL2tpRootLifecycle({
@@ -307,6 +315,8 @@ test('PROD topology opt-in without an accepted physical activation refuses befor
         await assert.rejects(root.startAfterDatabase(), /PRODUCTION_PHYSICAL_ACTIVATION_REQUIRED/);
         await root.stop();
     }
+    assert.equal(reads.length, 2);
+    assert.ok(reads.every(filter => filter.owner === 'classic' && filter.executionContext.hostIdentity === 'lm1.infograd.online'));
 });
 
 test('explicit PROD L2TP-only startup awaits migrations and indexes before creating the host once', async () => {

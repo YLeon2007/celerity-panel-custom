@@ -96,6 +96,9 @@ function createL2tpRouteBindings(activeHostProvider) {
         normalizeMainIngress(...args) {
             return callRuntimeService('service', 'normalizeMainIngress', args);
         },
+        reconcileRestoredInstall(...args) {
+            return callRuntimeService('service', 'reconcileRestoredInstall', args);
+        },
     });
     const stateManagementService = Object.freeze({
         configureRelay(...args) {

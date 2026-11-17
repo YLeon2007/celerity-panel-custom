@@ -404,9 +404,13 @@ function createTopologyOperationRuntime(dependencies = {}) {
         coordinator.readTestEnrollment = async () => {
             if (ownerEnrollmentEnv.TOPOLOGY_TEST_STARTUP_MODE !== 'dedicated-runtime-v1') throw new Error('TEST_OWNER_CONTEXT_REQUIRED');
             const rows = await dependencies.TopologyExecutionEnrollment.find({ executionContext: executionContext.hostIdentity })
-                .select('nodeId targetProfile ownerGeneration bootId pristineBootResume').read('primary').readConcern('majority').maxTimeMS(5000).lean();
+                .read('primary').readConcern('majority').maxTimeMS(5000).lean();
+            const { acceptedExecutionEnrollment, enrollmentRuntimeBootId } = require('../repositories/topologyExecutionBindingStore');
+            const current = await Promise.all(rows.map(async alias => acceptedExecutionEnrollment(alias,
+                await dependencies.TopologyConfigOwner.findOne({ node: alias.nodeId, profile: alias.targetProfile })
+                    .select('+executionEnrollment').read('primary').readConcern('majority').maxTimeMS(5000).lean())));
             return { status: rows.length ? 'enrolled_requires_runtime_reconciliation' : 'not_enrolled',
-                nodes: rows.map(n => ({ nodeId: n.nodeId, targetProfile: n.targetProfile, enrollmentId: n._id, ownerGeneration: n.ownerGeneration, enrollmentBootId: n.bootId, runtimeBootId: n.pristineBootResume?.bootId ?? n.bootId })) };
+                nodes: current.map(n => ({ nodeId: n.nodeId, targetProfile: n.targetProfile, enrollmentId: n._id, ownerGeneration: n.ownerGeneration, enrollmentBootId: n.bootId, runtimeBootId: enrollmentRuntimeBootId(n) })) };
         };
         return coordinator;
     } catch {

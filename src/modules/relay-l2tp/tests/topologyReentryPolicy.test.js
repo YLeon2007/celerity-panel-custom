@@ -55,6 +55,34 @@ test('normal production entry rejects business reentry before capture or public 
         } };
     await assert.rejects(require('../services/productionOwnerEntry').enrollProductionOwners({ lifecycle, store: {}, models: m }), { code: policy.CODE });
 });
+for (const lateBusiness of [false, true]) test(`ordinary production ROOT checks real policy before first physical attach and rechecks entry: late=${lateBusiness}`, async t => {
+    const owner = { ...handedBack(), ...(lateBusiness ? {} : { lastSettledOperation: 'historical-operation' }) };
+    const m = models(owner), events = [], counts = { factory: 0, enter: 0, attach: 0, capture: 0 };
+    const Owner = require('../../../models/topologyConfigOwnerModel');
+    t.mock.method(Owner, 'find', () => { events.push('policy'); return query([owner]); });
+    const Operation = require('../models/topologyOperationModel'), Binding = require('../models/topologyExecutionBindingModel');
+    t.mock.method(Operation, 'findOne', () => query(null));
+    t.mock.method(Binding, 'findOne', () => query(null));
+    t.mock.method(require('../services/productionAdmissionReadiness'), 'verifyProductionStartupSchema', async () => {
+        events.push('schema'); owner.lastSettledOperation = 'arrived-after-preflight';
+    });
+    const lifecycle = { async enrollProductionOwners() {
+        return require('../services/productionOwnerEntry').enrollProductionOwners({ models: m, store: {}, lifecycle: {
+            executionContext: PROD, withVerifiedMaintenance() {}, run() { counts.capture++; assert.fail('ban before capture'); },
+        } });
+    }, start() { assert.fail('ban before consumers'); }, async stop() {} };
+    const root = require('../../../modules/l2tpRuntimeLifecycleHook').createL2tpRootLifecycle({
+        env: { PANEL_DOMAIN: PROD.hostIdentity, L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' },
+        createTopologyExecutionAuthority() { counts.factory++; return { admission: {}, async withHeldAuthority(_context, work) {
+            counts.enter++; counts.attach++; events.push('attach'); return work({ async assertHeld() {} });
+        }, close() {} }; }, productionDatabase: () => ({}), createRuntimeLifecycleHook: () => lifecycle,
+    });
+    try { await assert.rejects(root.startAfterDatabase(), { code: policy.CODE }); }
+    finally { await root.stop(); }
+    assert.equal(counts.capture, 0);
+    if (!lateBusiness) assert.deepEqual(counts, { factory: 0, enter: 0, attach: 0, capture: 0 });
+    else { assert.deepEqual(counts, { factory: 1, enter: 1, attach: 1, capture: 0 }); assert.equal(events[0], 'policy'); }
+});
 const env = { PANEL_DOMAIN: TEST.hostIdentity, L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
     TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_STARTUP_MODE: 'dedicated-runtime-v1' };
 const next = (req, res, next) => next();

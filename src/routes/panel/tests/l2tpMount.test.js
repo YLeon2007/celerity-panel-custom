@@ -263,6 +263,48 @@ test('panel mounts one late-bound L2TP router and delegates configure and prefli
     assert.equal(result.status, 0, result.stderr);
 });
 
+test('mounted panel rollback route uses real active-host bindings, auth and CSRF before delegating exact operation id', async t => {
+    t.after(() => require('../../../services/sshPoolService').closeAll());
+    const express = require('express');
+    const Settings = require('../../../models/settingsModel');
+    t.mock.method(Settings, 'get', async () => ({ deployment: { completed: true } }));
+    const helpers = require('../helpers'); helpers.invalidateOnboardingCache();
+    t.after(() => helpers.invalidateOnboardingCache());
+    let calls = [], fail = false;
+    const service = { async reconcileRestoredInstall(...args) {
+        assert.strictEqual(this, service); calls.push(args);
+        if (fail) throw new Error('PRIVATE repository/readback failure');
+        return { operationId: args[0], status: 'failed', rollback: 'verified_restored' };
+    } };
+    const app = express(); app.use(express.json());
+    app.use((req, res, next) => { req.session = { authenticated: req.headers['x-fixture-auth'] === 'yes', panelCsrfToken: 'local-fixture-csrf' }; next(); });
+    // Mount the ordinary singleton panel: its actual registerRoutes creates
+    // the real late-bound bindings once, just as normal application startup.
+    app.use('/panel', require('..'));
+    const provider = require('../../../modules/l2tpActiveHostProvider').l2tpActiveHostProvider;
+    const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    const id = '111111111111111111111111', url = `http://127.0.0.1:${server.address().port}/panel/l2tp/operations/${id}/reconcile-rollback`;
+    const request = (headers = {}, body = {}) => fetch(url, { method: 'POST', redirect: 'manual',
+        headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+    assert.equal((await request()).status, 302);
+    assert.equal((await request({ 'x-fixture-auth': 'yes' })).status, 403);
+    const auth = { 'x-fixture-auth': 'yes', 'x-csrf-token': 'local-fixture-csrf' };
+    assert.equal((await request(auth, { unexpected: true })).status, 400);
+    assert.equal(calls.length, 0);
+    const unused = () => assert.fail('rollback must not invoke another service');
+    const activeHost = { runtime: { service: Object.assign(service, { getStatus: unused, preflight: unused, install: unused, getOperation: unused }),
+        stateManagementService: { configureRelay: unused }, userManagementService: { createUser: unused, listUsers: unused, updateUser: unused, disableUser: unused } }, loadPanelOverview: unused };
+    provider.installActiveHost(activeHost); t.after(() => provider.clearActiveHost(activeHost));
+    const accepted = await request(auth); assert.equal(accepted.status, 200);
+    assert.deepEqual(await accepted.json(), { operationId: id, status: 'failed', rollback: 'verified_restored' });
+    assert.deepEqual(calls, [[id]]);
+    fail = true;
+    const refused = await request(auth); assert.equal(refused.status, 409);
+    assert.deepEqual(await refused.json(), { error: { code: 'L2TP_ROLLBACK_RECONCILIATION_REFUSED' } });
+    assert.deepEqual(calls, [[id], [id]]);
+});
+
 test('authenticated panel requests receive a reusable CSRF token in response locals', () => {
     const result = spawnSync(process.execPath, ['--eval', `
         const assert = require('node:assert/strict');

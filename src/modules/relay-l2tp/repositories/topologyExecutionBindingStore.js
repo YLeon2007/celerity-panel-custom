@@ -106,10 +106,15 @@ function ownershipReceipt(r) {
 function sameAlias(a, b) {
     return ['_id', 'executionContext', 'nodeId', 'targetProfile', 'endpoint', 'nodeIdentity'].every(k => isDeepStrictEqual(a[k], b[k]));
 }
+function aliasContext(alias) {
+    const context = topologyExecutionContext(alias.executionContext === 'lm1.infograd.online' ? 'production' : 'test', alias.executionContext);
+    if (!context) throw failure();
+    return context;
+}
 function reentryEvidence(alias, owner) {
     checkedEnrollment(alias);
     const e = owner?.executionEnrollment;
-    if (alias.executionContext !== 'lm1.infograd.online' || !e
+    if (!isDeepStrictEqual(owner?.executionContext, aliasContext(alias)) || !e
         || !exact(e, ['kind', 'previousAdoptionReceipt', 'previousHandbackReceipt',
             ...(e.previousEnrollment !== undefined ? ['previousEnrollment'] : []), ...(e.enrollment !== undefined ? ['enrollment'] : [])])
         || e.kind !== 'public-handback-reentry-v1' || !ownershipReceipt(e.previousAdoptionReceipt) || !ownershipReceipt(e.previousHandbackReceipt)
@@ -130,7 +135,7 @@ function acceptedExecutionEnrollment(alias, owner) {
     if (!sameAlias(alias, current) || current.predecessorGeneration !== 'none'
         || current.ownerGeneration !== owner.adoptionReceipt.toGeneration
         || current.ownerGeneration === e.previousAdoptionReceipt.toGeneration
-        || !isDeepStrictEqual(owner.executionContext, { target: 'production', hostIdentity: alias.executionContext })
+        || !isDeepStrictEqual(owner.executionContext, aliasContext(alias))
         || String(owner.node) !== alias.nodeId || owner.profile !== alias.targetProfile
         || !isDeepStrictEqual(owner.nodeIdentity, alias.nodeIdentity)) throw failure();
     return current;
@@ -138,8 +143,8 @@ function acceptedExecutionEnrollment(alias, owner) {
 function handbackReentryEvidence(alias, owner) {
     checkedEnrollment(alias);
     const prior = acceptedExecutionEnrollment(alias, owner);
-    if (alias.executionContext !== 'lm1.infograd.online' || owner?.owner !== 'classic'
-        || !isDeepStrictEqual(owner.executionContext, { target: 'production', hostIdentity: alias.executionContext })
+    if (owner?.owner !== 'classic'
+        || !isDeepStrictEqual(owner.executionContext, aliasContext(alias))
         || String(owner.node) !== alias.nodeId || owner.profile !== alias.targetProfile || !isDeepStrictEqual(owner.nodeIdentity, alias.nodeIdentity)
         || !ownershipReceipt(owner.adoptionReceipt) || !ownershipReceipt(owner.handbackReceipt)
         || owner.adoptionReceipt.toGeneration !== prior.ownerGeneration
@@ -451,7 +456,7 @@ class TopologyExecutionBindingStore {
         const alias = await this.#majority(this.#models.Enrollment, { nodeId: input.nodeId, targetProfile: input.targetProfile });
         if (alias) {
             const prior = reentryEvidence(alias, initial);
-            if (this.#context.target !== 'production' || prior.enrollment !== undefined
+            if (prior.enrollment !== undefined
                 || enrollment.predecessorGeneration !== 'none' || !sameAlias(alias, { ...enrollment, _id: alias._id, executionContext: this.#context.hostIdentity })) throw failure();
         }
         const row = { _id: alias?._id ?? randomUUID(), executionContext: this.#context.hostIdentity, ...enrollment };
@@ -504,9 +509,12 @@ class TopologyExecutionBindingStore {
         const row = await this.#enrollment(input);
         const prior = enrollmentProjection(row);
         if (!isDeepStrictEqual({ ...prior, bootId: input.bootId }, input)) throw failure('ENROLLMENT_CHANGED');
+        const initialOwner = await this.#majority(this.#models.Owner, this.#ownerFilter(input));
+        const initialEvidence = this.#ownerEvidence(initialOwner, input);
+        const permanent = await this.#majority(this.#models.Enrollment, { _id: row._id });
         return this.#scope('reconcile-pristine', input, null, async (receipt, ensureOpen) => {
             if (receipt.maintenanceId !== row.maintenanceId || row.predecessorGeneration !== 'none') throw failure();
-            const ownerFilter = this.#ownerFilter(input), nodeFilter = this.#nodeFilter(input);
+            const ownerFilter = this.#ownerFilter(input, initialEvidence), nodeFilter = this.#nodeFilter(input);
             const absence = async session => {
                 for (const [Model, filter] of [
                     [this.#models.Binding, { nodeId: input.nodeId }],
@@ -530,6 +538,9 @@ class TopologyExecutionBindingStore {
             const resume = { initialBootId: row.bootId, bootId: input.bootId, proofId: receipt.proofId,
                 maintenanceId: receipt.maintenanceId, verifiedAt: new Date(), previousBootIds };
             const nonce = randomUUID();
+            const currentEpoch = initialEvidence.executionEnrollment;
+            const resumedEpoch = currentEpoch && bootChanged
+                ? { ...currentEpoch, enrollment: { ...row, pristineBootResume: resume } } : currentEpoch;
             // Narrow pristine TEST transition, not an enrollment replacement.
             // All original fields/receipt and IDs stay byte-for-byte unchanged.
             // The generic immutable model ABI is not relaxed.
@@ -540,16 +551,25 @@ class TopologyExecutionBindingStore {
                 await this.#cas(this.#models.Owner, ownerFilter, nonce, session);
                 await this.#cas(this.#models.HyNode, nodeFilter, nonce, session);
                 const filter = { ...row, pristineBootResume: row.pristineBootResume ?? { $exists: false } };
-                if (bootChanged) {
+                if (currentEpoch) {
+                    // A reentry keeps its permanent alias immutable. Resume the
+                    // same current private epoch under the existing owner CAS.
+                    if (!isDeepStrictEqual(await this.#models.Enrollment.findOne({ _id: row._id }).session(session).setOptions(OPTIONS).lean(), permanent)) throw failure('CONFLICT');
+                    if (bootChanged && (await this.#models.Owner.updateOne({ ...ownerFilter, executionBindingCheck: nonce },
+                        { $set: { executionEnrollment: resumedEpoch } }, { session, ...OPTIONS, runValidators: true })).matchedCount !== 1) throw failure('CONFLICT');
+                } else if (bootChanged) {
                     const result = await this.#models.Enrollment.collection.updateOne(filter, { $set: { pristineBootResume: resume } }, { session, ...OPTIONS });
                     if (result.matchedCount !== 1) throw failure('CONFLICT');
                 } else if (!await this.#models.Enrollment.findOne(filter).session(session).setOptions(OPTIONS).lean()) throw failure('CONFLICT');
             }, async () => {
                 const confirmed = await this.#enrollment(input);
                 if (!isDeepStrictEqual(confirmed, bootChanged ? { ...row, pristineBootResume: resume } : row)) throw failure('UNCONFIRMED');
-                const owner = await this.#majority(this.#models.Owner, { ...ownerFilter, executionBindingCheck: nonce });
+                const owner = await this.#majority(this.#models.Owner, { ...this.#ownerFilter(input, {
+                    ...initialEvidence, ...(resumedEpoch ? { executionEnrollment: resumedEpoch } : {}),
+                }), executionBindingCheck: nonce });
                 const node = await this.#majority(this.#models.HyNode, { ...nodeFilter, executionBindingCheck: nonce });
                 if (!owner || !node || !isDeepStrictEqual(this.#ownerEvidence(owner, input).originalSnapshot, originalSnapshot)) throw failure('UNCONFIRMED');
+                if (currentEpoch && !isDeepStrictEqual(await this.#majority(this.#models.Enrollment, { _id: row._id }), permanent)) throw failure('UNCONFIRMED');
                 return freeze({ enrollmentId: row._id, ...enrollmentProjection(confirmed) });
             }, ensureOpen);
         });
@@ -561,8 +581,7 @@ class TopologyExecutionBindingStore {
             : this.#majority(Model, filter, deadline);
         const alias = await get(this.#models.Enrollment, { executionContext: this.#context.hostIdentity,
             nodeId: expected.nodeId, targetProfile: expected.targetProfile });
-        const owner = this.#context.target === 'production'
-            ? await get(this.#models.Owner, { node: expected.nodeId, profile: expected.targetProfile }) : undefined;
+        const owner = await get(this.#models.Owner, { node: expected.nodeId, profile: expected.targetProfile });
         const row = acceptedExecutionEnrollment(checkedEnrollment(alias), owner);
         if (!samePin(row, expected)) throw failure();
         return freeze(structuredClone(row));

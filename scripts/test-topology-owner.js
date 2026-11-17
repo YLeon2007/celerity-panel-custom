@@ -63,6 +63,8 @@ async function initializeDedicatedTestState(models, check, physicalPlan) {
 }
 async function enrollTestOwners({ env, lifecycle, store, TopologyConfigOwner, TopologyExecutionEnrollment, dedicatedModels, resumeOnly = false, onReconciled } = {}) {
     assertTestContext(env);
+    const { isDeepStrictEqual: same } = require('node:util');
+    const { acceptedExecutionEnrollment, handbackReentryEvidence } = require('../src/modules/relay-l2tp/repositories/topologyExecutionBindingStore');
     if (typeof lifecycle?.withCapturedTestOwnerEnrollment !== 'function') {
         throw failure('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED');
     }
@@ -75,22 +77,34 @@ async function enrollTestOwners({ env, lifecycle, store, TopologyConfigOwner, To
         const enrolled = [];
         for (const pin of plan.nodes) {
             await check();
+            let classic;
             if (env.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1') {
-                const owner = await TopologyConfigOwner.findOne({ node: pin.nodeId, profile: pin.targetProfile }).read('primary').readConcern('majority').maxTimeMS(5000).lean();
+                const owner = await TopologyConfigOwner.findOne({ node: pin.nodeId, profile: pin.targetProfile }).select('+executionEnrollment').read('primary').readConcern('majority').maxTimeMS(5000).lean();
                 const existing = await TopologyExecutionEnrollment.findOne({ nodeId: pin.nodeId, targetProfile: pin.targetProfile }).read('primary').readConcern('majority').maxTimeMS(5000).lean();
                 if (owner || existing || resumeOnly) {
-                    if (!owner || !existing || owner.owner !== 'topology') throw failure('TEST_ENROLLMENT_RECONCILE_REQUIRED');
-                    const { proofRef, ...snapshot } = pin.originalSnapshot;
-                    const result = await store.verifyPristineEnrollment(freeze({ nodeId: pin.nodeId, targetProfile: pin.targetProfile,
-                        endpoint: pin.endpoint, nodeIdentity: pin.nodeIdentity, bootId: pin.bootId,
-                        predecessorGeneration: 'none', ownerGeneration: owner.generation }), snapshot);
-                    await check();
-                    enrolled.push({ nodeId: pin.nodeId, targetProfile: pin.targetProfile, enrollmentId: result.enrollmentId, ownerGeneration: owner.generation,
-                        enrollmentBootId: existing.bootId, runtimeBootId: result.bootId });
-                    continue;
+                    if (!owner || !existing) throw failure('TEST_ENROLLMENT_RECONCILE_REQUIRED');
+                    if (owner.owner === 'classic') {
+                        // A retained alias is history, not fresh authority. Only
+                        // verified zero-business handback may open a new epoch.
+                        await require('../src/modules/relay-l2tp/services/topologyReentryPolicy').assertOwnerReentryAllowed(owner, dedicatedModels);
+                        handbackReentryEvidence(existing, owner);
+                        if (!same(existing.endpoint, pin.endpoint) || !same(existing.nodeIdentity, pin.nodeIdentity)) throw failure('TEST_ENROLLMENT_RECONCILE_REQUIRED');
+                        classic = owner;
+                    } else {
+                        if (owner.owner !== 'topology') throw failure('TEST_ENROLLMENT_RECONCILE_REQUIRED');
+                        const current = acceptedExecutionEnrollment(existing, owner);
+                        const { proofRef, ...snapshot } = pin.originalSnapshot;
+                        const result = await store.verifyPristineEnrollment(freeze({ nodeId: pin.nodeId, targetProfile: pin.targetProfile,
+                            endpoint: pin.endpoint, nodeIdentity: pin.nodeIdentity, bootId: pin.bootId,
+                            predecessorGeneration: 'none', ownerGeneration: owner.generation }), snapshot);
+                        await check();
+                        enrolled.push({ nodeId: pin.nodeId, targetProfile: pin.targetProfile, enrollmentId: result.enrollmentId, ownerGeneration: owner.generation,
+                            enrollmentBootId: current.bootId, runtimeBootId: result.bootId });
+                        continue;
+                    }
                 }
             }
-            const classic = await transfer.initializeClassic({ node: pin.nodeId, profile: pin.targetProfile, nodeIdentity: pin.nodeIdentity });
+            classic ??= await transfer.initializeClassic({ node: pin.nodeId, profile: pin.targetProfile, nodeIdentity: pin.nodeIdentity });
             await check();
             const adopted = await transfer.adopt({ node: pin.nodeId, profile: pin.targetProfile,
                 generation: classic.generation, proofRef: pin.originalSnapshot.proofRef });
@@ -207,7 +221,7 @@ async function inspectTestOwnerHandback({ env, models }) {
     assertTestContext(env);
     if (env.TOPOLOGY_TEST_STARTUP_MODE !== 'dedicated-runtime-v1') throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
     const read = query => query.read('primary').readConcern('majority').maxTimeMS(5000).lean();
-    const owners = await read(models.TopologyConfigOwner.find({ executionContext: TEST, owner: 'topology' }));
+    const owners = await read(models.TopologyConfigOwner.find({ executionContext: TEST, owner: 'topology' }).select('+executionEnrollment'));
     const aliases = await read(models.TopologyExecutionEnrollment.find({ executionContext: TEST.hostIdentity }));
     if (!owners.length || owners.length !== aliases.length) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
     const ids = owners.map(row => String(row.node));
@@ -221,7 +235,8 @@ async function inspectTestOwnerHandback({ env, models }) {
         throw failure('TEST_OWNER_HANDBACK_BUSY');
     }
     return freeze(owners.map(owner => {
-        const alias = aliases.find(row => row.nodeId === String(owner.node) && row.targetProfile === owner.profile);
+        const permanent = aliases.find(row => row.nodeId === String(owner.node) && row.targetProfile === owner.profile);
+        const alias = permanent && require('../src/modules/relay-l2tp/repositories/topologyExecutionBindingStore').acceptedExecutionEnrollment(permanent, owner);
         if (!alias || alias.ownerGeneration !== owner.generation || owner.handbackReceipt !== undefined
             || alias.maintenanceId !== owner.adoptionReceipt?.maintenanceId) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
         return { nodeId: String(owner.node), targetProfile: owner.profile, ownerGeneration: owner.generation,

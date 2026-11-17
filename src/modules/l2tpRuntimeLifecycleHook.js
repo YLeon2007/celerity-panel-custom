@@ -427,6 +427,13 @@ function createL2tpRootLifecycle({
                     parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
                     const productionHost = isProductionSchemaHost(env);
                     if (productionHost && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true') {
+                        // The schema hold attaches a one-use physical scope.
+                        // Refuse read-only before constructing/opening it; keep
+                        // the enrollment recheck under its existing held scope.
+                        const policy = require('./relay-l2tp/services/topologyReentryPolicy');
+                        if ((await policy.readBusinessReentryRestriction({ executionContext: PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT })).blocked) {
+                            throw policy.businessReentryError();
+                        }
                         const authority = productionAuthority = createTopologyExecutionAuthority({ env });
                         if (!authority) throw new TypeError('PRODUCTION_PHYSICAL_ACTIVATION_REQUIRED');
                         try {

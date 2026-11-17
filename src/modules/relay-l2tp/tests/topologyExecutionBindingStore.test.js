@@ -212,6 +212,96 @@ async function setup(authority = goodAuthority, { publicOwner = false, nodes = [
         endpoint: ENDPOINT, nodeIdentity: IDENTITY, ownerGeneration, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
 }
 
+// Real public TEST enrollment/store/transfer on OWN scratch Mongo. Only physical
+// capture/maintenance IO is modeled; no supplied owner or enrollment success.
+async function zeroBusinessEnrollmentFixture() {
+    await setup();
+    await Promise.all(Object.values(models).map(model => model.collection.deleteMany({})));
+    const State = connection.models.ZeroBusinessTopologyState
+        ?? connection.model('ZeroBusinessTopologyState', require('../models/cascadeTopologyStateModel').schema);
+    await State.deleteMany({});
+    await State.create({ _id: 'singleton', revision: 0, deployedRevision: 0, remoteAdmissionCount: 0, topologyAdmissionCount: 0 });
+    await models.HyNode.create({ _id: NODE, ip: ENDPOINT.ip, name: 'zero-business-local-only', type: 'xray', active: true,
+        cascadeRole: 'portal', ssh: { port: ENDPOINT.port, username: ENDPOINT.username } });
+    const TEST = require('../domain/topologyExecutionContext').TEST_TOPOLOGY_EXECUTION_CONTEXT;
+    const entry = require('../../../../scripts/test-topology-owner');
+    const env = { PANEL_DOMAIN: TEST.hostIdentity, L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
+        TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_STARTUP_MODE: 'dedicated-runtime-v1' };
+    let maintenanceId = randomUUID(), bootId = randomUUID(), stores = 0;
+    const snapshot = { configSha256: '3'.repeat(64), unitSha256: '4'.repeat(64), serviceActive: 'inactive', serviceEnabled: 'disabled' };
+    const lifecycle = { executionContext: TEST, run: work => work(), async withCapturedTestOwnerEnrollment(work) {
+        return work({ nodes: [{ nodeId: NODE, targetProfile: 'xray-main', endpoint: ENDPOINT, nodeIdentity: IDENTITY,
+            bootId, originalSnapshot: { proofRef: 'dedicated-' + maintenanceId, ...snapshot } }] }, async () => {});
+    }, async withVerifiedMaintenance({ binding }, work) {
+        return work({ authority: 'external-maintenance-v1', status: 'verified', binding, proofId: randomUUID(), maintenanceId,
+            maintenance: 'held', allWriters: 'drained', oldBackend: { processTree: 'stopped', dispatch: 'disabled',
+                instanceId: 'modeled-zero-business-old-process', pid: 42, processStartTime: '123' }, readback: { source: 'node-readback', ...snapshot } });
+    } };
+    const store = new contract.TopologyExecutionBindingStore({ executionContext: TEST, ...models, async withVerifiedAuthority(challenge, work) {
+        stores++;
+        const proof = evidence(challenge, { maintenanceId, predecessor: { generation: 'none', bootId,
+            ...(challenge.action === 'enroll' ? { status: 'empty', protocolVersion: 2, journal: 'absent', legacyState: 'absent', writers: 'excluded' } : { status: 'pre-enrolled' }) } });
+        proof.connectionAttestation.maintenanceId = maintenanceId;
+        return work(proof);
+    } });
+    const stateModels = { CascadeTopologyState: State, TopologyConfigOwner: models.Owner,
+        TopologyOperation: models.Operation, TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment,
+        NodeOperationLock: models.Lock };
+    for (const [name, file] of [['RemoteAdmission','remoteAdmissionModel'], ['TopologyCreateIntent','topologyCreateIntentModel']]) {
+        stateModels[name] = connection.models[name] ?? connection.model(name, require('../models/' + file).schema);
+    }
+    const transfer = new (require('../../../services/topologyConfigTransfer').TopologyConfigTransfer)({ executionContext: TEST,
+        TopologyConfigOwner: models.Owner, withVerifiedMaintenance: lifecycle.withVerifiedMaintenance });
+    const enroll = resumeOnly => entry.enrollTestOwners({ env, lifecycle, store, TopologyConfigOwner: models.Owner,
+        TopologyExecutionEnrollment: models.Enrollment, dedicatedModels: stateModels, resumeOnly });
+    const first = await enroll(false);
+    await transfer.handback({ node: NODE, profile: 'xray-main', generation: first.nodes[0].ownerGeneration, proofRef: 'dedicated-' + maintenanceId });
+    return { enroll, transfer, stateModels, snapshot, stores: () => stores, nextEpoch() { maintenanceId = randomUUID(); bootId = randomUUID(); },
+        nextBoot() { bootId = randomUUID(); }, inspect: () => entry.inspectTestOwnerHandback({ env, models: stateModels }),
+        current: () => ({ maintenanceId, bootId }), handback: generation => transfer.handback({ node: NODE, profile: 'xray-main', generation, proofRef: 'dedicated-' + maintenanceId }) };
+}
+for (const resumeOnly of [false, true]) test(`dedicated TEST zero-business real enrollment → public handback → reentry/resume; retained alias: ${resumeOnly}`, async () => {
+    const f = await zeroBusinessEnrollmentFixture();
+    const alias = mongoose.mongo.BSON.serialize(await models.Enrollment.collection.findOne({ nodeId: NODE }));
+    const previous = await models.Owner.findOne().lean(); f.nextEpoch();
+    const result = await f.enroll(resumeOnly), node = result.nodes[0];
+    const current = await models.Owner.findOne().select('+executionEnrollment').lean();
+    assert.equal(result.status, 'enrolled'); assert.notEqual(node.ownerGeneration, previous.generation);
+    assert.equal(current.adoptionReceipt.fromGeneration, previous.generation);
+    assert.deepEqual(current.executionEnrollment.previousHandbackReceipt, previous.handbackReceipt);
+    assert.equal(current.executionEnrollment.enrollment.bootId, f.current().bootId);
+    assert.equal(current.executionEnrollment.enrollment.maintenanceId, f.current().maintenanceId);
+    assert.equal((await f.enroll(true)).nodes[0].ownerGeneration, node.ownerGeneration, 'actual pristine resume uses current private epoch, not historical alias');
+    f.nextBoot();
+    assert.equal((await f.enroll(true)).nodes[0].runtimeBootId, f.current().bootId, 'same held epoch pristine boot resume must not rewrite permanent alias');
+    const handbackPins = await f.inspect();
+    assert.equal(handbackPins[0].ownerGeneration, node.ownerGeneration);
+    assert.equal(handbackPins[0].proofRef, 'dedicated-' + f.current().maintenanceId);
+    assert.equal((await f.handback(node.ownerGeneration)).owner, 'classic');
+    assert.deepEqual(mongoose.mongo.BSON.serialize(await models.Enrollment.collection.findOne({ nodeId: NODE })), alias);
+    assert.equal(await models.Enrollment.countDocuments(), 1);
+    assert.equal(await models.Operation.countDocuments(), 0); assert.equal(await models.Binding.countDocuments(), 0);
+});
+for (const fault of ['settled-business', 'binding-business', 'operation-business', 'stale-owner', 'alias-epoch']) {
+    test(`dedicated TEST zero-business reentry refuses ${fault} without adoption/history writes`, async () => {
+        const f = await zeroBusinessEnrollmentFixture(); f.nextEpoch();
+        if (fault === 'settled-business') await models.Owner.collection.updateOne({}, { $set: { lastSettledOperation: 'retained-business' } });
+        if (fault === 'binding-business') await models.Binding.collection.insertOne({ nodeId: NODE, retained: true });
+        if (fault === 'operation-business') await models.Operation.collection.insertOne({ nodes: [{ node: new mongoose.Types.ObjectId(NODE) }], retained: true });
+        if (fault === 'stale-owner') await models.Owner.collection.updateOne({}, { $set: { generation: randomUUID() } });
+        if (fault === 'alias-epoch') await models.Enrollment.collection.updateOne({}, { $set: { ownerGeneration: randomUUID() } });
+        const before = await models.Owner.findOne().select('+executionEnrollment').lean(), calls = f.stores();
+        const alias = mongoose.mongo.BSON.serialize(await models.Enrollment.collection.findOne({ nodeId: NODE }));
+        const writes = [], record = event => { if (['insert','update','delete','commitTransaction'].includes(event.commandName)) writes.push(event.commandName); };
+        connection.getClient().on('commandStarted', record);
+        try { await assert.rejects(f.enroll(false), fault.endsWith('business') ? { code: 'TOPOLOGY_BUSINESS_REENTRY_BLOCKED' } : undefined); }
+        finally { connection.getClient().off('commandStarted', record); }
+        assert.deepEqual(writes, []); assert.equal(f.stores(), calls);
+        assert.deepEqual(await models.Owner.findOne().select('+executionEnrollment').lean(), before);
+        assert.deepEqual(mongoose.mongo.BSON.serialize(await models.Enrollment.collection.findOne({ nodeId: NODE })), alias);
+    });
+}
+
 // Two fixed, independent LOCAL physical inventories; the requested endpoint or
 // identity never supplies its own attestation. Persistence below is real Mongo.
 const BRIDGE = '507f1f77bcf86cd799439012';

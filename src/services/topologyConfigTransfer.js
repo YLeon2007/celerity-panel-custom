@@ -394,7 +394,7 @@ class TopologyConfigTransfer {
                     owner: nextOwner, generation: binding.nextGeneration, originalSnapshot: readback,
                     adoptionReceipt: receipt, legacyAppliedTopology: legacy,
                 }) : undefined;
-            const reentry = action === 'adopt' && this.executionContext === PROD && row.handbackReceipt !== undefined;
+            const reentry = action === 'adopt' && row.handbackReceipt !== undefined;
             const executionEnrollment = reentry ? { kind: 'public-handback-reentry-v1',
                 previousAdoptionReceipt: row.adoptionReceipt, previousHandbackReceipt: row.handbackReceipt,
                 ...(row.executionEnrollment?.enrollment === undefined ? {} : { previousEnrollment: row.executionEnrollment.enrollment }) } : undefined;

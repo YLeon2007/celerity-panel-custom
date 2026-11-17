@@ -20,7 +20,7 @@ test('TEST handback restores before real transfer and retains alias/business his
  const {randomUUID}=require('node:crypto'),{isDeepStrictEqual:same}=require('node:util');
  const env={PANEL_DOMAIN:context.hostIdentity,L2TP_EXECUTION_ENABLED:'true',L2TP_MIGRATIONS_ENABLED:'true',TOPOLOGY_TEST_EXECUTION_ENABLED:'true',TOPOLOGY_TEST_STARTUP_MODE:'dedicated-runtime-v1'};
  const events=[],rows=[],aliases=[];
- const query=value=>({read(){return this;},readConcern(){return this;},maxTimeMS(){return this;},lean:async()=>structuredClone(value)});
+ const query=value=>({select(){return this;},read(){return this;},readConcern(){return this;},maxTimeMS(){return this;},lean:async()=>structuredClone(value)});
  const match=(row,filter)=>Object.entries(filter).every(([k,v])=>same(row[k],v));
  const Model={collection:{indexes:async()=>[{key:{node:1,profile:1},unique:true}]},db:{transaction:async work=>work({})},
   find:filter=>query(rows.filter(r=>match(r,filter))),findOne:filter=>query(rows.find(r=>match(r,filter))??null),
