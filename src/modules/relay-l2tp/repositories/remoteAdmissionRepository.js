@@ -617,11 +617,11 @@ class RemoteAdmissionRepository {
                 && terminal.logs?.length === 1
                 && terminal.logs[0].code === 'CLASSIC_CONFIG_WRITE_OWNER_VETO';
             const compilerRefusalBeforeDispatch = terminal?.kind === 'install'
-                && terminal.errorCode === 'COMPILED_TOPOLOGY_MISMATCH'
+                && ['COMPILED_TOPOLOGY_MISMATCH', 'TOPOLOGY_L2TP_PATH_UNAVAILABLE'].includes(terminal.errorCode)
                 && terminal.attempts === 1 && terminal.startedAt === null
                 && terminal.step === '' && terminal.backupId === ''
                 && terminal.logs?.length === 1
-                && terminal.logs[0].code === 'COMPILED_TOPOLOGY_MISMATCH';
+                && terminal.logs[0].code === terminal.errorCode;
             if (!terminal || terminal.status === 'failed'
                 && (terminal.progress !== 0 || !PRE_REMOTE_FAILURES.has(terminal.errorCode)
                     && !ownerVetoBeforeDispatch && !compilerRefusalBeforeDispatch)) {

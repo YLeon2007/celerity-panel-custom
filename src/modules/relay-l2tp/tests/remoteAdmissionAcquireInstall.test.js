@@ -375,15 +375,16 @@ test('exact first-install owner veto before any step closes its admission, not a
     }
 });
 
-test('exact first-attempt pre-dispatch compiler refusal settles only its own terminal admission', async () => {
+test('exact first-attempt pre-dispatch compiler/path refusal settles only its own terminal admission', async () => {
+    for (const errorCode of ['COMPILED_TOPOLOGY_MISMATCH', 'TOPOLOGY_L2TP_PATH_UNAVAILABLE']) {
     for (const mutation of [null, op=>op.step='backup', op=>op.backupId='backup', op=>op.progress=1,
         op=>op.startedAt=new Date(), op=>op.attempts=2, op=>op.logs=[],
         op=>op.logs.push({code:'COMPILED_TOPOLOGY_MISMATCH'}), op=>op.logs[0].code='OTHER',
         op=>op.errorCode='REMOTE_COMMAND_OUTCOME_UNCERTAIN']) {
         const f=fixture(),admissionId=await f.repository.acquireInstall({nodeId:'relay-1'});
         Object.assign(f.records.get(admissionId),{phase:'recovery_required',operationId:'compiler-op',leaseOwner:'worker-1',ownerGeneration:2});
-        const op={_id:'compiler-op',node:'relay-1',kind:'install',status:'failed',errorCode:'COMPILED_TOPOLOGY_MISMATCH',
-            progress:0,step:'',backupId:'',startedAt:null,attempts:1,logs:[{code:'COMPILED_TOPOLOGY_MISMATCH'}],
+        const op={_id:'compiler-op',node:'relay-1',kind:'install',status:'failed',errorCode,
+            progress:0,step:'',backupId:'',startedAt:null,attempts:1,logs:[{code:errorCode}],
             admissionId,leaseOwner:'worker-1',ownerGeneration:2};
         mutation?.(op);f.operations.set('compiler-op',op);
         const before=JSON.stringify(op),input={admissionId,operationId:'compiler-op',nodeId:'relay-1',owner:'worker-1',ownerGeneration:2,kind:'install'};
@@ -391,6 +392,7 @@ test('exact first-attempt pre-dispatch compiler refusal settles only its own ter
         else{assert.equal(await f.repository.completeTerminalOperation(input),true);assert.equal(f.state.remoteAdmissionCount,0);
             await assert.rejects(f.repository.completeTerminalOperation(input),{code:'REMOTE_ADMISSION_NOT_ACTIVE'});assert.equal(f.state.remoteAdmissionCount,0);}
         assert.equal(JSON.stringify(op),before,'failed operation history is immutable during disposition');
+    }
     }
 });
 
