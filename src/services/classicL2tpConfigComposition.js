@@ -51,8 +51,8 @@ function applyClassicL2tpPathIngress(config, { nodeId, groups = [], links = [], 
                 const link = pathLinks[start], suffix = id(link).slice(-8);
                 const portals = (config.reverse?.portals || []).filter(row => row.tag === `portal-down-${suffix}`);
                 const tunnels = (config.inbounds || []).filter(row => row.tag === `conn-down-${suffix}`);
-                if (portals.length !== 1 || portals[0].domain !== (link.tunnelDomain || `${suffix}.reverse.tunnel.internal`)
-                    || tunnels.length !== 1 || tunnels[0].protocol !== 'vless'
+                if (portals.length !== 1 || portals[0].domain !== `${suffix}.${link.tunnelDomain || 'reverse.tunnel.internal'}`
+                    || tunnels.length !== 1 || tunnels[0].protocol !== (link.tunnelProtocol || 'vless')
                     || tunnels[0].port !== (link.tunnelPort || 10086)
                     || tunnels[0].settings?.clients?.length !== 1
                     || tunnels[0].settings.clients[0].id !== link.tunnelUuid) throw invalidPath();

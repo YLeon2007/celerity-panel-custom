@@ -43,7 +43,7 @@ test('classic ingress refuses missing/unconfirmed/disconnected links, wrong egre
 
 test('first classic relay deploy materializes its exact local egress before status promotion without requiring an unused prefix', () => {
     const prefix = { ...upstream, active: true, status: 'offline', mode: 'reverse' };
-    const pending = { ...first, status: 'pending' };
+    const pending = { ...first, status: 'pending', tunnelDomain: 'reverse.tunnel.internal', tunnelPort: 10086, tunnelProtocol: 'vless' };
     const full = { ...group, paths: [{ ...group.paths[0], linkIds: [prefix._id, first._id, second._id] }] };
     const config = JSON.parse(generator.generateRelayConfig(prefix, { ip: '192.0.2.1' }, [pending]));
     const links = [prefix, pending, second];
@@ -55,7 +55,7 @@ test('first classic relay deploy materializes its exact local egress before stat
 });
 
 test('materialized local egress cannot hide a changed UUID/domain/port, missing artifact or unknown downstream hop', () => {
-    const pending = { ...first, status: 'pending' };
+    const pending = { ...first, status: 'pending', tunnelDomain: 'reverse.tunnel.internal', tunnelPort: 10086, tunnelProtocol: 'vless' };
     const base = () => JSON.parse(generator.generateRelayConfig(upstream, { ip: '192.0.2.1' }, [pending]));
     const args = { nodeId: 'relay', groups: [group], links: [pending, second], mode: 'reverse', materializedLinkIds: [first._id, second._id] };
     for (const mutate of [
