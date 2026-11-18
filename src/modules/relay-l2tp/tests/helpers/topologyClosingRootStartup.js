@@ -78,9 +78,14 @@ function injectCrash(point) {
     let bindings=0;
     wrap(store,'reserveBinding',()=>{if(bindings===0)stop('bindings-0');},value=>{assert.ok(value);stop('bindings-'+(++bindings));});
     wrap(repo,'recordNode',null,(value,req)=>{if(value===true)stop(req.state+'-'+(String(req.node)===nodes[0].id?'P':'B'));});
+    for (const command of ['prepare','commit']) wrap(executor,command,null,(value,ctx)=>{
+        if(value?.ok) stop(command+'-receipt-'+(ctx.node.node===nodes[0].id?'P':'B'));
+    });
     wrap(executor,'verify',null,(value,ctx)=>{if(value?.ok && ctx.node.node===nodes[1].id)stop('verified');});
     wrap(finalizer,'beginV2Closure',null,value=>{if(value)stop('closing');});
-    wrap(executor,'close',null,(value,ctx)=>{if(value && ctx.node.node===nodes[0].id)stop('closed-P');});
+    wrap(require('../../services/topologyUserResync').TopologyUserResync,'resyncPlan',null,value=>{if(value?.ok)stop('users-restored');});
+    wrap(executor,'close',null,(value,ctx)=>{if(value)stop(ctx.node.node===nodes[0].id?'closed-P':'closed-B');});
+    wrap(finalizer,'persistV2TerminalProofs',null,value=>{if(value)stop('proven');});
     wrap(finalizer,'finalizeV2Succeeded',null,value=>{if(value)stop('succeeded');});
 }
 async function main(){

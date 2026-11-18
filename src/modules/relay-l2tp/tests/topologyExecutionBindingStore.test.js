@@ -455,7 +455,9 @@ test('ordinary startup recovers first apply with only portal binding', async () 
 // The first backend owns a normally admitted operation. SIGKILL follows an acknowledged
 // product boundary. The second backend receives neither the id nor the former worker id.
 const crashPoints = ['bindings-0','bindings-1','bindings-2','prepared-P','prepared-B',
-    'committed-P','committed-B','verified','closing','closed-P','succeeded'];
+    'committed-P','committed-B','verified','closing','closed-P','succeeded',
+    'prepare-receipt-P','prepare-receipt-B','commit-receipt-P','commit-receipt-B',
+    'users-restored','closed-B','proven'];
 for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:230000}, async t=>{
     const startup = true;
     const user = { xrayUuid: '550e8400-e29b-41d4-a716-446655440000', userId: 'local-fixture' };
