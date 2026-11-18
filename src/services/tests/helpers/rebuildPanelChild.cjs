@@ -38,6 +38,7 @@ require('../../rebuildTransport').createTransport = node => {
     const file = profile => { assert.ok(['main','bridge'].includes(profile)); return path.join(dir,`${id}-${profile}.json`); };
     const staged = new Set();
     return {
+        async requireSupportedCore() {},
         async read(profile) {
             try { return JSON.parse(fs.readFileSync(file(profile),'utf8')); }
             catch (e) { if (e.code === 'ENOENT' && profile === 'bridge') return null; throw e; }
@@ -47,9 +48,12 @@ require('../../rebuildTransport').createTransport = node => {
             for (const {profile,config} of pair) {
                 const candidate = file(profile) + '.candidate.json';
                 fs.writeFileSync(candidate, JSON.stringify(config), {mode:0o600,flag:'wx'}); staged.add(candidate);
-                const check = spawnSync(process.env.C3_XRAY,['run','-test','-config',candidate],{
-                    env:{...process.env,XRAY_LOCATION_ASSET:path.dirname(process.env.C3_XRAY)},stdio:'ignore',timeout:12000});
-                if(check.status !== 0) throw Object.assign(new Error('parser refused candidate'),{code:'REBUILD_PARSER_FAILED'});
+                for(const [core,version] of [[process.env.C3_XRAY,'26.3.27'],[process.env.C3_XRAY_26_11_9,'26.11.9']]){
+                    const banner=spawnSync(core,['version'],{encoding:'utf8',timeout:5000});
+                    assert.equal(banner.stdout?.split(/\s+/)[1],version);
+                    const check=spawnSync(core,['run','-test','-config',candidate], {env:{...process.env,XRAY_LOCATION_ASSET:path.dirname(core)},stdio:'ignore',timeout:12000});
+                    if(check.status!==0)throw Object.assign(new Error('parser refused candidate'),{code:'REBUILD_PARSER_FAILED'});
+                }
             }
         },
         async putPair(pair) {

@@ -20,7 +20,7 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
     const {HyNode:Node, CascadeLink:Link, RelayL2tpState:State, CascadeRouteGroup:Group} = f.models;
     const User = require('../../models/hyUserModel');
     const {port:dbPort,database,replicaSet} = f.lifecycle;
-    const env = Object.fromEntries(['PATH','HOME','TMPDIR','NODE_PATH','SESSION_SECRET','ENCRYPTION_KEY','C3_XRAY'].map(k=>[k,process.env[k]]));
+    const env = Object.fromEntries(['PATH','HOME','TMPDIR','NODE_PATH','SESSION_SECRET','ENCRYPTION_KEY','C3_XRAY','C3_XRAY_26_11_9'].map(k=>[k,process.env[k]]));
     Object.assign(env,{NODE_ENV:'test',LOG_LEVEL:'error',PORT:'0',USE_CADDY:'true',C3_REBUILD_ENABLED:'true',PANEL_DOMAIN:'fixture.invalid',ACME_EMAIL:'fixture@fixture.invalid',MONGO_URI:`mongodb://127.0.0.1:${dbPort}/${database}?replicaSet=${replicaSet}`});
     panel=fork(require.resolve('./helpers/rebuildPanelChild.cjs'),[],{cwd:dir,env,execArgv:[],stdio:['ignore','ignore','ignore','ipc']});
     exited = new Promise(resolve=>panel.once('exit',resolve));
@@ -69,7 +69,7 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
         assert.equal(events().length,at,'no effects before confirmation'); links[key]=res.linkId;
         if(autoDeploy){assert.equal(res.status,'awaiting_preview'); assert.ok(res.preview.allowed); await apply(res.linkId,res.preview);}
     }
-    const tag=k=>'portal-'+links[k].slice(-8);
+    const tag=k=>'rebuild-rp-egress-'+links[k].slice(-8);
     const rules=n=>config(n).routing.rules.filter(r=>r.ruleTag?.startsWith('rebuild-policy-'));
     const fallback=n=>rules(n).find(r=>r.ruleTag==='rebuild-policy-default').outboundTag;
     const assertGraph=(exit='ra')=>{
@@ -146,4 +146,26 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
         });
     });
     assert.ok(!events().some(e=>[nodeIds.x,nodeIds.y].includes(e.split(':')[1])));
+    await t.test('first Apply migrates a classic reverse pair without changing the portal client or rolling tunnel keys on repeat',async()=>{
+        const classic=require('../configGenerator');
+        const old=await Link.findById(links.xy).lean();
+        const subscriber={_id:id(),userId:'migration-fixture',subscriptionToken:randomUUID(),enabled:true,nodes:[nodes.x._id],xrayUuid:randomUUID()};
+        await User.collection.insertOne(subscriber);
+        const main=JSON.parse(classic.generateXrayConfigWithApi(nodes.x,[subscriber]));
+        classic.applyReversePortal(main,[old],['client']);
+        fs.writeFileSync(file('x','main'),JSON.stringify(main),{mode:0o600});
+        fs.writeFileSync(file('y','bridge'),classic.generateBridgeConfig(old,nodes.x),{mode:0o600});
+        assert.ok(main.reverse.portals.length && config('y','bridge').reverse.bridges.length);
+        const identity=cfg=>JSON.stringify(cfg.inbounds.find(i=>i.tag==='client'),(k,v)=>k==='sniffing'?undefined:v);
+        const before=identity(main); const raw=()=>Link.collection.findOne({_id:old._id},{projection:{rebuildVlessKeyEnvelope:1}});
+        const report=await preview(links.xy);
+        assert.ok(report.allowed && report.nodes.flatMap(n=>n.profiles).filter(p=>p.tunnelMigration==='legacy-to-vless-reverse').length===2);
+        assert.ok(!(await raw()).rebuildVlessKeyEnvelope);
+        await apply(links.xy,report);
+        const envelope=(await raw()).rebuildVlessKeyEnvelope;
+        assert.ok(typeof envelope==='string' && !config('x').reverse && !config('y','bridge').reverse);
+        assert.ok(identity(config('x'))===before,'client changed');
+        const digest=digests();await apply(links.xy);
+        assert.ok((await raw()).rebuildVlessKeyEnvelope===envelope); assert.deepEqual(digests(),digest);
+    });
 });
