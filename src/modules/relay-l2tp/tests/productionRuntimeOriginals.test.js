@@ -31,7 +31,8 @@ function fixture(change, pairCase) {
         } }) });
     const pair = nodes.map(node=>({nodeId:node.nodeId,targetProfile:node.targetProfile,maintenanceId:node.maintenanceId,
         ownerGeneration:node.acceptedOwner.generation,bootId:node.physical.bootId,nodeIdentity:{machineId:node.physical.machineId,
-            sshHostKeySha256:node.physical.sshHostKeySha256},endpoint:node.endpoint}));
+            sshHostKeySha256:node.physical.sshHostKeySha256},endpoint:node.endpoint,
+        originalSnapshot:Object.fromEntries(Object.entries(node.originalSnapshot).filter(([k])=>k!=='source'))}));
     return { authority, actions, pair };
 }
 for (const [label, override] of [['clean',{}],['prior journal',{journal:{}}],['legacy files',{pristine:false}],['original drift',{current:{}}]]) {
@@ -46,6 +47,18 @@ for (const [label, override] of [['clean',{}],['prior journal',{journal:{}}],['l
         } finally {authority.close();}
     });
 }
+test('partial reservation refuses a different durable original even if the current physical profile matches its pin', async t => {
+    for (const [field,value] of [['configSha256','9'.repeat(64)],['unitSha256','8'.repeat(64)],
+        ['serviceActive','inactive'],['serviceEnabled','masked']]) await t.test(field,async()=>{
+        const {authority,pair,actions}=fixture({},{});
+        pair[1].originalSnapshot[field]=value;
+        try {
+            await assert.rejects(authority.withHeldAuthority(PROD,c=>c.withCapturedOwnerEnrollment(()=>c.checkPristineReservationPair(pair))),
+                {code:'PRODUCTION_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED'});
+            assert.ok(actions.every(a=>['observe','attach','read'].includes(a)));
+        } finally {authority.close();}
+    });
+});
 test('one physical observation per shared host/node per checkpoint, no cross-checkpoint cache', async () => {
     const {authority,actions}=fixture({});
     try {

@@ -200,6 +200,11 @@ function createProductionPhysicalAuthority({ config: input, read = privateRead, 
                                 && e.bootId === n.physical.bootId && same(e.endpoint, n.endpoint)
                                 && same(e.nodeIdentity, { machineId: n.physical.machineId, sshHostKeySha256: n.physical.sshHostKeySha256 })
                                 && v.pristine === true && v.journal === null);
+                            // The pinned/live node can agree with itself while Mongo describes
+                            // a different original. Require the independently enrolled four
+                            // fields, not just the right owner generation and endpoint.
+                            const { source, ...original } = n.originalSnapshot;
+                            need(source === 'node-readback' && same(e.originalSnapshot, original));
                             checkOriginal(n);
                         }
                         return true;
