@@ -462,7 +462,7 @@ class TopologyOperationExecutor {
                 ...(Object.hasOwn(binding, 'profileTargetPin') ? { nodeId: binding.nodeId,
                     profileTargetPin: assertProfileTargetPin(binding.profileTargetPin) } : {}),
             });
-            if (verifiedClosingOriginal(binding.expected)) await bootstrapper.verifyExisting();
+            if (verifiedClosingOriginal(binding.expected) || require('../repositories/topologyExecutionBindingStore').partialReservationMember(binding.expected)) await bootstrapper.verifyExisting();
             else await bootstrapper.ensureRunner();
         }
         const factory = new this.#NodeTransportFactory({
@@ -899,7 +899,7 @@ class TopologyOperationExecutor {
 const verifiedClosingPair = new (require('node:async_hooks').AsyncLocalStorage)();
 function verifiedClosingOriginal(expected) {
     const scope = verifiedClosingPair.getStore();
-    if (!scope) return null;
+    if (!scope) return require('../repositories/topologyExecutionBindingStore').partialReservationMember(expected)?.original ?? null;
     if (!scope.open || scope.currentOwner !== expected.owner) throw unprovenBinding();
     const original = scope.bindings.find(b => b.nodeId === expected.nodeId);
     if (!original || expectedKeysFor(original).some(key => key !== 'owner' && !same(original[key], expected[key]))) throw unprovenBinding();

@@ -99,6 +99,13 @@ class TopologyExecutionAuthorityLifecycle {
             if(!invoked)throw failure();return result;
         } finally {open=false;if(pending)await pending.catch(()=>{});}
     }
+    async checkPristineReservationPair(pair) {
+        await this.assertHeld();
+        const state = this.#held.getStore();
+        if (this.#context.target !== 'production' || typeof state.capability.checkPristineReservationPair !== 'function'
+            || await state.capability.checkPristineReservationPair(pair) !== true) throw failure();
+        await this.assertHeld();
+    }
     async readUnclosedPair(bindings) {
         await this.assertHeld();
         const state = this.#held.getStore();

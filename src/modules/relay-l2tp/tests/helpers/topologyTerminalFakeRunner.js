@@ -10,7 +10,9 @@ function fakeRunner(t, bootId, { root: existingRoot } = {}) {
     const put = (name, content, mode = 0o600) => {
         const file = path.join(root, name);
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(file, content, { mode });
+        // The inspector checks the actual installed mode, even under CI umask 077.
+        const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW, mode);
+        try { fs.writeFileSync(fd, content); fs.fchmodSync(fd, mode); } finally { fs.closeSync(fd); }
     };
     put('proc/sys/kernel/random/boot_id', `${bootId}\n`);
     if (!existingRoot) put('usr/local/etc/xray/config.json', '{"old":true}\n');

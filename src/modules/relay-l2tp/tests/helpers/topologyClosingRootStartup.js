@@ -15,7 +15,17 @@ net.Socket.prototype.connect = function(...args) {
 const mongoose = require('mongoose');
 const trace = { scanned:[], attached:[], guardErrors:[], physicalPairReads:[], runner:[], ssh:0, failures:[], pid:process.pid };
 const diag = require('../../../../routes/topologyTestDiagnostics');
-diag.logTopologyTestFailure = input => trace.failures.push({phase:input.phase, code:input.error?.code, frames:diag.formatTopologyDiagnostic(input).sourceFrames, reason:input.error.message === 'Unclosed pair is unconfirmed' ? input.error.message : undefined});
+diag.logTopologyTestFailure = input => {
+    // Source locations only: the error message/command/options can contain credentials.
+    const frames = []; const seen = new Set();
+    for (let e = input.error; e && !seen.has(e) && seen.size < 6; e = e.cause) {
+        seen.add(e);
+        for (const m of String(e.stack || '').matchAll(/(?:^|\n)\s*at [^\n]*?\b(src\/[A-Za-z0-9_./-]+\.js:\d+:\d+)\)?(?=\n|$)/g)) {
+            if (!frames.includes(m[1])) frames.push(m[1]);
+        }
+    }
+    trace.failures.push({phase:input.phase,code:input.error?.code,frames:frames.slice(0,28),reason:input.error?.message === 'Unclosed pair is unconfirmed' ? 'Unclosed pair is unconfirmed' : undefined});
+};
 const PROD = require('../../domain/topologyExecutionContext').PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT;
 const env = { PANEL_DOMAIN:PROD.hostIdentity,L2TP_EXECUTION_ENABLED:'true',L2TP_MIGRATIONS_ENABLED:'true',TOPOLOGY_PRODUCTION_EXECUTION_ENABLED:'true' };
 async function open(pin) {

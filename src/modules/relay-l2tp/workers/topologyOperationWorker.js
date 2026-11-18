@@ -1376,14 +1376,26 @@ class TopologyOperationWorker {
 
     async run(operationIdentity) {
         if (!this.#bindingLifecycle) return this.#runHeld(operationIdentity);
-        try { return await this.#bindingLifecycle.run(() => this.#runHeld(operationIdentity)); }
+        try { return await this.#bindingLifecycle.run(async () => {
+            const result = await this.#runHeld(operationIdentity);
+            if (result.claimed !== false || result.stopped || result.status || this.executionContext.target !== 'production'
+                || !this.#retainExecutionOwnership || typeof this.#bindingProvisioner?.withPartialPortalClaim !== 'function') return result;
+            const operationId = entityId(operationIdentity);
+            try {
+                return await this.#bindingProvisioner.withPartialPortalClaim({operationId, owner:this.workerId, leaseMs:this.leaseMs},
+                    this.selectedTopologyRepository, (operation, locks) => this.#runHeld(operationId, undefined, false, false, false, false, false, {operation,locks})) ?? result;
+            } catch (error) {
+                traceWorkerFailure(null, operationId, 'worker.partial-reservation', error);
+                return {claimed:false, operationId, stopped:true, drainUncertain:true, errorCode:'TOPOLOGY_PARTIAL_RESERVATION_UNCONFIRMED'};
+            }
+        }); }
         catch {
             return { operationId: entityId(operationIdentity), stopped: true, drainUncertain: true,
                 errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
         }
     }
 
-    async #runHeld(operationIdentity, bootstrapContinuation, bindingReservationContinuation = false, retainedVerification = false, undispatchedPreparation = false, closedSettlement = false, preparedCommit = false) {
+    async #runHeld(operationIdentity, bootstrapContinuation, bindingReservationContinuation = false, retainedVerification = false, undispatchedPreparation = false, closedSettlement = false, preparedCommit = false, partial = null) {
         const operationId = entityId(operationIdentity);
         if (!SAFE_ID_PATTERN.test(operationId)) {
             throw new TypeError('Topology operation worker requires an operation id');
@@ -1441,7 +1453,7 @@ class TopologyOperationWorker {
             // Recovery is awaited; an earlier held observation cannot authorize
             // the claim after revocation or an early-returning controller.
             if (this.#bindingLifecycle) await this.#bindingLifecycle.assertHeld();
-            const operation = await (preparedCommit
+            const operation = partial?.operation ?? await (preparedCommit
                 ? this.operationRepository.claimPreparedCommit({operationId,owner:this.workerId,leaseMs:this.leaseMs,now:this.clock.now()}) : closedSettlement
                 ? this.operationRepository.claimClosedSettlement({operationId,owner:this.workerId,leaseMs:this.leaseMs,now:this.clock.now()}) : undispatchedPreparation
                 ? this.operationRepository.claimUndispatchedPreparation({operationId,owner:this.workerId,leaseMs:this.leaseMs,now:this.clock.now()}) : retainedVerification
@@ -1474,6 +1486,7 @@ class TopologyOperationWorker {
                 entries = this.durableEntries(operation, nodes);
             } catch (error) {
                 traceWorkerFailure(plan, operationId, 'worker.plan', error);
+                if (partial) return {claimed:true, operationId, stopped:true, drainUncertain:true, errorCode:'TOPOLOGY_PARTIAL_RESERVATION_UNCONFIRMED'};
                 if (operation.pppWait) {
                     return { claimed: true, operationId, status: 'awaiting_ppp', stopped: true };
                 }
@@ -1568,7 +1581,8 @@ class TopologyOperationWorker {
             if (undispatchedPreparation) {
                 for (const lock of operation.undispatchedPreparationContinuation.locks) acquiredNodeIds.push({ ...lock });
             }
-            const lockErrorCode = bootstrapContinuation || bindingReservationContinuation || undispatchedPreparation ? null : await this.acquireLocks(operationId, lockNodes, acquiredNodeIds);
+            if (partial) acquiredNodeIds.push(...partial.locks);
+            const lockErrorCode = partial || bootstrapContinuation || bindingReservationContinuation || undispatchedPreparation ? null : await this.acquireLocks(operationId, lockNodes, acquiredNodeIds);
             if (lockErrorCode) {
                 traceWorkerFailure(plan, operationId, 'worker.lock', { code: lockErrorCode });
                 // Nothing has dispatched in this acquisition attempt, even for
@@ -1598,6 +1612,7 @@ class TopologyOperationWorker {
                     await heartbeat.run(() => this.selectedTopologyRepository.verifySelected(operation));
                 } catch (error) {
                     await heartbeat.stop();
+                    if (partial) return {claimed:true, operationId, stopped:true, drainUncertain:true, errorCode:'TOPOLOGY_SELECTED_PIN_CHANGED'};
                     const released = await this.releaseNoDispatchLocks(operationId, acquiredNodeIds);
                     const rejected = released && await this.finalizer.rejectUndispatchedSelected?.({ operationId, owner: this.workerId,
                         leaseUntil: await this.renew(operationId), topologyRevision: operation.topologyRevision, priorDeployedRevision: operation.priorDeployedRevision });

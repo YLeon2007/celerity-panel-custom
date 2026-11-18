@@ -15,6 +15,18 @@ const ENROLLMENT_KEYS = ['nodeId', 'targetProfile', 'endpoint', 'nodeIdentity', 
 const ENROLLMENT_ROW_KEYS = ['_id', 'executionContext', 'proofId', 'maintenanceId', ...ENROLLMENT_KEYS];
 const BINDING_ROW_KEYS = [...new Set([...ENROLLMENT_ROW_KEYS, ...RECORD_KEYS, 'enrollmentId', 'commandTokens'])];
 const PROFILES = ['xray-main', 'xray-bridge'];
+// Only the store may open this scope, after the three-lease transaction and its
+// majority readback. It preserves the creator of P; it never changes a lease filter.
+const reclaimedReservation = new AsyncLocalStorage();
+function partialReservationMember(expected) {
+    const scope = reclaimedReservation.getStore();
+    if (!scope) return null;
+    if (!scope.open) throw failure();
+    const member = scope.members.find(m => m.expected.nodeId === expected.nodeId);
+    if (!member || !samePin(member.expected, expected)
+        || expectedKeys(member.expected).some(k => !isDeepStrictEqual(member.expected[k], expected[k]))) throw failure();
+    return member;
+}
 const OPTIONS = { maxTimeMS: TIMEOUT_MS, timeoutMS: TIMEOUT_MS };
 const NUMBER_TYPES = ['double', 'int', 'long'];
 const OWNER_PRIVATE_FIELDS = '+legacyAppliedTopology +profileTargetPin +executionEnrollment';
@@ -181,8 +193,10 @@ class TopologyExecutionBindingStore {
     #models;
     #authority;
     #assertAuthorityHeld;
+    #checkPristinePair;
     #held = new AsyncLocalStorage();
-    constructor({ executionContext, withVerifiedAuthority, assertAuthorityHeld, Operation, Lock, Owner, Enrollment, Binding, HyNode } = {}) {
+    constructor({ executionContext, withVerifiedAuthority, assertAuthorityHeld, checkPristinePair, Operation, Lock, Owner, Enrollment, Binding, HyNode } = {}) {
+        this.#checkPristinePair = checkPristinePair;
         const selected = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
         if (!matchesTopologyExecutionContext(executionContext, selected)) {
             throw new TypeError('Exact server-owned production context or canonical TEST context required');
@@ -865,6 +879,100 @@ class TopologyExecutionBindingStore {
         if (!matches(predecessorBindingId, UUID)) throw failure();
         return this.#binding('successor', expected, null, predecessorBindingId, joinForWrite);
     }
+    // The admitting worker reserves every participant before the first prepare.
+    // Exactly P and no B therefore distinguishes a reservation cut from uncertain
+    // delivery. Two bindings with pending DB labels do NOT establish that fact.
+    async withPartialPortalClaim({ operationId, owner, leaseMs }, selected, work) {
+        if (this.#context.target !== 'production' || !matches(operationId, ID) || !token(owner)
+            || !Number.isSafeInteger(leaseMs) || leaseMs < 120000 || typeof work !== 'function'
+            || typeof this.#checkPristinePair !== 'function' || typeof this.#assertAuthorityHeld !== 'function'
+            || typeof selected?.verifySelected !== 'function') return null;
+        const { Operation, Lock, Binding, Owner, HyNode } = this.#models;
+        const claim = topologyOperationClaimBindingFilter(this.#context);
+        const expired = { $lte: ['$leaseUntil', '$$NOW'] };
+        const filter = { ...claim, _id: operationId, status: 'preparing', attempts: 1,
+            admissionScope: 'selected', heldTopologyAdmission: true, kind: 'link.apply',
+            installedPath: { $exists: false }, pppWait: { $exists: false }, v2Terminal: { $exists: false },
+            $expr: { $and: [claim.$expr, { $eq: [{ $type: '$leaseUntil' }, 'date'] }, expired] } };
+        const before = await this.#majority(Operation, filter);
+        if (!before) return null;
+        if (!token(before.leaseOwner) || before.nodes?.length !== 2 || before.nodes[0].role !== 'portal'
+            || before.nodes[1].role !== 'bridge' || before.nodes.some(n => n.state !== 'pending' || n.backupId !== '')
+            || !isDeepStrictEqual(before.resourceNodeIds?.slice().sort(), before.nodes.map(n => String(n.node)).sort())) return null;
+        const reservations = await Binding.find({ operationId }).read('primary').readConcern('majority').limit(2).setOptions(OPTIONS).lean();
+        if (reservations.length !== 1 || reservations[0].nodeId !== String(before.nodes[0].node)) return null;
+        const old = before.leaseOwner, pending = [];
+        await this.#indexes();
+        await selected.verifySelected(before);
+        for (const [i, n] of before.nodes.entries()) {
+            const nodeId = String(n.node), candidateHash = `sha256:${n.candidateHash}`;
+            const backupId = `topology-${createHash('sha256').update([operationId,nodeId,candidateHash,n.targetProfile].join('\0')).digest('hex')}`;
+            const lockFilter = { operationId, node: nodeId, owner: old, remoteUncertain: true, $expr: expired };
+            const lock = await this.#majority(Lock, lockFilter);
+            if (!lock || !(lock.leaseUntil instanceof Date) || !matches(lock.generation, UUID)) throw failure();
+            const expected = freeze({ executionContext: this.#context.hostIdentity, operationId, nodeId, candidateHash, backupId,
+                targetProfile: n.targetProfile, ...Object.hasOwn(n, 'profileTargetPin') && { profileTargetPin: assertProfileTargetPin(n.profileTargetPin) },
+                topologyRevision: before.topologyRevision, priorDeployedRevision: before.priorDeployedRevision,
+                owner: old, attempt: 1, generation: lock.generation });
+            if (!validExpected(expected,this.#context)) throw failure();
+            this.#checkOperationRow(before,expected);
+            const enrollment = await this.#enrollment(expected);
+            if (enrollment.predecessorGeneration !== 'none') throw failure();
+            const ownerRow = await this.#majority(Owner,this.#ownerFilter(enrollment));
+            if (!ownerRow || ownerRow.lastSettledOperation !== undefined || ownerRow.lastSettledGeneration !== undefined) throw failure();
+            const evidence = this.#ownerEvidence(ownerRow,enrollment);
+            if (!await this.#majority(HyNode,this.#nodeFilter(enrollment))) throw failure();
+            if (!i) this.#checkRow(reservations[0],enrollment,expected);
+            pending.push({ lock, expected, enrollment, evidence, original: i ? null : recordProjection(reservations[0]) });
+        }
+        const checkPhysical = () => this.#checkPristinePair(pending.map(({enrollment,evidence}) => ({ ...enrollmentProjection(enrollment),
+            maintenanceId: enrollment.maintenanceId, originalSnapshot: evidence.originalSnapshot })));
+        await checkPhysical();
+        const leaseUntil = new Date(Date.now() + leaseMs), nonce = randomUUID();
+        const opMatch = { ...filter, leaseOwner: old, leaseUntil: before.leaseUntil, admissionFingerprint: before.admissionFingerprint };
+        const transfer = { $set: { leaseUntil, executionBindingCheck: nonce } };
+        let acknowledged;
+        await this.#transaction(async session => {
+            const opts = { ...OPTIONS, session };
+            const op = await Operation.findOne(opMatch).select(OPERATION_PRIVATE_FIELDS).setOptions(opts).lean();
+            if (!op || !isDeepStrictEqual(op.nodes,before.nodes) || !isDeepStrictEqual(op.resourceNodeIds,before.resourceNodeIds)
+                || await Lock.countDocuments({ operationId }).setOptions(opts) !== 2
+                || await Binding.countDocuments({ operationId }).setOptions(opts) !== 1) throw failure();
+            await selected.verifySelected(op,session);
+            for (const [i, {expected,evidence,enrollment,lock}] of pending.entries()) {
+                this.#checkOperationRow(op,expected);
+                if (!isDeepStrictEqual(await this.#enrollment(expected,session),enrollment)
+                    || await Binding.countDocuments({enrollmentId:enrollment._id}).setOptions(opts) !== (i ? 0 : 1)) throw failure();
+                if (!i) {
+                    const row = await Binding.findById(reservations[0]._id).setOptions(opts).lean();
+                    this.#checkRow(row,enrollment,expected);
+                    if (!isDeepStrictEqual(row,reservations[0])) throw failure();
+                }
+                const ownerFilter = { ...this.#ownerFilter(enrollment,evidence), lastSettledOperation: {$exists:false}, lastSettledGeneration: {$exists:false} };
+                await this.#cas(Owner,ownerFilter,nonce,session);
+                await this.#cas(HyNode,this.#nodeFilter(enrollment),nonce,session);
+                if ((await Lock.updateOne({ _id: lock._id, operationId, node:expected.nodeId, owner:old,
+                    generation:lock.generation, remoteUncertain:true, leaseUntil:lock.leaseUntil, $expr:expired },
+                    { $set:{ ...transfer.$set, owner } },opts)).matchedCount !== 1) throw failure();
+            }
+            if ((await Operation.updateOne(opMatch,{ $set:{ ...transfer.$set, leaseOwner:owner } },opts)).matchedCount !== 1) throw failure();
+        }, async deadline => {
+            const op = await this.#majority(Operation,{ _id:operationId, leaseOwner:owner, attempts:1, status:'preparing',
+                heldTopologyAdmission:true, executionBindingCheck:nonce, leaseUntil }, deadline);
+            if (!op || !isDeepStrictEqual(op.nodes,before.nodes)) throw failure('UNCONFIRMED');
+            for (const {expected} of pending) if (!await this.#majority(Lock,{operationId,node:expected.nodeId,
+                owner,generation:expected.generation,remoteUncertain:true,executionBindingCheck:nonce,leaseUntil},deadline)) throw failure('UNCONFIRMED');
+            acknowledged = op;
+        }, () => { if (Date.now() >= +leaseUntil) throw failure('UNCONFIRMED'); });
+        await checkPhysical();
+        if (!acknowledged || Date.now() >= +leaseUntil) throw failure('UNCONFIRMED');
+        const members = freeze(pending.map(({expected,original})=>({ expected:{...expected,owner}, original })));
+        const scope = { open:true, members };
+        try {
+            return await reclaimedReservation.run(scope, () => work(acknowledged,
+                members.map(({expected:e})=>({node:e.nodeId,generation:e.generation}))));
+        } finally { scope.open = false; }
+    }
     // Post-claim provisioning only. Reuse an exact durable binding; never retry
     // a failed read as creation. Select successors from privately joined settlement
     // metadata, not caller-selected IDs or a mutable runner/current-state scan.
@@ -942,4 +1050,4 @@ class TopologyExecutionBindingStore {
         return this.#binding('terminal', expected, work);
     }
 }
-module.exports = { TopologyExecutionBindingStore, enrollmentRuntimeBootId: liveBoot, acceptedExecutionEnrollment, handbackReentryEvidence };
+module.exports = { TopologyExecutionBindingStore, enrollmentRuntimeBootId: liveBoot, acceptedExecutionEnrollment, handbackReentryEvidence, partialReservationMember };

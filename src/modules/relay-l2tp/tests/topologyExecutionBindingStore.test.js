@@ -524,7 +524,10 @@ for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:2300
         }
         // Run a private Xray at the selected loopback API port independently of mock systemd.
         const xcfg=path.join(localNodes[0].root,'api-fixture.json');fs.writeFileSync(xcfg,bytes);
-        fs.copyFileSync(process.env.C3_XRAY,path.join(localNodes[0].root,'usr/local/bin/xray'));
+        // Keep the scratch executable in place; never stage a second binary in the fake root.
+        const localXray = path.join(localNodes[0].root, 'usr/local/bin/xray');
+        fs.unlinkSync(localXray); // only the shell stub created by fakeRunner above
+        fs.symlinkSync(fs.realpathSync(process.env.C3_XRAY), localXray);
         const xray=spawn(process.env.C3_XRAY,['run','-config',xcfg],{stdio:'ignore'});
         t.after(async()=>{if(xray.exitCode===null && !xray.signalCode){const end=new Promise(ok=>xray.once('exit',ok));xray.kill();await end;}});
         await until(()=>new Promise((ok,no)=>{const c=net.connect(port,'127.0.0.1');c.once('error',no);c.once('connect',()=>{c.destroy();ok();});}));
@@ -571,7 +574,10 @@ for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:2300
         assert.deepEqual(second.trace.scanned,[cut==='succeeded'?[]:[operationId]]);
         for(const b of pre.bindings)assert.deepEqual(after.bindings.find(v=>v._id===b._id),b);
         assert.ok(['succeeded','rolled_back','failed'].includes(after.op.status),`${cut}: still ${after.op.status}, locks=${after.locks.length} admission=${after.count}`);
-        assert.equal(after.op.heldTopologyAdmission,false);assert.equal(after.locks.length,0);assert.equal(after.count,0);
+        const why = JSON.stringify({cut,status:after.op.status,states:after.op.nodes.map(n=>n.state),
+            commands:second.trace.runner.map(([,command])=>command), failures:second.trace.failures.map(({phase,code,frames})=>({phase,code,frames}))});
+        if (cut === 'bindings-1') assert.equal(after.op.status, 'succeeded', why);
+        assert.equal(after.op.heldTopologyAdmission,false,why);assert.equal(after.locks.length,0);assert.equal(after.count,0);
         if(after.op.status==='succeeded')assert.equal(after.op.v2Terminal.proofs.length,2);
         else for(const n of localNodes)assert.equal(fs.readFileSync(n.configPath,'utf8'),'{}\n');
     }finally{await Promise.all(sockets.map(s=>new Promise(ok=>s.close(ok))));}
@@ -671,7 +677,9 @@ for (const scenario of ['drift', 'ambiguous close', 'matching pair', 'startup: m
     if (scenario.endsWith('matching pair')) {
         assert.ok(process.env.C3_XRAY, 'loopback Xray required');
         const root = roots.get(NODE).root;
-        fs.copyFileSync(process.env.C3_XRAY,path.join(root,'usr/local/bin/xray'));
+        const localXray = path.join(root, 'usr/local/bin/xray');
+        fs.unlinkSync(localXray); // fakeRunner's fixture-owned stub
+        fs.symlinkSync(fs.realpathSync(process.env.C3_XRAY), localXray);
         const child = spawn(process.env.C3_XRAY,['run','-config',path.join(root,portalNode.configPath)],{stdio:'ignore'});
         t.after(async () => { if (child.exitCode === null && !child.signalCode) { const joined = new Promise(r=>child.once('exit',r)); child.kill(); await joined; } });
         await until(async () => { await new Promise((resolve,reject) => {const c=net.connect(port,'127.0.0.1');c.once('error',reject);c.once('connect',()=>{c.destroy();resolve();});}); });
