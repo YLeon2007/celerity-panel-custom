@@ -197,11 +197,13 @@
     const i18n = window._networkI18n || {};
     const csrfToken = window._networkCsrfToken || '';
     const rebuild = window._c3Rebuild === true;
-    async function rebuildPreview(payload) {
-        const response = await fetch('/api/cascade/rebuild/preview', { method: 'POST',
+    async function rebuildPreview(payload, report) {
+        if (!report) {
+            const response = await fetch('/api/cascade/rebuild/preview', { method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify(payload) });
-        const report = await response.json();
-        if (!response.ok) throw new Error(report.error?.code || 'Предпросмотр недоступен');
+            report = await response.json();
+            if (!response.ok) throw new Error(report.error?.code || 'Предпросмотр недоступен');
+        }
         const text = report.nodes.map(n => n.nodeId + ': ' + n.profiles.map(p => p.profile + ' ' + p.change
             + (p.sections.length ? ' (' + p.sections.join(', ') + ')' : '')
             + (p.protectedChanged ? ' — изменятся параметры клиентов' : '')).join('; ')).join('\n');
@@ -1434,7 +1436,7 @@
     async function handleLinkAutoDeploy(snapshot, optedIn) {
         if (rebuild && snapshot?.executionMode === 'rebuild') {
             if (snapshot.status==='awaiting_preview') {
-                await deployTopology(snapshot.linkId); await loadTopology(); showToast('Схема пересобрана, файлы сверены');return;
+                await deployTopology(snapshot.linkId, undefined, snapshot.preview); await loadTopology(); showToast('Схема пересобрана, файлы сверены');return;
             }
             showToast(snapshot.status==='succeeded'?'Схема пересобрана, файлы сверены':'Сохранено без применения'); return;
         }
@@ -1612,11 +1614,11 @@
         if (el) el.remove();
     }
 
-    async function deployTopology(linkId, domainLinkId) {
+    async function deployTopology(linkId, domainLinkId, report) {
         const payload = { expectedTopologyRevision: topologyRevision };
         if (linkId) payload.linkId = linkId;
         if (domainLinkId) payload.domainLinkId = domainLinkId;
-        if (rebuild) payload.expectedPreview = await rebuildPreview(payload);
+        if (rebuild) payload.expectedPreview = await rebuildPreview(payload, report);
         const scope = 'apply:' + linkId;
         const headers = linkId ? createRequestHeaders({ ...payload, autoDeploy: true,
             desiredVersion: _allLinks.find(link => link._id === linkId)?.desiredVersion }, scope) : { 'Content-Type': 'application/json' };

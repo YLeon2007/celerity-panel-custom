@@ -37,7 +37,10 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     assert.equal(await Link.countDocuments(),0);
     const neighbor=await make(edge(x,y,9)), g=await make(edge(relay,geo,3,{geoRouting:{enabled:true,domains:['full:geo.invalid'],geoip:['ru']}}));
     const b=await make(edge(relay,exit,2)); assert.equal(writes.length,0);
-    const pr=await make(edge(portal,relay,1,{autoDeploy:true}));assert.equal(pr.status,'succeeded');assert.deepEqual([...new Set(writes)].sort(),[portal,relay,exit,geo].map(id).sort());
+    const pr=await make(edge(portal,relay,1,{autoDeploy:true}));assert.equal(pr.status,'awaiting_preview');assert.equal(pr.preview.allowed,true);assert.equal(stages.length,0);
+    const deploy='/topology/deploy';
+    const blind=await request('POST',deploy,{linkId:pr.linkId});assert.equal(blind.status,428);assert.equal(blind.body.error.code,'REBUILD_PREVIEW_REQUIRED');assert.equal(stages.length,0);
+    await ok('POST',deploy,{linkId:pr.linkId,expectedPreview:pr.preview.previewId});assert.deepEqual([...new Set(writes)].sort(),[portal,relay,exit,geo].map(id).sort());
     assert.equal((await State.findOne({node:relay._id}).lean()).routingMode,'follow-relay');
     const r=files.get(id(relay));const socks=()=>r.main.inbounds.find(i=>i.tag==='rebuild-relay-ingress');const port=socks().port;
     const policy=()=>r.main.routing.rules.filter(i=>i.ruleTag?.startsWith('rebuild-policy-'));assert.ok(policy().every(i=>['client','second',socks().tag].every(tag=>i.inboundTag.includes(tag))));
@@ -47,9 +50,12 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     const preview=await ok('POST','/rebuild/preview',{linkId:newer.linkId});assert.equal(preview.allowed,true);assert.equal(writes.length,before);assert.equal(JSON.stringify(preview).includes(uuid),false);
     const changed=await request('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:'1'.repeat(64)});assert.equal(changed.body.error.code,'REBUILD_PREVIEW_CHANGED');assert.equal(writes.length,before);
     await ok('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:preview.previewId});assert.equal(socks().port,port);assert.equal(policy().at(-1).outboundTag,`portal-${newer.linkId.slice(-8)}`);
-    await ok('DELETE',`/links/${b.linkId}`);assert.equal(socks().port,port);assert.ok(!files.get(id(exit)).bridge.reverse);
-    files.get(id(portal)).main.inbounds.find(i=>i.tag==='client').port++;const stageCount=stages.length;const refusal=await request('POST','/topology/deploy',{linkId:pr.linkId});assert.equal(refusal.body.error.code,'REBUILD_CLIENT_CHANGE');assert.equal(stages.length,stageCount);files.get(id(portal)).main.inbounds.find(i=>i.tag==='client').port--;
-    interrupt=id(relay);assert.equal((await request('DELETE',`/links/${pr.linkId}`)).status,409);assert.equal((await Link.findById(pr.linkId)).rebuildDelete,true);interrupt=null;
-    const retried=await ok('POST','/topology/deploy',{linkId:pr.linkId});assert.deepEqual(retried.nodes.map(n=>n.nodeId).sort(),[portal,relay,replacement,geo].map(id).sort());assert.ok(!files.get(id(portal)).main.reverse);assert.equal(files.get(id(portal)).main.outbounds[0].protocol,'blackhole');
+    const ticket=async(linkId,remove=false)=>({expectedPreview:(await ok('POST','/rebuild/preview',{linkId,remove})).previewId});
+    const deletedPath=`/links/${b.linkId}`,priorStages=stages.length;assert.equal((await request('DELETE',deletedPath)).status,428);assert.notEqual((await Link.findById(b.linkId)).rebuildDelete,true);assert.equal(stages.length,priorStages);
+    assert.equal((await request('DELETE',deletedPath,await ticket(b.linkId))).body.error.code,'REBUILD_PREVIEW_CHANGED');
+    await ok('DELETE',deletedPath,await ticket(b.linkId,true));assert.equal(socks().port,port);assert.ok(!files.get(id(exit)).bridge.reverse);
+    const prior=await ticket(pr.linkId);files.get(id(portal)).main.inbounds.find(i=>i.tag==='client').port++;const stageCount=stages.length;const refusal=await request('POST',deploy,{linkId:pr.linkId,...prior});assert.equal(refusal.body.error.code,'REBUILD_CLIENT_CHANGE');assert.equal(stages.length,stageCount);files.get(id(portal)).main.inbounds.find(i=>i.tag==='client').port--;
+    interrupt=id(relay);assert.equal((await request('DELETE',`/links/${pr.linkId}`,await ticket(pr.linkId,true))).status,409);assert.equal((await Link.findById(pr.linkId)).rebuildDelete,true);interrupt=null;
+    const retried=await ok('POST',deploy,{linkId:pr.linkId,...await ticket(pr.linkId)});assert.deepEqual(retried.nodes.map(n=>n.nodeId).sort(),[portal,relay,replacement,geo].map(id).sort());assert.ok(!files.get(id(portal)).main.reverse);assert.equal(files.get(id(portal)).main.outbounds[0].protocol,'blackhole');
     assert.equal(await Link.exists({_id:pr.linkId}),null);assert.ok(await Link.exists({_id:neighbor.linkId}));assert.ok(await Link.exists({_id:g.linkId}));assert.ok(!writes.includes(id(x))&&!writes.includes(id(y)));assert.deepEqual(await groups.findOne({_id:retainedGroup}),oldGroup);
 });
