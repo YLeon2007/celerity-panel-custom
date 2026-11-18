@@ -99,6 +99,14 @@ class TopologyExecutionAuthorityLifecycle {
             if(!invoked)throw failure();return result;
         } finally {open=false;if(pending)await pending.catch(()=>{});}
     }
+    async readUnclosedPair(bindings) {
+        await this.assertHeld();
+        const state = this.#held.getStore();
+        if (this.#context.target !== 'production' || typeof state.capability.readUnclosedPair !== 'function') throw failure();
+        const pair = await state.capability.readUnclosedPair(bindings);
+        await this.assertHeld();
+        return pair;
+    }
     async withTestRetainedVerifyObservation(bindings, work) {
         await this.assertHeld();const state=this.#held.getStore();
         if(this.#context!==TEST||typeof state.capability.withRetainedVerifyObservation!=='function')throw failure();

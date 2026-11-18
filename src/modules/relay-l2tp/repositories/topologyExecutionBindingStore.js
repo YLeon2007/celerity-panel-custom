@@ -587,6 +587,7 @@ class TopologyExecutionBindingStore {
         return freeze(structuredClone(row));
     }
     #checkRow(row, enrollment, expected) {
+        const original = require('../services/topologyOperationExecutor').verifiedClosingOriginal(expected);
         if (!exact(row, [...BINDING_ROW_KEYS, ...pinKeys(row), ...(row?.predecessorBindingId ? ['predecessorBindingId', 'predecessorReceipt'] : [])])
             || !matches(row.proofId, UUID) || !matches(row.maintenanceId, UUID)
             || row.enrollmentId !== enrollment._id || row.executionContext !== this.#context.hostIdentity
@@ -599,7 +600,8 @@ class TopologyExecutionBindingStore {
                 || row.predecessorReceipt.generation !== row.predecessorGeneration
                 || ['nodeId', 'targetProfile', 'executionContext'].some(key => row.predecessorReceipt[key] !== row[key])
                 || row.predecessorReceipt.operationId === row.operationId))
-            || !samePin(row, expected) || expectedKeys(expected).some(key => !isDeepStrictEqual(row[key], expected[key]))
+            || !samePin(row, expected) || (original ? !isDeepStrictEqual(recordProjection(row), original)
+                : expectedKeys(expected).some(key => !isDeepStrictEqual(row[key], expected[key])))
             || !matches(row._id, UUID) || !matches(row.attemptId, UUID)
             || row.generation === row.predecessorGeneration || !exact(row.commandIds, COMMANDS)
             || !COMMANDS.every(key => matches(row.commandIds[key], UUID))

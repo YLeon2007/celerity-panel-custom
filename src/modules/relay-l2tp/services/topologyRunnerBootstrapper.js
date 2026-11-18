@@ -193,6 +193,16 @@ class TopologyRunnerBootstrapper {
         } catch { throw new TopologyRunnerBootstrapperError(); }
     }
 
+    // Cold closure must never install, repair or rewrite runner/unit/config paths.
+    async verifyExisting() {
+        const current = parseInspection(await this.#nodeSSH.exec(INSPECT_COMMAND));
+        if (current?.digest !== TOPOLOGY_RUNNER_DIGEST || current.mode !== TOPOLOGY_RUNNER_MODE
+            || (this.#targetProfile === 'xray-bridge' && !parseBridgeUnitInspection(await this.#nodeSSH.exec(INSPECT_BRIDGE_UNIT_COMMAND)))) {
+            throw new TopologyRunnerBootstrapperError();
+        }
+        return success(false);
+    }
+
     /** @returns {Promise<EnsureRunnerResult>} */
     async ensureRunner() {
         if (arguments.length !== 0) throw new TopologyRunnerBootstrapperError();

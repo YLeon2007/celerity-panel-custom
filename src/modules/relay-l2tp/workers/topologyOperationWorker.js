@@ -1138,6 +1138,41 @@ class TopologyOperationWorker {
             ...(fenceReleased ? {} : { drainUncertain: true }) };
     }
 
+    async #resumeUnclosedPair(recovery) {
+        const { operationId, terminal } = recovery, bindings = terminal.bindings;
+        let claimed = false, heartbeat;
+        try {
+            if (recovery.status !== 'committing' || recovery.retained !== true || !same(terminal.proofs, [])
+                || terminal.sideEffects !== undefined || !this.userResync?.preferBoundRunner || !this.pppReadinessGate
+                || !bindings.every(b => b.owner === bindings[0].owner && b.operationId === operationId)
+                || !(this.executor instanceof require('../services/topologyOperationExecutor').TopologyOperationExecutor)) {
+                throw new Error('Unclosed pair is unconfirmed');
+            }
+            return await this.executor.withUnclosedPair(bindings, this.#bindingLifecycle, this.workerId, async (recheck, rehydrate) => {
+                const operation = await this.finalizer.reclaimUnclosedPair({ operationId, owner: this.workerId,
+                    leaseUntil: new Date(+this.clock.now() + this.leaseMs), topologyRevision: bindings[0].topologyRevision,
+                    priorDeployedRevision: bindings[0].priorDeployedRevision }, terminal);
+                claimed = true;
+                const plan = durablePlan(operation, operationId), nodes = orderedPlanNodes(plan);
+                const locks = bindings.map(b => ({ node: b.nodeId, generation: b.generation }));
+                this.#executionFences.set(plan, new Map(bindings.map(b => [b.nodeId,
+                    Object.freeze({ owner: this.workerId, attempt: b.attempt, generation: b.generation })])));
+                heartbeat = this.createLeaseHeartbeat(operationId, locks);
+                const prepared = [];
+                for (const entry of this.durableEntries(operation, nodes)) {
+                    const result = await heartbeat.run(() => rehydrate(this.context(plan, entry.node, undefined, entry.backupId)));
+                    prepared.push({ ...entry, prepared: result.prepared });
+                }
+                await heartbeat.run(recheck);
+                return await this.completeV2(plan, operationId, prepared, heartbeat, locks, true);
+            });
+        } catch (error) {
+            traceWorkerFailure(null, operationId, 'worker.unclosed-pair', error);
+            return { claimed, operationId, status: 'committing', stopped: true, drainUncertain: true,
+                errorCode: 'TOPOLOGY_V2_RECOVERY_REQUIRES_SETTLEMENT_REVIEW' };
+        } finally { if (heartbeat) await heartbeat.stop(); }
+    }
+
     async completeV2(plan, operationId, prepared, heartbeat, acquiredNodeIds, existingClosure = false, closedStatusOnly = false, readRestored = false) {
         const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
         if (!(this.executor instanceof TopologyOperationExecutor)
@@ -1389,6 +1424,11 @@ class TopologyOperationWorker {
                     }
                     if (recovery.status === 'succeeded' && recovery.retained === false) {
                         return { claimed: false, operationId, status: 'succeeded' };
+                    }
+                    if (this.executionContext.target === 'production' && recovery.terminal.state === 'closing'
+                        && recovery.terminal.bindings.length === 2 && recovery.terminal.bindings.every(b => b.predecessorGeneration === 'none')
+                        && same(recovery.nodes.map(n => n.role).sort(), ['bridge', 'portal'])) {
+                        return await this.#resumeUnclosedPair(recovery);
                     }
                     try {
                         for (const binding of recovery.terminal.bindings) await this.executor.probeTerminalBinding(binding,

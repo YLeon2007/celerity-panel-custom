@@ -183,13 +183,24 @@ test('ensureRunner atomically installs the pinned topology runner with fixed Nod
     ]);
     assert.deepEqual(
         Object.getOwnPropertyNames(Object.getPrototypeOf(bootstrapper)),
-        ['constructor', 'ensureRunner'],
+        ['constructor', 'verifyExisting', 'ensureRunner'],
     );
     assert.equal(bootstrapper.exec, undefined);
     assert.equal(bootstrapper.writeFile, undefined);
     assert.deepEqual(Object.keys(bootstrapper), []);
 });
 
+test('closure inspects existing runner and unit but cannot install missing assets', async () => {
+    for (const missingRunner of [true, false]) {
+        const calls=[];
+        const nodeSSH={writeFile:()=>assert.fail('no upload'),async exec(c){ calls.push(c);
+            if(c===INSPECT_COMMAND) return missingRunner?{code:0,stdout:'missing\n',stderr:''}:installedReadback;
+            assert.equal(c,INSPECT_UNIT_COMMAND);return missingUnitReadback;
+        }};
+        await assert.rejects(new TopologyRunnerBootstrapper({nodeSSH,...TEST_AUTHORIZATION}).verifyExisting(),{code:'TOPOLOGY_RUNNER_BOOTSTRAP_UNAVAILABLE'});
+        assert.deepEqual(calls,missingRunner?[INSPECT_COMMAND]:[INSPECT_COMMAND,INSPECT_UNIT_COMMAND]);
+    }
+});
 test('ensureRunner is idempotent when the pinned hash and mode are already installed', async () => {
     const calls = [];
     const nodeSecret = 'stored-node-private-key-secret';

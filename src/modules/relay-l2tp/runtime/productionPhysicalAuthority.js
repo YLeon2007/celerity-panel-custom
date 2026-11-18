@@ -179,6 +179,27 @@ function createProductionPhysicalAuthority({ config: input, read = privateRead, 
                         await refresh();
                         const result = await callback(plan, refresh); await refresh(); return result;
                     },
+                    // Both snapshots come from the pinned holders, not from DB state
+                    // or an unsuccessful status request for a never-issued close ID.
+                    async readUnclosedPair(bindings) {
+                        need(!dispatchClosed && bindings.length === 2);
+                        await refresh();
+                        const pair = [];
+                        for (const b of bindings) {
+                            const n = pinFor(b.nodeId), o = originals.get(b.nodeId);
+                            need(o && !o.restored && !o.released && n.targetProfile === b.targetProfile
+                                && b.maintenanceId === n.maintenanceId && b.bootId === n.physical.bootId);
+                            const v = await channels.get(b.nodeId).request('observe-unclosed');
+                            need(v.held === true && v.kind === 'node' && same(v.serverContext, PROD)
+                                && v.policySha256 === n.policySha256 && same(v.endpoint, n.endpoint)
+                                && same(v.physical, n.physical) && v.maintenanceId === n.maintenanceId
+                                && v.current?.unitSha256 === n.originalSnapshot.unitSha256
+                                && v.current?.serviceEnabled === n.originalSnapshot.serviceEnabled);
+                            pair.push(v);
+                        }
+                        await refresh();
+                        return pair;
+                    },
                     async withVerifiedMaintenance({ binding, proofRef }, callback) {
                         need(same(binding.executionContext, PROD) && ['adopt', 'handback'].includes(binding.action));
                         const n = pinFor(binding.node), original = originals.get(n.nodeId);

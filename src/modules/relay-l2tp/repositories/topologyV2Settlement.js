@@ -141,6 +141,10 @@ function operationFilter(request) {
         topologyRevision: request.topologyRevision, priorDeployedRevision: request.priorDeployedRevision,
         leaseOwner: request.owner, leaseUntil: { $eq: request.leaseUntil, $gt: new Date() }, pppWait: { $exists: false } };
 }
+function verifiedClosingBinding(binding, currentOwner) {
+    const original = require('../services/topologyOperationExecutor').verifiedClosingOriginal({ ...binding, owner: currentOwner });
+    return original && same(original, binding);
+}
 async function checked(repository, request, session, bindings) {
     models(repository);
     const operation = await repository.TopologyOperation.findOne(operationFilter(request)).select(OPERATION_PRIVATE_FIELDS).session(session).setOptions(OPTIONS).lean();
@@ -167,7 +171,7 @@ async function checked(repository, request, session, bindings) {
         const row = await repository.TopologyExecutionBinding.findOne({ operationId: request.operationId,
             nodeId: binding.nodeId, targetProfile: binding.targetProfile }).session(session).setOptions(OPTIONS).lean();
         if (!row || !same(record(row), binding) || binding.operationId !== request.operationId
-            || binding.owner !== request.owner || binding.attempt !== require('./topologyRetainedVerifyContinuation').originalExecutionAttempt(operation)
+            || (binding.owner !== request.owner && !verifiedClosingBinding(binding, request.owner)) || binding.attempt !== require('./topologyRetainedVerifyContinuation').originalExecutionAttempt(operation)
             || binding.executionContext !== context.hostIdentity
             || binding.topologyRevision !== request.topologyRevision || binding.priorDeployedRevision !== request.priorDeployedRevision
             || !['generation', 'attemptId', 'bootId', 'maintenanceId'].every(key => typeof binding[key] === 'string' && UUID.test(binding[key]))
@@ -184,7 +188,7 @@ async function checked(repository, request, session, bindings) {
             || require('./topologyExecutionBindingStore').enrollmentRuntimeBootId(enrolled) !== row.bootId
             || !same(enrolled.nodeIdentity, row.nodeIdentity) || !same(enrolled.endpoint, row.endpoint)) refused();
         const lock = await repository.NodeOperationLock.findOne({ node: binding.nodeId }).session(session).setOptions(OPTIONS).lean();
-        if (!lock || lock.owner !== binding.owner || lock.operationId !== binding.operationId
+        if (!lock || lock.owner !== request.owner || lock.operationId !== binding.operationId
             || lock.generation !== binding.generation || lock.remoteUncertain !== true
             || !(lock.leaseUntil instanceof Date) || lock.leaseUntil <= new Date()) refused();
         if (!owner || !same(owner.executionContext, context) || owner.owner !== 'topology'
@@ -382,4 +386,44 @@ async function confirmRoots(repository, operation, terminal) {
     }
     assertOwnerFences(terminal, owners);
 }
-module.exports = { begin, persist, settle, probe };
+// Resume only the original first P/B apply, under the unchanged closing intent.
+// Move all three expired leases together; nothing below clears uncertainty,
+// reserves a node, changes a binding creator/attempt, or publishes topology.
+async function reclaimUnclosedPair(repository, request, terminal) {
+    models(repository);
+    const { operationId, owner, leaseUntil } = request, bindings = terminal.bindings;
+    if (!(leaseUntil instanceof Date) || !(leaseUntil > new Date()) || terminal.state !== 'closing'
+        || !same(terminal.proofs, []) || terminal.sideEffects !== undefined || bindings.length !== 2
+        || bindings.some(b => !verifiedClosingBinding(b, owner) || b.owner !== bindings[0].owner || b.operationId !== operationId || b.attempt !== 1
+            || b.predecessorGeneration !== 'none')) refused();
+    const expired = { $expr: { $lte: ['$leaseUntil', '$$NOW'] }, leaseUntil: { $type: 'date' } };
+    return once(repository, async session => {
+        const filter = { _id: operationId, leaseOwner: bindings[0].owner, attempts: 1, heldTopologyAdmission: true,
+            kind: 'link.apply', status: 'committing', admissionScope: 'selected', v2Terminal: terminal,
+            pppWait: { $exists: false }, installedPath: { $exists: false }, ...expired };
+        const options = { session, ...OPTIONS };
+        const prior = await repository.TopologyOperation.findOne(filter).select(OPERATION_PRIVATE_FIELDS).setOptions(options).lean();
+        if (!prior || prior.executionContext?.target !== 'production' || prior.nodes.length !== 2
+            || !same(prior.nodes.map(n => n.role).sort(), ['bridge', 'portal'])
+            || !same(prior.nodes.map(n => String(n.node)), bindings.map(b => b.nodeId))
+            || !same([...prior.resourceNodeIds].sort(), bindings.map(b => b.nodeId).sort())
+            || await repository.NodeOperationLock.countDocuments({ operationId }).setOptions(options) !== 2
+            || await repository.TopologyExecutionBinding.countDocuments({ operationId }).setOptions(options) !== 2) refused();
+        if ((await repository.TopologyOperation.updateOne(filter, { $set: { leaseUntil, leaseOwner: owner } }, options)).matchedCount !== 1) refused();
+        for (const b of bindings) {
+            if ((await repository.NodeOperationLock.updateOne({ node: b.nodeId, operationId, owner: b.owner,
+                generation: b.generation, remoteUncertain: true, ...expired }, { $set: { leaseUntil, owner } }, options)).matchedCount !== 1) refused();
+        }
+        // Reuse the normal selected topology, enrollment, claim and owner fences
+        // in this transaction: any mismatch aborts all three renewals.
+        const { operation, rows } = await checked(repository, request, session, bindings);
+        assertOwnerFences(terminal, rows);
+        await fence(repository, rows, session, false);
+        return operation;
+    }, async () => {
+        const current = await majority(repository.TopologyOperation, operationFilter(request), OPERATION_PRIVATE_FIELDS);
+        if (!same(current?.v2Terminal, terminal)) refused();
+        await confirmRoots(repository, current, terminal);
+    }, request, 'resume-unclosed');
+}
+module.exports = { begin, persist, settle, probe, reclaimUnclosedPair };

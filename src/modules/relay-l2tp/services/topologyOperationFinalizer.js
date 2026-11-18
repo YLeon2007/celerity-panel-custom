@@ -116,6 +116,10 @@ class TopologyOperationFinalizer {
         return { ...input, now };
     }
 
+    reclaimUnclosedPair(input, terminal) {
+        return this.repository.reclaimUnclosedPair(this.#v2Request(input), terminal);
+    }
+
     beginV2Closure(input) {
         return this.repository.beginV2Closure(this.#v2Request(input, ['bindings']));
     }

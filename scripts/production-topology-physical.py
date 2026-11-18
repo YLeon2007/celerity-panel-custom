@@ -206,6 +206,16 @@ def serve():
         holder.deadline=time.monotonic()+(115 if action in ('prepare','restore') else 90 if action=='capture' else 30)
         result=None
         if action=='observe':result=observation()
+        elif action=='observe-unclosed' and p['kind']=='node':
+            # Snapshot the verified generation under the actual runner lock. A
+            # busy writer, missing lock, pending journal or restore is unknown.
+            need(value is None and holder.original is not None and holder.generation is not None)
+            need(holder.prepared is None and not holder.restored and holder.fs.absent(ROOT+'/restore.json'))
+            with holder.fs.lock(e['runner_lock'](p['targetProfile'])):
+                holder.checkpoint()
+                result=observation()
+                holder.checkpoint()
+            result['runnerIdle']=True
         elif p['kind']=='node':
             if action=='profile':
                 # Fixed-path, read-only import input under the same live exclusion.

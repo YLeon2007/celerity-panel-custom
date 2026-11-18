@@ -393,9 +393,11 @@ class TopologyOperationExecutor {
         let durable;
         try { durable = await reader.readVerified(expected); }
         catch (cause) { const error=unprovenBinding();error.cause=cause;throw error; }
+        const original = verifiedClosingOriginal(expected);
         if (!hasExactKeys(durable, recordKeys(durable)) || !isDeepFrozen(durable)
             || Object.hasOwn(expected, 'profileTargetPin') !== Object.hasOwn(durable, 'profileTargetPin')
-            || Object.entries(expected).some(([key, value]) => !same(durable[key], value))
+            || !(original ? sameRecord(durable, original)
+                : Object.entries(expected).every(([key, value]) => same(durable[key], value)))
             || !safeToken(durable.attemptId) || !safeToken(durable.predecessorGeneration)
             || !safeToken(durable.bootId) || !safeToken(durable.maintenanceId)
             || durable.generation === 'none' || durable.predecessorGeneration === durable.generation
@@ -460,7 +462,8 @@ class TopologyOperationExecutor {
                 ...(Object.hasOwn(binding, 'profileTargetPin') ? { nodeId: binding.nodeId,
                     profileTargetPin: assertProfileTargetPin(binding.profileTargetPin) } : {}),
             });
-            await bootstrapper.ensureRunner();
+            if (verifiedClosingOriginal(binding.expected)) await bootstrapper.verifyExisting();
+            else await bootstrapper.ensureRunner();
         }
         const factory = new this.#NodeTransportFactory({
             executionContext: this.#hostIdentity,
@@ -647,7 +650,12 @@ class TopologyOperationExecutor {
                     return { binding: bindings[index], poison: () => { state.uncertain = true; },
                         invoke: async (command, request) => {
                             await assertCurrent();
-                            await this.#proveBinding(context, state.binding, state.binding.durable);
+                            // The recovered P/B scopes are already nested. Recheck the
+                            // exact held frame; never reacquire its external writer scope.
+                            const reader = state.resumedUnclosed ? { readVerified: async expected =>
+                                (await this.#executionBindingReader.readVerifiedConnection(expected, bindings[index])).binding
+                            } : this.#executionBindingReader;
+                            await this.#proveBinding(context, state.binding, state.binding.durable, reader);
                             if (state.busy || state.uncertain || state.terminal || state.phase !== 'verify') throw unprovenBinding();
                             state.busy = true;
                             try {
@@ -808,6 +816,49 @@ class TopologyOperationExecutor {
         finally { state.busy = false; }
     }
 
+    // Validate the *entire pair* before restoring any local execution phase.
+    // A missing close receipt alone cannot distinguish never-started from unknown.
+    async withUnclosedPair(bindings, lifecycle, currentOwner, work) {
+        if (this.#target !== 'production' || bindings.length !== 2 || !isDeepFrozen(bindings)
+            || bindings.some(b => b.executionContext !== this.#hostIdentity || b.predecessorGeneration !== 'none')) throw unprovenBinding();
+        const check = async () => {
+            const observations = await lifecycle.readUnclosedPair(bindings);
+            if (!Array.isArray(observations) || observations.length !== bindings.length) throw unprovenBinding();
+            for (const [i, b] of bindings.entries()) {
+                const v = observations[i], j = v?.journal, g = j?.generations?.[b.generation];
+                const binding = { ...b, durable: b };
+                const { commandId, ...identity } = transportRequest(binding, 'prepare');
+                if (v?.nodeId !== b.nodeId || v.targetProfile !== b.targetProfile || v.runnerIdle !== true
+                    || v.physical?.bootId !== b.bootId || v.current?.source !== 'node-readback'
+                    || v.current.serviceActive !== 'active' || 'sha256:' + v.current.configSha256 !== b.candidateHash
+                    || j?.version !== 2 || j.head !== b.generation || j.nodeId !== b.nodeId || j.bootId !== b.bootId
+                    || j.executionContext !== b.executionContext || !hasExactKeys(j.generations, [b.generation])
+                    || !same(g?.binding, identity) || g.phase !== 'verified' || g.serviceState !== 'active:running'
+                    || !hasExactKeys(g.commands, ['prepare','commit','verify'].map(c => b.commandIds[c]).sort())) throw unprovenBinding();
+                for (const c of ['prepare','commit','verify']) {
+                    const row = g.commands[b.commandIds[c]];
+                    if (row?.state !== 'completed' || row.command !== c) throw unprovenBinding();
+                    assertReceipt(row.receipt, c, binding);
+                }
+            }
+        };
+        await check();
+        if (!safeToken(currentOwner) || !safeToken(bindings[0].owner)
+            || !bindings.every(b => b.operationId === bindings[0].operationId && b.owner === bindings[0].owner)) throw unprovenBinding();
+        const scope = { currentOwner, bindings, open: true };
+        try {
+            return await verifiedClosingPair.run(scope, () => work(check, async context => {
+                if (!scope.open) throw unprovenBinding();
+                const result = await this.rehydrate(context);
+                const state = this.#preparedBindings.get(result.prepared);
+                if (!scope.open || !bindings.some(b => sameRecord(b, state.binding.durable))) throw unprovenBinding();
+                state.resumedUnclosed = true;
+                state.phase = 'verify';
+                return result;
+            }));
+        } finally { scope.open = false; }
+    }
+
     async restoreCompletedVerify(context) {
         const state=this.#preparedBinding(context);
         if(state.busy||state.uncertain||state.terminal||this.#hostIdentity!=='test.infograd.online')throw unprovenBinding();
@@ -843,11 +894,22 @@ class TopologyOperationExecutor {
     }
 }
 
+// Only the lexical callback after physical verification can distinguish the immutable
+// binding creator from the current claimant. Never change a DB lease predicate.
+const verifiedClosingPair = new (require('node:async_hooks').AsyncLocalStorage)();
+function verifiedClosingOriginal(expected) {
+    const scope = verifiedClosingPair.getStore();
+    if (!scope) return null;
+    if (!scope.open || scope.currentOwner !== expected.owner) throw unprovenBinding();
+    const original = scope.bindings.find(b => b.nodeId === expected.nodeId);
+    if (!original || expectedKeysFor(original).some(key => key !== 'owner' && !same(original[key], expected[key]))) throw unprovenBinding();
+    return original;
+}
 const TERMINAL_PROOFS = new WeakSet();
 function isTopologyTerminalProof(proof) { return Boolean(proof) && TERMINAL_PROOFS.has(proof); }
 
 module.exports = {
-    isTopologyTerminalProof,
+    isTopologyTerminalProof, verifiedClosingOriginal,
     TEST_TARGET,
     TopologyOperationExecutor,
     TopologyOperationExecutorError,

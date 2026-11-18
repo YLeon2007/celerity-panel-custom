@@ -147,7 +147,8 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
         RunnerBootstrapper: LocalBootstrapper, ...(reader ? { executionBindingReader: reader } : {}) });
     return { executor, events, Node };
 }
-async function setup(authority = goodAuthority, { publicOwner = false, nodes = [frozenNode] } = {}) {
+async function setup(authority = goodAuthority, { publicOwner = false, nodes = [frozenNode], selected = {},
+    endpoint = ENDPOINT, owner = 'worker-17', emptyOriginal = false } = {}) {
     if (!models) {
         const bind = (name, location) => connection.model(name, require(location).schema);
         models = {
@@ -162,21 +163,21 @@ async function setup(authority = goodAuthority, { publicOwner = false, nodes = [
     }
     // Administrative fixture cleanup uses raw collections; public immutable models refuse mutation.
     await Promise.all(Object.values(models).map(model => model.collection.deleteMany({})));
-    await models.HyNode.create({ _id: NODE, ip: ENDPOINT.ip, name: 'local-only', type: 'xray', active: true,
-        cascadeRole: 'portal', ssh: { port: ENDPOINT.port, username: ENDPOINT.username,
+    await models.HyNode.create({ _id: NODE, ip: endpoint.ip, name: 'local-only', type: 'xray', active: true,
+        cascadeRole: 'portal', ssh: { port: endpoint.port, username: endpoint.username,
             privateKey: 'synthetic-local-fixture-not-a-key' } });
     const operationId = new mongoose.Types.ObjectId().toString();
-    const context = { operationId, topologyRevision: 17, priorDeployedRevision: 16, node: frozenNode,
-        executionFence: freeze({ owner: 'worker-17', attempt: 1, generation: randomUUID() }) };
+    const context = { operationId, topologyRevision: 17, priorDeployedRevision: 16, node: nodes[0],
+        executionFence: freeze({ owner, attempt: 1, generation: randomUUID() }) };
     const repository = new TopologyOperationRepository({ model: models.Operation });
     await connection.transaction(async session => repository.createFrozen({ operationId, executionContext: PROD,
         idempotencyKey: `topology:production:revision-17:host-${PROD.hostIdentity}:${randomUUID()}`,
         topologyRevision: 17, priorDeployedRevision: 16, nodes, heldTopologyAdmission: true,
-        admissionFingerprint: 'f'.repeat(64), session }));
-    await repository.claim({ operationId, executionContext: PROD, owner: 'worker-17', now: new Date(), leaseMs: 120000 });
+        admissionFingerprint: 'f'.repeat(64), ...selected, session }));
+    await repository.claim({ operationId, executionContext: PROD, owner, now: new Date(), leaseMs: 120000 });
     await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: NODE, operationId,
-        owner: 'worker-17', generation: context.executionFence.generation, leaseUntil: new Date(Date.now() + 120000) });
-    const originalSnapshot = { configSha256: '3'.repeat(64), unitSha256: '4'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
+        owner, generation: context.executionFence.generation, leaseUntil: new Date(Date.now() + 120000) });
+    const originalSnapshot = { configSha256: emptyOriginal ? emptyHash() : '3'.repeat(64), unitSha256: '4'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
     let ownerGeneration = OWNER_GENERATION;
     if (publicOwner) {
         // Receipt-contract regression uses the real native owner producer too.
@@ -209,7 +210,7 @@ async function setup(authority = goodAuthority, { publicOwner = false, nodes = [
     const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
     const store = new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
     return { store, context, expected: freeze(expected), enrollment: freeze({ nodeId: NODE, targetProfile: 'xray-main',
-        endpoint: ENDPOINT, nodeIdentity: IDENTITY, ownerGeneration, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
+        endpoint, nodeIdentity: IDENTITY, ownerGeneration, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
 }
 
 // Local replica set; only the physical reply is delayed. A heartbeat cannot
@@ -348,10 +349,13 @@ const BRIDGE_ENDPOINT = freeze({ ip: '192.0.2.18', port: 2222, username: 'bridge
 const bridgeNode = freeze({ ...frozenNode, node: BRIDGE, nodeRef: 'bridge', role: 'bridge', targetProfile: 'xray-bridge',
     configPath: '/usr/local/etc/xray-bridge/config.json', serviceUnit: 'xray-bridge.service',
     serviceUnitPath: '/etc/systemd/system/xray-bridge.service' });
-async function pairedScopes(afterWork) {
+const emptyHash = () => createHash('sha256').update('{}\n').digest('hex');
+async function pairedScopes(afterWork, { firstApply = false, portalNode = frozenNode, startup = false } = {}) {
+    const ep = startup ? {...ENDPOINT, username:'root'} : ENDPOINT,
+        eb = startup ? {...BRIDGE_ENDPOINT, username:'root'} : BRIDGE_ENDPOINT;
     const held = new Set(), calls = [], inventory = new Map([
-        [NODE, { endpoint: ENDPOINT, identity: IDENTITY }],
-        [BRIDGE, { endpoint: BRIDGE_ENDPOINT, identity: BRIDGE_IDENTITY }],
+        [NODE, { endpoint: ep, identity: IDENTITY }],
+        [BRIDGE, { endpoint: eb, identity: BRIDGE_IDENTITY }],
     ]);
     let revoked = false;
     const authority = async (challenge, work) => {
@@ -360,6 +364,9 @@ async function pairedScopes(afterWork) {
         assert.equal(held.has(id), false, 'external authority is not reentrant per node');
         calls.push({ id, action: challenge.action }); held.add(id);
         const proof = evidence(challenge, { physicalIdentity: { ...fixed.identity } });
+        if (firstApply) proof.predecessor = { generation: 'none', bootId: BOOT, ...(challenge.action === 'enroll'
+            ? { status: 'empty', protocolVersion: 2, journal: 'absent', legacyState: 'absent', writers: 'excluded' }
+            : { status: 'pre-enrolled' }) };
         proof.connectionAttestation.endpoint = { ...fixed.endpoint };
         proof.connectionAttestation.physicalIdentity = { ...fixed.identity };
         try {
@@ -368,12 +375,17 @@ async function pairedScopes(afterWork) {
             return result;
         } finally { held.delete(id); }
     };
-    const first = await setup(authority, { publicOwner: true, nodes: [frozenNode, bridgeNode] });
-    await models.HyNode.create({ _id: BRIDGE, ip: BRIDGE_ENDPOINT.ip, name: 'local-bridge', type: 'xray', active: true,
-        cascadeRole: 'bridge', ssh: { port: BRIDGE_ENDPOINT.port, username: BRIDGE_ENDPOINT.username,
+    const nodes = [portalNode, bridgeNode], linkId = '507f1f77bcf86cd799439013';
+    const selected = !firstApply ? {} : { kind: 'link.apply', linkId, linkIds: [linkId], staged: false, admissionScope: 'selected',
+        resourceNodeIds: [NODE, BRIDGE], baselineTopology: { nodes: [], links: [], groups: [] }, effectiveTopology: {
+            nodes: nodes.map(n => ({ id: n.node, role: n.role, type: 'xray', active: true })), groups: [],
+            links: [{ id: linkId, source: NODE, target: BRIDGE, mode: 'reverse', tunnelPort: 1443 }] } };
+    const first = await setup(authority, { publicOwner: true, nodes, selected, endpoint:ep, emptyOriginal:startup, ...(startup ? {owner:`panel-${process.pid}-topology`} : {}) });
+    await models.HyNode.create({ _id: BRIDGE, ip: eb.ip, name: 'local-bridge', type: 'xray', active: true,
+        cascadeRole: 'bridge', ssh: { port: eb.port, username: eb.username,
             privateKey: 'synthetic-local-fixture-not-a-key' } });
     const { TopologyConfigTransfer } = require('../../../services/topologyConfigTransfer');
-    const originalSnapshot = { configSha256: '7'.repeat(64), unitSha256: '8'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
+    const originalSnapshot = { configSha256: startup ? emptyHash() : '7'.repeat(64), unitSha256: '8'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
     const transfer = new TopologyConfigTransfer({ executionContext: PROD, TopologyConfigOwner: models.Owner,
         async withVerifiedMaintenance({ binding, proofRef }, work) {
             assert.equal(proofRef, 'SIMULATED-bridge-original');
@@ -394,16 +406,245 @@ async function pairedScopes(afterWork) {
         leaseUntil: new Date(Date.now() + 120000) });
     const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
     const second = { context, expected: freeze(expected), enrollment: freeze({ nodeId: BRIDGE, targetProfile: 'xray-bridge',
-        endpoint: BRIDGE_ENDPOINT, nodeIdentity: BRIDGE_IDENTITY, ownerGeneration: adopted.generation,
+        endpoint: eb, nodeIdentity: BRIDGE_IDENTITY, ownerGeneration: adopted.generation,
         predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
     const store = new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority,
         assertAuthorityHeld: async () => { assert.equal(revoked, false, 'external authority revoked'); assert.ok(held.size); }, ...models });
     for (const state of [first, second]) {
-        await store.preEnroll(state.enrollment); state.binding = await store.createBinding(state.expected);
+        await store.preEnroll(firstApply ? freeze({ ...state.enrollment, predecessorGeneration: 'none' }) : state.enrollment);
+        if (!firstApply || state === first) state.binding = await store.createBinding(state.expected);
     }
     calls.length = 0;
     return { store, states: [first, second], held, calls, revoke: () => { revoked = true; } };
 }
+
+test('ordinary startup recovers first apply with only portal binding', async () => {
+    const { store, states: [p] } = await pairedScopes(undefined, { firstApply: true });
+    const operationId = p.context.operationId;
+    const repo = new TopologyOperationRepository({ model: models.Operation });
+    const old = await models.Operation.findById(operationId).lean();
+    assert.equal(old.kind, 'link.apply'); assert.equal(old.attempts, 1); assert.equal(old.status, 'preparing');
+    assert.deepEqual(old.nodes.map(n => [n.state,n.backupId]), [['pending',''],['pending','']]);
+    assert.deepEqual((await models.Binding.find({operationId}).lean()).map(b => [b.nodeId,b.predecessorGeneration]), [[NODE,'none']]);
+    const locks = await models.Lock.find({operationId}).lean(); assert.equal(locks.length, 2); assert.ok(locks.every(l => l.remoteUncertain));
+    const clock = { now: () => new Date(Math.max(+old.leaseUntil, ...locks.map(l => +l.leaseUntil)) + 1) };
+    const { executor } = await assembled(store);
+    const { NodeOperationLockService } = require('../services/nodeOperationLockService');
+    const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+    const worker = new TopologyOperationWorker({ executionContext: PROD, operationRepository: repo,
+        executor, finalizer: { finalizeSucceeded() { throw Error('requires independently proven settlement'); } },
+        lockService: new NodeOperationLockService({repository:new NodeOperationLockRepository({model:models.Lock}),clock}),
+        workerId: 'worker-after-restart', leaseMs: 120000, clock,
+        bindingProvisioner: {executionContext:PROD, reserveBinding: e => store.createBinding(e)},
+        bindingLifecycle: {executionContext:PROD, run: work => work(), async assertHeld() {} } });
+    const outcomes = [];
+    const recovery = require('../runtime/createTopologyOperationRecoveryLifecycle').createTopologyOperationRecoveryLifecycle({
+        executionContext: PROD, env: { PANEL_DOMAIN:PROD.hostIdentity, L2TP_EXECUTION_ENABLED:'true',
+            L2TP_MIGRATIONS_ENABLED:'true', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED:'true' }, clock, operationModel:models.Operation,
+        worker: { async run(id) { assert.equal(id,operationId); const result=await worker.run(id); outcomes.push(result);return result; } } });
+    assert.equal(recovery.start().enabled, true); await recovery.stop();
+    assert.equal(outcomes.length,1,'ordinary startup tick must actually inspect the partial operation');
+    const after = await models.Operation.findById(operationId).lean();
+    assert.ok(after.heldTopologyAdmission === false && ['succeeded','failed','rolled_back'].includes(after.status),
+        `startup retained ${after.status}; claimed=${outcomes[0].claimed}; admission=${after.heldTopologyAdmission}`);
+    assert.equal(await models.Lock.countDocuments({operationId}),0);
+});
+
+// Crash-boundary replay on the fixture's private loopback replica set. No pp16 I/O.
+for (const scenario of ['drift', 'ambiguous close', 'matching pair', 'startup: matching pair', 'startup: guard unavailable', 'startup: prior lease live', 'startup: bridge lease live']) test(`retained first apply closing with expired lease: ${scenario}`, { timeout: 55000 }, async t => {
+    const startup = scenario.startsWith('startup:');
+    const user = { xrayUuid: '550e8400-e29b-41d4-a716-446655440000', userId: 'local-fixture' };
+    const port = await new Promise(resolve => {
+        const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
+    });
+    const config = { api: { tag: 'API', services: ['HandlerService'] }, inbounds: [
+        { tag: 'API_INBOUND', listen:'127.0.0.1', port, protocol:'dokodemo-door', settings:{address:'127.0.0.1'} },
+        { tag: 'users', listen:'127.0.0.1', port:0, protocol:'vless', settings:{decryption:'none', clients:[]} }],
+        outbounds:[{tag:'direct',protocol:'freedom'}], routing:{rules:[{type:'field', inboundTag:['API_INBOUND'],outboundTag:'API'}]} };
+    const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
+        ? Object.fromEntries(Object.keys(value).sort().map(k => [k,canonical(value[k])])) : value;
+    const bytes = Buffer.from(JSON.stringify(canonical(config))+'\n'), sha256 = createHash('sha256').update(bytes).digest('hex');
+    const portalNode = freeze({...frozenNode,candidateHash:sha256,candidate:{...frozenNode.candidate,bytes:[...bytes],sha256}});
+    const { states, store } = await pairedScopes(undefined, { firstApply: true, portalNode, startup });
+    const [p, b] = states, operationId = p.context.operationId, owner = p.expected.owner;
+    b.binding = await store.createBinding(b.expected);
+    const { fakeRunner } = require('./helpers/topologyTerminalFakeRunner');
+    const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
+    const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+    const { TopologyOperationFinalizationRepository } = require('../repositories/topologyOperationFinalizationRepository');
+    const { NodeOperationLockService } = require('../services/nodeOperationLockService');
+    const { TopologyOperationFinalizer } = require('../services/topologyOperationFinalizer');
+    const clock = { now: () => new Date() }, repo = new TopologyOperationRepository({ model: models.Operation });
+    const roots = new Map(states.map(s => [s.expected.nodeId, fakeRunner(t, BOOT)]));
+    roots.get(BRIDGE).put('usr/local/etc/xray-bridge/config.json', '{"old":true}\n');
+    if (startup) for (const s of states) roots.get(s.expected.nodeId).put(s.context.node.configPath, '{}\n');
+    const dispatch = [];
+    const executor = new TopologyOperationExecutor({ ...PROD, executionBindingReader: store,
+        RunnerBootstrapper: class { async ensureRunner() {} async verifyExisting() {} }, nodeExecutionResolver: { async resolve({nodeId}, pin) {
+            const s = states.find(s => s.expected.nodeId === nodeId);
+            assert.deepEqual(pin, {expectedEndpoint:s.enrollment.endpoint,expectedHostKeySha256:s.enrollment.nodeIdentity.sshHostKeySha256});
+            return {async exec(command, options) { dispatch.push([nodeId, require('./helpers/topologyV2Fixture').runnerRequest(command).command]); return roots.get(nodeId).execute(command, options); }};
+        } } });
+    for (const s of states) {
+        const prepared = await executor.prepare(s.context), ctx = {...s.context, backupId:prepared.backupId, prepared:prepared.prepared};
+        await executor.commit(ctx); await executor.verify(ctx);
+        assert.equal(await repo.recordNode({operationId, owner, node:s.expected.nodeId, now:clock.now(), state:'committed',backupId:ctx.backupId}), true);
+    }
+    assert.equal(await repo.setPhase({operationId,owner,now:clock.now(),from:'preparing',to:'committing'}), true);
+    const stateModel = startup ? 'CascadeTopologyState' : 'SettlementTopology';
+    const Topology = connection.models[stateModel] || connection.model(stateModel, require('../models/cascadeTopologyStateModel').schema);
+    await Topology.deleteMany({}); await Topology.create({_id:'singleton',revision:17,deployedRevision:16,remoteAdmissionCount:0,topologyAdmissionCount:1});
+    // The admitted selection is fixture input; use real owner rows and the native closing CAS.
+    const owners = await models.Owner.find({}).sort({node:1}).lean();
+    const pins = owners.map(o => ({node:String(o.node),profile:o.profile,generation:o.generation}));
+    await models.Operation.collection.updateOne({_id:new mongoose.Types.ObjectId(operationId)}, {$set:{selectedOwnerPins:pins}});
+    let selected = { async verifySelected(op) { assert.deepEqual(op.selectedOwnerPins,pins); assert.deepEqual(op.resourceNodeIds,[NODE,BRIDGE]); } };
+    const linkModel = startup ? 'CascadeLink' : 'ClosingLink';
+    const Link = connection.models[linkModel] || connection.model(linkModel, require('../../../models/cascadeLinkModel').schema);
+    const linkId = '507f1f77bcf86cd799439013';
+    await Link.deleteMany({}); await Link.create({_id:linkId, name:'local',portalNode:NODE,bridgeNode:BRIDGE,tunnelUuid:randomUUID(),status:'pending'});
+    if (startup) {
+        // Build the pre-crash selection with the real admission reader, not fabricated pins.
+        const snapshotReader={HyNode:models.HyNode,CascadeLink:Link,readDraft:async()=>({groups:[],installedRouteOwners:[]})};
+        selected=new (require('../repositories/topologyDeploymentRepository').TopologyDeploymentRepository)({snapshotReader,CascadeTopologyState:Topology,
+            TopologyOperation:models.Operation,TopologyConfigOwner:models.Owner,NodeOperationLock:models.Lock});
+        const snapshot=await snapshotReader.readDraft(), data=await selected.readSelected({snapshot,scope:{kind:'link.apply',linkId},executionContext:PROD});
+        const fields=Object.fromEntries(['baselineTopology','effectiveTopology','resourceNodeIds','selectedOwnerPins','desiredVersion','routeState'].map(k=>[k,data[k]]));
+        const id={_id:new mongoose.Types.ObjectId(operationId)}, raw=await models.Operation.collection.findOne(id);
+        fields.admissionFingerprint=require('../repositories/topologyOperationRepository').selectedAdmissionFingerprint({...raw,...fields});
+        await models.Operation.collection.updateOne(id,{$set:fields});
+    }
+    const finalizer = new TopologyOperationFinalizer({clock, repository:new TopologyOperationFinalizationRepository({TopologyOperation:models.Operation,
+        CascadeLink:Link, CascadeTopologyState:Topology, NodeOperationLock:models.Lock, TopologyConfigOwner:models.Owner, TopologyExecutionBinding:models.Binding,
+        TopologyExecutionEnrollment:models.Enrollment, selectedTopologyRepository:selected})});
+    const before = await models.Operation.findById(operationId).lean();
+    await finalizer.beginV2Closure({operationId,owner,topologyRevision:17,priorDeployedRevision:16,leaseUntil:before.leaseUntil,bindings:states.map(s=>s.binding)});
+    const expired = new Date(Date.now()-10000);
+    const live = new Date(Date.now()+120000), priorLease = scenario === 'startup: prior lease live' ? live : expired;
+    await models.Operation.updateOne({_id:operationId},{$set:{leaseUntil:priorLease}}); await models.Lock.updateMany({operationId},{$set:{leaseUntil:priorLease}});
+    if (scenario === 'startup: bridge lease live') await models.Lock.updateOne({operationId,node:BRIDGE},{$set:{leaseUntil:live}});
+    const pre = await models.Operation.findById(operationId).lean(); assert.deepEqual(pre.nodes.map(n=>n.state),['committed','committed']);
+    assert.equal(pre.v2Terminal.state,'closing'); assert.deepEqual(pre.v2Terminal.proofs,[]); assert.equal(pre.v2Terminal.sideEffects,undefined);
+    const originalLocks=await models.Lock.find({operationId}).sort({node:1}).lean(); assert.equal(originalLocks.length,2);
+    assert.ok(originalLocks.every(l=>l.remoteUncertain && +l.leaseUntil===+(scenario === 'startup: bridge lease live' && String(l.node)===BRIDGE ? live : priorLease))); dispatch.length=0;
+    if (scenario === 'drift') fs.appendFileSync(path.join(roots.get(BRIDGE).root,bridgeNode.configPath),' ');
+    const journalFile = s => path.join(roots.get(s.expected.nodeId).root,'var/lib/celerity/topology/fences',s.binding.targetProfile,'journal.json');
+    if (scenario === 'ambiguous close') {
+        const j = JSON.parse(fs.readFileSync(journalFile(b)));
+        j.generations[j.head].commands[b.binding.commandIds.close] = {state:'running',command:'close'};
+        fs.writeFileSync(journalFile(b),JSON.stringify(j));
+    }
+    let reads = 0;
+    const readUnclosedPair = async () => {
+        reads++;
+        return states.map(s => ({ nodeId:s.binding.nodeId, targetProfile:s.binding.targetProfile,runnerIdle:true,
+            physical:{bootId:BOOT}, journal:JSON.parse(fs.readFileSync(journalFile(s))), current:{source:'node-readback',serviceActive:'active',
+                configSha256:createHash('sha256').update(fs.readFileSync(path.join(roots.get(s.binding.nodeId).root,s.context.node.configPath))).digest('hex')} }));
+    };
+    if (scenario.endsWith('matching pair')) {
+        assert.ok(process.env.C3_XRAY, 'loopback Xray required');
+        const root = roots.get(NODE).root;
+        fs.copyFileSync(process.env.C3_XRAY,path.join(root,'usr/local/bin/xray'));
+        const child = spawn(process.env.C3_XRAY,['run','-config',path.join(root,portalNode.configPath)],{stdio:'ignore'});
+        t.after(async () => { if (child.exitCode === null && !child.signalCode) { const joined = new Promise(r=>child.once('exit',r)); child.kill(); await joined; } });
+        await until(async () => { await new Promise((resolve,reject) => {const c=net.connect(port,'127.0.0.1');c.once('error',reject);c.once('connect',()=>{c.destroy();resolve();});}); });
+    }
+    if (startup) {
+        // Complete the local startup catalog before spawning the independent backend.
+        // Root initialization is read-only: it receives neither worker ID nor operation ID.
+        const schemaModels = {...require('..').registerModels(),HyNode:require('../../../models/hyNodeModel'),CascadeLink:require('../../../models/cascadeLinkModel')};
+        for (const M of Object.values(schemaModels)) {
+            const local = connection.models[M.modelName] || connection.model(M.modelName,M.schema,M.collection.name);
+            await local.init(); await local.createCollection(); await local.createIndexes();
+        }
+        const hy=connection.models.HyNode; await hy.deleteMany({}); await hy.collection.insertMany(await models.HyNode.collection.find().toArray());
+        const users=connection.db.collection(require('../../../models/hyUserModel').collection.name);
+        await users.deleteMany({userId:user.userId});await users.insertOne({...user,enabled:true,groups:[],nodes:[new mongoose.Types.ObjectId(NODE)]});
+        const {config:replica}=await connection.getClient().db('admin').command({replSetGetConfig:1});
+        const sockets=[], localNodes=[];
+        try {
+            for(const s of states) {
+                const n=s.expected.nodeId, root=roots.get(n).root, gen=s.enrollment.ownerGeneration;
+                const original=n===NODE?['3','4']:['7','8'];
+                const pin={kind:'node',nodeId:n,targetProfile:s.binding.targetProfile,physical:{...s.enrollment.nodeIdentity,bootId:BOOT},endpoint:s.enrollment.endpoint,
+                    privateKeyPath:'/etc/celerity/unused-local-fixture',maintenanceId:MAINTENANCE,policySha256:original[0].repeat(64),proofRef:'local-original',
+                    acceptedOwner:{owner:'topology',generation:gen},originalScope:{epoch:randomUUID(),bundleSha256:original[1].repeat(64),ownerGeneration:gen},
+                    originalSnapshot:{source:'node-readback',configSha256:emptyHash(),unitSha256:original[1].repeat(64),serviceActive:'active',serviceEnabled:'enabled'}};
+                const socket=path.join(root,'guard.sock');
+                if(!(scenario==='startup: guard unavailable' && n===BRIDGE)) {
+                    const server=net.createServer(c=>c.resume()); await new Promise((ok,no)=>server.once('error',no).listen(socket,ok)); sockets.push(server);
+                }
+                const journal=journalFile(s), configPath=path.join(root,s.context.node.configPath), j=JSON.parse(fs.readFileSync(journal));
+                assert.equal(j.head,s.binding.generation); assert.equal(j.generations[j.head].phase,'verified');
+                assert.ok(!Object.hasOwn(j.generations[j.head].commands,s.binding.commandIds.close));
+                assert.equal(createHash('sha256').update(fs.readFileSync(configPath)).digest('hex'),s.context.node.candidateHash);
+                roots.get(n).put('usr/local/bin/celerity-topology-node-runner-v2', fs.readFileSync(path.join(__dirname,'../node-artifacts/topology/runner.sh')),0o750);
+                if(n===BRIDGE) roots.get(n).put('etc/systemd/system/xray-bridge.service',require('../../../services/configGenerator').generateBridgeSystemdService());
+                localNodes.push({id:n,root,socket,pin,journal,configPath});
+            }
+            const config={version:1,executionContext:PROD,mode:'runtime',host:{...localNodes[0].pin,kind:'host'},nodes:localNodes.map(n=>n.pin),
+                admission:{serverContext:PROD,databaseName:dbName,maintenanceGeneration:randomUUID(),deployment:{setName:replica._id,replicaSetId:String(replica.settings.replicaSetId)},
+                    manifestSha256:require('../services/productionAdmissionInitializer').REVIEWED_MANIFEST_SHA256}};
+            const run=spawn(process.execPath,[path.join(__dirname,'helpers/topologyClosingRootStartup.js')],{cwd:directory,env:{PATH:process.env.PATH,TMPDIR:process.env.TMPDIR,
+                NODE_ENV:'test',PANEL_DOMAIN:'test.invalid',ACME_EMAIL:'fixture@test.invalid',SESSION_SECRET:'local-start',JWT_SECRET:'local-start',ENCRYPTION_KEY:'0'.repeat(32)},stdio:['pipe','pipe','pipe']});
+            let out='';run.stdout.on('data',chunk=>out+=chunk);run.stderr.resume();const joined=new Promise((ok,no)=>{run.once('error',no);run.once('close',ok);});
+            const timeout=setTimeout(()=>run.kill('SIGKILL'),30000);
+            run.stdin.end(JSON.stringify({uri:`mongodb://127.0.0.1:${connection.port}/${dbName}?replicaSet=bindingScratch`,config,nodes:localNodes,operationCollection:models.Operation.collection.name}));
+            let rc;try{rc=await joined;}finally{clearTimeout(timeout);}
+            const line=out.split('\n').find(l=>l.startsWith('CLOSING_ROOT '));assert.ok(line,`local startup produced no trace (exit ${rc})`);
+            const trace=JSON.parse(line.slice(13)); assert.equal(rc,0,JSON.stringify(trace)); assert.notEqual(trace.pid,process.pid);
+            const fresh=await models.Operation.findById(operationId).lean(); const lockRows=await models.Lock.find({operationId}).sort({node:1}).lean();
+            const admission=(await Topology.findById('singleton').lean()).topologyAdmissionCount;
+            assert.equal(await models.Operation.countDocuments({}),1);assert.equal(fresh.attempts,pre.attempts);assert.deepEqual(fresh.v2Terminal.bindings,pre.v2Terminal.bindings);
+            t.diagnostic(`startup=${JSON.stringify(trace)} status=${fresh.status} retained=${fresh.heldTopologyAdmission} proofs=${fresh.v2Terminal.proofs.length} locks=${lockRows.length} admission=${admission}`);
+            if(scenario!=='startup: matching pair') {assert.deepEqual(lockRows,originalLocks);assert.deepEqual(fresh.v2Terminal,pre.v2Terminal);assert.equal(fresh.leaseOwner,pre.leaseOwner);
+                assert.equal(+fresh.leaseUntil,+priorLease);assert.equal(fresh.heldTopologyAdmission,true);assert.equal(admission,1);assert.deepEqual(trace.runner,[]);}
+            if(scenario==='startup: guard unavailable') {assert.ok(!trace.started);assert.deepEqual(trace.guardErrors,[[BRIDGE,'ENOENT']]);assert.equal(trace.ssh,0);
+                assert.equal(fresh.v2Terminal.state,'closing');assert.deepEqual(trace.scanned,[]);return;}
+            assert.ok(trace.started,'ordinary root did not start');assert.deepEqual(trace.attached,[NODE,BRIDGE]);
+            if (scenario==='startup: prior lease live' || scenario==='startup: bridge lease live') {
+                assert.deepEqual(trace.scanned,scenario==='startup: prior lease live' ? [[]] : [[operationId]]);
+                assert.equal(trace.ssh,0); assert.equal(fresh.v2Terminal.state,'closing'); return;
+            }
+            assert.deepEqual(trace.scanned,[[operationId]]);
+            assert.deepEqual(trace.worker,{id:`panel-${trace.pid}-topology`,boundResync:true,pppGate:true,typed:true});
+            assert.ok(pre.v2Terminal.bindings.every(b=>b.operationId===operationId && b.owner===owner && b.owner!==trace.worker.id));
+            assert.equal(fresh.status,'succeeded','ordinary startup must finish the discovered operation under its new process identity');
+            assert.deepEqual(trace.physicalPairReads,[NODE,BRIDGE,NODE,BRIDGE]);
+            assert.deepEqual(trace.transfers.map(x=>[x.from,x.to,x.generation,x.pairReads]),
+                [null,...states.map(s=>s.binding.generation)].map(g=>[owner,trace.worker.id,g,[NODE,BRIDGE]]));
+            assert.equal(new Set(trace.transfers.map(x=>x.tx)).size,1);
+            assert.equal(admission,0);assert.equal(lockRows.length,0);assert.equal(fresh.heldTopologyAdmission,false);
+            assert.deepEqual(fresh.v2Terminal.proofs.map(r=>r.commandId),states.map(s=>s.binding.commandIds.close));
+            assert.deepEqual(trace.runner,[[NODE,'restore-users'],[NODE,'close'],[NODE,'status'],[BRIDGE,'close'],[BRIDGE,'status']]);
+            return;
+        } finally { await Promise.all(sockets.map(server=>new Promise(ok=>server.close(ok)))); }
+    }
+    const {TopologyUserResync} = require('../services/topologyUserResync');
+    const userResync = new TopologyUserResync({HyNode:models.HyNode,preferBoundRunner:true,syncService:{
+        _getUsersForNode:async n=>String(n._id)===NODE?[user]:[],addXrayUser:()=>assert.fail('classic writer') }});
+    const noRelay=()=>assert.fail('P/B only, no PPP');
+    const pppReadinessGate=new (require('../services/topologyPppReadinessGate').TopologyPppReadinessGate)({
+        RelayL2tpState:{findOne:noRelay},L2tpUser:{find:noRelay},L2tpOperation:{findOne:noRelay},transportResolver:noRelay});
+    const worker = new TopologyOperationWorker({executionContext:PROD,operationRepository:repo,selectedTopologyRepository:selected,executor,finalizer,userResync,pppReadinessGate,
+        workerId:owner,clock,leaseMs:120000,lockService:new NodeOperationLockService({repository:new NodeOperationLockRepository({model:models.Lock}),clock}),
+        bindingProvisioner:{executionContext:PROD,reserveBinding:()=>assert.fail('no second reservation')},
+        bindingLifecycle:{executionContext:PROD,run:work=>work(),assertHeld:async()=>{},readUnclosedPair} });
+    const result=await worker.run(operationId), after=await models.Operation.findById(operationId).lean();
+    assert.equal(after.attempts,pre.attempts); assert.deepEqual(after.v2Terminal.bindings,pre.v2Terminal.bindings);
+    assert.ok(!dispatch.some(([,cmd])=>['prepare','commit','verify','rollback'].includes(cmd)));
+    if (scenario !== 'matching pair') {
+        assert.equal(after.status,'committing'); assert.deepEqual(after.v2Terminal,pre.v2Terminal); assert.equal(after.heldTopologyAdmission,true);
+        assert.deepEqual(await models.Lock.find({operationId}).sort({node:1}).lean(),originalLocks); assert.equal((await Topology.findById('singleton').lean()).topologyAdmissionCount,1);
+    }
+    if (scenario !== 'matching pair') { assert.equal(result.stopped,true); assert.equal(reads,1); assert.deepEqual(dispatch,[]); assert.equal(+after.leaseUntil,+expired); return; }
+    assert.equal(after.status,'succeeded',`matching pair: worker=${result.errorCode}, claimed=${result.claimed}, pairReads=${reads}, dispatch=${dispatch.map(([,c])=>c).join(",")}, proofs=${after.v2Terminal.proofs.length}, locks=${await models.Lock.countDocuments({operationId})}`);
+    assert.equal(after.heldTopologyAdmission,false); assert.equal((await Topology.findById('singleton').lean()).topologyAdmissionCount,0);
+    assert.equal(await models.Lock.countDocuments({operationId}),0); assert.equal(after.v2Terminal.state,'proven');
+    assert.ok(reads >= 2); assert.equal((await Link.findById(linkId).lean()).status,'deployed');
+    assert.deepEqual(dispatch,[[NODE,'restore-users'],[NODE,'close'],[NODE,'status'],[BRIDGE,'close'],[BRIDGE,'status']]);
+    assert.deepEqual(after.v2Terminal.proofs.map(r=>r.commandId),states.map(s=>s.binding.commandIds.close));
+});
 
 test('nested independent node scopes resolve both exact held connections without external reentry in either order', async t => {
     for (const reverse of [false, true]) await t.test(reverse ? 'bridge then portal' : 'portal then bridge', async () => {

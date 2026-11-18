@@ -191,6 +191,11 @@ class TopologyOperationFinalizationRepository {
             HyNode, L2tpUser, L2tpOperation });
     }
 
+    reclaimUnclosedPair(request, terminal) {
+        assertFinalizationRequest(request);
+        return require('./topologyV2Settlement').reclaimUnclosedPair(this, request, terminal);
+    }
+
     beginV2Closure(request) {
         assertFinalizationRequest(request);
         return require('./topologyV2Settlement').begin(this, request);
