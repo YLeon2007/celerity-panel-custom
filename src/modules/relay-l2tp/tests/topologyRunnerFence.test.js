@@ -223,6 +223,42 @@ test('rollback restores exact snapshot and closes with an explicit rolledback te
     assert.equal(f.ok('close').terminalOutcome, 'rolledback');
     assert.match(f.run('commit', { commandId: 'late-commit' }).stderr, /GENERATION_CLOSED/);
 });
+// Physical primitives for operator abort; no DB/lease release or control-plane
+// cancellation is exercised here. Use the shipped runner in two separate roots.
+for (const committed of [0, 1, 2]) test(`operator abort prerequisites: baseline on both participants after ${committed} commits`, t => {
+    const nodes = ['xray-main','xray-bridge'].map((profile, i) => {
+        const f = fixture(t), dir = i ? 'xray-bridge' : 'xray';
+        const config = `usr/local/etc/${dir}/config.json`, peer = `usr/local/etc/${i ? 'xray' : 'xray-bridge'}/config.json`;
+        const neighbour = { tag: `untouched-${i}`, protocol: 'freedom' };
+        const profileBytes = outbounds => JSON.stringify({ inbounds: [], outbounds }) + '\n';
+        const original = profileBytes([neighbour]), candidate = profileBytes([neighbour, {tag: `selected-${i}`, protocol:'blackhole'}]);
+        const peerBytes = profileBytes([{ tag:`separate-profile-${i}`, protocol:'freedom' }]);
+        f.put(config, original); f.put(peer, peerBytes);
+        const peerPath = path.join(f.root,peer), peerBefore = fs.statSync(peerPath,{bigint:true});
+        const binding = {nodeId:`node-${i}`, generation:`generation-${i}`, backupId:`backup-${i}`, targetProfile:profile,
+            candidateHash:`sha256:${createHash('sha256').update(candidate).digest('hex')}`};
+        function cmd(name, commandId = `${name}-${i}`) {
+            const r = f.run(name,{...binding, commandId}, name==='prepare' ? candidate : '');
+            assert.equal(r.status,0,r.stderr);return JSON.parse(r.stdout);
+        }
+        function current() { return fs.readFileSync(path.join(f.root,config),'utf8'); }
+        function preserved() {
+            assert.deepEqual(JSON.parse(current()).outbounds[0],neighbour);
+            assert.equal(fs.readFileSync(peerPath,'utf8'),peerBytes);
+            const s=fs.statSync(peerPath,{bigint:true});assert.equal(s.ino,peerBefore.ino);assert.equal(s.mtimeNs,peerBefore.mtimeNs);
+        }
+        return {cmd,current,preserved,original,candidate};
+    });
+    for(const n of nodes) assert.equal(n.cmd('prepare').phase,'prepared');
+    for(const n of nodes.slice(0,committed)) assert.equal(n.cmd('commit').phase,'committed');
+    nodes.forEach((n,i)=>{assert.equal(n.current(),i<committed ? n.candidate : n.original);n.preserved();});
+    for(const n of [...nodes].reverse()) { assert.equal(n.cmd('rollback').phase,'rolledback'); assert.equal(n.current(),n.original); }
+    nodes.forEach((n,i)=>{
+        const close=n.cmd('close');assert.equal(close.terminalOutcome,'rolledback');assert.equal(close.ownershipRetained,true);
+        assert.deepEqual(n.cmd('status',`close-${i}`),{...close,command:'status'});
+        assert.equal(n.current(),n.original);n.preserved();
+    });
+});
 test('absent-config rollback waits for stopped systemd job and terminal readback remains exact', t => {
     const f = fixture(t); fs.unlinkSync(path.join(f.root, 'usr/local/etc/xray/config.json'));
     f.ok('prepare'); f.ok('commit'); f.ok('verify'); f.put('stopped', '');
