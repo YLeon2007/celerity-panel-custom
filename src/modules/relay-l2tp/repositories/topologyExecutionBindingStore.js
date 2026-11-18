@@ -880,7 +880,7 @@ class TopologyExecutionBindingStore {
         return this.#binding('successor', expected, null, predecessorBindingId, joinForWrite);
     }
     // The admitting worker reserves every participant before the first prepare.
-    // Exactly P and no B therefore distinguishes a reservation cut from uncertain
+    // No reservation, or exactly P and no B, distinguishes a cut from uncertain
     // delivery. Two bindings with pending DB labels do NOT establish that fact.
     async withPartialPortalClaim({ operationId, owner, leaseMs }, selected, work) {
         if (this.#context.target !== 'production' || !matches(operationId, ID) || !token(owner)
@@ -900,7 +900,7 @@ class TopologyExecutionBindingStore {
             || before.nodes[1].role !== 'bridge' || before.nodes.some(n => n.state !== 'pending' || n.backupId !== '')
             || !isDeepStrictEqual(before.resourceNodeIds?.slice().sort(), before.nodes.map(n => String(n.node)).sort())) return null;
         const reservations = await Binding.find({ operationId }).read('primary').readConcern('majority').limit(2).setOptions(OPTIONS).lean();
-        if (reservations.length !== 1 || reservations[0].nodeId !== String(before.nodes[0].node)) return null;
+        if (reservations.length > 1 || (reservations.length === 1 && reservations[0].nodeId !== String(before.nodes[0].node))) return null;
         const old = before.leaseOwner, pending = [];
         await this.#indexes();
         await selected.verifySelected(before);
@@ -922,8 +922,9 @@ class TopologyExecutionBindingStore {
             if (!ownerRow || ownerRow.lastSettledOperation !== undefined || ownerRow.lastSettledGeneration !== undefined) throw failure();
             const evidence = this.#ownerEvidence(ownerRow,enrollment);
             if (!await this.#majority(HyNode,this.#nodeFilter(enrollment))) throw failure();
-            if (!i) this.#checkRow(reservations[0],enrollment,expected);
-            pending.push({ lock, expected, enrollment, evidence, original: i ? null : recordProjection(reservations[0]) });
+            const reservation = reservations[i];
+            if (reservation) this.#checkRow(reservation,enrollment,expected);
+            pending.push({ lock, expected, enrollment, evidence, original: reservation ? recordProjection(reservation) : null });
         }
         const checkPhysical = () => this.#checkPristinePair(pending.map(({enrollment,evidence}) => ({ ...enrollmentProjection(enrollment),
             maintenanceId: enrollment.maintenanceId, originalSnapshot: evidence.originalSnapshot })));
@@ -937,16 +938,16 @@ class TopologyExecutionBindingStore {
             const op = await Operation.findOne(opMatch).select(OPERATION_PRIVATE_FIELDS).setOptions(opts).lean();
             if (!op || !isDeepStrictEqual(op.nodes,before.nodes) || !isDeepStrictEqual(op.resourceNodeIds,before.resourceNodeIds)
                 || await Lock.countDocuments({ operationId }).setOptions(opts) !== 2
-                || await Binding.countDocuments({ operationId }).setOptions(opts) !== 1) throw failure();
+                || await Binding.countDocuments({ operationId }).setOptions(opts) !== reservations.length) throw failure();
             await selected.verifySelected(op,session);
             for (const [i, {expected,evidence,enrollment,lock}] of pending.entries()) {
                 this.#checkOperationRow(op,expected);
                 if (!isDeepStrictEqual(await this.#enrollment(expected,session),enrollment)
-                    || await Binding.countDocuments({enrollmentId:enrollment._id}).setOptions(opts) !== (i ? 0 : 1)) throw failure();
-                if (!i) {
-                    const row = await Binding.findById(reservations[0]._id).setOptions(opts).lean();
+                    || await Binding.countDocuments({enrollmentId:enrollment._id}).setOptions(opts) !== (reservations[i] ? 1 : 0)) throw failure();
+                if (reservations[i]) {
+                    const row = await Binding.findById(reservations[i]._id).setOptions(opts).lean();
                     this.#checkRow(row,enrollment,expected);
-                    if (!isDeepStrictEqual(row,reservations[0])) throw failure();
+                    if (!isDeepStrictEqual(row,reservations[i])) throw failure();
                 }
                 const ownerFilter = { ...this.#ownerFilter(enrollment,evidence), lastSettledOperation: {$exists:false}, lastSettledGeneration: {$exists:false} };
                 await this.#cas(Owner,ownerFilter,nonce,session);

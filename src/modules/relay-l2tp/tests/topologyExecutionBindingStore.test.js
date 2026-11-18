@@ -576,7 +576,7 @@ for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:2300
         assert.ok(['succeeded','rolled_back','failed'].includes(after.op.status),`${cut}: still ${after.op.status}, locks=${after.locks.length} admission=${after.count}`);
         const why = JSON.stringify({cut,status:after.op.status,states:after.op.nodes.map(n=>n.state),
             commands:second.trace.runner.map(([,command])=>command), failures:second.trace.failures.map(({phase,code,frames})=>({phase,code,frames}))});
-        if (cut === 'bindings-1') assert.equal(after.op.status, 'succeeded', why);
+        if (cut === 'bindings-0' || cut === 'bindings-1') assert.equal(after.op.status, 'succeeded', why);
         assert.equal(after.op.heldTopologyAdmission,false,why);assert.equal(after.locks.length,0);assert.equal(after.count,0);
         if(after.op.status==='succeeded')assert.equal(after.op.v2Terminal.proofs.length,2);
         else for(const n of localNodes)assert.equal(fs.readFileSync(n.configPath,'utf8'),'{}\n');
