@@ -1,0 +1,17 @@
+[Unit]
+Description=C3 PROD native v2 exclusion guard (retains ambiguity; never restarts)
+BindsTo=c3-prod-isolation.service
+After=c3-prod-isolation.service
+Before=c3-prod-backend.service
+
+[Service]
+Type=exec
+ExecStartPre=/usr/bin/python3.13 -I -B /opt/hysteria-panel/deploy/prod-path/preflight.py isolation
+ExecStart=/usr/bin/python3.13 -I /usr/local/libexec/c3-prod-maintenance/exclusion_guard.py
+ExecStartPost=/usr/bin/python3.13 -I -B /opt/hysteria-panel/deploy/prod-path/preflight.py guard-ready
+TimeoutStartSec=120s
+UMask=0077
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

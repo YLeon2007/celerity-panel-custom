@@ -1,0 +1,21 @@
+[Unit]
+Description=C3 PROD backend (no automatic restart or alternate Compose writer)
+BindsTo=docker.service c3-prod-isolation.service c3-prod-guard.service
+After=network-online.target docker.service c3-prod-isolation.service c3-prod-guard.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/hysteria-panel
+EnvironmentFile=/etc/celerity/c3-prod-backend.env
+ExecStartPre=/usr/bin/python3.13 -I -B /opt/hysteria-panel/deploy/prod-path/preflight.py guard-ready
+ExecStart=/usr/bin/flock --nonblock --no-fork /var/lib/celerity/prod-path/backend.launch.lock /usr/bin/python3.13 -I -B /opt/hysteria-panel/deploy/prod-path/preflight.py backend
+Restart=no
+# Signal the attached Compose parent first; give native Node drain (>30m) time.
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=36min
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
