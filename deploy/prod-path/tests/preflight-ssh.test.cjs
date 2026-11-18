@@ -24,7 +24,18 @@ const pins = hostKeys.map((hostKey, i) => ({
 const model = { version: 1, executionContext: PROD, mode: 'enroll', admission: { serverContext: PROD },
     host: pins[0], nodes: pins.slice(1) };
 
-function simulatedSsh(t, config, { wrongKey, wrongBoot } = {}) {
+function runtimeModel(cohost = false) {
+    const config = structuredClone(model);
+    config.mode = 'runtime';
+    for (const n of config.nodes) {
+        n.originalScope = { epoch: randomUUID(), bundleSha256: n.policySha256, ownerGeneration: randomUUID() };
+        n.acceptedOwner = { owner: 'topology', generation: n.originalScope.ownerGeneration };
+    }
+    if (cohost) config.host = { ...config.nodes[0], kind: 'host' };
+    return config;
+}
+
+function simulatedSsh(t, config, { wrongKey, wrongBoot, refuseAttach, wrongOwner, journal } = {}) {
     const attempts = [], actions = [], ends = [];
     class Client extends EventEmitter {
         connect(opts) {
@@ -47,11 +58,21 @@ function simulatedSsh(t, config, { wrongKey, wrongBoot } = {}) {
             stream.stderr = new EventEmitter();
             stream.write = wire => {
                 const q = JSON.parse(wire);
-                actions.push([this.pin.kind, q.action]);
-                assert.equal(q.action, 'observe');
-                const observed = { ...this.pin, serverContext: PROD, held: true,
-                    oldBackend: { instanceId: 'fixture-drained', pid: 42, processStartTime: '123' } };
-                if (wrongBoot === this.pin.endpoint.ip) observed.physical = { ...this.pin.physical, bootId: randomUUID() };
+                actions.push([this.pin.kind, q.action, this.pin.endpoint.ip]);
+                const ip = this.pin.endpoint.ip;
+                if (q.action === 'attach') assert.deepEqual(q.value, this.pin.originalScope);
+                else assert.equal(q.value, null);
+                assert.ok((config.mode === 'runtime' ? ['observe', 'attach', 'read'] : ['observe']).includes(q.action));
+                if (q.action === 'attach' && refuseAttach === ip) {
+                    queueMicrotask(() => stream.emit('close'));
+                    return;
+                }
+                const observed = q.action === 'observe' ? { ...this.pin, serverContext: PROD, held: true,
+                    oldBackend: { instanceId: 'fixture-drained', pid: 42, processStartTime: '123' },
+                    ...(journal && this.pin.kind === 'node' ? { journal, pristine: false } : {}) }
+                    : { ...this.pin.originalScope, phase: 'captured-held' };
+                if (q.action === 'observe' && wrongBoot === ip) observed.physical = { ...this.pin.physical, bootId: randomUUID() };
+                if (q.action === 'read' && wrongOwner === ip) observed.ownerGeneration = randomUUID();
                 queueMicrotask(() => stream.emit('data', Buffer.from(JSON.stringify({ nonce: q.nonce, result: observed }) + '\n')));
             };
             callback(null, stream);
@@ -98,6 +119,54 @@ test('a matching ssh key is not sufficient: stale Boot or mixed host pin refuses
     const { ends } = simulatedSsh(t, model, { wrongBoot: model.host.endpoint.ip });
     await assert.rejects(run(model), /UNKNOWN_RETAINED/);
     assert.equal(ends.length, pins.length);
+});
+
+test('runtime preflight reattaches both accepted originals without capture or runner dispatch', async t => {
+    const config = runtimeModel();
+    const { actions, attempts, ends } = simulatedSsh(t, config);
+    await run(config);
+    assert.deepEqual(actions.filter(([, a]) => a === 'attach').map(([, , ip]) => ip), config.nodes.map(n => n.endpoint.ip));
+    for (const n of config.nodes) assert.ok(actions.some(([, a, ip]) => a === 'read' && ip === n.endpoint.ip));
+    assert.deepEqual(ends, attempts);
+});
+
+test('same-boot runtime cohost does not turn a retained verified head into settlement', async t => {
+    const config = runtimeModel(true);
+    const journal = { head: 'fixture-retained', generations: { 'fixture-retained': { phase: 'verified' } } };
+    const { actions, attempts, ends } = simulatedSsh(t, config, { journal });
+    await run(config);
+    assert.deepEqual(attempts, config.nodes.map(n => n.endpoint.ip));
+    assert.deepEqual(actions.filter(([, a]) => a === 'attach').map(([, , ip]) => ip), attempts);
+    assert.deepEqual(ends, attempts);
+});
+
+for (const [label, index, cohost] of [['B', 1, false], ['P', 0, false], ['P with panel cohost', 0, true]]) {
+    test(`runtime preflight refuses stale observed boot before attach: ${label}`, async t => {
+        const config = runtimeModel(cohost);
+        const { actions, attempts, ends } = simulatedSsh(t, config, { wrongBoot: config.nodes[index].endpoint.ip });
+        await assert.rejects(run(config), /UNKNOWN_RETAINED/);
+        assert.ok(actions.every(([, a]) => a === 'observe'));
+        assert.deepEqual(ends, attempts);
+    });
+
+    test(`matching new policy pins are insufficient if native attach refuses: ${label}`, async t => {
+        const config = runtimeModel(cohost);
+        const node = config.nodes[index];
+        node.physical.bootId = randomUUID();
+        node.policySha256 = '9'.repeat(64); // independently supplied input in this transport fixture only
+        if (cohost) config.host = { ...node, kind: 'host' };
+        const { actions, attempts, ends } = simulatedSsh(t, config, { refuseAttach: node.endpoint.ip });
+        await assert.rejects(run(config), /PRODUCTION_AUTHORITY_CHANNEL_LOST/);
+        assert.ok(actions.some(([, a, ip]) => a === 'attach' && ip === node.endpoint.ip));
+        assert.deepEqual(ends.toSorted(), attempts.toSorted());
+    });
+}
+
+test('owner generation drift between runtime attach and readback refuses', async t => {
+    const config = runtimeModel();
+    const { actions } = simulatedSsh(t, config, { wrongOwner: config.nodes[1].endpoint.ip });
+    await assert.rejects(run(config), /UNKNOWN_RETAINED/);
+    assert.ok(actions.some(([, a]) => a === 'read'));
 });
 
 test('missing key, nonroot UID, wrong domain and loopback refuse before opening SSH', async t => {

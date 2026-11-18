@@ -63,7 +63,13 @@ async function preflight({ env = process.env, uid = process.getuid(), read = pri
         for (const pin of targets) need(routable(pin.endpoint.ip), 'NON_ROUTABLE_ENDPOINT');
         // Refuse unreadable or over-permissive keys before opening any channel.
         for (const file of new Set(targets.map(pin => pin.privateKeyPath))) read(file);
-        await authority.withHeldAuthority(config.executionContext, async () => {});
+        await authority.withHeldAuthority(config.executionContext, async held => {
+            // An observe reply can match a repinned policy without proving that
+            // the native helper can attach the unchanged, already bound originals.
+            // In runtime mode this path is attach/read only. Do NOT invoke it in
+            // enroll mode, where the same capability would capture originals.
+            if (config.mode === 'runtime') await held.withCapturedOwnerEnrollment(async () => {});
+        });
     } finally { authority.close(); }
 }
 

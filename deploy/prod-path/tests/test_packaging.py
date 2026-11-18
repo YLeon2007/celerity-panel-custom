@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -146,6 +148,20 @@ class PackagingTests(unittest.TestCase):
 
     def test_staged_rebind_uses_exact_pins_and_never_rebinds_selected_nodes(self):
         self.exercise_rebind()
+
+    def test_guest_boot_request_is_refused_before_live_checks(self):
+        rb = load('rebind-boot')
+        for role in ('B', 'P', 'cohost'):
+            args = ['guest', '--role', role]
+            with self.subTest(role=role):
+                with patch.object(rb, 'apply', side_effect=AssertionError('entered live branch')) as live:
+                    with patch.object(sys, 'argv', ['rebind-boot.py', *args]), redirect_stdout(io.StringIO()):
+                        self.assertEqual(rb.main(), 1)
+                    live.assert_not_called()
+                cli = subprocess.run([sys.executable, '-I', '-B', str(HERE / 'rebind-boot.py'), *args],
+                                     capture_output=True, text=True, timeout=5, check=False)
+                self.assertEqual((cli.returncode, cli.stdout, cli.stderr),
+                                 (1, 'C3_REBIND_REFUSED:SELECTED_GUEST_BOOT_TRANSITION_UNSUPPORTED\n', ''))
 
     def test_interrupted_pair_publication_keeps_old_panel_pin_and_refuses_replay(self):
         self.exercise_rebind(interrupt=True)
