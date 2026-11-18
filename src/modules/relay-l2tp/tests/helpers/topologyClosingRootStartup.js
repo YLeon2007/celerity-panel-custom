@@ -28,6 +28,14 @@ diag.logTopologyTestFailure = input => {
 };
 const PROD = require('../../domain/topologyExecutionContext').PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT;
 const env = { PANEL_DOMAIN:PROD.hostIdentity,L2TP_EXECUTION_ENABLED:'true',L2TP_MIGRATIONS_ENABLED:'true',TOPOLOGY_PRODUCTION_EXECUTION_ENABLED:'true' };
+let checkingPair=false;
+const lifecycle = require('../../runtime/topologyExecutionAuthorityLifecycle').TopologyExecutionAuthorityLifecycle.prototype;
+const checkPair = lifecycle.checkPristineReservationPair;
+lifecycle.checkPristineReservationPair = async function(pair) {
+    checkingPair=true;
+    try { const result=await checkPair.call(this,pair); trace.pristinePair=pair.map(e=>e.nodeId); return result; }
+    finally { checkingPair=false; }
+};
 async function open(pin) {
     const n=nodes.find(n=>n.id===pin.nodeId); assert.ok(n);
     if(fault==='node' && n===nodes[1]) throw Object.assign(new Error('fixture host unreachable'),{code:'EHOSTUNREACH'});
@@ -36,8 +44,12 @@ async function open(pin) {
     return { get alive(){return !socket.destroyed;}, close(){socket.destroy();}, async request(action,value){
         if (action==='observe' || action==='observe-unclosed') {
             if(action==='observe-unclosed') {assert.equal(attached,true);trace.physicalPairReads.push(n.id);}
-            const journal=fs.existsSync(n.journal)?JSON.parse(fs.readFileSync(n.journal)):null;
+            let journal=fs.existsSync(n.journal)?JSON.parse(fs.readFileSync(n.journal)):null;
             // Fault only the read response: neither the runner journal nor Mongo is rewritten.
+            if(checkingPair && action==='observe' && n===nodes[1] && fault?.kind==='unexpected-prepare') {
+                assert.equal(journal,null);assert.equal(attached,true);
+                journal=fault.view;trace.receiptConflictObserved=true;
+            }
             if(action==='observe-unclosed' && n===nodes[1] && fault?.kind==='conflicting-runner-receipt') {
                 const result=journal?.generations?.[fault.generation]?.commands?.[fault.verify];
                 assert.equal(result?.state,'completed');assert.equal(result.receipt.commandId,fault.verify);
@@ -120,11 +132,13 @@ async function main(){
     client.on('commandStarted',e=>{const c=e.command;if(c.find===operationCollection && c.filter.executionContext?.target==='production' &&
         c.filter.$or?.some(f=>f.leaseUntil?.$lte && f.status?.$in?.includes('committing')))scans.add(e.requestId);});
     trace.transfers=[];
+    const testsExpiry=e=>(e?.$lte?.[0]==='$leaseUntil' && e.$lte[1]==='$$NOW') || e?.$and?.some(testsExpiry);
     client.on('commandStarted',({command:c})=>{for(const u of c.updates||[]){
         const owner=u.u?.$set?.leaseOwner??u.u?.$set?.owner;
-        if(owner && u.q?.$expr?.$lte?.[1]==='$$NOW' && (c.update===operationCollection || u.q.remoteUncertain===true)){
+        if(owner && testsExpiry(u.q?.$expr) && (c.update===operationCollection || u.q.remoteUncertain===true)){
             trace.transfers.push({from:u.q.leaseOwner??u.q.owner,to:owner,generation:u.q.generation??null,
-                pairReads:trace.physicalPairReads.slice(),tx:String(c.txnNumber)});
+                pairReads:trace.physicalPairReads.slice(),pristinePair:trace.pristinePair,
+                tx:String(c.txnNumber),session:c.lsid?.id?.toString('hex'),transaction:c.autocommit===false});
         }
     }});
     client.on('commandSucceeded',e=>{if(scans.delete(e.requestId))trace.scanned.push(e.reply.cursor.firstBatch.map(o=>String(o._id)));});

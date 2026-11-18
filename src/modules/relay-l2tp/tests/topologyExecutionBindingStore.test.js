@@ -557,7 +557,7 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
             const crashTrace=out.split('\n').find(l=>l.startsWith('CRASH_TRACE '));
             return {pid:child.pid,trace,commands:failpoint?JSON.parse(crashTrace.slice(12)):trace.runner};
         }
-        const snapshot=async()=>({op:await models.Operation.findById(operationId).select('+closingHandoff').lean(),locks:await models.Lock.find({operationId}).select('+closingHandoffId').sort({node:1}).lean(),
+        const snapshot=async()=>({op:await models.Operation.findById(operationId).select('+reservationHandoff +closingHandoff').lean(),locks:await models.Lock.find({operationId}).select('+reservationHandoffId +closingHandoffId').sort({node:1}).lean(),
             bindings:await models.Binding.find({operationId}).sort({nodeId:1}).lean(),count:(await Topology.findById('singleton').lean()).topologyAdmissionCount});
         const rechecked=cut==='portal-recheck-takeover-kill', added=cut==='empty-to-portal-takeover-kill';
         const portalKill=cut==='portal-takeover-kill'||rechecked||added, closingKill=cut==='closing-takeover-kill';
@@ -586,23 +586,37 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
             assert.equal(trace.receiptConflictObserved,true);assert.deepEqual(trace.runner,[]);assert.deepEqual(trace.transfers,[]);
             assert.deepEqual(await snapshot(),state);assert.deepEqual(fs.readFileSync(bridge.journal),original);
         };
+        const assertUnexpectedPrepareRefused=async state=>{
+            const b=state.bindings.find(row=>row.nodeId===BRIDGE), id=randomUUID();
+            const identity=Object.fromEntries(['operationId','nodeId','candidateHash','backupId','targetProfile','executionContext','attemptId','generation','predecessorGeneration'].map(k=>[k,b[k]]));
+            assert.notEqual(b.commandIds.prepare,id);
+            const receipt=require('./helpers/topologyV2Fixture').v2Receipt({...identity,command:'prepare',commandId:id},{bootId:b.bootId});
+            const view={version:2,executionContext:b.executionContext,nodeId:b.nodeId,bootId:b.bootId,head:b.generation,
+                generations:{[b.generation]:{binding:identity,phase:'prepared',commands:{[id]:{command:'prepare',state:'completed',receipt}}}}};
+            const {trace}=await boot(undefined,{kind:'unexpected-prepare',view});
+            assert.deepEqual(trace.scanned,[[operationId]]);assert.equal(trace.receiptConflictObserved,true);
+            assert.deepEqual(trace.runner,[]);assert.equal(trace.ssh,0);assert.deepEqual(trace.transfers,[]);
+            assert.deepEqual(await snapshot(),state);for(const n of localNodes)assert.equal(fs.existsSync(n.journal),false);
+        };
         if(cut!=='succeeded') {
             // Wait for the real DB clock, no fake expired lease and no recovery edits.
             await waitExpiry(pre);
             const bridge=localNodes[1], original=fs.readFileSync(bridge.configPath);
             if(cut==='closing')await assertConflictingReceiptRefused(pre);
+            if(firstCut==='bindings-2')await assertUnexpectedPrepareRefused(pre);
             for(const fault of ['node','guard','drift']) {
                 if(fault==='guard')fs.renameSync(bridge.socket,bridge.socket+'.held');
                 if(fault==='drift')fs.appendFileSync(bridge.configPath,' ');
                 try {const {trace}=await boot(undefined,fault);const blocked=await snapshot();
                     assert.deepEqual(trace.runner,[],fault);assert.deepEqual(blocked.locks,pre.locks,fault);assert.equal(blocked.count,1);
                     assert.deepEqual(blocked.bindings,pre.bindings);assert.equal(blocked.op.heldTopologyAdmission,true);
+                    if(firstCut==='bindings-2'){assert.deepEqual(trace.transfers,[],fault);assert.equal(trace.ssh,0,fault);assert.deepEqual(blocked,pre,fault);}
                 }finally{if(fault==='drift')fs.writeFileSync(bridge.configPath,original);if(fault==='guard')fs.renameSync(bridge.socket+'.held',bridge.socket);}
             }
         }
         let transferredBindings=[];
         if(doubleKill){
-            const middle=await boot(fullKill?'bindings-2':rechecked||added?'bindings-1':portalKill?'partial-takeover':'closing-takeover');
+            const middle=await boot(fullKill?'partial-takeover':rechecked||added?'bindings-1':portalKill?'partial-takeover':'closing-takeover');
             const transferred=await snapshot(), holder=`panel-${middle.pid}-topology`;
             if(portalKill)assert.deepEqual(first.commands,[]);
             assert.deepEqual(middle.commands,[]);
@@ -612,9 +626,10 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
             transferredBindings=transferred.bindings;assert.equal(transferred.op.attempts,1);assert.equal(transferred.count,1);
             assert.deepEqual(transferred.locks.map(l=>[String(l.node),l.owner,l.generation,l.remoteUncertain]),
                 pre.locks.map(l=>[String(l.node),holder,l.generation,true]));
-            if(!rechecked&&!added&&!fullKill)assert.ok(transferred.locks.every(l=>+l.leaseUntil===+transferred.op.leaseUntil));
+            if(!rechecked&&!added)assert.ok(transferred.locks.every(l=>+l.leaseUntil===+transferred.op.leaseUntil));
             await waitExpiry(transferred);
             if(closingKill)await assertConflictingReceiptRefused(transferred);
+            if(fullKill)await assertUnexpectedPrepareRefused(transferred);
         }
         const second=await boot();assert.notEqual(first.pid,second.pid);const after=await snapshot();
         if(cut==='first-connection-granted'){
@@ -624,7 +639,14 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
             return;
         }
         if(receiptCut){const [,cmd,role]=receiptCut;assert.ok(!second.commands.some(([id,c])=>id===localNodes[role==='P'?0:1].id && c===cmd),'acknowledged effect dispatched twice');}
-        if(doubleKill) for(const n of localNodes)for(const cmd of ['prepare','commit','verify','close']){
+        if(firstCut==='bindings-2'){
+            const rows=second.trace.transfers;
+            assert.equal(rows.length,3);assert.ok(rows.every(r=>r.transaction && r.session && r.tx===rows[0].tx && r.session===rows[0].session));
+            for(const r of rows)assert.deepEqual(r.pristinePair,[NODE,BRIDGE]);
+            assert.deepEqual(rows.map(r=>r.generation).filter(Boolean).sort(),pre.locks.map(l=>l.generation).sort());
+            assert.equal(rows.filter(r=>r.generation===null).length,1);
+        }
+        if(doubleKill || firstCut==='bindings-2') for(const n of localNodes)for(const cmd of ['prepare','commit','verify','close']){
             const calls=[...first.commands,...second.commands].filter(([id,c])=>id===n.id&&c===cmd).length;
             assert.ok(calls<=1,`duplicate ${cmd} on ${n.id}`);
             if(after.op.status==='succeeded')assert.equal(calls,1);
