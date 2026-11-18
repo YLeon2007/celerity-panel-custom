@@ -19,7 +19,7 @@ function rebuildId(value) {
 }
 
 function refId(value) {
-    return rebuildId(value?._id ?? value?.id ?? value);
+    return rebuildId(value?.toHexString ? value : value?._id ?? value?.id ?? value);
 }
 
 function geoSelectors(geo) {
@@ -119,7 +119,19 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
             key: link.id, priority: link.priority, enabled: true, complete: true,
         })), Object.fromEntries(possibleDefaults.map(link => [link.id, true])));
         entry.defaultLink = possibleDefaults.find(link => link.id === selection.pathKey) ?? null;
-        entry.hasExit = entry.isExit || !!entry.defaultLink || entry.geoLinks.some(link => byNodeId.get(link.target).hasExit);
+        const routedGeoLinks = entry.geoLinks.filter(link => byNodeId.get(link.target).hasExit);
+        entry.hasExit = entry.isExit || !!entry.defaultLink || routedGeoLinks.length > 0;
+
+        // Reverse mux does not carry route-only sniff metadata. Work out
+        // whether a client (or forward-hop) sniff must replace the destination
+        // before crossing a reverse edge to a later domain policy.
+        const routedLinks = entry.defaultLink ? [...routedGeoLinks, entry.defaultLink] : routedGeoLinks;
+        entry.hasDomainPolicy = (entry.hasExit && entry.geoLinks.some(link => link.domains.length > 0))
+            || routedLinks.some(link => byNodeId.get(link.target).hasDomainPolicy);
+        entry.carryDomain = routedLinks.some(link => {
+            const target = byNodeId.get(link.target);
+            return target.carryDomain || link.mode === 'reverse' && target.hasDomainPolicy;
+        });
     }
     const orderedNodes = new Map(nodeIds.map(id => [id, byNodeId.get(id)]));
     const orderedLinks = new Map([...byLinkId].sort(([a], [b]) => compare(a, b)));
