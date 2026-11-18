@@ -185,6 +185,25 @@ function createProductionPhysicalAuthority({ config: input, read = privateRead, 
                         await refresh();
                         const result = await callback(plan, refresh); await refresh(); return result;
                     },
+                    // Read-only prerequisite for a first reservation interrupted before
+                    // either prepare. This observation alone never grants a lease or
+                    // proves that a command with an ambiguous delivery can be replayed.
+                    async checkPristineReservationPair(pair) {
+                        need(config.mode === 'runtime' && !dispatchClosed && Array.isArray(pair) && pair.length === 2
+                            && new Set(pair.map(e => e?.nodeId)).size === 2);
+                        await refresh();
+                        for (const e of pair) {
+                            const n = pinFor(e.nodeId), o = originals.get(n.nodeId), v = observations.get(n.nodeId);
+                            need(o && !o.restored && !o.handed && !o.released && n.acceptedOwner.owner === 'topology'
+                                && e.ownerGeneration === o.ownerGeneration && e.ownerGeneration === n.acceptedOwner.generation
+                                && e.targetProfile === n.targetProfile && e.maintenanceId === n.maintenanceId
+                                && e.bootId === n.physical.bootId && same(e.endpoint, n.endpoint)
+                                && same(e.nodeIdentity, { machineId: n.physical.machineId, sshHostKeySha256: n.physical.sshHostKeySha256 })
+                                && v.pristine === true && v.journal === null);
+                            checkOriginal(n);
+                        }
+                        return true;
+                    },
                     // Both snapshots come from the pinned holders, not from DB state
                     // or an unsuccessful status request for a never-issued close ID.
                     async readUnclosedPair(bindings) {
