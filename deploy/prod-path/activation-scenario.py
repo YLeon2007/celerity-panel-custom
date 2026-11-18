@@ -3,8 +3,10 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 
 PP16_LINK = '6afafb6d991fd12f22e9f457'
@@ -48,6 +50,19 @@ def build_plan(cfg):
         if set(cfg) != {'target', 'mode', 'linkId'} or not re.fullmatch(r'[0-9a-f]{24}', cfg['linkId']):
             raise ValueError('invalid selection')
         steps = FIRST
+    elif cfg.get('target') == 'pp16' and cfg.get('mode') in ('B6', 'B7'):
+        if set(cfg) != {'target', 'mode', 'linkId'} or cfg['linkId'] != PP16_LINK:
+            raise ValueError('invalid guest selection')
+        role = 'B' if cfg['mode'] == 'B6' else 'P'
+        # Only the side-effect-free capability query; no address or caller-
+        # supplied boot ID. A future positive reply is not reboot authority.
+        code = 'SELECTED_GUEST_BOOT_TRANSITION_UNSUPPORTED'
+        probe = subprocess.run([sys.executable, '-I', '-B', str(Path(__file__).with_name('rebind-boot.py')),
+                                'guest', '--role', role], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, env={}, timeout=5, check=False)
+        if probe.returncode != 1 or probe.stdout != ('C3_REBIND_REFUSED:'+code+'\n').encode():
+            code = 'SELECTED_GUEST_BOOT_TRANSITION_UNCONFIRMED'
+        return dict(cfg, executed=False, role=role, blocked=code, steps=[])
     else:
         raise ValueError('unsupported plan')
     # No validation of a live topology, backup, scope or approval takes place here.
@@ -69,11 +84,11 @@ def main():
         return 2
     try:
         plan = build_plan(read_config(args.config))
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError, RecursionError, subprocess.TimeoutExpired):
         print('INVALID_CONFIG', file=sys.stderr)
         return 2
     print(json.dumps(plan, separators=(',', ':')))
-    return 0
+    return 1 if 'blocked' in plan else 0
 
 
 if __name__ == '__main__':

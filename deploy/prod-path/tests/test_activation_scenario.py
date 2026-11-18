@@ -51,3 +51,16 @@ class ActivationScenarioTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('LIVE_DISABLED', result.stderr)
             self.assertEqual(result.stdout, '')
+
+    def test_selected_guest_boot_gates_fail_before_reboot_or_standalone_rebind(self):
+        for mode, role in [('B6', 'B'), ('B7', 'P')]:
+            cfg = {'target':'pp16', 'mode':mode, 'linkId':LINK}
+            dry = self.invoke(cfg, '--dry-run')
+            self.assertEqual(dry.returncode, 1)
+            self.assertEqual(json.loads(dry.stdout), dict(cfg, role=role, executed=False, steps=[],
+                blocked='SELECTED_GUEST_BOOT_TRANSITION_UNSUPPORTED'))
+            live = self.invoke(cfg)
+            self.assertEqual((live.returncode, live.stderr.strip(), live.stdout), (2, 'LIVE_DISABLED', ''))
+            for wrong in [dict(cfg, target='prod'), dict(cfg, linkId='0'*24), dict(cfg, bootId='untrusted')]:
+                res = self.invoke(wrong, '--dry-run')
+                self.assertEqual((res.returncode, res.stdout), (2, ''))
