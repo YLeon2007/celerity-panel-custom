@@ -420,15 +420,19 @@ async function pairedScopes(afterWork, { firstApply = false, portalNode = frozen
     return { store, states: [first, second], held, calls, revoke: () => { revoked = true; } };
 }
 
-test('ordinary startup recovers first apply with only portal binding', async () => {
+// This fixture deliberately has neither the two-guard takeover capability nor a
+// finalizer. The positive is `cold startup matrix: bindings-1` below, using the
+// real runtime, DB-clock expiry, a second PID, two close proofs and zero holds.
+test('a scan with an advanced local clock but no takeover capability keeps a portal-only reservation', async () => {
     const { store, states: [p] } = await pairedScopes(undefined, { firstApply: true });
     const operationId = p.context.operationId;
     const repo = new TopologyOperationRepository({ model: models.Operation });
     const old = await models.Operation.findById(operationId).lean();
     assert.equal(old.kind, 'link.apply'); assert.equal(old.attempts, 1); assert.equal(old.status, 'preparing');
     assert.deepEqual(old.nodes.map(n => [n.state,n.backupId]), [['pending',''],['pending','']]);
-    assert.deepEqual((await models.Binding.find({operationId}).lean()).map(b => [b.nodeId,b.predecessorGeneration]), [[NODE,'none']]);
-    const locks = await models.Lock.find({operationId}).lean(); assert.equal(locks.length, 2); assert.ok(locks.every(l => l.remoteUncertain));
+    const originalBindings = await models.Binding.find({operationId}).lean();
+    assert.deepEqual(originalBindings.map(b => [b.nodeId,b.predecessorGeneration]), [[NODE,'none']]);
+    const locks = await models.Lock.find({operationId}).sort({node:1}).lean(); assert.equal(locks.length, 2); assert.ok(locks.every(l => l.remoteUncertain));
     const clock = { now: () => new Date(Math.max(+old.leaseUntil, ...locks.map(l => +l.leaseUntil)) + 1) };
     const { executor } = await assembled(store);
     const { NodeOperationLockService } = require('../services/nodeOperationLockService');
@@ -447,9 +451,11 @@ test('ordinary startup recovers first apply with only portal binding', async () 
     assert.equal(recovery.start().enabled, true); await recovery.stop();
     assert.equal(outcomes.length,1,'ordinary startup tick must actually inspect the partial operation');
     const after = await models.Operation.findById(operationId).lean();
-    assert.ok(after.heldTopologyAdmission === false && ['succeeded','failed','rolled_back'].includes(after.status),
-        `startup retained ${after.status}; claimed=${outcomes[0].claimed}; admission=${after.heldTopologyAdmission}`);
-    assert.equal(await models.Lock.countDocuments({operationId}),0);
+    assert.equal(outcomes[0].claimed,false);
+    assert.equal(after.heldTopologyAdmission,true);
+    assert.deepEqual(after,old);
+    assert.deepEqual(await models.Lock.find({operationId}).sort({node:1}).lean(),locks);
+    assert.deepEqual(await models.Binding.find({operationId}).lean(),originalBindings);
 });
 
 // The first backend owns a normally admitted operation. SIGKILL follows an acknowledged
