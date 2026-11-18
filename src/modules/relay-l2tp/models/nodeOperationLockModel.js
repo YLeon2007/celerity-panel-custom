@@ -26,6 +26,7 @@ const nodeOperationLockSchema = new mongoose.Schema({
     executionBindingCheck: { type: String },
     // Stable across ordinary same-owner renewal/binding checks. Not a lease.
     reservationHandoffId: { type: String, select: false },
+    closingHandoffId: { type: String, select: false },
     generation: {
         type: String,
         required: true,

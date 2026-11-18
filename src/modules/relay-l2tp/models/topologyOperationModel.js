@@ -141,6 +141,8 @@ const topologyOperationSchema = new mongoose.Schema({
     v2Terminal: { type: mongoose.Schema.Types.Mixed, default: undefined },
     // Atomic takeover receipt; private to the production reservation recovery path.
     reservationHandoff: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
+    // Separate from preparation; only a transaction under both physical closing proofs writes this.
+    closingHandoff: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     undispatchedPreparationContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     undispatchedPreparationSettlement: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     closedSettlementContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },

@@ -232,7 +232,7 @@ function fixture({ cut, nonempty = false, successor = false } = {}) {
             },
             async reclaimUnclosedPair(request, terminal) {
                 const row = await settlement.reclaimUnclosedPair(repository, request, terminal);
-                if (stopAfterTakeover) throw new Error('modeled crash at confirmed takeover before rehydration');
+                if (stopAfterTakeover) { stopAfterTakeover=false; throw new Error('modeled crash at confirmed takeover before rehydration'); }
                 return row;
             },
         };
@@ -371,7 +371,7 @@ test('S4 timeout with completed remote commit leaves failed retained outside sca
     f.expire(); await unchangedAfterScan(f, []);
 });
 
-test('S4 closing takeover control publishes once; crash just after takeover wedges second restart', async t => {
+test('S4 closing takeover publishes once, including a second restart before any close', async t => {
     for (const crash of [false, true]) await t.test(crash ? 'second restart' : 'first restart', async () => {
         const f = fixture({ cut: 'closing' });
         assert.equal((await f.start()).errorCode, 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED');
@@ -394,8 +394,13 @@ test('S4 closing takeover control publishes once; crash just after takeover wedg
         assert.equal(f.op().leaseOwner, 'worker-B');
         assert.deepEqual(f.s.get().lock.map(l => [l.owner, l.generation]), before.lock.map(l => ['worker-B', l.generation]));
         assert.equal(f.events.length, commands); assert.deepEqual(f.proof, [[P, B]]);
-        f.expire(); await unchangedAfterScan(f, [review(false)], 'worker-C');
-        assert.deepEqual(f.proof, [[P, B], [P, B]]);
+        f.expire();
+        assert.deepEqual((await f.restart('worker-C')).outcomes, [{claimed:true, operationId:id, status:'succeeded'}]);
+        assert.deepEqual(f.s.get().binding,before.binding);assert.equal(f.op().attempts,1);
+        assert.deepEqual(f.events.slice(commands).map(([node,action])=>[node,action]),[[P,'close'],[P,'status'],[B,'close'],[B,'status']]);
+        assert.equal(f.op().v2Terminal.proofs.length,2);assert.equal(f.s.get().lock.length,0);assert.equal(f.s.get().topology[0].topologyAdmissionCount,0);
+        const done=f.s.snapshot(), count=f.events.length;
+        assert.deepEqual((await f.restart('worker-D')).outcomes,[]);assert.deepEqual(f.s.get(),done);assert.equal(f.events.length,count);
     });
 });
 

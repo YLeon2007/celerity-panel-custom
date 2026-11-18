@@ -556,7 +556,7 @@ for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:cut.
             const crashTrace=out.split('\n').find(l=>l.startsWith('CRASH_TRACE '));
             return {pid:child.pid,trace,commands:failpoint?JSON.parse(crashTrace.slice(12)):trace.runner};
         }
-        const snapshot=async()=>({op:await models.Operation.findById(operationId).lean(),locks:await models.Lock.find({operationId}).sort({node:1}).lean(),
+        const snapshot=async()=>({op:await models.Operation.findById(operationId).select('+closingHandoff').lean(),locks:await models.Lock.find({operationId}).select('+closingHandoffId').sort({node:1}).lean(),
             bindings:await models.Binding.find({operationId}).sort({nodeId:1}).lean(),count:(await Topology.findById('singleton').lean()).topologyAdmissionCount});
         const rechecked=cut==='portal-recheck-takeover-kill', added=cut==='empty-to-portal-takeover-kill';
         const portalKill=cut==='portal-takeover-kill'||rechecked||added, closingKill=cut==='closing-takeover-kill';
@@ -577,29 +577,25 @@ for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:cut.
             const due=Math.max(+state.op.leaseUntil,...state.locks.map(l=>+l.leaseUntil));
             assert.ok(due-Number(dbNow)<=121000);await new Promise(ok=>setTimeout(ok,Math.max(0,due-Number(dbNow))+25));
         };
+        const assertConflictingReceiptRefused=async state=>{
+            const bridge=localNodes[1], b=state.bindings.find(row=>row.nodeId===bridge.id);
+            const original=fs.readFileSync(bridge.journal);
+            const {trace}=await boot(undefined,{kind:'conflicting-runner-receipt',generation:b.generation,verify:b.commandIds.verify,other:randomUUID()});
+            assert.equal(trace.receiptConflictObserved,true);assert.deepEqual(trace.runner,[]);assert.deepEqual(trace.transfers,[]);
+            assert.deepEqual(await snapshot(),state);assert.deepEqual(fs.readFileSync(bridge.journal),original);
+        };
         if(cut!=='succeeded') {
             // Wait for the real DB clock, no fake expired lease and no recovery edits.
             await waitExpiry(pre);
             const bridge=localNodes[1], original=fs.readFileSync(bridge.configPath);
-            for(const fault of ['node','guard','drift', ...(cut==='closing'?['conflicting-runner-receipt']:[])]) {
-                let originalJournal;
-                if(fault==='conflicting-runner-receipt') {
-                    // A syntactically valid receipt with the wrong command identity,
-                    // on a pair that the healthy control below can actually finish.
-                    // Mutate only this fake-root journal; never mutate Mongo recovery state.
-                    const binding=pre.bindings.find(row=>row.nodeId===bridge.id);
-                    originalJournal=fs.readFileSync(bridge.journal);const journal=JSON.parse(originalJournal);
-                    const record=journal.generations[binding.generation].commands[binding.commandIds.verify];
-                    assert.equal(record.receipt.commandId,binding.commandIds.verify);
-                    record.receipt.commandId=randomUUID();fs.writeFileSync(bridge.journal,JSON.stringify(journal));
-                }
+            if(cut==='closing')await assertConflictingReceiptRefused(pre);
+            for(const fault of ['node','guard','drift']) {
                 if(fault==='guard')fs.renameSync(bridge.socket,bridge.socket+'.held');
                 if(fault==='drift')fs.appendFileSync(bridge.configPath,' ');
                 try {const {trace}=await boot(undefined,fault);const blocked=await snapshot();
                     assert.deepEqual(trace.runner,[],fault);assert.deepEqual(blocked.locks,pre.locks,fault);assert.equal(blocked.count,1);
                     assert.deepEqual(blocked.bindings,pre.bindings);assert.equal(blocked.op.heldTopologyAdmission,true);
-                    if(originalJournal){assert.deepEqual(blocked.op,pre.op);assert.deepEqual(trace.transfers,[]);assert.ok(trace.physicalPairReads.includes(bridge.id));}
-                }finally{if(originalJournal)fs.writeFileSync(bridge.journal,originalJournal);if(fault==='drift')fs.writeFileSync(bridge.configPath,original);if(fault==='guard')fs.renameSync(bridge.socket+'.held',bridge.socket);}
+                }finally{if(fault==='drift')fs.writeFileSync(bridge.configPath,original);if(fault==='guard')fs.renameSync(bridge.socket+'.held',bridge.socket);}
             }
         }
         let transferredBindings=[];
@@ -616,6 +612,7 @@ for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:cut.
                 pre.locks.map(l=>[String(l.node),holder,l.generation,true]));
             if(!rechecked&&!added)assert.ok(transferred.locks.every(l=>+l.leaseUntil===+transferred.op.leaseUntil));
             await waitExpiry(transferred);
+            if(closingKill)await assertConflictingReceiptRefused(transferred);
         }
         const second=await boot();assert.notEqual(first.pid,second.pid);const after=await snapshot();
         if(receiptCut){const [,cmd,role]=receiptCut;assert.ok(!second.commands.some(([id,c])=>id===localNodes[role==='P'?0:1].id && c===cmd),'acknowledged effect dispatched twice');}

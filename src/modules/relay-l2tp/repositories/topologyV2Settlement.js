@@ -1,6 +1,7 @@
 'use strict';
 
 const { isDeepStrictEqual: same } = require('node:util');
+const { randomUUID } = require('node:crypto');
 const { recordKeysFor, exact, UUID, validTerminalReceipt, freeze } = require('../models/topologyExecutionBindingContract');
 const { assertProfileTargetPin, verifyImportedProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
 const { selectedAdmissionFingerprint } = require('./topologyOperationRepository');
@@ -397,22 +398,35 @@ async function reclaimUnclosedPair(repository, request, terminal) {
         || bindings.some(b => !verifiedClosingBinding(b, owner) || b.owner !== bindings[0].owner || b.operationId !== operationId || b.attempt !== 1
             || b.predecessorGeneration !== 'none')) refused();
     const expired = { $expr: { $lte: ['$leaseUntil', '$$NOW'] }, leaseUntil: { $type: 'date' } };
+    const creator = bindings[0].owner;
+    const receipt = (holder, id) => ({ kind: 'unclosed-pair-v1', id, operationId, attempt: 1, creator, holder,
+        members: bindings.map(b => ({ node: b.nodeId, generation: b.generation, close: b.commandIds.close })) });
+    const next = receipt(owner, randomUUID());
     return once(repository, async session => {
-        const filter = { _id: operationId, leaseOwner: bindings[0].owner, attempts: 1, heldTopologyAdmission: true,
+        const filter = { _id: operationId, attempts: 1, heldTopologyAdmission: true,
             kind: 'link.apply', status: 'committing', admissionScope: 'selected', v2Terminal: terminal,
             pppWait: { $exists: false }, installedPath: { $exists: false }, ...expired };
         const options = { session, ...OPTIONS };
-        const prior = await repository.TopologyOperation.findOne(filter).select(OPERATION_PRIVATE_FIELDS).setOptions(options).lean();
+        const prior = await repository.TopologyOperation.findOne(filter).select(`${OPERATION_PRIVATE_FIELDS} +closingHandoff`).setOptions(options).lean();
         if (!prior || prior.executionContext?.target !== 'production' || prior.nodes.length !== 2
             || !same(prior.nodes.map(n => n.role).sort(), ['bridge', 'portal'])
             || !same(prior.nodes.map(n => String(n.node)), bindings.map(b => b.nodeId))
             || !same([...prior.resourceNodeIds].sort(), bindings.map(b => b.nodeId).sort())
             || await repository.NodeOperationLock.countDocuments({ operationId }).setOptions(options) !== 2
             || await repository.TopologyExecutionBinding.countDocuments({ operationId }).setOptions(options) !== 2) refused();
-        if ((await repository.TopologyOperation.updateOne(filter, { $set: { leaseUntil, leaseOwner: owner } }, options)).matchedCount !== 1) refused();
+        const outgoing = prior.leaseOwner, previous = prior.closingHandoff;
+        if (typeof outgoing !== 'string' || !outgoing || outgoing === owner) refused();
+        // Never infer a legitimate replacement from three matching owner strings alone.
+        if (previous === undefined) { if (outgoing !== creator) refused(); }
+        else if (typeof previous?.id !== 'string' || !UUID.test(previous.id) || !same(previous, receipt(outgoing, previous.id))) refused();
+        const absent = { $exists: false };
+        const opMatch = { ...filter, leaseOwner: outgoing, closingHandoff: previous ?? absent };
+        if ((await repository.TopologyOperation.updateOne(opMatch,
+            { $set: { leaseUntil, leaseOwner: owner, closingHandoff: next } }, options)).matchedCount !== 1) refused();
         for (const b of bindings) {
-            if ((await repository.NodeOperationLock.updateOne({ node: b.nodeId, operationId, owner: b.owner,
-                generation: b.generation, remoteUncertain: true, ...expired }, { $set: { leaseUntil, owner } }, options)).matchedCount !== 1) refused();
+            if ((await repository.NodeOperationLock.updateOne({ node: b.nodeId, operationId, owner: outgoing,
+                generation: b.generation, closingHandoffId: previous?.id ?? absent, remoteUncertain: true, ...expired },
+                { $set: { leaseUntil, owner, closingHandoffId: next.id } }, options)).matchedCount !== 1) refused();
         }
         // Reuse the normal selected topology, enrollment, claim and owner fences
         // in this transaction: any mismatch aborts all three renewals.
@@ -421,8 +435,12 @@ async function reclaimUnclosedPair(repository, request, terminal) {
         await fence(repository, rows, session, false);
         return operation;
     }, async () => {
-        const current = await majority(repository.TopologyOperation, operationFilter(request), OPERATION_PRIVATE_FIELDS);
-        if (!same(current?.v2Terminal, terminal)) refused();
+        const current = await majority(repository.TopologyOperation, operationFilter(request), `${OPERATION_PRIVATE_FIELDS} +closingHandoff`);
+        if (!same(current?.v2Terminal, terminal) || !same(current.closingHandoff, next)) refused();
+        for (const b of bindings) {
+            if (!await majority(repository.NodeOperationLock, { node: b.nodeId, operationId, generation: b.generation,
+                owner, leaseUntil, remoteUncertain: true, closingHandoffId: next.id })) refused();
+        }
         await confirmRoots(repository, current, terminal);
     }, request, 'resume-unclosed');
 }

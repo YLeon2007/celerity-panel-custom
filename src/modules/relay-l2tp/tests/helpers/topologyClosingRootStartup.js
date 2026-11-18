@@ -37,6 +37,12 @@ async function open(pin) {
         if (action==='observe' || action==='observe-unclosed') {
             if(action==='observe-unclosed') {assert.equal(attached,true);trace.physicalPairReads.push(n.id);}
             const journal=fs.existsSync(n.journal)?JSON.parse(fs.readFileSync(n.journal)):null;
+            // Fault only the read response: neither the runner journal nor Mongo is rewritten.
+            if(action==='observe-unclosed' && n===nodes[1] && fault?.kind==='conflicting-runner-receipt') {
+                const result=journal?.generations?.[fault.generation]?.commands?.[fault.verify];
+                assert.equal(result?.state,'completed');assert.equal(result.receipt.commandId,fault.verify);
+                result.receipt.commandId=fault.other;trace.receiptConflictObserved=true;
+            }
             const pristine=journal===null && ['fences/'+n.pin.targetProfile,'operations','backups'].every(s=>!fs.existsSync(path.join(n.root,'var/lib/celerity/topology',s)));
             return {kind:'node',nodeId:n.id,targetProfile:n.pin.targetProfile,held:true,serverContext:PROD,physical:n.pin.physical,
                 endpoint:n.pin.endpoint,policySha256:n.pin.policySha256,maintenanceId:n.pin.maintenanceId,pristine,journal,
