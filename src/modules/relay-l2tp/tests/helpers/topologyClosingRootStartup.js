@@ -99,6 +99,7 @@ function injectCrash(point) {
         };
     }
     wrap(store,'reserveBinding',()=>{if(bindings===0)stop('bindings-0');},value=>{assert.ok(value);stop('bindings-'+(++bindings));});
+    wrap(store,'readVerifiedConnection',null,()=>stop('first-connection-granted'));
     wrap(repo,'recordNode',null,(value,req)=>{if(value===true)stop(req.state+'-'+(String(req.node)===nodes[0].id?'P':'B'));});
     for (const command of ['prepare','commit']) wrap(executor,command,null,(value,ctx)=>{
         if(value?.ok) stop(command+'-receipt-'+(ctx.node.node===nodes[0].id?'P':'B'));
