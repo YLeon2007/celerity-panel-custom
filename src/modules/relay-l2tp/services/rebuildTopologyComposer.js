@@ -125,7 +125,7 @@ function assertListeners(main, bridge) {
 }
 
 /** Build owned MAIN/BRIDGE replacements from an explicit desired graph. No I/O. */
-function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeIds, panelTls = {} }) {
+function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeIds, panelTls = {}, followRelayStates = [], controlPlaneAddresses = [] }) {
     requireRebuild(panelTls && typeof panelTls === 'object' && !Array.isArray(panelTls)
         && (panelTls.serverName === undefined || typeof panelTls.serverName === 'string'), 'REBUILD_INVALID_PANEL_TLS');
     const options = { panelTls };
@@ -153,6 +153,13 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
                 }
             }
             addSharedPolicy(main, [...tags, ...transit], entry, graph);
+        }
+        const installed = followRelayStates.filter(state => rebuildId(state.node) === nodeId);
+        if (installed.length) {
+            requireRebuild(entry.role === 'relay' && installed.length === 1, 'REBUILD_L2TP_STATE_AMBIGUOUS');
+            require('./l2tpFollowRelay').attachLocalFollowRelay({ nodeId, state: installed[0], main, bridge,
+                controlPlaneAddresses, carryDomain: entry.carryDomain,
+                policy: main.routing.rules.filter(rule => rule.ruleTag?.startsWith(REBUILD_POLICY_RULE_PREFIX)) });
         }
         assertListeners(main, bridge);
         profiles.push({ nodeId, profile: 'main', config: composeXrayConfig(main, []) },

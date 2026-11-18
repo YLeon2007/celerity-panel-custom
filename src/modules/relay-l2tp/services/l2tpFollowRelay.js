@@ -256,4 +256,27 @@ function applyFollowRelay({ nodeId, state, main, bridge = null, routeState, cont
     return { main: nextMain, bridge: nextBridge, applied: true, inboundTag, routeState };
 }
 
-module.exports = { applyFollowRelay, REBUILD_RELAY_INGRESS_TAG, FOLLOW_RELAY_OUTBOUND_TAG };
+// Rebuild places relay graph artifacts in MAIN. Keep a stable loopback hop for
+// IP-addressed PPP, but attach that listener to the actual generated policy,
+// not a second copy of the policy or a stale per-path outbound in BRIDGE.
+function attachLocalFollowRelay({ nodeId, state, main, bridge, policy, controlPlaneAddresses, carryDomain }) {
+    if (selectL2tpRoutingMode(state) !== FOLLOW_RELAY_MODE) fail('STATE', 'Explicit follow-relay selection required');
+    const { inboundTag, groupId } = validateInstalled(nodeId, state);
+    const tag = REBUILD_RELAY_INGRESS_TAG, port = cascadePathIngressPort(String(nodeId), 'follow-relay-v1');
+    ensureTproxy(main, bridge, inboundTag, state.tproxyPort);
+    if (policy.length === 0 || policy.at(-1).ruleTag !== 'rebuild-policy-default'
+        || [...main.inbounds, ...bridge.inbounds].some(i => i.tag === tag || bindsPort(i, port))) {
+        fail('INGRESS', 'Stable local ingress conflicts with the relay configuration');
+    }
+    const guard = protections(controlPlaneAddresses, [main, bridge]);
+    replacePppRouting(main, inboundTag, groupId, state.activePathKey, port, guard);
+    main.inbounds.push({ tag, port, protocol: 'socks', listen: LOOPBACK,
+        settings: { auth: 'noauth', udp: true, ip: LOOPBACK },
+        sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: !carryDomain } });
+    main.routing.rules.unshift(...guard(tag));
+    // replacePppRouting retains the ordinary shared rule objects when this
+    // fresh graph does not yet contain the transparent ingress tag.
+    for (const rule of policy) rule.inboundTag.push(tag);
+}
+
+module.exports = { applyFollowRelay, attachLocalFollowRelay, REBUILD_RELAY_INGRESS_TAG, FOLLOW_RELAY_OUTBOUND_TAG };
