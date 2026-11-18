@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ROUTE_GROUP_MODE, FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../domain/l2tpRoutingSelection');
 
 const DESIRED_STATES = ['absent', 'installed'];
 const STATUSES = [
@@ -55,14 +56,20 @@ const relayL2tpStateSchema = new mongoose.Schema({
     routeTable: { type: Number, default: null },
     routingMode: {
         type: String,
-        enum: ['route-group'],
-        default: 'route-group',
+        enum: [ROUTE_GROUP_MODE, FOLLOW_RELAY_MODE],
+        default: ROUTE_GROUP_MODE,
+    },
+    routingVersion: {
+        type: Number,
+        required() { return this.routingMode === FOLLOW_RELAY_MODE; },
+        validate(value) { return this.routingMode === FOLLOW_RELAY_MODE && value === FOLLOW_RELAY_VERSION; },
     },
     routeGroup: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'CascadeRouteGroup',
         required() {
-            return this.desiredState === 'installed' || this.status === 'installed';
+            return !(this.routingMode === FOLLOW_RELAY_MODE && this.routingVersion === FOLLOW_RELAY_VERSION)
+                && (this.desiredState === 'installed' || this.status === 'installed');
         },
         default: null,
     },

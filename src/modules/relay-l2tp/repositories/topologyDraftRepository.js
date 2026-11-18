@@ -2,6 +2,7 @@
 
 const { randomUUID } = require('node:crypto');
 const { entityId } = require('../domain/topologyDraft');
+const { partitionRebuildL2tpStates } = require('../domain/l2tpRoutingSelection');
 
 // Include old and new endpoints, and every path changed by dependency cleanup.
 // This is deliberately independent of active/status projection: inactive drafts
@@ -131,6 +132,7 @@ const NODE_SELECT = '_id cascadeRole';
 const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled lifecycle';
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status node activePathKey appliedTopologyRevision secretRevision';
+const FOLLOW_RELAY_STATE_SELECT = `${ROUTE_GROUP_REFERENCE_SELECT} desiredState installedRouteGroup routingMode routingVersion tproxyPort`;
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision replacementReservation topologyAdmissionCount';
 
 class TopologyDraftRepositoryError extends Error {
@@ -237,14 +239,15 @@ class TopologyDraftRepository {
         this.transactionRunner = runTransaction;
     }
 
-    async readDraft(session) {
+    async readDraft(session, { rebuildL2tp = false } = {}) {
         const topologyQuery = this.CascadeTopologyState.findById('singleton')
             .select(TOPOLOGY_STATE_SELECT);
         const nodeQuery = this.HyNode.find(NODE_FILTER).select(NODE_SELECT);
         const linkQuery = this.CascadeLink.find({}).select(LINK_SELECT);
         const groupQuery = this.CascadeRouteGroup.find({}).select(GROUP_SELECT);
-        const relayStateQuery = this.RelayL2tpState.find(this.withScopedNodeLocks ? {} : ACTIVE_ROUTE_GROUP_FILTER)
-            .select(this.withScopedNodeLocks
+        const allRelayStates = rebuildL2tp === true || this.withScopedNodeLocks;
+        const relayStateQuery = this.RelayL2tpState.find(allRelayStates ? {} : ACTIVE_ROUTE_GROUP_FILTER)
+            .select(rebuildL2tp === true ? FOLLOW_RELAY_STATE_SELECT : this.withScopedNodeLocks
                 ? `${ROUTE_GROUP_REFERENCE_SELECT} desiredState installedRouteGroup` : ROUTE_GROUP_REFERENCE_SELECT);
         const state = await withSession(topologyQuery, session).lean();
         const nodes = await withSession(nodeQuery, session).lean();
@@ -254,11 +257,15 @@ class TopologyDraftRepository {
         const links = await withSession(linkQuery, session).lean();
         const groups = await withSession(groupQuery, session).lean();
         const relayStates = await withSession(relayStateQuery, session).lean();
-        const activeRelayStates = this.withScopedNodeLocks ? (relayStates || []).filter(row =>
+        // Rebuild retains all group records and follower rows, but only legacy
+        // L2TP claims an installed route-group path. Strict reads are unchanged.
+        const dependencies = rebuildL2tp === true ? partitionRebuildL2tpStates(relayStates || []) : null;
+        const activeRelayStates = allRelayStates ? (dependencies?.legacyStates ?? relayStates ?? []).filter(row =>
             row.routeGroup != null && (row.desiredState === 'installed' || ACTIVE_RELAY_STATUSES.includes(row.status))) : relayStates;
         return {
             ...(this.allowStandaloneClassicDrafts ? { classicEndpointNodes: classicEndpointNodes || [] } : {}),
             ...(this.withScopedNodeLocks ? { relayReferences: relayStates || [] } : {}),
+            ...(dependencies ? { followRelayStates: dependencies.followRelayStates } : {}),
             revision: state?.revision ?? 0,
             deployedRevision: state?.deployedRevision ?? 0,
             ...(state?.topologyAdmissionCount !== undefined ? { topologyAdmissionCount: state.topologyAdmissionCount } : {}),

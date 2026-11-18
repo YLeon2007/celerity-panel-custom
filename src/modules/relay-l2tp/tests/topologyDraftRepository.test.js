@@ -188,6 +188,41 @@ test('missing installed owner active path stays missing instead of inventing mai
     assert.deepEqual(snapshot.installedRouteGroupIds, ['installed-group']);
 });
 
+test('only an explicit rebuild snapshot separates follow-relay from legacy path ownership without dropping groups', async () => {
+    const trace = [];
+    const models = createModels(trace);
+    const groups = [{ _id: 'retained-group', paths: [{ pathKey: 'old', linkIds: ['old-hop'], enabled: true }] },
+        { _id: 'strict-group', paths: [{ pathKey: 'main', linkIds: ['strict-hop'], enabled: true }] }];
+    const base = { status: 'installed', desiredState: 'installed', secretRevision: 8, tproxyPort: 12345 };
+    const states = [{ ...base, node: 'follower', routeGroup: 'retained-group', activePathKey: 'old', routingMode: 'follow-relay', routingVersion: 1 },
+        { ...base, node: 'other-follower', routeGroup: null, routingMode: 'follow-relay', routingVersion: 1 },
+        { ...base, node: 'strict-relay', routeGroup: 'strict-group', activePathKey: 'main' }];
+    models.CascadeRouteGroup.find = () => queryResult(groups, trace, 'groups');
+    models.RelayL2tpState.find = filter => {
+        let selected;
+        const query = {
+            select(paths) { selected = paths.split(' '); return query; },
+            async lean() {
+                const matching = filter.routeGroup ? states.filter(row => row.routeGroup != null) : states;
+                return matching.map(row => Object.fromEntries(Object.entries(row).filter(([key]) => selected.includes(key))));
+            },
+        };
+        return query;
+    };
+    const repository = new TopologyDraftRepository(models);
+    const strict = await repository.readDraft();
+    assert.deepEqual(strict.activeRouteGroupIds, ['retained-group', 'strict-group']);
+    assert.equal(strict.followRelayStates, undefined);
+    const rebuild = await repository.readDraft(undefined, { rebuildL2tp: true });
+    assert.deepEqual(rebuild.groups, groups);
+    assert.deepEqual(rebuild.activeRouteGroupIds, ['strict-group']);
+    assert.deepEqual(rebuild.installedRouteGroupIds, ['strict-group']);
+    assert.deepEqual(rebuild.installedRouteOwners.map(row => row.nodeId), ['strict-relay']);
+    assert.deepEqual(rebuild.followRelayStates, states.slice(0, 2));
+    states[0].routingVersion = 2;
+    await assert.rejects(repository.readDraft(undefined, { rebuildL2tp: true }), { code: 'L2TP_ROUTING_SELECTION_INVALID' });
+});
+
 test('pinned link snapshot selects status for scoped pending-link guard', async () => {
     const trace = [];
     const session = { id: 'link-status-session' };
