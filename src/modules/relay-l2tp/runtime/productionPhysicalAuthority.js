@@ -16,6 +16,16 @@ const profiles = Object.freeze({
 });
 function fail(code = 'PRODUCTION_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED') { throw Object.assign(new Error(code), { code }); }
 function need(value) { if (!value) fail(); }
+// Compare the complete locked journal with the DB-selected first prepare. No
+// second generation, unfinished command or caller-supplied receipt is accepted.
+function onlyPortalPrepare(b, journal) {
+    const binding=Object.fromEntries(['operationId','nodeId','candidateHash','backupId','targetProfile','executionContext','attemptId','generation','predecessorGeneration'].map(k=>[k,b[k]]));
+    const commandId=b.commandIds.prepare;
+    const receipt={ok:true,command:'prepare',...binding,commandId,protocolVersion:2,completion:'completed',phase:'prepared',
+        terminal:false,ownershipRetained:true,terminalOutcome:'not-terminal',bootId:b.bootId,systemdJob:'not-applicable',serviceState:'not-applicable',completedCommand:'prepare'};
+    return same(journal,{version:2,bootId:b.bootId,nodeId:b.nodeId,executionContext:b.executionContext,head:b.generation,
+        generations:{[b.generation]:{binding,phase:'prepared',serviceState:'not-applicable',commands:{[commandId]:{state:'completed',command:'prepare',receipt}}}}});
+}
 function privateRead(file) {
     need(path.isAbsolute(file) && path.normalize(file) === file);
     for (let p = file; ; p = path.dirname(p)) {
@@ -141,6 +151,33 @@ function createProductionPhysicalAuthority({ config: input, read = privateRead, 
                 return { ...v, processTree: 'stopped', dispatch: 'disabled' };
             };
             const checkOriginal = n => need(same(observations.get(n.nodeId).current, n.originalSnapshot));
+            const checkReservationPair = async (pair,portal) => {
+                need(config.mode === 'runtime' && !dispatchClosed && Array.isArray(pair) && pair.length === 2
+                    && new Set(pair.map(e => e?.nodeId)).size === 2);
+                await refresh();
+                for (const e of pair) {
+                    const n = pinFor(e.nodeId), o = originals.get(n.nodeId), v = observations.get(n.nodeId);
+                    need(o && !o.restored && !o.handed && !o.released && n.acceptedOwner.owner === 'topology'
+                        && e.ownerGeneration === o.ownerGeneration && e.ownerGeneration === n.acceptedOwner.generation
+                        && e.targetProfile === n.targetProfile && e.maintenanceId === n.maintenanceId
+                        && e.bootId === n.physical.bootId && same(e.endpoint, n.endpoint)
+                        && same(e.nodeIdentity, { machineId: n.physical.machineId, sshHostKeySha256: n.physical.sshHostKeySha256 }));
+                    if (portal && e.nodeId===portal.nodeId) {
+                        const locked=await channels.get(n.nodeId).request('observe-unclosed');
+                        need(locked.runnerIdle===true && locked.held===true && locked.kind==='node' && same(locked.serverContext,PROD)
+                            && locked.policySha256===n.policySha256 && same(locked.physical,n.physical) && same(locked.endpoint,n.endpoint)
+                            && locked.nodeId===n.nodeId && locked.targetProfile===n.targetProfile && locked.maintenanceId===n.maintenanceId
+                            && same(locked.current,n.originalSnapshot) && onlyPortalPrepare(portal,locked.journal) && same(v.journal,locked.journal));
+                    } else need(v.pristine===true && v.journal===null);
+                    // The pinned/live node can agree with itself while Mongo describes
+                    // a different original. Require the independently enrolled four
+                    // fields, not just the right owner generation and endpoint.
+                    const { source, ...original } = n.originalSnapshot;
+                    need(source === 'node-readback' && same(e.originalSnapshot, original));
+                    checkOriginal(n);
+                }
+                return true;
+            };
             try {
                 for (const pin of pins) if (!channels.has(key(pin))) channels.set(key(pin),
                     pin === sharedHostNode ? channels.get('host') : await open(pin));
@@ -188,28 +225,12 @@ function createProductionPhysicalAuthority({ config: input, read = privateRead, 
                     // Read-only prerequisite for a first reservation interrupted before
                     // either prepare. This observation alone never grants a lease or
                     // proves that a command with an ambiguous delivery can be replayed.
-                    async checkPristineReservationPair(pair) {
-                        need(config.mode === 'runtime' && !dispatchClosed && Array.isArray(pair) && pair.length === 2
-                            && new Set(pair.map(e => e?.nodeId)).size === 2);
-                        await refresh();
-                        for (const e of pair) {
-                            const n = pinFor(e.nodeId), o = originals.get(n.nodeId), v = observations.get(n.nodeId);
-                            need(o && !o.restored && !o.handed && !o.released && n.acceptedOwner.owner === 'topology'
-                                && e.ownerGeneration === o.ownerGeneration && e.ownerGeneration === n.acceptedOwner.generation
-                                && e.targetProfile === n.targetProfile && e.maintenanceId === n.maintenanceId
-                                && e.bootId === n.physical.bootId && same(e.endpoint, n.endpoint)
-                                && same(e.nodeIdentity, { machineId: n.physical.machineId, sshHostKeySha256: n.physical.sshHostKeySha256 })
-                                && v.pristine === true && v.journal === null);
-                            // The pinned/live node can agree with itself while Mongo describes
-                            // a different original. Require the independently enrolled four
-                            // fields, not just the right owner generation and endpoint.
-                            const { source, ...original } = n.originalSnapshot;
-                            need(source === 'node-readback' && same(e.originalSnapshot, original));
-                            checkOriginal(n);
-                        }
-                        return true;
+                    async checkPristineReservationPair(pair) { return checkReservationPair(pair,null); },
+                    async checkPreparedPortalPair(pair,portal) {
+                        need(portal?.predecessorGeneration==='none' && portal.nodeId===pair[0]?.nodeId && portal.attempt===1);
+                        return checkReservationPair(pair,portal);
                     },
-                    // Both snapshots come from the pinned holders, not from DB state
+                     // Both snapshots come from the pinned holders, not from DB state
                     // or an unsuccessful status request for a never-issued close ID.
                     async readUnclosedPair(bindings) {
                         need(!dispatchClosed && bindings.length === 2);

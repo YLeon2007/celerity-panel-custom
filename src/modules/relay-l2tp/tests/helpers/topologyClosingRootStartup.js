@@ -46,6 +46,11 @@ async function open(pin) {
             if(action==='observe-unclosed') {assert.equal(attached,true);trace.physicalPairReads.push(n.id);}
             let journal=fs.existsSync(n.journal)?JSON.parse(fs.readFileSync(n.journal)):null;
             // Fault only the read response: neither the runner journal nor Mongo is rewritten.
+            if(action==='observe-unclosed' && n===nodes[0] && fault?.kind==='prepared-portal-conflict') {
+                const row=journal?.generations?.[fault.generation]?.commands?.[fault.prepare];
+                assert.equal(row?.state,'completed');assert.equal(row.receipt.commandId,fault.prepare);
+                row.receipt.commandId=fault.other;trace.receiptConflictObserved=true;
+            }
             if(checkingPair && action==='observe' && n===nodes[1] && fault?.kind==='unexpected-prepare') {
                 assert.equal(journal,null);assert.equal(attached,true);
                 journal=fault.view;trace.receiptConflictObserved=true;
@@ -111,7 +116,7 @@ function injectCrash(point) {
         };
     }
     wrap(store,'reserveBinding',()=>{if(bindings===0)stop('bindings-0');},value=>{assert.ok(value);stop('bindings-'+(++bindings));});
-    wrap(store,'readVerifiedConnection',null,()=>stop('first-connection-granted'));
+    wrap(store,'readVerifiedConnection',null,(_value,expected)=>{stop('first-connection-granted');if(expected.nodeId===nodes[1].id)stop('bridge-connection-granted');});
     wrap(repo,'recordNode',null,(value,req)=>{if(value===true)stop(req.state+'-'+(String(req.node)===nodes[0].id?'P':'B'));});
     for (const command of ['prepare','commit']) wrap(executor,command,null,(value,ctx)=>{
         if(value?.ok) stop(command+'-receipt-'+(ctx.node.node===nodes[0].id?'P':'B'));

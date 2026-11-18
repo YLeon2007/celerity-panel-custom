@@ -265,6 +265,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
                 withVerifiedAuthority: (challenge, work) => bindingLifecycle.withVerifiedAuthority(challenge, work),
                 assertAuthorityHeld: () => bindingLifecycle.assertHeld(),
                 checkPristinePair: pair => bindingLifecycle.checkPristineReservationPair(pair),
+                checkPreparedPortalPair: (pair,portal) => bindingLifecycle.checkPreparedPortalPair(pair,portal),
                 Operation: TopologyOperation, Lock: dependencies.NodeOperationLock,
                 Owner: dependencies.TopologyConfigOwner, Enrollment: dependencies.TopologyExecutionEnrollment,
                 Binding: dependencies.TopologyExecutionBinding, HyNode });

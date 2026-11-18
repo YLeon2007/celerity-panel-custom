@@ -464,7 +464,7 @@ const crashPoints = ['bindings-0','bindings-1','bindings-2','prepared-P','prepar
     'committed-P','committed-B','verified','closing','closed-P','succeeded',
     'prepare-receipt-P','prepare-receipt-B','commit-receipt-P','commit-receipt-B',
     'users-restored','closed-B','proven','portal-takeover-kill','closing-takeover-kill','portal-recheck-takeover-kill','empty-to-portal-takeover-kill'];
-const reservationControls=['first-connection-granted','full-reservation-takeover-kill'];
+const reservationControls=['first-connection-granted','full-reservation-takeover-kill','prepared-portal-takeover-kill','bridge-connection-granted'];
 for (const cut of [...crashPoints,...reservationControls]) test(`${reservationControls.includes(cut)?'reservation control':'cold startup matrix'}: ${cut}`, {timeout:cut.endsWith('-takeover-kill')?430000:230000}, async t=>{
     const startup = true;
     const user = { xrayUuid: '550e8400-e29b-41d4-a716-446655440000', userId: 'local-fixture' };
@@ -562,7 +562,8 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
         const rechecked=cut==='portal-recheck-takeover-kill', added=cut==='empty-to-portal-takeover-kill';
         const portalKill=cut==='portal-takeover-kill'||rechecked||added, closingKill=cut==='closing-takeover-kill';
         const fullKill=cut==='full-reservation-takeover-kill';
-        const doubleKill=portalKill || closingKill || fullKill, firstCut=added?'bindings-0':portalKill?'bindings-1':closingKill?'closing':fullKill?'bindings-2':cut;
+        const prepKill=cut==='prepared-portal-takeover-kill';
+        const doubleKill=portalKill || closingKill || fullKill || prepKill, firstCut=added?'bindings-0':portalKill?'bindings-1':closingKill?'closing':fullKill?'bindings-2':prepKill?'prepared-P':cut;
         assert.equal((await snapshot()).op.status,'queued');const first=await boot(firstCut);const pre=await snapshot();
         assert.equal(pre.bindings.length,firstCut.startsWith('bindings-')?Number(firstCut.slice(-1)):2);
         assert.equal(pre.locks.length,cut==='succeeded'?0:2); assert.equal(pre.count,cut==='succeeded'?0:1);
@@ -598,12 +599,21 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
             assert.deepEqual(trace.runner,[]);assert.equal(trace.ssh,0);assert.deepEqual(trace.transfers,[]);
             assert.deepEqual(await snapshot(),state);for(const n of localNodes)assert.equal(fs.existsSync(n.journal),false);
         };
+        const assertPortalReceiptConflictRefused=async state=>{
+            const n=localNodes[0], b=state.bindings.find(row=>row.nodeId===n.id), original=fs.readFileSync(n.journal);
+            assert.deepEqual(state.op.nodes.map(v=>v.state),['prepared','pending']);
+            const {trace}=await boot(undefined,{kind:'prepared-portal-conflict',generation:b.generation,prepare:b.commandIds.prepare,other:randomUUID()});
+            assert.deepEqual(trace.scanned,[[operationId]]);assert.equal(trace.receiptConflictObserved,true);
+            assert.deepEqual(trace.runner,[]);assert.equal(trace.ssh,0);assert.deepEqual(trace.transfers,[]);assert.deepEqual(await snapshot(),state);
+            assert.deepEqual(fs.readFileSync(n.journal),original);assert.equal(fs.existsSync(localNodes[1].journal),false);
+        };
         if(cut!=='succeeded') {
             // Wait for the real DB clock, no fake expired lease and no recovery edits.
             await waitExpiry(pre);
             const bridge=localNodes[1], original=fs.readFileSync(bridge.configPath);
             if(cut==='closing')await assertConflictingReceiptRefused(pre);
             if(firstCut==='bindings-2')await assertUnexpectedPrepareRefused(pre);
+            if(firstCut==='prepared-P')await assertPortalReceiptConflictRefused(pre);
             for(const fault of ['node','guard','drift']) {
                 if(fault==='guard')fs.renameSync(bridge.socket,bridge.socket+'.held');
                 if(fault==='drift')fs.appendFileSync(bridge.configPath,' ');
@@ -616,7 +626,7 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
         }
         let transferredBindings=[];
         if(doubleKill){
-            const middle=await boot(fullKill?'partial-takeover':rechecked||added?'bindings-1':portalKill?'partial-takeover':'closing-takeover');
+            const middle=await boot(fullKill||prepKill?'partial-takeover':rechecked||added?'bindings-1':portalKill?'partial-takeover':'closing-takeover');
             const transferred=await snapshot(), holder=`panel-${middle.pid}-topology`;
             if(portalKill)assert.deepEqual(first.commands,[]);
             assert.deepEqual(middle.commands,[]);
@@ -630,8 +640,18 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
             await waitExpiry(transferred);
             if(closingKill)await assertConflictingReceiptRefused(transferred);
             if(fullKill)await assertUnexpectedPrepareRefused(transferred);
+            if(prepKill)await assertPortalReceiptConflictRefused(transferred);
         }
         const second=await boot();assert.notEqual(first.pid,second.pid);const after=await snapshot();
+        if(cut==='bridge-connection-granted'){
+            assert.deepEqual(first.commands,[[NODE,'prepare']]);assert.deepEqual(pre.op.nodes.map(v=>v.state),['prepared','pending']);
+            assert.deepEqual(second.trace.scanned,[[operationId]]);assert.deepEqual(second.commands,[]);assert.equal(second.trace.ssh,0);
+            assert.deepEqual(second.trace.transfers,[]);assert.deepEqual(after,pre);assert.equal(fs.existsSync(localNodes[1].journal),false);return;
+        }
+        if(firstCut==='prepared-P'){
+            assert.deepEqual(first.commands,[[NODE,'prepare']]);assert.equal(after.op.status,'succeeded');
+            assert.ok(second.trace.transfers.length===3 && second.trace.transfers.every(r=>r.transaction && r.session===second.trace.transfers[0].session && r.tx===second.trace.transfers[0].tx && r.pairReads.includes(NODE)));
+        }
         if(cut==='first-connection-granted'){
             assert.deepEqual(first.commands,[]);assert.deepEqual(second.commands,[]);assert.deepEqual(second.trace.transfers,[]);
             assert.deepEqual(second.trace.scanned,[[operationId]]);assert.deepEqual(after,pre);
@@ -646,7 +666,7 @@ for (const cut of [...crashPoints,...reservationControls]) test(`${reservationCo
             assert.deepEqual(rows.map(r=>r.generation).filter(Boolean).sort(),pre.locks.map(l=>l.generation).sort());
             assert.equal(rows.filter(r=>r.generation===null).length,1);
         }
-        if(doubleKill || firstCut==='bindings-2') for(const n of localNodes)for(const cmd of ['prepare','commit','verify','close']){
+        if(doubleKill || firstCut==='bindings-2' || firstCut==='prepared-P') for(const n of localNodes)for(const cmd of ['prepare','commit','verify','close']){
             const calls=[...first.commands,...second.commands].filter(([id,c])=>id===n.id&&c===cmd).length;
             assert.ok(calls<=1,`duplicate ${cmd} on ${n.id}`);
             if(after.op.status==='succeeded')assert.equal(calls,1);

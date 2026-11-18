@@ -207,9 +207,11 @@ class TopologyExecutionBindingStore {
     #authority;
     #assertAuthorityHeld;
     #checkPristinePair;
+    #checkPreparedPortalPair;
     #held = new AsyncLocalStorage();
-    constructor({ executionContext, withVerifiedAuthority, assertAuthorityHeld, checkPristinePair, Operation, Lock, Owner, Enrollment, Binding, HyNode } = {}) {
+    constructor({ executionContext, withVerifiedAuthority, assertAuthorityHeld, checkPristinePair, checkPreparedPortalPair, Operation, Lock, Owner, Enrollment, Binding, HyNode } = {}) {
         this.#checkPristinePair = checkPristinePair;
+        this.#checkPreparedPortalPair = checkPreparedPortalPair;
         const selected = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
         if (!matchesTopologyExecutionContext(executionContext, selected)) {
             throw new TypeError('Exact server-owned production context or canonical TEST context required');
@@ -922,19 +924,23 @@ class TopologyExecutionBindingStore {
             $expr: { $and: [claim.$expr, { $eq: [{ $type: '$leaseUntil' }, 'date'] }, expired] } };
         const before = await this.#majority(Operation, filter);
         if (!before) return null;
+        const preparedP=before.nodes?.[0]?.state==='prepared';
         if (!token(before.leaseOwner) || before.nodes?.length !== 2 || before.nodes[0].role !== 'portal'
-            || before.nodes[1].role !== 'bridge' || before.nodes.some(n => n.state !== 'pending' || n.backupId !== '')
+            || before.nodes[1].role !== 'bridge' || before.nodes[1].state!=='pending' || before.nodes[1].backupId!==''
+            || (preparedP ? typeof this.#checkPreparedPortalPair!=='function' || before.leaseOwner===owner : before.nodes[0].state!=='pending' || before.nodes[0].backupId!=='')
             || !isDeepStrictEqual(before.resourceNodeIds?.slice().sort(), before.nodes.map(n => String(n.node)).sort())) return null;
         const found = await Binding.find({ operationId }).read('primary').readConcern('majority').limit(3).setOptions(OPTIONS).lean();
         const reservations = before.nodes.map(n => found.find(b => b.nodeId === String(n.node))).filter(Boolean);
         if (reservations.length !== found.length || (reservations.length === 1 && reservations[0].nodeId !== String(before.nodes[0].node))) throw failure();
+        if (preparedP && reservations.length!==2) throw failure();
         const old = before.leaseOwner, pending = [];
+        const prepKind='first-prepared-portal-handoff-v1', reservationKind='first-reservation-handoff-v1';
         const prior = before.reservationHandoff;
         // A repeat takeover is scoped to the exact acknowledged transaction.
         // Do not infer the binding's creator from the current lease holder or
         // authorize a legacy/malformed receipt. No command may have begun.
         if (prior !== undefined && (!exact(prior, ['kind','operationId','attempt','fingerprint','holder','nonce','members'])
-            || prior.kind !== 'first-reservation-handoff-v1' || prior.operationId !== operationId || prior.attempt !== 1
+            || !(prior.kind===reservationKind || (preparedP && prior.kind===prepKind && prior.members?.every?.(m=>m?.original))) || prior.operationId !== operationId || prior.attempt !== 1
             || prior.fingerprint !== before.admissionFingerprint || prior.holder !== old || !matches(prior.nonce,UUID)
             || !Array.isArray(prior.members) || prior.members.length !== 2)) throw failure();
         await this.#indexes();
@@ -961,7 +967,9 @@ class TopologyExecutionBindingStore {
             if (!await this.#majority(HyNode,this.#nodeFilter(enrollment))) throw failure();
             const reservation = reservations[i];
             const sealed = reservation && unopened(lock.executionBindingCheck, reservation._id);
-            if (reservations.length === 2 && !sealed) throw failure();
+            if (preparedP && i===0) {
+                if (n.backupId!==backupId || !matches(lock.executionBindingCheck,UUID)) throw failure();
+            } else if (reservations.length === 2 && !sealed) throw failure();
             let handoffOriginal = null;
             if (prior !== undefined) {
                 const m = prior.members[i];
@@ -976,13 +984,14 @@ class TopologyExecutionBindingStore {
             if (reservation) this.#checkRow(reservation,enrollment,expected,handoffOriginal);
             pending.push({ lock, sealed, expected, handoffOriginal, enrollment, evidence, original: reservation ? recordProjection(reservation) : null });
         }
-        const checkPhysical = () => this.#checkPristinePair(pending.map(({enrollment,evidence}) => ({ ...enrollmentProjection(enrollment),
+        const pair=freeze(pending.map(({enrollment,evidence}) => ({ ...enrollmentProjection(enrollment),
             maintenanceId: enrollment.maintenanceId, originalSnapshot: evidence.originalSnapshot })));
+        const checkPhysical = () => preparedP ? this.#checkPreparedPortalPair(pair,pending[0].original) : this.#checkPristinePair(pair);
         await checkPhysical();
         const leaseUntil = new Date(Date.now() + leaseMs), nonce = randomUUID();
         const opMatch = { ...filter, leaseOwner: old, leaseUntil: before.leaseUntil, admissionFingerprint: before.admissionFingerprint,
             reservationHandoff: prior === undefined ? {$exists:false} : prior };
-        const handoff = {kind:'first-reservation-handoff-v1',operationId,attempt:1,fingerprint:before.admissionFingerprint,
+        const handoff = {kind:preparedP?prepKind:reservationKind,operationId,attempt:1,fingerprint:before.admissionFingerprint,
             holder:owner,nonce,members:pending.map(({expected:e,original})=>({nodeId:e.nodeId,generation:e.generation,original}))};
         const transfer = { $set: { leaseUntil, executionBindingCheck: nonce } };
         let acknowledged;
@@ -1008,7 +1017,7 @@ class TopologyExecutionBindingStore {
                 const outgoingLock = { _id: lock._id, operationId, node:expected.nodeId, owner:old,
                     generation:lock.generation, remoteUncertain:true, leaseUntil:lock.leaseUntil, $expr:expired,
                     reservationHandoffId: prior === undefined ? {$exists:false} : prior.nonce };
-                if ((await Lock.updateOne(withUnopenedStamp(outgoingLock, sealed && lock.executionBindingCheck),
+                if ((await Lock.updateOne(withUnopenedStamp(outgoingLock, (sealed || preparedP) && lock.executionBindingCheck),
                     { $set:{ ...transfer.$set, ...(sealed && {executionBindingCheck:lock.executionBindingCheck}), owner, reservationHandoffId:nonce } },opts)).matchedCount !== 1) throw failure();
             }
             if ((await Operation.updateOne(opMatch,{ $set:{ ...transfer.$set, leaseOwner:owner, reservationHandoff:handoff } },opts)).matchedCount !== 1) throw failure();
@@ -1026,7 +1035,7 @@ class TopologyExecutionBindingStore {
         const scope = { open:true, members };
         try {
             return await reclaimedReservation.run(scope, () => work(acknowledged,
-                members.map(({expected:e})=>({node:e.nodeId,generation:e.generation}))));
+                members.map(({expected:e})=>({node:e.nodeId,generation:e.generation})), preparedP ? checkPhysical : null));
         } finally { scope.open = false; }
     }
     // Post-claim provisioning only. Reuse an exact durable binding; never retry

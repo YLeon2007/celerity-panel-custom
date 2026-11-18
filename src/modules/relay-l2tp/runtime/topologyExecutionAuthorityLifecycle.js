@@ -106,6 +106,13 @@ class TopologyExecutionAuthorityLifecycle {
             || await state.capability.checkPristineReservationPair(pair) !== true) throw failure();
         await this.assertHeld();
     }
+    async checkPreparedPortalPair(pair, portal) {
+        await this.assertHeld();
+        const state = this.#held.getStore();
+        if (this.#context.target !== 'production' || typeof state.capability.checkPreparedPortalPair !== 'function'
+            || await state.capability.checkPreparedPortalPair(pair,portal) !== true) throw failure();
+        await this.assertHeld();
+    }
     async readUnclosedPair(bindings) {
         await this.assertHeld();
         const state = this.#held.getStore();

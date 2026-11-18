@@ -1383,7 +1383,7 @@ class TopologyOperationWorker {
             const operationId = entityId(operationIdentity);
             try {
                 return await this.#bindingProvisioner.withPartialPortalClaim({operationId, owner:this.workerId, leaseMs:this.leaseMs},
-                    this.selectedTopologyRepository, (operation, locks) => this.#runHeld(operationId, undefined, false, false, false, false, false, {operation,locks})) ?? result;
+                    this.selectedTopologyRepository, (operation, locks, checkPreparedPortal) => this.#runHeld(operationId, undefined, false, false, false, false, false, {operation,locks,checkPreparedPortal})) ?? result;
             } catch (error) {
                 traceWorkerFailure(null, operationId, 'worker.partial-reservation', error);
                 return {claimed:false, operationId, stopped:true, drainUncertain:true, errorCode:'TOPOLOGY_PARTIAL_RESERVATION_UNCONFIRMED'};
@@ -1628,7 +1628,12 @@ class TopologyOperationWorker {
                 node, Object.freeze({ owner: this.workerId, attempt: operation.attempts, generation }),
             ])));
 
-            if (this.#bindingProvisioner && !bootstrapContinuation && !undispatchedPreparation) {
+            const retainedPortal = typeof partial?.checkPreparedPortal === 'function';
+            if (retainedPortal && !(nodes.length===2 && nodes[0].role==='portal' && nodes[1].role==='bridge'
+                && entries[0]?.state==='prepared' && entries[1]?.state==='pending' && operation.attempts===1)) {
+                return {claimed:true,operationId,stopped:true,drainUncertain:true,errorCode:'TOPOLOGY_PREPARED_PORTAL_UNCONFIRMED'};
+            }
+            if (this.#bindingProvisioner && !bootstrapContinuation && !undispatchedPreparation && !retainedPortal) {
                 // Recovery is diagnostic only: never provision fresh IDs after any
                 // prior prepared/committed state, attempt reclaim or uncertain write.
                 if (operation.attempts !== 1 || entries.some(entry => entry.state !== 'pending')) {
@@ -1657,7 +1662,7 @@ class TopologyOperationWorker {
                 }
             }
 
-            if (!undispatchedPreparation && entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
+            if (!undispatchedPreparation && !retainedPortal && entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
                 const cleaned = await this.cleanupExpiredPreparation(
                     plan,
                     operationId,
@@ -1673,6 +1678,18 @@ class TopologyOperationWorker {
                 for (const node of nodes) {
                     preparingNode = node;
                     await this.renew(operationId);
+                    if (retainedPortal) {
+                        await heartbeat.run(partial.checkPreparedPortal);
+                        if (node===nodes[0]) {
+                            // Guard already verified the original completed prepare under the runner lock.
+                            // Rebuild only the in-process executor handle; never send prepare again.
+                            const backup=entries[0].backupId;
+                            const r=await heartbeat.run(()=>this.executor.rehydrate(this.context(plan,node,undefined,backup)));
+                            if (r?.ok!==true || r.backupId!==backup || !Object.isFrozen(r.prepared)) throw new Error('TOPOLOGY_PREPARED_PORTAL_UNCONFIRMED');
+                            prepared.push({node,prepared:r.prepared,backupId:backup});
+                            continue;
+                        }
+                    }
                     const retained = undispatchedPreparation && entries.find(entry => entry.node.node === node.node && entry.state === 'prepared');
                     if (retained) {
                         const result = await heartbeat.run(() => this.executor.rehydrate(this.context(plan, node, undefined, retained.backupId)));
@@ -1703,6 +1720,7 @@ class TopologyOperationWorker {
                 if (error instanceof LeaseLostError) throw error;
                 logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}${error?.cause ? ` (cause: ${error.cause?.message || error.cause})` : ''}`);
                 traceWorkerFailure(plan, operationId, 'worker.prepare', error, preparingNode?.node);
+                if (retainedPortal) return {claimed:true,operationId,status:'preparing',stopped:true,drainUncertain:true,errorCode:'TOPOLOGY_PREPARED_PORTAL_UNCONFIRMED'};
                 if (undispatchedPreparation && entries.some(entry => entry.node.node === preparingNode?.node && entry.state === 'prepared')) {
                     // Rehydration/status is read-only. A refused observation is
                     // not permission to replace a proven original prepare with
