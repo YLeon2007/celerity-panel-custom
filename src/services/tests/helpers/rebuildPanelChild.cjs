@@ -38,7 +38,9 @@ require('../../rebuildTransport').createTransport = node => {
     const file = profile => { assert.ok(['main','bridge'].includes(profile)); return path.join(dir,`${id}-${profile}.json`); };
     const staged = new Set();
     return {
-        async requireSupportedCore() {},
+        async requireSupportedCore() {
+            if(fs.existsSync(path.join(dir,`old-core-${id}`)))throw Object.assign(new Error('old fixture core'),{code:'REBUILD_XRAY_VERSION_TOO_OLD'});
+        },
         async read(profile) {
             try { return JSON.parse(fs.readFileSync(file(profile),'utf8')); }
             catch (e) { if (e.code === 'ENOENT' && profile === 'bridge') return null; throw e; }

@@ -161,6 +161,18 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
         const report=await preview(links.xy);
         assert.ok(report.allowed && report.nodes.flatMap(n=>n.profiles).filter(p=>p.tunnelMigration==='legacy-to-vless-reverse').length===2);
         assert.ok(!(await raw()).rebuildVlessKeyEnvelope);
+        // An endpoint can change AFTER a valid Preview. Check both orientations;
+        // neither the other node's files nor the DB key may change on refusal.
+        for (const side of ['x','y']) {
+            const prior=digests(), count=events().length, marker=path.join(dir,`old-core-${nodeIds[side]}`);
+            fs.writeFileSync(marker,'',{flag:'wx'});
+            try {
+                const denied=await call('POST','/topology/deploy',{linkId:links.xy,expectedPreview:report.previewId},409);
+                assert.equal(denied.error.code,'REBUILD_XRAY_VERSION_TOO_OLD');
+                assert.ok(!(await raw()).rebuildVlessKeyEnvelope);
+                assert.equal(events().length,count);assert.deepEqual(digests(),prior);
+            } finally {fs.unlinkSync(marker);}
+        }
         await apply(links.xy,report);
         const envelope=(await raw()).rebuildVlessKeyEnvelope;
         assert.ok(typeof envelope==='string' && !config('x').reverse && !config('y','bridge').reverse);
