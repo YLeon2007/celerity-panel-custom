@@ -7,6 +7,14 @@ const nodes=[node('r','relay',1),node('a','bridge',2),node('b','bridge',3)];
 const edge=(key,id,n,extra)=>({_id:key,portalNode:'r',bridgeNode:id,tunnelPort:20000+n,tunnelUuid:`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,...extra});
 const state={node:'r',routingMode:'follow-relay',routingVersion:1,status:'installed',desiredState:'installed',routeGroup:'retained',secretRevision:2,tproxyPort:32120};
 const compile=links=>composeRebuildProfiles({nodes,links,followRelayStates:[state],controlPlaneAddresses:['panel.invalid','192.0.2.1']}).find(p=>p.nodeId==='r'&&p.profile==='main').config;
+test('installed PPP honors the relay subscriber deny rules before geo and default',()=>{
+ const relay={...nodes[0],aclRules:['reject(full-deny.invalid)','reject(all)']};
+ const profiles=composeRebuildProfiles({nodes:[relay,...nodes.slice(1)],links:[edge('default','a',1)],followRelayStates:[state],controlPlaneAddresses:['panel.invalid']});
+ const main=profiles.find(p=>p.nodeId==='r'&&p.profile==='main').config;
+ const rules=main.routing.rules, firstPolicy=rules.findIndex(rule=>rule.ruleTag==='rebuild-policy-default');
+ const denies=rules.filter(rule=>rule.outboundTag==='block'&&rule.inboundTag?.includes('client'));
+ assert.equal(denies.length,2);for(const rule of denies){assert.ok(rule.inboundTag.includes('rebuild-relay-ingress'));assert.ok(!rule.inboundTag.includes('API_INBOUND'));assert.ok(rules.indexOf(rule)<firstPolicy);}
+});
 test('real graph owns a stable local SOCKS and one policy for PPP plus ordinary relay clients',()=>{
  const first=compile([edge('default','a',1),edge('geo','b',2,{geoRouting:{enabled:true,domains:['full:geo.invalid'],geoip:['ru']}})]), next=compile([edge('replacement','b',3)]), closed=compile([]);
  for(const cfg of [first,next,closed]){

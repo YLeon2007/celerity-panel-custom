@@ -68,8 +68,10 @@ function mainProfile(node, users, options) {
     const tags = config.inbounds.map(inbound => inbound.tag);
     requireRebuild(tags.every(tag => typeof tag === 'string' && tag.trim() === tag && tag.length > 0), 'REBUILD_INVALID_INBOUND_TAG');
     for (const rule of config.routing.rules) rule.inboundTag = tags.slice();
+    // Keep references to the subscriber ACLs only, before API/tunnel rules are added.
+    const subscriberDenies = [...config.routing.rules];
     generator.applyXrayApi(config, node.xray?.apiPort ?? 61000);
-    return { config, tags };
+    return { config, tags, subscriberDenies };
 }
 
 function addLinkArtifacts(config, entry, projected, options) {
@@ -134,7 +136,7 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
     const users = collectUsers(usersByNode);
     const profiles = [];
     for (const [nodeId, entry] of graph.byNodeId) {
-        const { config: main, tags } = mainProfile(entry.node, users.has(nodeId) ? users.get(nodeId) : [], options);
+        const { config: main, tags, subscriberDenies } = mainProfile(entry.node, users.has(nodeId) ? users.get(nodeId) : [], options);
         const bridge = blackholeProfile();
         const transit = entry.incoming.map(ingressTag);
         if (entry.isExit) {
@@ -159,7 +161,7 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
             requireRebuild(entry.role === 'relay' && installed.length === 1, 'REBUILD_L2TP_STATE_AMBIGUOUS');
             require('./l2tpFollowRelay').attachLocalFollowRelay({ nodeId, state: installed[0], main, bridge,
                 controlPlaneAddresses, carryDomain: entry.carryDomain,
-                policy: main.routing.rules.filter(rule => rule.ruleTag?.startsWith(REBUILD_POLICY_RULE_PREFIX)) });
+                policy: [...subscriberDenies, ...main.routing.rules.filter(rule => rule.ruleTag?.startsWith(REBUILD_POLICY_RULE_PREFIX))] });
         }
         assertListeners(main, bridge);
         profiles.push({ nodeId, profile: 'main', config: composeXrayConfig(main, []) },
