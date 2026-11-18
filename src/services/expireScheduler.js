@@ -56,9 +56,12 @@ function processExpired() {
             if (overdue.length === 0) return 0;
 
             const sync = getSync();
-            await Promise.allSettled(overdue.map(u => sync.disableUser(u, 'expired')));
-            logger.info(`[ExpireScheduler] Processed ${overdue.length} expired user(s)`);
-            return overdue.length;
+            const results = await Promise.allSettled(overdue.map(u => sync.disableUser(u, 'expired')));
+            const disabled = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
+            const failed = results.filter(r => r.status === 'rejected').length;
+            if (failed) logger.warn(`[ExpireScheduler] Failed to process ${failed} expired user(s)`);
+            logger.info(`[ExpireScheduler] Disabled ${disabled} expired user(s) in DB`);
+            return disabled;
         } finally {
             _processing = null;
         }
@@ -158,8 +161,8 @@ function notify(expireAt) {
  * Boot catchup + initial schedule. Idempotent.
  *
  * Expiry catchup and the next-fire scheduling are awaited because they
- * directly affect correctness of the first HTTP responses (xray clients on
- * disabled users must be gone before the panel accepts subscription requests).
+ * directly affect correctness of the first HTTP responses. DB disablement
+ * does not attest Xray runtime removal (the classic agent may be unavailable).
  *
  * The traffic-limit migration sweep is dispatched in the background — it can
  * be large on existing installs and would otherwise delay server startup by

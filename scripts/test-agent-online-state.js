@@ -26,21 +26,23 @@ assert.deepStrictEqual(extractAgentOnlineUserIds({ users: {} }), []);
 assert.deepStrictEqual(extractAgentOnlineUserIds(null), []);
 
 {
+    const sample = (ids, observedAt = 1000) => ({ ids, observedAt });
     const contributions = new Map([
-        ['de', new Set(['leon'])],
-        ['fi', new Set(['lilya'])],
+        ['de', sample(['leon'])],
+        ['fi', sample(['lilya'], 2000)],
     ]);
-    const merged = mergeNodeOnlineContributions(contributions, ['de', 'fi']);
+    const merged = mergeNodeOnlineContributions(contributions, ['de', 'fi'], 2000);
     assert.deepStrictEqual([...merged.userIds].sort(), ['leon', 'lilya']);
+    assert.deepStrictEqual([...mergeNodeOnlineContributions(contributions, ['de', 'fi'], 46_000).userIds], ['lilya']);
 
     // A successful empty /online response for one node must replace that node,
     // not preserve old users for an extra panel-side timeout.
-    contributions.set('de', new Set());
-    const afterEmptyDe = mergeNodeOnlineContributions(contributions, ['de', 'fi']);
+    contributions.set('de', sample([]));
+    const afterEmptyDe = mergeNodeOnlineContributions(contributions, ['de', 'fi'], 2000);
     assert.deepStrictEqual([...afterEmptyDe.userIds].sort(), ['lilya']);
 
     // Removed/inactive node contributions must be pruned.
-    const afterPrune = mergeNodeOnlineContributions(contributions, ['de']);
+    const afterPrune = mergeNodeOnlineContributions(contributions, ['de'], 2000);
     assert.deepStrictEqual([...afterPrune.contributions.keys()], ['de']);
 }
 

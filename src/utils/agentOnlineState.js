@@ -6,21 +6,21 @@ function extractAgentOnlineUserIds(payload) {
         .filter(Boolean);
 }
 
-function mergeNodeOnlineContributions(contributions, activeNodeKeys = []) {
-    const active = new Set((activeNodeKeys || []).map(String));
+// Keep a recent sample through transient refusals, but polling must not
+// extend its lifetime. Bound the grace by the agent's idle window.
+const maxSampleAgeMs = 45_000;
+
+function mergeNodeOnlineContributions(contributions, activeNodeKeys, now) {
+    const active = new Set(Array.from(activeNodeKeys, String));
     const next = new Map();
-
-    for (const [nodeKey, ids] of contributions.entries()) {
-        const key = String(nodeKey);
-        if (!active.has(key)) continue;
-        next.set(key, new Set([...(ids || [])].map(String).filter(Boolean)));
-    }
-
     const userIds = new Set();
-    for (const ids of next.values()) {
-        ids.forEach(userId => userIds.add(userId));
+    for (const [nodeKey, sample] of contributions) {
+        const key = String(nodeKey);
+        const age = now - sample.observedAt;
+        if (!active.has(key) || !Number.isFinite(age) || age < 0 || age >= maxSampleAgeMs) continue;
+        next.set(key, sample);
+        for (const id of sample.ids) if (id) userIds.add(String(id));
     }
-
     return { contributions: next, userIds };
 }
 
