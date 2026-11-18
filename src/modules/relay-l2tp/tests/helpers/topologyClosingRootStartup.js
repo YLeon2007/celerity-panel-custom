@@ -99,6 +99,7 @@ function injectCrash(point) {
     });
     wrap(executor,'verify',null,(value,ctx)=>{if(value?.ok && ctx.node.node===nodes[1].id)stop('verified');});
     wrap(finalizer,'beginV2Closure',null,value=>{if(value)stop('closing');});
+    wrap(finalizer,'reclaimUnclosedPair',null,value=>{if(value)stop('closing-takeover');});
     wrap(require('../../services/topologyUserResync').TopologyUserResync,'resyncPlan',null,value=>{if(value?.ok)stop('users-restored');});
     wrap(executor,'close',null,(value,ctx)=>{if(value)stop(ctx.node.node===nodes[0].id?'closed-P':'closed-B');});
     wrap(finalizer,'persistV2TerminalProofs',null,value=>{if(value)stop('proven');});
