@@ -1040,106 +1040,17 @@ function stripServerInbounds(config, nodeConfig) {
     return config;
 }
 
-// --- Scoped mixed-mode primitives -------------------------------------------
-// The hop-by-hop mixed builder needs reverse-bridge artifacts on an existing
-// config and forward hop inbounds whose unconditional `-> direct` exit rule
-// is suppressed (the builder emits exit rules itself, after geo-branch
-// rules). Baseline configGenerator (b97900e) does not export these; commit
-// 3471f52 adds them as applyReverseBridge / applyForwardHopInbound(_, _, tag)
-// upstream. Until the mode-generator owner ports that part, keep local
-// mirrors here so this module stays scoped. Behavior must match 3471f52
-// exactly — deduplicate once configGenerator exports the shared helpers.
-function tunnelDomainOf(link) {
-    const baseDomain = link.tunnelDomain || 'reverse.tunnel.internal';
-    return `${String(link._id).slice(-8)}.${baseDomain}`;
-}
-
-function outboundUserOf(uuid, protocol) {
-    if (protocol === 'vmess') return { id: uuid, alterId: 0, security: 'auto' };
-    return { id: uuid, encryption: 'none' };
-}
-
-/**
- * Mirror of configGenerator.applyReverseBridge(config, links, egressTag)
- * from 3471f52: for every reverse link this node dials (it is the target /
- * bridgeNode), install the reverse bridge control block, the tunnel outbound
- * and the full-domain control-channel rule; route tunnel-exit traffic to
- * egressTag unless it is null.
- */
-function applyReverseBridgeArtifacts(config, links, egressTag = 'freedom') {
-    if (!links || links.length === 0) return;
-
-    config.reverse = config.reverse || {};
-    config.reverse.bridges = config.reverse.bridges || [];
-    config.outbounds = config.outbounds || [];
-    config.routing = config.routing || { rules: [] };
-    config.routing.rules = config.routing.rules || [];
-
+// Legacy mixed-mode output keeps the generator's historical domain-only
+// control rule. Rebuild opts in to stricter control scoping separately.
+function applyReverseBridgeArtifacts(config, links, egressTag) {
     for (const link of links) {
-        const portalNode = link.portalNode;
-        if (!portalNode || !portalNode.ip) {
-            throw new FrozenTopologyDeploymentPlanError(
-                'XRAY_CONFIG_GENERATION_FAILED',
-                `Portal node is not populated for cascade link ${link.name || link._id}`,
-            );
-        }
-
-        const tunnelDomain = tunnelDomainOf(link);
-        const protocol = link.tunnelProtocol || 'vless';
-        const linkIdShort = String(link._id).slice(-8);
-        const bridgeTag = `bridge-${linkIdShort}`;
-        const tunnelTag = `tunnel-${linkIdShort}`;
-
-        const tunnelOutbound = {
-            tag: tunnelTag,
-            protocol,
-            settings: {
-                vnext: [{
-                    address: portalNode.ip,
-                    port: link.tunnelPort || 10086,
-                    users: [outboundUserOf(link.tunnelUuid, protocol)],
-                }],
-            },
-            streamSettings: configGenerator.buildCascadeTunnelStreamSettings(link),
-        };
-        if (link.muxEnabled) {
-            tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
-        }
-
-        config.reverse.bridges.push({ tag: bridgeTag, domain: tunnelDomain });
-        config.outbounds.unshift(tunnelOutbound);
-
-        config.routing.rules.push({
-            type: 'field',
-            domain: [`full:${tunnelDomain}`],
-            outboundTag: tunnelTag,
-        });
-        if (egressTag !== null) {
-            config.routing.rules.push({
-                type: 'field',
-                inboundTag: [bridgeTag],
-                outboundTag: egressTag,
-            });
-        }
+        if (!link.portalNode?.ip) throw new FrozenTopologyDeploymentPlanError(
+            'XRAY_CONFIG_GENERATION_FAILED',
+            `Portal node is not populated for cascade link ${link.name || link._id}`,
+        );
     }
+    configGenerator.applyReverseBridge(config, links, egressTag);
 }
-
-/**
- * Equivalent of configGenerator.applyForwardHopInbound(config, links, null)
- * from 3471f52: bind the hop inbounds but suppress the per-link
- * `inboundTag -> direct` exit rule the baseline helper appends
- * unconditionally — mixed composition places exit rules after geo branches.
- */
-function applyForwardHopInboundNoEgress(config, links) {
-    if (!links || links.length === 0) return;
-    config.routing = config.routing || { rules: [] };
-    config.routing.rules = config.routing.rules || [];
-    const ruleCount = config.routing.rules.length;
-    configGenerator.applyForwardHopInbound(config, links);
-    config.routing.rules = config.routing.rules.filter((rule, index) => index < ruleCount
-        || !(rule.type === 'field' && rule.outboundTag === 'direct' && Array.isArray(rule.inboundTag)));
-}
-// --- End scoped mixed-mode primitives ---------------------------------------
 
 function composeBaselineWithCascade(baseline, cascade) {
     const config = composeXrayConfig(baseline, [{
@@ -1554,9 +1465,10 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
             (geoLeafEntry.link.mode === 'forward' ? forwardUps : reverseUps).push(geoLeafEntry);
         }
         if (forwardUps.length > 0) {
-            applyForwardHopInboundNoEgress(
+            configGenerator.applyForwardHopInbound(
                 config,
                 forwardUps.map(entry => projectedByEntryId.get(entry.id)),
+                { transitOnly: true },
             );
         }
         if (reverseUps.length > 0) {

@@ -5,9 +5,13 @@
 const yaml = require('yaml');
 const fs = require('fs');
 const path = require('path');
-const logger = require('../utils/logger');
-const appConfig = require('../../config');
 const { composeXrayConfig } = require('../modules/relay-l2tp/services/xrayConfigComposer');
+
+// Descriptor-only generation must not load dotenv or open the panel's logs.
+const panelDomainFromConfig = () => require('../../config').PANEL_DOMAIN;
+const logger = () => require('../utils/logger');
+const suppliedPanelCertificate = input => [input.certificate, input.key].every(lines =>
+    Array.isArray(lines) && lines.length > 0 && lines.every(line => typeof line === 'string' && line.length > 0)) ? input : null;
 
 // Canonical on-node path for the Xray access log when the opt-in access-logs
 // module is enabled. The cc-agent tails exactly this file.
@@ -106,7 +110,7 @@ function parsePemBlock(pem) {
  * @returns {{ certificate: string[], key: string[], domain: string, mtimeMs: number } | null}
  */
 function buildPanelInlineCertificate() {
-    const domain = appConfig?.PANEL_DOMAIN || '';
+    const domain = panelDomainFromConfig() || '';
     if (!domain) return null;
 
     const candidates = _panelCertCandidates(domain);
@@ -127,7 +131,7 @@ function buildPanelInlineCertificate() {
         if (_panelCertCache.cert) {
             // Cert source disappeared (mount glitch?). Surface a warning but
             // do not return stale PEM — config without certs is safer.
-            logger.warn(`[configGenerator] Panel certificate path missing for ${domain}; cleared inline cache`);
+            logger().warn(`[configGenerator] Panel certificate path missing for ${domain}; cleared inline cache`);
             _panelCertCache.cert = null;
             _panelCertCache.key = null;
             _panelCertCache.mtimeMs = 0;
@@ -157,7 +161,7 @@ function buildPanelInlineCertificate() {
         const certificate = parsePemBlock(certPem);
         const key = parsePemBlock(keyPem);
         if (certificate.length === 0 || key.length === 0) {
-            logger.warn(`[configGenerator] Panel cert/key looks empty (${chosen.cert})`);
+            logger().warn(`[configGenerator] Panel cert/key looks empty (${chosen.cert})`);
             return null;
         }
         _panelCertCache.cert = certificate;
@@ -167,7 +171,7 @@ function buildPanelInlineCertificate() {
         _panelCertCache.sourcePath = chosen.cert;
         return { certificate, key, domain, mtimeMs };
     } catch (err) {
-        logger.error(`[configGenerator] Failed to read panel certificate at ${chosen.cert}: ${err.message}`);
+        logger().error(`[configGenerator] Failed to read panel certificate at ${chosen.cert}: ${err.message}`);
         return null;
     }
 }
@@ -584,7 +588,7 @@ WantedBy=multi-user.target
  * @param {Object} [node] - Owning node for certificate paths and TLS serverName fallback
  * @returns {Object} streamSettings
  */
-function buildXrayStreamSettings(inbound, node = {}) {
+function buildXrayStreamSettings(inbound, node = {}, { panelTls } = {}) {
     const transport = inbound.transport || 'tcp';
     const security = inbound.security || 'reality';
 
@@ -616,8 +620,9 @@ function buildXrayStreamSettings(inbound, node = {}) {
         let certificates;
         let serverName;
         if (tlsSource === 'panel') {
-            const panelCert = buildPanelInlineCertificate();
-            serverName = appConfig?.PANEL_DOMAIN || node.domain || node.sni || '';
+            const panelDomain = panelTls === undefined ? panelDomainFromConfig() : panelTls.serverName;
+            const panelCert = panelTls === undefined ? buildPanelInlineCertificate() : suppliedPanelCertificate(panelTls);
+            serverName = panelDomain || node.domain || node.sni || '';
             if (panelCert) {
                 certificates = [{
                     ocspStapling: 3600,
@@ -625,9 +630,9 @@ function buildXrayStreamSettings(inbound, node = {}) {
                     key: panelCert.key,
                 }];
             } else {
-                const reason = (appConfig?.PANEL_DOMAIN || '').trim()
-                    ? `panel certificate file unreadable for ${appConfig.PANEL_DOMAIN}`
-                    : 'PANEL_DOMAIN env var is not set';
+                const reason = panelTls !== undefined ? 'panel TLS input missing'
+                    : ((panelDomain || '').trim() ? `panel certificate file unreadable for ${panelDomain}`
+                        : 'PANEL_DOMAIN env var is not set');
                 const err = new Error(`PANEL_CERT_UNAVAILABLE: ${reason}`);
                 err.code = 'PANEL_CERT_UNAVAILABLE';
                 throw err;
@@ -713,7 +718,7 @@ function buildXrayClients(users, inbound) {
  * Build a VLESS inbound entry from a per-inbound config. Used both for the
  * main inbound and each item in `extraInbounds[]`.
  */
-function buildVlessInbound(inbound, users, node) {
+function buildVlessInbound(inbound, users, node, options) {
     const settings = {
         clients: buildXrayClients(users, inbound),
         decryption: 'none',
@@ -731,7 +736,7 @@ function buildVlessInbound(inbound, users, node) {
         protocol: 'vless',
         tag: inbound.inboundTag,
         settings,
-        streamSettings: buildXrayStreamSettings(inbound, node),
+        streamSettings: buildXrayStreamSettings(inbound, node, options),
         sniffing: {
             enabled: true,
             destOverride: ['http', 'tls', 'quic'],
@@ -780,8 +785,8 @@ function generateXrayConfig(node, users, options = {}) {
     const config = {
         log: buildXrayLogSection(node),
         inbounds: [
-            buildVlessInbound(mainInbound, users, node),
-            ...extraInbounds.map(extra => buildVlessInbound(extra, users, node)),
+            buildVlessInbound(mainInbound, users, node, options),
+            ...extraInbounds.map(extra => buildVlessInbound(extra, users, node, options)),
         ],
         outbounds: [
             { protocol: 'freedom', tag: 'direct' },
@@ -856,7 +861,7 @@ function generateXrayConfig(node, users, options = {}) {
     for (const rule of aclRules) {
         const match = rule.match(/^([\w\-]+)\((.+)\)$/);
         if (!match) {
-            if (rule.trim()) logger.warn(`[Xray ACL] Skipping unparsable rule: "${rule}"`);
+            if (rule.trim()) logger().warn(`[Xray ACL] Skipping unparsable rule: "${rule}"`);
             continue;
         }
         const [, action, target] = match;
@@ -873,7 +878,7 @@ function generateXrayConfig(node, users, options = {}) {
         }
 
         if (!outboundTag) {
-            logger.warn(`[Xray ACL] Skipping rule with unknown action "${action}": "${rule}"`);
+            logger().warn(`[Xray ACL] Skipping rule with unknown action "${action}": "${rule}"`);
             continue;
         }
 
@@ -1017,7 +1022,7 @@ function getCascadeTunnelDomain(link) {
  *        A string is accepted for backward compatibility; multiple tags route
  *        traffic from any of the listed inbounds (main + extras) into the cascade.
  */
-function applyReversePortal(config, portalLinks, clientInboundTags) {
+function applyReversePortal(config, portalLinks, clientInboundTags, options = {}) {
     if (!portalLinks || portalLinks.length === 0) return;
     const tags = normalizeInboundTags(clientInboundTags);
 
@@ -1051,7 +1056,7 @@ function applyReversePortal(config, portalLinks, clientInboundTags) {
             port: link.tunnelPort || 10086,
             protocol,
             settings,
-            streamSettings: buildCascadeTunnelStreamSettings(link, { server: true }),
+            streamSettings: buildCascadeTunnelStreamSettings(link, { ...options, server: true }),
         };
 
         config.inbounds.push(inbound);
@@ -1123,6 +1128,64 @@ function applyReversePortal(config, portalLinks, clientInboundTags) {
             inboundTag: tags,
             outboundTag: defaultTags[0],
         });
+    }
+}
+
+// Install the target-side reverse dialer. Transit composers pass null to
+// supply their own payload policy instead of the historical terminal egress.
+function applyReverseBridge(config, links, egressTag = 'freedom', { scopeControl = false, panelTls } = {}) {
+    if (!links || links.length === 0) return;
+
+    config.reverse = config.reverse || {};
+    config.reverse.bridges = config.reverse.bridges || [];
+    config.outbounds = config.outbounds || [];
+    config.routing = config.routing || { rules: [] };
+    config.routing.rules = config.routing.rules || [];
+
+    for (const link of links) {
+        const portalNode = link.portalNode;
+        if (!portalNode || !portalNode.ip) {
+            throw new Error('Reverse tunnel source has no server address');
+        }
+
+        const tunnelDomain = getCascadeTunnelDomain(link);
+        const protocol = link.tunnelProtocol || 'vless';
+        const linkIdShort = String(link._id).slice(-8);
+        const bridgeTag = `bridge-${linkIdShort}`;
+        const tunnelTag = `tunnel-${linkIdShort}`;
+
+        const tunnelOutbound = {
+            tag: tunnelTag,
+            protocol,
+            settings: {
+                vnext: [{
+                    address: portalNode.ip,
+                    port: link.tunnelPort || 10086,
+                    users: [buildOutboundUser(link.tunnelUuid, protocol)],
+                }],
+            },
+            streamSettings: buildCascadeTunnelStreamSettings(link, { panelTls }),
+        };
+        if (link.muxEnabled) {
+            tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
+        }
+
+        config.reverse.bridges.push({ tag: bridgeTag, domain: tunnelDomain });
+        config.outbounds.unshift(tunnelOutbound);
+
+        config.routing.rules.push({
+            type: 'field',
+            ...(scopeControl ? { inboundTag: [bridgeTag] } : {}),
+            domain: [`full:${tunnelDomain}`],
+            outboundTag: tunnelTag,
+        });
+        if (egressTag !== null) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: [bridgeTag],
+                outboundTag: egressTag,
+            });
+        }
     }
 }
 
@@ -1599,13 +1662,14 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
     if (security === 'tls') {
         // Inline panel cert when tlsServerName matches PANEL_DOMAIN; otherwise
         // fall back to file paths and keep allowInsecure on the client side.
-        const panelDomain = (appConfig?.PANEL_DOMAIN || '').trim();
+        const panelDomain = ((opts.panelTls === undefined ? panelDomainFromConfig() : opts.panelTls.serverName) || '').trim();
         const wantPanelCert = !!panelDomain && link.tlsServerName === panelDomain;
 
         if (opts.server) {
             let certificates;
             if (wantPanelCert) {
-                const panelCert = buildPanelInlineCertificate();
+                const panelCert = opts.panelTls === undefined
+                    ? buildPanelInlineCertificate() : suppliedPanelCertificate(opts.panelTls);
                 if (panelCert) {
                     certificates = [{
                         ocspStapling: 3600,
@@ -1613,12 +1677,14 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
                         key: panelCert.key,
                     }];
                 } else {
-                    const err = new Error(`PANEL_CERT_UNAVAILABLE: cascade link "${link?.name || link?._id}" expects panel cert for ${panelDomain} but it is not readable on disk`);
+                    const err = new Error(opts.panelTls === undefined
+                        ? `PANEL_CERT_UNAVAILABLE: cascade link "${link?.name || link?._id}" expects panel cert for ${panelDomain} but it is not readable on disk`
+                        : 'PANEL_CERT_UNAVAILABLE: panel TLS input missing');
                     err.code = 'PANEL_CERT_UNAVAILABLE';
                     throw err;
                 }
             } else {
-                logger.warn(`[configGenerator] Cascade TLS link "${link?.name || link?._id}" uses tlsServerName="${link.tlsServerName || ''}" — using file paths; ensure cert/key exist on the bridge node`);
+                if (opts.panelTls === undefined) logger().warn(`[configGenerator] Cascade TLS link "${link?.name || link?._id}" uses tlsServerName="${link.tlsServerName || ''}" — using file paths; ensure cert/key exist on the bridge node`);
                 certificates = [{
                     certificateFile: '/usr/local/etc/xray/cert.pem',
                     keyFile: '/usr/local/etc/xray/key.pem',
@@ -1710,7 +1776,7 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
  *        each installs a loopback socks inbound whose tag joins the rule set
  *        pointing at the chain exit outbound.
  */
-function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathIngress = [], geoBranches = []) {
+function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathIngress = [], geoBranches = [], options = {}) {
     if (!forwardLinks || forwardLinks.length === 0) return;
     const ingressTags = [];
     if (cascadePathIngress && cascadePathIngress.length > 0) {
@@ -1761,7 +1827,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                     users: [buildOutboundUser(link.tunnelUuid, fwdProto)],
                 }],
             },
-            streamSettings: buildCascadeTunnelStreamSettings(link),
+            streamSettings: buildCascadeTunnelStreamSettings(link, options),
         };
 
         if (link.muxEnabled) {
@@ -1799,7 +1865,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                     users: [buildOutboundUser(branchLink.tunnelUuid, branchProto)],
                 }],
             },
-            streamSettings: buildCascadeTunnelStreamSettings(branchLink),
+            streamSettings: buildCascadeTunnelStreamSettings(branchLink, options),
         };
         if (branchLink.muxEnabled) {
             outbound.mux = { enabled: true, concurrency: branchLink.muxConcurrency || 8 };
@@ -1934,7 +2000,7 @@ function generateForwardHopConfig(linkOrLinks) {
  * @param {Object} config - Parsed Xray config object (mutated in place)
  * @param {Array} hopLinks - CascadeLink documents where this node is bridgeNode (forward mode)
  */
-function applyForwardHopInbound(config, hopLinks) {
+function applyForwardHopInbound(config, hopLinks, { transitOnly = false, panelTls } = {}) {
     if (!hopLinks || hopLinks.length === 0) return;
 
     config.inbounds = config.inbounds || [];
@@ -1954,7 +2020,7 @@ function applyForwardHopInbound(config, hopLinks) {
             port: link.tunnelPort || 10086,
             protocol: hopProto,
             settings: hopSettings,
-            streamSettings: buildCascadeTunnelStreamSettings(link, { server: true }),
+            streamSettings: buildCascadeTunnelStreamSettings(link, { server: true, panelTls }),
             sniffing: {
                 enabled: true,
                 destOverride: ['http', 'tls', 'quic'],
@@ -1965,7 +2031,7 @@ function applyForwardHopInbound(config, hopLinks) {
         // proxySettings.tag builds the full chained path on the entry node.
         // Intermediate hops act as transport proxies and should forward the
         // decoded stream directly to the next target address.
-        config.routing.rules.push({
+        if (!transitOnly) config.routing.rules.push({
             type: 'field',
             inboundTag: [inboundTag],
             outboundTag: 'direct',
@@ -2053,6 +2119,7 @@ module.exports = {
     buildXrayStreamSettings,
     generateXraySystemdService,
     applyReversePortal,
+    applyReverseBridge,
     generateBridgeConfig,
     generateCombinedBridgeConfig,
     generateRelayConfig,
