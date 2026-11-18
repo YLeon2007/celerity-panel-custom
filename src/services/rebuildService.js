@@ -4,7 +4,24 @@ const {runRebuild}=require('./rebuildCoordinator');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {createTransport}=require('./rebuildTransport');
+const {createPrivateKey,createPublicKey}=require('node:crypto');
 const fail=code=>Object.assign(new Error(code),{code});
+// Subscriptions publish a separate X25519 public key. It never appears in
+// the server JSON, so comparing MAIN before/after cannot catch a DB-only edit.
+const x25519Prefix=Buffer.from('302e020100300506032b656e04220420','hex');
+function inconsistentPublishedKey(node){
+    if(node.cascadeRole!=='portal')return false;
+    const xray=node.xray||{};
+    return [xray,...(xray.extraInbounds||[])].some(inbound=>{
+        if((inbound.security||'reality')!=='reality')return false;
+        try {
+            const raw=Buffer.from(inbound.realityPrivateKey,'base64url');
+            if(raw.length!==32 || raw.toString('base64url')!==inbound.realityPrivateKey)return true;
+            const secret=createPrivateKey({key:Buffer.concat([x25519Prefix,raw]),format:'der',type:'pkcs8'});
+            return createPublicKey(secret).export({format:'jwk'}).x!==inbound.realityPublicKey;
+        } catch {return true;}
+    });
+}
 function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=require('../models/hyNodeModel'),
     State=require('../modules/relay-l2tp/models/relayL2tpStateModel'),sync=require('./syncService'),locks=makeLocks(),connect=createTransport,
     compose=composeRebuildProfiles,env=process.env,cache=require('./cacheService')}={}){
@@ -32,7 +49,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     transports.set(String(node._id),connect(node));
                 }
                 const controlPlaneAddresses=[...new Set([env.PANEL_DOMAIN,...nodes.flatMap(n=>[n.ip,n.domain])].filter(Boolean))];
-                return compose({nodes,links,affectedNodeIds:ids,usersByNode,panelTls,followRelayStates,controlPlaneAddresses});
+                const candidates=compose({nodes,links,affectedNodeIds:ids,usersByNode,panelTls,followRelayStates,controlPlaneAddresses});
+                const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
+                return candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p);
             },
             async read(id,p){const current=await transports.get(id).read(p);if(p==='main'){
                 const installed=states.get(id);const ingress=(current?.inbounds||[]).filter(i=>i.tag?.startsWith('relay-l2tp-'));

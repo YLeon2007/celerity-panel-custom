@@ -61,8 +61,10 @@ async function runRebuild(d, req) {
                 const profiles=[];
                 for(const p of pair){
                     const before=await d.read(nodeId,p.profile);
-                    profiles.push(profilePreview(before,p.config,p.profile));
-                    fingerprint.update(JSON.stringify([nodeId,p.profile,before,p.config]));
+                    const diff=profilePreview(before,p.config,p.profile);
+                    if(p.publishedKeyMismatch)diff.protectedChanged=true;
+                    profiles.push(diff);
+                    fingerprint.update(JSON.stringify([nodeId,p.profile,before,p.config,diff.protectedChanged]));
                 }
                 report.push({nodeId,profiles});
             }
