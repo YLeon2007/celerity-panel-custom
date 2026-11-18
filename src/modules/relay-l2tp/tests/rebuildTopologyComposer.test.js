@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { Types } = require('mongoose');
-const { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX } = require('../services/rebuildTopologyComposer');
+const { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX, syntheticTunnelSettings } = require('./helpers/rebuildComposerFixture');
 
 const id = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const node = (key, role, n) => ({
@@ -11,7 +11,7 @@ const node = (key, role, n) => ({
     xray: { inboundTag: `client-${key}`, transport: 'tcp', security: 'none', apiPort: 23000 + n },
 });
 const edge = (key, portalNode, bridgeNode, n, extra) => ({
-    _id: key, portalNode, bridgeNode, tunnelPort: 13000 + n, tunnelUuid: id(n), ...extra,
+    _id: key, portalNode, bridgeNode, tunnelPort: 13000 + n, tunnelUuid: id(n), _rebuildVless: syntheticTunnelSettings(n), ...extra,
 });
 const geo = (priority, domains = ['domain:geo.invalid'], geoip = ['ru']) => ({
     priority, geoRouting: { enabled: true, domains, geoip },
@@ -41,37 +41,46 @@ test('actual profiles route a reverse split/merge with priorities and share rela
         'reverse payload must carry the sniffed hostname to the downstream relay geo policy');
     assert.equal(r.inbounds.find(i => i.tag === 'client-r').sniffing.routeOnly, true,
         'local geo matching does not need to replace the destination');
-    assert.equal(route(p, 'client-p'), 'portal-pr');
-    assert.equal(route(p, 'client-p', 'domain:geo.invalid'), 'portal-pb');
-    assert.equal(route(p, 'client-p', 'geoip:ru'), 'portal-pb');
-    assert.equal(route(p, 'bridge-conn-pr', 'full:pr.reverse.tunnel.internal'), 'portal-pr');
-    assert.equal(route(p, 'bridge-conn-pr'), 'block');
-    assert.equal(route(r, 'client-r', 'full:pr.reverse.tunnel.internal'), 'portal-rm', 'reverse control is not a global rule');
-    assert.equal(route(r, 'bridge-pr', 'full:pr.reverse.tunnel.internal'), 'tunnel-pr');
-    assert.equal(route(r, 'bridge-pr'), 'portal-rm');
-    assert.equal(route(r, 'bridge-pr', 'geoip:ru'), 'portal-rb');
+    assert.equal(route(p, 'client-p'), 'rebuild-rp-egress-pr');
+    assert.equal(route(p, 'client-p', 'domain:geo.invalid'), 'rebuild-rp-egress-pb');
+    assert.equal(route(p, 'client-p', 'geoip:ru'), 'rebuild-rp-egress-pb');
+    assert.equal(route(p, 'rebuild-rp-conn-pr', 'full:pr.reverse.tunnel.internal'), 'block', 'the connector is not a payload ingress');
+    assert.equal(route(r, 'rebuild-rp-ingress-pr', 'full:pr.reverse.tunnel.internal'), 'rebuild-rp-egress-rm',
+        'the old control domain is no longer special on the payload path');
+    assert.equal(route(r, 'rebuild-rp-ingress-pr'), 'rebuild-rp-egress-rm');
+    assert.equal(route(r, 'rebuild-rp-ingress-pr', 'geoip:ru'), 'rebuild-rp-egress-rb');
     assert.equal(r.routing.domainStrategy, 'IPOnDemand');
     for (const rule of r.routing.rules.filter(rule => rule.ruleTag?.startsWith(REBUILD_POLICY_RULE_PREFIX))) {
         rule.inboundTag.push('later-local-ingress');
     }
-    assert.equal(route(r, 'later-local-ingress', 'domain:geo.invalid'), 'portal-rb');
-    assert.equal(route(r, 'later-local-ingress'), 'portal-rm');
-    for (const tag of ['bridge-sm', 'bridge-rm']) assert.equal(route(m, tag), 'portal-ma');
-    assert.equal(m.outbounds.find(outbound => outbound.tag === 'tunnel-sm').settings.vnext[0].address, nodes[2].ip);
-    assert.equal(m.outbounds.find(outbound => outbound.tag === 'tunnel-rm').settings.vnext[0].address, nodes[1].ip);
+    assert.equal(route(r, 'later-local-ingress', 'domain:geo.invalid'), 'rebuild-rp-egress-rb');
+    assert.equal(route(r, 'later-local-ingress'), 'rebuild-rp-egress-rm');
+    for (const tag of ['rebuild-rp-ingress-sm', 'rebuild-rp-ingress-rm']) assert.equal(route(m, tag), 'rebuild-rp-egress-ma');
+    assert.equal(m.outbounds.find(outbound => outbound.tag === 'rebuild-rp-dial-sm').settings.address, nodes[2].ip);
+    assert.equal(m.outbounds.find(outbound => outbound.tag === 'rebuild-rp-dial-rm').settings.address, nodes[1].ip);
     const bridge = byNode(output, 'a', 'bridge');
-    assert.deepEqual(bridge.reverse.bridges.map(item => item.tag), ['bridge-ma', 'bridge-pa', 'bridge-ra']);
-    assert.equal(route(bridge, 'bridge-ra'), 'freedom');
-    assert.equal(route(bridge, 'bridge-ra', 'geoip:private'), 'block');
+    assert.deepEqual(bridge.outbounds.filter(item => item.settings?.reverse).map(item => item.settings.reverse.tag),
+        ['rebuild-rp-ingress-ma', 'rebuild-rp-ingress-pa', 'rebuild-rp-ingress-ra']);
+    assert.equal(route(bridge, 'rebuild-rp-ingress-ra'), 'freedom');
+    assert.equal(route(bridge, 'rebuild-rp-ingress-ra', 'geoip:private'), 'block');
     assert.equal(route(bridge, 'unrecognized'), 'block');
     assert.equal(route(byNode(output, 'a'), 'client-a'), 'block');
     assert.deepEqual(p.inbounds.find(i => i.tag === 'client-p').settings.clients.map(c => c.id), [id(201)]);
     assert.deepEqual(r.inbounds.find(i => i.tag === 'client-r').settings.clients.map(c => c.id), [id(202)]);
-    assert.deepEqual(p.inbounds.find(i => i.tag === 'bridge-conn-pr').settings.clients.map(c => c.id), [id(5)]);
-    assert.equal(byNode(output, 'r', 'bridge').reverse, undefined);
+    assert.deepEqual(p.inbounds.find(i => i.tag === 'rebuild-rp-conn-pr').settings.clients,
+        [{ id: id(5), reverse: { tag: 'rebuild-rp-egress-pr' } }]);
+    for (const { config } of output) {
+        assert.equal(config.reverse, undefined);
+        assert.equal(config.routing.balancers, undefined);
+        const tags = [...config.inbounds.map(i => i.tag), ...config.outbounds.map(o => o.tag),
+            ...config.routing.rules.flatMap(rule => [...(rule.inboundTag ?? []), rule.outboundTag])];
+        assert.ok(!tags.some(tag => /^(portal|bridge|tunnel)-/.test(tag)));
+        assert.ok(!config.routing.rules.some(rule => rule.domain?.some(domain => domain.endsWith('.reverse.tunnel.internal'))));
+        assert.equal(config.outbounds[0].protocol, 'blackhole');
+    }
 });
 
-test('completion uses existing per-hop forward and reverse primitives, actual Xray client settings intact', () => {
+test('native-to-forward transit keeps client settings and matching tunnel credentials on both ends', () => {
     const p = node(new Types.ObjectId('000000000000000000000001'), 'portal', 1);
     const r = node('r', 'relay', 2);
     const b = node('b', 'bridge', 3);
@@ -79,8 +88,10 @@ test('completion uses existing per-hop forward and reverse primitives, actual Xr
         realityDest: 'cover.invalid:443', realitySni: ['cover.invalid'], realityPrivateKey: 'dummy-key', realityShortIds: ['aabb'],
         extraInbounds: [{ inboundTag: 'custom-extra', port: 24443, transport: 'ws', security: 'tls', wsPath: '/fixture',
             wsHost: 'cover.invalid', alpn: ['http/1.1'] }] };
+    const rev = edge('rev', p._id, 'r', 1, { muxEnabled: true, tunnelTransport: 'splithttp', xhttpPath: '/fixture-hop' });
+    Object.defineProperty(rev, '_rebuildVless', { enumerable: false });
     const output = composeRebuildProfiles({ nodes: [r, b, p], links: [edge('f', 'r', 'b', 2, { mode: 'forward' }),
-        edge('rev', p._id, 'r', 1)], usersByNode: new Map([[p._id, [{ userId: 'dummy', xrayUuid: id(301) }]]]),
+        rev], usersByNode: new Map([[p._id, [{ userId: 'dummy', xrayUuid: id(301) }]]]),
     panelTls: { serverName: 'cover.invalid', certificate: ['dummy-cert'], key: ['dummy-key'] } });
     const main = byNode(output, p._id.toHexString());
     const orig = main.inbounds.find(i => i.tag === 'custom-main');
@@ -93,15 +104,26 @@ test('completion uses existing per-hop forward and reverse primitives, actual Xr
     assert.deepEqual(extra.streamSettings.tlsSettings.certificates[0].certificate, ['dummy-cert']);
     assert.equal(extra.settings.clients[0].flow, undefined);
     assert.equal(extra.settings.clients[0].id, orig.settings.clients[0].id);
-    assert.equal(route(main, 'custom-extra'), 'portal-rev');
+    assert.equal(route(main, 'custom-extra'), 'rebuild-rp-egress-rev');
     assert.equal(route(main, 'API_INBOUND'), 'API');
     const relay = byNode(output, 'r');
-    assert.equal(route(relay, 'bridge-rev'), 'fwd-f');
+    const connector = main.inbounds.find(i => i.tag === 'rebuild-rp-conn-rev');
+    const dialer = relay.outbounds.find(o => o.tag === 'rebuild-rp-dial-rev');
+    assert.equal(connector.settings.decryption, syntheticTunnelSettings(1).decryption);
+    assert.deepEqual(dialer.settings, { address: p.ip, port: connector.port, id: connector.settings.clients[0].id,
+        encryption: syntheticTunnelSettings(1).encryption, reverse: { tag: 'rebuild-rp-ingress-rev' } });
+    assert.equal(dialer.mux, undefined, 'native reverse multiplexes internally');
+    assert.equal(connector.streamSettings.network, 'xhttp');
+    assert.deepEqual(dialer.streamSettings.xhttpSettings, connector.streamSettings.xhttpSettings);
+    assert.equal(route(relay, dialer.settings.reverse.tag), 'fwd-f');
+    assert.equal(byNode(output, 'r', 'bridge').outbounds.length, 1);
     const forward = relay.outbounds.find(outbound => outbound.tag === 'fwd-f');
     const exit = byNode(output, 'b', 'bridge');
     const hop = exit.inbounds.find(inbound => inbound.tag === 'fwd-hop-f');
     assert.equal(forward.settings.vnext[0].port, hop.port);
     assert.equal(forward.settings.vnext[0].users[0].id, hop.settings.clients[0].id);
+    assert.equal(forward.settings.vnext[0].users[0].encryption, syntheticTunnelSettings(2).encryption);
+    assert.equal(hop.settings.decryption, syntheticTunnelSettings(2).decryption);
     assert.equal(route(exit, hop.tag), 'freedom');
 });
 
@@ -115,12 +137,12 @@ test('dead and detached profiles are closed, remove stale tunnel ownership, and 
     assert.deepEqual([...new Set(output.map(p => p.nodeId))].sort(), ['b', 'p', 'r']);
     assert.equal(route(byNode(output, 'p'), 'client-p', 'domain:geo.invalid'), 'block');
     assert.equal(byNode(output, 'p').routing.domainStrategy, 'IPIfNonMatch', 'no geo IP lookup when no exit is possible');
-    assert.equal(route(byNode(output, 'r'), 'bridge-pr'), 'block');
+    assert.equal(route(byNode(output, 'r'), 'rebuild-rp-ingress-pr'), 'block');
     for (const profile of output) assert.equal(profile.config.outbounds.some(o => o.protocol === 'freedom'), false);
     const detached = composeRebuildProfiles({ ...input, links: [] });
     for (const profile of detached) {
         assert.equal(profile.config.reverse, undefined);
-        assert.equal(profile.config.inbounds.some(i => /bridge-conn|fwd-hop/.test(i.tag)), false);
+        assert.equal(profile.config.inbounds.some(i => /^(rebuild-rp-|bridge-conn-|fwd-hop-)/.test(i.tag)), false);
         assert.equal(profile.config.outbounds.length, 1);
     }
 });
@@ -131,6 +153,17 @@ test('rejects colliding listener ownership across MAIN and BRIDGE and missing ex
     assert.throws(() => composeRebuildProfiles({ nodes, links: [link] }), { code: 'REBUILD_LISTENER_COLLISION' });
     assert.throws(() => composeRebuildProfiles({ nodes, links: [{ ...link, tunnelUuid: undefined }] }),
         { code: 'REBUILD_INVALID_TUNNEL' });
+    for (const mode of ['forward', 'reverse']) {
+        assert.throws(() => composeRebuildProfiles({ nodes, links: [edge('no-keys', 'p', 'b', 1, { mode, _rebuildVless: undefined })] }),
+            { code: 'REBUILD_INVALID_TUNNEL_KEY_SETTINGS' });
+    }
+    assert.throws(() => composeRebuildProfiles({ nodes, links: [edge('plaintext', 'p', 'b', 1, {
+        _rebuildVless: { decryption: 'none', encryption: 'none' },
+    })] }), { code: 'REBUILD_INVALID_TUNNEL_KEY_SETTINGS' });
+    const relay = node('r', 'relay', 3);
+    relay.xray.inboundTag = 'rebuild-rp-ingress-rev';
+    assert.throws(() => composeRebuildProfiles({ nodes: [...nodes, relay], links: [edge('rev', 'p', 'r', 1)] }),
+        { code: 'REBUILD_TUNNEL_TAG_COLLISION' });
 });
 
 test('geo-only relay blocks unmatched traffic; broken geo edge does not spill into another exit', () => {
@@ -140,7 +173,7 @@ test('geo-only relay blocks unmatched traffic; broken geo edge does not spill in
     const output = composeRebuildProfiles({ nodes, links });
     const relay = byNode(output, 'r');
     assert.equal(route(byNode(output, 'p'), 'client-p'), 'fwd-pr');
-    assert.equal(route(relay, 'fwd-hop-pr', 'domain:geo.invalid'), 'portal-rb');
+    assert.equal(route(relay, 'fwd-hop-pr', 'domain:geo.invalid'), 'rebuild-rp-egress-rb');
     assert.equal(route(relay, 'fwd-hop-pr', 'full:closed.invalid'), 'block');
     assert.equal(route(relay, 'fwd-hop-pr'), 'block');
     assert.equal(route(relay, 'client-r'), 'block');
@@ -150,15 +183,31 @@ test('geo-only relay blocks unmatched traffic; broken geo edge does not spill in
 
 test('TLS tunnels use explicitly supplied certs, not ambient environment', () => {
     const nodes = [node('p', 'portal', 1), node('b', 'bridge', 2)];
-    const links = [edge('tls', 'p', 'b', 1, { tunnelSecurity: 'tls', tlsServerName: 'panel.invalid' })];
+    const links = [edge('tls', 'p', 'b', 1, { tunnelSecurity: 'tls', tlsServerName: 'panel.invalid', _rebuildVless: undefined })];
     assert.throws(() => composeRebuildProfiles({ nodes, links, panelTls: { serverName: 'panel.invalid' } }),
         { code: 'PANEL_CERT_UNAVAILABLE' });
     const output = composeRebuildProfiles({ nodes, links, panelTls: {
         serverName: 'panel.invalid', certificate: ['fixture-cert'], key: ['fixture-key'],
     } });
-    const inbound = byNode(output, 'p').inbounds.find(item => item.tag === 'bridge-conn-tls');
-    const outbound = byNode(output, 'b', 'bridge').outbounds.find(item => item.tag === 'tunnel-tls');
+    const inbound = byNode(output, 'p').inbounds.find(item => item.tag === 'rebuild-rp-conn-tls');
+    const outbound = byNode(output, 'b', 'bridge').outbounds.find(item => item.tag === 'rebuild-rp-dial-tls');
     assert.equal(inbound.streamSettings.tlsSettings.certificates[0].certificate[0], 'fixture-cert');
     assert.equal(outbound.streamSettings.tlsSettings.serverName, 'panel.invalid');
     assert.equal(outbound.streamSettings.tlsSettings.allowInsecure, undefined);
+    assert.equal(inbound.settings.decryption, 'none');
+    assert.equal(outbound.settings.encryption, 'none');
+});
+
+test('forward VMess retains its wire settings without VLESS keys', () => {
+    const nodes = [node('p', 'portal', 1), node('b', 'bridge', 2)];
+    const links = [edge('vmess', 'p', 'b', 1, { mode: 'forward', tunnelProtocol: 'vmess', muxEnabled: true,
+        muxConcurrency: 4, _rebuildVless: undefined })];
+    const output = composeRebuildProfiles({ nodes, links });
+    const outbound = byNode(output, 'p').outbounds.find(item => item.tag === 'fwd-vmess');
+    const inbound = byNode(output, 'b', 'bridge').inbounds.find(item => item.tag === 'fwd-hop-vmess');
+    assert.equal(outbound.protocol, 'vmess');
+    assert.equal(inbound.protocol, 'vmess');
+    assert.equal(inbound.settings.decryption, undefined);
+    assert.deepEqual(outbound.settings.vnext[0].users, [{ id: inbound.settings.clients[0].id, security: 'auto', alterId: 0 }]);
+    assert.deepEqual(outbound.mux, { enabled: true, concurrency: 4 });
 });

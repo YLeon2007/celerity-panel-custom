@@ -1,36 +1,71 @@
 'use strict';
 
 const generator = require('../../../services/configGenerator');
+const { tunnelSettings } = require('../../../services/rebuildLinkKeys');
 const { composeXrayConfig } = require('./xrayConfigComposer');
 const { compileRebuildGraph, rebuildId, requireRebuild } = require('../domain/rebuildTopologyCompiler');
 
 const REBUILD_POLICY_RULE_PREFIX = 'rebuild-policy-';
-const short = entry => entry.id.slice(-8); // same tags/domains as the classic tunnel helpers
-const ingressTag = entry => `${entry.mode === 'reverse' ? 'bridge' : 'fwd-hop'}-${short(entry)}`;
-const egressTag = entry => `${entry.mode === 'reverse' ? 'portal' : 'fwd'}-${short(entry)}`;
+const short = entry => entry.id.slice(-8);
+const ingressTag = entry => `${entry.mode === 'reverse' ? 'rebuild-rp-ingress' : 'fwd-hop'}-${short(entry)}`;
+const egressTag = entry => `${entry.mode === 'reverse' ? 'rebuild-rp-egress' : 'fwd'}-${short(entry)}`;
 const validPort = port => Number.isSafeInteger(port) && port > 0 && port <= 65535;
 const address = node => typeof node.ip === 'string' && /^\S+$/.test(node.ip);
+const encrypted = key => typeof key === 'string' && key.length > 0 && key !== 'none' && !/\s/.test(key);
 
-function projectLinks(graph) {
+function projectLinks(graph, options) {
     const shortIds = new Set();
     const result = new Map();
     for (const entry of graph.byLinkId.values()) {
-        const link = entry.link;
-        const source = graph.byNodeId.get(entry.source).node;
-        const target = graph.byNodeId.get(entry.target).node;
-        requireRebuild(address(entry.mode === 'reverse' ? source : target), 'REBUILD_INVALID_NODE_ADDRESS');
-        requireRebuild(validPort(link.tunnelPort) && typeof link.tunnelUuid === 'string' && /^\S+$/.test(link.tunnelUuid)
-            && (!link.tunnelDomain || typeof link.tunnelDomain === 'string' && /^[a-z0-9.-]+$/i.test(link.tunnelDomain))
-            && ['vless', 'vmess'].includes(link.tunnelProtocol ?? 'vless')
-            && ['none', 'tls', 'reality'].includes(link.tunnelSecurity ?? 'none')
+        const { link, protocol } = entry;
+        const reverse = entry.mode === 'reverse';
+        const server = graph.byNodeId.get(reverse ? entry.source : entry.target).node;
+        const security = link.tunnelSecurity ?? 'none';
+        const port = link.tunnelPort;
+        const id = link.tunnelUuid;
+        requireRebuild(address(server), 'REBUILD_INVALID_NODE_ADDRESS');
+        requireRebuild(validPort(port) && typeof id === 'string' && /^\S+$/.test(id)
+            && ['none', 'tls', 'reality'].includes(security)
             && ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'].includes(link.tunnelTransport ?? 'tcp'), 'REBUILD_INVALID_TUNNEL');
-        if (link.tunnelSecurity === 'reality') {
+        if (security === 'reality') {
             requireRebuild(typeof link.realityPrivateKey === 'string' && link.realityPrivateKey.length > 0
                 && typeof link.realityPublicKey === 'string' && link.realityPublicKey.length > 0, 'REBUILD_INVALID_TUNNEL');
         }
         requireRebuild(!shortIds.has(short(entry)), 'REBUILD_TUNNEL_TAG_COLLISION');
         shortIds.add(short(entry));
-        result.set(entry.id, { ...link, _id: entry.id, portalNode: source, bridgeNode: target });
+
+        let decryption = 'none';
+        let encryption = 'none';
+        if (protocol === 'vless' && security === 'none') {
+            const keys = tunnelSettings(link);
+            decryption = keys?.decryption;
+            encryption = keys?.encryption;
+            requireRebuild(encrypted(decryption) && encrypted(encryption), 'REBUILD_INVALID_TUNNEL_KEY_SETTINGS');
+        }
+
+        // Xray creates the source-side outbound and the target-side inbound
+        // from these reverse tags. There is no legacy control-domain route.
+        const client = { id, ...(reverse ? { reverse: { tag: egressTag(entry) } } : {}) };
+        const endpoint = { address: server.ip, port };
+        const dialUser = protocol === 'vmess' ? { id, alterId: 0, security: 'auto' } : { id, encryption };
+        const dialSettings = reverse
+            ? { ...endpoint, ...dialUser, reverse: { tag: ingressTag(entry) } }
+            : { vnext: [{ ...endpoint, users: [dialUser] }] };
+        result.set(entry.id, {
+            listener: {
+                tag: reverse ? `rebuild-rp-conn-${short(entry)}` : ingressTag(entry),
+                listen: '0.0.0.0', port, protocol,
+                settings: { clients: [client], ...(protocol === 'vless' ? { decryption } : {}) },
+                streamSettings: generator.buildCascadeTunnelStreamSettings(link, { ...options, server: true }),
+                ...(!reverse ? { sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true } } : {}),
+            },
+            dialer: {
+                tag: reverse ? `rebuild-rp-dial-${short(entry)}` : egressTag(entry),
+                protocol, settings: dialSettings,
+                streamSettings: generator.buildCascadeTunnelStreamSettings(link, options),
+                ...(!reverse && link.muxEnabled ? { mux: { enabled: true, concurrency: link.muxConcurrency || 8 } } : {}),
+            },
+        });
     }
     return result;
 }
@@ -74,19 +109,19 @@ function mainProfile(node, users, options) {
     return { config, tags, subscriberDenies };
 }
 
-function addLinkArtifacts(config, entry, projected, options) {
-    const find = mode => entry.incoming.filter(link => link.mode === mode).map(link => projected.get(link.id));
-    generator.applyForwardHopInbound(config, find('forward'), { ...options, transitOnly: true });
-    generator.applyReverseBridge(config, find('reverse'), null, { ...options, scopeControl: true });
-    for (const edge of entry.outgoing) {
-        const link = projected.get(edge.id);
-        if (edge.mode === 'reverse') generator.applyReversePortal(config, [link], [], options);
-        else generator.applyForwardChain(config, [link], [], [], [], options);
+function addLinkArtifacts(config, entry, projected) {
+    // A reverse edge switches which endpoint dials, not the payload direction.
+    // Append only: Xray falls back to the first outbound (blackhole).
+    for (const edge of entry.incoming) {
+        const { listener, dialer } = projected.get(edge.id);
+        if (edge.mode === 'reverse') config.outbounds.push(dialer);
+        else config.inbounds.push(listener);
     }
-    // Xray uses its FIRST outbound for unmatched traffic. The reverse bridge
-    // helper prepends dialers in classic profiles; restore fail-closed ordering.
-    const block = config.outbounds.findIndex(outbound => outbound.tag === 'block');
-    config.outbounds.unshift(...config.outbounds.splice(block, 1));
+    for (const edge of entry.outgoing) {
+        const { listener, dialer } = projected.get(edge.id);
+        if (edge.mode === 'reverse') config.inbounds.push(listener);
+        else config.outbounds.push(dialer);
+    }
 }
 
 function addSharedPolicy(config, tags, entry, graph) {
@@ -109,7 +144,7 @@ function addSharedPolicy(config, tags, entry, graph) {
     add('default', entry.defaultLink ? egressTag(entry.defaultLink) : 'block');
 }
 
-function assertListeners(main, bridge) {
+function assertProfileOwnership(main, bridge) {
     const ports = new Set();
     // The generators use only TCP listeners, either wildcard or loopback.
     // A wildcard also owns the corresponding loopback port across profiles.
@@ -121,8 +156,11 @@ function assertListeners(main, bridge) {
     for (const config of [main, bridge]) {
         const inbounds = new Set(config.inbounds.map(inbound => inbound.tag));
         const outbounds = new Set(config.outbounds.map(outbound => outbound.tag));
-        requireRebuild(config.reverse?.bridges?.every(bridge => !inbounds.has(bridge.tag)) !== false
-            && config.reverse?.portals?.every(portal => !outbounds.has(portal.tag)) !== false, 'REBUILD_TUNNEL_TAG_COLLISION');
+        const reverseIngress = config.outbounds.map(outbound => outbound.settings?.reverse?.tag).filter(Boolean);
+        const reverseEgress = config.inbounds.flatMap(inbound => (inbound.settings?.clients ?? [])
+            .map(client => client.reverse?.tag).filter(Boolean));
+        requireRebuild(reverseIngress.every(tag => !inbounds.has(tag))
+            && reverseEgress.every(tag => !outbounds.has(tag)), 'REBUILD_TUNNEL_TAG_COLLISION');
     }
 }
 
@@ -132,7 +170,7 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
         && (panelTls.serverName === undefined || typeof panelTls.serverName === 'string'), 'REBUILD_INVALID_PANEL_TLS');
     const options = { panelTls };
     const graph = compileRebuildGraph({ nodes, links, affectedNodeIds });
-    const projected = projectLinks(graph);
+    const projected = projectLinks(graph, options);
     const users = collectUsers(usersByNode);
     const profiles = [];
     for (const [nodeId, entry] of graph.byNodeId) {
@@ -141,12 +179,12 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
         const transit = entry.incoming.map(ingressTag);
         if (entry.isExit) {
             bridge.log = generator.buildXrayLogSection(entry.node);
-            addLinkArtifacts(bridge, entry, projected, options);
+            addLinkArtifacts(bridge, entry, projected);
             bridge.outbounds.push({ tag: 'freedom', protocol: 'freedom', settings: { domainStrategy: 'UseIPv4' } });
             bridge.routing.rules.push({ type: 'field', ip: ['geoip:private'], inboundTag: transit.slice(), outboundTag: 'block' },
                 { type: 'field', inboundTag: transit, outboundTag: 'freedom' });
         } else {
-            addLinkArtifacts(main, entry, projected, options);
+            addLinkArtifacts(main, entry, projected);
             // Only generated client and forward-hop inbounds have sniffing.
             // Leave reverse connectors and non-transit client settings alone.
             if (entry.carryDomain) {
@@ -163,7 +201,7 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
                 controlPlaneAddresses, carryDomain: entry.carryDomain,
                 policy: [...subscriberDenies, ...main.routing.rules.filter(rule => rule.ruleTag?.startsWith(REBUILD_POLICY_RULE_PREFIX))] });
         }
-        assertListeners(main, bridge);
+        assertProfileOwnership(main, bridge);
         profiles.push({ nodeId, profile: 'main', config: composeXrayConfig(main, []) },
             { nodeId, profile: 'bridge', config: composeXrayConfig(bridge, []) });
     }

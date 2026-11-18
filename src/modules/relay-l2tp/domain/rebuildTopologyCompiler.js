@@ -79,11 +79,14 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
         requireRebuild(from.node.active !== false && to.node.active !== false, 'REBUILD_INACTIVE_ENDPOINT');
         const id = refId(link);
         const mode = link.mode === undefined ? 'reverse' : link.mode;
+        const protocol = link.tunnelProtocol ?? 'vless';
         const priority = link.priority === undefined ? DEFAULT_PRIORITY : link.priority;
         requireRebuild(mode === 'reverse' || mode === 'forward', 'REBUILD_INVALID_MODE');
+        requireRebuild(protocol === 'vless' || (mode === 'forward' && protocol === 'vmess'), 'REBUILD_INVALID_TUNNEL');
         requireRebuild(Number.isFinite(priority), 'REBUILD_INVALID_PRIORITY');
         requireRebuild(!byLinkId.has(id), 'REBUILD_DUPLICATE_LINK');
-        const entry = { id, source, target, mode, priority, ...geoSelectors(link.geoRouting), link };
+        // Preserve the original descriptor, including non-persisted key material.
+        const entry = { id, source, target, mode, protocol, priority, ...geoSelectors(link.geoRouting), link };
         byLinkId.set(id, entry);
         from.outgoing.push(entry);
         to.incoming.push(entry);
@@ -122,7 +125,7 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
         const routedGeoLinks = entry.geoLinks.filter(link => byNodeId.get(link.target).hasExit);
         entry.hasExit = entry.isExit || !!entry.defaultLink || routedGeoLinks.length > 0;
 
-        // Reverse mux does not carry route-only sniff metadata. Work out
+        // Native reverse does not carry route-only sniff metadata. Work out
         // whether a client (or forward-hop) sniff must replace the destination
         // before crossing a reverse edge to a later domain policy.
         const routedLinks = entry.defaultLink ? [...routedGeoLinks, entry.defaultLink] : routedGeoLinks;

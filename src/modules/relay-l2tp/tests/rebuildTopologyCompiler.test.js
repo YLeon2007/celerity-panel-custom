@@ -60,9 +60,22 @@ test('invalid graph and incomplete scope are refused without serializing source 
         ['REBUILD_UNKNOWN_NODE', [edge('ab', 'z-portal', 'missing')]],
         ['REBUILD_INVALID_EDGE_ROLE', [edge('ab', 'b-exit', 'z-portal')]],
         ['REBUILD_INVALID_PRIORITY', [edge('ab', 'z-portal', 'b-exit', { priority: '1' })]],
+        ['REBUILD_INVALID_TUNNEL', [edge('vm', 'z-portal', 'b-exit', { tunnelProtocol: 'vmess' })]],
         ['REBUILD_INVALID_GEO', [edge('ab', 'z-portal', 'b-exit', { geoRouting: { enabled: true } })]],
         ['REBUILD_DUPLICATE_LINK', [edge('ab', 'z-portal', 'b-exit'), edge('ab', 'z-portal', 'a-exit')]],
     ]) {
         assert.throws(() => compileRebuildGraph({ nodes, links, affectedNodeIds }), { code });
     }
+});
+
+test('normalizes the protocol without cloning the separately prepared link descriptor', () => {
+    const reverse = edge('reverse', 'z-portal', 'a-exit');
+    Object.defineProperty(reverse, '_rebuildVless', { value: Object.freeze({ decryption: 'fixture', encryption: 'fixture' }) });
+    Object.freeze(reverse);
+    const forward = edge('forward', 'z-portal', 'b-exit', { tunnelProtocol: 'vmess', mode: 'forward' });
+    const graph = compileRebuildGraph({ nodes, links: [reverse, forward] });
+    assert.ok(graph.byLinkId.get('reverse').link === reverse);
+    assert.ok(graph.byLinkId.get('reverse').link._rebuildVless === reverse._rebuildVless);
+    assert.equal(graph.byLinkId.get('reverse').protocol, 'vless');
+    assert.equal(graph.byLinkId.get('forward').protocol, 'vmess');
 });
