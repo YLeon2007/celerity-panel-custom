@@ -13,6 +13,12 @@ const lifecycleSchema = new mongoose.Schema({
     desiredVersion: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
 }, { _id: false, versionKey: false, strict: 'throw' });
 
+function hideRebuildSecrets(_doc, row) {
+    delete row.rebuildVlessKeyEnvelope;
+    delete row._rebuildVless;
+    return row;
+}
+
 const cascadeLinkSchema = new mongoose.Schema({
     name: { type: String, required: true },
 
@@ -24,6 +30,16 @@ const cascadeLinkSchema = new mongoose.Schema({
     bridgeNode: { type: mongoose.Schema.Types.ObjectId, ref: 'HyNode', required: true },
 
     tunnelUuid: { type: String, required: true },
+    // Only the guarded rebuild key initializer writes this versioned AEAD
+    // envelope. CRUD/list queries and document serialization omit it.
+    rebuildVlessKeyEnvelope: {
+        type: String,
+        select: false,
+        validate: {
+            validator: value => /^v1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{22}$/.test(value),
+            message: 'REBUILD_LINK_KEY_INVALID',
+        },
+    },
     tunnelPort: { type: Number, default: 10086 },
     tunnelDomain: { type: String, default: 'reverse.tunnel.internal' },
     tunnelProtocol: { type: String, enum: ['vless', 'vmess'], default: 'vless' },
@@ -92,7 +108,11 @@ const cascadeLinkSchema = new mongoose.Schema({
     lastError: { type: String, default: '' },
     lastHealthCheck: { type: Date, default: null },
     latencyMs: { type: Number, default: null },
-}, { timestamps: true });
+}, {
+    timestamps: true,
+    toJSON: { transform: hideRebuildSecrets },
+    toObject: { transform: hideRebuildSecrets },
+});
 
 cascadeLinkSchema.index({ portalNode: 1 });
 cascadeLinkSchema.index({ bridgeNode: 1 });
