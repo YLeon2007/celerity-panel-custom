@@ -76,7 +76,7 @@ class LocalNodeSSH {
 // Test-only crash injector. Hook acknowledged product boundaries, never fabricate a result,
 // run a worker directly or forward the first child's identity to the recovering backend.
 function injectCrash(point) {
-    const stop=name=>{if(name===point){fs.writeSync(1,'CRASH_POINT '+name+'\n');process.kill(process.pid,'SIGKILL');}};
+    const stop=name=>{if(name===point){fs.writeSync(1,'CRASH_TRACE '+JSON.stringify(trace.runner)+'\nCRASH_POINT '+name+'\n');process.kill(process.pid,'SIGKILL');}};
     function wrap(Type,name,before,after) {
         const original=Type.prototype[name];assert.equal(typeof original,'function');
         Type.prototype[name]=async function(...args){before?.(...args);const value=await original.apply(this,args);after?.(value,...args);return value;};
@@ -86,6 +86,12 @@ function injectCrash(point) {
     const executor=require('../../services/topologyOperationExecutor').TopologyOperationExecutor;
     const finalizer=require('../../services/topologyOperationFinalizer').TopologyOperationFinalizer;
     let bindings=0;
+    if(point==='partial-takeover') {
+        const claim=store.prototype.withPartialPortalClaim;
+        store.prototype.withPartialPortalClaim=function(req,selected,work){
+            return claim.call(this,req,selected,(...args)=>{stop('partial-takeover');return work(...args);});
+        };
+    }
     wrap(store,'reserveBinding',()=>{if(bindings===0)stop('bindings-0');},value=>{assert.ok(value);stop('bindings-'+(++bindings));});
     wrap(repo,'recordNode',null,(value,req)=>{if(value===true)stop(req.state+'-'+(String(req.node)===nodes[0].id?'P':'B'));});
     for (const command of ['prepare','commit']) wrap(executor,command,null,(value,ctx)=>{

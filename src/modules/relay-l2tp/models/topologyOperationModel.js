@@ -139,6 +139,8 @@ const topologyOperationSchema = new mongoose.Schema({
     executionContext: executionContextField(),
     // Durable closure intent/proofs; blocks reclaim even after lease expiry.
     v2Terminal: { type: mongoose.Schema.Types.Mixed, default: undefined },
+    // Atomic takeover receipt; private to the production reservation recovery path.
+    reservationHandoff: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     undispatchedPreparationContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     undispatchedPreparationSettlement: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     closedSettlementContinuation: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },

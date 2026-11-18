@@ -30,7 +30,7 @@ function partialReservationMember(expected) {
 const OPTIONS = { maxTimeMS: TIMEOUT_MS, timeoutMS: TIMEOUT_MS };
 const NUMBER_TYPES = ['double', 'int', 'long'];
 const OWNER_PRIVATE_FIELDS = '+legacyAppliedTopology +profileTargetPin +executionEnrollment';
-const OPERATION_PRIVATE_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
+const OPERATION_PRIVATE_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath +reservationHandoff';
 function executionAttemptFilter(context,attempt){
     if(context.target!=='test')return {attempts:attempt};
     return {$or:[{attempts:attempt},{
@@ -902,6 +902,14 @@ class TopologyExecutionBindingStore {
         const reservations = await Binding.find({ operationId }).read('primary').readConcern('majority').limit(2).setOptions(OPTIONS).lean();
         if (reservations.length > 1 || (reservations.length === 1 && reservations[0].nodeId !== String(before.nodes[0].node))) return null;
         const old = before.leaseOwner, pending = [];
+        const prior = before.reservationHandoff;
+        // A repeat takeover is scoped to the exact acknowledged transaction.
+        // Do not infer the binding's creator from the current lease holder or
+        // authorize a legacy/malformed receipt. No command may have begun.
+        if (prior !== undefined && (!exact(prior, ['kind','operationId','attempt','fingerprint','holder','nonce','members'])
+            || prior.kind !== 'first-reservation-handoff-v1' || prior.operationId !== operationId || prior.attempt !== 1
+            || prior.fingerprint !== before.admissionFingerprint || prior.holder !== old || !matches(prior.nonce,UUID)
+            || before.executionBindingCheck !== prior.nonce || !Array.isArray(prior.members) || prior.members.length !== 2)) throw failure();
         await this.#indexes();
         await selected.verifySelected(before);
         for (const [i, n] of before.nodes.entries()) {
@@ -923,14 +931,29 @@ class TopologyExecutionBindingStore {
             const evidence = this.#ownerEvidence(ownerRow,enrollment);
             if (!await this.#majority(HyNode,this.#nodeFilter(enrollment))) throw failure();
             const reservation = reservations[i];
-            if (reservation) this.#checkRow(reservation,enrollment,expected);
-            pending.push({ lock, expected, enrollment, evidence, original: reservation ? recordProjection(reservation) : null });
+            let creatorExpected = expected;
+            if (prior !== undefined) {
+                const m = prior.members[i];
+                if (!exact(m,['nodeId','generation','original']) || m.nodeId !== nodeId || m.generation !== lock.generation
+                    || lock.executionBindingCheck !== prior.nonce || +lock.leaseUntil !== +before.leaseUntil) throw failure();
+                if (reservation) {
+                    if (!m.original || !isDeepStrictEqual(m.original,recordProjection(reservation)) || !token(m.original.owner)) throw failure();
+                    // Only for immutable record comparison; DB leases and every
+                    // CAS still identify the actual previous/current holders.
+                    creatorExpected = {...expected,owner:m.original.owner};
+                } else if (m.original !== null) throw failure();
+            }
+            if (reservation) this.#checkRow(reservation,enrollment,creatorExpected);
+            pending.push({ lock, expected, creatorExpected, enrollment, evidence, original: reservation ? recordProjection(reservation) : null });
         }
         const checkPhysical = () => this.#checkPristinePair(pending.map(({enrollment,evidence}) => ({ ...enrollmentProjection(enrollment),
             maintenanceId: enrollment.maintenanceId, originalSnapshot: evidence.originalSnapshot })));
         await checkPhysical();
         const leaseUntil = new Date(Date.now() + leaseMs), nonce = randomUUID();
-        const opMatch = { ...filter, leaseOwner: old, leaseUntil: before.leaseUntil, admissionFingerprint: before.admissionFingerprint };
+        const opMatch = { ...filter, leaseOwner: old, leaseUntil: before.leaseUntil, admissionFingerprint: before.admissionFingerprint,
+            reservationHandoff: prior === undefined ? {$exists:false} : prior, ...(prior !== undefined ? {executionBindingCheck:prior.nonce} : {}) };
+        const handoff = {kind:'first-reservation-handoff-v1',operationId,attempt:1,fingerprint:before.admissionFingerprint,
+            holder:owner,nonce,members:pending.map(({expected:e,original})=>({nodeId:e.nodeId,generation:e.generation,original}))};
         const transfer = { $set: { leaseUntil, executionBindingCheck: nonce } };
         let acknowledged;
         await this.#transaction(async session => {
@@ -940,27 +963,28 @@ class TopologyExecutionBindingStore {
                 || await Lock.countDocuments({ operationId }).setOptions(opts) !== 2
                 || await Binding.countDocuments({ operationId }).setOptions(opts) !== reservations.length) throw failure();
             await selected.verifySelected(op,session);
-            for (const [i, {expected,evidence,enrollment,lock}] of pending.entries()) {
+            for (const [i, {expected,creatorExpected,evidence,enrollment,lock}] of pending.entries()) {
                 this.#checkOperationRow(op,expected);
                 if (!isDeepStrictEqual(await this.#enrollment(expected,session),enrollment)
                     || await Binding.countDocuments({enrollmentId:enrollment._id}).setOptions(opts) !== (reservations[i] ? 1 : 0)) throw failure();
                 if (reservations[i]) {
                     const row = await Binding.findById(reservations[i]._id).setOptions(opts).lean();
-                    this.#checkRow(row,enrollment,expected);
+                    this.#checkRow(row,enrollment,creatorExpected);
                     if (!isDeepStrictEqual(row,reservations[i])) throw failure();
                 }
                 const ownerFilter = { ...this.#ownerFilter(enrollment,evidence), lastSettledOperation: {$exists:false}, lastSettledGeneration: {$exists:false} };
                 await this.#cas(Owner,ownerFilter,nonce,session);
                 await this.#cas(HyNode,this.#nodeFilter(enrollment),nonce,session);
                 if ((await Lock.updateOne({ _id: lock._id, operationId, node:expected.nodeId, owner:old,
-                    generation:lock.generation, remoteUncertain:true, leaseUntil:lock.leaseUntil, $expr:expired },
+                    generation:lock.generation, remoteUncertain:true, leaseUntil:lock.leaseUntil, $expr:expired,
+                    ...(prior !== undefined ? {executionBindingCheck:prior.nonce} : {}) },
                     { $set:{ ...transfer.$set, owner } },opts)).matchedCount !== 1) throw failure();
             }
-            if ((await Operation.updateOne(opMatch,{ $set:{ ...transfer.$set, leaseOwner:owner } },opts)).matchedCount !== 1) throw failure();
+            if ((await Operation.updateOne(opMatch,{ $set:{ ...transfer.$set, leaseOwner:owner, reservationHandoff:handoff } },opts)).matchedCount !== 1) throw failure();
         }, async deadline => {
             const op = await this.#majority(Operation,{ _id:operationId, leaseOwner:owner, attempts:1, status:'preparing',
                 heldTopologyAdmission:true, executionBindingCheck:nonce, leaseUntil }, deadline);
-            if (!op || !isDeepStrictEqual(op.nodes,before.nodes)) throw failure('UNCONFIRMED');
+            if (!op || !isDeepStrictEqual(op.reservationHandoff,handoff) || !isDeepStrictEqual(op.nodes,before.nodes)) throw failure('UNCONFIRMED');
             for (const {expected} of pending) if (!await this.#majority(Lock,{operationId,node:expected.nodeId,
                 owner,generation:expected.generation,remoteUncertain:true,executionBindingCheck:nonce,leaseUntil},deadline)) throw failure('UNCONFIRMED');
             acknowledged = op;

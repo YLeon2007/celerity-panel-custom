@@ -463,8 +463,8 @@ test('a scan with an advanced local clock but no takeover capability keeps a por
 const crashPoints = ['bindings-0','bindings-1','bindings-2','prepared-P','prepared-B',
     'committed-P','committed-B','verified','closing','closed-P','succeeded',
     'prepare-receipt-P','prepare-receipt-B','commit-receipt-P','commit-receipt-B',
-    'users-restored','closed-B','proven'];
-for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:230000}, async t=>{
+    'users-restored','closed-B','proven','portal-takeover-kill'];
+for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:cut==='portal-takeover-kill'?430000:230000}, async t=>{
     const startup = true;
     const user = { xrayUuid: '550e8400-e29b-41d4-a716-446655440000', userId: 'local-fixture' };
     const port = await new Promise(resolve => {
@@ -553,36 +553,73 @@ for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:2300
             const line=out.split('\n').find(l=>l.startsWith('CLOSING_ROOT '));const trace=line?JSON.parse(line.slice(13)):null;
             if(failpoint){assert.equal(result.signal,'SIGKILL',JSON.stringify(trace));assert.ok(out.split('\n').includes('CRASH_POINT '+failpoint));}
             else {assert.equal(result.code,0);assert.ok(trace);}
-            return {pid:child.pid,trace};
+            const crashTrace=out.split('\n').find(l=>l.startsWith('CRASH_TRACE '));
+            return {pid:child.pid,trace,commands:failpoint?JSON.parse(crashTrace.slice(12)):trace.runner};
         }
         const snapshot=async()=>({op:await models.Operation.findById(operationId).lean(),locks:await models.Lock.find({operationId}).sort({node:1}).lean(),
             bindings:await models.Binding.find({operationId}).sort({nodeId:1}).lean(),count:(await Topology.findById('singleton').lean()).topologyAdmissionCount});
-        assert.equal((await snapshot()).op.status,'queued');const first=await boot(cut);const pre=await snapshot();
-        assert.equal(pre.bindings.length,cut.startsWith('bindings-')?Number(cut.slice(-1)):2);
+        const doubleKill=cut==='portal-takeover-kill', firstCut=doubleKill?'bindings-1':cut;
+        assert.equal((await snapshot()).op.status,'queued');const first=await boot(firstCut);const pre=await snapshot();
+        assert.equal(pre.bindings.length,firstCut.startsWith('bindings-')?Number(firstCut.slice(-1)):2);
         assert.equal(pre.locks.length,cut==='succeeded'?0:2); assert.equal(pre.count,cut==='succeeded'?0:1);
+        const receiptCut=/^(prepare|commit)-receipt-(P|B)$/.exec(cut);
+        if(receiptCut){
+            const [,cmd,role]=receiptCut,i=role==='P'?0:1,n=localNodes[i],b=pre.bindings.find(row=>row.nodeId===n.id);
+            const journal=JSON.parse(fs.readFileSync(n.journal));const r=journal.generations[b.generation].commands[b.commandIds[cmd]];
+            assert.equal(r.state,'completed');assert.equal(r.receipt.commandId,b.commandIds[cmd]);assert.equal(r.receipt.operationId,operationId);
+            assert.equal(pre.op.nodes[i].state,cmd==='prepare'?'pending':'prepared');
+            assert.equal(first.commands.filter(([id,c])=>id===n.id&&c===cmd).length,1);
+        }
+        const waitExpiry=async state=>{
+            const dbNow=(await connection.db.admin().command({hello:1})).localTime;
+            const due=Math.max(+state.op.leaseUntil,...state.locks.map(l=>+l.leaseUntil));
+            assert.ok(due-Number(dbNow)<=121000);await new Promise(ok=>setTimeout(ok,Math.max(0,due-Number(dbNow))+25));
+        };
         if(cut!=='succeeded') {
             // Wait for the real DB clock, no fake expired lease and no recovery edits.
-            const dbNow=(await connection.db.admin().command({hello:1})).localTime;
-            const due=Math.max(+pre.op.leaseUntil,...pre.locks.map(l=>+l.leaseUntil));
-            assert.ok(due-Number(dbNow)<=121000);await new Promise(ok=>setTimeout(ok,Math.max(0,due-Number(dbNow))+25));
+            await waitExpiry(pre);
             const bridge=localNodes[1], original=fs.readFileSync(bridge.configPath);
-            for(const fault of ['node','guard','drift']) {
+            for(const fault of ['node','guard','drift', ...(cut==='closing'?['conflicting-runner-receipt']:[])]) {
+                let originalJournal;
+                if(fault==='conflicting-runner-receipt') {
+                    // A syntactically valid receipt with the wrong command identity,
+                    // on a pair that the healthy control below can actually finish.
+                    // Mutate only this fake-root journal; never mutate Mongo recovery state.
+                    const binding=pre.bindings.find(row=>row.nodeId===bridge.id);
+                    originalJournal=fs.readFileSync(bridge.journal);const journal=JSON.parse(originalJournal);
+                    const record=journal.generations[binding.generation].commands[binding.commandIds.verify];
+                    assert.equal(record.receipt.commandId,binding.commandIds.verify);
+                    record.receipt.commandId=randomUUID();fs.writeFileSync(bridge.journal,JSON.stringify(journal));
+                }
                 if(fault==='guard')fs.renameSync(bridge.socket,bridge.socket+'.held');
                 if(fault==='drift')fs.appendFileSync(bridge.configPath,' ');
                 try {const {trace}=await boot(undefined,fault);const blocked=await snapshot();
                     assert.deepEqual(trace.runner,[],fault);assert.deepEqual(blocked.locks,pre.locks,fault);assert.equal(blocked.count,1);
                     assert.deepEqual(blocked.bindings,pre.bindings);assert.equal(blocked.op.heldTopologyAdmission,true);
-                }finally{if(fault==='drift')fs.writeFileSync(bridge.configPath,original);if(fault==='guard')fs.renameSync(bridge.socket+'.held',bridge.socket);}
+                    if(originalJournal){assert.deepEqual(blocked.op,pre.op);assert.deepEqual(trace.transfers,[]);assert.ok(trace.physicalPairReads.includes(bridge.id));}
+                }finally{if(originalJournal)fs.writeFileSync(bridge.journal,originalJournal);if(fault==='drift')fs.writeFileSync(bridge.configPath,original);if(fault==='guard')fs.renameSync(bridge.socket+'.held',bridge.socket);}
             }
         }
+        if(doubleKill){
+            const middle=await boot('partial-takeover'), transferred=await snapshot(), holder=`panel-${middle.pid}-topology`;
+            assert.deepEqual(first.commands,[]);assert.deepEqual(middle.commands,[]);
+            assert.notEqual(holder,pre.op.leaseOwner);assert.equal(transferred.op.leaseOwner,holder);
+            assert.deepEqual(transferred.bindings,pre.bindings);assert.equal(transferred.op.attempts,1);assert.equal(transferred.count,1);
+            assert.deepEqual(transferred.locks.map(l=>[String(l.node),l.owner,l.generation,+l.leaseUntil,l.remoteUncertain]),
+                pre.locks.map(l=>[String(l.node),holder,l.generation,+transferred.op.leaseUntil,true]));
+            await waitExpiry(transferred);
+        }
         const second=await boot();assert.notEqual(first.pid,second.pid);const after=await snapshot();
+        if(receiptCut){const [,cmd,role]=receiptCut;assert.ok(!second.commands.some(([id,c])=>id===localNodes[role==='P'?0:1].id && c===cmd),'acknowledged effect dispatched twice');}
+        if(doubleKill && after.op.status==='succeeded') for(const n of localNodes)for(const cmd of ['prepare','commit','verify','close'])
+            assert.equal(second.commands.filter(([id,c])=>id===n.id&&c===cmd).length,1);
         assert.equal(await models.Operation.countDocuments({}),1);assert.equal(after.op.attempts,pre.op.attempts);
         assert.deepEqual(second.trace.scanned,[cut==='succeeded'?[]:[operationId]]);
         for(const b of pre.bindings)assert.deepEqual(after.bindings.find(v=>v._id===b._id),b);
         assert.ok(['succeeded','rolled_back','failed'].includes(after.op.status),`${cut}: still ${after.op.status}, locks=${after.locks.length} admission=${after.count}`);
         const why = JSON.stringify({cut,status:after.op.status,states:after.op.nodes.map(n=>n.state),
             commands:second.trace.runner.map(([,command])=>command), failures:second.trace.failures.map(({phase,code,frames})=>({phase,code,frames}))});
-        if (cut === 'bindings-0' || cut === 'bindings-1') assert.equal(after.op.status, 'succeeded', why);
+        if (cut === 'bindings-0' || cut === 'bindings-1' || doubleKill) assert.equal(after.op.status, 'succeeded', why);
         assert.equal(after.op.heldTopologyAdmission,false,why);assert.equal(after.locks.length,0);assert.equal(after.count,0);
         if(after.op.status==='succeeded')assert.equal(after.op.v2Terminal.proofs.length,2);
         else for(const n of localNodes)assert.equal(fs.readFileSync(n.configPath,'utf8'),'{}\n');
