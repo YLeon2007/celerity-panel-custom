@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
 import tempfile
@@ -180,8 +179,8 @@ class ActualReadinessDispatch(unittest.TestCase):
         content = (json.dumps(config, separators=(',', ':')) + '\n').encode()
         self.prepared(content)
         executable = self.root / 'usr/local/bin/xray'
-        shutil.copyfile(binary, executable)
-        executable.chmod(0o750)
+        executable.unlink()
+        executable.symlink_to(Path(binary).resolve(strict=True))
         child = subprocess.Popen([binary, 'run', '-config', str(self.root / 'usr/local/etc/xray/config.json')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         def stop():
             if child.poll() is None:
@@ -213,6 +212,20 @@ class ActualReadinessDispatch(unittest.TestCase):
         self.assertEqual([{'id': u['account']['id'], 'email': u['email']} for u in actual], users)
         self.assertIsNone(self.engine.read()['dispatchInFlight'])
         self.assertEqual(self.dispatch('close', content)['phase'], 'closed')
+
+        # Neither a CRUD verb nor a new snapshot on the old binding is an
+        # ordinary post-settlement user mutation capability.
+        for command in ('add-user', 'disable-user', 'delete-user'):
+            with self.subTest(command=command), self.assertRaisesRegex(m.Refusal, 'INVALID_COMMAND'):
+                self.engine.dispatch(self.request(command, content), b'', self.fd)
+        self.assertIsNone(self.engine.read()['dispatchInFlight'])
+        replacement = (json.dumps({'users': [dict(users[0], email='bob')]}, separators=(',', ':')) + '\n').encode()
+        altered = {**checks, 'snapshotSha256': hashlib.sha256(replacement).hexdigest()}
+        with self.assertRaisesRegex(m.Refusal, 'RUNNER_OUTCOME_UNKNOWN_RETAINED'):
+            self.dispatch('restore-users', content, altered, replacement)
+        self.assertIsNotNone(self.engine.read()['dispatchInFlight'])
+        after = json.loads(query().stdout)['users']
+        self.assertEqual(after, actual, 'closed generation did not touch real Xray runtime membership')
 
 
 if __name__ == '__main__':

@@ -25,3 +25,26 @@ test('dedicated TEST publication health binds physical service and listener to v
  const missing=createDedicatedTestNodeHealth({authority:{readCurrentHealth:async()=>[]},connect:()=>{throw Error('must not probe');}});
  assert.deepEqual(await missing({nodes:[node]}),[{nodeId:'p',healthy:false}]);assert.deepEqual(node,before);
 });
+
+test('publication health uses an actual loopback listener and does not equate TCP alone with applied health', async () => {
+ const { createDedicatedTestNodeHealth } = require('../services/topologyDedicatedTestHealth');
+ const { createServer } = require('node:net');
+ const { once } = require('node:events');
+ const server = createServer(socket => socket.end()).listen(0, '127.0.0.1');
+ await once(server, 'listening');
+ const node = { nodeId: 'p', ip: '127.0.0.1', port: server.address().port, candidateHash: 'a'.repeat(64) };
+ let observedHash = node.candidateHash;
+ const read = createDedicatedTestNodeHealth({ authority: { readCurrentHealth: async () => [
+  { nodeId: node.nodeId, endpoint: { ip: node.ip }, healthy: true, configSha256: observedHash },
+ ] } });
+ const expectHealth = async healthy => assert.deepEqual(await read({ nodes: [node] }), [{ nodeId: node.nodeId, healthy }]);
+ try {
+  await expectHealth(true);
+  observedHash = 'b'.repeat(64);
+  await expectHealth(false);
+ } finally {
+  await new Promise(resolve => server.close(resolve));
+ }
+ observedHash = node.candidateHash;
+ await expectHealth(false);
+});

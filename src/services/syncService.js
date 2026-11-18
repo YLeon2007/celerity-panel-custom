@@ -28,6 +28,7 @@ const { invalidateNodesCache, invalidateUserCache } = require('../utils/helpers'
 const logger = require('../utils/logger');
 const axios = require('axios');
 const https = require('https');
+const { performance } = require('node:perf_hooks');
 const config = require('../../config');
 const webhook = require('./webhookService');
 const { extractXrayOnlineUserIds } = require('../utils/userClientStats');
@@ -849,6 +850,7 @@ class SyncService {
             }
 
             const userEntries = Object.entries(users);
+            const observedAt = performance.now();
             const now = new Date();
             const snapshotKey = node._id?.toString?.() || node.id || node.name;
             const previousUsers = this.xrayUserStatsSnapshots.get(snapshotKey) || {};
@@ -919,7 +921,7 @@ class SyncService {
             if (nodeTx > 0 || nodeRx > 0 || activeUsers > 0) {
                 logger.info(`[Agent Stats] ${node.name}: ${activeUsers} online, node ↑${(nodeTx / 1024 / 1024).toFixed(1)}MB ↓${(nodeRx / 1024 / 1024).toFixed(1)}MB`);
             }
-            return { onlineUserIds: onlineWindowUserIds, nodeKey: snapshotKey, ok: true };
+            return { onlineUserIds: onlineWindowUserIds, nodeKey: snapshotKey, observedAt, ok: true };
         } catch (error) {
             logger.error(`[Agent Stats] ${node.name} error: ${error.message}`);
             const nodeKey = node._id?.toString?.() || node.id || node.name;
@@ -1368,20 +1370,31 @@ class SyncService {
                     ok: true,
                     nodeKey: node._id?.toString?.() || node.id || node.name,
                     onlineUserIds: extractAgentOnlineUserIds(response.data || {}),
+                    observedAt: performance.now(),
                 };
             }));
-
-            results.forEach((result) => {
-                if (result.status !== 'fulfilled') return;
-                const value = result.value;
-                if (!value || !value.nodeKey || !Array.isArray(value.onlineUserIds)) return;
-                this.xrayNodeOnlineUsers.set(value.nodeKey, new Set(value.onlineUserIds.map(String)));
-            });
+            this.#recordOnlineSamples(results);
         }
 
-        const merged = mergeNodeOnlineContributions(this.xrayNodeOnlineUsers, [...activeXrayNodeKeys]);
+        await this.#publishOnlineSamples(activeXrayNodeKeys, 10);
+    }
+
+    #recordOnlineSamples(results) {
+        for (const result of results) {
+            if (result.status !== 'fulfilled') continue;
+            const sample = result.value;
+            if (sample?.ok !== true || !sample.nodeKey || !Array.isArray(sample.onlineUserIds)
+                || !Number.isFinite(sample.observedAt)) continue;
+            const previous = this.xrayNodeOnlineUsers.get(sample.nodeKey);
+            if (previous && previous.observedAt > sample.observedAt) continue;
+            this.xrayNodeOnlineUsers.set(sample.nodeKey, { ids: sample.onlineUserIds, observedAt: sample.observedAt });
+        }
+    }
+
+    async #publishOnlineSamples(activeXrayNodeKeys, ttl) {
+        const merged = mergeNodeOnlineContributions(this.xrayNodeOnlineUsers, activeXrayNodeKeys, performance.now());
         this.xrayNodeOnlineUsers = merged.contributions;
-        await cache.setXrayOnlineUsers([...merged.userIds], 10);
+        await cache.setXrayOnlineUsers([...merged.userIds], ttl);
     }
 
     /**
@@ -1403,28 +1416,10 @@ class SyncService {
                     this.getOnlineUsers(node)
                 ])
             );
-            results.forEach((result) => {
-                if (result.status !== 'fulfilled') return;
-                const value = result.value;
-                if (!value || !value.nodeKey || !Array.isArray(value.onlineUserIds)) return;
-                // Only a successful stats response should replace that node's
-                // contribution. A timeout/unavailable node must not erase users
-                // reported by other nodes or cause whole-list flicker.
-                if (value.ok) {
-                    this.xrayNodeOnlineUsers.set(value.nodeKey, new Set(value.onlineUserIds.map(String)));
-                }
-            });
+            this.#recordOnlineSamples(results);
         }
 
-        for (const nodeKey of this.xrayNodeOnlineUsers.keys()) {
-            if (!activeXrayNodeKeys.has(nodeKey)) this.xrayNodeOnlineUsers.delete(nodeKey);
-        }
-
-        const xrayOnlineUserIds = new Set();
-        for (const ids of this.xrayNodeOnlineUsers.values()) {
-            ids.forEach(userId => xrayOnlineUserIds.add(userId));
-        }
-        await cache.setXrayOnlineUsers([...xrayOnlineUserIds], Math.max(45, cache.ttl.ONLINE_SESSIONS || 10));
+        await this.#publishOnlineSamples(activeXrayNodeKeys, Math.max(45, cache.ttl.ONLINE_SESSIONS || 10));
         
         // Update last stats collection time
         this.lastSyncTime = new Date();
@@ -1450,13 +1445,12 @@ class SyncService {
     }
 
     /**
-     * Atomically flip an enabled user to disabled, tear down their runtime
-     * presence (Xray clients, Hysteria sessions), invalidate caches and emit
-     * the appropriate webhook.
+     * Atomically flip an enabled user to disabled, request runtime revocation,
+     * invalidate caches and emit the appropriate webhook. A successful DB
+     * update does not prove runtime revocation.
      *
-     * Compare-and-set on { enabled: true } makes this idempotent: concurrent
-     * scheduler/catchup/stats callers race only on the DB write — the loser
-     * exits early and no side-effect is duplicated.
+     * Recheck both enabled and the reason at the write: a snapshot selected
+     * by a scheduler may already have been renewed or reset by an operator.
      *
      * @param {object} user   plain user object; must have userId
      * @param {string} reason 'expired' | 'traffic'
@@ -1465,8 +1459,20 @@ class SyncService {
     async disableUser(user, reason) {
         if (!user || !user.userId) return false;
 
+        const filter = { userId: user.userId, enabled: true, ...(user._id ? { _id: user._id } : {}) };
+        if (reason === 'expired') {
+            filter.expireAt = { $ne: null, $lte: new Date() };
+        } else if (reason === 'traffic') {
+            filter.trafficLimit = { $gt: 0 };
+            filter.$expr = { $gte: [
+                { $add: [{ $ifNull: ['$traffic.tx', 0] }, { $ifNull: ['$traffic.rx', 0] }] },
+                '$trafficLimit',
+            ] };
+        } else {
+            return false;
+        }
         const result = await HyUser.updateOne(
-            { userId: user.userId, enabled: true },
+            filter,
             { $set: { enabled: false } }
         );
         if (result.modifiedCount === 0) return false;
