@@ -223,6 +223,22 @@ test('rollback restores exact snapshot and closes with an explicit rolledback te
     assert.equal(f.ok('close').terminalOutcome, 'rolledback');
     assert.match(f.run('commit', { commandId: 'late-commit' }).stderr, /GENERATION_CLOSED/);
 });
+for (const originallyAbsent of [false, true]) test(`operator abort safety: refuse third-state profile before rollback intent (absent=${originallyAbsent})`, t => {
+    const f = fixture(t), config = 'usr/local/etc/xray/config.json';
+    const journal = path.join(f.root, 'var/lib/celerity/topology/fences/xray-main/journal.json');
+    if (originallyAbsent) fs.unlinkSync(path.join(f.root, config));
+    f.ok('prepare'); f.ok('commit');
+    // A different link acquired a new fragment on the same active profile.
+    const drift = '{"inbounds":[],"outbounds":[{"tag":"neighbour-after-commit","protocol":"freedom"}]}\n';
+    f.put(config, drift);
+    const before = fs.readFileSync(journal), serviceLog = fs.readFileSync(path.join(f.root,'systemctl.log'));
+    const refused = f.run('rollback');
+    assert.notEqual(refused.status, 0);
+    assert.equal(JSON.parse(refused.stderr).code, 'ROLLBACK_PROFILE_DRIFT_RETAINED');
+    assert.equal(fs.readFileSync(path.join(f.root, config),'utf8'), drift);
+    assert.deepEqual(fs.readFileSync(journal), before);
+    assert.deepEqual(fs.readFileSync(path.join(f.root,'systemctl.log')), serviceLog);
+});
 // Physical primitives for operator abort; no DB/lease release or control-plane
 // cancellation is exercised here. Use the shipped runner in two separate roots.
 for (const committed of [0, 1, 2]) test(`operator abort prerequisites: baseline on both participants after ${committed} commits`, t => {

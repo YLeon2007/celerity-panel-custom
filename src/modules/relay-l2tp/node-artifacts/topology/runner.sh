@@ -545,6 +545,19 @@ def main():
                    close=('new', 'prepared', 'verified', 'rolledback'))
     if current['phase'] not in allowed[command]:
         refuse('INVALID_PHASE')
+    if command == 'rollback':
+        # Under the same exclusive runner lock as the effect, reject a third
+        # state before recording intent. A drifted file may belong to a peer
+        # link in this profile. An absent original is not a wildcard to unlink.
+        profile = binding['targetProfile']
+        backup_dir = state + '/backups/' + binding['backupId'] + '/' + profile
+        saved = profile_bytes(backup_dir + '/config.json')
+        absent = profile_bytes(backup_dir + '/config.absent')
+        if (saved is None) == (absent is None) or absent not in (None, b''):
+            refuse('ROLLBACK_SNAPSHOT_UNPROVEN')
+        active = profile_bytes(root + '/usr/local/etc/' + ('xray' if profile == 'xray-main' else 'xray-bridge') + '/config.json')
+        if active != saved and (active is None or 'sha256:' + hashlib.sha256(active).hexdigest() != binding['candidateHash']):
+            refuse('ROLLBACK_PROFILE_DRIFT_RETAINED')
     previous_phase = current['phase']
     current['phase'] = command + '-running'
     current['commands'][command_id] = dict(state='running', command=command)
