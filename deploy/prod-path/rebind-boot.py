@@ -177,6 +177,8 @@ def apply(a):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='phase', required=True)
+    guest = sub.add_parser('guest', allow_abbrev=False, help='report the closed selected-guest transition gate')
+    guest.add_argument('--role', choices=('B', 'P', 'cohost'), required=True)
     for verb in ('guard', 'inspect', 'publish'):
         p = sub.add_parser(verb)
         for arg in ('project', 'accept-boot', 'old-panel-sha', 'old-host-sha', 'old-guard-sha'):
@@ -185,8 +187,14 @@ def main():
             p.add_argument('--previous-guard-policy', required=True)
         if verb == 'publish':
             p.add_argument('--accept-host-sha', required=True)
+    args = parser.parse_args()
+    if args.phase == 'guest':
+        # A5 can consume this refusal without host checks or authority-bearing
+        # inputs. This is not a reboot probe or a request to stage a guard.
+        print('C3_REBIND_REFUSED:SELECTED_GUEST_BOOT_TRANSITION_UNSUPPORTED')
+        return 1
     try:
-        apply(parser.parse_args())
+        apply(args)
         return 0
     except P['Refused'] as exc:
         print('C3_REBIND_REFUSED:' + str(exc))
