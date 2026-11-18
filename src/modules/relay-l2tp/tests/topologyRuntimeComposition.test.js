@@ -502,6 +502,42 @@ function heldRuntimeFixture(context = PROD) {
     return fixture;
 }
 
+test('held shell runtime resync after closing never calls the masked classic agent', { timeout: 5000 }, async () => {
+    const f = heldRuntimeFixture(PROD);
+    delete f.controller.runnerTransport; // Ordinary physical controller: shell bootstrap, not preinstalled.
+    f.deps.env.TOPOLOGY_TEST_EXECUTION_ENABLED = 'false';
+    const stage = [], user = { userId: 'fixture', xrayUuid: '550e8400-e29b-41d4-a716-446655440000' };
+    f.deps.HyNode.findById = id => ({ lean: async () => ({ _id: id, type: 'xray' }) });
+    const service = createTopologyOperationRuntime(f.deps).operationWorker.userResync;
+    service.attempts = 1;
+    service.logger = { warn() {} };
+    service._syncService = { async _getUsersForNode() { return [user]; },
+        async addXrayUser() { stage.push('classic.agent'); return false; } };
+    const { withTopologyReadinessScope } = require('../services/topologyReadinessScope');
+    const { randomUUID } = require('node:crypto');
+    const entries = ['xray-main', 'xray-bridge'].map((profile, i) => ({
+        binding: { nodeId: String(i), targetProfile: profile, commandIds: { verify: randomUUID() }, bootId: randomUUID() },
+        poison() {}, async invoke(command, request) {
+            stage.push(profile + '.' + command);
+            assert.deepEqual(request.users, [{ id: user.xrayUuid, email: user.userId }]);
+            return { ok: true, code: 'XRAY_USERS_RESTORED', userCount: 1 };
+        },
+    }));
+    const plan = { nodes: [{ node: '0' }, { node: '1' }] };
+    const resync = () => service.resyncPlan(plan);
+    const result = await withTopologyReadinessScope(entries, async () => {}, resync);
+    assert.deepEqual(stage, ['xray-main.restore-users'], 'first differing stage in the verified mutation scope');
+    assert.equal(result.ok, true); assert.equal(result.userCount, 1);
+    stage.length = 0;
+    assert.equal((await resync()).ok, false, 'absent held scope must refuse');
+    assert.deepEqual(stage, []);
+    let reads = 0;
+    service._syncService._getUsersForNode = async () => ++reads === 1 ? [] : [user];
+    const changed = await withTopologyReadinessScope(entries, async () => {}, () => service.resyncPlan({ nodes: [plan.nodes[0]] }));
+    assert.equal(changed.ok, false, 'empty assignment changed during confirmation');
+    assert.deepEqual(stage, [], 'assignment changes cannot fall through to classic HTTP');
+});
+
 function assertHeldRuntime(service, context, options) {
     const { TopologyExecutionAuthorityLifecycle } = require('../runtime/topologyExecutionAuthorityLifecycle');
     const { TopologyExecutionBindingStore } = require('../repositories/topologyExecutionBindingStore');

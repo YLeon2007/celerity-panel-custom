@@ -75,7 +75,7 @@ class TopologyUserResync {
         // so every plan reaching the worker is a deploy.
         const syncService = this.syncService;
         if (typeof syncService?._getUsersForNode !== 'function'
-            || (!this.restrictedRunner && typeof syncService?.addXrayUser !== 'function')) {
+            || (!this.restrictedRunner && !this.preferBoundRunner && typeof syncService?.addXrayUser !== 'function')) {
             return {
                 nodeCount: 0,
                 userCount: 0,
@@ -103,11 +103,8 @@ class TopologyUserResync {
                 failedUsers.push({ node: id, userId: null, reason: 'USER_SNAPSHOT_UNPROVEN' });
                 continue;
             }
-            // Dedicated native TEST has no unfenced config-persisting agent.
-            // Nonempty assignments must use the existing held runner scope;
-            // missing scope never falls back to the legacy agent. Empty TEST
-            // assignments retain their previous zero-action behavior. The
-            // independently restricted production empty guard is unchanged.
+            // With classic writers excluded, a nonempty assignment must use the
+            // existing held runner scope. Never fall back to the agent.
             if (this.restrictedRunner || this.preferBoundRunner && preferredUsers.length > 0) {
                 try {
                     const { topologyReadinessProfile, invokeTopologyReadiness } = require('./topologyReadinessScope');
@@ -147,6 +144,14 @@ class TopologyUserResync {
             }
             nodeCount += 1;
             const users = await syncService._getUsersForNode(node);
+            if (this.preferBoundRunner) {
+                // Only a confirmed empty snapshot reaches this no-action path.
+                // A new assignment cannot authorize a legacy HTTP dispatch.
+                if (!Array.isArray(users) || users.length !== 0) {
+                    failedUsers.push({ node: id, userId: null, reason: 'USER_SNAPSHOT_UNPROVEN' });
+                }
+                continue;
+            }
             for (const user of users || []) {
                 if (await this.pushUser(node, user)) {
                     userCount += 1;

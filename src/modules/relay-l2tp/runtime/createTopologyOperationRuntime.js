@@ -277,7 +277,10 @@ function createTopologyOperationRuntime(dependencies = {}) {
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
         const userResync = new TopologyUserResync({ HyNode, restrictedRunner: Boolean(preinstalledRunnerAuthority),
-            preferBoundRunner: Boolean(bindingLifecycle) && ownerEnrollmentEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1' });
+            // The ordinary held production path also excludes the classic agent.
+            // Bootstrap selection does not select the post-verify user writer.
+            preferBoundRunner: Boolean(bindingLifecycle) && ((executionContext.target === 'production' && !preinstalledRunnerAuthority)
+                || ownerEnrollmentEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1') });
         // The runtime always wires the real node runner verifier. Missing
         // execution/model capabilities make the runtime unavailable, not ready.
         const pppGateDependencies = {
