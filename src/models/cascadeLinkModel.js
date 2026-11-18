@@ -70,6 +70,9 @@ const cascadeLinkSchema = new mongoose.Schema({
     priority: { type: Number, default: 100 },
 
     active: { type: Boolean, default: true },
+    // Keep endpoints available to a fresh operator Apply until both halves of
+    // a rebuild DELETE have passed readback. No startup recovery consumes it.
+    rebuildDelete: { type: Boolean, default: undefined },
     // Metadata only. Startup must never infer a fresh deploy from this flag.
     autoDeploy: { type: Boolean, default: false },
     // The old descriptor remains intact until operation-owned cleanup/readback

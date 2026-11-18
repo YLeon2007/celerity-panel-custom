@@ -39,7 +39,7 @@ function profilePreview(before, after, profile) {
 // readback succeeds for the whole original component. A fresh Apply uses the
 // same inventory after a crash. No operation replay or startup worker.
 async function runRebuild(d, req) {
-    return d.global(async()=>{
+    return d.global(async(verify = async()=>{})=>{
         const inventory=await d.links(), anchor=inventory.find(row=>id(row)===req.linkId);
         if (!anchor && !req.nodeId) throw fail('REBUILD_LINK_NOT_FOUND');
         const nodes=componentFor(inventory,anchor?ends(anchor):[req.nodeId]);
@@ -61,14 +61,16 @@ async function runRebuild(d, req) {
             const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report};
             if(req.preview) return result;
             if(!result.allowed)throw Object.assign(fail('REBUILD_CLIENT_CHANGE'),{preview:result});
+            await verify();
             if(req.remove && !anchor?.rebuildDelete) await d.markDelete?.(req.linkId);
+            if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }
             // A connection loss is reported as failure even if only a restart
             // was missed. Never skip an unchanged profile pair on a retry.
-            for(const [nodeId,pair] of pairs) await d.putPair(nodeId,pair);
+            for(const [nodeId,pair] of pairs) { await verify(); await d.putPair(nodeId,pair); }
             for(const [nodeId,pair] of pairs) for(const p of pair) {
                 if(!equal(await d.read(nodeId,p.profile),p.config))throw fail('REBUILD_READBACK_MISMATCH');
             }
-            await d.finish({nodes,desired,removed});return result;
+            await verify(); await d.finish({nodes,desired,removed});return result;
         });
     });
 }

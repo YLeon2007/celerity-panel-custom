@@ -257,6 +257,13 @@ class SyncService {
      * Self-signed certificates are accepted.
      */
     async _agentRequest(node, method, path, body = null) {
+        if (require('./rebuildMode').isRebuildEnabled() && method !== 'GET') {
+            return require('./rebuildLocks').withNode(node._id, () => this._sendAgentRequest(node, method, path, body));
+        }
+        return this._sendAgentRequest(node, method, path, body);
+    }
+
+    async _sendAgentRequest(node, method, path, body) {
         const xray = node.xray || {};
         const useTls = xray.agentTls !== false;
         const port = xray.agentPort || 62080;
@@ -487,6 +494,15 @@ class SyncService {
      * falls back to SSH restart.
      */
     async updateXrayNodeConfig(node) {
+        if (require('./rebuildMode').isRebuildEnabled()) {
+            // Serialize the database user snapshot as well as the subsequent POST.
+            // Standalone classic nodes continue to receive their regular full config.
+            return require('./rebuildLocks').withNode(node._id, async () => {
+                const cascade = node.cascadeRole && node.cascadeRole !== 'standalone' || await require('../models/cascadeLinkModel').exists({
+                    $or: [{ portalNode: node._id }, { bridgeNode: node._id }], active: true });
+                return this.#updateXrayNodeConfig(node, { topologyManaged: !!cascade, allowedStatuses: undefined, fenced: true });
+            });
+        }
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         const writerEnv = Object.freeze({ ...process.env });
         const allowedStatuses = usesTestTopologyConfig(node) ? APPLIED_LINK_STATUSES : undefined;
