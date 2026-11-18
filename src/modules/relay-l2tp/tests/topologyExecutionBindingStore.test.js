@@ -148,7 +148,7 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
     return { executor, events, Node };
 }
 async function setup(authority = goodAuthority, { publicOwner = false, nodes = [frozenNode], selected = {},
-    endpoint = ENDPOINT, owner = 'worker-17', emptyOriginal = false } = {}) {
+    endpoint = ENDPOINT, owner = 'worker-17', emptyOriginal = false, queued = false } = {}) {
     if (!models) {
         const bind = (name, location) => connection.model(name, require(location).schema);
         models = {
@@ -174,9 +174,11 @@ async function setup(authority = goodAuthority, { publicOwner = false, nodes = [
         idempotencyKey: `topology:production:revision-17:host-${PROD.hostIdentity}:${randomUUID()}`,
         topologyRevision: 17, priorDeployedRevision: 16, nodes, heldTopologyAdmission: true,
         admissionFingerprint: 'f'.repeat(64), ...selected, session }));
-    await repository.claim({ operationId, executionContext: PROD, owner, now: new Date(), leaseMs: 120000 });
-    await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: NODE, operationId,
-        owner, generation: context.executionFence.generation, leaseUntil: new Date(Date.now() + 120000) });
+    if (!queued) {
+        await repository.claim({ operationId, executionContext: PROD, owner, now: new Date(), leaseMs: 120000 });
+        await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: NODE, operationId,
+            owner, generation: context.executionFence.generation, leaseUntil: new Date(Date.now() + 120000) });
+    }
     const originalSnapshot = { configSha256: emptyOriginal ? emptyHash() : '3'.repeat(64), unitSha256: '4'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
     let ownerGeneration = OWNER_GENERATION;
     if (publicOwner) {
@@ -350,7 +352,7 @@ const bridgeNode = freeze({ ...frozenNode, node: BRIDGE, nodeRef: 'bridge', role
     configPath: '/usr/local/etc/xray-bridge/config.json', serviceUnit: 'xray-bridge.service',
     serviceUnitPath: '/etc/systemd/system/xray-bridge.service' });
 const emptyHash = () => createHash('sha256').update('{}\n').digest('hex');
-async function pairedScopes(afterWork, { firstApply = false, portalNode = frozenNode, startup = false } = {}) {
+async function pairedScopes(afterWork, { firstApply = false, portalNode = frozenNode, startup = false, queued = false } = {}) {
     const ep = startup ? {...ENDPOINT, username:'root'} : ENDPOINT,
         eb = startup ? {...BRIDGE_ENDPOINT, username:'root'} : BRIDGE_ENDPOINT;
     const held = new Set(), calls = [], inventory = new Map([
@@ -380,7 +382,7 @@ async function pairedScopes(afterWork, { firstApply = false, portalNode = frozen
         resourceNodeIds: [NODE, BRIDGE], baselineTopology: { nodes: [], links: [], groups: [] }, effectiveTopology: {
             nodes: nodes.map(n => ({ id: n.node, role: n.role, type: 'xray', active: true })), groups: [],
             links: [{ id: linkId, source: NODE, target: BRIDGE, mode: 'reverse', tunnelPort: 1443 }] } };
-    const first = await setup(authority, { publicOwner: true, nodes, selected, endpoint:ep, emptyOriginal:startup, ...(startup ? {owner:`panel-${process.pid}-topology`} : {}) });
+    const first = await setup(authority, { publicOwner: true, nodes, selected, endpoint:ep, emptyOriginal:startup, queued, ...(startup ? {owner:`panel-${process.pid}-topology`} : {}) });
     await models.HyNode.create({ _id: BRIDGE, ip: eb.ip, name: 'local-bridge', type: 'xray', active: true,
         cascadeRole: 'bridge', ssh: { port: eb.port, username: eb.username,
             privateKey: 'synthetic-local-fixture-not-a-key' } });
@@ -401,7 +403,7 @@ async function pairedScopes(afterWork, { firstApply = false, portalNode = frozen
         proofRef: 'SIMULATED-bridge-original' });
     const context = { ...first.context, node: bridgeNode,
         executionFence: freeze({ ...first.context.executionFence, generation: randomUUID() }) };
-    await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: BRIDGE,
+    if (!queued) await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: BRIDGE,
         operationId: context.operationId, owner: context.executionFence.owner, generation: context.executionFence.generation,
         leaseUntil: new Date(Date.now() + 120000) });
     const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
@@ -412,7 +414,7 @@ async function pairedScopes(afterWork, { firstApply = false, portalNode = frozen
         assertAuthorityHeld: async () => { assert.equal(revoked, false, 'external authority revoked'); assert.ok(held.size); }, ...models });
     for (const state of [first, second]) {
         await store.preEnroll(firstApply ? freeze({ ...state.enrollment, predecessorGeneration: 'none' }) : state.enrollment);
-        if (!firstApply || state === first) state.binding = await store.createBinding(state.expected);
+        if (!queued && (!firstApply || state === first)) state.binding = await store.createBinding(state.expected);
     }
     calls.length = 0;
     return { store, states: [first, second], held, calls, revoke: () => { revoked = true; } };
@@ -448,6 +450,129 @@ test('ordinary startup recovers first apply with only portal binding', async () 
     assert.ok(after.heldTopologyAdmission === false && ['succeeded','failed','rolled_back'].includes(after.status),
         `startup retained ${after.status}; claimed=${outcomes[0].claimed}; admission=${after.heldTopologyAdmission}`);
     assert.equal(await models.Lock.countDocuments({operationId}),0);
+});
+
+// The first backend owns a normally admitted operation. SIGKILL follows an acknowledged
+// product boundary. The second backend receives neither the id nor the former worker id.
+const crashPoints = ['bindings-0','bindings-1','bindings-2','prepared-P','prepared-B',
+    'committed-P','committed-B','verified','closing','closed-P','succeeded'];
+for (const cut of crashPoints) test(`cold startup matrix: ${cut}`, {timeout:230000}, async t=>{
+    const startup = true;
+    const user = { xrayUuid: '550e8400-e29b-41d4-a716-446655440000', userId: 'local-fixture' };
+    const port = await new Promise(resolve => {
+        const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
+    });
+    const config = { api: { tag: 'API', services: ['HandlerService'] }, inbounds: [
+        { tag: 'API_INBOUND', listen:'127.0.0.1', port, protocol:'dokodemo-door', settings:{address:'127.0.0.1'} },
+        { tag: 'users', listen:'127.0.0.1', port:0, protocol:'vless', settings:{decryption:'none', clients:[]} }],
+        outbounds:[{tag:'direct',protocol:'freedom'}], routing:{rules:[{type:'field', inboundTag:['API_INBOUND'],outboundTag:'API'}]} };
+    const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
+        ? Object.fromEntries(Object.keys(value).sort().map(k => [k,canonical(value[k])])) : value;
+    const bytes = Buffer.from(JSON.stringify(canonical(config))+'\n'), sha256 = createHash('sha256').update(bytes).digest('hex');
+    const portalNode = freeze({...frozenNode,candidateHash:sha256,candidate:{...frozenNode.candidate,bytes:[...bytes],sha256}});
+    const {states}=await pairedScopes(undefined,{firstApply:true,portalNode,startup,queued:true});
+    const operationId=states[0].context.operationId;
+    const stateModel = startup ? 'CascadeTopologyState' : 'SettlementTopology';
+    const Topology = connection.models[stateModel] || connection.model(stateModel, require('../models/cascadeTopologyStateModel').schema);
+    await Topology.deleteMany({}); await Topology.create({_id:'singleton',revision:17,deployedRevision:16,remoteAdmissionCount:0,topologyAdmissionCount:1});
+    // The admitted selection is fixture input; use real owner rows and the native closing CAS.
+    const owners = await models.Owner.find({}).sort({node:1}).lean();
+    const pins = owners.map(o => ({node:String(o.node),profile:o.profile,generation:o.generation}));
+    await models.Operation.collection.updateOne({_id:new mongoose.Types.ObjectId(operationId)}, {$set:{selectedOwnerPins:pins}});
+    let selected = { async verifySelected(op) { assert.deepEqual(op.selectedOwnerPins,pins); assert.deepEqual(op.resourceNodeIds,[NODE,BRIDGE]); } };
+    const linkModel = startup ? 'CascadeLink' : 'ClosingLink';
+    const Link = connection.models[linkModel] || connection.model(linkModel, require('../../../models/cascadeLinkModel').schema);
+    const linkId = '507f1f77bcf86cd799439013';
+    await Link.deleteMany({}); await Link.create({_id:linkId, name:'local',portalNode:NODE,bridgeNode:BRIDGE,tunnelUuid:randomUUID(),status:'pending'});
+    if (startup) {
+        // Build the pre-crash selection with the real admission reader, not fabricated pins.
+        const snapshotReader={HyNode:models.HyNode,CascadeLink:Link,readDraft:async()=>({groups:[],installedRouteOwners:[]})};
+        selected=new (require('../repositories/topologyDeploymentRepository').TopologyDeploymentRepository)({snapshotReader,CascadeTopologyState:Topology,
+            TopologyOperation:models.Operation,TopologyConfigOwner:models.Owner,NodeOperationLock:models.Lock});
+        const snapshot=await snapshotReader.readDraft(), data=await selected.readSelected({snapshot,scope:{kind:'link.apply',linkId},executionContext:PROD});
+        const fields=Object.fromEntries(['baselineTopology','effectiveTopology','resourceNodeIds','selectedOwnerPins','desiredVersion','routeState'].map(k=>[k,data[k]]));
+        const id={_id:new mongoose.Types.ObjectId(operationId)}, raw=await models.Operation.collection.findOne(id);
+        fields.admissionFingerprint=require('../repositories/topologyOperationRepository').selectedAdmissionFingerprint({...raw,...fields});
+        await models.Operation.collection.updateOne(id,{$set:fields});
+    }
+        const schemaModels = {...require('..').registerModels(),HyNode:require('../../../models/hyNodeModel'),CascadeLink:require('../../../models/cascadeLinkModel')};
+        for (const M of Object.values(schemaModels)) {
+            const local = connection.models[M.modelName] || connection.model(M.modelName,M.schema,M.collection.name);
+            await local.init(); await local.createCollection(); await local.createIndexes();
+        }
+        const hy=connection.models.HyNode; await hy.deleteMany({}); await hy.collection.insertMany(await models.HyNode.collection.find().toArray());
+        const users=connection.db.collection(require('../../../models/hyUserModel').collection.name);
+        await users.deleteMany({userId:user.userId});await users.insertOne({...user,enabled:true,groups:[],nodes:[new mongoose.Types.ObjectId(NODE)]});
+        const {config:replica}=await connection.getClient().db('admin').command({replSetGetConfig:1});
+    const localNodes=[], sockets=[];
+    try {
+        const {fakeRunner}=require('./helpers/topologyTerminalFakeRunner');
+        for(const s of states) {
+            const n=s.expected.nodeId, f=fakeRunner(t,BOOT), root=f.root, gen=s.enrollment.ownerGeneration;
+                const original=n===NODE?['3','4']:['7','8'];
+                const pin={kind:'node',nodeId:n,targetProfile:s.enrollment.targetProfile,physical:{...s.enrollment.nodeIdentity,bootId:BOOT},endpoint:s.enrollment.endpoint,
+                    privateKeyPath:'/etc/celerity/unused-local-fixture',maintenanceId:MAINTENANCE,policySha256:original[0].repeat(64),proofRef:'local-original',
+                    acceptedOwner:{owner:'topology',generation:gen},originalScope:{epoch:randomUUID(),bundleSha256:original[1].repeat(64),ownerGeneration:gen},
+                    originalSnapshot:{source:'node-readback',configSha256:emptyHash(),unitSha256:original[1].repeat(64),serviceActive:'active',serviceEnabled:'enabled'}};
+            const socket=path.join(root,'guard.sock');
+            const server=net.createServer(c=>c.resume()); await new Promise((ok,no)=>server.once('error',no).listen(socket,ok));sockets.push(server);
+            f.put(s.context.node.configPath,'{}\n');f.put('usr/local/bin/celerity-topology-node-runner-v2',fs.readFileSync(path.join(__dirname,'../node-artifacts/topology/runner.sh')),0o750);
+            if(n===BRIDGE) f.put('etc/systemd/system/xray-bridge.service',require('../../../services/configGenerator').generateBridgeSystemdService());
+            localNodes.push({id:n,root,socket,pin,journal:path.join(root,'var/lib/celerity/topology/fences',pin.targetProfile,'journal.json'),configPath:path.join(root,s.context.node.configPath)});
+        }
+        // Run a private Xray at the selected loopback API port independently of mock systemd.
+        const xcfg=path.join(localNodes[0].root,'api-fixture.json');fs.writeFileSync(xcfg,bytes);
+        fs.copyFileSync(process.env.C3_XRAY,path.join(localNodes[0].root,'usr/local/bin/xray'));
+        const xray=spawn(process.env.C3_XRAY,['run','-config',xcfg],{stdio:'ignore'});
+        t.after(async()=>{if(xray.exitCode===null && !xray.signalCode){const end=new Promise(ok=>xray.once('exit',ok));xray.kill();await end;}});
+        await until(()=>new Promise((ok,no)=>{const c=net.connect(port,'127.0.0.1');c.once('error',no);c.once('connect',()=>{c.destroy();ok();});}));
+            const rootConfig={version:1,executionContext:PROD,mode:'runtime',host:{...localNodes[0].pin,kind:'host'},nodes:localNodes.map(n=>n.pin),
+                admission:{serverContext:PROD,databaseName:dbName,maintenanceGeneration:randomUUID(),deployment:{setName:replica._id,replicaSetId:String(replica.settings.replicaSetId)},
+                    manifestSha256:require('../services/productionAdmissionInitializer').REVIEWED_MANIFEST_SHA256}};
+        async function boot(failpoint,fault) {
+            const child=spawn(process.execPath,[path.join(__dirname,'helpers/topologyClosingRootStartup.js')],{cwd:directory,
+                env:{TMPDIR:process.env.TMPDIR,PATH:process.env.PATH,NODE_ENV:'test',PANEL_DOMAIN:'test.invalid',ACME_EMAIL:'fixture@test.invalid',
+                    SESSION_SECRET:'local-only-test',JWT_SECRET:'local-only-test',ENCRYPTION_KEY:'0'.repeat(32)},stdio:['pipe','pipe','pipe']});
+            let out='';child.stdout.on('data',b=>{out+=b;});child.stderr.resume();
+            const joined=new Promise((ok,no)=>{child.once('error',no);child.once('close',(code,signal)=>ok({code,signal}));});
+            const timer=setTimeout(()=>child.kill('SIGKILL'),45000);
+            child.stdin.end(JSON.stringify({uri:`mongodb://127.0.0.1:${connection.port}/${dbName}?replicaSet=bindingScratch`,
+                config:rootConfig,nodes:localNodes,operationCollection:models.Operation.collection.name,cut:failpoint,fault}));
+            let result;try{result=await joined;}finally{clearTimeout(timer);}
+            const line=out.split('\n').find(l=>l.startsWith('CLOSING_ROOT '));const trace=line?JSON.parse(line.slice(13)):null;
+            if(failpoint){assert.equal(result.signal,'SIGKILL',JSON.stringify(trace));assert.ok(out.split('\n').includes('CRASH_POINT '+failpoint));}
+            else {assert.equal(result.code,0);assert.ok(trace);}
+            return {pid:child.pid,trace};
+        }
+        const snapshot=async()=>({op:await models.Operation.findById(operationId).lean(),locks:await models.Lock.find({operationId}).sort({node:1}).lean(),
+            bindings:await models.Binding.find({operationId}).sort({nodeId:1}).lean(),count:(await Topology.findById('singleton').lean()).topologyAdmissionCount});
+        assert.equal((await snapshot()).op.status,'queued');const first=await boot(cut);const pre=await snapshot();
+        assert.equal(pre.bindings.length,cut.startsWith('bindings-')?Number(cut.slice(-1)):2);
+        assert.equal(pre.locks.length,cut==='succeeded'?0:2); assert.equal(pre.count,cut==='succeeded'?0:1);
+        if(cut!=='succeeded') {
+            // Wait for the real DB clock, no fake expired lease and no recovery edits.
+            const dbNow=(await connection.db.admin().command({hello:1})).localTime;
+            const due=Math.max(+pre.op.leaseUntil,...pre.locks.map(l=>+l.leaseUntil));
+            assert.ok(due-Number(dbNow)<=121000);await new Promise(ok=>setTimeout(ok,Math.max(0,due-Number(dbNow))+25));
+            const bridge=localNodes[1], original=fs.readFileSync(bridge.configPath);
+            for(const fault of ['node','guard','drift']) {
+                if(fault==='guard')fs.renameSync(bridge.socket,bridge.socket+'.held');
+                if(fault==='drift')fs.appendFileSync(bridge.configPath,' ');
+                try {const {trace}=await boot(undefined,fault);const blocked=await snapshot();
+                    assert.deepEqual(trace.runner,[],fault);assert.deepEqual(blocked.locks,pre.locks,fault);assert.equal(blocked.count,1);
+                    assert.deepEqual(blocked.bindings,pre.bindings);assert.equal(blocked.op.heldTopologyAdmission,true);
+                }finally{if(fault==='drift')fs.writeFileSync(bridge.configPath,original);if(fault==='guard')fs.renameSync(bridge.socket+'.held',bridge.socket);}
+            }
+        }
+        const second=await boot();assert.notEqual(first.pid,second.pid);const after=await snapshot();
+        assert.equal(await models.Operation.countDocuments({}),1);assert.equal(after.op.attempts,pre.op.attempts);
+        assert.deepEqual(second.trace.scanned,[cut==='succeeded'?[]:[operationId]]);
+        for(const b of pre.bindings)assert.deepEqual(after.bindings.find(v=>v._id===b._id),b);
+        assert.ok(['succeeded','rolled_back','failed'].includes(after.op.status),`${cut}: still ${after.op.status}, locks=${after.locks.length} admission=${after.count}`);
+        assert.equal(after.op.heldTopologyAdmission,false);assert.equal(after.locks.length,0);assert.equal(after.count,0);
+        if(after.op.status==='succeeded')assert.equal(after.op.v2Terminal.proofs.length,2);
+        else for(const n of localNodes)assert.equal(fs.readFileSync(n.configPath,'utf8'),'{}\n');
+    }finally{await Promise.all(sockets.map(s=>new Promise(ok=>s.close(ok))));}
 });
 
 // Crash-boundary replay on the fixture's private loopback replica set. No pp16 I/O.
