@@ -27,6 +27,17 @@ function fixture(change) {
         } }) });
     return { authority, actions };
 }
+test('one physical observation per shared host/node per checkpoint, no cross-checkpoint cache', async () => {
+    const {authority,actions}=fixture({});
+    try {
+        await authority.withHeldAuthority(PROD,async c=>{
+            assert.deepEqual(actions,['observe']);
+            await c.assertHeld(); await c.assertHeld();
+            assert.deepEqual(actions,['observe','observe','observe']);
+        });
+        assert.equal(actions.filter(a=>a==='observe').length,4);
+    } finally { authority.close(); }
+});
 for (const [name, change] of [['accepted', {}], ['wrong epoch', { epoch: randomUUID() }], ['wrong original bytes', { bundleSha256: 'd'.repeat(64) }]]) {
     test(`runtime reattach verifies independent originals before enrollment callback: ${name}`, async () => {
         const { authority, actions } = fixture(change); let entered = 0;

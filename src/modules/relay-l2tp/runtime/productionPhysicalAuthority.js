@@ -109,9 +109,15 @@ function createProductionPhysicalAuthority({ config: input, read = privateRead, 
             busy = true; let scopeOpen = true; const observations = new Map();
             const refresh = async () => {
                 need(scopeOpen && !poisoned && !closed);
+                // A co-located host/node was opened as one independently pinned helper.
+                // Share its observation only within this checkpoint; validate both logical pins.
+                // Never cache across callbacks, lease transitions or physical commands.
+                let hostObservation;
                 for (const pin of pins) {
                     const channel = channels.get(key(pin)); need(channel?.alive);
-                    const v = await channel.request('observe');
+                    const v = pin === sharedHostNode && channel === channels.get('host')
+                        ? hostObservation : await channel.request('observe');
+                    if (pin === config.host) hostObservation = v;
                     const pairedKind = v.kind === pin.kind || (pin.kind === 'host' && sharedHostNode && v.kind === 'node'
                         && v.nodeId === sharedHostNode.nodeId && v.targetProfile === sharedHostNode.targetProfile);
                     need(scopeOpen && channel.alive && same(v.serverContext, PROD) && pairedKind && v.held === true
