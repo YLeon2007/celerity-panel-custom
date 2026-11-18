@@ -1,0 +1,13 @@
+[Unit]
+Description=C3 PROD persistent writer isolation check (does not create masks)
+After=local-fs.target
+Before=c3-prod-guard.service c3-prod-backend.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3.13 -I -B /opt/hysteria-panel/deploy/prod-path/preflight.py isolation
+TimeoutStartSec=90s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,46 @@
+# Only with the source PROD docker-compose.yml, as the last file (Compose >= 2.24.4).
+services:
+  backend:
+    build: !reset null
+    image: ${C3_PROD_BACKEND_IMAGE:?approved backend image digest required}
+    pull_policy: never
+    user: "0:0" # The installed producer requires root-owned 0600 config/key files.
+    restart: "no" # PID1 orders the only sanctioned start; no Docker boot restart.
+    stop_grace_period: 35m
+    entrypoint: ["/bin/sh", "-ec", "node /app/deploy/prod-path/preflight-ssh.cjs && exec node /app/index.js"]
+    command: []
+    environment:
+      PANEL_DOMAIN: lm1.infograd.online
+      L2TP_EXECUTION_ENABLED: "true"
+      L2TP_MIGRATIONS_ENABLED: "true"
+      TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: "true"
+      TOPOLOGY_TEST_EXECUTION_ENABLED: "false"
+      TOPOLOGY_TEST_STARTUP_MODE: ""
+      L2TP_PRODUCTION_EXECUTION_ENABLED: "false"
+      UPDATER_URL: ""
+      UPDATER_SECRET: ""
+    volumes: !override
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./data:/app/data
+      - caddy_data:/caddy_data:ro
+      - type: bind
+        source: /etc/celerity
+        target: /etc/celerity
+        read_only: true
+        bind:
+          create_host_path: false
+  updater:
+    # Never enable the profile. Even if targeted explicitly, it cannot write.
+    profiles: [c3-disabled-updater]
+    build: !reset null
+    image: ${C3_PROD_BACKEND_IMAGE:?approved backend image digest required}
+    pull_policy: never
+    restart: "no"
+    entrypoint: ["/bin/false"]
+    command: []
+    working_dir: /app
+    environment: !override {}
+    volumes: !reset []
+    networks: !reset []
+    network_mode: none
