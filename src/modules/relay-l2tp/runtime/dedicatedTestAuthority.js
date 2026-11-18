@@ -52,15 +52,32 @@ function validate(config) {
 }
 async function connect(pin, read) {
     const { Client } = require('ssh2'); const client = new Client();
+    const readyTimeout = 10000;
     const channel = await new Promise((resolve, reject) => {
-        client.once('error', reject);
-        client.once('ready', () => client.exec('/usr/bin/python3 -I -B /usr/local/libexec/celerity-test-dedicated-node', (e, stream) => e ? reject(e) : resolve(stream)));
-        client.connect({ host: pin.endpoint.ip, port: pin.endpoint.port, username: pin.endpoint.username,
-            privateKey: read(pin.privateKeyPath), readyTimeout: 10000,
-            // Transport liveness must not undercut the existing 10s observation
-            // deadline. No observation deadline, operation lease or fence changes.
-            keepaliveInterval: 1000, keepaliveCountMax: 12,
-            hostVerifier: b => Buffer.isBuffer(b) && sha(b) === pin.hostKeySha256 });
+        let settled = false;
+        const finish = (error, stream) => {
+            if (settled) return;
+            settled = true; clearTimeout(timer);
+            if (error) reject(error); else resolve(stream);
+        };
+        // ssh2 clears readyTimeout on authentication, before exec is acknowledged.
+        // Keep one setup budget across both waits; no re-open after expiry.
+        const timer = setTimeout(() => finish(new Error('DEDICATED_AUTHORITY_OPEN_TIMEOUT')), readyTimeout);
+        client.on('error', finish);
+        client.once('close', () => finish(new Error('CHANNEL_LOST')));
+        client.once('ready', () => {
+            if (settled) return;
+            try {
+                client.exec('/usr/bin/python3 -I -B /usr/local/libexec/celerity-test-dedicated-node', (e, stream) => finish(e, stream));
+            } catch (e) { finish(e); }
+        });
+        try {
+            client.connect({ host: pin.endpoint.ip, port: pin.endpoint.port, username: pin.endpoint.username,
+                privateKey: read(pin.privateKeyPath), readyTimeout,
+                // Liveness must not undercut the existing 10s observation deadline.
+                keepaliveInterval: 1000, keepaliveCountMax: 12,
+                hostVerifier: b => Buffer.isBuffer(b) && sha(b) === pin.hostKeySha256 });
+        } catch (e) { finish(e); }
     }).catch(e => { client.destroy(); throw e; });
     let alive = true, buffer = '', pending;
     const close = () => { alive = false; pending?.reject(new Error('CHANNEL_LOST')); pending = undefined; client.end(); };
