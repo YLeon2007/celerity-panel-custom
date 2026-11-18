@@ -4,6 +4,7 @@ const {runRebuild}=require('./rebuildCoordinator');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {createTransport}=require('./rebuildTransport');
+const {prepareLinks}=require('./rebuildLinkKeys');
 const {createPrivateKey,createPublicKey}=require('node:crypto');
 const fail=code=>Object.assign(new Error(code),{code});
 // Subscriptions publish a separate X25519 public key. It never appears in
@@ -27,7 +28,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     compose=composeRebuildProfiles,env=process.env,cache=require('./cacheService')}={}){
     const gate=()=>{if(!isRebuildEnabled(env))throw fail('REBUILD_DISABLED');};
     async function execute(req,alreadyHeld){
-        gate();const transports=new Map(),states=new Map();
+        gate();const transports=new Map(),states=new Map();let prepared;
         try{return await runRebuild({global:alreadyHeld?fn=>fn(alreadyHeld):locks.run,withNodes,
             links:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]}).lean(),
             async build(ids,links){
@@ -49,7 +50,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     transports.set(String(node._id),connect(node));
                 }
                 const controlPlaneAddresses=[...new Set([env.PANEL_DOMAIN,...nodes.flatMap(n=>[n.ip,n.domain])].filter(Boolean))];
-                const candidates=compose({nodes,links,affectedNodeIds:ids,usersByNode,panelTls,followRelayStates,controlPlaneAddresses});
+                for(const id of ids)await transports.get(id).requireSupportedCore();
+                prepared=await prepareLinks(Link,links,{env});
+                const candidates=compose({nodes,links:prepared,affectedNodeIds:ids,usersByNode,panelTls,followRelayStates,controlPlaneAddresses});
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
                 return candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p);
             },
@@ -57,6 +60,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 const installed=states.get(id);const ingress=(current?.inbounds||[]).filter(i=>i.tag?.startsWith('relay-l2tp-'));
                 if(ingress.length || installed){if(ingress.length!==1 || !installed || ingress[0].port!==installed.tproxyPort || ingress[0].tag!==`relay-l2tp-${installed.routeGroup||id}` || ingress[0].protocol!=='dokodemo-door' || ingress[0].settings?.followRedirect!==true || ingress[0].streamSettings?.sockopt?.tproxy!=='tproxy')throw fail('REBUILD_L2TP_BASELINE_MISMATCH');}
             }return current;},
+            persistKeys:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
             markDelete:async id=>{const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
             stagePair:(id,pair)=>transports.get(id).stagePair(pair),putPair:(id,pair)=>transports.get(id).putPair(pair),
             async finish({desired,removed}){

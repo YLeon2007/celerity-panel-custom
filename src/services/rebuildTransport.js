@@ -15,6 +15,16 @@ function createTransport(node, SSH=require('./nodeSSH')) {
         if(result?.code!==0)throw fail('REBUILD_NODE_COMMAND_FAILED');return result.stdout;
     }
     async function read(profile){if(!Object.hasOwn(paths,profile))throw fail('REBUILD_INVALID_PROFILE');if(!connected){await ssh.connect();connected=true;}return readClassicProfile(ssh,paths[profile],{allowAbsent:profile==='bridge'});}
+    async function requireSupportedCore(){
+        // Probe the exact binary used by the checked units, not a cached DB
+        // value or the agent's PATH. Do not include remote output in errors.
+        let output;
+        try {output=await check('/usr/local/bin/xray version');} catch {throw fail('REBUILD_XRAY_VERSION_UNKNOWN');}
+        const match=/^Xray (\d{1,4})\.(\d{1,4})\.(\d{1,4})(?=\s|$)/.exec(String(output));
+        if(!match)throw fail('REBUILD_XRAY_VERSION_UNKNOWN');
+        const [year,month,day]=match.slice(1).map(Number);
+        if(year<25 || year===25 && (month<9 || month===9 && day<11))throw fail('REBUILD_XRAY_VERSION_TOO_OLD');
+    }
     async function stagePair(pair){
         for(const {profile,config} of pair){
             const path=paths[profile],file=temp(profile),dir=path.slice(0,path.lastIndexOf('/')),unit=services[profile];
@@ -25,7 +35,7 @@ function createTransport(node, SSH=require('./nodeSSH')) {
                 const start=await check(`systemctl show -p ExecStart --value ${unit}.service`);
                 if(!start.includes('path=/usr/local/bin/xray ;') || !start.includes(` -config ${path} ;`))throw fail('REBUILD_SERVICE_LAYOUT');
             }
-            const active=profile==='main'||config.inbounds.length>0||!!config.reverse?.bridges?.length;
+            const active=profile==='main'||config.inbounds.length>0||config.outbounds.some(o=>o.protocol==='vless' && o.settings?.reverse?.tag);
             attemptedStage=true;
             await check(`set -eu; umask 077; test ! -L ${dir}; test ! -L ${path}; if ! test -d ${dir}; then install -d -m 0755 ${dir}; fi; (set -C; cat > ${file}); /usr/local/bin/xray run -test -config ${file} >/dev/null 2>&1`,JSON.stringify(config));
             staged.set(profile,{active,state});
@@ -52,6 +62,6 @@ function createTransport(node, SSH=require('./nodeSSH')) {
         else if(side.state==='loaded') await check('systemctl disable xray-bridge.service');
     }
     async function close(){if(connected){try{if(attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`);}finally{ssh.disconnect();}}}
-    return {read,stagePair,putPair,close};
+    return {read,requireSupportedCore,stagePair,putPair,close};
 }
 module.exports={createTransport};

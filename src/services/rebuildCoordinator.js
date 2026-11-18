@@ -25,6 +25,8 @@ function protectedInterfaces(config) {
     const projected = config.inbounds.filter(i => {
         if (!i || typeof i !== 'object') throw fail('REBUILD_BASELINE_INVALID');
         if (['dokodemo-door','socks'].includes(i.protocol) && (i.tag==='API_INBOUND'|| /^(?:cascade-|relay-l2tp-|rebuild-relay-ingress$)/.test(i.tag))) return false;
+        const native=/^rebuild-rp-conn-([a-f0-9]{8})$/.exec(i.tag);
+        if(native && i.protocol==='vless' && i.settings?.clients?.length===1 && !i.settings.clients[0].email && i.settings.clients[0].reverse?.tag===`rebuild-rp-egress-${native[1]}`)return false;
         return !(/^(?:bridge-conn-|conn-down-|fwd-hop-|cascade-in-)[\w-]+$/.test(i.tag) && ['vless','vmess'].includes(i.protocol) && Array.isArray(i.settings?.clients) && i.settings.clients.every(c=>!c.email));
     }).map(i=>{
         const {sniffing, ...copy}=structuredClone(i); // changes how to route, not how to connect
@@ -36,7 +38,9 @@ function protectedInterfaces(config) {
 function profilePreview(before, after, profile) {
     if (!before && profile==='main') throw fail('REBUILD_MAIN_UNREADABLE');
     const sections=[...new Set([...Object.keys(before||{}),...Object.keys(after)])].filter(k=>!equal(before?.[k],after[k]));
-    return {profile, change:!before?'create':sections.length?'replace':'unchanged', sections:sections.filter(k=>['inbounds','outbounds','routing','reverse','log','api','stats','policy','dns','observatory'].includes(k)).sort(),protectedChanged:profile==='main' && !equal(protectedInterfaces(before),protectedInterfaces(after))};
+    const legacy=Boolean(before?.reverse?.portals?.length || before?.reverse?.bridges?.length);
+    const native=after.inbounds?.some(i=>i.settings?.clients?.some(c=>c.reverse?.tag)) || after.outbounds?.some(o=>o.settings?.reverse?.tag);
+    return {profile, change:!before?'create':sections.length?'replace':'unchanged', ...(legacy&&native&&!after.reverse?{tunnelMigration:'legacy-to-vless-reverse'}:{}),sections:sections.filter(k=>['inbounds','outbounds','routing','reverse','log','api','stats','policy','dns','observatory'].includes(k)).sort(),protectedChanged:profile==='main' && !equal(protectedInterfaces(before),protectedInterfaces(after))};
 }
 // DELETE retains the old endpoint row (a rebuild-only desired tombstone) until
 // readback succeeds for the whole original component. A fresh Apply uses the
@@ -73,6 +77,7 @@ async function runRebuild(d, req) {
             if(!result.allowed)throw Object.assign(fail('REBUILD_CLIENT_CHANGE'),{preview:result});
             if(req.expectedPreview!==undefined && req.expectedPreview!==result.previewId)throw Object.assign(fail('REBUILD_PREVIEW_CHANGED'),{preview:result});
             await verify();
+            await d.persistKeys?.(verify);
             if(req.remove && !anchor?.rebuildDelete) await d.markDelete?.(req.linkId);
             if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }
             // A connection loss is reported as failure even if only a restart

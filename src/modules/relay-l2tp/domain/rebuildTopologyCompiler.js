@@ -79,10 +79,11 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
         requireRebuild(from.node.active !== false && to.node.active !== false, 'REBUILD_INACTIVE_ENDPOINT');
         const id = refId(link);
         const mode = link.mode === undefined ? 'reverse' : link.mode;
-        const protocol = link.tunnelProtocol ?? 'vless';
+        const storedProtocol = link.tunnelProtocol ?? 'vless';
+        const protocol = mode === 'reverse' ? 'vless' : storedProtocol;
         const priority = link.priority === undefined ? DEFAULT_PRIORITY : link.priority;
         requireRebuild(mode === 'reverse' || mode === 'forward', 'REBUILD_INVALID_MODE');
-        requireRebuild(protocol === 'vless' || (mode === 'forward' && protocol === 'vmess'), 'REBUILD_INVALID_TUNNEL');
+        requireRebuild(['vless','vmess'].includes(storedProtocol), 'REBUILD_INVALID_TUNNEL');
         requireRebuild(Number.isFinite(priority), 'REBUILD_INVALID_PRIORITY');
         requireRebuild(!byLinkId.has(id), 'REBUILD_DUPLICATE_LINK');
         // Preserve the original descriptor, including non-persisted key material.

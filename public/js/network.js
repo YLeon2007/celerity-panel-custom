@@ -206,6 +206,7 @@
         }
         const text = report.nodes.map(n => n.nodeId + ': ' + n.profiles.map(p => p.profile + ' ' + p.change
             + (p.sections.length ? ' (' + p.sections.join(', ') + ')' : '')
+            + (p.tunnelMigration === 'legacy-to-vless-reverse' ? ' — туннель: legacy → VLESS Reverse Proxy' + (p.profile === 'main' && !p.protectedChanged ? '; клиентский вход не меняется' : '') : '')
             + (p.protectedChanged ? ' — изменятся параметры клиентов' : '')).join('; ')).join('\n');
         if (!report.allowed) throw new Error('Запись запрещена:\n' + text);
         if (!confirm('Пересобрать эти ноды?\n' + text)) throw new Error('Отменено до записи');
