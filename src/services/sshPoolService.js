@@ -53,6 +53,7 @@ const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
 const {
     createExecStdinError,
+    discardLateExecStream,
     hasExecStdin,
     writeExecStdin,
 } = require('./sshExecStdin');
@@ -361,6 +362,10 @@ class SSHPool {
             
             try {
                 client.exec(command, (err, stream) => {
+                    if (settled) {
+                        discardLateExecStream(stream);
+                        return;
+                    }
                     if (err) {
                         // Connection broken - remove from pool
                         this.removeConnection(nodeId, 'exec error');

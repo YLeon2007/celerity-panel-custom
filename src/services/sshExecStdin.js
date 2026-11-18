@@ -13,6 +13,15 @@ function createExecStdinError() {
     return new Error(EXEC_STDIN_ERROR_MESSAGE);
 }
 
+// Only dispose the late channel, not the shared connection. The exec request
+// may already have reached the server: this is not cancellation or no-dispatch.
+function discardLateExecStream(stream) {
+    if (!stream) return;
+    stream.on('error', () => {});
+    stream.stderr.on('error', () => {});
+    try { stream.destroy(); } catch { /* caller's timeout is already final */ }
+}
+
 function stdinBuffer(input) {
     if (typeof input === 'string' || Buffer.isBuffer(input) || ArrayBuffer.isView(input)) {
         return Buffer.from(input);
@@ -83,6 +92,7 @@ function writeExecStdin(stream, input, { onComplete, onError }) {
 
 module.exports = {
     createExecStdinError,
+    discardLateExecStream,
     hasExecStdin,
     writeExecStdin,
 };

@@ -30,6 +30,7 @@ const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
 const {
     createExecStdinError,
+    discardLateExecStream,
     hasExecStdin,
     writeExecStdin,
 } = require('./sshExecStdin');
@@ -234,27 +235,36 @@ class NodeSSH {
                 reject(includesStdin ? createExecStdinError() : new Error('SSH not connected'));
                 return;
             }
-            
+
+            let settled = false;
+            let stdinController = null;
+            const settle = (error, result) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                stdinController?.cancel();
+                if (error) reject(error);
+                else resolve(result);
+            };
+            // Match the explicit runner exec budget without changing the legacy
+            // direct default. Neither a timeout nor a late reply permits replay.
+            const execTimeout = options.timeout;
+            const timer = execTimeout ? setTimeout(() => settle(includesStdin
+                ? createExecStdinError() : new Error(`Exec timeout (${execTimeout}ms)`)), execTimeout) : undefined;
             try {
                 this.directClient.exec(command, (err, stream) => {
+                    if (settled) {
+                        discardLateExecStream(stream);
+                        return;
+                    }
                     if (err) {
-                        reject(includesStdin ? createExecStdinError() : err);
+                        settle(includesStdin ? createExecStdinError() : err);
                         return;
                     }
 
                     let stdout = '';
                     let stderr = '';
-                    let settled = false;
                     let stdinComplete = !includesStdin;
-                    let stdinController = null;
-
-                    const settle = (error, result) => {
-                        if (settled) return;
-                        settled = true;
-                        stdinController?.cancel();
-                        if (error) reject(error);
-                        else resolve(result);
-                    };
 
                     stream
                         .on('close', (code) => {
@@ -288,7 +298,7 @@ class NodeSSH {
                     }
                 });
             } catch (error) {
-                reject(includesStdin ? createExecStdinError() : error);
+                settle(includesStdin ? createExecStdinError() : error);
             }
         });
     }

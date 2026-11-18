@@ -45,6 +45,49 @@ async function withPooledExec(execImplementation, callback) {
 
 test.after(() => sshPool.closeAll());
 
+for (const mode of ['pool', 'direct']) {
+    test(`${mode}: a timed-out exec ignores the late channel without sending stdin or replaying`, async t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        let callback;
+        let calls = 0;
+        let writes = 0;
+        let ends = 0;
+        let destroyed = 0;
+        const exec = (_command, cb) => { calls++; callback = cb; };
+        const exercise = async run => {
+            const invocation = run();
+            const rejected = assert.rejects(invocation, { message: SANITIZED_STDIN_ERROR });
+            await Promise.resolve();
+            assert.equal(calls, 1);
+            t.mock.timers.tick(50);
+            const stream = createExecStream({ onWrite: () => writes++, onEnd: () => ends++ });
+            stream.destroy = () => destroyed++;
+            callback(null, stream);
+            await rejected;
+            assert.deepEqual({ calls, writes, ends, destroyed }, { calls: 1, writes: 0, ends: 0, destroyed: 1 });
+        };
+        const options = { stdin: 'local-payload', timeout: 50 };
+        if (mode === 'direct') {
+            await exercise(() => createDirectNodeSSH(exec).exec('/fixed/receiver', options));
+        } else {
+            await withPooledExec(exec, () => exercise(() => sshPool.exec({ id: 'late-channel' }, '/fixed/receiver', options)));
+        }
+    });
+}
+
+test('explicit direct exec timeout also applies after channel open without stdin', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const stream = createExecStream();
+    let calls = 0;
+    const direct = createDirectNodeSSH((_command, callback) => { calls++; callback(null, stream); });
+    const rejected = assert.rejects(direct.exec('/fixed/commit', { timeout: 130_000 }), { message: 'Exec timeout (130000ms)' });
+    t.mock.timers.tick(130_000);
+    stream.emit('data', Buffer.from('late-reply'));
+    stream.emit('close', 0);
+    await rejected;
+    assert.equal(calls, 1);
+});
+
 test('NodeSSH forwards stdin options through pooled execution', async () => {
     const originalExec = sshPool.exec;
     const calls = [];
