@@ -25,6 +25,7 @@ const { selectLinkApplyBaselineLinkIds, acceptedIntentResponse, readPersistedInt
 const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
 const { nodeActivation: normalizeNodeActivation, selectedDesiredVersion } = require('../modules/relay-l2tp/services/topologyNodeActivation');
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
+const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
 
 const DEFAULT_MODELS = Object.freeze({
     HyNode,
@@ -363,6 +364,13 @@ function createCascadeTopologyDeployRouter({
     operationStatusRateLimiter = defaultOperationStatusRateLimiter,
     routeLogger = logger,
 } = {}) {
+    const router = express.Router();
+    if (isRebuildEnabled(deploymentEnv)) {
+        // Do not construct a strict coordinator or fall through to classic.
+        // Keep the graph and its layout endpoint on the separate cascade router.
+        router.all(['/activation-policy', '/operations/:operationId', '/deploy', '/replace'], rejectRebuildRoute);
+        return router;
+    }
     if (typeof createService !== 'function') {
         throw new TypeError('Cascade topology deploy router requires a deployment service factory');
     }
@@ -379,7 +387,6 @@ function createCascadeTopologyDeployRouter({
         throw new TypeError('Cascade topology deploy router requires CSRF and rate-limit protection');
     }
 
-    const router = express.Router();
     const readScope = requireScope('nodes:read');
     const writeScope = requireScope('nodes:write');
     const sessionWriteCsrf = (req, res, next) => (

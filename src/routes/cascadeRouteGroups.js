@@ -14,6 +14,7 @@ const {
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const { requireScope } = require('../middleware/auth');
+const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
 
 const ROUTE_GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
@@ -237,6 +238,11 @@ function createCascadeRouteGroupsRouter({
     createDraftWriteService = createTopologyDraftWriteService,
 } = {}) {
     const router = express.Router();
+    if (isRebuildEnabled()) {
+        router.post('/', rejectRebuildRoute);
+        router.put('/:id', rejectRebuildRoute);
+        router.delete('/:id', rejectRebuildRoute);
+    }
     let writeService = topologyDraftWriteService;
     const getWriteService = () => {
         if (!writeService) {

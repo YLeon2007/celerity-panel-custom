@@ -14,6 +14,7 @@ const cascadeService = require('../services/cascadeService');
 const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
+const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -55,6 +56,7 @@ router.post('/links/:id/deploy', requireScope('nodes:write'), deployLimiter, asy
 /**
  * POST /cascade/links/:id/undeploy — remove cascade config from nodes
  */
+if (isRebuildEnabled()) router.post('/links/:id/undeploy', rejectRebuildRoute);
 router.post('/links/:id/undeploy', requireScope('nodes:write'), deployLimiter, async (req, res) => {
     try {
         if (!isValidObjectId(req.params.id)) {

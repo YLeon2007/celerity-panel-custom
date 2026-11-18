@@ -18,6 +18,7 @@ const {
 } = require('../modules/relay-l2tp/services/topologyDraftWriteService');
 const { maintainAutoL2tpPaths } = require('../modules/relay-l2tp/services/autoL2tpPathMaintenance');
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
+const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const {
@@ -558,6 +559,14 @@ function createCascadeLinksRouter({
 } = {}) {
     deploymentEnv = Object.freeze({ ...deploymentEnv });
     const router = express.Router();
+    if (isRebuildEnabled(deploymentEnv)) {
+        router.use('/auto-deploy-jobs', rejectRebuildRoute);
+        router.get('/port-check', rejectRebuildRoute);
+        // Transitional refusal: parent wires dedicated rebuild mutation handlers.
+        router.post('/', rejectRebuildRoute);
+        router.put('/:id', rejectRebuildRoute);
+        router.delete('/:id', rejectRebuildRoute);
+    }
     const getIntentService = (method = 'accept') => {
         const service = topologyIntentService === undefined
             ? (method === 'accept' ? l2tpActiveHostProvider.getActiveHost()?.selectedTopologyIntentService

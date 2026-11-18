@@ -2,6 +2,7 @@
 
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { randomUUID } = require('node:crypto');
+const { isRebuildEnabled } = require('./rebuildMode');
 const { resolveL2tpExecutionAuthorization } = require('../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
 const heldWrites = new AsyncLocalStorage();
 const failure = code => Object.assign(new Error(code), { code });
@@ -17,6 +18,9 @@ async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env, lea
     const parent = heldWrites.getStore();
     const nested = parent?.get(key);
     if (nested && !nested.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+    // Rebuild is not authority to use an old classic writer without its fence.
+    // Keep this fail-closed until the caller has a dedicated rebuild writer.
+    if (isRebuildEnabled(selectedEnv)) throw failure('REBUILD_WRITER_UNAVAILABLE');
     if (!nested && !resolveL2tpExecutionAuthorization(selectedEnv).enableInstallAdmission) return callback();
     async function run(scope) {
         scope.pending++;

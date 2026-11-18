@@ -770,6 +770,18 @@ test('a checked handback cannot mask a later unreadable history scan', async t =
 
 // Reader wiring only: live receipt validation/retirement and actual guard are
 // exercised in testLegacyTopologyRelease.test.js. No physical authority here.
+test('rebuild does not consult the legacy release exception for unretired history', async t => {
+    const target = node('standalone');
+    stubSync(t, { connected: false, owners: [], operations: [{ status: 'failed', heldTopologyAdmission: false,
+        nodes: [{ node: target._id, state: 'prepared' }] }] });
+    const reader = require('../testLegacyTopologyRelease');
+    t.mock.method(reader, 'hasTestLegacyTopologyRelease', async () => assert.fail('legacy release bypass entered'));
+    const { topologyManagesNodeConfig } = require('../topologyConfigOwnership');
+    assert.equal(await topologyManagesNodeConfig(target, { C3_REBUILD_ENABLED: 'true',
+        PANEL_DOMAIN: PROD.hostIdentity, TOPOLOGY_TEST_EXECUTION_ENABLED: 'false',
+        TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false' }), true);
+});
+
 for (const writer of ['sync', 'cascade']) {
     test(writer + ': exact TEST historical handoff recognition still reads the independent native owner veto', async t => {
         const target = { ...node('standalone'), _id: '6ab189dc63913ebd4a917399' };

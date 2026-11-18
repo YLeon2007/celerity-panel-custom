@@ -3,6 +3,7 @@
 const {
     topologyExecutionContext, matchesTopologyExecutionContext, TOPOLOGY_EXECUTION_CONTEXTS,
 } = require('../modules/relay-l2tp/domain/topologyExecutionContext');
+const { isRebuildEnabled } = require('./rebuildMode');
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const scalarMatch = (value, pattern) => typeof value === 'string' && pattern.test(value);
@@ -143,7 +144,9 @@ async function topologyManagesNodeConfig(node, env = process.env) {
                     && operations.every(operation => handedBackHistory(operation, rows, String(node._id), context));
             }
             if (!settled) {
-                if (!historicalVeto) return true;
+                // Rebuild cannot inherit the separate, finite legacy release
+                // exception just because both native execution flags are off.
+                if (!historicalVeto || isRebuildEnabled(env)) return true;
                 const { hasTestLegacyTopologyRelease } = require('./testLegacyTopologyRelease');
                 if (!await hasTestLegacyTopologyRelease({ db: mongoose.connection.db,
                     nodeId: String(node._id), env: releaseEnv })) return true;

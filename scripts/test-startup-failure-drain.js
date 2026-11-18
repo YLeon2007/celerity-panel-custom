@@ -39,6 +39,7 @@ function harness({ classic = true, signalAtConnect = false, stopError = null, di
     if (!admitted) delete mongoose.models.Admitted.$init;
     const lifecycle = { async stop() { calls.push('worker-stop'); if (stopError) throw stopError; } };
     const fakes = {
+        './src/services/rebuildMode': { validateRebuildMode: () => false },
         './src/classicSettings': classic ? {} : null,
         mongoose,
         './config': { MONGO_URI: 'fake://no-io' },

@@ -16,6 +16,8 @@ function exact(object, keys) {
 function absolute(value) { return typeof value === 'string' && value.startsWith('/') && path.resolve(value) === value && !value.includes('\0'); }
 function load() {
     if (process.env.C3_SETTINGS === undefined) return null;
+    // The pinned classic settings projection must not silently discard rebuild.
+    require('./services/rebuildMode').validateRebuildMode();
     try {
         const file = process.env.C3_SETTINGS;
         need(absolute(file));

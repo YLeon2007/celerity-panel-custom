@@ -16,6 +16,7 @@ const {
     createClassicScopedCascadeDeploymentService,
 } = require('../../services/classicScopedCascadeDeploymentService');
 const { issueClassicLifecycleGrant } = require('../../services/classicLifecycleAuthorization');
+const { isRebuildEnabled, rebuildStrictDisabled } = require('../../services/rebuildMode');
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -112,6 +113,7 @@ function getClassicTopologyCoordinator() {
 }
 
 async function manageCascade(args, emit) {
+    if (isRebuildEnabled()) throw rebuildStrictDisabled();
     const parsed = manageCascadeSchema.parse(args);
     const { action, id, data = {}, expectedTopologyRevision } = parsed;
     if (['create', 'update', 'delete'].includes(action)

@@ -3,10 +3,12 @@
  * by Click Connect
  */
 
-// Validate opt-in file settings before importing application dependencies/timers.
+// Resolve and validate the mode before models, lifecycle, or other side effects.
+const { validateRebuildMode, rejectRebuildRoute } = require('./src/services/rebuildMode');
 const classicSettings = require('./src/classicSettings');
-const mongoose = require('mongoose');
 const config = require('./config');
+const rebuildEnabled = validateRebuildMode();
+const mongoose = require('mongoose');
 const logger = require('./src/utils/logger');
 const { createL2tpRootLifecycle, productionSchemaConnectionOptions } = require('./src/modules/l2tpRuntimeLifecycleHook');
 const l2tpRootLifecycle = createL2tpRootLifecycle();
@@ -16,14 +18,24 @@ const HyNode = require('./src/models/hyNodeModel');
 // Start the existing automatic schema work before the remaining synchronous
 // route/service imports. Cold Mongo DDL and module compilation are independent;
 // HTTP still waits for the same complete readiness/migration/runtime barriers.
-if (classicSettings) {
-    require('./src/modules/relay-l2tp').registerModels();
+if (classicSettings || rebuildEnabled) {
+    if (!rebuildEnabled) require('./src/modules/relay-l2tp').registerModels();
     // Compile the complete ordinary schema catalog before opening Mongo. This
     // lets automatic DDL progress during route assembly instead of admitting
     // late model/index work after the long synchronous dependency imports.
+    const ordinaryModels = [HyNode, HyUser];
     for (const model of ['settingsModel', 'serverGroupModel', 'statsSnapshotModel',
         'userDeviceModel', 'cascadeLinkModel', 'uaSnapshotModel', 'adminModel', 'apiKeyModel']) {
-        require(`./src/models/${model}`);
+        ordinaryModels.push(require(`./src/models/${model}`));
+    }
+    // Rebuild can still import strict schemas for read-only classic vetoes and
+    // projections. Disable their automatic DDL, including lazy imports after
+    // connect, without turning off normal classic schema initialization.
+    if (rebuildEnabled && productionSchemaConnectionOptions(process.env).autoCreate !== false) {
+        for (const { schema } of ordinaryModels) {
+            schema.set('autoCreate', true);
+            schema.set('autoIndex', true);
+        }
     }
 }
 let bootstrapSignal;
@@ -43,6 +55,7 @@ async function connectMongo(retries = 5, delayMs = 3000) {
                 serverSelectionTimeoutMS: 10000,
                 socketTimeoutMS: 45000,
                 ...productionSchemaConnectionOptions(process.env),
+                ...(rebuildEnabled ? { autoCreate: false, autoIndex: false } : {}),
             });
             return;
         } catch (err) {
@@ -141,7 +154,7 @@ const usersRoutes = require('./src/routes/users');
 const nodesRoutes = require('./src/routes/nodes');
 const cascadeRoutes = require('./src/routes/cascade');
 const cascadeRouteGroupsRoutes = require('./src/routes/cascadeRouteGroups');
-const topologyTransferDraftsRoutes = require('./src/routes/topologyTransferDrafts');
+const topologyTransferDraftsRoutes = rebuildEnabled ? rejectRebuildRoute : require('./src/routes/topologyTransferDrafts');
 const cascadeTopologyDeployRoutes = require('./src/routes/cascadeTopologyDeploy');
 if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const groupsRoutes = require('./src/routes/groups');
@@ -481,7 +494,8 @@ app.use('/api/nodes', requireAuth, nodesRoutes);
 app.use('/api/cascade/route-groups', requireAuth, cascadeRouteGroupsRoutes);
 app.use('/api/cascade/topology-transfer-drafts', topologyTransferDraftsRoutes);
 app.use('/api/cascade/topology', cascadeTopologyDeployRoutes);
-app.use('/api/cascade/topology-test', require('./src/routes/topologyTestActivation').createTopologyTestActivationRouter());
+app.use('/api/cascade/topology-test', rebuildEnabled ? rejectRebuildRoute
+    : require('./src/routes/topologyTestActivation').createTopologyTestActivationRouter());
 app.use('/api/cascade', requireAuth, cascadeRoutes);
 app.use('/api/mcp', requireAuth, mcpRoutes);
 app.use('/api/groups', requireAuth, groupsRoutes);
@@ -629,7 +643,7 @@ async function startServer() {
         logger.info('[MongoDB] Connected');
 
         await l2tpRootLifecycle.startAfterDatabase();
-        if (classicSettings) {
+        if (classicSettings || rebuildEnabled) {
             // The topology proof joins its own catalog, but classic models also
             // own required indexes. Join every admitted init before HTTP, even
             // when Mongo is still processing automatic DDL. allSettled retains

@@ -1,12 +1,6 @@
 'use strict';
 
 const {
-    createL2tpMigrationBootstrap,
-} = require('./l2tpMigrationBootstrap');
-const {
-    createL2tpStartupLifecycle,
-} = require('./createL2tpStartupLifecycle');
-const {
     l2tpActiveHostProvider,
 } = require('./l2tpActiveHostProvider');
 const {
@@ -18,6 +12,7 @@ const {
 const {
     resolveL2tpExecutionAuthorization,
 } = require('./relay-l2tp/domain/l2tpExecutionAuthorization');
+const { validateRebuildMode, rebuildStrictDisabled } = require('../services/rebuildMode');
 
 function isProductionSchemaHost(env) {
     return env?.PANEL_DOMAIN === PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT.hostIdentity;
@@ -100,11 +95,12 @@ function createEnabledHostDependencies(factory, env, ownerEnrollment) {
 function createL2tpRuntimeLifecycleHook({
     env = process.env,
     createHostDependencies,
-    createStartupLifecycle = createL2tpStartupLifecycle,
+    createStartupLifecycle = options => require('./createL2tpStartupLifecycle').createL2tpStartupLifecycle(options),
     activeHostProvider = l2tpActiveHostProvider,
     startWorkers = true,
     ownerEnrollment = false,
 } = {}) {
+    if (validateRebuildMode(env)) throw rebuildStrictDisabled();
     const enabled = parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
     const hostDependencies = enabled
         ? createEnabledHostDependencies(createHostDependencies, env, ownerEnrollment)
@@ -389,14 +385,16 @@ function createL2tpRootHostDependencies({
 
 function createL2tpRootLifecycle({
     env = process.env,
-    createMigrationBootstrap = createL2tpMigrationBootstrap,
+    createMigrationBootstrap = options => require('./l2tpMigrationBootstrap').createL2tpMigrationBootstrap(options),
     ensureModelIndexes = options => require('./l2tpModelIndexReadiness').ensureL2tpModelIndexes(options),
     createHostDependencies = createL2tpRootHostDependencies,
     createRuntimeLifecycleHook = createL2tpRuntimeLifecycleHook,
     activeHostProvider = l2tpActiveHostProvider,
-    createTopologyExecutionAuthority = require('./relay-l2tp/runtime/productionPhysicalAuthority').createRootTopologyExecutionAuthority,
+    createTopologyExecutionAuthority = options => require('./relay-l2tp/runtime/productionPhysicalAuthority')
+        .createRootTopologyExecutionAuthority(options),
     productionDatabase = () => require('mongoose').connection.db,
 } = {}) {
+    const rebuildEnabled = validateRebuildMode(env);
     let lifecycle;
     let productionAuthority;
     let startPromise;
@@ -406,6 +404,7 @@ function createL2tpRootLifecycle({
 
     return {
         enrollTestOwnersAfterDatabase() {
+            if (rebuildEnabled) return Promise.reject(rebuildStrictDisabled());
             if (startPromise !== undefined || stopRequested) return Promise.reject(new Error('TEST_OWNER_STARTUP_MODE_CONFLICT'));
             const ownerEnv = Object.freeze({ ...env });
             require('../../scripts/test-topology-owner').assertTestContext(ownerEnv);
@@ -423,7 +422,7 @@ function createL2tpRootLifecycle({
             if (ownerEnrollmentMode) return Promise.reject(new Error('TEST_OWNER_STARTUP_MODE_CONFLICT'));
             if (startPromise === undefined) {
                 startPromise = Promise.resolve().then(async () => {
-                    if (stopRequested) return undefined;
+                    if (stopRequested || rebuildEnabled) return undefined;
                     parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
                     const productionHost = isProductionSchemaHost(env);
                     if (productionHost && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true') {

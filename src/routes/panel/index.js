@@ -5,6 +5,7 @@
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const { isRebuildEnabled, rejectRebuildRoute } = require('../../services/rebuildMode');
 
 const l2tpModuleEntry = require('../../modules/relay-l2tp');
 const {
@@ -52,6 +53,9 @@ function createPanelRouter({
     // IP whitelist applies to all panel routes
     router.use(checkIpWhitelist);
 
+    const rebuildEnabled = isRebuildEnabled();
+    if (rebuildEnabled) router.use(['/l2tp', '/nodes/:id/l2tp'], rejectRebuildRoute);
+
     // Auth routes are public (login, setup, totp, logout)
     router.use('/', authRoutes);
 
@@ -68,6 +72,8 @@ function createPanelRouter({
     router.use('/', requireAuth, requireOnboarding, systemRoutes);
     router.use('/', requireAuth, requireOnboarding, migrationRoutes);
     router.use('/', requireAuth, requireOnboarding, accessLogsRoutes);
+
+    if (rebuildEnabled) return router;
 
     const routeBindings = createL2tpRouteBindings(activeHostProvider);
     injectedL2tpModuleEntry.registerRoutes({
