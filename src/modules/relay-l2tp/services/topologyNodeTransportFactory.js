@@ -168,6 +168,12 @@ function createArtifactInvoker(nodeSSH, binding) {
             if (['restore-users', 'read-restored-users'].includes(request.command)) {
                 return await nodeSSH.exec(runnerCommand(request), { stdin: request.snapshot });
             }
+            // commit waits for the systemd restart and verifies the finished job.
+            // This is the runner SSH request, not a physical-authority RPC. Never
+            // retry an ambiguous reply here: the original command may be running.
+            if (request.command === TOPOLOGY_NODE_COMMANDS.COMMIT) {
+                return await nodeSSH.exec(runnerCommand(request), { timeout: 130000 });
+            }
             return await nodeSSH.exec(runnerCommand(request));
         } catch {
             throw new TopologyNodeTransportFactoryError();

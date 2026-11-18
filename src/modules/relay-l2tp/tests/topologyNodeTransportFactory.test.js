@@ -177,7 +177,7 @@ test('binds node identity and role profile across every lifecycle command', asyn
         })),
         [
             { command: 'prepare', nodeId: 'relay-node', targetProfile: 'xray-bridge', checks: undefined, options: { stdin: artifactContent } },
-            { command: 'commit', nodeId: 'relay-node', targetProfile: 'xray-bridge', checks: undefined, options: undefined },
+            { command: 'commit', nodeId: 'relay-node', targetProfile: 'xray-bridge', checks: undefined, options: { timeout: 130000 } },
             {
                 command: 'verify',
                 nodeId: 'relay-node',
