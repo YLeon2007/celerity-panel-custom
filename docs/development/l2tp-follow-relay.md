@@ -1,6 +1,6 @@
 # L2TP Follow Relay v1: контракт rebuild
 
-`follow-relay` — режим маршрутизации **установленного** PPP на relay. Он не устанавливает L2TP и не делает профиль готовым к трафику. Обычные клиенты relay и PPP используют один локальный SOCKS-вход в `xray-bridge`: ветки domain/geoip и default определяет один набор правил графа.
+`follow-relay` — режим маршрутизации **установленного** PPP на relay. Он не устанавливает L2TP. В режиме rebuild `composeRebuildProfiles` вызывает `attachLocalFollowRelay` для MAIN: PPP идёт через стабильный локальный SOCKS, обычные клиенты приходят на свои VLESS-входы, а запреты, geo и default принимают решение по общим правилам. Не искать этот SOCKS в `xray-bridge`. Описанный ниже helper `applyFollowRelay` — альтернативный контракт для графа, владеющего маршрутизацией в BRIDGE, а не путь действующего rebuild API.
 
 ## Выбор режима и зависимости
 
@@ -8,7 +8,7 @@
 - Rebuild выбирает `{ routingMode: 'follow-relay', routingVersion: 1 }` явной парой. Неподдерживаемая пара отклоняется (`L2TP_ROUTING_SELECTION_INVALID`). `routeGroup` и `activePathKey` существующей записи не надо стирать: они нужны для идентификации прежнего фрагмента и отката, а не для выбора нового выхода. Для follow-relay без прежней группы `routeGroup` необязателен.
 - `TopologyDraftRepository.readDraft(session, { rebuildL2tp: true })` возвращает `followRelayStates` отдельно от `activeRouteGroupIds`, `installedRouteGroupIds` и `installedRouteOwners` legacy. Список `groups` не меняется. `partitionRebuildL2tpStates(states)` делает то же разделение для уже прочитанных записей. Оно не даёт права менять/удалять группы, которые могут использоваться другими политиками, и не заменяет независимые проверки installed PPP, пользователей и ревизий. `readDraft(session)` сохраняет прежний контракт.
 
-## Вызов компоновщиком rebuild
+## Отдельный helper для политики, размещённой в BRIDGE
 
 ```js
 const {
@@ -38,4 +38,4 @@ MAIN-правила, относящиеся к прежнему PPP-входу, 
 
 Локальные тесты покрывают first-match для обоих входов, domain/IP/default, private/control-plane, reverse, повторную композицию, замену выхода, `no_bridge_exit` и `detached`, сохранение серверного ingress/TPROXY и отделение legacy-групп. First-match в тесте — модель маршрутов, не Xray-процесс. Не проверялись парсер Xray, реальный DNS/SOCKS UDP, PPP/IPsec, REALITY или фактический egress.
 
-Здесь нет вызова из глобального composer/API, активации режима в БД, оркестрации выкладки двух профилей, readback или миграции. Интегратор обязан сохранить fenced проверки PPP и legacy-групп, исключить legacy writers для переключённого relay и не считать конфиг доказательством трафика. Для выхода из `no_bridge_exit`/`detached` необходимо заново сгенерировать bridge из актуального графа; старый policy не восстанавливается.
+Сам `applyFollowRelay` ничего не записывает. О действующем API, перечитывании профилей и повторном Apply см. [режим rebuild](../rebuild-mode.md). Проверка трафика требует отдельного стендового прогона с Xray и PPP.

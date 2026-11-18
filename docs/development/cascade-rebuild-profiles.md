@@ -81,13 +81,4 @@ handoff before starting replacements in MAIN. Physical co-location, port claims
 outside these two profiles, compatibility with the installed Xray binary, and
 atomicity/rollback of service application are not decided here.
 
-For L2TP: use the affected relay's **MAIN** config. Add the actual local packet
-inbound tag to each rule's `inboundTag` whose `ruleTag` starts with exported
-`REBUILD_POLICY_RULE_PREFIX` (`rebuild-policy-`), including
-`rebuild-policy-default` even when it points to `block`. Prepend any L2TP ingress
-protective rules, and give the actual local inbound route sniffing as appropriate
-(e.g. copy the relay client inbound's sniffing semantics for downstream domain
-routing). Do not add the tag to API/control/legacy ACL rules, do not route it to
-a separately selected cascade outbound, and do not include it in the VLESS
-user-management inbound list. No L2TP listeners or service changes are made by
-this composer.
+For installed follow-relay states, the composer calls `attachLocalFollowRelay` in **MAIN**. The stable loopback SOCKS joins the subscriber deny rules and then the same geo/default rules as ordinary clients, including `block` without an exit. It does not join API/control routes or become a user-management inbound. Sniffing happens on the listener making the decision. The composer emits the existing transparent ingress in the candidate; it does not install PPP, change firewall rules or restart services.
