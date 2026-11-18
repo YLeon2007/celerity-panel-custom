@@ -648,8 +648,6 @@ router.post('/nodes/:id', async (req, res) => {
                 ? req.body.comment.trim().slice(0, 500)
                 : '',
             initScript: req.body.initScript || '',
-            'ssh.port': parseInt(req.body['ssh.port']) || 22,
-            'ssh.username': req.body['ssh.username'] || 'root',
         };
 
         if (req.body.statsSecret) {
@@ -692,19 +690,26 @@ router.post('/nodes/:id', async (req, res) => {
             Object.assign(updates, hyFields);
         }
 
-        if (req.body['ssh.password']) {
-            updates['ssh.password'] = cryptoService.encrypt(req.body['ssh.password']);
+        const sshUpdates = {};
+        if (req.body['ssh.port'] !== undefined) {
+            sshUpdates['ssh.port'] = parseInt(req.body['ssh.port'], 10) || 22;
         }
-
+        if (req.body['ssh.username'] !== undefined) {
+            sshUpdates['ssh.username'] = req.body['ssh.username'] || 'root';
+        }
+        if (req.body['ssh.password']) {
+            sshUpdates['ssh.password'] = cryptoService.encrypt(req.body['ssh.password']);
+        }
         if (req.body['ssh.clearPrivateKey'] === '1') {
-            updates['ssh.privateKey'] = '';
+            sshUpdates['ssh.privateKey'] = '';
         } else if (req.body['ssh.privateKey'] && req.body['ssh.privateKey'].trim()) {
             const rawKey = req.body['ssh.privateKey'].trim();
             if (!sshKeyService.isValidPrivateKey(rawKey)) {
                 return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent('Invalid private key format')}`);
             }
-            updates['ssh.privateKey'] = cryptoService.encrypt(rawKey);
+            sshUpdates['ssh.privateKey'] = cryptoService.encrypt(rawKey);
         }
+        Object.assign(updates, sshUpdates);
 
         // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
         const before = existingNode.toObject({ depopulate: true });
@@ -729,27 +734,21 @@ router.post('/nodes/:id', async (req, res) => {
             || before.active !== after.active;
         syncService.schedulePush(nodeId, lifecycleChanged ? updates : changedUpdates);
 
-        // Sync SSH credentials to sibling node on the same IP (if SSH was part of this update)
-        const sshChanged = updates['ssh.password'] !== undefined
-            || updates['ssh.privateKey'] !== undefined
-            || updates['ssh.port'] !== undefined
-            || updates['ssh.username'] !== undefined;
-        if (sshChanged) {
-            const updatedNode = await HyNode.findById(nodeId).select('ip ssh').lean();
-            if (updatedNode) {
-                await HyNode.updateMany(
-                    { ip: updatedNode.ip, _id: { $ne: updatedNode._id } },
-                    { $set: { ssh: updatedNode.ssh } }
-                );
-            }
+        // SSH settings are host-local: a move must not update siblings at either IP.
+        if (before.ip && before.ip === after.ip && Object.keys(sshUpdates).length) {
+            await HyNode.updateMany(
+                { ip: before.ip, _id: { $ne: existingNode._id } },
+                { $set: sshUpdates }
+            );
         }
 
         // Invalidate active-nodes, subscription, and dashboard caches so ranking/config changes apply immediately
         await invalidateNodesCache();
         res.redirect('/panel/nodes');
-    } catch (error) {
-        logger.error(`[Panel] Update node error: ${error.message}`);
-        res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(error.message)}`);
+    } catch {
+        // Casting and persistence errors can contain the submitted values.
+        logger.error('[Panel] Update node failed');
+        res.redirect(`/panel/nodes/${nodeId}?error=Failed%20to%20update%20node`);
     }
 });
 

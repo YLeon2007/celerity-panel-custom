@@ -360,7 +360,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
         const allowedUpdates = [
             'name', 'domain', 'sni', 'port', 'portRange', 'statsPort',
-            'groups', 'ssh', 'paths', 'settings', 'active', 'rankingCoefficient',
+            'groups', 'paths', 'settings', 'active', 'rankingCoefficient',
             'type', 'xray', 'virtual', 'cascadeRole', 'country', 'comment',
             'hopInterval', 'acme', 'masquerade', 'bandwidth',
             'ignoreClientBandwidth', 'speedTest', 'disableUDP',
@@ -371,9 +371,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         const updates = {};
         for (const key of allowedUpdates) {
             if (req.body[key] !== undefined) {
-                if (key === 'ssh') {
-                    updates[key] = cryptoService.encryptSshCredentials(req.body[key]);
-                } else if (key === 'comment') {
+                if (key === 'comment') {
                     updates[key] = typeof req.body[key] === 'string'
                         ? req.body[key].trim().slice(0, 500)
                         : '';
@@ -382,6 +380,17 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                 }
             }
         }
+
+        // Patch individual fields on both nodes; a partial SSH object is not a replacement.
+        const ssh = req.body.ssh;
+        const sshUpdates = {};
+        for (const key of ['port', 'username', 'password', 'privateKey']) {
+            if (!ssh || !Object.hasOwn(ssh, key) || ssh[key] === undefined) continue;
+            const value = ssh[key];
+            const isSecret = key === 'password' || key === 'privateKey';
+            sshUpdates[`ssh.${key}`] = isSecret && value ? cryptoService.encrypt(value) : value;
+        }
+        Object.assign(updates, sshUpdates);
 
         // findByIdAndUpdate bypasses pre('validate') hooks even with runValidators,
         // so enforce type-specific invariants explicitly here. We need the existing
@@ -412,17 +421,17 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             req.params.id,
             { $set: updates },
             { new: true }
-        ).populate('groups', 'name color');
+        ).select('-ssh.password -ssh.privateKey').populate('groups', 'name color');
 
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
         }
 
-        // Sync SSH credentials to sibling node on the same IP (if SSH was updated)
-        if (updates.ssh) {
+        // SSH settings are host-local: a move must not update siblings at either IP.
+        if (existing.ip && existing.ip === node.ip && Object.keys(sshUpdates).length) {
             await HyNode.updateMany(
-                { ip: node.ip, _id: { $ne: node._id } },
-                { $set: { ssh: node.ssh } }
+                { ip: existing.ip, _id: { $ne: node._id } },
+                { $set: sshUpdates }
             );
         }
 
@@ -435,9 +444,10 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         logger.info(`[Nodes API] Updated node ${node.name}`);
         
         res.json(node);
-    } catch (error) {
-        logger.error(`[Nodes API] Update error: ${error.message}`);
-        res.status(500).json({ error: error.message });
+    } catch {
+        // Casting and persistence errors can contain the submitted values.
+        logger.error('[Nodes API] Update node failed');
+        res.status(500).json({ error: 'Failed to update node' });
     }
 });
 
