@@ -1,5 +1,8 @@
 'use strict';
 const { isDeepStrictEqual: equal } = require('node:util');
+const {createHmac,randomBytes}=require('node:crypto');
+// The preview fingerprint is opaque and expires when the panel restarts.
+const previewKey=randomBytes(32);
 const fail = code => Object.assign(new Error(code), {code});
 const id = obj => String(obj?._id ?? obj);
 const ends = row => [id(row.portalNode), id(row.bridgeNode)];
@@ -50,17 +53,23 @@ async function runRebuild(d, req) {
             const desired=links.filter(row=>!removed.includes(row)&&row.active!==false);
             const candidates=await d.build(nodes,desired);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
-            const pairs=new Map(), report=[];
+            const pairs=new Map(), report=[], fingerprint=createHmac('sha256',previewKey);
+            fingerprint.update(JSON.stringify([req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()]));
             for(const nodeId of nodes){
                 const pair=candidates.filter(p=>p.nodeId===nodeId); pairs.set(nodeId,pair);
                 if(pair.length!==2||new Set(pair.map(p=>p.profile)).size!==2||!pair.every(p=>['main','bridge'].includes(p.profile)))throw fail('REBUILD_INCOMPLETE_PROFILES');
                 const profiles=[];
-                for(const p of pair) profiles.push(profilePreview(await d.read(nodeId,p.profile),p.config,p.profile));
+                for(const p of pair){
+                    const before=await d.read(nodeId,p.profile);
+                    profiles.push(profilePreview(before,p.config,p.profile));
+                    fingerprint.update(JSON.stringify([nodeId,p.profile,before,p.config]));
+                }
                 report.push({nodeId,profiles});
             }
-            const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report};
+            const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:fingerprint.digest('hex')};
             if(req.preview) return result;
             if(!result.allowed)throw Object.assign(fail('REBUILD_CLIENT_CHANGE'),{preview:result});
+            if(req.expectedPreview!==undefined && req.expectedPreview!==result.previewId)throw Object.assign(fail('REBUILD_PREVIEW_CHANGED'),{preview:result});
             await verify();
             if(req.remove && !anchor?.rebuildDelete) await d.markDelete?.(req.linkId);
             if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }

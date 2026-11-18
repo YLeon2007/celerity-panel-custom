@@ -102,13 +102,20 @@ async function verify(app) {
         assert.equal(result.body.error.code, 'REBUILD_STRICT_DISABLED');
     };
     for (const [method, suffix] of [
-        ['POST', 'topology/deploy'], ['POST', 'topology/replace'], ['GET', 'topology/operations/dummy'],
+        ['POST', 'topology/replace'], ['GET', 'topology/operations/dummy'],
         ['GET', 'topology/activation-policy'], ['POST', 'topology-test/resume-bindings'],
         ['POST', 'topology-transfer-drafts/import'], ['GET', 'links/auto-deploy-jobs/dummy'],
         ['POST', 'links/auto-deploy-jobs/dummy/settle-unadmitted-preparation'], ['GET', 'links/port-check'],
-        ['POST', 'links'], ['PUT', 'links/dummy'], ['DELETE', 'links/dummy'], ['POST', 'links/dummy/undeploy'],
+        ['POST', 'links/dummy/undeploy'],
         ['POST', 'route-groups'],
     ]) await assertBlocked(method, '/api/cascade/' + suffix);
+    // Dedicated rebuild mutations are mounted before the old routes. A session
+    // without a CSRF token reaches neither strict admission nor a DB writer.
+    for (const [method, suffix] of [['POST','topology/deploy'],['POST','links'],['PUT','links/dummy'],['DELETE','links/dummy']]) {
+        const result = await requests(app, method, '/api/cascade/' + suffix);
+        assert.equal(result.status, 403); assert.equal(result.body.code, 'CSRF_TOKEN_INVALID');
+    }
+    assert.deepEqual((await requests(app,'GET','/api/cascade/rebuild/mode')).body,{mode:'rebuild'});
     await assertBlocked('GET', '/panel/l2tp');
     await assertBlocked('POST', '/panel/nodes/dummy/l2tp/install');
     assert.equal((await requests(app, 'GET', '/health')).status, 200);

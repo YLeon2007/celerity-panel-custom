@@ -196,6 +196,19 @@
 
     const i18n = window._networkI18n || {};
     const csrfToken = window._networkCsrfToken || '';
+    const rebuild = window._c3Rebuild === true;
+    async function rebuildPreview(payload) {
+        const response = await fetch('/api/cascade/rebuild/preview', { method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify(payload) });
+        const report = await response.json();
+        if (!response.ok) throw new Error(report.error?.code || 'Предпросмотр недоступен');
+        const text = report.nodes.map(n => n.nodeId + ': ' + n.profiles.map(p => p.profile + ' ' + p.change
+            + (p.sections.length ? ' (' + p.sections.join(', ') + ')' : '')
+            + (p.protectedChanged ? ' — изменятся параметры клиентов' : '')).join('; ')).join('\n');
+        if (!report.allowed) throw new Error('Запись запрещена:\n' + text);
+        if (!confirm('Пересобрать эти ноды?\n' + text)) throw new Error('Отменено до записи');
+        return report.previewId;
+    }
 
     // Do not reuse legacy chain labels: domain.reconcile excludes pending edges
     // and reconciles only the selected confirmed-applied connected component.
@@ -268,7 +281,7 @@
         deployedRevision = snapshot.deployedRevision;
         listedLinkIds = new Set(snapshot.links.map(link => link._id));
         for (const link of snapshot.links) {
-            if (link.lifecycle?.state === 'deleting' && /^[a-f0-9]{24}$/.test(link.lifecycle.deleteJobId || '')) {
+            if (!rebuild && link.lifecycle?.state === 'deleting' && /^[a-f0-9]{24}$/.test(link.lifecycle.deleteJobId || '')) {
                 retainDeletion(link, link.lifecycle.deleteJobId);
                 startIntentPolling({ jobId: link.lifecycle.deleteJobId, version: 2, kind: 'link.delete', linkId: link._id });
             }
@@ -322,6 +335,7 @@
             return null;
         }
         if (!response.ok) throw new Error(errorMessage);
+        if (rebuild && payload.executionMode === 'rebuild') return payload;
         const job = response.status === 202 ? responseJob(payload, expectedKind, expectedLinkId) : null;
         if (job) {
             if (job.version === 2 && (payload.desiredSaved !== true || payload.linkId !== job.linkId)) {
@@ -336,6 +350,17 @@
     // ==================== INIT ====================
 
     function init() {
+        if (rebuild) {
+            const parent = document.getElementById('btnAddLink')?.parentElement;
+            if (parent) { const unlock = document.createElement('button'); unlock.type='button'; unlock.className='btn btn-sm btn-outline';
+                unlock.textContent='Блокировка Apply'; parent.appendChild(unlock); unlock.onclick=async()=>{try{
+                    const r=await fetch('/api/cascade/rebuild/lock');const s=await r.json(); if(!r.ok)throw Error('Статус блокировки недоступен');
+                    if(!s.stale){ showToast(s.locked?'Apply занят':'Свободно');return; }
+                    if(!confirm('Предыдущий исполнитель и его команды на нодах остановлены? Снять именно эту устаревшую блокировку?'))return;
+                    const u=await fetch('/api/cascade/rebuild/unlock',{method:'POST',headers:{'Content-Type':'application/json','x-csrf-token':csrfToken},body:JSON.stringify({token:s.token})});
+                    if(!u.ok)throw Error('Блокировка не снята');showToast('Устаревшая блокировка снята');
+                }catch(e){showToast(e.message,'error');}}; }
+        }
         cy = cytoscape({
             container: document.getElementById('cy'),
             style: getCytoscapeStyle(),
@@ -436,7 +461,7 @@
     async function loadTopology() {
         // A read-only diagnostic; a failed read never enables a previously
         // disabled action. Backend enrollment independently enforces the ban.
-        fetch('/api/cascade/topology/activation-policy').then(async response => {
+        if (!rebuild) fetch('/api/cascade/topology/activation-policy').then(async response => {
             if (response.ok) renderBusinessReentryRestriction(await response.json(), document);
         }).catch(() => {});
         showLoading(true);
@@ -974,6 +999,7 @@
     function domainSyncAnchorError(linkId) {
         const link = _allLinks.find(link => String(link._id) === linkId);
         if (!link) return topologyCauseText('SCOPE_LINK_MISSING');
+        if (rebuild) return null;
         if (link.active === false) return 'Связь отключена — включите её перед синхронизацией домена';
         return ['deployed', 'online', 'staged'].includes(link.status)
             ? null : topologyCauseText('SCOPE_LINK_UNCONFIRMED');
@@ -1247,7 +1273,7 @@
         form.tunnelDomain.value = link.tunnelDomain || 'reverse.tunnel.internal';
         form.muxEnabled.checked = !!link.muxEnabled;
         form.muxConcurrency.value = link.muxConcurrency || 8;
-        form.priority.value = link.priority || 100;
+        form.priority.value = link.priority ?? 100;
         // The saved preference is metadata, not consent to deploy on this edit.
         form.autoDeploy.checked = false;
         updateLinkSubmitIntent();
@@ -1405,7 +1431,13 @@
         return message + ' ' + job.jobId;
     }
 
-    function handleLinkAutoDeploy(snapshot, optedIn) {
+    async function handleLinkAutoDeploy(snapshot, optedIn) {
+        if (rebuild && snapshot?.executionMode === 'rebuild') {
+            if (snapshot.status==='awaiting_preview') {
+                await deployTopology(snapshot.linkId); await loadTopology(); showToast('Схема пересобрана, файлы сверены');return;
+            }
+            showToast(snapshot.status==='succeeded'?'Схема пересобрана, файлы сверены':'Сохранено без применения'); return;
+        }
         if (!optedIn) {
             showToast(i18n.savedWithoutDeploy || 'Изменения сохранены. Деплой не запускался.');
             return;
@@ -1447,6 +1479,7 @@
 
     function createRequestHeaders(data, formKind) {
         const headers = { 'Content-Type': 'application/json' };
+        if (rebuild) return { ...headers, 'x-csrf-token': csrfToken };
         if (data.autoDeploy === true) {
             // Revision refresh is not a new logical create. Keep each form's
             // identity through rejected/unknown deliveries; retire on acceptance.
@@ -1489,7 +1522,7 @@
                 : !!form.autoDeploy?.checked,
             muxEnabled:     form.muxEnabled?.checked || false,
             muxConcurrency: parseInt(form.muxConcurrency?.value) || 8,
-            priority:       parseInt(form.priority?.value) || 100,
+            priority:       Number(form.priority?.value || 100),
         };
 
         // Tunnel domain (reverse only)
@@ -1531,6 +1564,7 @@
 
         try {
             const requestScope = linkId ? 'edit:' + linkId : 'main';
+            if(rebuild && data.autoDeploy===true)data.interactivePreview=true;
             const headers = createRequestHeaders(data, requestScope);
             const res = await fetch(linkId ? ('/api/cascade/links/' + linkId) : '/api/cascade/links', {
                 method: linkId ? 'PUT' : 'POST',
@@ -1542,7 +1576,7 @@
             pendingCreateRequests[requestScope] = null;
             closeModal();
             await loadTopology();
-            handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true);
+            await handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
@@ -1582,6 +1616,7 @@
         const payload = { expectedTopologyRevision: topologyRevision };
         if (linkId) payload.linkId = linkId;
         if (domainLinkId) payload.domainLinkId = domainLinkId;
+        if (rebuild) payload.expectedPreview = await rebuildPreview(payload);
         const scope = 'apply:' + linkId;
         const headers = linkId ? createRequestHeaders({ ...payload, autoDeploy: true,
             desiredVersion: _allLinks.find(link => link._id === linkId)?.desiredVersion }, scope) : { 'Content-Type': 'application/json' };
@@ -1598,6 +1633,7 @@
             throw new Error(describeTopologyError(data, 'HTTP ' + res.status));
         }
         const job = responseJob(data, 'link.apply', linkId);
+        if (rebuild && data.executionMode === 'rebuild' && data.status === 'succeeded') return data;
         if (res.status === 202 && job) {
             if (data.desiredSaved !== true || data.linkId !== job.linkId) throw new Error(i18n.operationUnconfirmed || 'Ответ задания не подтверждён');
             pendingCreateRequests[scope] = null;
@@ -1805,13 +1841,15 @@
         let response;
         try {
             const scope = 'delete:' + linkId;
+            const expectedPreview = rebuild ? await rebuildPreview({linkId,remove:true}) : undefined;
             response = await fetch('/api/cascade/links/' + linkId, {
                 method: 'DELETE',
                 headers: createRequestHeaders({ autoDeploy: true, linkId }, scope),
-                body: JSON.stringify({ expectedTopologyRevision: topologyRevision }),
+                body: JSON.stringify({ expectedTopologyRevision: topologyRevision, expectedPreview }),
             });
             const result = await handleDraftMutationResponse(response, 'link.delete', linkId);
             if (!result) return;
+            if(rebuild && result.executionMode==='rebuild' && result.deleted===linkId){showToast('Связь удалена, обе части пересобраны');await loadTopology();closeInfoModal();return;}
             const job = responseJob(result, 'link.delete', linkId);
             if (job) {
                 retainDeletion(link, job.jobId);
@@ -2134,6 +2172,7 @@
         var btn = document.getElementById('quickLinkSubmit');
         if (btn) { btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>'; }
         try {
+            if(rebuild && data.autoDeploy===true)data.interactivePreview=true;
             var res = await fetch('/api/cascade/links', {
                 method: 'POST',
                 headers: createRequestHeaders(data, 'quick'),
@@ -2144,7 +2183,7 @@
             pendingCreateRequests.quick = null;
             closeQuickModal();
             await loadTopology();
-            handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
+            await handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {

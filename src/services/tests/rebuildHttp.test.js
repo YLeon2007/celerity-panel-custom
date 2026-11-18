@@ -1,0 +1,55 @@
+'use strict';
+const test=require('node:test'), assert=require('node:assert/strict');
+const express=require('express'), mongoose=require('mongoose');
+const {fixture}=require('../../modules/relay-l2tp/tests/helpers/installedEditMongoFixture');
+const {routerForRebuild}=require('../../routes/cascadeRebuild');
+const {createRebuildService}=require('../rebuildService');
+const {generateXrayConfigWithApi}=require('../configGenerator');
+const {randomUUID}=require('node:crypto');
+
+test('public rebuild actions use the DB component; read-only preview, user guard, explicit AutoDeploy, bridged DELETE retry',async t=>{
+    const f=fixture();t.after(()=>f.stop());await f.start();
+    const {HyNode:Node,CascadeLink:Link,RelayL2tpState:State}=f.models;
+    const User=require('../../models/hyUserModel'), sync=require('../syncService');
+    const nodes=[], files=new Map(), writes=[], stages=[];
+    const group=new mongoose.Types.ObjectId();
+    for(const [i,role] of ['portal','relay','bridge','bridge','bridge','portal','bridge'].entries()){
+        const n={_id:new mongoose.Types.ObjectId(),name:`local-${i}`,cascadeRole:role,type:'xray',active:true,ip:`192.0.2.${i+1}`,port:21000+i,groups:[group],xray:{transport:'tcp',security:'none',apiPort:33000+i,inboundTag:'client',extraInbounds:[{inboundTag:'second',port:28000+i,transport:'tcp',security:'none'}]}};
+        await Node.collection.insertOne(n);nodes.push(n);
+    }
+    const [portal,relay,exit,geo,replacement,x,y]=nodes, id=n=>String(n._id);
+    const uuid=randomUUID();await User.collection.insertOne({userId:'local-user',enabled:true,xrayUuid:uuid,nodes:[],groups:[group]});
+    const retainedGroup=new mongoose.Types.ObjectId();const groups=f.models.CascadeRouteGroup.collection;
+    const oldGroup={_id:retainedGroup,name:'local-legacy',mode:'reverse',strategy:'priority-failover',paths:[{pathKey:'old',priority:1,enabled:true,linkIds:[new mongoose.Types.ObjectId()]}]}; await groups.insertOne(oldGroup);
+    for(const n of nodes){files.set(id(n),{main:JSON.parse(generateXrayConfigWithApi(n,await sync._getUsersForNode(n))),bridge:null});}
+    const tproxy={tag:`relay-l2tp-${retainedGroup}`,port:31081,protocol:'dokodemo-door',listen:'0.0.0.0',settings:{network:'tcp,udp',followRedirect:true},streamSettings:{sockopt:{tproxy:'tproxy'}}};
+    files.get(id(relay)).main.inbounds.push(tproxy);
+    const installed={node:relay._id,routeGroup:retainedGroup,status:'installed',desiredState:'installed',secretRevision:1,tproxyPort:tproxy.port};await State.collection.insertOne({...installed});
+    let interrupt=null;
+    const service=createRebuildService({env:{C3_REBUILD_ENABLED:'true',PANEL_DOMAIN:'fixture.invalid'},cache:{async invalidateAllSubscriptions(){}},connect(node){const key=id(node),row=files.get(key);return {read:async p=>structuredClone(row[p]),close:async()=>{},stagePair:async()=>{stages.push(key)},putPair:async pair=>{if(interrupt===key)throw new Error('interrupted');for(const p of pair)row[p.profile]=structuredClone(p.config);writes.push(key);}};}});
+    const csrf=randomUUID(),app=express();app.use(express.json());app.use((req,_res,next)=>{req.session={authenticated:true,panelCsrfToken:csrf};next()});app.use('/api/cascade',routerForRebuild({service,Link,Node}));
+    const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});t.after(()=>new Promise(resolve=>server.close(resolve)));
+    const request=async(method,path,body,token=csrf)=>{const result=await fetch(`http://127.0.0.1:${server.address().port}/api/cascade${path}`,{method,headers:{'content-type':'application/json','x-csrf-token':token},...(body?{body:JSON.stringify(body)}:{})});return {status:result.status,body:await result.json()};};
+    const ok=async(...args)=>{const r=await request(...args);assert.equal(r.status,200,r.body.error?.code);return r.body;};
+    const edge=(a,b,n,other={})=>({portalNodeId:id(a),bridgeNodeId:id(b),tunnelPort:41000+n,name:`link-${n}`,priority:10*n,...other});
+    const make=async(b)=>ok('POST','/links',b);
+    assert.equal((await request('POST','/links',edge(portal,relay,1),'missing')).status,403);
+    assert.equal(await Link.countDocuments(),0);
+    const neighbor=await make(edge(x,y,9)), g=await make(edge(relay,geo,3,{geoRouting:{enabled:true,domains:['full:geo.invalid'],geoip:['ru']}}));
+    const b=await make(edge(relay,exit,2)); assert.equal(writes.length,0);
+    const pr=await make(edge(portal,relay,1,{autoDeploy:true}));assert.equal(pr.status,'succeeded');assert.deepEqual([...new Set(writes)].sort(),[portal,relay,exit,geo].map(id).sort());
+    assert.equal((await State.findOne({node:relay._id}).lean()).routingMode,'follow-relay');
+    const r=files.get(id(relay));const socks=()=>r.main.inbounds.find(i=>i.tag==='rebuild-relay-ingress');const port=socks().port;
+    const policy=()=>r.main.routing.rules.filter(i=>i.ruleTag?.startsWith('rebuild-policy-'));assert.ok(policy().every(i=>['client','second',socks().tag].every(tag=>i.inboundTag.includes(tag))));
+    for(const tag of ['client','second'])assert.deepEqual(r.main.inbounds.find(i=>i.tag===tag).settings.clients.map(c=>c.id),[uuid]);
+    const before=writes.length;await ok('PUT',`/links/${pr.linkId}`,{name:'renamed'});assert.equal(writes.length,before,'saved AutoDeploy metadata is not a new request');
+    const newer=await make(edge(relay,replacement,4,{priority:1,autoDeploy:true,interactivePreview:true}));assert.equal(newer.status,'awaiting_preview');assert.equal(writes.length,before);
+    const preview=await ok('POST','/rebuild/preview',{linkId:newer.linkId});assert.equal(preview.allowed,true);assert.equal(writes.length,before);assert.equal(JSON.stringify(preview).includes(uuid),false);
+    const changed=await request('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:'1'.repeat(64)});assert.equal(changed.body.error.code,'REBUILD_PREVIEW_CHANGED');assert.equal(writes.length,before);
+    await ok('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:preview.previewId});assert.equal(socks().port,port);assert.equal(policy().at(-1).outboundTag,`portal-${newer.linkId.slice(-8)}`);
+    await ok('DELETE',`/links/${b.linkId}`);assert.equal(socks().port,port);assert.ok(!files.get(id(exit)).bridge.reverse);
+    files.get(id(portal)).main.inbounds.find(i=>i.tag==='client').port++;const stageCount=stages.length;const refusal=await request('POST','/topology/deploy',{linkId:pr.linkId});assert.equal(refusal.body.error.code,'REBUILD_CLIENT_CHANGE');assert.equal(stages.length,stageCount);files.get(id(portal)).main.inbounds.find(i=>i.tag==='client').port--;
+    interrupt=id(relay);assert.equal((await request('DELETE',`/links/${pr.linkId}`)).status,409);assert.equal((await Link.findById(pr.linkId)).rebuildDelete,true);interrupt=null;
+    const retried=await ok('POST','/topology/deploy',{linkId:pr.linkId});assert.deepEqual(retried.nodes.map(n=>n.nodeId).sort(),[portal,relay,replacement,geo].map(id).sort());assert.ok(!files.get(id(portal)).main.reverse);assert.equal(files.get(id(portal)).main.outbounds[0].protocol,'blackhole');
+    assert.equal(await Link.exists({_id:pr.linkId}),null);assert.ok(await Link.exists({_id:neighbor.linkId}));assert.ok(await Link.exists({_id:g.linkId}));assert.ok(!writes.includes(id(x))&&!writes.includes(id(y)));assert.deepEqual(await groups.findOne({_id:retainedGroup}),oldGroup);
+});

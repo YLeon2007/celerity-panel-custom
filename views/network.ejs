@@ -112,4 +112,4 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js" crossorigin="anonymous"></script>
-<script src="/js/network.min.js?v=8c1440573d630ba3"></script>
+<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %><script>window._c3Rebuild=true;window._networkCsrfToken=<%- JSON.stringify(typeof csrfToken==='string'?csrfToken:'') %>;</script><script src="/js/network.js?v=rebuild1"></script><% } else { %><script src="/js/network.min.js?v=8c1440573d630ba3"></script><% } %>

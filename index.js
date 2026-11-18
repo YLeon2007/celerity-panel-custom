@@ -245,6 +245,7 @@ app.use(i18nMiddleware);
 const { version: appVersion } = require('./package.json');
 app.use((req, res, next) => {
     res.locals.appVersion = appVersion;
+    res.locals.c3Rebuild = rebuildEnabled;
     next();
 });
 
@@ -491,6 +492,7 @@ app.use(marzbanCompat);
 
 app.use('/api/users', requireAuth, usersRoutes);
 app.use('/api/nodes', requireAuth, nodesRoutes);
+if (rebuildEnabled) app.use('/api/cascade', requireAuth, require('./src/routes/cascadeRebuild').routerForRebuild());
 app.use('/api/cascade/route-groups', requireAuth, cascadeRouteGroupsRoutes);
 app.use('/api/cascade/topology-transfer-drafts', topologyTransferDraftsRoutes);
 app.use('/api/cascade/topology', cascadeTopologyDeployRoutes);
