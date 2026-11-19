@@ -35,6 +35,10 @@ function protectedInterfaces(config) {
     });
     return projected.sort((a,b)=>String(a.tag).localeCompare(String(b.tag)));
 }
+function hasProtectedClientInbound(main, tag) {
+    if (!main) throw fail('REBUILD_MAIN_UNREADABLE');
+    return protectedInterfaces(main).some(i => i.protocol === 'vless' && i.tag === tag);
+}
 function profilePreview(before, after, profile) {
     if (!before && profile==='main') throw fail('REBUILD_MAIN_UNREADABLE');
     const sections=[...new Set([...Object.keys(before||{}),...Object.keys(after)])].filter(k=>!equal(before?.[k],after[k]));
@@ -90,4 +94,4 @@ async function runRebuild(d, req) {
         });
     });
 }
-module.exports={runRebuild,componentFor,profilePreview};
+module.exports={runRebuild,componentFor,profilePreview,hasProtectedClientInbound};

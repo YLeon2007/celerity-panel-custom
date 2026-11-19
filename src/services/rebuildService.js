@@ -1,6 +1,6 @@
 'use strict';
 const {isRebuildEnabled}=require('./rebuildMode');
-const {runRebuild}=require('./rebuildCoordinator');
+const {runRebuild,hasProtectedClientInbound}=require('./rebuildCoordinator');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {createTransport}=require('./rebuildTransport');
@@ -55,7 +55,16 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 const controlPlaneAddresses=[...new Set([env.PANEL_DOMAIN,...nodes.flatMap(n=>[n.ip,n.domain])].filter(Boolean))];
                 for(const id of ids)await transports.get(id).requireSupportedCore();
                 prepared=await prepareLinks(Link,links,{env});
-                const candidates=compose({nodes,links:prepared,affectedNodeIds:ids,usersByNode,panelTls,followRelayStates,controlPlaneAddresses});
+                // A bridge can still serve its managed client interface with no assigned users.
+                // Pass only its presence to the generator, never observed MAIN parameters.
+                const bridgesWithClientInbound=new Set();
+                for(const node of nodes){
+                    const id=String(node._id);
+                    if(node.cascadeRole!=='bridge'||usersByNode.get(id).length)continue;
+                    const main=await transports.get(id).read('main');
+                    if(hasProtectedClientInbound(main,node.xray?.inboundTag||'vless-in'))bridgesWithClientInbound.add(id);
+                }
+                const candidates=compose({nodes,links:prepared,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses});
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
                 return candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p);
             },

@@ -90,7 +90,7 @@ function blackholeProfile() {
     };
 }
 
-function mainProfile({ node, role }, users, options) {
+function mainProfile({ node, role }, users, options, hasClientInbound) {
     requireRebuild(node.type === 'xray' && (node.port === undefined || validPort(node.port))
         && (node.xray?.apiPort === undefined || validPort(node.xray.apiPort)), 'REBUILD_INVALID_NODE_CONFIG');
     requireRebuild(Array.isArray(users) && users.every(user => typeof user?.xrayUuid === 'string' && /^\S+$/.test(user.xrayUuid)
@@ -98,7 +98,7 @@ function mainProfile({ node, role }, users, options) {
     const apiPort = node.xray?.apiPort ?? 61000;
     // Classic exit-only setup does not provision client inbounds or REALITY keys.
     // Keep MAIN available for local management without opening a subscriber port.
-    if (role === 'bridge' && users.length === 0) {
+    if (role === 'bridge' && users.length === 0 && !hasClientInbound) {
         const config = blackholeProfile();
         config.log = generator.buildXrayLogSection(node);
         generator.applyXrayApi(config, apiPort);
@@ -174,7 +174,7 @@ function assertProfileOwnership(main, bridge) {
 }
 
 /** Build owned MAIN/BRIDGE replacements from an explicit desired graph. No I/O. */
-function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeIds, panelTls = {}, followRelayStates = [], controlPlaneAddresses = [] }) {
+function composeRebuildProfiles({ nodes, links, usersByNode = {}, bridgesWithClientInbound = new Set(), affectedNodeIds, panelTls = {}, followRelayStates = [], controlPlaneAddresses = [] }) {
     requireRebuild(panelTls && typeof panelTls === 'object' && !Array.isArray(panelTls)
         && (panelTls.serverName === undefined || typeof panelTls.serverName === 'string'), 'REBUILD_INVALID_PANEL_TLS');
     const options = { panelTls };
@@ -183,7 +183,7 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
     const users = collectUsers(usersByNode);
     const profiles = [];
     for (const [nodeId, entry] of graph.byNodeId) {
-        const { config: main, tags, subscriberDenies } = mainProfile(entry, users.has(nodeId) ? users.get(nodeId) : [], options);
+        const { config: main, tags, subscriberDenies } = mainProfile(entry, users.has(nodeId) ? users.get(nodeId) : [], options, bridgesWithClientInbound.has(nodeId));
         const bridge = blackholeProfile();
         const transit = entry.incoming.map(ingressTag);
         if (entry.isExit) {
