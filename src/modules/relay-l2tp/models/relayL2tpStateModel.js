@@ -82,6 +82,10 @@ const relayL2tpStateSchema = new mongoose.Schema({
     managedVersion: { type: String, default: '' },
     configFingerprint: { type: String, default: '' },
     backupId: { type: String, default: '' },
+    // Rebuild-only first-install ownership. Keep it across follow-relay Apply;
+    // backupId is an ownership witness, not permission to restore an old MAIN.
+    rebuildInstallToken: { type: String, select: false },
+    rebuildMachineId: { type: String, select: false },
     operationId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'L2tpOperation',

@@ -5,6 +5,8 @@ const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {createTransport}=require('./rebuildTransport');
 const {prepareLinks}=require('./rebuildLinkKeys');
+const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
+const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
 const {createPrivateKey,createPublicKey}=require('node:crypto');
 const fail=code=>Object.assign(new Error(code),{code});
 // Subscriptions publish a separate X25519 public key. It never appears in
@@ -25,7 +27,8 @@ function inconsistentPublishedKey(node){
 }
 function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=require('../models/hyNodeModel'),
     State=require('../modules/relay-l2tp/models/relayL2tpStateModel'),sync=require('./syncService'),locks=makeLocks(),connect=createTransport,
-    compose=composeRebuildProfiles,env=process.env,cache=require('./cacheService')}={}){
+    compose=composeRebuildProfiles,env=process.env,cache=require('./cacheService'),
+    L2tpUser,createRelayDirect}={}){
     const gate=()=>{if(!isRebuildEnabled(env))throw fail('REBUILD_DISABLED');};
     async function execute(req,alreadyHeld){
         gate();const transports=new Map(),states=new Map();let prepared;
@@ -76,6 +79,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             }
         },req);}finally{const results=await Promise.allSettled([...transports.values()].map(t=>t.close()));if(results.some(x=>x.status==='rejected'))throw fail('REBUILD_TRANSPORT_CLEANUP_FAILED');}
     }
-    return {execute,locks};
+    const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks,env,createRelayDirect});
+    const removeRelay=createRebuildRelayRemove({Node,State,L2tpUser,locks,env,createRelayDirect});
+    return {execute,locks,installRelay,removeRelay};
 }
 module.exports={createRebuildService};

@@ -1,0 +1,527 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
+const { EventEmitter } = require('node:events');
+const { Client } = require('ssh2');
+const { generateXraySystemdService, generateBridgeSystemdService } = require('../../configGenerator');
+const { composeRebuildProfiles } = require('../../../modules/relay-l2tp/services/rebuildTopologyComposer');
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const { join, dirname } = require('node:path');
+const applyWire = require('./rebuildRelayApplyWire');
+
+module.exports = ({ fixture, id, oid, machineId }) => {
+    test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
+
+    function host(t, scenario, { preEnabled = false, idleIke = false, subscribers = [], lifecycle = false, mainUid = 65534 } = {}) {
+        const f = fixture(t);
+        const root = fs.mkdtempSync(join(process.cwd(), '.relay-install-join-'));
+        t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+        const put = (file, bytes, mode = 0o600) => {
+            const path = join(root, file);
+            fs.mkdirSync(dirname(path), { recursive: true, mode: 0o755 });
+            fs.writeFileSync(path, bytes, { mode });
+            fs.chmodSync(path, mode);
+            return path;
+        };
+        const mainPath = '/usr/local/etc/xray/config.json', bridgePath = '/usr/local/etc/xray-bridge/config.json';
+        const xl = 'xl2tpd.service', ike = 'strongswan-starter.service', x = 'xray.service', b = 'xray-bridge.service';
+        const net = 'celerity-rebuild-l2tp-network.service';
+        const bootLink = '/etc/systemd/system/multi-user.target.wants/' + xl;
+        const stock = join(__dirname, '../../../modules/relay-l2tp/node-artifacts/l2tp');
+        const key = Buffer.from('synthetic SSH wire key');
+        const pin = createHash('sha256').update(key).digest('hex');
+        f.env.C3_REBUILD_L2TP_SSH_SHA256 = pin;
+        const relay = Object.assign(f.nodes[0], { port: 21443, xray: { apiPort: 61001, security: 'none' },
+            aclRules: ['reject(denied.invalid)'], ssh: { username: 'root', port: 22, password: 'local-fixture-only' } });
+        const exit = { _id: oid('d'.repeat(24)), type: 'xray', active: true, ip: '192.0.2.99', cascadeRole: 'bridge', ssh: relay.ssh };
+        f.nodes.push(exit);
+        f.links.push({ _id: oid('e'.repeat(24)), portalNode: relay._id, bridgeNode: exit._id,
+            tunnelProtocol: 'vmess', tunnelPort: 20443, tunnelUuid: '7b159424-f38c-4869-bbf8-cb426fa00354',
+            mode: 'forward', active: true, status: scenario === 'offline' ? 'offline' : 'deployed' });
+        const usersByNode = { [id]: subscribers };
+        const generated = composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode });
+        const main = generated.find(row => row.nodeId === id && row.profile === 'main').config;
+        const bridge = generated.find(row => row.nodeId === id && row.profile === 'bridge').config;
+        if (scenario.startsWith('sidecar')) {
+            // Put the stock decision suffix behind an already-owned loopback listener.
+            const shared = 'rebuild-relay-ingress', port = 24081;
+            bridge.inbounds.push({ tag: shared, port, listen: '127.0.0.1', protocol: 'socks', settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' } });
+            bridge.outbounds.push(...main.outbounds.splice(1));
+            bridge.routing.rules = main.routing.rules.filter(row => row.outboundTag !== 'API').map(row => ({ ...row, inboundTag: [shared] }));
+            main.routing.rules = main.routing.rules.filter(row => !row.ruleTag?.startsWith('rebuild-policy-'));
+            main.outbounds.push({ tag: 'relay-policy', protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port }] } });
+            main.routing.rules.push({ type: 'field', inboundTag: [main.inbounds[0].tag], outboundTag: 'relay-policy' });
+            if (scenario === 'sidecar-unsafe') {
+                bridge.outbounds.push({ tag: 'bad-direct', protocol: 'freedom' });
+                bridge.routing.rules.unshift({ type: 'field', outboundTag: 'bad-direct' });
+            }
+        }
+        const bridgeActive = bridge.inbounds.length > 0;
+        const mainMode = 0o640, bridgeMode = lifecycle && bridgeActive ? 0o644 : 0o640;
+        const mpath = put(mainPath, JSON.stringify(main), mainMode), bpath = put(bridgePath, JSON.stringify(bridge), bridgeMode);
+        put('/usr/local/bin/xray', 'modeled executable\n', 0o755);
+        put('/usr/lib/systemd/system/' + ike, '[Service]\nExecStart=/usr/sbin/ipsec start --nofork\n', 0o644);
+        put('/etc/systemd/system/' + x, generateXraySystemdService(), 0o644);
+        if (bridgeActive) put('/etc/systemd/system/' + b, generateBridgeSystemdService(), 0o644);
+        fs.mkdirSync(dirname(join(root, bootLink)), { recursive: true, mode: 0o755 });
+        fs.mkdirSync(join(root, 'var/lib'), { recursive: true, mode: 0o755 });
+        put('/etc/ppp/chap-secrets', '# stock chap\n', lifecycle ? 0o640 : 0o600);
+        put('/etc/ppp/options', '# stock options\n');
+        put('/etc/systemd/system/foreign.service', '[Service]\nExecStart=/bin/false\n', 0o644);
+        const lns = '; package conffile\n[global]\n';
+        put('/etc/xl2tpd/xl2tpd.conf', lns, 0o644);
+        put('/etc/ipsec.secrets', '# stock secrets\n');
+        const starter = put('/etc/ipsec.conf', '# stock starter\nconfig setup\n');
+        fs.mkdirSync(join(root, 'etc/ipsec.d'), { mode: 0o755 });
+        const packages = ['strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables'];
+        // One absolute path projected; the shipped ensure helper is used unchanged.
+        put('bin/dpkg-query', `#!/bin/sh\n[ "$#" -eq 3 ] && [ "$1" = -W ] && [ "$2" = '-f=\${db:Status-Abbrev}' ] || exit 91\ncase "$3" in ${packages.join('|')}) printf 'ii ';; *) exit 91;; esac\n`, 0o700);
+        put('bin/apt-get', '#!/bin/sh\nexit 92\n', 0o700);
+        put('bin/systemctl', '#!/bin/sh\ncase "$*" in "show xl2tpd.service --value -p LoadState") printf "not-found\\n";; daemon-reload) test -f "$ROOT/etc/systemd/system/xl2tpd.service";; *) exit 93;; esac\n', 0o700);
+        put('bin/python3', '#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = "$ROOT/ensure-xl2tpd-unit.py" ] || exit 94\nexec /usr/bin/python3 -I -B "$1" "$ROOT"\n', 0o700);
+        for (const name of ['grep', 'dirname']) fs.symlinkSync('/usr/bin/' + name, join(root, 'bin', name));
+        const script = fs.readFileSync(join(stock, 'install-runtime.sh'), 'utf8');
+        const absolute = "readonly IPSEC_CONF='/etc/ipsec.conf'";
+        assert.equal(script.split(absolute).length, 2);
+        fs.symlinkSync(join(stock, 'ensure-xl2tpd-unit.py'), join(root, 'ensure-xl2tpd-unit.py'));
+        const runtime = put('install-runtime.sh', script.replace(absolute, 'readonly IPSEC_CONF="$ROOT/etc/ipsec.conf"'));
+        const prereq = spawnSync('/bin/bash', [runtime],
+            { env: { ROOT: root, PATH: join(root, 'bin') }, encoding: 'utf8', timeout: 10000 });
+        assert.equal(prereq.status, 0, prereq.stderr);
+        assert.deepEqual(JSON.parse(prereq.stdout), { status: 'ok', changed: 2, present: 6 });
+        const unit = (path, extra = {}) => ({ LoadState: 'loaded', UnitFileState: 'disabled', ActiveState: 'inactive', SubState: 'dead',
+            FragmentPath: path, MainPID: '0', InvocationID: '', DropInPaths: '', NeedDaemonReload: 'no', PrivateNetwork: 'no',
+            KillMode: 'control-group', User: '', ...extra });
+        const stockX = (name, path, active, pid) => unit('/etc/systemd/system/' + name, { User: 'nobody',
+            UnitFileState: active ? 'enabled' : 'disabled', ...(active && { ActiveState: 'active', SubState: 'running', MainPID: pid, InvocationID: 'original-' + name }),
+            ExecStart: `{ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${path} ; }` });
+        const original = {
+            [x]: stockX(x, mainPath, true, '101'), [b]: bridgeActive ? stockX(b, bridgePath, true, '103') : unit('', { LoadState: 'not-found', UnitFileState: '' }),
+            [xl]: unit('/etc/systemd/system/' + xl, { LoadState: scenario === 'masked' ? 'masked' : 'loaded',
+                UnitFileState: scenario === 'masked' ? 'masked' : preEnabled || scenario === 'prewrite' ? 'enabled' : 'disabled',
+                ExecStart: '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }' }),
+            [ike]: unit('/usr/lib/systemd/system/' + ike, { ExecStart: '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }',
+                ControlGroup: '/system.slice/' + ike, ...((idleIke || scenario.startsWith('ike-')) && { ActiveState: 'active', SubState: 'running',
+                    MainPID: '200', InvocationID: 'stock-ike', UnitFileState: 'enabled' }) }),
+            [net]: unit('', { LoadState: 'not-found', UnitFileState: '' }),
+        };
+        if (preEnabled || scenario === 'prewrite') {
+            fs.symlinkSync(original[xl].FragmentPath, join(root, bootLink));
+        }
+        if (scenario === 'prewrite') {
+            fs.writeFileSync(starter, '# stock starter\nconfig setup\n');
+        }
+        if (scenario === 'unit-drift') fs.appendFileSync(join(root, original[xl].FragmentPath), '# changed\n');
+        const foreign = { rules: [], routes: [{ dst: '198.51.100.0/24', table: 201, dev: 'fixture0' }],
+            tables: [{ table: { family: 'inet', name: 'foreign', comment: 'operator-owned' } }],
+            sockets: [['tcp', '192.0.2.4', 39491, '999']] };
+        const manager = put('manager.json', JSON.stringify({ packages, machine: machineId, original, units: original,
+            running: { [x]: main, ...(bridgeActive && { [b]: bridge }) }, nextPid: 300, charonPid: '201', ikeConnection: false,
+            lnsMd5: createHash('md5').update(lns).digest('hex'), effects: [], rule: null, route: null, nft: null, foreign,
+            stockRules: [[0, 255], [32766, 254], [32767, 253]].map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
+            owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534], [fs.statSync(bpath).ino]: [0, 65534] } }));
+        const actions = [], refusals = [], wireFaults = [];
+        let removeBaseline;
+        const records = () => JSON.parse(fs.readFileSync(manager, 'utf8'));
+        const writeRecords = value => fs.writeFileSync(manager, JSON.stringify(value));
+        const applyHandlers = new Map();
+        if (lifecycle) {
+            const pool = require('../../sshPoolService');
+            // Use the supported pool-disabled branch; no settings DB or real SSH.
+            const { settingsLoaded, config } = pool;
+            pool.settingsLoaded = true;
+            pool.config = { ...config, enabled: false };
+            t.after(() => Object.assign(pool, { settingsLoaded, config }));
+            applyHandlers.set(relay.ip, applyWire({ root, records, writeRecords, mainPath, bridgePath }));
+            const peerRoot = join(root, 'peer');
+            const peer = { units: {}, effects: [], running: {}, owners: {}, nextPid: 600 };
+            for (const { profile, config: cfg } of generated.filter(row => row.nodeId === String(exit._id))) {
+                const [name, path] = profile === 'main' ? [x, mainPath] : [b, bridgePath];
+                put(join('peer', path), JSON.stringify(cfg), 0o640);
+                peer.running[name] = cfg;
+                peer.units[name] = stockX(name, path, true, String(++peer.nextPid));
+            }
+            applyHandlers.set(exit.ip, applyWire({ root: peerRoot, records: () => peer, writeRecords: () => {}, mainPath, bridgePath }));
+        }
+        // Model ssh2 at the connection/channel boundary. Production NodeSSH
+        // still pins the endpoint, opens the direct client and ships stdin.
+        const peers = new WeakMap(), liveClients = new Set();
+        t.mock.method(Client.prototype, 'connect', function (options) {
+            assert.ok(options.host === relay.ip || applyHandlers.has(options.host));
+            assert.equal(options.port, 22);
+            assert.equal(options.username, 'root');
+            if (options.hostVerifier) {
+                assert.equal(options.host, relay.ip);
+                assert.equal(options.hostVerifier(key), true);
+                assert.equal(options.hostVerifier(Buffer.from('other key')), false);
+            }
+            peers.set(this, { ip: options.host, pinned: typeof options.hostVerifier === 'function' });
+            liveClients.add(this);
+            queueMicrotask(() => this.emit('ready'));
+            return this;
+        });
+        t.mock.method(Client.prototype, 'end', function () { liveClients.delete(this); });
+        t.mock.method(Client.prototype, 'exec', function (command, ready) {
+            const peer = peers.get(this);
+            const stream = new EventEmitter(), chunks = [];
+            stream.stderr = new EventEmitter();
+            stream.write = chunk => { chunks.push(Buffer.from(chunk)); return true; };
+            const execute = stdin => {
+                if (!command.startsWith('/usr/bin/timeout -k ')) {
+                    assert.ok(!peer.pinned && applyHandlers.has(peer.ip));
+                    return applyHandlers.get(peer.ip)(command, stdin);
+                }
+                assert.ok(peer.pinned && peer.ip === relay.ip);
+                const request = JSON.parse(stdin);
+                const { action } = request;
+                actions.push(action);
+                if (action === 'install') assert.ok(f.states[0]?.status === 'installing'
+                    && f.users.some(user => String(user.relayNode) === id && user.syncStatus === 'pending'));
+                if (action === 'prepare-remove' || action === 'remove') {
+                    assert.ok(f.lockHeld);
+                    const [state] = f.states;
+                    assert.equal(state.status, action === 'remove' ? 'removing' : 'installed');
+                    assert.equal(f.users.filter(user => String(user.relayNode) === id && user.syncStatus === 'synced').length, 1);
+                    const network = Object.fromEntries(['clientCidr', 'tproxyPort', 'fwmark', 'routeTable'].map(key => [key, state[key]]));
+                    assert.deepEqual(request, { action, machineId, nodeId: id, backupId: state.backupId, network,
+                        ...(action === 'remove' ? { baseline: removeBaseline } : {}) });
+                }
+                const result = spawnSync('/usr/bin/python3', ['-I', '-B', join(__dirname, 'rebuildRelayInstallHost.py'), root, scenario],
+                    { input: JSON.stringify(command) + '\n' + stdin, env: {}, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
+                assert.ok(!result.error && [0, 70, 75].includes(result.status), 'local DIRECT harness exit: ' + (result.error?.code ?? result.status));
+                assert.deepEqual(records().faults ?? [], [], 'closed DIRECT command model');
+                if (/^DIRECT_[A-Z_]+\n$/.test(result.stderr)) refusals.push(result.stderr.trim());
+                if (action === 'prepare-remove' && result.status === 0) removeBaseline = JSON.parse(result.stdout).baseline;
+                return result;
+            };
+            let ended = false;
+            const finish = stdin => {
+                try {
+                    const result = execute(stdin);
+                    stream.emit('data', result.stdout);
+                    stream.stderr.emit('data', result.stderr);
+                    stream.emit('close', result.status);
+                } catch (error) {
+                    wireFaults.push(error);
+                    stream.emit('error', error);
+                }
+            };
+            stream.end = done => { ended = true; done(); queueMicrotask(() => finish(Buffer.concat(chunks).toString('utf8'))); };
+            ready(null, stream);
+            // Ordinary SSH execs without stdin never call channel.end().
+            queueMicrotask(() => { if (!ended) finish(undefined); });
+        });
+        t.after(() => {
+            assert.deepEqual(wireFaults, [], 'fixture wire must handle every dispatched frame');
+            assert.equal(liveClients.size, 0, 'all SSH clients closed');
+        });
+        const before = Object.fromEntries([mainPath, bridgePath, '/etc/ipsec.conf', '/etc/ppp/chap-secrets', '/etc/ipsec.secrets',
+            '/etc/xl2tpd/xl2tpd.conf', '/etc/ppp/options', '/etc/systemd/system/' + x, '/etc/systemd/system/' + xl,
+            '/etc/systemd/system/foreign.service', '/usr/lib/systemd/system/' + ike, '/usr/local/bin/xray',
+            ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
+            .map(path => [path, fs.readFileSync(join(root, path))]));
+        const build = f.create;
+        const create = overrides => build({ createRelayDirect: undefined, ...overrides });
+        return Object.assign(f, { create, actions, refusals, root, before, mainPath, bridgePath, mpath, bpath, bridge,
+            bootLink, generated, usersByNode, x, b, xl, ike, net,
+            records, writeRecords, removeBaseline: () => removeBaseline,
+        });
+    }
+
+    for (const scenario of ['main', 'sidecar', 'offline', 'settled', 'sidecar-refusal', 'prewrite', 'masked', 'package',
+        'ike-active', 'ike-refusal', 'unit-drift', 'user-rpc-error', 'sidecar-unsafe']) {
+        test(`joined DIRECT + stock prerequisites: ${scenario}`, async t => {
+            const f = host(t, scenario);
+            const expected = { settled: 'REBUILD_L2TP_INSTALL_FAILED', 'sidecar-refusal': 'REBUILD_L2TP_INSTALL_FAILED',
+                'ike-refusal': 'REBUILD_L2TP_INSTALL_FAILED', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                prewrite: 'REBUILD_L2TP_INSTALL_FAILED', masked: 'REBUILD_L2TP_HOST_NOT_READY',
+                package: 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'user-rpc-error': 'REBUILD_L2TP_DIRECT_PROFILE_USERS',
+                'sidecar-unsafe': 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' }[scenario];
+            const outcome = await f.create().installRelay(id).catch(error => error);
+            assert.equal(outcome.code ?? outcome.status, expected ?? 'installed', `host refusals: ${f.refusals.join(', ')}`);
+            if (!expected) {
+                assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
+                assert.ok(fs.lstatSync(join(f.root, f.bootLink)).isSymbolicLink());
+                const current = JSON.parse(fs.readFileSync(f.mpath)), side = JSON.parse(fs.readFileSync(f.bpath));
+                assert.ok(current.inbounds.some(row => row.tag === `relay-l2tp-${id}`));
+                const policy = scenario === 'sidecar' ? side : current;
+                const fallback = policy.routing.rules.find(row => row.ruleTag === 'rebuild-policy-default');
+                assert.ok(fallback.inboundTag.includes('rebuild-relay-ingress'));
+                assert.equal(policy.outbounds[0].protocol, 'blackhole');
+                assert.ok(policy.routing.rules.slice(0, policy.routing.rules.indexOf(fallback)).some(rule =>
+                    rule.inboundTag?.includes('rebuild-relay-ingress') && rule.outboundTag === 'block'
+                    && rule.domain?.includes('full:denied.invalid')));
+                if (scenario !== 'sidecar') assert.ok(fs.readFileSync(f.bpath).equals(Buffer.from(JSON.stringify(f.bridge))));
+                assert.deepEqual(f.records().owners[String(fs.statSync(f.mpath).ino)], [65534, 65534]);
+                if (scenario === 'sidecar') assert.deepEqual(f.records().owners[String(fs.statSync(f.bpath).ino)], [0, 65534]);
+                assert.equal(fs.statSync(f.mpath).mode & 0o777, 0o640);
+                assert.equal(f.states[0].status, 'installed');
+                assert.equal(f.users[0].syncStatus, 'synced');
+                return;
+            }
+            assert.equal(f.states.length + f.users.length, 0);
+            for (const [path, bytes] of Object.entries(f.before)) {
+                if (scenario === 'prewrite' && path === '/etc/ppp/options') {
+                    assert.equal(fs.readFileSync(join(f.root, path), 'utf8'), '# external change\n');
+                } else assert.ok(fs.readFileSync(join(f.root, path)).equals(bytes), path);
+            }
+            if (['settled', 'sidecar-refusal', 'ike-refusal'].includes(scenario)) {
+                assert.equal(f.actions.at(-1), 'rollback');
+                assert.equal(f.records().nft, null);
+                if (scenario === 'ike-refusal') assert.equal(f.records().units['strongswan-starter.service'].ActiveState, 'active');
+                assert.equal(fs.existsSync(join(f.root, f.bootLink)), false);
+                assert.deepEqual(f.records().owners[String(fs.statSync(f.mpath).ino)], [65534, 65534]);
+                if (scenario === 'sidecar-refusal') assert.deepEqual(f.records().owners[String(fs.statSync(f.bpath).ino)], [0, 65534]);
+                assert.equal(fs.statSync(f.mpath).mode & 0o777, 0o640);
+            } else {
+                assert.ok(!f.actions.includes('rollback'));
+                assert.equal(f.records().effects.length, 0);
+                assert.equal(fs.existsSync(join(f.root, 'var/lib/celerity-rebuild-l2tp-direct')), false);
+                if (scenario === 'prewrite') assert.deepEqual(f.refusals, ['DIRECT_NO_WRITE_BASELINE_CHANGED']);
+            }
+        });
+    }
+
+    function applyOptions(t, f) {
+        const Link = require('../../../models/cascadeLinkModel');
+        const State = require('../../../modules/relay-l2tp/models/relayL2tpStateModel');
+        t.mock.method(require('../../configGenerator'), 'buildPanelInlineCertificate', () => null);
+        const session = { synthetic: true };
+        t.mock.method(Link.db, 'transaction', fn => fn(session));
+        t.mock.method(State.collection, 'updateOne', async (where, update, options) => {
+            const [row] = f.states;
+            assert.equal(options.session.synthetic, true);
+            for (const [k, value] of Object.entries(where)) assert.equal(String(row[k] ?? null), String(value));
+            Object.assign(row, update.$set);
+            return { acknowledged: true, matchedCount: 1 };
+        });
+        t.mock.method(Link.collection, 'updateMany', async (where, update, options) => {
+            assert.equal(options.session.synthetic, true);
+            assert.deepEqual(where._id.$in.map(String), f.links.map(row => String(row._id)));
+            for (const row of f.links) Object.assign(row, update.$set);
+            return { acknowledged: true, matchedCount: f.links.length };
+        });
+        return { sync: { _getUsersForNode: async node => structuredClone(f.usersByNode[String(node._id)] ?? []) },
+            cache: { invalidateAllSubscriptions: async () => {} } };
+    }
+
+    const fingerprint = (f, path) => {
+        const file = join(f.root, path), st = fs.lstatSync(file);
+        return { inode: st.ino, mode: st.mode & 0o777, owner: f.records().owners[st.ino] ?? [0, 0],
+            digest: createHash('sha256').update(st.isSymbolicLink() ? fs.readlinkSync(file) : fs.readFileSync(file)).digest('hex') };
+    };
+    const present = path => fs.lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+    const readJson = path => JSON.parse(fs.readFileSync(path, 'utf8'));
+    const ownerReceipt = row => Object.fromEntries(['backupId', 'rebuildMachineId', 'rebuildInstallToken', 'pskEncrypted',
+        'secretRevision', 'installedAt', 'lastVerifiedAt', 'lastSyncAt'].map(k => [k, row[k]]));
+    const digestAccount = row => createHash('sha256').update(JSON.stringify(row)).digest('hex');
+    const installedActions = ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify'];
+    const status = outcome => outcome.code ?? outcome.status;
+    const diagnostic = f => JSON.stringify({ action: f.actions.at(-1), wire: f.refusals.at(-1), guard: f.records().lastRefusal });
+
+    async function laterApply(f, service) {
+        const ownership = ownerReceipt(f.states[0]);
+        const account = () => f.users.find(user => String(user.relayNode) === id);
+        const beforeAccount = digestAccount(account());
+        const boot = fingerprint(f, f.bootLink);
+        const beforeMain = fingerprint(f, f.mainPath);
+        const originalInvocation = f.records().units[f.x].InvocationID;
+        f.nodes[0].aclRules = ['reject(new-deny.invalid)'];
+        assert.equal((await service.execute({ nodeId: id })).allowed, true);
+        assert.deepEqual(ownerReceipt(f.states[0]), ownership, 'Apply changed the persisted install owner');
+        assert.equal(digestAccount(account()), beforeAccount, 'Apply changed the persisted bootstrap account');
+        assert.deepEqual(fingerprint(f, f.bootLink), boot, 'Apply changed boot enrollment');
+        const afterMain = fingerprint(f, f.mainPath);
+        assert.notEqual(afterMain.inode, beforeMain.inode);
+        assert.deepEqual([afterMain.owner, afterMain.mode], [beforeMain.owner, beforeMain.mode]);
+        assert.notEqual(f.records().units[f.x].InvocationID, originalInvocation);
+        assert.equal(f.records().units[f.net].ActiveState, 'failed');
+        assert.equal(f.records().units[f.xl].ActiveState, 'inactive');
+        assert.ok(f.records().rule && f.records().route && f.records().nft, 'Apply retains the installed kernel policy');
+        const main = readJson(f.mpath);
+        assert.ok(main.routing.rules.some(rule => rule.domain?.includes('full:new-deny.invalid')
+            && rule.outboundTag === 'block' && rule.inboundTag.includes('rebuild-relay-ingress')));
+        assert.ok(main.inbounds.some(row => row.tag === `relay-l2tp-${id}` && row.port === f.states[0].tproxyPort));
+    }
+
+    test('joined DIRECT: later Apply preserves install ownership and recomposes policy', async t => {
+        const f = host(t, 'sidecar', { lifecycle: true });
+        const service = f.create(applyOptions(t, f));
+        assert.equal((await service.installRelay(id)).status, 'installed');
+        await laterApply(f, service);
+    });
+
+    // The pre-enabled control separates the baseline removal path from the
+    // boot-enrollment case, and exposes sidecar/idle-IKE failures independently.
+    for (const { name, sidecar = false, preEnabled = false, idleIke = false, apply = false, mainUid } of [
+        { name: 'MAIN, root-owned pre-enabled control', preEnabled: true, mainUid: 0 },
+        { name: 'MAIN, non-root ownership', preEnabled: true },
+        { name: 'MAIN, install-enrolled boot' },
+        { name: 'MAIN, initially idle active IKE', preEnabled: true, idleIke: true },
+        { name: 'sidecar handoff', sidecar: true, preEnabled: true },
+        { name: 'later Apply, install-enrolled boot', apply: true },
+        { name: 'later Apply, root-owned pre-enabled control', apply: true, preEnabled: true, mainUid: 0 },
+        { name: 'later Apply, from sidecar install', apply: true, sidecar: true, preEnabled: true },
+    ]) test(`joined install → ${apply ? 'Apply → ' : ''}remove: ${name}`, async t => {
+        const subscribers = [{ userId: 'fixture-subscriber', xrayUuid: '00000000-0000-4000-8000-000000000005' }];
+        const f = host(t, sidecar ? 'sidecar' : 'main', { preEnabled, idleIke, subscribers, lifecycle: true, mainUid });
+        const service = f.create(applyOptions(t, f));
+        const before = Object.fromEntries(Object.keys(f.before).map(path => [path, fingerprint(f, path)]));
+        const leaves = () => ['etc', 'usr', 'var', 'peer'].flatMap(dir => fs.readdirSync(join(f.root, dir), { recursive: true, withFileTypes: true })
+            .filter(entry => !entry.isDirectory()).map(entry => join(entry.parentPath, entry.name).slice(f.root.length))).sort();
+        const beforeLeaves = leaves();
+        const bootBefore = preEnabled ? fingerprint(f, f.bootLink) : null;
+        const stockUnits = f.records().original;
+        const foreignUser = { _id: oid('7'.repeat(24)), relayNode: oid('8'.repeat(24)), login: 'relay-bootstrap',
+            enabled: true, passwordEncrypted: 'unrelated-fixture-value', syncStatus: 'synced' };
+        const foreignAccountReceipt = digestAccount(foreignUser);
+        // Distinct node and same login: a broad cleanup would delete both.
+        f.users.push(foreignUser);
+        const installed = await service.installRelay(id).catch(error => error);
+        assert.equal(status(installed), 'installed', diagnostic(f));
+        assert.deepEqual(f.actions, installedActions);
+        const state = { ...f.states[0] };
+        const account = f.users.find(user => String(user.relayNode) === id);
+        assert.ok(account?.enabled && account.syncStatus === 'synced' && account.passwordEncrypted);
+        const installedMain = readJson(f.mpath);
+        const installedSide = readJson(f.bpath);
+        const ownedTag = `relay-l2tp-${id}`;
+        const handoffIn = cfg => cfg.inbounds.find(row => row.tag === 'rebuild-relay-ingress');
+        const hasSubscriber = cfg => cfg.inbounds.some(i => i.settings?.clients?.some(client =>
+            client.email === subscribers[0].userId && client.id === subscribers[0].xrayUuid));
+        const installedHandoff = handoffIn(sidecar ? installedSide : installedMain);
+        assert.equal(installedMain.inbounds.find(i => i.tag === ownedTag)?.port, state.tproxyPort);
+        assert.ok(installedHandoff && installedHandoff.listen === '127.0.0.1');
+        assert.ok(hasSubscriber(installedMain));
+        const staged = f.records();
+        assert.equal(staged.nft, state.backupId);
+        assert.equal(staged.rule.table, String(state.routeTable));
+        assert.equal(staged.route.table, String(state.routeTable));
+        assert.ok(staged.ikeConnection);
+        const ports = state => new Set(state.sockets.map(([, , port]) => port));
+        for (const port of [state.tproxyPort, installedHandoff.port, 1701, 500, 4500]) assert.ok(ports(staged).has(port), `installed listener ${port}`);
+        assert.equal(fs.readlinkSync(join(f.root, f.bootLink)), '/etc/systemd/system/' + f.xl);
+
+        const ownedFiles = ['/etc/ppp/options.xl2tpd', '/etc/ipsec.d/celerity-rebuild-l2tp.conf',
+            '/etc/celerity-rebuild-l2tp/ingress.nft', '/etc/systemd/system/' + f.net,
+            '/etc/systemd/system/xl2tpd.service.d/50-celerity-rebuild-l2tp.conf'];
+        for (const path of ownedFiles) assert.ok(fs.lstatSync(join(f.root, path)).isFile(), path);
+        const vault = `/var/lib/celerity-rebuild-l2tp-direct/${state.backupId}`;
+        const manifestPath = vault + '/manifest.json';
+        const manifest = fingerprint(f, manifestPath);
+        assert.equal(readJson(join(f.root, manifestPath)).phase, 'installed');
+
+        if (apply) await laterApply(f, service);
+        const beforeRemove = f.records();
+        const currentHandoff = handoffIn(readJson(f.mpath))?.port;
+        const bridgeBeforeRemove = fingerprint(f, f.bridgePath);
+        const peerBefore = [f.mainPath, f.bridgePath].map(path => fingerprint(f, join('peer', path)));
+        const preserve = structuredClone(beforeRemove.foreign);
+        // Additional non-overlapping rule is legal after install; the stricter
+        // clean-install rule census must not be bypassed to seed it earlier.
+        preserve.rules.push({ priority: 10078, src: '198.51.100.0/24', table: 201 });
+        f.writeRecords({ ...beforeRemove, foreign: preserve });
+        const linksBefore = JSON.stringify(f.links);
+        const accountBefore = digestAccount(account);
+        const prepareSnapshot = Object.fromEntries(leaves().map(path => [path, fingerprint(f, path)]));
+        const outcome = await service.removeRelay(id).catch(error => error);
+        assert.equal(f.lockHeld, false);
+        // Keep testing success below: characterize failures without counting
+        // them as successful removal or loosening the accepted host state.
+        if (outcome.code && f.actions.at(-1) === 'prepare-remove') {
+            assert.deepEqual(Object.fromEntries(leaves().map(path => [path, fingerprint(f, path)])), prepareSnapshot);
+            assert.deepEqual(f.records().effects, beforeRemove.effects);
+            assert.equal(f.states[0].status, 'installed');
+            assert.equal(digestAccount(f.users.find(user => String(user.relayNode) === id)), accountBefore);
+        }
+        if (outcome.code === 'REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN' && f.actions.at(-1) === 'remove') {
+            assert.equal(f.states[0].status, 'removing');
+            assert.equal(f.states[0].desiredState, 'absent');
+            assert.equal(digestAccount(f.users.find(user => String(user.relayNode) === id)), accountBefore);
+        }
+        assert.equal(status(outcome), 'not_installed', diagnostic(f));
+        assert.deepEqual(outcome, { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
+        assert.deepEqual(f.actions, [...installedActions, 'prepare-remove', 'remove']);
+
+        const current = f.records();
+        assert.deepEqual([current.rule, current.route, current.nft, current.ikeConnection], [null, null, null, false]);
+        assert.deepEqual(current.foreign, preserve);
+        assert.deepEqual(current.stockRules, staged.stockRules);
+        assert.ok(current.sockets.some(row => JSON.stringify(row) === JSON.stringify(preserve.sockets[0])));
+        const reserved = [state.tproxyPort, 1701];
+        if (!sidecar) reserved.push(installedHandoff.port);
+        if (currentHandoff) reserved.push(currentHandoff);
+        if (!idleIke) reserved.push(500, 4500);
+        for (const port of reserved) assert.ok(!ports(current).has(port), `lingering listener ${port}`);
+        if (idleIke) for (const port of [500, 4500]) {
+            assert.deepEqual(current.sockets.filter(row => row[2] === port), [['udp', '0.0.0.0', port, current.charonPid]]);
+        }
+        for (const name of [f.xl, f.ike, f.net]) {
+            for (const prop of ['LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'DropInPaths', 'FragmentPath']) {
+                assert.equal(current.units[name][prop], stockUnits[name][prop], `${name}:${prop}`);
+            }
+        }
+        assert.equal(current.units[f.x].ActiveState, 'active');
+        assert.notEqual(current.units[f.x].InvocationID, beforeRemove.units[f.x].InvocationID);
+
+        for (const path of [...ownedFiles, '/etc/celerity-rebuild-l2tp', '/etc/systemd/system/xl2tpd.service.d']) {
+            assert.ok(!present(join(f.root, path)), `lingering owned path ${path}`);
+        }
+        if (preEnabled) assert.deepEqual(fingerprint(f, f.bootLink), bootBefore);
+        else assert.ok(!present(join(f.root, f.bootLink)), 'lingering install-owned boot link');
+        for (const path of Object.keys(before).filter(path => path !== f.mainPath && path !== f.bridgePath)) {
+            const attrs = fingerprint(f, path);
+            assert.deepEqual({ ...attrs, inode: before[path].inode }, before[path], path);
+            // The VPN conffiles can be atomically restored. Unowned files must
+            // never be rewritten, even to their original bytes.
+            if (!['/etc/ipsec.conf', '/etc/ipsec.secrets', '/etc/ppp/chap-secrets', '/etc/xl2tpd/xl2tpd.conf'].includes(path)) {
+                assert.equal(attrs.inode, before[path].inode, path);
+            }
+        }
+        assert.deepEqual(fingerprint(f, manifestPath), manifest, 'original install receipt is retained, not a live artifact');
+        assert.match(f.removeBaseline(), /^[a-f0-9]{64}$/);
+        assert.deepEqual(readJson(join(f.root, vault, 'remove-attempt.json')), { baseline: f.removeBaseline() });
+        assert.deepEqual(fs.readdirSync(join(f.root, vault)).sort(), ['manifest.json', 'remove-attempt.json']);
+        assert.deepEqual(leaves(), [...beforeLeaves, manifestPath, vault + '/remove-attempt.json'].sort(), 'no extra live or staging files');
+
+        const config = readJson(f.mpath);
+        const expected = apply ? composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode: f.usersByNode,
+            panelTls: { serverName: f.env.PANEL_DOMAIN },
+            controlPlaneAddresses: [f.env.PANEL_DOMAIN, ...f.nodes.flatMap(n => [n.ip, n.domain]).filter(Boolean)],
+        }).find(row => row.nodeId === id && row.profile === 'main').config : JSON.parse(f.before[f.mainPath]);
+        assert.deepEqual(config, expected, 'remove subtracts PPP, not current subscriber/tunnel/ACL policy');
+        assert.ok(hasSubscriber(config), 'subscriber remains configured');
+        assert.deepEqual(current.running[f.x], expected, 'MAIN read back after restart');
+        const sideFinal = fingerprint(f, f.bridgePath);
+        if (sidecar && !apply) {
+            assert.deepEqual(readJson(f.bpath), JSON.parse(f.before[f.bridgePath]), 'restore the originally installed sidecar policy');
+            assert.deepEqual(current.running[f.b], JSON.parse(f.before[f.bridgePath]));
+            assert.deepEqual([sideFinal.owner, sideFinal.mode], [before[f.bridgePath].owner, before[f.bridgePath].mode]);
+            assert.deepEqual(current.sockets.filter(row => row[2] === installedHandoff.port), [
+                ['tcp', '127.0.0.1', installedHandoff.port, current.units[f.b].MainPID],
+                ['udp', '127.0.0.1', installedHandoff.port, current.units[f.b].MainPID],
+            ], 'the pre-existing sidecar listener is not owned by the install');
+        } else {
+            assert.deepEqual(sideFinal, bridgeBeforeRemove);
+            assert.deepEqual(current.units[f.b], beforeRemove.units[f.b]);
+            if (sidecar && apply) assert.ok(!ports(current).has(installedHandoff.port));
+        }
+        assert.deepEqual([f.mainPath, f.bridgePath].map(path => fingerprint(f, join('peer', path))), peerBefore);
+        assert.equal(JSON.stringify(f.links), linksBefore);
+        assert.deepEqual(f.users.map(digestAccount), [foreignAccountReceipt]);
+        const [remaining] = f.states;
+        assert.equal(f.states.length, 1);
+        assert.equal(String(remaining._id), String(state._id));
+        assert.deepEqual([remaining.status, remaining.desiredState], ['not_installed', 'absent']);
+        for (const key of [...Object.keys(ownerReceipt(state)), 'pskHint', 'clientCidr', 'tproxyPort', 'fwmark', 'routeTable',
+            'routingMode', 'routingVersion', 'localAddress', 'poolStart', 'poolEnd', 'dnsServers', 'mtu', 'mru']) {
+            assert.ok(!Object.hasOwn(remaining, key), `lingering installed field ${key}`);
+        }
+        const mainFinal = fingerprint(f, f.mainPath);
+        assert.deepEqual({ owner: mainFinal.owner, mode: mainFinal.mode },
+            { owner: before[f.mainPath].owner, mode: before[f.mainPath].mode }, 'restore MAIN owner and mode');
+    });
+};

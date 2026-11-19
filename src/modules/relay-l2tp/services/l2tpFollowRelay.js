@@ -127,11 +127,20 @@ function validateSharedPolicy(bridge, ingressTag) {
     const rules = bridge.routing.rules;
     const policy = rules.filter(rule => rule.inboundTag?.includes(ingressTag));
     const fallback = policy.at(-1);
-    if (!fallback || !fieldRule(fallback) || !isTunnel(bridge, fallback.outboundTag)
+    const native = tag => !targetOf(bridge, tag) && bridge.inbounds.filter(row => row.protocol === 'vless')
+        .flatMap(row => row.settings?.clients ?? []).filter(client => client.reverse?.tag === tag).length === 1
+        && !matches(bridge.outbounds, tag).length && !matches(bridge.reverse?.portals ?? [], tag).length;
+    const tunnel = tag => isTunnel(bridge, tag) || native(tag);
+    const tagged = (rule, key) => !Object.hasOwn(rule, 'ruleTag') || (typeof rule.ruleTag === 'string'
+        && (key ? /^rebuild-policy-geo-\d+-(ip|domain)$/.exec(rule.ruleTag)?.[1] === key
+            : rule.ruleTag === 'rebuild-policy-default'));
+    if (!fallback || !fieldRule(fallback, 'ruleTag') || !tagged(fallback)
+        || !(tunnel(fallback.outboundTag) || (fallback.ruleTag === 'rebuild-policy-default' && isBlock(bridge, fallback.outboundTag)))
         || policy.slice(0, -1).some(rule => {
             const keys = ['ip', 'domain'].filter(key => Object.hasOwn(rule, key));
-            return keys.length !== 1 || !fieldRule(rule, ...keys) || !strings(rule[keys[0]])
-                || rule[keys[0]].length === 0 || !(isTunnel(bridge, rule.outboundTag) || isBlock(bridge, rule.outboundTag));
+            if (rule.ruleTag === 'acl-catch-all' && fieldRule(rule, 'ruleTag') && isBlock(bridge, rule.outboundTag)) return false;
+            return keys.length !== 1 || !fieldRule(rule, 'ruleTag', ...keys) || !tagged(rule, keys[0]) || !strings(rule[keys[0]])
+                || rule[keys[0]].length === 0 || !(tunnel(rule.outboundTag) || isBlock(bridge, rule.outboundTag));
         }) || rules.slice(0, rules.indexOf(fallback)).some(rule => !rule.inboundTag?.length
             && !isConditionalGlobalBlock(bridge, rule) && !isReverseControl(bridge, rule))) {
         fail('POLICY', 'Missing, unsafe or shadowed shared relay policy');

@@ -73,7 +73,15 @@ function createPanelRouter({
     router.use('/', requireAuth, requireOnboarding, migrationRoutes);
     router.use('/', requireAuth, requireOnboarding, accessLogsRoutes);
 
-    if (rebuildEnabled) return router;
+    if (rebuildEnabled) {
+        // Same panel IP whitelist, authenticated session, onboarding, CSRF and
+        // rate limiter as the stock installer. No API-key-only install route.
+        router.post('/rebuild/relays/:id/l2tp/install', requireAuth, requireOnboarding,
+            requirePanelCsrf, injectedL2tpRateLimiter, require('./rebuildRelayInstall'));
+        router.post('/rebuild/relays/:id/l2tp/remove', requireAuth, requireOnboarding,
+            requirePanelCsrf, injectedL2tpRateLimiter, require('./rebuildRelayRemove'));
+        return router;
+    }
 
     const routeBindings = createL2tpRouteBindings(activeHostProvider);
     injectedL2tpModuleEntry.registerRoutes({
