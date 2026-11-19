@@ -58,6 +58,10 @@ test('actual profiles route a reverse split/merge with priorities and share rela
     for (const tag of ['rebuild-rp-ingress-sm', 'rebuild-rp-ingress-rm']) assert.equal(route(m, tag), 'rebuild-rp-egress-ma');
     assert.equal(m.outbounds.find(outbound => outbound.tag === 'rebuild-rp-dial-sm').settings.address, nodes[2].ip);
     assert.equal(m.outbounds.find(outbound => outbound.tag === 'rebuild-rp-dial-rm').settings.address, nodes[1].ip);
+    for (const exit of ['a', 'b', 'c']) {
+        const freedom = byNode(output, exit, 'bridge').outbounds.find(o => o.protocol === 'freedom');
+        assert.deepEqual(freedom.settings.finalRules, [{ action: 'block', ip: ['geoip:private'] }, { action: 'allow' }]);
+    }
     const bridge = byNode(output, 'a', 'bridge');
     assert.deepEqual(bridge.outbounds.filter(item => item.settings?.reverse).map(item => item.settings.reverse.tag),
         ['rebuild-rp-ingress-ma', 'rebuild-rp-ingress-pa', 'rebuild-rp-ingress-ra']);

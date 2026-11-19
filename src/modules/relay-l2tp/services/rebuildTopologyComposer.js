@@ -189,7 +189,11 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
         if (entry.isExit) {
             bridge.log = generator.buildXrayLogSection(entry.node);
             addLinkArtifacts(bridge, entry, projected);
-            bridge.outbounds.push({ tag: 'freedom', protocol: 'freedom', settings: { domainStrategy: 'UseIPv4' } });
+            // Native VLESS reverse defaults to deny-all at the final dial on newer Xray cores.
+            bridge.outbounds.push({ tag: 'freedom', protocol: 'freedom', settings: {
+                domainStrategy: 'UseIPv4',
+                finalRules: [{ action: 'block', ip: ['geoip:private'] }, { action: 'allow' }],
+            } });
             bridge.routing.rules.push({ type: 'field', ip: ['geoip:private'], inboundTag: transit.slice(), outboundTag: 'block' },
                 { type: 'field', inboundTag: transit, outboundTag: 'freedom' });
         } else {
