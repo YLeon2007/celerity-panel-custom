@@ -32,6 +32,11 @@ XL, IKE, X, B = 'xl2tpd.service', 'strongswan-starter.service', 'xray.service', 
 # Exact native unit emitted by the stock prerequisite installer.
 NATIVE_XL_SHA = '20e9c67838fa8072a5378839fc729a1123d1580879fbf20f9121d558fd0fe0df'
 XL_BOOT = SYSTEM + '/multi-user.target.wants/' + XL
+XL_DEFAULT = '/etc/default/xl2tpd'
+# Extracted from signed Debian trixie/main xl2tpd_1.3.18-1+b1_amd64.deb
+# (archive SHA256 dd6fdf32b90f9f7d516f5251e1abdb65851156c80163a41aab60cf94dcff16da).
+STOCK_XL_DEFAULT_SHA = '37b5938f462ec60b4f8c179b34f70b548c09da4691c938e88ce111ce41268833'
+STOCK_XL_DEFAULT_MD5 = b'fadc31f26078d8c3fb033d7d4516500b'
 REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables')
 STOCK_IKE_INCLUDE = b'include /etc/ipsec.d/*.conf'
 UNITS = (XL, IKE, X, B, NET_UNIT)
@@ -198,7 +203,8 @@ def unit(name):
             'Environment', 'EnvironmentFiles', 'RootDirectory', 'RootImage', 'PrivateNetwork',
             'KillMode', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'WorkingDirectory',
             'Restart', 'Type', 'Requires', 'After', 'ControlGroup', 'RequiredBy', 'BoundBy', 'ConsistsOf',
-            'PropagatesStopTo', 'Conflicts', 'ConflictedBy', 'Wants', 'BindsTo', 'PartOf', 'Upholds')
+            'PropagatesStopTo', 'Conflicts', 'ConflictedBy', 'Wants', 'BindsTo', 'PartOf', 'Upholds',
+            'SourcePath', 'ExecCondition', 'ExecReload', 'PassEnvironment', 'UnsetEnvironment')
     # `systemctl show` returns nonzero for some not-found units. LoadState is
     # inspected explicitly; do not treat arbitrary command failures as absence.
     text = command('/usr/bin/systemctl', '--no-pager', 'show', '--all', '--property=' + ','.join(keys), name,
@@ -415,6 +421,29 @@ def native_vpn(info, name):
             and not any(info.get(k) for k in ('Environment', 'EnvironmentFiles', 'RootDirectory', 'RootImage', 'ExecStartPre', 'ExecStartPost')))
 
 
+def xl_defaults_admitted(record, info):
+    # An absent file cannot supply defaults. Keep the existing minimal layout.
+    if record is None:
+        return True
+    metadata = command('/usr/bin/dpkg-query', '-W', r'-f=${Version}\n${Architecture}\n${Conffiles}', 'xl2tpd', quiet=True)
+    version, arch, *rows = metadata.split(b'\n')
+    need(version and arch, 'PREREQUISITE')
+    conffiles = [fields[1:] for row in rows if (fields := row.split()) and fields[0] == XL_DEFAULT.encode()]
+    data = raw(record)
+    if (version, arch) != (b'1.3.18-1+b1', b'amd64'):
+        # An inert local file is not the same as a package conffile edited to be inert.
+        return not conffiles and not uncomment(data)
+    # The dpkg MD5 is only a conffile record check. The authenticated package's
+    # full SHA256 pins every byte (including both assignments and comments).
+    # observe() has already checked native_vpn, including the helper unit's
+    # on-disk digest and metadata. Only that exact unit can ignore these SysV defaults.
+    return (conffiles == [[STOCK_XL_DEFAULT_MD5]] and record['mode'] == 0o644 and record['gid'] == 0
+            and digest(data) == STOCK_XL_DEFAULT_SHA and info['FragmentPath'] == SYSTEM + '/' + XL
+            and no_hooks(info) and info.get('Group', '') in ('', 'root')
+            and not any(info.get(k) for k in ('SourcePath', 'ExecCondition', 'ExecReload', 'PassEnvironment', 'UnsetEnvironment'))
+            and re.fullmatch(r'\{ path=/usr/sbin/xl2tpd ; argv\[\]=/usr/sbin/xl2tpd -D ;[^{}]*\}', info.get('ExecStart', '')) is not None)
+
+
 def directory_absent(path):
     parent, name = os.path.split(path)
     with directory(parent) as fd:
@@ -514,13 +543,13 @@ def observe(machine, d) -> dict[str, Any]:
     need(ike_include_matches(files['starter'], []), 'PREREQUISITE')
     bridge = read(BRIDGE)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
-    for path in ('/etc/ppp/options', '/etc/strongswan.conf', '/etc/default/xl2tpd'):
+    global_paths = ('/etc/ppp/options', '/etc/strongswan.conf', XL_DEFAULT)
+    for path in global_paths:
         # Fingerprint stock/default inputs that this installer never edits.
         if os.path.lexists(path):
             need(read(path, 262144) is not None, 'PREREQUISITE')
-    globals_before = {path: read(path, 262144) for path in ('/etc/ppp/options', '/etc/strongswan.conf', '/etc/default/xl2tpd')}
-    xl_default = globals_before['/etc/default/xl2tpd']
-    need(xl_default is None or not uncomment(raw(xl_default)), 'PREREQUISITE')
+    globals_before = {path: read(path, 262144) for path in global_paths}
+    need(xl_defaults_admitted(globals_before[XL_DEFAULT], units[XL]), 'PREREQUISITE')
     rows = sock_rows()
     ike_sockets = idle_ike(units[IKE], rows) if units[IKE]['ActiveState'] == 'active' else []
     net = ipaddress.IPv4Network(d['clientCidr'])
@@ -657,6 +686,8 @@ def original_files(before, records):
 
 def neighbors(before, sidecar=False):
     b = unit(B)
+    # Verify/rollback (and owned removal below) pin the admitted bytes and
+    # metadata, rather than rerunning the pristine-unit defaults admission.
     need(all(read(path, 262144) == value for path, value in before['globalFiles'].items()), 'ROLLBACK_DRIFT')
     if sidecar:
         need(all(b.get(k) == before['units'][B][k] for k in ('LoadState', 'UnitFileState', 'FragmentPath', 'DropInPaths'))
