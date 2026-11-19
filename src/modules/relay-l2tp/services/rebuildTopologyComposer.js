@@ -90,11 +90,20 @@ function blackholeProfile() {
     };
 }
 
-function mainProfile(node, users, options) {
+function mainProfile({ node, role }, users, options) {
     requireRebuild(node.type === 'xray' && (node.port === undefined || validPort(node.port))
         && (node.xray?.apiPort === undefined || validPort(node.xray.apiPort)), 'REBUILD_INVALID_NODE_CONFIG');
     requireRebuild(Array.isArray(users) && users.every(user => typeof user?.xrayUuid === 'string' && /^\S+$/.test(user.xrayUuid)
         && typeof user.userId === 'string' && user.userId.length > 0), 'REBUILD_INVALID_USERS');
+    const apiPort = node.xray?.apiPort ?? 61000;
+    // Classic exit-only setup does not provision client inbounds or REALITY keys.
+    // Keep MAIN available for local management without opening a subscriber port.
+    if (role === 'bridge' && users.length === 0) {
+        const config = blackholeProfile();
+        config.log = generator.buildXrayLogSection(node);
+        generator.applyXrayApi(config, apiPort);
+        return { config, tags: [], subscriberDenies: [] };
+    }
     // Only deny rules carry over. A classic direct/custom ACL can bypass the
     // rebuild graph; do not even give the profile those outbound objects.
     const aclRules = (node.aclRules ?? []).filter(rule => typeof rule === 'string' && /^reject\(.+\)$/.test(rule));
@@ -105,7 +114,7 @@ function mainProfile(node, users, options) {
     for (const rule of config.routing.rules) rule.inboundTag = tags.slice();
     // Keep references to the subscriber ACLs only, before API/tunnel rules are added.
     const subscriberDenies = [...config.routing.rules];
-    generator.applyXrayApi(config, node.xray?.apiPort ?? 61000);
+    generator.applyXrayApi(config, apiPort);
     return { config, tags, subscriberDenies };
 }
 
@@ -174,7 +183,7 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
     const users = collectUsers(usersByNode);
     const profiles = [];
     for (const [nodeId, entry] of graph.byNodeId) {
-        const { config: main, tags, subscriberDenies } = mainProfile(entry.node, users.has(nodeId) ? users.get(nodeId) : [], options);
+        const { config: main, tags, subscriberDenies } = mainProfile(entry, users.has(nodeId) ? users.get(nodeId) : [], options);
         const bridge = blackholeProfile();
         const transit = entry.incoming.map(ingressTag);
         if (entry.isExit) {
@@ -192,7 +201,7 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, affectedNodeId
                     if (inbound.sniffing?.enabled) inbound.sniffing.routeOnly = false;
                 }
             }
-            addSharedPolicy(main, [...tags, ...transit], entry, graph);
+            if (tags.length || transit.length) addSharedPolicy(main, [...tags, ...transit], entry, graph);
         }
         const installed = followRelayStates.filter(state => rebuildId(state.node) === nodeId);
         if (installed.length) {

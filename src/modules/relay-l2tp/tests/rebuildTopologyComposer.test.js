@@ -147,10 +147,62 @@ test('dead and detached profiles are closed, remove stale tunnel ownership, and 
     }
 });
 
+test('clientless bridge MAIN keeps only the loopback API even with unused REALITY settings', () => {
+    const bridge = node('b', 'bridge', 2);
+    Object.assign(bridge.xray, { security: 'reality', realityPrivateKey: '',
+        extraInbounds: [{ inboundTag: 'unused-extra', port: 24443, security: 'reality', realityPrivateKey: '' }] });
+    bridge.aclRules = ['reject(all)'];
+    const nodes = [node('p', 'portal', 1), bridge];
+    const link = edge('pb', 'p', 'b', 1, { mode: 'reverse' });
+    const profiles = composeRebuildProfiles({ nodes, links: [link], usersByNode: { b: [] } });
+    const main = byNode(profiles, 'b');
+    assert.deepEqual(main.inbounds.map(({ tag, listen, port }) => ({ tag, listen, port })),
+        [{ tag: 'API_INBOUND', listen: '127.0.0.1', port: bridge.xray.apiPort }]);
+    assert.equal(main.api.tag, 'API');
+    assert.equal(route(main, 'API_INBOUND'), 'API');
+    assert.deepEqual(main.routing.rules.map(rule => rule.outboundTag), ['API']);
+    assert.deepEqual(main.outbounds.map(outbound => outbound.protocol), ['blackhole']);
+    const sidecar = byNode(profiles, 'b', 'bridge');
+    assert.equal(sidecar.outbounds.find(outbound => outbound.tag === 'rebuild-rp-dial-pb').settings.reverse.tag,
+        'rebuild-rp-ingress-pb');
+    assert.equal(route(sidecar, 'rebuild-rp-ingress-pb'), 'freedom');
+    assert.equal(route(sidecar, 'rebuild-rp-ingress-pb', 'geoip:private'), 'block');
+    const detached = composeRebuildProfiles({ nodes: [bridge], links: [] });
+    assert.deepEqual(byNode(detached, 'b'), main);
+});
+
+test('required client inbounds retain invalid REALITY keys for Xray to reject', () => {
+    for (const [role, users] of [
+        ['portal', []], ['relay', []], ['bridge', [{ userId: 'client-fixture', xrayUuid: id(201) }]],
+    ]) {
+        const fixture = node('target', role, 2);
+        Object.assign(fixture.xray, { security: 'reality', realityPrivateKey: '',
+            extraInbounds: [{ inboundTag: 'extra', port: 24443, security: 'reality', realityPrivateKey: 'invalid' }] });
+        const portal = node('p', 'portal', 1);
+        const nodes = role === 'portal' ? [fixture] : [portal, fixture];
+        const links = role === 'portal' ? [] : [edge('pt', 'p', 'target', 1)];
+        const main = byNode(composeRebuildProfiles({ nodes, links, usersByNode: { target: users } }), 'target');
+        const clientInbounds = main.inbounds.filter(inbound => inbound.protocol === 'vless');
+        assert.deepEqual(clientInbounds.map(inbound => inbound.tag), ['client-target', 'extra'], role);
+        assert.deepEqual(clientInbounds.map(inbound => inbound.streamSettings.realitySettings.privateKey), ['', 'invalid'], role);
+        for (const inbound of clientInbounds) {
+            assert.deepEqual(inbound.settings.clients.map(client => client.id), users.map(user => user.xrayUuid), role);
+        }
+    }
+    const b = node('b', 'bridge', 2);
+    assert.throws(() => composeRebuildProfiles({ nodes: [b], links: [], usersByNode: { b: null } }),
+        { code: 'REBUILD_INVALID_USERS' });
+});
+
 test('rejects colliding listener ownership across MAIN and BRIDGE and missing exact tunnel credentials', () => {
     const nodes = [node('p', 'portal', 1), node('b', 'bridge', 2)];
     const link = edge('f', 'p', 'b', 2, { mode: 'forward', tunnelPort: nodes[1].port });
-    assert.throws(() => composeRebuildProfiles({ nodes, links: [link] }), { code: 'REBUILD_LISTENER_COLLISION' });
+    const usersByNode = { b: [{ userId: 'b-dummy', xrayUuid: id(201) }] };
+    assert.throws(() => composeRebuildProfiles({ nodes, links: [link], usersByNode }), { code: 'REBUILD_LISTENER_COLLISION' });
+    const clientless = composeRebuildProfiles({ nodes, links: [link] });
+    assert.equal(byNode(clientless, 'b', 'bridge').inbounds.find(i => i.tag === 'fwd-hop-f').port, link.tunnelPort);
+    assert.throws(() => composeRebuildProfiles({ nodes, links: [{ ...link, tunnelPort: nodes[1].xray.apiPort }] }),
+        { code: 'REBUILD_LISTENER_COLLISION' });
     assert.throws(() => composeRebuildProfiles({ nodes, links: [{ ...link, tunnelUuid: undefined }] }),
         { code: 'REBUILD_INVALID_TUNNEL' });
     for (const mode of ['forward', 'reverse']) {
