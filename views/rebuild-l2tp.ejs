@@ -1,0 +1,151 @@
+<%
+const l = key => t(`rebuildL2tp.${key}`);
+const available = typeof loadError === 'undefined' || !loadError;
+const relayStatuses = new Set(['not_installed', 'queued', 'preflight', 'installing', 'installed',
+    'degraded', 'drifted', 'removing', 'error', 'role_lost']);
+const validId = id => typeof id === 'string' && /^[a-f0-9]{24}(?![\s\S])/.test(id);
+const validLogin = login => typeof login === 'string' && /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/.test(login);
+const relayNames = new Map(relays.map(({ id, name }) => [id, name]));
+const relayPath = id => `/panel/rebuild/relays/${id}/l2tp`;
+const accountPath = '/panel/rebuild/relays/l2tp/accounts';
+const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
+    'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted'];
+function secretControl(kind, url, index, login) {
+    const valueId = `rebuild-l2tp-${kind}-${index}`;
+%>
+    <div data-secret-url="<%= url %>" <% if (login !== undefined) { %>data-login="<%= login %>"<% } %>>
+        <button type="button" class="btn-icon" data-show-secret data-show-label="<%= l(`${kind}.show`) %>"
+                data-hide-label="<%= l(`${kind}.hide`) %>" aria-label="<%= l(`${kind}.show`) %>"
+                title="<%= l(`${kind}.show`) %>" aria-expanded="false" aria-controls="<%= valueId %>">
+            <i class="ti ti-eye" aria-hidden="true"></i>
+        </button>
+        <button type="button" class="btn-icon" data-copy-secret aria-label="<%= l(`${kind}.copy`) %>" title="<%= l(`${kind}.copy`) %>">
+            <i class="ti ti-copy" aria-hidden="true"></i>
+        </button>
+        <code id="<%= valueId %>" data-secret-value hidden></code>
+        <div class="text-muted" role="status"></div>
+    </div>
+<% } %>
+<style>
+    #rebuild-l2tp .card + .card { margin-top: 1rem; }
+    #rebuild-l2tp td, #rebuild-l2tp th { vertical-align: top; }
+    #rebuild-l2tp [data-secret-value] { white-space: normal; overflow-wrap: anywhere; }
+    #rebuild-l2tp .rebuild-addresses { list-style: none; margin: 0; padding: 0; }
+    #rebuild-l2tp [data-action-status]:not(:empty) { margin-bottom: .75rem; }
+</style>
+<div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
+     data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
+    <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
+    <div class="card">
+        <div class="card-body">
+            <p data-action-status role="status"></p>
+            <a href="/panel/l2tp" data-refresh hidden><%= l('refresh') %></a>
+        </div>
+        <section aria-labelledby="rebuild-l2tp-relays">
+            <div class="card-header"><h2 id="rebuild-l2tp-relays"><i class="ti ti-server-2" aria-hidden="true"></i> <%= l('relays') %></h2></div>
+            <% if (relays.length) { %>
+                <div class="table-wrapper">
+                    <table class="table">
+                        <thead><tr>
+                            <th scope="col"><%= l('relay') %></th>
+                            <th scope="col"><%= l('relayAddress') %></th>
+                            <th scope="col"><%= l('state') %></th>
+                            <th scope="col"><%= l('psk.label') %></th>
+                            <th scope="col"><%= l('actions') %></th>
+                        </tr></thead>
+                        <tbody>
+                        <% relays.forEach((relay, index) => {
+                            const actionable = available && relay.bound === true && validId(relay.id);
+                            const status = relayStatuses.has(relay.status) ? relay.status : 'unknown';
+                        %>
+                            <tr>
+                                <th scope="row"><%= relay.name %></th>
+                                <td><code><%= relay.ip %></code></td>
+                                <td>
+                                    <span class="badge <%= status === 'installed' ? 'badge-success' : 'badge-secondary' %>"><%= l(`status.${status}`) %></span>
+                                    <% if (!relay.bound) { %><div class="text-muted"><%= l('missingBinding') %></div><% } %>
+                                </td>
+                                <td><% if (actionable && relay.canRevealPsk === true) { secretControl('psk', `${relayPath(relay.id)}/psk/reveal`, index); } %></td>
+                                <td>
+                                    <% if (actionable && relay.canInstall === true) { %>
+                                        <button type="button" class="btn btn-sm btn-primary" data-install-url="<%= relayPath(relay.id) %>/install"
+                                                data-node-id="<%= relay.id %>"><%= l('install') %></button>
+                                    <% } %>
+                                    <% if (actionable && relay.canRemove === true) { %>
+                                        <a class="btn btn-sm btn-danger" href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a>
+                                    <% } %>
+                                </td>
+                            </tr>
+                        <% }); %>
+                        </tbody>
+                    </table>
+                </div>
+            <% } else if (available) { %>
+                <p class="card-body text-muted"><%= l('noRelays') %></p>
+            <% } %>
+        </section>
+    </div>
+    <section class="card" aria-labelledby="rebuild-l2tp-accounts">
+        <div class="card-header"><h2 id="rebuild-l2tp-accounts"><i class="ti ti-users" aria-hidden="true"></i> <%= l('accounts') %></h2></div>
+        <% if (available && canManageAccounts === true) { %>
+            <div class="card-body">
+                <form method="post" autocomplete="off" data-create>
+                    <div class="form-group">
+                        <label for="rebuild-l2tp-login"><%= l('login') %></label>
+                        <input id="rebuild-l2tp-login" type="text" maxlength="64" required aria-describedby="rebuild-l2tp-login-hint">
+                        <small id="rebuild-l2tp-login-hint"><%= l('loginHint') %></small>
+                    </div>
+                    <button type="submit" class="btn btn-primary" disabled><i class="ti ti-plus" aria-hidden="true"></i> <%= l('create') %></button>
+                </form>
+            </div>
+        <% } else if (available) { %>
+            <p class="card-body text-muted"><%= l('accountsReadOnly') %></p>
+        <% } %>
+        <% if (accounts.length) { %>
+            <div class="table-wrapper">
+                <table class="table">
+                    <thead><tr>
+                        <th scope="col"><%= l('login') %></th>
+                        <th scope="col"><%= l('accountAddresses') %></th>
+                        <th scope="col"><%= l('state') %></th>
+                        <th scope="col"><%= l('password.label') %></th>
+                        <th scope="col"><%= l('actions') %></th>
+                    </tr></thead>
+                    <tbody>
+                    <% accounts.forEach((account, index) => {
+                        const actionable = available && canManageAccounts === true && account.consistent === true && validLogin(account.login);
+                    %>
+                        <tr>
+                            <th scope="row"><code><%= account.login %></code></th>
+                            <td>
+                                <ul class="rebuild-addresses">
+                                    <% account.addresses.forEach(({ id, ip }) => { %>
+                                        <li><%= relayNames.get(id) || id %>: <code><%= ip %></code></li>
+                                    <% }); %>
+                                </ul>
+                            </td>
+                            <td>
+                                <span class="badge <%= account.enabled ? 'badge-success' : 'badge-secondary' %>"><%= l(account.enabled ? 'enabled' : 'disabled') %></span>
+                                <% if (!account.consistent) { %><div class="text-muted"><%= l('inconsistent') %></div><% } %>
+                            </td>
+                            <td><% if (actionable) { secretControl('password', `${accountPath}/reveal`, index, account.login); } %></td>
+                            <td>
+                                <% if (actionable && account.login !== 'relay-bootstrap') { %>
+                                    <% if (account.enabled === true) { %>
+                                        <button type="button" class="btn btn-sm btn-secondary" data-account-action="disable" data-login="<%= account.login %>"><%= l('disable') %></button>
+                                    <% } %>
+                                    <button type="button" class="btn btn-sm btn-danger" data-account-action="delete"
+                                            data-confirm="<%= l('confirmDelete') %>" data-login="<%= account.login %>"><%= l('delete') %></button>
+                                <% } %>
+                            </td>
+                        </tr>
+                    <% }); %>
+                    </tbody>
+                </table>
+            </div>
+        <% } else if (available) { %>
+            <p class="card-body text-muted"><%= l('noAccounts') %></p>
+        <% } %>
+    </section>
+</div>
+<script src="/js/rebuild-l2tp.js" defer></script>
