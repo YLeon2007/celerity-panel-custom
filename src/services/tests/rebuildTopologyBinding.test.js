@@ -10,16 +10,17 @@ const ssh2 = require('ssh2');
 let openWire;
 const originalClient = ssh2.Client;
 ssh2.Client = class extends EventEmitter {
-    connect(config) { this._sock = { writable: true }; this.wire = openWire(this, config); }
+    connect(config) { this._sock = { writable: true, destroy: () => this.end() }; this.wire = openWire(this, config); }
     exec(command, cb) { this.wire.exec(command, cb); }
     end() { this._sock.writable = false; this.wire?.close(); }
 };
 const { createRebuildService } = require('../rebuildService');
 const { makeLocks } = require('../rebuildLocks');
 const pool = require('../sshPoolService');
+const poolConnection = pool.getConnection;
 const { MAIN, BRIDGE } = require('../classicAppliedConfig');
 const { READ_CHAIN, VERIFY_CHAIN } = require('../rebuildTunnelTls');
-require('../nodeSSH'); // lazy in rebuildTransport; capture the simulated wire here
+const NodeSSH = require('../nodeSSH'); // lazy in rebuildTransport; capture the simulated wire here
 ssh2.Client = originalClient;
 
 test.before(() => test.mock.method(require('node:net').Socket.prototype, 'connect', () => assert.fail('fixture must not open sockets')));
@@ -33,7 +34,7 @@ const query = fn => ({ select() { return this; }, sort() { return this; }, read(
     readConcern() { return this; }, session() { return this; }, async lean() { return structuredClone(fn()); } });
 const profileRead = path => `if test -f ${path}; then cat ${path}; elif test ! -e ${path}; then printf 'C3_CLASSIC_PROFILE_ABSENT'; else exit 1; fi`;
 
-function fixture(t, { injected = false, relayCount = 2 } = {}) {
+function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } = {}) {
     const nodes = ['bridge', 'relay', 'relay'].slice(0, 1 + relayCount).map((role, i) => ({
         _id: objectId(i + 1), ip: `node${i}.fixture.invalid`, active: true, type: 'xray', cascadeRole: role,
         sshHostKeySha256: 'f'.repeat(64), ssh: { port: 2222 + i, username: 'root', password: 'fixture-auth',
@@ -58,7 +59,7 @@ function fixture(t, { injected = false, relayCount = 2 } = {}) {
         C3_REBUILD_L2TP_SSH_SHA256: bindings[0]?.sshHostKeySha256 };
     const setList = rows => { env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(rows); };
     setList(bindings);
-    const effects = [], sessions = [], probes = [], commands = [], overrides = {};
+    const effects = [], sessions = [], probes = [], commands = [], poolRequests = [], overrides = {};
     let lock;
     const locks = makeLocks({
         async insertOne(row) { assert.equal(lock, undefined); lock = row; },
@@ -76,7 +77,10 @@ function fixture(t, { injected = false, relayCount = 2 } = {}) {
         assert.equal(config.port, nodes[i].ssh.port);
         assert.equal(config.username, nodes[i].ssh.username);
         const verified = !config.hostVerifier || config.hostVerifier(host.key);
-        queueMicrotask(() => verified ? client.emit('ready') : client.emit('error', Error('fixture key mismatch')));
+        queueMicrotask(() => {
+            if (overrides.onHandshake?.(host.id, client, session)) return;
+            verified ? client.emit('ready') : client.emit('error', Error('fixture key mismatch'));
+        });
         return {
             close() { if (!session.closed) { session.closed = true; client.emit('close'); } },
             exec(command, cb) {
@@ -121,9 +125,10 @@ function fixture(t, { injected = false, relayCount = 2 } = {}) {
             },
         };
     };
-    const poolConnection = pool.getConnection;
     t.mock.method(pool, 'getConnection', async function (node, options) {
-        assert.equal(node._id, nodes[0]._id, 'L2TP transport must not consult the pool');
+        poolRequests.push(node._id);
+        assert.ok(node._id === nodes[0]._id || ordinaryRelay && node._id === nodes[2]?._id,
+            'L2TP transport must not consult the pool');
         return poolConnection.call(this, node, options);
     });
 
@@ -149,7 +154,7 @@ function fixture(t, { injected = false, relayCount = 2 } = {}) {
             { nodeId, profile: 'bridge', config: blank() },
         ]),
     });
-    return { service, request, nodes, states, hosts, bindings, env, setList, effects, sessions, probes, commands, overrides, links };
+    return { service, request, nodes, states, hosts, bindings, env, setList, effects, sessions, probes, commands, poolRequests, overrides, links };
 }
 
 const assertNoWrites = f => assert.deepEqual(f.effects.filter(([type]) => type !== 'injected-stock'), []);
@@ -216,6 +221,93 @@ test('unconfigured list does not change legacy singleton resolution; non-L2TP ig
     assert.equal(stock.probes.length, 0);
     assert.deepEqual(stock.sessions.map(s => s.pinned), [false]);
     assert.equal(stock.effects.filter(([verb]) => verb === 'replace').length, 2);
+});
+
+test('enrolled uninstalled relay uses the operator pin; a relay without a list entry stays ordinary', async t => {
+    const f = fixture(t, { ordinaryRelay: true });
+    f.states.length = 0;
+    for (const h of f.hosts) h.files[MAIN].inbounds = [];
+    f.setList(f.bindings.slice(0, 1));
+
+    f.hosts[1].key = wireKey(9);
+    await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_SSH_CONNECT_FAILED' });
+    assertNoWrites(f);
+    assert.deepEqual(f.commands, []);
+    assert.deepEqual(f.sessions.map(s => [s.id, s.pinned, s.closed]), [[f.nodes[1]._id, true, true]]);
+
+    f.hosts[1].key = wireKey(1);
+    assert.equal((await f.service.execute(f.request)).allowed, true);
+    assert.deepEqual(f.probes.map(s => s.id), [f.nodes[1]._id]);
+    assert.ok(f.poolRequests.includes(f.nodes[2]._id));
+    assert.ok(!f.poolRequests.includes(f.nodes[1]._id));
+    const ordinary = f.sessions.filter(s => s.id === f.nodes[2]._id);
+    assert.deepEqual(ordinary.map(s => s.pinned), [false]);
+    assert.equal(f.effects.filter(([verb]) => verb === 'replace').length, 6);
+    assert.ok(!f.effects.some(([verb]) => verb === 'state'), 'enrollment alone does not publish an installed state');
+});
+
+test('revoking an uninstalled relay enrollment during the handshake refuses before any command', async t => {
+    const f = fixture(t, { relayCount: 1 });
+    f.states.length = 0;
+    f.hosts[1].files[MAIN].inbounds = [];
+    f.overrides.onHandshake = () => { f.setList([]); };
+    await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_INSTALL_DISABLED' });
+    assert.deepEqual(f.sessions.map(s => [s.id, s.pinned, s.closed]), [[f.nodes[1]._id, true, true]]);
+    assert.deepEqual(f.poolRequests, []);
+    assert.deepEqual(f.commands, []);
+    assertNoWrites(f);
+});
+
+for (const closeBeforeReady of [true, false]) {
+    test(`Apply disposes a ${closeBeforeReady ? 'closed' : 'stalled'} pre-auth wire without retry or late use`, { timeout: 1000 }, async t => {
+        const f = fixture(t, { relayCount: 1 });
+        if (!closeBeforeReady) shortenAdmission(t);
+        pool.config.maxRetries = 2;
+        let lateClient;
+        f.overrides.onHandshake = (id, client, session) => {
+            assert.equal(id, f.nodes[1]._id);
+            lateClient = client;
+            if (closeBeforeReady) {
+                // ssh2 can emit end/close, and clear readyTimeout, without error.
+                session.closed = true;
+                client._sock.writable = false;
+                client.emit('end');
+                client.emit('close');
+            }
+            return true;
+        };
+        await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_SSH_CONNECT_FAILED' });
+        assert.deepEqual(f.sessions.map(s => [s.pinned, s.closed]), [[true, true]]);
+        await f.service.locks.run(async () => {}); // The failed Apply released its lock.
+        assert.equal(lateClient.listenerCount('ready'), 0);
+        lateClient.emit('ready');
+        lateClient.emit('error', Error('fixture late error'));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(f.sessions.length, 1);
+        assert.deepEqual(f.poolRequests, []);
+        assert.deepEqual(f.commands, []);
+        assertNoWrites(f);
+    });
+}
+
+function shortenAdmission(t) {
+    const realSetTimeout = setTimeout;
+    t.mock.method(global, 'setTimeout', (fn, ms, ...args) => realSetTimeout(fn, ms === 30000 ? 25 : ms, ...args));
+}
+
+test('expiry while queued never opens a late direct connection', { timeout: 1000 }, async t => {
+    const f = fixture(t, { relayCount: 1 });
+    shortenAdmission(t);
+    const active = NodeSSH._activeDirect;
+    NodeSSH._activeDirect = Infinity; // Model a fully occupied legacy semaphore.
+    try {
+        await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_SSH_CONNECT_FAILED' });
+        assert.equal(NodeSSH._waitQueue.length, 0);
+        NodeSSH._releaseDirectSlot();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(f.sessions, []);
+        assertNoWrites(f);
+    } finally { NodeSSH._activeDirect = active; }
 });
 
 test('a changed binding after attestation vetoes the whole component before its first effect', async t => {

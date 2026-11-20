@@ -3,6 +3,7 @@ const { randomUUID } = require('node:crypto');
 const { MAIN, BRIDGE, readClassicProfile }=require('./classicAppliedConfig');
 const {generateBridgeSystemdService}=require('./configGenerator');
 const {READ_CHAIN,VERIFY_CHAIN}=require('./rebuildTunnelTls');
+const {CONNECT_TIMEOUT_MS}=require('./rebuildSshLimits');
 const fail=code=>Object.assign(new Error(code),{code});
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
 const readMachineId='/usr/bin/head -c 34 /etc/machine-id';
@@ -19,9 +20,12 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         if(closed||attestationStarted)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         attestationStarted=true;
         await authority.verify();
-        try{await ssh.connect();}catch{ssh.disconnect();throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');}
+        if(closed)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+        try{await ssh.connectDirectOnce(CONNECT_TIMEOUT_MS);}catch{throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');}
+        if(closed)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         connected=true;
         await authority.verify();
+        if(closed)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         let result;
         try{result=await ssh.exec(readMachineId,{timeout:10000});}catch{throw fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');}
         if(result?.code!==0 || result.stderr!=='' || ![authority.machineId,`${authority.machineId}\n`].includes(result.stdout)){
@@ -31,8 +35,10 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
     }
     async function run(command,options){
         if(closed || authority && !attested)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
-        if(authority)await authority.verify();
-        if(!connected){await ssh.connect();connected=true;}
+        if(authority){
+            await authority.verify();
+            if(closed||!connected)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+        }else if(!connected){await ssh.connect();connected=true;}
         return ssh.exec(command,options);
     }
     async function check(command,stdin) {
@@ -92,7 +98,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
     async function close(){
         if(closed)return;
         try{if(connected&&attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`);}
-        finally{closed=true;if(connected)ssh.disconnect();}
+        finally{closed=true;if(connected||attestationStarted)ssh.disconnect();}
     }
     return {read,requireSupportedCore,stagePair,putPair,close,
         ...(authority&&{attest}),

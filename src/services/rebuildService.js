@@ -72,22 +72,23 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     }
     async function openTransports(nodes,states,transports,bindings,verifyLock){
         await verifyLock();
-        // Resolve the complete affected set before opening any transport. A
-        // missing list entry is a refusal, never authority to use the card.
+        // Resolve the complete affected set before opening any transport. An
+        // installed relay requires a binding; an explicit enrollment binds
+        // even before L2TP is installed.
         for(const node of nodes){
             const id=String(node._id), state=states.get(id);
-            if(!state)continue;
-            const binding=captureRelayBinding(env,id,node);
+            const binding=captureRelayBinding(env,id,node,{optional:!state});
+            if(!binding)continue;
             // Historical route-group state may predate a rebuild receipt.
             // When a receipt exists it must agree with the operator binding.
-            if(state.rebuildMachineId!=null && state.rebuildMachineId!==binding.binding.machineId)throw fail('REBUILD_L2TP_BINDING_MISMATCH');
+            if(state?.rebuildMachineId!=null && state.rebuildMachineId!==binding.binding.machineId)throw fail('REBUILD_L2TP_BINDING_MISMATCH');
             bindings.set(id,binding);
         }
         for(const node of nodes){
             const id=String(node._id), binding=bindings.get(id);
             if(!binding)continue;
             // The general-purpose connector is only for ordinary Xray nodes;
-            // it cannot supply or replace an installed relay's attested writer.
+            // it cannot supply or replace a bound relay's attested writer.
             const transport=createBoundRelayTransport(node,binding,verifyLock);
             transports.set(id,transport);
             await transport.attest();

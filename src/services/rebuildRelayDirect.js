@@ -7,6 +7,7 @@ const { randomBytes } = require('node:crypto');
 const { isIPv4 } = require('node:net');
 const { performance } = require('node:perf_hooks');
 const { captureRelayBinding } = require('./rebuildRelayAuthorization');
+const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
@@ -170,7 +171,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         const chap = action === 'check-chap' || action === 'sync-chap';
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         checkBinding();
-        await connect(count ? 5000 : 30000);
+        await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
         requireThat(!closed, 'DIRECT_CLOSED');
         checkBinding();
         const stdin = JSON.stringify({ action, machineId, ...params });
@@ -244,7 +245,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         const params = { nodeId, backupId, network: removeNetwork(installation.network, invalid),
             currentUsers: chapUsers(currentUsers, invalid), desiredUsers: chapUsers(desiredUsers, invalid) };
         requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
-        await connect(30000);
+        await connect(CONNECT_TIMEOUT_MS);
         await lock(verifyLock);
         const { changed } = await exec(action, params, write, reply => exactAck(backupId)(reply)
             && Object.keys(reply).length === 3 && typeof reply.changed === 'boolean');

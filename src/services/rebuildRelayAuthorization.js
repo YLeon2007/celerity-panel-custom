@@ -50,18 +50,35 @@ function listBinding(raw, id) {
     // Count lexical member names too: JSON.parse silently collapses duplicate keys.
     let members = 0;
     for (const [, separator] of raw.matchAll(/"(?:[^"\\]|\\[\s\S])*"\s*(:)?/g)) if (separator) members++;
-    if (!match || members !== rows.length * fields.length) throw disabled();
-    return Object.freeze(match);
+    if (members !== rows.length * fields.length) throw disabled();
+    return match && Object.freeze(match);
 }
 
 function rebuildAllowed(env) {
     try { return validateRebuildMode(env) === true; } catch { return false; }
 }
 
-function resolveRelayBinding(env, id, node) {
+function resolveRelayBinding(env, id, node, { optional = false } = {}) {
+    const listMode = Object.hasOwn(env, LIST);
+    let binding;
+    if (optional) {
+        if (listMode) {
+            try { binding = listBinding(env[LIST], id); }
+            catch (error) {
+                // Invalid enrollment is not evidence of an unenrolled relay.
+                // It does not gate ordinary non-relay nodes without state.
+                if (error.code === 'REBUILD_L2TP_INSTALL_DISABLED' && node?.cascadeRole !== 'relay') return;
+                throw error;
+            }
+            if (!binding) return;
+        } else if (env.C3_REBUILD_L2TP_RELAY_ID !== id) {
+            return;
+        }
+    }
     if (!rebuildAllowed(env) || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== 'true' || !hex(id, 24)) throw disabled();
-    if (Object.hasOwn(env, LIST)) {
-        const binding = listBinding(env[LIST], id);
+    if (listMode) {
+        binding ??= listBinding(env[LIST], id);
+        if (!binding) throw disabled();
         if (node !== undefined && (String(node?._id ?? node?.id ?? '') !== id
             || hostIdentity(node?.ip) !== hostIdentity(binding.host)
             || node?.ssh?.port !== binding.port || node?.ssh?.username !== binding.username)) throw fail('BINDING_MISMATCH');
@@ -91,8 +108,9 @@ function sameRelayBinding(a, b) {
 
 // Capture admission before waiting for Apply exclusion; re-resolve under that
 // exclusion and at effect boundaries. Switching modes also revokes the grant.
-function captureRelayBinding(env, id, node) {
-    const binding = resolveRelayBinding(env, id, node);
+function captureRelayBinding(env, id, node, options) {
+    const binding = resolveRelayBinding(env, id, node, options);
+    if (!binding) return;
     const listMode = Object.hasOwn(env, LIST);
     return Object.freeze({ binding, listMode, check(currentNode = node) {
         if (Object.hasOwn(env, LIST) !== listMode) throw disabled();

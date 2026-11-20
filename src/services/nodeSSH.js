@@ -25,6 +25,7 @@
  */
 
 const { Client } = require('ssh2');
+const { performance } = require('node:perf_hooks');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
@@ -57,9 +58,16 @@ function getDirectMaxRetries() {
     return (Number.isFinite(r) && r >= 0) ? r : FALLBACK_MAX_RETRIES;
 }
 
+function discardPendingClient(client) {
+    // ssh2's Client.destroy() is a no-op once the read side has ended.
+    // Force disposal of the socket this fresh, non-pooled client owns.
+    try { client?._sock?.destroy(); } catch { /* Preserve the admission failure. */ }
+}
+
 class NodeSSH {
     #hostKeyOptions;
     #verifiedDirectClient = null;
+    #pendingDirect = null;
 
     constructor(node, options) {
         this.#hostKeyOptions = sshPool.hostKeyOptions(node, options);
@@ -111,6 +119,39 @@ class NodeSSH {
         }
     }
 
+    /** One pinned admission, including time spent in the direct-slot queue. */
+    async connectDirectOnce(timeout) {
+        sshPool.hostKeyOptions(this.node, this.#hostKeyOptions);
+        if (this.usePool || !this.#hostKeyOptions || this.#pendingDirect || this.directClient) {
+            throw new Error('SSH one-shot admission requires a fresh pinned direct client');
+        }
+        const controller = this.#pendingDirect = new AbortController();
+        const { signal } = controller;
+        const deadline = performance.now() + timeout;
+        const expire = () => controller.abort(new Error('SSH admission timed out'));
+        const checkDeadline = () => {
+            if (performance.now() >= deadline) expire();
+            signal.throwIfAborted();
+        };
+        const timer = setTimeout(expire, timeout);
+        let acquired = false, client;
+        try {
+            await NodeSSH._acquireDirectSlot(signal);
+            acquired = true;
+            checkDeadline();
+            client = await this._openDirectClient(signal);
+            checkDeadline();
+            this.directClient = this.#verifiedDirectClient = client;
+        } catch (error) {
+            discardPendingClient(client);
+            throw error;
+        } finally {
+            clearTimeout(timer);
+            this.#pendingDirect = null;
+            if (acquired) NodeSSH._releaseDirectSlot();
+        }
+    }
+
     /**
      * Open a single SSH client with bounded retries and exponential backoff.
      * Mirrors the retry pattern in sshPoolService.createConnection.
@@ -134,7 +175,7 @@ class NodeSSH {
     /**
      * One handshake attempt. Resolves with a ready Client or rejects.
      */
-    _openDirectClient() {
+    _openDirectClient(signal) {
         return new Promise((resolve, reject) => {
             const client = new Client();
 
@@ -152,6 +193,32 @@ class NodeSSH {
                 config.password = cryptoService.decryptSafe(this.node.ssh.password);
             } else {
                 reject(new Error('SSH: no key or password provided'));
+                return;
+            }
+
+            if (signal) {
+                let settled = false;
+                const ignoreError = () => {}; // The disposed socket can still report a late error.
+                const cleanup = () => {
+                    if (settled) return false;
+                    settled = true;
+                    client.off('ready', onReady).off('end', onClosed).off('close', onClosed)
+                        .off('error', onError).on('error', ignoreError);
+                    signal.removeEventListener('abort', onAbort);
+                    return true;
+                };
+                const onReady = () => { if (cleanup()) resolve(client); };
+                const onError = error => {
+                    if (!cleanup()) return; // Revoke readiness before destroying the pending socket.
+                    discardPendingClient(client);
+                    reject(error);
+                };
+                const onClosed = () => onError(new Error('SSH closed before ready'));
+                const onAbort = () => onError(signal.reason);
+                client.on('ready', onReady).on('end', onClosed).on('close', onClosed).on('error', onError);
+                signal.addEventListener('abort', onAbort, { once: true });
+                if (signal.aborted) return onAbort();
+                try { client.connect(config); } catch (error) { onError(error); }
                 return;
             }
 
@@ -177,12 +244,26 @@ class NodeSSH {
      * Acquire a slot from the global direct-connection semaphore.
      * Blocks (queues) when MAX_CONCURRENT_DIRECT handshakes are already in flight.
      */
-    static _acquireDirectSlot() {
+    static _acquireDirectSlot(signal) {
         if (NodeSSH._activeDirect < MAX_CONCURRENT_DIRECT) {
             NodeSSH._activeDirect++;
             return Promise.resolve();
         }
-        return new Promise(resolve => NodeSSH._waitQueue.push(resolve));
+        if (!signal) return new Promise(resolve => NodeSSH._waitQueue.push(resolve));
+        return new Promise((resolve, reject) => {
+            const take = () => {
+                signal.removeEventListener('abort', cancel);
+                resolve();
+            };
+            const cancel = () => {
+                const index = NodeSSH._waitQueue.indexOf(take);
+                if (index !== -1) NodeSSH._waitQueue.splice(index, 1);
+                reject(signal.reason);
+            };
+            if (signal.aborted) return cancel();
+            NodeSSH._waitQueue.push(take);
+            signal.addEventListener('abort', cancel, { once: true });
+        });
     }
 
     /**
@@ -202,6 +283,7 @@ class NodeSSH {
      * Close connection
      */
     disconnect() {
+        this.#pendingDirect?.abort();
         this.#verifiedDirectClient = null;
         if (this.directClient) {
             this.directClient.end();
