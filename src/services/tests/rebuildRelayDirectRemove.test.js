@@ -96,7 +96,7 @@ test('only exact no-effect refusal is negative; no unknown or late lock loss con
         let checks = 0;
         const result = remote.remove(plan, () => ++checks === 1 || !lostAfter);
         if (expectUnknown) await assert.rejects(result, { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', remoteOutcomeUncertain: true });
-        else assert.equal(await result, false);
+        else await assert.rejects(result, { code: 'REBUILD_L2TP_DIRECT_REMOVE_REFUSED', commandSettled: true });
         await remote.close();
     }
 });

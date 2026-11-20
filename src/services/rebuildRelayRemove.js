@@ -209,7 +209,24 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     await guard();
                     try {
                         if (await remote.remove(plan, guard) !== true) throw fail(UNKNOWN);
-                    } catch { throw fail(UNKNOWN); }
+                    } catch (error) {
+                        if (error?.code !== 'REBUILD_L2TP_DIRECT_REMOVE_REFUSED' || error.commandSettled !== true
+                            || error.remoteOutcomeUncertain) throw fail(UNKNOWN);
+                        // DIRECT guarantees this receipt can only precede intent.
+                        // Recheck our lease and exact inventories before a single
+                        // non-retryable CAS. Never retire an account on refusal.
+                        const { status, desiredState, updatedAt } = state;
+                        const restore = { $set: { status, desiredState }, ...(Object.hasOwn(state, 'updatedAt')
+                            ? {} : { $unset: { updatedAt: '' } }) };
+                        if (Object.hasOwn(state, 'updatedAt')) restore.$set.updatedAt = updatedAt;
+                        try {
+                            await guard();
+                            const reverted = await State.updateMany(exact(reservation, stateKeys), restore, write);
+                            if (reverted?.acknowledged !== true || reverted.matchedCount !== 1) throw fail(CHANGED);
+                            await checkInventory(state, true);
+                        } catch { throw fail(UNKNOWN); }
+                        throw fail('REBUILD_L2TP_REMOVE_REFUSED');
+                    }
 
                     try {
                         await guard();

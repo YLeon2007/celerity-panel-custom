@@ -297,12 +297,9 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 // also rechecks the host snapshot under its local flock.
                 try { await lock(verifyLock); } catch { return false; }
                 if (closed) return false;
-                try {
-                    await exec('remove', params, true, value => exactAck(params.backupId)(value) && value.removed === true);
-                } catch (error) {
-                    if (error.commandSettled && error.code === 'REBUILD_L2TP_DIRECT_REMOVE_REFUSED') return false;
-                    throw error;
-                }
+                // Preserve the authenticated pre-intent refusal; only this
+                // exact frame permits the caller to unwind its DB reservation.
+                await exec('remove', params, true, value => exactAck(params.backupId)(value) && value.removed === true);
                 try {
                     await lock(verifyLock);
                     requireThat(!closed, 'DIRECT_CLOSED');

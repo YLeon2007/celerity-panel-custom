@@ -139,6 +139,71 @@ const finishUnknown = { code: 'REBUILD_L2TP_REMOVE_FINISH_OUTCOME_UNKNOWN' };
 const noOwner = { code: 'REBUILD_L2TP_REMOVE_NOT_OWNED' };
 const privateError = () => new Error('private fixture details');
 
+test('final host refusal restores only the exact reservation; unknown outcomes retain it', async t => {
+    const f = await installed(t);
+    const prior = copy(f.states[0]), account = copy(f.users[0]);
+    f.nodes[0].ssh.username = 'root';
+    f.env.C3_REBUILD_L2TP_SSH_SHA256 = 'd'.repeat(64);
+    const census = 'e'.repeat(64);
+    const { createRelayDirect } = require('../rebuildRelayDirect');
+    const calls = [];
+    let receipt = { code: 70, stdout: '', stderr: 'DIRECT_REMOVE_REFUSED\n' }, beforeReply;
+    class SSH {
+        connect() {}
+        disconnect() {}
+        async exec(_, { stdin }) {
+            const frame = JSON.parse(stdin);
+            calls.push(frame.action);
+            if (frame.action === 'remove') {
+                assert.equal(frame.expectedCensus, census);
+                assert.equal(f.states[0].status, 'removing');
+                assert.deepEqual(f.users, [account]);
+                beforeReply?.();
+                return receipt;
+            }
+            const reply = frame.action === 'session-count' ? { activeSessions: 0, census }
+                : { ok: true, machineId, backupId, baseline: 'f'.repeat(64) };
+            assert.ok(['session-count', 'prepare-remove'].includes(frame.action));
+            return { code: 0, stdout: JSON.stringify(reply) + '\n', stderr: '' };
+        }
+    }
+    t.mock.method(User.collection, 'countDocuments', async () => f.users.length);
+    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
+    const tryRemove = async code => {
+        const preview = await service.previewRemoveRelay(id);
+        assert.equal(preview.confirmable, true);
+        await assert.rejects(service.confirmRemoveRelay(id, preview), { code });
+        assert.deepEqual(calls.splice(0), ['session-count', 'session-count', 'prepare-remove', 'remove']);
+        assert.deepEqual(f.users, [account]);
+        assert.ok(!f.events.includes('L2tpUser:delete'));
+    };
+    await tryRemove('REBUILD_L2TP_REMOVE_REFUSED');
+    assert.deepEqual(f.states, [prior]);
+    assert.deepEqual(f.events.splice(0), ['RelayL2tpState:update', 'RelayL2tpState:update']);
+    receipt = { code: 124, stdout: '', stderr: '' };
+    await tryRemove('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
+    assert.equal(f.states[0].status, 'removing');
+    assert.deepEqual(f.events.splice(0), ['RelayL2tpState:update']);
+    // Independent attempts in the same regression: neither a lost lease nor
+    // a reservation drift immediately before the restoration may free the row.
+    receipt = { code: 70, stdout: '', stderr: 'DIRECT_REMOVE_REFUSED\n' };
+    f.states[0] = copy(prior);
+    beforeReply = f.loseLock;
+    await tryRemove('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
+    assert.equal(f.states[0].status, 'removing');
+    assert.deepEqual(f.events.splice(0), ['RelayL2tpState:update']);
+    f.states[0] = copy(prior);
+    beforeReply = undefined;
+    f.stateHooks.update = ({ update, apply }) => {
+        if (update.$set.status === 'installed') f.states[0].updatedAt = new Date(100);
+        return apply();
+    };
+    await tryRemove('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
+    assert.equal(f.states[0].status, 'removing');
+    assert.deepEqual(f.states[0].updatedAt, new Date(100));
+    assert.deepEqual(f.events, ['RelayL2tpState:update', 'RelayL2tpState:update']);
+});
+
 test('installed candidate -> removing before dispatch -> verified absence; only bootstrap credentials are retired', async t => {
     const f = await installed(t);
     const before = copy(f.states[0]), account = copy(f.users[0]);

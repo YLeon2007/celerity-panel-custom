@@ -28,6 +28,7 @@ function issueRemovalTicket(req, estimate) {
 const localizedErrors = Object.freeze({
     [required]: 'nodes.rebuildRemoveRefresh',
     REBUILD_L2TP_REMOVE_PREVIEW_CHANGED: 'nodes.rebuildRemoveRefresh',
+    REBUILD_L2TP_REMOVE_REFUSED: 'nodes.rebuildRemoveRefresh',
     REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE: 'nodes.rebuildRemoveCountUnavailable',
     REBUILD_L2TP_REMOVE_SESSIONS_BUSY: 'nodes.rebuildRemoveBusy',
 });
