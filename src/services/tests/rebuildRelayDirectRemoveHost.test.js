@@ -69,6 +69,8 @@ Path(h['XRAY']).write_text('modeled executable')
 Path(h['BRIDGE']).parent.mkdir(parents=True)
 for k, data in dict(main=f['old'], starter='# initial\n', lns='# stock\n', secrets='# initial\n', chap='# initial\n').items():
     Path(P[k]).write_text(data)
+if scenario.startswith('chap-unterminated-'):
+    Path(P['chap']).write_bytes(b'# original comment with opaque byte \xff')
 
 def stat(value):
     return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size')})
@@ -155,6 +157,8 @@ def sc(*args):
             raise Refusal('COMMAND_FAILED')
         if args == ('stop', XL) and scenario == 'chap-sync-remove':
             chap.write_bytes(chap.read_bytes() + b'\n# appended during Remove\r\n')
+        if args == ('stop', XL) and scenario == 'chap-unterminated-list-suffix':
+            chap.write_bytes(chap.read_bytes() + suffix)
         name = rest[0]
         if testing and cmd == 'stop' and ((name == XL and scenario.startswith(('xl-stop-', 'xl-reset-')))
                                           or (name == IKE and scenario == 'ike-stop-failed')):
@@ -315,6 +319,14 @@ side, side_unit = R(h['BRIDGE']), dict(units[B])
 changes.clear()
 testing = True
 req['nodeId'] = f['nodeId']
+suffix = b''
+if scenario.endswith('-suffix') or scenario == 'chap-unterminated-separated':
+    # Preserve an actual unmanaged row, with its original EOF and CRLF bytes.
+    suffix = (b'\n' if scenario == 'chap-unterminated-separated' else b'') + foreign
+    if scenario == 'chap-unterminated-list-suffix':
+        req['currentUsers'] = [dict(login='alice', password='test-old', ipAddress='10.255.1.10', enabled=True)]
+    else:
+        Path(P['chap']).write_bytes(Path(P['chap']).read_bytes() + suffix)
 if scenario == 'apply-quiescent-dependent': req['transit'] = []
 if scenario == 'foreign-drop': Path(h['DROP_DIR'], 'foreign.conf').write_text('untouched')
 if scenario == 'foreign-dep': units[X]['RequiredBy'] += ' ' + B
@@ -555,7 +567,12 @@ else:
         preserved = b'# later prefix\r\n' + stock_chap + foreign + b'\n# appended during Remove\r\n'
         # Without foreign edits the separator disappears with the block. The
         # edited prefix above no longer matches the preimage; preserve it whole.
-        assert chap.read_bytes() == (preserved if scenario == 'chap-sync-remove' else chap_preimage)
+        if suffix:
+            separator = b'\n' if scenario in ('chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix') else b''
+            preserved = chap_preimage + separator + suffix
+        elif scenario != 'chap-sync-remove':
+            preserved = chap_preimage
+        assert chap.read_bytes() == preserved
         assert R(P['chap'])['mode'] == 0o600
         assert not any(policy.values()) and intent.is_file() and wire('prepare-remove')[0] != 0
         assert not Path(h['DROP_DIR']).exists() and not Path(h['NFT_DIR']).exists()
@@ -567,6 +584,8 @@ print('ok')
 
 for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation',
     'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown',
+    'chap-unterminated-clean', 'chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix', 'chap-unterminated-separated',
+    'chap-terminated-suffix',
     'foreign-drop', 'foreign-dep', 'foreign-ike', 'foreign-rule', 'foreign-listener', 'ambiguous', 'ambiguous-shared',
     'duplicate-json', 'nft-drift', 'invalid-candidate', 'active-ppp', 'wrong-network', 'wrong-machine', 'wrong-node',
     'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route',

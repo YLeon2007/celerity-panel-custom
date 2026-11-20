@@ -18,6 +18,10 @@ const id = 'a'.repeat(24), machineId = 'b'.repeat(32), backupId = 'rebuild-uniqu
 const oid = value => new Types.ObjectId(value);
 const copy = value => mongo.BSON.deserialize(mongo.BSON.serialize(value));
 const matches = (row, where) => Object.entries(where).every(([key, value]) => {
+    if (key === '$expr') {
+        assert.equal(value.$eq[0], '$$ROOT');
+        return equal(row, value.$eq[1].$literal);
+    }
     if (key === '$or') return value.some(filter => matches(row, filter));
     if (key === '$nor') return !value.some(filter => matches(row, filter));
     if (value && Object.hasOwn(value, '$exists')) return Object.hasOwn(row, key) === value.$exists

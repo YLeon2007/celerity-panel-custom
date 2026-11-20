@@ -44,8 +44,8 @@ const accountKeys = ['_id', 'relayNode', 'login', 'ip', 'enabled', 'passwordEncr
 const unsetInstalled = Object.fromEntries(installedFields.map(key => [key, '']));
 const exact = (row, keys) => Object.fromEntries(keys.map(key => [key, Object.hasOwn(row, key)
     ? { $eq: row[key], ...(row[key] === null && { $exists: true }) } : { $exists: false }]));
-const exactAccounts = rows => rows.map(row => exact(row, [...new Set([...accountKeys, ...Object.keys(row)])]))
-    .sort((a, b) => String(a._id.$eq).localeCompare(String(b._id.$eq)));
+const orderedAccounts = rows => [...rows].sort((a, b) => String(a._id).localeCompare(String(b._id)));
+const exactAccount = row => ({ ...exact(row, ['_id', 'relayNode']), $expr: { $eq: ['$$ROOT', { $literal: row }] } });
 const integer = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
 const nonempty = value => typeof value === 'string' && value.length > 0;
 const empty = value => value == null || value === '';
@@ -139,12 +139,12 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     let rows, approved = false, currentUsers;
                     try { rows = await users(); }
                     catch (error) { if (phase !== 'preview') throw error; }
-                    const accountFences = rows && exactAccounts(rows);
+                    const accounts = rows && orderedAccounts(rows);
                     if (proof && (!equal(proof.node, node) || !equal(proof.stateFence, stateFence)
-                        || !equal(proof.accountFences, accountFences))) throw fail(PREVIEW_CHANGED);
+                        || !equal(proof.accounts, accounts))) throw fail(PREVIEW_CHANGED);
                     try {
-                        if (fence.listMode) currentUsers = projectRelayChap(state, rows, chapKey);
-                        else ownedAccount(rows, state, id);
+                        if (fence.listMode) currentUsers = projectRelayChap(state, accounts, chapKey);
+                        else ownedAccount(accounts, state, id);
                         approved = true;
                     } catch { if (phase !== 'preview') throw fail(NOT_OWNED); }
 
@@ -154,7 +154,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             ? [await getNode(session), await getState(session), accounts && await users(session)]
                             : await Promise.all([getNode(), getState(), accounts && users()]);
                         if (!equal(currentNode, node) || !currentState || !equal(exact(currentState, stateKeys), exact(expected, stateKeys))
-                            || (accounts && !equal(exactAccounts(currentRows), accounts))) throw fail(CHANGED);
+                            || (accounts && !equal(orderedAccounts(currentRows), accounts))) throw fail(CHANGED);
                         await authority();
                     };
                     // Legacy singleton still authenticates its unchanged block
@@ -184,11 +184,11 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             remote = undefined;
                         }
                         if (!transitProved && census?.activeSessions === 0) census = null;
-                        const confirmable = approved && accountCount === accountFences.length && census?.activeSessions === 0;
-                        await checkInventory(state, approved ? accountFences : undefined);
+                        const confirmable = approved && accountCount === accounts.length && census?.activeSessions === 0;
+                        await checkInventory(state, approved ? accounts : undefined);
                         const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions: census?.activeSessions ?? null,
                             confirmable });
-                        if (confirmable) previews.set(snapshot, { node, stateFence, accountFences,
+                        if (confirmable) previews.set(snapshot, { node, stateFence, accounts,
                             binding: fence.binding, listMode: fence.listMode, census: census.census,
                             expires: performance.now() + PREVIEW_TTL_MS });
                         return snapshot;
@@ -214,7 +214,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         if (census.activeSessions !== 0) throw fail(SESSIONS_BUSY);
                         if (proof && census.census !== proof.census) throw fail(PREVIEW_CHANGED);
                         expectedCensus = census.census;
-                        await checkInventory(state, accountFences);
+                        await checkInventory(state, accounts);
                         checkPreview();
                     }
                     // No saved MAIN is sent or rebuilt here. The direct driver
@@ -222,7 +222,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     // The actual host Remove must recheck the confirmed census.
                     const plan = await remote.prepareRemove({ ...input, ...(expectedCensus && { expectedCensus }) });
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
-                    await checkInventory(state, accountFences);
+                    await checkInventory(state, accounts);
                     checkPreview();
 
                     const transition = { status: 'removing', desiredState: 'absent', updatedAt: new Date() };
@@ -238,7 +238,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     let revoked;
                     const guard = async () => {
                         if (revoked) throw revoked;
-                        try { await checkInventory(reservation, accountFences); }
+                        try { await checkInventory(reservation, accounts); }
                         catch (error) { revoked = safe(error); throw revoked; }
                     };
                     await guard();
@@ -258,7 +258,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             await guard();
                             const reverted = await State.updateMany(exact(reservation, stateKeys), restore, write);
                             if (reverted?.acknowledged !== true || reverted.matchedCount !== 1) throw fail(CHANGED);
-                            await checkInventory(state, accountFences);
+                            await checkInventory(state, accounts);
                         } catch { throw fail(UNKNOWN); }
                         throw fail('REBUILD_L2TP_REMOVE_REFUSED');
                     }
@@ -266,10 +266,13 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     try {
                         await guard();
                         const settle = async session => {
-                            if (session) await checkInventory(reservation, accountFences, session);
+                            if (session) await checkInventory(reservation, accounts, session);
                             const options = session ? { session, timestamps: false } : write;
-                            for (const accountFence of accountFences) {
-                                const deleted = await User.deleteMany(accountFence, options);
+                            for (const row of accounts) {
+                                // Match the entire list-mode row: enumerating known
+                                // fields could miss a field added since the snapshot.
+                                const filter = session ? exactAccount(row) : exact(row, [...new Set([...accountKeys, ...Object.keys(row)])]);
+                                const deleted = await User.deleteMany(filter, options);
                                 if (deleted?.acknowledged !== true || deleted.deletedCount !== 1) throw fail(CHANGED);
                             }
                             await checkInventory(reservation, [], session);
@@ -279,9 +282,10 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             if (finished?.acknowledged !== true || finished.matchedCount !== 1) throw fail(CHANGED);
                             if (session) await authority();
                         };
-                        // A multi-row retirement and the final State CAS must
-                        // publish together; never retry an uncertain commit.
-                        if (accountFences.length > 1) await transactOnce(State, User, settle);
+                        // List mode requires atomic retirement and publication,
+                        // even with one account. Preserve the non-transactional
+                        // no-list bootstrap path for standalone MongoDB.
+                        if (fence.listMode) await transactOnce(State, User, settle);
                         else await settle();
                     } catch { throw fail(FINISH_UNKNOWN); }
                     removed = true;

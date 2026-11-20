@@ -16,6 +16,10 @@ const id = 'a'.repeat(24), machineId = 'b'.repeat(32), backupId = 'c'.repeat(32)
 const oid = value => new Types.ObjectId(value);
 const copy = value => mongo.BSON.deserialize(mongo.BSON.serialize(value));
 const matches = (row, where) => Object.entries(where).every(([key, value]) => {
+    if (key === '$expr') {
+        assert.equal(value.$eq[0], '$$ROOT');
+        return equal(row, value.$eq[1].$literal);
+    }
     if (key === '$or') return value.some(filter => matches(row, filter));
     if (value && Object.hasOwn(value, '$exists')) return Object.hasOwn(row, key) === value.$exists
         && (!Object.hasOwn(value, '$eq') || equal(row[key], value.$eq));
@@ -57,7 +61,7 @@ function bind(t, model, data, traces) {
             }
             return { acknowledged: true, matchedCount: Number(index !== -1), upsertedCount: 0 };
         };
-        return handlers[kind] ? handlers[kind]({ where, update, apply, session: options.session }) : apply();
+        return handlers[kind] ? handlers[kind]({ where, update, apply, session: options.session, rows }) : apply();
     };
     t.mock.method(model.collection, 'findOne', async (where, { projection, session } = {}) => project(
         (session?.rows.get(data) ?? data).find(row => matches(row, where)), projection));
@@ -143,7 +147,7 @@ const finishUnknown = { code: 'REBUILD_L2TP_REMOVE_FINISH_OUTCOME_UNKNOWN' };
 const noOwner = { code: 'REBUILD_L2TP_REMOVE_NOT_OWNED' };
 const privateError = () => new Error('private fixture details');
 
-async function sharedFixture(t) {
+async function sharedFixture(t, { singleton = false } = {}) {
     const f = await installed(t);
     const peerId = 'e'.repeat(24), peerMachine = 'd'.repeat(32), peerIp = '192.0.2.200';
     for (const node of f.nodes) node.ssh.username = 'root';
@@ -157,7 +161,7 @@ async function sharedFixture(t) {
     f.states.push({ ...copy(target), _id: oid(), node: oid(peerId), rebuildMachineId: peerMachine,
         backupId: 'f'.repeat(32), rebuildInstallToken: 'eeeeeeee-eeee-4eee-aeee-eeeeeeeeeeee',
         clientCidr: `${peerPrefix}.0/24`, localAddress: `${peerPrefix}.1`, poolStart: `${peerPrefix}.10`, poolEnd: `${peerPrefix}.250` });
-    f.users.push({ ...copy(f.users[0]), _id: oid(), login: 'disabled-user', ip: `${prefix}.11`, enabled: false,
+    if (!singleton) f.users.push({ ...copy(f.users[0]), _id: oid(), login: 'disabled-user', ip: `${prefix}.11`, enabled: false,
         desiredRevision: 3, appliedRevision: 3, passwordEncrypted: encrypt('fixture-disabled', f.env.ENCRYPTION_KEY) });
     f.users.push(...f.users.map(row => ({ ...copy(row), _id: oid(), relayNode: oid(peerId), ip: row.ip.replace(prefix, peerPrefix) })));
     const selected = () => f.users.filter(row => String(row.relayNode) === id);
@@ -168,34 +172,7 @@ async function sharedFixture(t) {
         rebuildApplied: { listener: oid(id), mode: 'reverse', protocol: 'vless', port: 22010,
             uuid: '00000000-0000-4000-8000-000000000009' } });
 
-    const attempts = [];
-    const dbHooks = {};
-    class Session {
-        transaction = { transition: value => { assert.equal(value, 'TRANSACTION_COMMITTED'); this.active = false; } };
-        startTransaction(options) {
-            assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
-            this.active = true;
-            this.rows = new Map([f.states, f.users].map(rows => [rows, rows.map(copy)]));
-        }
-        inTransaction() { return this.active; }
-        abortTransaction() { attempts.push('abort'); this.active = false; }
-        endSession() { assert.equal(this.active, false); }
-    }
-    t.mock.method(State.db, 'startSession', async () => new Session());
-    t.mock.method(State.db, 'getClient', () => ({ db(name) {
-        assert.equal(name, 'admin');
-        return { async command(command, { session }) {
-            assert.equal(command.commitTransaction, 1);
-            assert.equal(command.writeConcern.w, 'majority');
-            assert.ok(session.inTransaction());
-            attempts.push('commit');
-            const apply = () => {
-                for (const [rows, pending] of session.rows) rows.splice(0, rows.length, ...pending);
-                return { ok: 1 };
-            };
-            return dbHooks.commit ? dbHooks.commit(apply) : apply();
-        } };
-    } }));
+    const { attempts, dbHooks } = modelTransactions(t, f);
     const frames = [], census = '3'.repeat(64), baseline = '4'.repeat(64);
     const wire = {};
     const { createRelayDirect } = require('../rebuildRelayDirect');
@@ -214,7 +191,7 @@ async function sharedFixture(t) {
                 assert.equal(frame.baseline, baseline);
                 assert.equal(frame.expectedCensus, census);
                 assert.equal(f.states[0].status, 'removing');
-                assert.equal(selected().length, 2);
+                assert.equal(selected().length, expectedUsers.length);
             }
             const reply = await wire[frame.action]?.() ?? (frame.action === 'session-count' ? { activeSessions: 0, census }
                 : { ok: true, machineId, backupId, baseline, removed: true });
@@ -226,6 +203,42 @@ async function sharedFixture(t) {
     })).sort((a, b) => a.login.localeCompare(b.login));
     const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
     return { ...f, service, selected, sibling, frames, attempts, dbHooks, wire };
+}
+
+function modelTransactions(t, { states, users }) {
+    const attempts = [], dbHooks = {};
+    class Session {
+        transaction = { transition: value => { assert.equal(value, 'TRANSACTION_COMMITTED'); this.active = false; } };
+        startTransaction(options) {
+            assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
+            this.active = true;
+            this.rows = new Map([states, users].map(rows => [rows, rows.map(copy)]));
+        }
+        inTransaction() { return this.active; }
+        abortTransaction() { attempts.push('abort'); this.active = false; }
+        endSession() { assert.equal(this.active, false); }
+    }
+    t.mock.method(State.db, 'startSession', async () => new Session());
+    t.mock.method(State.db, 'getClient', () => ({ db(name) {
+        assert.equal(name, 'admin');
+        return { async command(command, { session }) {
+            assert.equal(command.commitTransaction, 1);
+            assert.equal(command.writeConcern.w, 'majority');
+            assert.ok(session.inTransaction());
+            attempts.push('commit');
+            // Nothing is visible outside the session before the commit.
+            assert.equal(states[0].status, 'removing');
+            assert.ok(users.some(row => String(row.relayNode) === id));
+            assert.equal(session.rows.get(states)[0].status, 'not_installed');
+            assert.equal(session.rows.get(users).some(row => String(row.relayNode) === id), false);
+            const apply = () => {
+                for (const [rows, pending] of session.rows) rows.splice(0, rows.length, ...pending);
+                return { ok: 1 };
+            };
+            return dbHooks.commit ? dbHooks.commit(apply) : apply();
+        } };
+    } }));
+    return { attempts, dbHooks };
 }
 
 test('shared Remove sends the same private DB projection to DIRECT and retires only the selected relay', async t => {
@@ -267,7 +280,21 @@ test('shared Remove rechecks disabled rows after prepare and the confirmed censu
     assert.deepEqual(f.events, []);
 });
 
-test('shared Remove restores the reservation on known host refusal and aborts an incomplete account retirement', async t => {
+test('shared Remove rechecks a disabled row identity after reserving and before DIRECT mutation', async t => {
+    const f = await sharedFixture(t);
+    f.stateHooks.update = ({ update, apply }) => {
+        const result = apply();
+        if (update.$set.status === 'removing') f.selected().find(row => !row.enabled)._id = oid();
+        return result;
+    };
+    await assert.rejects(f.service.removeRelay(id), { code: 'REBUILD_L2TP_REMOVE_CHANGED' });
+    assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove']);
+    assert.deepEqual(f.attempts, []);
+    assert.equal(f.states[0].status, 'removing');
+    assert.equal(f.selected().length, 2);
+});
+
+test('shared Remove restores the exact reservation on known pre-intent host refusal', async t => {
     const f = await sharedFixture(t);
     const rows = f.users.map(copy), initial = copy(f.states[0]);
     const preview = await f.service.previewRemoveRelay(id);
@@ -276,20 +303,60 @@ test('shared Remove restores the reservation on known host refusal and aborts an
     assert.deepEqual(f.states[0], initial);
     assert.deepEqual(f.users, rows);
     assert.deepEqual(f.attempts, []);
+});
 
-    delete f.wire.remove;
-    let deletes = 0;
-    f.userHooks.delete = ({ where, apply, session }) => {
+test('lost DIRECT Remove acknowledgement leaves all list rows and never starts settlement or replays', async t => {
+    const f = await sharedFixture(t);
+    const rows = f.users.map(copy);
+    f.wire.remove = () => ({ code: 75, stdout: '', stderr: '' });
+    await assert.rejects(f.service.removeRelay(id), outcomeUnknown);
+    await assert.rejects(f.service.removeRelay(id), noOwner);
+    assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove', 'remove']);
+    assert.deepEqual(f.attempts, []);
+    assert.equal(f.states[0].status, 'removing');
+    assert.deepEqual(f.users, rows);
+});
+
+test('list Remove aborts all retirement when a later, disabled-row CAS misses', async t => {
+    const f = await sharedFixture(t);
+    const rows = f.users.map(copy);
+    const deletedCounts = [];
+    f.userHooks.delete = ({ where, apply, session, rows: pending }) => {
         assert.ok(session.inTransaction());
         assert.equal(String(where.relayNode.$eq), id);
         assert.deepEqual(f.users, rows);
-        return ++deletes === 1 ? apply() : { acknowledged: true, deletedCount: 0 };
+        if (deletedCounts.length === 1) {
+            const target = pending.find(row => equal(row._id, where._id.$eq));
+            assert.equal(target.enabled, false);
+            // Insert an unexpected field, absent from the selected snapshot and
+            // the Mongoose schema. Field-by-field CAS can miss this change.
+            target.foreignField = 'changed at second CAS';
+        }
+        const result = apply();
+        deletedCounts.push(result.deletedCount);
+        return result;
     };
-    await assert.rejects(f.service.confirmRemoveRelay(id, preview), finishUnknown);
-    assert.equal(deletes, 2);
+    await assert.rejects(f.service.removeRelay(id), finishUnknown);
+    await assert.rejects(f.service.removeRelay(id), noOwner);
+    assert.deepEqual(deletedCounts, [1, 0]);
     assert.deepEqual(f.attempts, ['abort']);
+    assert.equal(f.frames.filter(x => x.action === 'remove').length, 1);
     assert.equal(f.states[0].status, 'removing');
     assert.deepEqual(f.users, rows);
+});
+
+test('single-account list Remove aborts the retirement when the final reservation CAS misses', async t => {
+    const f = await sharedFixture(t, { singleton: true });
+    const rows = f.users.map(copy), peer = copy(f.states[1]);
+    f.stateHooks.update = ({ update, apply }) => update.$set.status === 'not_installed'
+        ? { acknowledged: true, matchedCount: 0 } : apply();
+    await assert.rejects(f.service.removeRelay(id), finishUnknown);
+    await assert.rejects(f.service.removeRelay(id), noOwner);
+    assert.deepEqual(f.attempts, ['abort']);
+    assert.equal(f.frames.filter(x => x.action === 'remove').length, 1);
+    assert.deepEqual(f.users, rows);
+    assert.equal(f.states[0].status, 'removing');
+    assert.deepEqual(f.states[1], peer);
 });
 
 test('shared Remove refuses invalid disabled credentials rather than falling back to the install receipt', async t => {
@@ -313,9 +380,9 @@ test('trusted shared Remove also requires a fresh zero census before dispatch', 
     assert.deepEqual(f.attempts, ['commit']);
 });
 
-for (const committed of [false, true]) {
-    test(`shared Remove never retries an unacknowledged settlement commit (committed=${committed})`, async t => {
-        const f = await sharedFixture(t);
+for (const [singleton, committed] of [[false, false], [false, true], [true, false], [true, true]]) {
+    test(`list Remove never retries an unacknowledged settlement commit (singleton=${singleton}, committed=${committed})`, async t => {
+        const f = await sharedFixture(t, { singleton });
         const selected = f.selected().map(copy), sibling = f.sibling().map(copy);
         f.dbHooks.commit = apply => { if (committed) apply(); throw privateError(); };
         await assert.rejects(f.service.removeRelay(id), finishUnknown);
@@ -330,6 +397,7 @@ for (const committed of [false, true]) {
 
 test('list Remove requires card corroboration and a preview from the same binding generation', async t => {
     const f = await installed(t);
+    const { attempts } = modelTransactions(t, f);
     const row = { nodeId: id, host: f.nodes[0].ip, port: 22, username: 'root', machineId, sshHostKeySha256: '1'.repeat(64) };
     const key = 'C3_REBUILD_L2TP_RELAYS_JSON';
     f.env[key] = JSON.stringify([row]);
@@ -366,6 +434,7 @@ test('list Remove requires card corroboration and a preview from the same bindin
     const current = await service.previewRemoveRelay(id);
     assert.equal((await service.confirmRemoveRelay(id, current)).status, 'not_installed');
     assert.deepEqual(actions, ['session-count', 'session-count', 'session-count', 'prepare-remove', 'remove']);
+    assert.deepEqual(attempts, ['commit']);
 });
 
 test('final host refusal restores only the exact reservation; unknown outcomes retain it', async t => {
@@ -433,7 +502,8 @@ test('final host refusal restores only the exact reservation; unknown outcomes r
     assert.deepEqual(f.events, ['RelayL2tpState:update', 'RelayL2tpState:update']);
 });
 
-test('installed candidate -> removing before dispatch -> verified absence; only bootstrap credentials are retired', async t => {
+test('no-list Install and Remove need no transaction and retire only the exact bootstrap', async t => {
+    const startSession = t.mock.method(State.db, 'startSession', async () => { throw Error('standalone fixture'); });
     const f = await installed(t);
     const before = copy(f.states[0]), account = copy(f.users[0]);
     const other = { _id: oid(), relayNode: oid(), login: account.login, passwordEncrypted: 'unrelated' };
@@ -470,6 +540,7 @@ test('installed candidate -> removing before dispatch -> verified absence; only 
     // validates its global source inventory; Remove did not touch that row.
     f.users.pop();
     await f.service.installRelay(id); // confirmed absence is a genuinely fresh install admission
+    assert.equal(startSession.mock.callCount(), 0);
 });
 
 test('refuses legacy, foreign and drifted installations before opening the driver', async t => {

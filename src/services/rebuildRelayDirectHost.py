@@ -1155,13 +1155,16 @@ def chap_rows_digest(rows):
 def remove_chap(record, backup, expected):
     prefix, suffix, rows = owned_chap(record, backup, expected)
     need(record is not None, 'ROLLBACK_DRIFT')
-    # Install added one separator LF. Remove it only when the saved preimage
-    # proves the whole prefix is unchanged; otherwise preserve the prefix bytes.
+    # Install added one LF. The exact saved prefix proves which byte it owns;
+    # never trim an edited prefix. Keep that LF if dropping it would join the
+    # original unterminated line to an independently appended suffix.
     original = backup['before']['files']['chap']
-    if original is not None and prefix == raw(original) + b'\n':
+    original_bytes = raw(original) if original is not None else None
+    if original_bytes is not None and prefix == original_bytes + b'\n':
         if not suffix:
             return original, chap_rows_digest(rows)
-        prefix = prefix[:-1]
+        if not original_bytes or original_bytes.endswith(b'\n') or suffix.startswith(b'\n'):
+            prefix = original_bytes
     return {**record, 'data': b64(prefix + suffix)}, chap_rows_digest(rows)
 
 
