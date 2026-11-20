@@ -3,6 +3,7 @@
 const { createRebuildService } = require('../../services/rebuildService');
 
 const methods = Object.freeze({ create: 'createRelayAccount', disable: 'disableRelayAccount', delete: 'deleteRelayAccount' });
+const statuses = Object.freeze({ create: 'created', disable: 'disabled', delete: 'deleted' });
 const blocked = new Set(['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN',
     'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', 'REBUILD_L2TP_ACCOUNTS_FINISH_UNKNOWN',
     'REBUILD_L2TP_ACCOUNTS_RELEASE_UNKNOWN', 'REBUILD_L2TP_ACCOUNTS_CLEANUP_FAILED']);
@@ -22,8 +23,16 @@ function accountHandler(action, service = createRebuildService) {
             || Object.keys(body).some(key => !allowed.includes(key)) || typeof body.login !== 'string'
             || (action === 'create' && typeof body.password !== 'string')) return res.status(400).json({ error: { code: invalid } });
         try {
-            const result = await service()[methods[action]]({ login: body.login, ...(action === 'create' && { password: body.password }) });
-            return res.status(action === 'create' ? 201 : 200).json(result);
+            const { login } = body;
+            const result = await service()[methods[action]]({ login, ...(action === 'create' && { password: body.password }) });
+            const status = statuses[action], relayCount = result?.relayCount;
+            if (result?.executionMode !== 'rebuild' || result.status !== status || result.login !== login
+                || !Number.isSafeInteger(relayCount) || relayCount < 1) {
+                return res.status(409).json({ error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED' } });
+            }
+            // Only the public receipt crosses this boundary, even if the
+            // service starts returning private inventory or transport metadata.
+            return res.status(action === 'create' ? 201 : 200).json({ executionMode: 'rebuild', status, login, relayCount });
         } catch (error) {
             const { code } = error ?? {};
             if (code === invalid) return res.status(400).json({ error: { code } });

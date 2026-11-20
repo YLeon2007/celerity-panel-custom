@@ -11,7 +11,13 @@ const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelTranspor
 // scope checked; session writes also need the panel's actual CSRF token.
 function routerForRebuild({service=createRebuildService(),Link=require('../models/cascadeLinkModel'),Node=require('../models/hyNodeModel')}={}){
  const router=express.Router(), write=[requireScope('nodes:write'),(req,res,next)=>req.apiKey?next():requirePanelCsrf(req,res,next)], read=requireScope('nodes:read');
- const wrap=fn=>async(req,res)=>{try{res.json(await fn(req));}catch(e){const code=/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z_]+$/.test(e.code)?e.code:'REBUILD_FAILED';res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:code==='REBUILD_INVALID_REQUEST'?400:409).json({error:{code},...(e.saved?{desiredSaved:true,linkId:e.saved}:{}),...(e.preview?{preview:e.preview}:{})});}};
+ const wrap=fn=>async(req,res)=>{
+    try{res.json(await fn(req));}catch(e){
+        const code=typeof e?.code==='string'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(e.code)?e.code:'REBUILD_FAILED';
+        res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:code==='REBUILD_INVALID_REQUEST'?400:409)
+            .json({error:{code},...(e?.saved?{desiredSaved:true,linkId:e.saved}:{}),...(e?.preview?{preview:e.preview}:{})});
+    }
+ };
  const run=async(req,preview=false,remove=false)=>{const linkId=req.params.id??req.body?.linkId??req.body?.domainLinkId;
   if(linkId!==undefined&&!objectId(linkId))throw fail('REBUILD_INVALID_REQUEST');
   const expectedPreview=req.body?.expectedPreview;

@@ -6,7 +6,11 @@ function handler(service = () => createRebuildService()) {
             (req.body !== undefined && (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
             Object.keys(req.body).some(k => k !== '_csrf')))) return res.status(400).json({error:{code:'REBUILD_INVALID_REQUEST'}});
         try { return res.json(await service().installRelay(req.params.id)); }
-        catch (error) { return res.status(409).json({error:{code:/^REBUILD_[A-Z_]+$/.test(error.code)?error.code:'REBUILD_L2TP_INSTALL_FAILED'}}); }
+        catch (error) {
+            const code = typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+(?![\s\S])/.test(error.code)
+                ? error.code : 'REBUILD_L2TP_INSTALL_FAILED';
+            return res.status(409).json({ error: { code } });
+        }
     };
 }
 module.exports=handler();
