@@ -6,6 +6,54 @@ const { spawnSync } = require('node:child_process');
 const { mkdtempSync, rmSync } = require('node:fs');
 const { join } = require('node:path');
 
+// The relay's systemctl show emits the following three separate rows, not one
+// property containing a list. Only this managed oneshot may repeat ExecStart.
+const unitHarness = String.raw`
+import pathlib, sys
+h = {'__name__': 'fixture'}
+exec(compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], 'exec'), h)
+net, x = h['NET_UNIT'], h['X']
+lines = [
+    'ExecStart={ path=/usr/sbin/nft ; argv[]=/usr/sbin/nft -f /etc/celerity-rebuild-l2tp/ingress.nft ; ignore_errors=no ; start_time=[Fri 2026-11-20 14:15:46 CET] ; stop_time=[Fri 2026-11-20 14:15:46 CET] ; pid=32666 ; code=exited ; status=0 }',
+    'ExecStart={ path=/usr/sbin/ip ; argv[]=/usr/sbin/ip -4 route add local 0.0.0.0/0 dev lo table 100 ; ignore_errors=no ; start_time=[Fri 2026-11-20 14:15:46 CET] ; stop_time=[Fri 2026-11-20 14:15:46 CET] ; pid=32672 ; code=exited ; status=0 }',
+    'ExecStart={ path=/usr/sbin/ip ; argv[]=/usr/sbin/ip -4 rule add priority 10077 from 10.255.191.0/24 fwmark 100 table 100 ; ignore_errors=no ; start_time=[Fri 2026-11-20 14:15:46 CET] ; stop_time=[Fri 2026-11-20 14:15:46 CET] ; pid=32678 ; code=exited ; status=0 }',
+]
+
+def show(name, rows, kind='oneshot', tail=()):
+    def command(*args, **kwargs):
+        assert args[:4] == ('/usr/bin/systemctl', '--no-pager', 'show', '--all')
+        assert args[-1] == name and kwargs == {'unit_show': True}
+        return ('\n'.join([f'Type={kind}', *rows, 'LoadState=loaded', 'ActiveState=active', 'SubState=exited', *tail]) + '\n').encode()
+    h['command'] = command
+    return h['unit'](name)
+
+info = show(net, lines)
+assert info['ExecStart'] == ' '.join(line.split('=', 1)[1] for line in lines)
+assert {k: info[k] for k in ('Type', 'LoadState', 'ActiveState', 'SubState')} == {
+    'Type': 'oneshot', 'LoadState': 'loaded', 'ActiveState': 'active', 'SubState': 'exited'}
+assert show(x, lines[:1], 'simple')['ExecStart'] == lines[0].split('=', 1)[1]
+for name, rows, kind, tail in (
+    (x, lines, 'oneshot', ()),
+    (net, lines, 'simple', ()),
+    (net, lines[:2], 'oneshot', ()),
+    (net, lines + lines[:1], 'oneshot', ()),
+    (net, lines[:2] + ['ExecStart='], 'oneshot', ()),
+    (net, lines, 'oneshot', ('ActiveState=active',)),
+):
+    try:
+        show(name, rows, kind, tail)
+    except h['Refusal'] as error:
+        assert str(error) == 'PREREQUISITE'
+    else:
+        raise AssertionError('accepted unexpected duplicate property rows')
+`;
+
+test('DIRECT unit reader preserves the real three-row managed oneshot ExecStart only', () => {
+    const result = spawnSync('/usr/bin/python3', ['-I', '-B', '-c', unitHarness,
+        join(__dirname, '..', 'rebuildRelayDirectHost.py')], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr || String(result.error));
+});
+
 // Exercise the real file publication/manifest/rollback code in a disposable
 // in-worktree root. Runtime facts and privileged UID are modeled; no host
 // commands, sockets, or service manager are called by this harness.

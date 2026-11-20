@@ -129,8 +129,12 @@ def reloaded():
     if backing(h['NET']).exists():
         net = backing(h['NET']).read_text()
         assert f'Requires={X}\n' in net and 'Type=oneshot\n' in net
+        commands = [line.removeprefix('ExecStart=') for line in net.splitlines() if line.startswith('ExecStart=')]
+        # systemctl show emits one property row per command on the real relay.
+        records = [f'{{ path={cmd.split()[0]} ; argv[]={cmd} ; ignore_errors=no ; '
+                   'start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0 }' for cmd in commands]
         units[NET].update(LoadState='loaded', FragmentPath=h['NET'], UnitFileState='static',
-                          Type='oneshot', Requires=X, RequiredBy=XL)
+                          Type='oneshot', Requires=X, RequiredBy=XL, ExecStart=records)
         units[X]['RequiredBy'] = NET
         units[IKE]['RequiredBy'] = XL
     else:
@@ -193,8 +197,11 @@ def run(argv, **kwargs):
         if action == 'show':
             assert len(rest) == 3 and rest[0] == '--all' and rest[1].startswith('--property=')
             info = s['units'][rest[2]]
-            return reply(''.join(f'{k}={info.get(k, "")}\n' for k in rest[1].split('=', 1)[1].split(',')),
-                         1 if info['LoadState'] == 'not-found' else 0)
+            rows = []
+            for k in rest[1].split('=', 1)[1].split(','):
+                value = info.get(k, '')
+                rows.extend(f'{k}={entry}\n' for entry in (value if isinstance(value, list) else [value]))
+            return reply(''.join(rows), 1 if info['LoadState'] == 'not-found' else 0)
         if action == 'list-jobs':
             assert rest == ['--no-legend', '--plain']
             return reply()

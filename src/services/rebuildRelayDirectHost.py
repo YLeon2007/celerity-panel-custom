@@ -210,6 +210,17 @@ def unit(name):
     text = command('/usr/bin/systemctl', '--no-pager', 'show', '--all', '--property=' + ','.join(keys), name,
                    unit_show=True).decode('utf-8')
     pairs = [line.split('=', 1) for line in text.splitlines() if '=' in line]
+    if name == NET_UNIT:
+        starts = [value for key, value in pairs if key == 'ExecStart']
+        if len(starts) > 1:
+            # systemctl show emits a row per command for our three-command
+            # oneshot. Preserve order and keep every other property unique.
+            need(len(starts) == 3 and ['Type', 'oneshot'] in pairs
+                 and ['LoadState', 'loaded'] in pairs
+                 and all(re.fullmatch(r'\{ path=/[^ ;{}]+ ; argv\[\]=[^{}]+ \}', value) for value in starts),
+                 'PREREQUISITE')
+            pairs = [(key, value) for key, value in pairs if key != 'ExecStart']
+            pairs.append(('ExecStart', ' '.join(starts)))
     info = dict(pairs)
     need(len(pairs) == len(info), 'PREREQUISITE')
     need(info.get('LoadState') in ('loaded', 'masked', 'not-found') and
