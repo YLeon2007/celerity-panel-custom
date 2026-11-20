@@ -5,7 +5,7 @@ const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
 const { canInstallRelay } = require('./rebuildRelayAuthorization');
 const { read } = require('./rebuildRelayBackendStore');
-const { readTopology } = require('./rebuildRelayBackend');
+const { readAppliedTransit } = require('./rebuildAppliedLink');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -111,6 +111,9 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         await authority();
                     };
 
+                    // Only a confirmed Apply receipt can classify the physical
+                    // MAIN listener as transport. A PUT can change draft fields.
+                    const transit = Link && await readAppliedTransit(Link, id);
                     await authority();
                     remote = createRelayDirect({ node, env });
                     if (typeof remote?.prepareRemove !== 'function' || typeof remote.remove !== 'function' || typeof remote.close !== 'function') {
@@ -118,13 +121,8 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     }
                     // No saved MAIN is sent or rebuilt here. The direct driver
                     // prepares subtraction against the current physical profiles.
-                    // Apply may have changed transport listeners since Install.
-                    // Unrelated drafts do not override the applied graph or the
-                    // full HandlerService check for unrecognized inbounds.
-                    const topology = Link && await readTopology(Node, Link, node, env.PANEL_DOMAIN, { appliedOnly: true });
-                    await authority();
                     const plan = await remote.prepareRemove({ nodeId: id, backupId: state.backupId, network,
-                        ...(topology && { transit: topology.transit ?? [] }) });
+                        ...(transit && { transit }) });
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
                     await checkInventory(state, true);
 

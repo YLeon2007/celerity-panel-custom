@@ -8,6 +8,7 @@ const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {prepareLinks}=require('./rebuildLinkKeys');
 const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
 const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
+const {appliedLink}=require('./rebuildAppliedLink');
 const {createPrivateKey,createPublicKey}=require('node:crypto');
 const fail=code=>Object.assign(new Error(code),{code});
 // Subscriptions publish a separate X25519 public key. It never appears in
@@ -94,7 +95,11 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     for(const state of states.values()){
                         const result=await State.updateOne({_id:state._id,status:'installed',desiredState:'installed',secretRevision:state.secretRevision,tproxyPort:state.tproxyPort,routeGroup:state.routeGroup??null},{$set:{routingMode:'follow-relay',routingVersion:1}},{session});if(result.matchedCount!==1)throw fail('REBUILD_L2TP_STATE_TRANSITION');
                     }
-                    if(desired.length)await Link.updateMany({_id:{$in:desired.map(l=>l._id)}},{$set:{status:'deployed',lastError:''}},{session});
+                    for(const link of desired){
+                        const result=await Link.updateOne({_id:link._id,active:{$ne:false},rebuildDelete:{$ne:true}},
+                            {$set:{status:'deployed',lastError:'',rebuildApplied:appliedLink(link)}},{session,runValidators:true});
+                        if(result.acknowledged!==true||result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');
+                    }
                     if(removed.length){const result=await Link.deleteMany({_id:{$in:removed.map(l=>l._id)},rebuildDelete:true},{session});if(result.deletedCount!==removed.length)throw fail('REBUILD_LINK_CHANGED');}
                 });await cache.invalidateAllSubscriptions();require('./cascadeService')._invalidateTopologyCache();
             }

@@ -13,17 +13,17 @@ const fail = code => Object.assign(new Error(code), { code });
 const eligible = node => node?.type === 'xray' && node.active === true && node.cascadeRole === 'relay'
     && !node.useCustomConfig && !!isIP(node.ip);
 
-async function readTopology(Node, Link, node, panelDomain, { appliedOnly = false } = {}) {
+async function readTopology(Node, Link, node, panelDomain) {
     const id = String(node._id);
-    const inventory = await read(Link.find({ $or: [{ active: true }, { rebuildDelete: true }] })
+    const links = await read(Link.find({ $or: [{ active: true }, { rebuildDelete: true }] })
         .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelPort tunnelUuid'));
     // Offline also describes an applied link whose tunnel is unconfirmed.
     const applied = link => !link.rebuildDelete && !link.lifecycle && ['deployed', 'online', 'offline'].includes(link.status);
-    const links = appliedOnly ? inventory.filter(applied) : inventory;
+
     const ids = new Set(componentFor(links, [id]));
     const scoped = links.filter(link => ids.has(String(link.portalNode)) && ids.has(String(link.bridgeNode)));
     // This is a graph inventory, not evidence that the data plane works.
-    if (!appliedOnly && scoped.some(link => !applied(link))) {
+    if (scoped.some(link => !applied(link))) {
         throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
     }
     const peers = ids.size > 1 ? await read(Node.find({ _id: { $in: [...ids].filter(n => n !== id) } })
@@ -81,4 +81,4 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
     };
 }
 
-module.exports = { createRebuildRelayBackend, readTopology };
+module.exports = { createRebuildRelayBackend };

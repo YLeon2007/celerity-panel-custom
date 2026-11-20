@@ -13,9 +13,18 @@ const lifecycleSchema = new mongoose.Schema({
     desiredVersion: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
 }, { _id: false, versionKey: false, strict: 'throw' });
 
+const appliedLinkSchema = new mongoose.Schema({
+    listener: { type: mongoose.Schema.Types.ObjectId, required: true },
+    mode: { type: String, enum: ['reverse', 'forward'], required: true },
+    protocol: { type: String, enum: ['vless', 'vmess'], required: true },
+    port: { type: Number, min: 1, max: 65535, validate: Number.isInteger, required: true },
+    uuid: { type: String, match: /^\S+$/, required: true },
+}, { _id: false, versionKey: false, strict: 'throw' });
+
 function hideRebuildSecrets(_doc, row) {
     delete row.rebuildVlessKeyEnvelope;
     delete row._rebuildVless;
+    delete row.rebuildApplied;
     return row;
 }
 
@@ -91,6 +100,9 @@ const cascadeLinkSchema = new mongoose.Schema({
     // Keep endpoints available to a fresh operator Apply until both halves of
     // a rebuild DELETE have passed readback. No startup recovery consumes it.
     rebuildDelete: { type: Boolean, default: undefined },
+    // null = a newly created Rebuild draft; absent = legacy, not proof of a
+    // never-applied draft. Only successful Apply readback writes a descriptor.
+    rebuildApplied: { type: appliedLinkSchema, select: false, default: undefined },
     // Metadata only. Startup must never infer a fresh deploy from this flag.
     autoDeploy: { type: Boolean, default: false },
     // The old descriptor remains intact until operation-owned cleanup/readback

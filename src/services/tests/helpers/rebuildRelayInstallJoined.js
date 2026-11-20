@@ -152,7 +152,7 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             stockRules: [[0, 255], [32766, 254], [32767, 253]].map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
             owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534], [fs.statSync(bpath).ino]: [0, 65534] } }));
         const actions = [], refusals = [], wireFaults = [];
-        let removeBaseline;
+        let removeBaseline, expectedRemoveTransit;
         const records = () => JSON.parse(fs.readFileSync(manager, 'utf8'));
         const writeRecords = value => fs.writeFileSync(manager, JSON.stringify(value));
         const applyHandlers = new Map();
@@ -214,8 +214,7 @@ module.exports = ({ fixture, id, oid, machineId }) => {
                     assert.equal(state.status, action === 'remove' ? 'removing' : 'installed');
                     assert.equal(f.users.filter(user => String(user.relayNode) === id && user.syncStatus === 'synced').length, 1);
                     const network = Object.fromEntries(['clientCidr', 'tproxyPort', 'fwmark', 'routeTable'].map(key => [key, state[key]]));
-                    const transit = scenario === 'transit-ok' ? [{ linkId: String(f.links[0]._id), mode: 'reverse',
-                        port: f.links[0].tunnelPort, uuid: f.links[0].tunnelUuid }] : [];
+                    const transit = expectedRemoveTransit ?? [];
                     assert.deepEqual(request, { action, machineId, nodeId: id, backupId: state.backupId, network, transit,
                         ...(action === 'remove' ? { baseline: removeBaseline } : {}) });
                 }
@@ -258,11 +257,12 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         return Object.assign(f, { create, actions, refusals, root, before, mainPath, bridgePath, mpath, bpath, bridge,
             bootLink, generated, usersByNode, x, b, xl, ike, net,
             records, writeRecords, removeBaseline: () => removeBaseline,
+            expectRemoveTransit: value => { expectedRemoveTransit = value; },
         });
     }
 
     for (const scenario of ['transit-ok', 'transit-forward', 'transit-missing-client', 'transit-drift',
-        'transit-mixed', 'transit-foreign', 'transit-ambiguous-ascii', 'transit-ambiguous-unicode']) {
+        'transit-mixed', 'transit-foreign', 'transit-loopback-listener', 'transit-ambiguous-ascii', 'transit-ambiguous-unicode']) {
         test(`joined DIRECT: ${scenario}`, async t => {
             const f = host(t, scenario, { subscribers: [
                 { userId: 'fixture-subscriber', xrayUuid: '00000000-0000-4000-8000-000000000005' },
@@ -276,8 +276,9 @@ module.exports = ({ fixture, id, oid, machineId }) => {
                 assert.ok(f.records().inboundUserCalls.includes('vless-in'));
                 assert.ok(!f.records().inboundUserCalls.some(tag => /^(rebuild-rp-conn-|fwd-hop-)/.test(tag)));
             } else {
-                assert.equal(result.code, scenario.startsWith('transit-ambiguous')
-                    ? 'REBUILD_L2TP_DIRECT_CANDIDATE_INVALID' : 'REBUILD_L2TP_DIRECT_PROFILE_USERS');
+                const expected = scenario.startsWith('transit-ambiguous') ? 'CANDIDATE_INVALID'
+                    : scenario === 'transit-loopback-listener' ? 'RUNTIME_UNPROVED' : 'PROFILE_USERS';
+                assert.equal(result.code, `REBUILD_L2TP_DIRECT_${expected}`);
                 assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
                 assert.equal(f.states.length + f.users.length + f.records().effects.length, 0);
                 assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
@@ -353,11 +354,14 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             Object.assign(row, update.$set);
             return { acknowledged: true, matchedCount: 1 };
         });
-        t.mock.method(Link.collection, 'updateMany', async (where, update, options) => {
+        t.mock.method(Link.collection, 'updateOne', async (where, update, options) => {
             assert.equal(options.session.synthetic, true);
-            assert.deepEqual(where._id.$in.map(String), f.links.map(row => String(row._id)));
-            for (const row of f.links) Object.assign(row, update.$set);
-            return { acknowledged: true, matchedCount: f.links.length };
+            const row = f.links.find(row => String(where._id) === String(row._id));
+            assert.ok(row && row.active && !row.rebuildDelete);
+            // Collection receives a cast Mongoose subdocument. Keep the
+            // backing row as the corresponding BSON-shaped lean object.
+            Object.assign(row, update.$set, { rebuildApplied: update.$set.rebuildApplied.toBSON() });
+            return { acknowledged: true, matchedCount: 1 };
         });
         return { sync: { _getUsersForNode: async node => structuredClone(f.usersByNode[String(node._id)] ?? []) },
             cache: { invalidateAllSubscriptions: async () => {} } };
@@ -409,7 +413,7 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         await laterApply(f, service);
     });
 
-    test('joined DIRECT: Remove verifies the current transport after Apply and an unrelated draft', async t => {
+    test('joined DIRECT: Remove uses the applied port despite a pending edit and ignores an unapplied draft', async t => {
         const f = host(t, 'transit-ok', { lifecycle: true, subscribers: [
             { userId: 'fixture-subscriber', xrayUuid: '00000000-0000-4000-8000-000000000005' },
         ] });
@@ -423,15 +427,34 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         await laterApply(f, service);
         const applied = { ...old, port: f.links[0].tunnelPort };
         assert.deepEqual(connector(), applied);
-        const draft = { ...f.links[0], _id: oid('d'.repeat(24)), mode: 'forward', tunnelPort: applied.port + 1,
-            status: 'draft' };
+        const receipt = { mode: 'reverse', protocol: 'vless', port: applied.port,
+            uuid: old.settings.clients[0].id, listener: oid(id) };
+        const draft = { ...f.links[0], _id: oid('c'.repeat(24)), tunnelPort: applied.port + 2,
+            status: 'pending', rebuildApplied: null };
+        Object.assign(f.links[0], { status: 'pending', tunnelPort: applied.port + 1 });
         f.links.push(draft);
+        f.expectRemoveTransit([{ linkId: String(f.links[0]._id), mode: 'reverse', port: applied.port, uuid: receipt.uuid }]);
         const removed = await service.removeRelay(id).catch(error => error);
         assert.equal(status(removed), 'not_installed', diagnostic(f));
         assert.deepEqual(connector(), applied);
+        assert.equal(f.links[0].tunnelPort, applied.port + 1);
+        assert.deepEqual(f.links[0].rebuildApplied, receipt);
         assert.deepEqual(f.links[1], draft);
         assert.ok(f.records().inboundUserCalls.includes('vless-in'));
         assert.ok(!f.records().inboundUserCalls.includes(tag));
+    });
+
+    test('joined DIRECT: legacy pending link without an Apply receipt refuses Remove without writes', async t => {
+        const f = host(t, 'transit-ok', { lifecycle: true });
+        const service = f.create(applyOptions(t, f));
+        assert.equal((await service.installRelay(id)).status, 'installed');
+        Object.assign(f.links[0], { status: 'pending', tunnelPort: f.links[0].tunnelPort + 1 });
+        const before = JSON.stringify([f.states, f.users, f.links, f.records().effects]);
+        const main = fingerprint(f, f.mainPath);
+        await assert.rejects(service.removeRelay(id), { code: 'REBUILD_L2TP_APPLIED_LINK_UNPROVED' });
+        assert.deepEqual(f.actions, installedActions);
+        assert.deepEqual(fingerprint(f, f.mainPath), main);
+        assert.equal(JSON.stringify([f.states, f.users, f.links, f.records().effects]), before);
     });
 
     // The pre-enabled control separates the baseline removal path from the

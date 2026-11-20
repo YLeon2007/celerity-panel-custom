@@ -328,8 +328,10 @@ def xray_users(config, info, rows, transit=None):
         clients = row.get('settings', {}).get('clients')
         need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', tag) and isinstance(clients, list), 'PROFILE_USERS')
         if tag in owned:
-            listeners = [owners for p, _, n, owners in rows if p == 'tcp' and n == owned[tag]]
-            need(listeners and all(owners == [pid] for owners in listeners), 'RUNTIME_UNPROVED')
+            listeners = [(address, owners) for p, address, n, owners in rows if p == 'tcp' and n == owned[tag]]
+            # ss prints the IPv4 wildcard as 0.0.0.0 or * on a dual-stack socket.
+            need(any(address in ('0.0.0.0', '*') for address, _ in listeners)
+                 and all(owners == [pid] for _, owners in listeners), 'RUNTIME_UNPROVED')
             continue
         # Subscriber inventory still requires the full HandlerService list,
         # not a count. Refuse dynamic or unrecognised account shapes.

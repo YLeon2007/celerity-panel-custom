@@ -32,7 +32,12 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     const request=async(method,path,body,token=csrf)=>{const result=await fetch(`http://127.0.0.1:${server.address().port}/api/cascade${path}`,{method,headers:{'content-type':'application/json','x-csrf-token':token},...(body?{body:JSON.stringify(body)}:{})});return {status:result.status,body:await result.json()};};
     const ok=async(...args)=>{const r=await request(...args);assert.equal(r.status,200,r.body.error?.code);return r.body;};
     const edge=(a,b,n,other={})=>({portalNodeId:id(a),bridgeNodeId:id(b),tunnelPort:41000+n,name:`link-${n}`,priority:10*n,...other});
-    const make=async(b)=>ok('POST','/links',b);
+    const applied=async linkId=>(await Link.findById(linkId).select('+rebuildApplied').lean()).rebuildApplied;
+    const make=async(b)=>{
+        const result=await ok('POST','/links',b);
+        assert.equal(await applied(result.linkId),null);
+        return result;
+    };
     assert.equal((await request('POST','/links',edge(portal,relay,1),'missing')).status,403);
     assert.equal(await Link.countDocuments(),0);
     const neighbor=await make(edge(x,y,9)), g=await make(edge(relay,geo,3,{geoRouting:{enabled:true,domains:['full:geo.invalid'],geoip:['ru']}}));
@@ -45,11 +50,20 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     const r=files.get(id(relay));const socks=()=>r.main.inbounds.find(i=>i.tag==='rebuild-relay-ingress');const port=socks().port;
     const policy=()=>r.main.routing.rules.filter(i=>i.ruleTag?.startsWith('rebuild-policy-'));assert.ok(policy().every(i=>['client','second',socks().tag].every(tag=>i.inboundTag.includes(tag))));
     for(const tag of ['client','second'])assert.deepEqual(r.main.inbounds.find(i=>i.tag===tag).settings.clients.map(c=>c.id),[uuid]);
-    const before=writes.length;await ok('PUT',`/links/${pr.linkId}`,{name:'renamed'});assert.equal(writes.length,before,'saved AutoDeploy metadata is not a new request');
+    const oldApplied=await applied(pr.linkId);
+    assert.equal(oldApplied.port,41001);assert.equal(String(oldApplied.listener),id(portal));
+    assert.equal(Object.hasOwn((await Link.findById(pr.linkId)).toJSON(),'rebuildApplied'),false);
+    assert.equal((await Link.findById(pr.linkId).lean()).rebuildApplied,undefined);
+    const before=writes.length;await ok('PUT',`/links/${pr.linkId}`,{name:'renamed',tunnelPort:41011,rebuildApplied:null});
+    assert.equal(writes.length,before,'saved AutoDeploy metadata is not a new request');
+    const edited=await Link.findById(pr.linkId).lean();assert.equal(edited.status,'pending');assert.equal(edited.tunnelPort,41011);
+    assert.deepEqual(await applied(pr.linkId),oldApplied);
     const newer=await make(edge(relay,replacement,4,{priority:1,autoDeploy:true,interactivePreview:true}));assert.equal(newer.status,'awaiting_preview');assert.equal(writes.length,before);
     const preview=await ok('POST','/rebuild/preview',{linkId:newer.linkId});assert.equal(preview.allowed,true);assert.equal(writes.length,before);assert.equal(JSON.stringify(preview).includes(uuid),false);
     const changed=await request('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:'1'.repeat(64)});assert.equal(changed.body.error.code,'REBUILD_PREVIEW_CHANGED');assert.equal(writes.length,before);
+    assert.equal(await applied(newer.linkId),null);assert.deepEqual(await applied(pr.linkId),oldApplied);
     await ok('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:preview.previewId});assert.equal(socks().port,port);assert.equal(policy().at(-1).outboundTag,`rebuild-rp-egress-${newer.linkId.slice(-8)}`);
+    assert.equal((await applied(pr.linkId)).port,41011);
     const ticket=async(linkId,remove=false)=>({expectedPreview:(await ok('POST','/rebuild/preview',{linkId,remove})).previewId});
     const deletedPath=`/links/${b.linkId}`,priorStages=stages.length;assert.equal((await request('DELETE',deletedPath)).status,428);assert.notEqual((await Link.findById(b.linkId)).rebuildDelete,true);assert.equal(stages.length,priorStages);
     assert.equal((await request('DELETE',deletedPath,await ticket(b.linkId))).body.error.code,'REBUILD_PREVIEW_CHANGED');

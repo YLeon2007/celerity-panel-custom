@@ -148,6 +148,8 @@ test('installed candidate -> removing before dispatch -> verified absence; only 
     f.nodes.push(bridge);
     const link = { _id: oid(), portalNode: oid(id), bridgeNode: bridge._id, mode: 'reverse', status: 'online', active: true,
         tunnelPort: 22001, tunnelUuid: '00000000-0000-4000-8000-000000000008' };
+    link.rebuildApplied = { listener: link.portalNode, mode: 'reverse', protocol: 'vless',
+        port: link.tunnelPort, uuid: link.tunnelUuid };
     f.links.push(link);
     f.hooks.remove = async guard => {
         await guard();

@@ -28,7 +28,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
  router.delete('/links/:id',...write,wrap(async req=>({executionMode:'rebuild',deleted:req.params.id,...(await run(req,false,true))})));
  const save=(editing)=>async req=>service.locks.run(async verify=>{
     const b=req.body||{};if(editing&&!objectId(req.params.id))throw fail('REBUILD_INVALID_REQUEST');
-    const link=editing?await Link.findById(req.params.id):new Link({tunnelUuid:crypto.randomUUID()});
+    const link=editing?await Link.findById(req.params.id):new Link({tunnelUuid:crypto.randomUUID(),rebuildApplied:null});
     if(!link)throw fail('REBUILD_LINK_NOT_FOUND');if(link.rebuildDelete||link.lifecycle)throw fail('REBUILD_DELETION_PENDING');
     const old=editing?[String(link.portalNode),String(link.bridgeNode)]:[];
     const source=b.portalNodeId??old[0],target=b.bridgeNodeId??old[1];

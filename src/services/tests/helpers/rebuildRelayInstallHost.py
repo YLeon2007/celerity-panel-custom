@@ -170,7 +170,10 @@ def sockets():
         assert info['ActiveState'] == 'active'
         for inbound in profile['inbounds']:
             protocols = ['tcp', 'udp'] if inbound['protocol'] == 'socks' or inbound['tag'].startswith('relay-l2tp-') else ['tcp']
-            result.extend((proto, inbound.get('listen', '0.0.0.0'), inbound['port'], info['MainPID']) for proto in protocols)
+            address = inbound.get('listen', '0.0.0.0')
+            if scenario == 'transit-loopback-listener' and inbound['tag'] == 'rebuild-rp-conn-eeeeeeee':
+                address = '127.0.0.1'
+            result.extend((proto, address, inbound['port'], info['MainPID']) for proto in protocols)
     if s['units'][IKE]['ActiveState'] == 'active':
         result.extend(('udp', '0.0.0.0', port, s['charonPid']) for port in (500, 4500))
     if s['units'][XL]['ActiveState'] == 'active':
