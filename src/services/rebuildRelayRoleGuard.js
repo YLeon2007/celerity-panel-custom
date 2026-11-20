@@ -7,20 +7,19 @@ const { readAccountCount, formatRelayCounts } = require('./rebuildRelayCounts');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 
 const BLOCKED = 'REBUILD_L2TP_ROLE_BLOCKED';
+const WRITE_BLOCKED = 'REBUILD_L2TP_NODE_WRITE_BLOCKED';
 const UNAVAILABLE = 'REBUILD_L2TP_ROLE_STATE_UNAVAILABLE';
-const STALE = 'REBUILD_NODE_ROLE_CHANGED';
 const reasons = Object.freeze({
     [UNAVAILABLE]: 'nodes.rebuildRoleStateUnavailable',
-    [STALE]: 'nodes.rebuildRoleChanged',
     REBUILD_BUSY: 'nodes.rebuildRoleBusy',
     REBUILD_LOCK_LOST: 'nodes.rebuildRoleBusy',
-    REBUILD_L2TP_ACCOUNTS_BLOCKED: 'nodes.rebuildRoleBusy',
+    REBUILD_L2TP_ACCOUNTS_BLOCKED: 'nodes.rebuildNodeAccountsPending',
     REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE: 'nodes.rebuildRoleStateUnavailable',
 });
 const fail = code => Object.assign(new Error(code), { code });
 const primary = query => query.read('primary').readConcern('majority').maxTimeMS(5000);
 
-async function relayRoleBlock(nodeId, preview) {
+async function relayRoleBlock(nodeId, preview, code = BLOCKED) {
     let state;
     try {
         const State = require('../modules/relay-l2tp/models/relayL2tpStateModel');
@@ -42,39 +41,97 @@ async function relayRoleBlock(nodeId, preview) {
         accountCount: await readAccountCount(require('../modules/relay-l2tp/models/l2tpUserModel'), nodeId),
         activeSessions: null,
     });
-    return Object.assign(fail(BLOCKED), { counts, estimate });
+    return Object.assign(fail(code), { counts, estimate });
 }
 
-async function saveNodeRole(nodeId, requestedRole, persist, { expectedRole } = {}) {
-    if (!isRebuildEnabled() || requestedRole === undefined) return persist({});
-    // Same singleton and lock ordering as Apply / Install / Remove. A fresh
-    // primary role and L2TP state read must be inside the lock, as must the write.
+const currentWrites = new WeakMap();
+const nodeWriteVerifier = node => currentWrites.get(node);
+
+async function withNodeWriterFence(write) {
+    if (!isRebuildEnabled()) return write({}, async () => {});
     const Node = require('../models/hyNodeModel');
-    return makeLocks().run(verify => withNode(nodeId, async () => {
+    return makeLocks().run(async verify => {
         await verify();
         await assertNoPendingRelayAccounts(Node.db);
-        const node = await primary(Node.findById(nodeId).select('cascadeRole')).lean();
+        return write({ writeConcern: { w: 'majority' } }, verify);
+    });
+}
+
+async function withNodeWrite(nodeId, write, { requireRemoval = false, fullSetup = false, select } = {}) {
+    if (!isRebuildEnabled()) return write({}, undefined, async () => {});
+    // Same singleton and lock ordering as Apply / Install / Remove. Never
+    // admit from a route's previously loaded card or from a pending read made
+    // outside the lock. Keep it held through host actions and related writes.
+    const Node = require('../models/hyNodeModel');
+    return withNodeWriterFence((options, verify) => withNode(nodeId, async () => {
+        const query = primary(Node.findById(nodeId));
+        if (select) query.select(select);
+        const node = await query;
         if (!node) return null;
-        if (node.cascadeRole === 'relay' && requestedRole !== 'relay') {
-            const block = await relayRoleBlock(nodeId);
-            if (block) throw block;
-        }
-        // Panel uses a hydrated RMW snapshot; don't save it after a competing role edit.
-        if (expectedRole !== undefined && expectedRole !== (node.cascadeRole || 'standalone')) throw fail(STALE);
+        if (fullSetup) await assertRelaySetupAllowed(node);
+        else if (requireRemoval) await assertRelayNodeWritable(nodeId);
         await verify();
-        return persist({ writeConcern: { w: 'majority' } });
+        currentWrites.set(node, verify);
+        try { return await write(options, node, verify); }
+        finally { currentWrites.delete(node); }
     }));
+}
+
+async function assertRelayNodeWritable(nodeId, code = WRITE_BLOCKED) {
+    const block = await relayRoleBlock(nodeId, undefined, code);
+    if (block) throw block;
+}
+
+async function assertRelaySetupAllowed(node) {
+    await assertRelayNodeWritable(node._id);
+    // A second Xray card for the same address still writes the same service.
+    if (node.type === 'xray' && node.ip) {
+        const Node = require('../models/hyNodeModel');
+        const siblings = await primary(Node.find({ ip: node.ip, type: 'xray', _id: { $ne: node._id } }).select('_id')).lean();
+        for (const sibling of siblings) await assertRelayNodeWritable(sibling._id);
+    }
+}
+
+const sshKeys = ['port', 'username', 'password', 'privateKey'];
+function changesIdentityField(node, key, value) {
+    return (value == null ? value : node.schema.path(key).cast(value)) !== node.get(key);
+}
+
+// Only invalidate L2TP ownership on a real change. In particular, the panel
+// always resubmits the SSH port and username when saving a cosmetic edit.
+async function assertNodeEditAllowed(node, updates, sshUpdates = {}) {
+    if (!node) return; // Non-rebuild write.
+    const changed = key => Object.hasOwn(updates, key) && changesIdentityField(node, key, updates[key]);
+    if (changed('cascadeRole')) await assertRelayNodeWritable(node._id, BLOCKED);
+    if (['ip', 'type', 'active', 'useCustomConfig', ...sshKeys.map(key => `ssh.${key}`)].some(changed)
+        || (Object.hasOwn(updates, 'ssh') && sshKeys.some(key => changesIdentityField(node, `ssh.${key}`, updates.ssh?.[key])))) {
+        await assertRelayNodeWritable(node._id);
+    }
+
+    // A same-address edit also writes the sibling cards. Check them *before*
+    // the primary edit, including when its own submitted SSH values are a no-op.
+    if (node.ip && !changed('ip') && Object.keys(sshUpdates).length) {
+        const Node = require('../models/hyNodeModel');
+        const siblings = await primary(Node.find({ ip: node.ip, _id: { $ne: node._id } }).select('ssh'));
+        for (const sibling of siblings) {
+            if (Object.entries(sshUpdates).some(([key, value]) => changesIdentityField(sibling, key, value))) {
+                await assertRelayNodeWritable(sibling._id);
+            }
+        }
+    }
 }
 
 function describeRoleError(error, t = translate) {
     const code = error?.code;
-    if (code === BLOCKED) {
+    if (code === BLOCKED || code === WRITE_BLOCKED) {
         const { accountCount, activeSessions } = error.counts;
-        return { status: 409, code, message: t('nodes.rebuildRoleBlocked').replace('{counts}', formatRelayCounts(error.counts, t)),
+        const key = code === BLOCKED ? 'nodes.rebuildRoleBlocked' : 'nodes.rebuildNodeWriteBlocked';
+        return { status: 409, code, message: t(key).replace('{counts}', formatRelayCounts(error.counts, t)),
             accountCount, activeSessions };
     }
     if (!Object.hasOwn(reasons, code)) return null;
-    return { status: code === UNAVAILABLE ? 503 : 409, code, message: t(reasons[code]) };
+    return { status: code === UNAVAILABLE ? 503 : 409, code, message: t(reasons[code]),
+        ...(error.retryAllowed === false && { retryAllowed: false }) };
 }
 
-module.exports = { relayRoleBlock, saveNodeRole, describeRoleError };
+module.exports = { relayRoleBlock, withNodeWriterFence, withNodeWrite, nodeWriteVerifier, assertNodeEditAllowed, assertRelaySetupAllowed, describeRoleError };

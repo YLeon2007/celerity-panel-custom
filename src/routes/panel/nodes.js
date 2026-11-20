@@ -22,7 +22,7 @@ const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
-const { relayRoleBlock, saveNodeRole, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
+const { relayRoleBlock, withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
 const { canPreviewRemoval, issueRemovalTicket } = require('./rebuildRelayRemove');
 
@@ -614,136 +614,140 @@ router.post('/nodes/:id', async (req, res) => {
     const nodeId = req.params.id;
     try {
         // Both private Xray fields must survive the full subdocument merge below.
-        const existingNode = await HyNode.findById(nodeId)
-            .select('+xray.manualKey +xray.accessLogs.ingestTokenEncrypted');
-        if (!existingNode) {
-            return res.redirect('/panel/nodes');
-        }
+        const result = await withNodeWrite(nodeId, async (options, current, verify) => {
+            const existingNode = current ?? await HyNode.findById(nodeId)
+                .select('+xray.manualKey +xray.accessLogs.ingestTokenEncrypted');
+            if (!existingNode) {
+                return { redirect: '/panel/nodes' };
+            }
 
-        const { name, cascadeRole } = req.body;
-        const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
-        const ip = req.body.ip || '';
+            const { name, cascadeRole } = req.body;
+            const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
+            const ip = req.body.ip || '';
 
-        if (!name) {
-            return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent('Name is required')}`);
-        }
-        if (nodeType !== 'virtual' && !ip) {
-            return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent('IP address is required')}`);
-        }
+            if (!name) {
+                return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent('Name is required')}` };
+            }
+            if (nodeType !== 'virtual' && !ip) {
+                return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent('IP address is required')}` };
+            }
 
-        let groups = [];
-        if (req.body.groups) {
-            groups = Array.isArray(req.body.groups) ? req.body.groups : [req.body.groups];
-        }
+            let groups = [];
+            if (req.body.groups) {
+                groups = Array.isArray(req.body.groups) ? req.body.groups : [req.body.groups];
+            }
 
-        const updates = {
-            name,
-            ip: nodeType === 'virtual' ? null : ip,
-            type: nodeType,
-            domain: req.body.domain || '',
-            sni: req.body.sni || '',
-            port: parseInt(req.body.port) || 443,
-            portRange: req.body.portRange || '20000-50000',
-            statsPort: parseInt(req.body.statsPort) || 9999,
-            groups,
-            maxOnlineUsers: parseInt(req.body.maxOnlineUsers) || 0,
-            rankingCoefficient: parseFloat(req.body.rankingCoefficient) || 1,
-            active: req.body.active === 'on',
-            useCustomConfig: req.body.useCustomConfig === 'on',
-            customConfig: req.body.customConfig || '',
-            obfs: {
-                type: req.body['obfs.type'] || '',
-                password: req.body['obfs.password'] || '',
-            },
-            flag: req.body.flag || '',
-            country: req.body.country || '',
-            comment: typeof req.body.comment === 'string'
-                ? req.body.comment.trim().slice(0, 500)
-                : '',
-            initScript: req.body.initScript || '',
-        };
-        // In rebuild an omitted role must not overwrite a concurrent role edit.
-        if (cascadeRole !== undefined) updates.cascadeRole = cascadeRole;
-        else if (!isRebuildEnabled()) updates.cascadeRole = existingNode.cascadeRole || 'standalone';
-
-        if (req.body.statsSecret) {
-            updates.statsSecret = req.body.statsSecret;
-        }
-
-        if (nodeType === 'xray') {
-            const existingXray = (existingNode.xray && typeof existingNode.xray.toObject === 'function')
-                ? existingNode.xray.toObject()
-                : (existingNode.xray || {});
-            // resolveManualKeyPlaceholder runs BEFORE the merge so the
-            // existing key is restored when the operator did not change it.
-            const parsedXray = resolveManualKeyPlaceholder(parseXrayFormFields(req.body), existingXray);
-            updates.xray = {
-                ...existingXray,
-                ...parsedXray,
+            const updates = {
+                name,
+                ip: nodeType === 'virtual' ? null : ip,
+                type: nodeType,
+                domain: req.body.domain || '',
+                sni: req.body.sni || '',
+                port: parseInt(req.body.port) || 443,
+                portRange: req.body.portRange || '20000-50000',
+                statsPort: parseInt(req.body.statsPort) || 9999,
+                groups,
+                maxOnlineUsers: parseInt(req.body.maxOnlineUsers) || 0,
+                rankingCoefficient: parseFloat(req.body.rankingCoefficient) || 1,
+                active: req.body.active === 'on',
+                useCustomConfig: req.body.useCustomConfig === 'on',
+                customConfig: req.body.customConfig || '',
+                obfs: {
+                    type: req.body['obfs.type'] || '',
+                    password: req.body['obfs.password'] || '',
+                },
+                flag: req.body.flag || '',
+                country: req.body.country || '',
+                comment: typeof req.body.comment === 'string'
+                    ? req.body.comment.trim().slice(0, 500)
+                    : '',
+                initScript: req.body.initScript || '',
             };
-            const portForValidate = parseInt(req.body.port, 10) || existingNode.port;
-            const domainForValidate = String(req.body.domain || '').trim();
-            const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate, domain: domainForValidate });
-            if (xrayError) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(xrayError)}`);
-            }
-            ensureExtraInboundRealityKeys(updates.xray);
-            if ((req.body.cascadeRole || 'standalone') !== 'bridge' && !updates.xray.agentToken) {
-                updates.xray.agentToken = nodeSetup.generateAgentToken();
-            }
-        } else if (nodeType === 'virtual') {
-            const virtualError = applyVirtualFormFields(updates, req.body);
-            if (virtualError) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(virtualError)}`);
-            }
-        } else {
-            const hyFields = parseHysteriaFormFields(req.body);
-            const hyValidationError = validateHysteriaFormFields(hyFields);
-            if (hyValidationError) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(hyValidationError)}`);
-            }
-            delete hyFields.acmeDnsConfigValid;
-            Object.assign(updates, hyFields);
-        }
+            // In rebuild an omitted role must not overwrite a concurrent role edit.
+            if (cascadeRole !== undefined) updates.cascadeRole = cascadeRole;
+            else if (!isRebuildEnabled()) updates.cascadeRole = existingNode.cascadeRole || 'standalone';
 
-        const sshUpdates = {};
-        if (req.body['ssh.port'] !== undefined) {
-            sshUpdates['ssh.port'] = parseInt(req.body['ssh.port'], 10) || 22;
-        }
-        if (req.body['ssh.username'] !== undefined) {
-            sshUpdates['ssh.username'] = req.body['ssh.username'] || 'root';
-        }
-        if (req.body['ssh.password']) {
-            sshUpdates['ssh.password'] = cryptoService.encrypt(req.body['ssh.password']);
-        }
-        if (req.body['ssh.clearPrivateKey'] === '1') {
-            sshUpdates['ssh.privateKey'] = '';
-        } else if (req.body['ssh.privateKey'] && req.body['ssh.privateKey'].trim()) {
-            const rawKey = req.body['ssh.privateKey'].trim();
-            if (!sshKeyService.isValidPrivateKey(rawKey)) {
-                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent('Invalid private key format')}`);
+            if (req.body.statsSecret) {
+                updates.statsSecret = req.body.statsSecret;
             }
-            sshUpdates['ssh.privateKey'] = cryptoService.encrypt(rawKey);
-        }
-        Object.assign(updates, sshUpdates);
 
-        // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
-        const before = existingNode.toObject({ depopulate: true });
-        const saved = await saveNodeRole(nodeId, cascadeRole, async options => {
+            if (nodeType === 'xray') {
+                const existingXray = (existingNode.xray && typeof existingNode.xray.toObject === 'function')
+                    ? existingNode.xray.toObject()
+                    : (existingNode.xray || {});
+                // resolveManualKeyPlaceholder runs BEFORE the merge so the
+                // existing key is restored when the operator did not change it.
+                const parsedXray = resolveManualKeyPlaceholder(parseXrayFormFields(req.body), existingXray);
+                updates.xray = {
+                    ...existingXray,
+                    ...parsedXray,
+                };
+                const portForValidate = parseInt(req.body.port, 10) || existingNode.port;
+                const domainForValidate = String(req.body.domain || '').trim();
+                const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate, domain: domainForValidate });
+                if (xrayError) {
+                    return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent(xrayError)}` };
+                }
+                ensureExtraInboundRealityKeys(updates.xray);
+                if ((req.body.cascadeRole || 'standalone') !== 'bridge' && !updates.xray.agentToken) {
+                    updates.xray.agentToken = nodeSetup.generateAgentToken();
+                }
+            } else if (nodeType === 'virtual') {
+                const virtualError = applyVirtualFormFields(updates, req.body);
+                if (virtualError) {
+                    return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent(virtualError)}` };
+                }
+            } else {
+                const hyFields = parseHysteriaFormFields(req.body);
+                const hyValidationError = validateHysteriaFormFields(hyFields);
+                if (hyValidationError) {
+                    return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent(hyValidationError)}` };
+                }
+                delete hyFields.acmeDnsConfigValid;
+                Object.assign(updates, hyFields);
+            }
+
+            const sshUpdates = {};
+            if (req.body['ssh.port'] !== undefined) {
+                sshUpdates['ssh.port'] = parseInt(req.body['ssh.port'], 10) || 22;
+            }
+            if (req.body['ssh.username'] !== undefined) {
+                sshUpdates['ssh.username'] = req.body['ssh.username'] || 'root';
+            }
+            if (req.body['ssh.password']) {
+                sshUpdates['ssh.password'] = cryptoService.encrypt(req.body['ssh.password']);
+            }
+            if (req.body['ssh.clearPrivateKey'] === '1') {
+                sshUpdates['ssh.privateKey'] = '';
+            } else if (req.body['ssh.privateKey'] && req.body['ssh.privateKey'].trim()) {
+                const rawKey = req.body['ssh.privateKey'].trim();
+                if (!sshKeyService.isValidPrivateKey(rawKey)) {
+                    return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent('Invalid private key format')}` };
+                }
+                sshUpdates['ssh.privateKey'] = cryptoService.encrypt(rawKey);
+            }
+            Object.assign(updates, sshUpdates);
+
+            await assertNodeEditAllowed(current, updates, sshUpdates);
+            await verify();
+            // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
+            const before = existingNode.toObject({ depopulate: true });
             existingNode.set(updates);
-            // Mongoose also persists hydrated schema defaults on existing rows.
-            // An omitted role is not a role write, even on a legacy row.
-            if (cascadeRole === undefined && !Object.hasOwn(updates, 'cascadeRole')) {
-                existingNode.$ignore('cascadeRole');
-            }
+            // Mongoose hydrates schema defaults on older cards. An omitted role is not a role write.
+            if (!Object.hasOwn(updates, 'cascadeRole')) existingNode.$ignore('cascadeRole');
             await existingNode.save(options);
-            return true;
-        }, { expectedRole: existingNode.cascadeRole || 'standalone' });
-        if (!saved) return res.redirect('/panel/nodes');
+            const after = existingNode.toObject({ depopulate: true });
+            if (before.ip && before.ip === after.ip && Object.keys(sshUpdates).length) {
+                await verify();
+                await HyNode.updateMany({ ip: before.ip, _id: { $ne: existingNode._id } }, { $set: sshUpdates }, options);
+            }
+            return { before, after, updates };
+        }, { select: '+xray.manualKey +xray.accessLogs.ingestTokenEncrypted' });
+        if (!result || result.redirect) return res.redirect(result?.redirect ?? '/panel/nodes');
+        const { before, after, updates } = result;
 
         // The form always submits config defaults and replaces xray. Classify
         // the actual schema-cast saved delta, not the presence of those fields.
-        const after = existingNode.toObject({ depopulate: true });
         const changedUpdates = Object.fromEntries(Object.entries(updates).filter(([key]) => {
             const root = key.split('.')[0];
             return !isDeepStrictEqual(before[root], after[root]);
@@ -758,14 +762,6 @@ router.post('/nodes/:id', async (req, res) => {
         const lifecycleChanged = before.type !== after.type || before.cascadeRole !== after.cascadeRole
             || before.active !== after.active;
         syncService.schedulePush(nodeId, lifecycleChanged ? updates : changedUpdates);
-
-        // SSH settings are host-local: a move must not update siblings at either IP.
-        if (before.ip && before.ip === after.ip && Object.keys(sshUpdates).length) {
-            await HyNode.updateMany(
-                { ip: before.ip, _id: { $ne: existingNode._id } },
-                { $set: sshUpdates }
-            );
-        }
 
         // Invalidate active-nodes, subscription, and dashboard caches so ranking/config changes apply immediately
         await invalidateNodesCache();
@@ -782,71 +778,82 @@ router.post('/nodes/:id', async (req, res) => {
 // POST /panel/nodes/:id/setup - Auto-setup node via SSH
 router.post('/nodes/:id/setup', async (req, res) => {
     try {
-        const node = await HyNode.findById(req.params.id);
-        
-        if (!node) {
-            return res.status(404).json({ success: false, error: 'Нода не найдена', logs: [] });
-        }
+        const reply = (status, body) => ({ status, body });
+        const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
+            const node = current ?? await HyNode.findById(req.params.id);
 
-        if (node.type === 'virtual') {
-            return res.status(400).json({ success: false, error: 'Virtual nodes have no remote service to set up', logs: [] });
-        }
-
-        if (!node.ssh?.password && !node.ssh?.privateKey) {
-            return res.status(400).json({ success: false, error: 'SSH данные не настроены', logs: [] });
-        }
-        
-        logger.info(`[Panel] Starting setup for node ${node.name} (type: ${node.type || 'hysteria'}, role: ${node.cascadeRole || 'standalone'})`);
-        
-        let result;
-        if (node.type === 'xray' && node.cascadeRole === 'bridge') {
-            result = await nodeSetup.setupXrayNode(node, { restartService: false, exitOnly: true });
-            if (result.success) {
-                result.logs = result.logs || [];
-                result.logs.push('[Bridge] Xray installed. Create a cascade link to deploy bridge config.');
+            if (!node) {
+                return reply(404, { success: false, error: 'Нода не найдена', logs: [] });
             }
-        } else if (node.type === 'xray') {
-            result = await nodeSetup.setupXrayNodeWithAgent(node, { restartService: true });
-        } else {
-            const skipHopping = isSameVpsAsPanel(node);
-            result = await nodeSetup.setupNode(node, {
-                installHysteria: true,
-                setupPortHopping: !skipHopping,
-                restartService: true,
-            });
-        }
-        
-        if (result.success) {
-            const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-            if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-            if (node.cascadeRole === 'bridge') updateFields.status = 'offline';
-            await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields });
-            await invalidateNodesCache();
 
-            if (node.type === 'xray' && node.cascadeRole !== 'bridge') {
-                const CascadeLink = require('../../models/cascadeLinkModel');
-                const linkCount = await CascadeLink.countDocuments({
-                    $or: [{ portalNode: node._id }, { bridgeNode: node._id }],
-                    active: true,
-                });
-                if (linkCount > 0) {
+            if (node.type === 'virtual') {
+                return reply(400, { success: false, error: 'Virtual nodes have no remote service to set up', logs: [] });
+            }
+
+            if (!node.ssh?.password && !node.ssh?.privateKey) {
+                return reply(400, { success: false, error: 'SSH данные не настроены', logs: [] });
+            }
+
+            logger.info(`[Panel] Starting setup for node ${node.name} (type: ${node.type || 'hysteria'}, role: ${node.cascadeRole || 'standalone'})`);
+
+            let result;
+            if (node.type === 'xray' && node.cascadeRole === 'bridge') {
+                result = await nodeSetup.setupXrayNode(node, { restartService: false, exitOnly: true });
+                if (result.success) {
                     result.logs = result.logs || [];
-                    result.logs.push(`[Cascade] Re-deploying ${linkCount} cascade link(s)...`);
-                    cascadeService.redeployAllLinksForNode(node._id).catch(err => {
-                        logger.error(`[Cascade] Auto-redeploy after setup: ${err.message}`);
-                    });
+                    result.logs.push('[Bridge] Xray installed. Create a cascade link to deploy bridge config.');
                 }
+            } else if (node.type === 'xray') {
+                result = await nodeSetup.setupXrayNodeWithAgent(node, { restartService: true });
+            } else {
+                const skipHopping = isSameVpsAsPanel(node);
+                result = await nodeSetup.setupNode(node, {
+                    installHysteria: true,
+                    setupPortHopping: !skipHopping,
+                    restartService: true,
+                });
             }
 
-            res.json({ success: true, message: 'Нода успешно настроена', logs: result.logs || [] });
-        } else {
-            await HyNode.findByIdAndUpdate(req.params.id, { 
-                $set: { status: 'error', lastError: result.error, healthFailures: 0 } 
-            });
-            await invalidateNodesCache();
-            res.status(500).json({ success: false, error: result.error, logs: result.logs || [] });
-        }
+            if (result.success) {
+                const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
+                if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
+                if (node.cascadeRole === 'bridge') updateFields.status = 'offline';
+                await verify();
+                await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields }, options);
+                await invalidateNodesCache();
+
+                if (node.type === 'xray' && node.cascadeRole !== 'bridge' && !current) {
+                    const CascadeLink = require('../../models/cascadeLinkModel');
+                    const linkCount = await CascadeLink.countDocuments({
+                        $or: [{ portalNode: node._id }, { bridgeNode: node._id }],
+                        active: true,
+                    });
+                    if (linkCount > 0) {
+                        result.logs = result.logs || [];
+                        result.logs.push(`[Cascade] Re-deploying ${linkCount} cascade link(s)...`);
+                        cascadeService.redeployAllLinksForNode(node._id).catch(err => {
+                            logger.error(`[Cascade] Auto-redeploy after setup: ${err.message}`);
+                        });
+                    }
+                }
+
+                return reply(200, { success: true, message: 'Нода успешно настроена', logs: result.logs || [] });
+            } else {
+                await verify();
+                await HyNode.findByIdAndUpdate(req.params.id, {
+                    $set: { status: 'error', lastError: result.error, healthFailures: 0 }
+                }, options);
+                await invalidateNodesCache();
+                return reply(500, { success: false, error: result.error, logs: result.logs || [] });
+            }
+        }, { fullSetup: true });
+        return result ? res.status(result.status).json(result.body) : res.status(404).json({ success: false, error: 'Нода не найдена', logs: [] });
     } catch (error) {
+        const conflict = describeRoleError(error, res.locals.t);
+        if (conflict) {
+            const { status, message, ...details } = conflict;
+            return res.status(status).json({ success: false, error: message, logs: [], ...details });
+        }
         logger.error(`[Panel] Setup error: ${error.message}`);
         res.status(500).json({ success: false, error: error.message, logs: [`Exception: ${error.message}`] });
     }
@@ -855,32 +862,42 @@ router.post('/nodes/:id/setup', async (req, res) => {
 // POST /panel/nodes/:id/generate-ssh-key - Generate and install ed25519 SSH key
 router.post('/nodes/:id/generate-ssh-key', generateSshKeyLimiter, async (req, res) => {
     try {
-        const node = await HyNode.findById(req.params.id);
+        const reply = (status, body) => ({ status, body });
+        const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
+            const node = current ?? await HyNode.findById(req.params.id);
 
-        if (!node) {
-            return res.status(404).json({ success: false, error: 'Node not found' });
-        }
+            if (!node) {
+                return reply(404, { success: false, error: 'Node not found' });
+            }
 
-        if (!node.ssh?.password && !node.ssh?.privateKey) {
-            return res.status(400).json({ success: false, error: 'SSH credentials not configured. Add a password or existing key first.' });
-        }
+            if (!node.ssh?.password && !node.ssh?.privateKey) {
+                return reply(400, { success: false, error: 'SSH credentials not configured. Add a password or existing key first.' });
+            }
 
-        logger.info(`[Panel] Generating SSH key for node ${node.name}`);
+            logger.info(`[Panel] Generating SSH key for node ${node.name}`);
 
-        const conn = await connectNodeSSH(node);
+            const conn = await connectNodeSSH(node);
 
-        const { privateKey, publicKey } = sshKeyService.generateEd25519KeyPair();
-        await sshKeyService.installPublicKey(conn, publicKey);
-        conn.end();
+            const { privateKey, publicKey } = sshKeyService.generateEd25519KeyPair();
+            await sshKeyService.installPublicKey(conn, publicKey);
+            conn.end();
 
-        const encryptedKey = cryptoService.encrypt(privateKey);
-        await HyNode.findByIdAndUpdate(req.params.id, {
-            $set: { 'ssh.privateKey': encryptedKey },
-        });
+            const encryptedKey = cryptoService.encrypt(privateKey);
+            await verify();
+            await HyNode.findByIdAndUpdate(req.params.id, {
+                $set: { 'ssh.privateKey': encryptedKey },
+            }, options);
 
-        logger.info(`[Panel] SSH key installed on ${node.name}`);
-        res.json({ success: true, message: 'SSH key generated and installed successfully' });
+            logger.info(`[Panel] SSH key installed on ${node.name}`);
+            return reply(200, { success: true, message: 'SSH key generated and installed successfully' });
+        }, { requireRemoval: true });
+        return result ? res.status(result.status).json(result.body) : res.status(404).json({ success: false, error: 'Node not found', logs: [] });
     } catch (error) {
+        const conflict = describeRoleError(error, res.locals.t);
+        if (conflict) {
+            const { status, message, ...details } = conflict;
+            return res.status(status).json({ success: false, error: message, logs: [], ...details });
+        }
         logger.error(`[Panel] SSH key generation error: ${error.message}`);
         res.status(500).json({ success: false, error: error.message });
     }
@@ -1271,44 +1288,55 @@ router.get('/stats/api/ssh-pool', async (req, res) => {
 // POST /nodes/:id/restart - Restart node service (via Agent for Xray, SSH for Hysteria)
 router.post('/nodes/:id/restart', async (req, res) => {
     try {
-        const node = await HyNode.findById(req.params.id);
-        if (!node) {
-            return res.status(404).json({ error: 'Node not found' });
-        }
-
-        if (node.type === 'virtual') {
-            return res.status(400).json({ error: 'Virtual nodes have no remote service to restart' });
-        }
-
-        // Xray nodes with agent: restart + sync through the agent API
-        if (node.type === 'xray' && node.xray?.agentToken) {
-            try {
-                await syncService.updateNodeConfig(node);
-                return res.json({ success: true, output: 'Restarted and synced via agent' });
-            } catch (agentErr) {
-                return res.status(500).json({ error: `Agent restart failed: ${agentErr.message}` });
+        const reply = (status, body) => ({ status, body });
+        const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
+            const node = current ?? await HyNode.findById(req.params.id);
+            if (!node) {
+                return reply(404, { error: 'Node not found' });
             }
-        }
 
-        // Hysteria nodes (and Xray without agent): SSH restart
-        if (!node.ssh?.password && !node.ssh?.privateKey) {
-            return res.status(400).json({ error: 'SSH credentials not configured' });
-        }
+            if (node.type === 'virtual') {
+                return reply(400, { error: 'Virtual nodes have no remote service to restart' });
+            }
 
-        const conn = await nodeSetup.connectSSH(node);
-        const serviceName = node.type === 'xray' ? 'xray' : 'hysteria-server';
-        const result = await nodeSetup.execSSH(conn, `systemctl restart ${serviceName} && sleep 2 && systemctl is-active ${serviceName}`);
-        conn.end();
+            // Xray nodes with agent: restart + sync through the agent API
+            if (node.type === 'xray' && node.xray?.agentToken) {
+                try {
+                    await syncService.updateNodeConfig(node);
+                    return reply(200, { success: true, output: 'Restarted and synced via agent' });
+                } catch (agentErr) {
+                    if (describeRoleError(agentErr, res.locals.t)) throw agentErr;
+                    return reply(500, { error: `Agent restart failed: ${agentErr.message}` });
+                }
+            }
 
-        const isActive = result.output.trim().includes('active');
+            // Hysteria nodes (and Xray without agent): SSH restart
+            if (!node.ssh?.password && !node.ssh?.privateKey) {
+                return reply(400, { error: 'SSH credentials not configured' });
+            }
 
-        await HyNode.findByIdAndUpdate(req.params.id, {
-            $set: { status: isActive ? 'online' : 'error', lastSync: new Date() }
+            const conn = await nodeSetup.connectSSH(node);
+            const serviceName = node.type === 'xray' ? 'xray' : 'hysteria-server';
+            const result = await nodeSetup.execSSH(conn, `systemctl restart ${serviceName} && sleep 2 && systemctl is-active ${serviceName}`);
+            conn.end();
+
+            const isActive = result.output.trim().includes('active');
+
+            await verify();
+            await HyNode.findByIdAndUpdate(req.params.id, {
+                $set: { status: isActive ? 'online' : 'error', lastSync: new Date() }
+            }, options);
+            await invalidateNodesCache();
+
+            return reply(200, { success: isActive, output: result.output });
         });
-        await invalidateNodesCache();
-
-        res.json({ success: isActive, output: result.output });
+        return result ? res.status(result.status).json(result.body) : res.status(404).json({ success: false, error: 'Node not found', logs: [] });
     } catch (error) {
+        const conflict = describeRoleError(error, res.locals.t);
+        if (conflict) {
+            const { status, message, ...details } = conflict;
+            return res.status(status).json({ success: false, error: message, logs: [], ...details });
+        }
         res.status(500).json({ error: error.message });
     }
 });

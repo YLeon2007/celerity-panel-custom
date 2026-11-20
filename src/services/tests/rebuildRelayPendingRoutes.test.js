@@ -36,7 +36,7 @@ test('pending relay-account intent fences public Install, confirmed Remove, Appl
     const serviceModule = require('../rebuildService');
     const now = new Date();
     const node = { _id: id, name: 'Fixture relay', cascadeRole: 'relay', type: 'xray', active: true, ip: '192.0.2.30' };
-    const state = { _id: '1'.repeat(24), node: id, status: 'installed', desiredState: 'installed',
+    let state = { _id: '1'.repeat(24), node: id, status: 'installed', desiredState: 'installed',
         routingMode: 'follow-relay', routingVersion: 1, rebuildMachineId: machine,
         rebuildInstallToken: '00000000-0000-4000-8000-000000000001', backupId: 'fixture-backup',
         secretRevision: 1, pskEncrypted: 'dummy-psk', clientCidr: '10.255.0.0/24', poolStart: '10.255.0.10',
@@ -83,7 +83,9 @@ test('pending relay-account intent fences public Install, confirmed Remove, Appl
         } };
     });
     t.mock.method(Settings, 'get', async () => ({ deployment: { completed: true } }));
-    t.mock.method(Node, 'findById', () => query({ ...node }));
+    t.mock.method(Node, 'findById', () => ({ ...query({ ...node }),
+        then: (resolve, reject) => Promise.resolve(Node.hydrate(node)).then(resolve, reject),
+    }));
     t.mock.method(Node, 'find', () => { record('node inventory'); return query([{ ...node }, { _id: portal, cascadeRole: 'portal' }]); });
     t.mock.method(Node, 'findByIdAndUpdate', (_, update, options) => {
         record('role write');
@@ -195,7 +197,8 @@ test('pending relay-account intent fences public Install, confirmed Remove, Appl
     // the singleton THROUGH the business write, contending with real Apply.
     pending = null;
     // Loss after the pending read must not authorize the draft or role write.
-    node.cascadeRole = 'bridge'; // No relay demotion workflow needed for these controls.
+    node.cascadeRole = 'bridge';
+    state = null; // Positive controls do not carry a relay installation.
     loseLock = true;
     for (const [action, isRole] of [[() => createLink(false), false], [role, true]]) {
         lockEvents.length = 0;

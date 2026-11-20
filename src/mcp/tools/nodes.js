@@ -10,7 +10,7 @@ const HyUser = require('../../models/hyUserModel');
 const cache = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
 const logger = require('../../utils/logger');
-const { saveNodeRole, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
+const { withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 
 async function invalidateNodesCache() {
     await cache.invalidateNodes();
@@ -303,6 +303,17 @@ async function queryNodes(args) {
 }
 
 async function manageNode(args, emit) {
+    try {
+        return await manageNodeAction(args, emit);
+    } catch (error) {
+        const conflict = describeRoleError(error);
+        if (!conflict) throw error;
+        const { status, message, code, ...details } = conflict;
+        return { error: message, code: status, reason: code, ...details };
+    }
+}
+
+async function manageNodeAction(args, emit) {
     const parsed = manageNodeSchema.parse(args);
     const { action, id, data = {}, setupOptions } = parsed;
 
@@ -440,37 +451,35 @@ async function manageNode(args, emit) {
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
-            const existing = await HyNode.findById(id).select('type ip virtual').lean();
-            if (!existing) return { error: `Node '${id}' not found`, code: 404 };
+            const result = await withNodeWrite(id, async (options, current, verify) => {
+                const existing = current ?? await HyNode.findById(id).select('type ip virtual').lean();
+                if (!existing) return { error: `Node '${id}' not found`, code: 404 };
 
-            const nextType = updates.type || existing.type;
-            const nextVirtual = updates.virtual !== undefined ? updates.virtual : existing.virtual;
-            const nextIp = existing.ip;
+                const nextType = updates.type || existing.type;
+                const nextVirtual = updates.virtual !== undefined ? updates.virtual : existing.virtual;
+                const nextIp = existing.ip;
 
-            if (nextType === 'virtual') {
-                const v = nextVirtual || {};
-                if (v.selectMode === 'group' && !v.sourceGroup) {
-                    return { error: 'Virtual node (group): sourceGroup required', code: 400 };
+                if (nextType === 'virtual') {
+                    const v = nextVirtual || {};
+                    if (v.selectMode === 'group' && !v.sourceGroup) {
+                        return { error: 'Virtual node (group): sourceGroup required', code: 400 };
+                    }
+                    if (v.selectMode !== 'group' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
+                        return { error: 'Virtual node (manual): at least one source required', code: 400 };
+                    }
+                    updates.ip = null;
+                } else if (!nextIp) {
+                    return { error: `Node type ${nextType} requires ip`, code: 400 };
                 }
-                if (v.selectMode !== 'group' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
-                    return { error: 'Virtual node (manual): at least one source required', code: 400 };
-                }
-                updates.ip = null;
-            } else if (!nextIp) {
-                return { error: `Node type ${nextType} requires ip`, code: 400 };
-            }
 
-            let node;
-            try {
-                node = await saveNodeRole(id, updates.cascadeRole, options => HyNode.findByIdAndUpdate(
-                    id, { $set: updates }, { new: true, ...options }
-                ).populate('groups', 'name color'));
-            } catch (error) {
-                const conflict = describeRoleError(error);
-                if (!conflict) throw error;
-                const { status, message, code, ...details } = conflict;
-                return { error: message, code: status, reason: code, ...details };
-            }
+                await assertNodeEditAllowed(current, updates);
+                await verify();
+                const node = await HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true, ...options })
+                    .populate('groups', 'name color');
+                return { node };
+            });
+            if (result?.error) return result;
+            const node = result?.node;
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             await invalidateNodesCache();
 
@@ -485,9 +494,15 @@ async function manageNode(args, emit) {
 
         case 'delete': {
             if (!id) throw new Error('id is required for delete');
-            const node = await HyNode.findByIdAndDelete(id);
+            const node = await withNodeWrite(id, async (options, _current, verify) => {
+                const deleted = await HyNode.findByIdAndDelete(id, options);
+                if (deleted) {
+                    await verify();
+                    await HyUser.updateMany({ nodes: deleted._id }, { $pull: { nodes: deleted._id } }, options);
+                }
+                return deleted;
+            }, { requireRemoval: true });
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
-            await HyUser.updateMany({ nodes: node._id }, { $pull: { nodes: node._id } });
             await invalidateNodesCache();
             logger.info(`[MCP] Deleted node ${node.name}`);
             return { success: true, message: `Node '${node.name}' deleted` };
@@ -512,40 +527,44 @@ async function manageNode(args, emit) {
 
         case 'setup': {
             if (!id) throw new Error('id is required for setup');
-            const node = await HyNode.findById(id);
-            if (!node) return { error: `Node '${id}' not found`, code: 404 };
+            return await withNodeWrite(id, async (options, current, verify) => {
+                const node = current ?? await HyNode.findById(id);
+                if (!node) return { error: `Node '${id}' not found`, code: 404 };
 
-            if (node.type === 'virtual') {
-                return { error: 'Virtual nodes have no remote server to set up', code: 400 };
-            }
+                if (node.type === 'virtual') {
+                    return { error: 'Virtual nodes have no remote server to set up', code: 400 };
+                }
 
-            if (!node.ssh?.password && !node.ssh?.privateKey) {
-                return { error: 'SSH credentials not configured', code: 400 };
-            }
+                if (!node.ssh?.password && !node.ssh?.privateKey) {
+                    return { error: 'SSH credentials not configured', code: 400 };
+                }
 
-            const opts = setupOptions || { installHysteria: true, setupPortHopping: true, restartService: true };
-            const nodeSetup = require('../../services/nodeSetup');
+                const opts = setupOptions || { installHysteria: true, setupPortHopping: true, restartService: true };
+                const nodeSetup = require('../../services/nodeSetup');
 
-            emit('progress', { step: 1, total: 3, message: `Connecting to ${node.name} via SSH...` });
+                emit('progress', { step: 1, total: 3, message: `Connecting to ${node.name} via SSH...` });
 
-            let result;
-            if (node.type === 'xray') {
-                result = await nodeSetup.setupXrayNode(node, { restartService: opts.restartService });
-            } else {
-                result = await nodeSetup.setupNode(node, opts);
-            }
+                let result;
+                if (node.type === 'xray') {
+                    result = await nodeSetup.setupXrayNode(node, { restartService: opts.restartService });
+                } else {
+                    result = await nodeSetup.setupNode(node, opts);
+                }
 
-            if (result.success) {
-                const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-                if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-                await HyNode.findByIdAndUpdate(id, { $set: updateFields });
-                await invalidateNodesCache();
-                logger.info(`[MCP] Setup completed for ${node.name}`);
-                return { success: true, logs: result.logs };
-            } else {
-                await HyNode.findByIdAndUpdate(id, { $set: { status: 'error', lastError: result.error } });
-                return { success: false, error: result.error, logs: result.logs };
-            }
+                if (result.success) {
+                    const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
+                    if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
+                    await verify();
+                    await HyNode.findByIdAndUpdate(id, { $set: updateFields }, options);
+                    await invalidateNodesCache();
+                    logger.info(`[MCP] Setup completed for ${node.name}`);
+                    return { success: true, logs: result.logs };
+                } else {
+                    await verify();
+                    await HyNode.findByIdAndUpdate(id, { $set: { status: 'error', lastError: result.error } }, options);
+                    return { success: false, error: result.error, logs: result.logs };
+                }
+            }, { fullSetup: true }) ?? { error: `Node '${id}' not found`, code: 404 };
         }
 
         case 'reset_status': {

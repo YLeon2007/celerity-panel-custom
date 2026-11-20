@@ -332,6 +332,8 @@
     "cascadeRole": "Роль в каскаде",
     "cascadeRoleHint": "Роль ноды в каскадной топологии. Bridge-ноды скрыты из подписок пользователей.",
     "rebuildRoleBlocked": "Перед сменой роли удалите L2TP. {counts}",
+    "rebuildNodeWriteBlocked": "Перед изменением идентификаторов узла или выполнением этой операции удалите L2TP. {counts}",
+    "rebuildNodeAccountsPending": "Результат изменения учётных записей ретранслятора не подтверждён. Изменения узлов заблокированы.",
     "rebuildRelayCounts": "Учётные записи L2TP: {accounts}; активные сессии PPP/L2TP: {sessions}.",
     "rebuildCountUnavailable": "не подтверждено",
     "rebuildRemoveOpen": "Проверить условия удаления L2TP",

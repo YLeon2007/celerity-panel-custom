@@ -17,6 +17,8 @@ const Settings = require('../../models/settingsModel');
 const cryptoService = require('../../services/cryptoService');
 const sshKeyService = require('../../services/sshKeyService');
 const nodeSetup = require('../../services/nodeSetup');
+const { withNodeWriterFence, assertRelaySetupAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
+const { withNodes } = require('../../services/rebuildLocks');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { invalidateOnboardingCache } = require('./helpers');
@@ -303,19 +305,33 @@ router.post('/wizard/self-host', wizardLimiter, async (req, res) => {
             });
         }
 
-        // Deduplicate: skip if a node with same ip+type already exists
-        const createdNodeIds = [];
-        for (const nodeData of nodesToCreate) {
-            const existing = await HyNode.findOne({ ip: nodeData.ip, type: nodeData.type });
-            if (existing) {
-                logger.info(`[Wizard] Node ${nodeData.type} on ${nodeData.ip} already exists, reusing`);
-                createdNodeIds.push(existing._id.toString());
-            } else {
-                const created = await HyNode.create(nodeData);
-                createdNodeIds.push(created._id.toString());
-                logger.info(`[Wizard] Created ${nodeData.type} node on ${nodeData.ip}`);
+        // Preflight all existing cards before creating any new ones. The
+        // background runner rechecks them under its own fence before effects.
+        const createdNodeIds = await withNodeWriterFence(async (options, verify) => {
+            const existingByIndex = [];
+            if (options.writeConcern) {
+                for (const { ip, type } of nodesToCreate) {
+                    const existing = await HyNode.findOne({ ip, type }).read('primary').readConcern('majority').maxTimeMS(5000);
+                    if (existing) await assertRelaySetupAllowed(existing);
+                    existingByIndex.push(existing);
+                }
             }
-        }
+            const ids = [];
+            for (const [i, nodeData] of nodesToCreate.entries()) {
+                const existing = options.writeConcern ? existingByIndex[i]
+                    : await HyNode.findOne({ ip: nodeData.ip, type: nodeData.type });
+                if (existing) {
+                    logger.info(`[Wizard] Node ${nodeData.type} on ${nodeData.ip} already exists, reusing`);
+                    ids.push(existing._id.toString());
+                } else {
+                    await verify();
+                    const created = options.writeConcern ? await new HyNode(nodeData).save(options) : await HyNode.create(nodeData);
+                    logger.info(`[Wizard] Created ${nodeData.type} node on ${nodeData.ip}`);
+                    ids.push(created._id.toString());
+                }
+            }
+            return ids;
+        });
 
         await invalidateNodesCache();
 
@@ -336,6 +352,8 @@ router.post('/wizard/self-host', wizardLimiter, async (req, res) => {
 
         return res.redirect(`/panel/wizard/progress/${taskId}`);
     } catch (err) {
+        const conflict = describeRoleError(err, res.locals.t);
+        if (conflict) return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent(conflict.message));
         logger.error(`[Wizard] Self-host POST error: ${err.message}`);
         return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent(err.message));
     }
@@ -353,66 +371,91 @@ async function _runBootstrap(taskId, nodeIds) {
     let statusChanged = false;
 
     try {
-        const starterBundle = await ensureStarterAccessBundle(nodeIds);
-        if (starterBundle) {
-            pushLog(`[Info] Starter group ready: ${starterBundle.groupName}`);
-            pushLog(`[Info] Starter user ready: ${starterBundle.userId}`);
-            task.starterSubscription = {
-                userId: starterBundle.userId,
-                url: starterBundle.subscriptionUrl,
-                token: starterBundle.subscriptionToken,
+        await withNodeWriterFence((options, verify) => {
+            const run = async () => {
+                const current = new Map();
+                if (options.writeConcern) {
+                    for (const nodeId of nodeIds) {
+                        const node = await HyNode.findById(nodeId).read('primary').readConcern('majority').maxTimeMS(5000);
+                        if (node) await assertRelaySetupAllowed(node);
+                        current.set(nodeId, node);
+                    }
+                    await verify();
+                }
+                try {
+                    const starterBundle = await ensureStarterAccessBundle(nodeIds);
+                    if (starterBundle) {
+                        pushLog(`[Info] Starter group ready: ${starterBundle.groupName}`);
+                        pushLog(`[Info] Starter user ready: ${starterBundle.userId}`);
+                        task.starterSubscription = {
+                            userId: starterBundle.userId,
+                            url: starterBundle.subscriptionUrl,
+                            token: starterBundle.subscriptionToken,
+                        };
+                        pushLog('[Info] Starter subscription link is ready.');
+                        pushLog('[Info] It will be shown separately after provisioning completes.');
+                    }
+                } catch (err) {
+                    pushLog(`[Error] Could not prepare starter access: ${err.message}`);
+                    allSuccess = false;
+                }
+
+                for (const nodeId of nodeIds) {
+                    const node = options.writeConcern ? current.get(nodeId) : await HyNode.findById(nodeId);
+                    if (!node) {
+                        pushLog(`[Error] Node ${nodeId} not found, skipping`);
+                        allSuccess = false;
+                        continue;
+                    }
+                    if (node.type === 'virtual') {
+                        pushLog(`[Skip] Virtual node ${node.name}: nothing to install`);
+                        continue;
+                    }
+
+                    pushLog(`\n--- Setting up ${node.type.toUpperCase()} node: ${node.name} (${node.ip}) ---`);
+
+                    let result;
+                    await verify();
+                    try {
+                        if (node.type === 'xray') {
+                            result = await nodeSetup.setupXrayNodeWithAgent(node, { restartService: true });
+                        } else {
+                            result = await nodeSetup.setupNode(node, {
+                                installHysteria:  true,
+                                setupPortHopping: false,
+                                restartService:   true,
+                            });
+                        }
+                    } catch (err) {
+                        result = { success: false, error: err.message, logs: [] };
+                    }
+
+                    for (const line of (result.logs || [])) { pushLog(line); }
+
+                    if (result.success) {
+                        const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
+                        if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
+                        await verify();
+                        await HyNode.findByIdAndUpdate(nodeId, { $set: updateFields }, options);
+                        statusChanged = true;
+                        pushLog(`[OK] ${node.type.toUpperCase()} node setup completed`);
+                    } else {
+                        await verify();
+                        await HyNode.findByIdAndUpdate(nodeId, { $set: { status: 'error', lastError: result.error } }, options);
+                        statusChanged = true;
+                        pushLog(`[FAIL] ${node.type.toUpperCase()} node setup failed: ${result.error}`);
+                        allSuccess = false;
+                    }
+                }
+
             };
-            pushLog('[Info] Starter subscription link is ready.');
-            pushLog('[Info] It will be shown separately after provisioning completes.');
-        }
-    } catch (err) {
-        pushLog(`[Error] Could not prepare starter access: ${err.message}`);
+            return options.writeConcern ? withNodes(nodeIds, run) : run();
+        });
+    } catch (error) {
+        const conflict = describeRoleError(error);
+        if (!conflict) throw error;
+        pushLog(`[Error] ${conflict.message}`);
         allSuccess = false;
-    }
-
-    for (const nodeId of nodeIds) {
-        const node = await HyNode.findById(nodeId);
-        if (!node) {
-            pushLog(`[Error] Node ${nodeId} not found, skipping`);
-            allSuccess = false;
-            continue;
-        }
-        if (node.type === 'virtual') {
-            pushLog(`[Skip] Virtual node ${node.name}: nothing to install`);
-            continue;
-        }
-
-        pushLog(`\n--- Setting up ${node.type.toUpperCase()} node: ${node.name} (${node.ip}) ---`);
-
-        let result;
-        try {
-            if (node.type === 'xray') {
-                result = await nodeSetup.setupXrayNodeWithAgent(node, { restartService: true });
-            } else {
-                result = await nodeSetup.setupNode(node, {
-                    installHysteria:  true,
-                    setupPortHopping: false,
-                    restartService:   true,
-                });
-            }
-        } catch (err) {
-            result = { success: false, error: err.message, logs: [] };
-        }
-
-        for (const line of (result.logs || [])) { pushLog(line); }
-
-        if (result.success) {
-            const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-            if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-            await HyNode.findByIdAndUpdate(nodeId, { $set: updateFields });
-            statusChanged = true;
-            pushLog(`[OK] ${node.type.toUpperCase()} node setup completed`);
-        } else {
-            await HyNode.findByIdAndUpdate(nodeId, { $set: { status: 'error', lastError: result.error } });
-            statusChanged = true;
-            pushLog(`[FAIL] ${node.type.toUpperCase()} node setup failed: ${result.error}`);
-            allSuccess = false;
-        }
     }
 
     if (statusChanged) {

@@ -495,13 +495,38 @@ class SyncService {
      */
     async updateXrayNodeConfig(node) {
         if (require('./rebuildMode').isRebuildEnabled()) {
-            // Serialize the database user snapshot as well as the subsequent POST.
-            // Standalone classic nodes continue to receive their regular full config.
-            return require('./rebuildLocks').withNode(node._id, async () => {
-                const cascade = node.cascadeRole && node.cascadeRole !== 'standalone' || await require('../models/cascadeLinkModel').exists({
-                    $or: [{ portalNode: node._id }, { bridgeNode: node._id }], active: true });
-                return this.#updateXrayNodeConfig(node, { topologyManaged: !!cascade, allowedStatuses: undefined, fenced: true });
+            const { withNode } = require('./rebuildLocks');
+            const { withNodeWrite, nodeWriteVerifier, assertRelaySetupAllowed } = require('./rebuildRelayRoleGuard');
+            const manages = async current => !!(current.cascadeRole && current.cascadeRole !== 'standalone'
+                || await require('../models/cascadeLinkModel').exists({
+                    $or: [{ portalNode: current._id }, { bridgeNode: current._id }], active: true,
+                }));
+            const sync = (current, topologyManaged) => this.#updateXrayNodeConfig(current, {
+                topologyManaged, allowedStatuses: undefined, fenced: true,
             });
+            const syncUnderApply = async (current, verify) => {
+                if (!current || current.type !== 'xray') return false;
+                const managed = await manages(current);
+                if (!managed) await assertRelaySetupAllowed(current);
+                await verify();
+                return sync(current, managed);
+            };
+            // Enable/Restart already own Apply and the node lock and supplied
+            // the fresh, fenced card. Do not try to acquire Apply underneath it.
+            const verifyRebuildWrite = nodeWriteVerifier(node);
+            if (verifyRebuildWrite) return syncUnderApply(node, verifyRebuildWrite);
+
+            // The user-only path keeps the per-node lock. Re-read here so a
+            // queued standalone snapshot cannot overwrite a newly owned relay.
+            const managed = await withNode(node._id, async () => {
+                const current = await HyNode.findById(node._id).read('primary').readConcern('majority').maxTimeMS(5000);
+                if (!current || current.type !== 'xray') return { result: false };
+                return await manages(current) ? { result: await sync(current, true) } : null;
+            });
+            if (managed) return managed.result;
+            // Standalone Sync can upload a complete profile. Release the local
+            // lock before entering the normal Apply -> node acquisition order.
+            return await withNodeWrite(node._id, (_, current, verify) => syncUnderApply(current, verify)) ?? false;
         }
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         const writerEnv = Object.freeze({ ...process.env });
@@ -1163,7 +1188,7 @@ class SyncService {
             const nodes = await HyNode.find({ active: true });
             
             // Parallel sync with concurrency limit
-            const CONCURRENCY = 5;
+            const CONCURRENCY = require('./rebuildMode').isRebuildEnabled() ? 1 : 5;
             for (let i = 0; i < nodes.length; i += CONCURRENCY) {
                 const batch = nodes.slice(i, i + CONCURRENCY);
                 await Promise.allSettled(

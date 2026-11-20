@@ -332,6 +332,8 @@
     "cascadeRole": "Cascade Role",
     "cascadeRoleHint": "Defines the node's role in the cascade topology. Bridge nodes are hidden from user subscriptions.",
     "rebuildRoleBlocked": "Remove L2TP before changing the role. {counts}",
+    "rebuildNodeWriteBlocked": "Remove L2TP before changing the relay identity or running this operation. {counts}",
+    "rebuildNodeAccountsPending": "A relay account change has an unresolved outcome. Node changes are blocked.",
     "rebuildRelayCounts": "L2TP accounts: {accounts}; active PPP/L2TP sessions: {sessions}.",
     "rebuildCountUnavailable": "unconfirmed",
     "rebuildRemoveOpen": "Review L2TP removal",

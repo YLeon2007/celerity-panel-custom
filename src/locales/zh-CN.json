@@ -331,6 +331,8 @@
     "cascadeRole": "级联角色",
     "cascadeRoleHint": "定义节点在级联拓扑中的角色。桥接节点会从用户订阅中隐藏。",
     "rebuildRoleBlocked": "更改角色前请先移除 L2TP。{counts}",
+    "rebuildNodeWriteBlocked": "更改中继节点标识或执行此操作前，请先移除 L2TP。{counts}",
+    "rebuildNodeAccountsPending": "中继节点账户变更结果尚未确认，节点变更已被阻止。",
     "rebuildRelayCounts": "L2TP 账户数：{accounts}；活跃 PPP/L2TP 会话数：{sessions}。",
     "rebuildCountUnavailable": "未确认",
     "rebuildRemoveOpen": "查看 L2TP 移除预览",

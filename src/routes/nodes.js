@@ -13,7 +13,15 @@ const { requireScope } = require('../middleware/auth');
 const { invalidateNodesCache } = require('../utils/helpers');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
-const { saveNodeRole, describeRoleError } = require('../services/rebuildRelayRoleGuard');
+const { withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../services/rebuildRelayRoleGuard');
+
+function sendNodeWriteConflict(res, error) {
+    const conflict = describeRoleError(error, res.locals.t);
+    if (!conflict) return false;
+    const { status, message, ...details } = conflict;
+    res.status(status).json({ error: message, ...details });
+    return true;
+}
 
 function hasSshCredentials(node) {
     return !!(node?.ssh?.password || node?.ssh?.privateKey);
@@ -60,83 +68,92 @@ async function startNodeRuntime(node) {
 
 async function setNodeActive(req, res, active) {
     try {
-        const node = await HyNode.findById(req.params.id);
-        if (!node) {
-            return res.status(404).json({ error: 'Node not found' });
-        }
-
-        if (!active) {
-            const runtime = await disableNodeRuntime(node);
-            const disabledNode = await HyNode.findByIdAndUpdate(
-                req.params.id,
-                { $set: { active: false, status: 'offline', onlineUsers: 0 } },
-                { new: true }
-            );
-
-            await invalidateNodesCache();
-
-            const warning = runtime.success === false
-                ? runtimeErrorMessage(runtime, 'Runtime stop failed')
-                : undefined;
-
-            if (warning) {
-                logger.warn(`[Nodes API] Disabled node ${node.name}, runtime stop warning: ${warning}`);
-            } else {
-                logger.info(`[Nodes API] Disabled node ${node.name}`);
+        const reply = (status, body) => ({ status, body });
+        const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
+            const node = current ?? await HyNode.findById(req.params.id);
+            if (!node) {
+                return reply(404, { error: 'Node not found' });
             }
 
-            return res.json({
-                success: true,
-                node: disabledNode,
-                runtime,
-                ...(warning ? { warning } : {}),
-            });
-        }
+            if (!active) {
+                const runtime = await disableNodeRuntime(node);
+                await verify();
+                const disabledNode = await HyNode.findByIdAndUpdate(
+                    req.params.id,
+                    { $set: { active: false, status: 'offline', onlineUsers: 0 } },
+                    { new: true, ...options }
+                );
 
-        let runtime;
-        try {
-            runtime = await startNodeRuntime(node);
-        } catch (error) {
-            runtime = { success: false, attempted: true, error: error.message };
-        }
+                await invalidateNodesCache();
 
-        if (!runtime.success) {
-            const errorMessage = runtimeErrorMessage(runtime, 'Node startup could not be confirmed');
-            const failedNode = await HyNode.findByIdAndUpdate(
-                req.params.id,
-                {
-                    $set: {
-                        active: false,
-                        status: 'offline',
-                        onlineUsers: 0,
-                        lastError: errorMessage,
+                const warning = runtime.success === false
+                    ? runtimeErrorMessage(runtime, 'Runtime stop failed')
+                    : undefined;
+
+                if (warning) {
+                    logger.warn(`[Nodes API] Disabled node ${node.name}, runtime stop warning: ${warning}`);
+                } else {
+                    logger.info(`[Nodes API] Disabled node ${node.name}`);
+                }
+
+                return reply(200, {
+                    success: true,
+                    node: disabledNode,
+                    runtime,
+                    ...(warning ? { warning } : {}),
+                });
+            }
+
+            let runtime;
+            try {
+                runtime = await startNodeRuntime(node);
+            } catch (error) {
+                if (describeRoleError(error, res.locals.t)) throw error;
+                runtime = { success: false, attempted: true, error: error.message };
+            }
+
+            if (!runtime.success) {
+                const errorMessage = runtimeErrorMessage(runtime, 'Node startup could not be confirmed');
+                await verify();
+                const failedNode = await HyNode.findByIdAndUpdate(
+                    req.params.id,
+                    {
+                        $set: {
+                            active: false,
+                            status: 'offline',
+                            onlineUsers: 0,
+                            lastError: errorMessage,
+                        },
                     },
-                },
-                { new: true }
+                    { new: true, ...options }
+                );
+
+                await invalidateNodesCache();
+
+                logger.warn(`[Nodes API] Enable node ${node.name} failed: ${errorMessage}`);
+                return reply(500, {
+                    error: errorMessage,
+                    node: failedNode,
+                    runtime,
+                });
+            }
+
+            await verify();
+            const enabledNode = await HyNode.findByIdAndUpdate(
+                req.params.id,
+                { $set: { active: true, status: node.type === 'virtual' ? node.status : 'online', lastError: '' } },
+                { new: true, ...options }
             );
 
             await invalidateNodesCache();
 
-            logger.warn(`[Nodes API] Enable node ${node.name} failed: ${errorMessage}`);
-            return res.status(500).json({
-                error: errorMessage,
-                node: failedNode,
-                runtime,
-            });
-        }
+            logger.info(`[Nodes API] Enabled node ${node.name}`);
 
-        const enabledNode = await HyNode.findByIdAndUpdate(
-            req.params.id,
-            { $set: { active: true, status: node.type === 'virtual' ? node.status : 'online', lastError: '' } },
-            { new: true }
-        );
-
-        await invalidateNodesCache();
-
-        logger.info(`[Nodes API] Enabled node ${node.name}`);
-
-        res.json({ success: true, node: enabledNode, runtime });
+            return reply(200, { success: true, node: enabledNode, runtime });
+        }, { requireRemoval: true });
+        return result ? res.status(result.status).json(result.body) : res.status(404).json({ error: 'Node not found' });
     } catch (error) {
+        if (sendNodeWriteConflict(res, error)) return;
         logger.error(`[Nodes API] ${active ? 'Enable' : 'Disable'} node error: ${error.message}`);
         res.status(500).json({ error: error.message });
     }
@@ -396,45 +413,43 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         // findByIdAndUpdate bypasses pre('validate') hooks even with runValidators,
         // so enforce type-specific invariants explicitly here. We need the existing
         // doc to know the resulting type when only one of {type,virtual} is sent.
-        const existing = await HyNode.findById(req.params.id).select('type ip virtual').lean();
-        if (!existing) {
-            return res.status(404).json({ error: 'Node not found' });
-        }
-        const nextType = updates.type || existing.type;
-        const nextVirtual = updates.virtual !== undefined ? updates.virtual : existing.virtual;
-        const nextIp = updates.ip !== undefined ? updates.ip : existing.ip;
-
-        if (nextType === 'virtual') {
-            const v = nextVirtual || {};
-            if (v.selectMode === 'group' && !v.sourceGroup) {
-                return res.status(400).json({ error: 'Virtual node (group): sourceGroup required' });
+        const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
+            const existing = current ?? await HyNode.findById(req.params.id).select('type ip virtual').lean();
+            if (!existing) {
+                return null;
             }
-            if (v.selectMode !== 'group' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
-                return res.status(400).json({ error: 'Virtual node (manual): at least one source required' });
+            const nextType = updates.type || existing.type;
+            const nextVirtual = updates.virtual !== undefined ? updates.virtual : existing.virtual;
+            const nextIp = updates.ip !== undefined ? updates.ip : existing.ip;
+
+            if (nextType === 'virtual') {
+                const v = nextVirtual || {};
+                if (v.selectMode === 'group' && !v.sourceGroup) {
+                    return { invalid: 'Virtual node (group): sourceGroup required' };
+                }
+                if (v.selectMode !== 'group' && (!Array.isArray(v.sources) || v.sources.length === 0)) {
+                    return { invalid: 'Virtual node (manual): at least one source required' };
+                }
+                // Virtual nodes carry no IP — clear any leftover from a prior type.
+                updates.ip = null;
+            } else if (!nextIp) {
+                return { invalid: `Node type ${nextType} requires ip` };
             }
-            // Virtual nodes carry no IP — clear any leftover from a prior type.
-            updates.ip = null;
-        } else if (!nextIp) {
-            return res.status(400).json({ error: `Node type ${nextType} requires ip` });
-        }
 
-        const node = await saveNodeRole(req.params.id, updates.cascadeRole, options => HyNode.findByIdAndUpdate(
-            req.params.id,
-            { $set: updates },
-            { new: true, ...options }
-        ).select('-ssh.password -ssh.privateKey').populate('groups', 'name color'));
-
-        if (!node) {
-            return res.status(404).json({ error: 'Node not found' });
-        }
-
-        // SSH settings are host-local: a move must not update siblings at either IP.
-        if (existing.ip && existing.ip === node.ip && Object.keys(sshUpdates).length) {
-            await HyNode.updateMany(
-                { ip: existing.ip, _id: { $ne: node._id } },
-                { $set: sshUpdates }
-            );
-        }
+            await assertNodeEditAllowed(current, updates, sshUpdates);
+            await verify();
+            const node = await HyNode.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, ...options })
+                .select('-ssh.password -ssh.privateKey').populate('groups', 'name color');
+            // SSH is host-local. Never propagate a move at either address.
+            if (existing.ip && existing.ip === node?.ip && Object.keys(sshUpdates).length) {
+                await verify();
+                await HyNode.updateMany({ ip: existing.ip, _id: { $ne: node._id } }, { $set: sshUpdates }, options);
+            }
+            return { node };
+        });
+        if (result?.invalid) return res.status(400).json({ error: result.invalid });
+        const node = result?.node;
+        if (!node) return res.status(404).json({ error: 'Node not found' });
 
         // Auto-push config to the node if any config-affecting field changed.
         require('../services/syncService').schedulePush(node._id, updates);
@@ -446,11 +461,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         
         res.json(node);
     } catch (error) {
-        const conflict = describeRoleError(error, res.locals.t);
-        if (conflict) {
-            const { status, message, ...details } = conflict;
-            return res.status(status).json({ error: message, ...details });
-        }
+        if (sendNodeWriteConflict(res, error)) return;
         // Casting and persistence errors can contain the submitted values.
         logger.error('[Nodes API] Update node failed');
         res.status(500).json({ error: 'Failed to update node' });
@@ -462,18 +473,16 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
  */
 router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
-        const node = await HyNode.findByIdAndDelete(req.params.id);
-        
-        if (!node) {
-            return res.status(404).json({ error: 'Node not found' });
-        }
-        
-        // Удаляем ноду из списка пользователей
-        await HyUser.updateMany(
-            { nodes: node._id },
-            { $pull: { nodes: node._id } }
-        );
-        
+        const node = await withNodeWrite(req.params.id, async (options, _current, verify) => {
+            const deleted = await HyNode.findByIdAndDelete(req.params.id, options);
+            if (deleted) {
+                await verify();
+                await HyUser.updateMany({ nodes: deleted._id }, { $pull: { nodes: deleted._id } }, options);
+            }
+            return deleted;
+        }, { requireRemoval: true });
+        if (!node) return res.status(404).json({ error: 'Node not found' });
+
         // Инвалидируем кэш
         await invalidateNodesCache();
         
@@ -481,6 +490,7 @@ router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
         
         res.json({ success: true, message: 'Нода удалена' });
     } catch (error) {
+        if (sendNodeWriteConflict(res, error)) return;
         logger.error(`[Nodes API] Delete error: ${error.message}`);
         res.status(500).json({ error: error.message });
     }
@@ -735,6 +745,7 @@ router.post('/:id/update-config', requireScope('nodes:write'), async (req, res) 
             res.status(500).json({ error: 'Не удалось обновить конфиг' });
         }
     } catch (error) {
+        if (sendNodeWriteConflict(res, error)) return;
         res.status(500).json({ error: error.message });
     }
 });
@@ -759,56 +770,63 @@ router.post('/:id/update-config', requireScope('nodes:write'), async (req, res) 
  */
 router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
     try {
-        const node = await HyNode.findById(req.params.id);
+        const reply = (status, body) => ({ status, body });
+        const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
+            const node = current ?? await HyNode.findById(req.params.id);
 
-        if (!node) {
-            return res.status(404).json({ error: 'Node not found' });
-        }
+            if (!node) {
+                return reply(404, { error: 'Node not found' });
+            }
 
-        if (!node.ssh?.password && !node.ssh?.privateKey) {
-            return res.status(400).json({ error: 'SSH credentials not configured for this node' });
-        }
+            if (!node.ssh?.password && !node.ssh?.privateKey) {
+                return reply(400, { error: 'SSH credentials not configured for this node' });
+            }
 
-        const {
-            installHysteria  = true,
-            setupPortHopping = true,
-            restartService   = true,
-        } = req.body || {};
+            const {
+                installHysteria  = true,
+                setupPortHopping = true,
+                restartService   = true,
+            } = req.body || {};
 
-        if (node.type === 'virtual') {
-            return res.status(400).json({ success: false, error: 'Virtual nodes have no remote server to set up' });
-        }
+            if (node.type === 'virtual') {
+                return reply(400, { success: false, error: 'Virtual nodes have no remote server to set up' });
+            }
 
-        logger.info(`[Nodes API] Auto-setup started for ${node.name} (${node.ip}) via API`);
+            logger.info(`[Nodes API] Auto-setup started for ${node.name} (${node.ip}) via API`);
 
-        const nodeSetup = require('../services/nodeSetup');
+            const nodeSetup = require('../services/nodeSetup');
 
-        let result;
-        if (node.type === 'xray') {
-            result = await nodeSetup.setupXrayNode(node, { restartService });
-        } else {
-            result = await nodeSetup.setupNode(node, {
-                installHysteria,
-                setupPortHopping,
-                restartService,
-            });
-        }
+            let result;
+            if (node.type === 'xray') {
+                result = await nodeSetup.setupXrayNode(node, { restartService });
+            } else {
+                result = await nodeSetup.setupNode(node, {
+                    installHysteria,
+                    setupPortHopping,
+                    restartService,
+                });
+            }
 
-        if (result.success) {
-            const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-            if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-            await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields });
-            await invalidateNodesCache();
-            logger.info(`[Nodes API] Auto-setup completed for ${node.name} (${node.type})`);
-            res.json({ success: true, logs: result.logs });
-        } else {
-            await HyNode.findByIdAndUpdate(req.params.id, {
-                $set: { status: 'error', lastError: result.error, healthFailures: 0 },
-            });
-            logger.warn(`[Nodes API] Auto-setup failed for ${node.name}: ${result.error}`);
-            res.status(500).json({ success: false, error: result.error, logs: result.logs });
-        }
+            if (result.success) {
+                const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
+                if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
+                await verify();
+                await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields }, options);
+                await invalidateNodesCache();
+                logger.info(`[Nodes API] Auto-setup completed for ${node.name} (${node.type})`);
+                return reply(200, { success: true, logs: result.logs });
+            } else {
+                await verify();
+                await HyNode.findByIdAndUpdate(req.params.id, {
+                    $set: { status: 'error', lastError: result.error, healthFailures: 0 },
+                }, options);
+                logger.warn(`[Nodes API] Auto-setup failed for ${node.name}: ${result.error}`);
+                return reply(500, { success: false, error: result.error, logs: result.logs });
+            }
+        }, { fullSetup: true });
+        return result ? res.status(result.status).json(result.body) : res.status(404).json({ error: 'Node not found' });
     } catch (error) {
+        if (sendNodeWriteConflict(res, error)) return;
         logger.error(`[Nodes API] Setup error: ${error.message}`);
         res.status(500).json({ error: error.message });
     }
