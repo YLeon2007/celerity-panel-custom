@@ -1,6 +1,7 @@
 'use strict';
 
 const { readFileSync } = require('node:fs');
+const { deflateSync } = require('node:zlib');
 const { join } = require('node:path');
 const { randomBytes } = require('node:crypto');
 const { isIPv4 } = require('node:net');
@@ -111,11 +112,12 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     const { ip, ssh: { port, username } = {} } = node;
     requireThat(typeof ip === 'string' && ip.length > 0 && integer(port, 1, 65535)
         && username === 'root', 'SSH_ENDPOINT_INVALID');
-    const script = readFileSync(join(__dirname, 'rebuildRelayDirectHost.py'), 'utf8');
-    // The source is static; the entire request, including config and credentials,
-    // travels in stdin only, never in SSH command text, environment, or SFTP paths.
-    // No sudo I/O logging path for the credential-bearing stdin.
-    const command = limits => `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script.replace(/'/g, `'"'"'`)}'`;
+    // Keep the static helper below Linux's per-argument limit, including the
+    // remote login shell's -c argument. Only local source enters this envelope;
+    // the entire request, including secrets, still travels in stdin.
+    const source = deflateSync(readFileSync(join(__dirname, 'rebuildRelayDirectHost.py'))).toString('base64');
+    const script = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("${source}")),"<DIRECT host>","exec"))`;
+    const command = limits => `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script}'`;
     const ssh = new (SSH || require('./nodeSSH'))(node, {
         expectedHostKeySha256: pin, expectedEndpoint: { ip, port, username },
     });
