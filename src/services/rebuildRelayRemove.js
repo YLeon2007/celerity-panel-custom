@@ -5,6 +5,7 @@ const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
 const { canInstallRelay } = require('./rebuildRelayAuthorization');
 const { read } = require('./rebuildRelayBackendStore');
+const { readAccountCount, readSessionCensus } = require('./rebuildRelayCounts');
 const { readAppliedTransit } = require('./rebuildAppliedLink');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
@@ -15,6 +16,14 @@ const CHANGED = 'REBUILD_L2TP_REMOVE_CHANGED';
 const UNKNOWN = 'REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN';
 const FINISH_UNKNOWN = 'REBUILD_L2TP_REMOVE_FINISH_OUTCOME_UNKNOWN';
 const CLEANUP = 'REBUILD_L2TP_REMOVED_CLEANUP_FAILED';
+const CONFIRM = 'REBUILD_L2TP_REMOVE_CONFIRMATION_REQUIRED';
+const PREVIEW_CHANGED = 'REBUILD_L2TP_REMOVE_PREVIEW_CHANGED';
+const COUNT_UNAVAILABLE = 'REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE';
+const SESSIONS_BUSY = 'REBUILD_L2TP_REMOVE_SESSIONS_BUSY';
+const PREVIEW_TTL_MS = 120_000;
+// Private proof accompanying the immutable public estimate. Neither the
+// installation receipt nor the host census is sent to the browser.
+const previews = new WeakMap();
 const safe = error => fail(typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$(?!\n)/.test(error.code)
     ? error.code : 'REBUILD_L2TP_REMOVE_FAILED');
 const write = { writeConcern: { w: 'majority' }, timestamps: false };
@@ -73,13 +82,20 @@ function ownedAccount(rows, state, nodeId) {
 }
 
 function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
-    return async function removeRelay(id) {
+    const run = async (id, phase, estimate) => {
         if (typeof id !== 'string' || id.length !== 24 || !/^[a-f0-9]{24}$/.test(id)) throw fail('REBUILD_INVALID_REQUEST');
         const machineId = env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
         const authorize = () => {
             if (!canInstallRelay(env, id) || env.C3_REBUILD_L2TP_RELAY_MACHINE_ID !== machineId) throw fail(DISABLED);
         };
         authorize();
+        const proof = phase === 'confirm' ? previews.get(estimate) : undefined;
+        const checkPreview = () => {
+            if (phase === 'confirm' && (!proof || estimate.nodeId !== id || performance.now() >= proof.expires)) {
+                throw fail(CONFIRM);
+            }
+        };
+        checkPreview();
         let primary, removed = false;
         try {
             return await locks.run(verifyLock => withNode(id, async () => {
@@ -99,8 +115,41 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     const network = installedNetwork(state, id, machineId);
                     const User = L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel');
                     const users = () => read(User.find({ relayNode: id }).select('+passwordEncrypted').limit(2));
+                    if (phase === 'preview') {
+                        const accountCount = await readAccountCount(User, id);
+                        const input = { nodeId: id, backupId: state.backupId, network };
+                        await authority();
+                        let census = null;
+                        try {
+                            remote = createRelayDirect({ node, env });
+                            census = await readSessionCensus(remote, input);
+                        } catch { /* Refusal or unavailable driver, not zero. */ }
+                        finally {
+                            if (typeof remote?.close === 'function') {
+                                try { await remote.close(); } catch { census = null; }
+                            }
+                            remote = undefined;
+                        }
+                        let account;
+                        if (accountCount === 1 && census?.activeSessions === 0) {
+                            try { account = ownedAccount(await users(), state, id); } catch { /* No removal authority. */ }
+                        }
+                        const [currentNode, currentState] = await Promise.all([getNode(),
+                            read(State.findOne({ _id: state._id, node: id }).select(stateFields)),
+                        ]);
+                        const stateFence = exact(state, stateKeys);
+                        if (!equal(currentNode, node) || !currentState || !equal(exact(currentState, stateKeys), stateFence)) throw fail(CHANGED);
+                        await authority();
+                        const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions: census?.activeSessions ?? null,
+                            confirmable: !!account });
+                        if (account) previews.set(snapshot, { node, stateFence, accountFence: exact(account, accountKeys),
+                            census: census.census, expires: performance.now() + PREVIEW_TTL_MS });
+                        return snapshot;
+                    }
                     const account = ownedAccount(await users(), state, id);
                     const accountFence = exact(account, accountKeys);
+                    if (proof && (!equal(proof.node, node) || !equal(proof.stateFence, exact(state, stateKeys))
+                        || !equal(proof.accountFence, accountFence))) throw fail(PREVIEW_CHANGED);
                     const checkInventory = async (expected, expectAccount) => {
                         const [currentNode, currentState, currentUsers] = await Promise.all([
                             getNode(), read(State.findOne({ _id: state._id, node: id }).select(stateFields)), users(),
@@ -114,17 +163,32 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     // Only a confirmed Apply receipt can classify the physical
                     // MAIN listener as transport. A PUT can change draft fields.
                     const transit = Link && await readAppliedTransit(Link, id);
+                    if (proof) {
+                        const accountCount = await readAccountCount(User, id);
+                        if (accountCount === null) throw fail(COUNT_UNAVAILABLE);
+                        if (accountCount !== estimate.accountCount) throw fail(PREVIEW_CHANGED);
+                        checkPreview();
+                    }
                     await authority();
                     remote = createRelayDirect({ node, env });
                     if (typeof remote?.prepareRemove !== 'function' || typeof remote.remove !== 'function' || typeof remote.close !== 'function') {
                         throw fail('REBUILD_L2TP_REMOVE_BACKEND_UNAVAILABLE');
                     }
+                    if (proof) {
+                        const census = await readSessionCensus(remote, { nodeId: id, backupId: state.backupId, network });
+                        if (!census) throw fail(COUNT_UNAVAILABLE);
+                        if (census.activeSessions !== 0) throw fail(SESSIONS_BUSY);
+                        if (census.census !== proof.census) throw fail(PREVIEW_CHANGED);
+                        checkPreview();
+                    }
                     // No saved MAIN is sent or rebuilt here. The direct driver
-                    // prepares subtraction against the current physical profiles.
+                    // prepares subtraction against the current physical profiles
+                    // and still owns the physical PPP-busy checks through remove.
                     const plan = await remote.prepareRemove({ nodeId: id, backupId: state.backupId, network,
                         ...(transit && { transit }) });
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
                     await checkInventory(state, true);
+                    checkPreview();
 
                     const transition = { status: 'removing', desiredState: 'absent', updatedAt: new Date() };
                     const reservation = { ...state, ...transition };
@@ -173,6 +237,12 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
             // Do not allow lock/transport teardown to reclassify settlement.
             throw primary ?? (removed ? fail(CLEANUP) : safe(error));
         }
+    };
+    return {
+        previewRemoveRelay: id => run(id, 'preview'),
+        confirmRemoveRelay: (id, estimate) => run(id, 'confirm', estimate),
+        // Trusted lifecycle caller only. The panel always uses confirmRemoveRelay.
+        removeRelay: id => run(id, 'internal'),
     };
 }
 

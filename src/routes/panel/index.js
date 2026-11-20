@@ -14,6 +14,7 @@ const {
 } = require('../../modules/l2tpActiveHostProvider');
 const { checkIpWhitelist, requireAuth, requireOnboarding, render } = require('./helpers');
 const { issuePanelCsrfToken, requirePanelCsrf } = require('./csrf');
+const { canPreviewRemoval, submitRemoval, cancelRemoval } = require('./rebuildRelayRemove');
 
 const authRoutes = require('./auth');
 const wizardRoutes = require('./wizard');
@@ -66,6 +67,10 @@ function createPanelRouter({
     router.use('/', requireAuth, wizardRoutes);
 
     // All other routes require authentication and completed onboarding
+    if (rebuildEnabled) {
+        router.get('/nodes/:id', requireAuth, requireOnboarding, (req, res, next) =>
+            canPreviewRemoval(req) ? injectedL2tpRateLimiter(req, res, next) : next());
+    }
     router.use('/', requireAuth, requireOnboarding, nodesRoutes);
     router.use('/', requireAuth, requireOnboarding, usersRoutes);
     router.use('/', requireAuth, requireOnboarding, settingsRoutes);
@@ -79,7 +84,9 @@ function createPanelRouter({
         router.post('/rebuild/relays/:id/l2tp/install', requireAuth, requireOnboarding,
             requirePanelCsrf, injectedL2tpRateLimiter, require('./rebuildRelayInstall'));
         router.post('/rebuild/relays/:id/l2tp/remove', requireAuth, requireOnboarding,
-            requirePanelCsrf, injectedL2tpRateLimiter, require('./rebuildRelayRemove'));
+            requirePanelCsrf, injectedL2tpRateLimiter, submitRemoval);
+        router.post('/rebuild/relays/:id/l2tp/remove/cancel', requireAuth, requireOnboarding,
+            requirePanelCsrf, injectedL2tpRateLimiter, cancelRemoval);
         return router;
     }
 

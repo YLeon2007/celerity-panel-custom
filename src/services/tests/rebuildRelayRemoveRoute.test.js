@@ -42,16 +42,13 @@ test('mounted rebuild panel remove shares auth, onboarding, CSRF and install lim
     t.after(() => { if (previous === undefined) delete process.env.C3_REBUILD_ENABLED; else process.env.C3_REBUILD_ENABLED = previous; });
     t.after(() => require.cache[require.resolve('../sshPoolService')]?.exports.closeAll());
     const Settings = require('../../models/settingsModel');
-    let completed = false, limit = 0, error;
+    let completed = false, limit = 0, deny = false;
     const calls = [];
     t.mock.method(Settings, 'get', async () => ({ deployment: { completed } }));
     t.mock.method(serviceModule, 'createRebuildService', () => ({
         async installRelay(nodeId) { calls.push(['install', nodeId]); return { status: 'installed' }; },
-        async removeRelay(nodeId) {
-            calls.push(['remove', nodeId]);
-            if (error) throw error;
-            return { executionMode: 'rebuild', status: 'not_installed', nodeId };
-        },
+        async removeRelay() { assert.fail('unconfirmed service must never be called by the router'); },
+        async confirmRemoveRelay() { assert.fail('no preview ticket was issued'); },
     }));
     const { createPanelRouter } = require('../../routes/panel');
     const { invalidateOnboardingCache } = require('../../routes/panel/helpers');
@@ -60,7 +57,7 @@ test('mounted rebuild panel remove shares auth, onboarding, CSRF and install lim
     const app = express();
     app.use('/panel', createPanelRouter({
         l2tpModuleEntry: { registerRoutes: () => assert.fail('legacy L2TP must not be registered') },
-        l2tpRateLimiter(req, res, next) { if (++limit === 5) return res.status(429).end(); return next(); },
+        l2tpRateLimiter(req, res, next) { limit++; if (deny) return res.status(429).end(); return next(); },
     }));
     app.use('/api/cascade', routerForRebuild({ service: {}, Node: {}, Link: {} }));
     const session = { authenticated: true };
@@ -83,18 +80,18 @@ test('mounted rebuild panel remove shares auth, onboarding, CSRF and install lim
     assert.equal((await request(app, `/panel${route}/uninstall`, authorized)).status, 404);
     assert.equal(limit, 0);
     assert.deepEqual(calls, []);
+    assert.equal((await request(app, url, authorized)).status, 409, 'CSRF alone must not permit Remove');
+    assert.deepEqual(calls, []);
     assert.equal((await request(app, `${url}?node=other`, authorized)).status, 400);
     assert.equal((await request(app, url, { ...authorized, body: { backupId: 'injection' } })).status, 400);
     assert.equal((await request(app, `/panel${route}/install`, authorized)).status, 200);
-    const success = await request(app, url, { session, body: { _csrf: csrf } });
-    assert.equal(success.status, 200);
-    assert.deepEqual(JSON.parse(success.body), { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
+    const forged = await request(app, url, { session, body: { _csrf: csrf, decision: 'confirm', ticket: 'a'.repeat(64) } });
+    assert.equal(forged.status, 409);
+    assert.deepEqual(JSON.parse(forged.body), { error: { code: 'REBUILD_L2TP_REMOVE_CONFIRMATION_REQUIRED' } });
+    deny = true;
     assert.equal((await request(app, url, authorized)).status, 429);
-    assert.deepEqual(calls, [['install', id], ['remove', id]]);
-    error = Object.assign(new Error('private fixture details'), { code: 'REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN' });
-    const unknown = await request(app, url, authorized);
-    assert.equal(unknown.status, 409);
-    assert.deepEqual(JSON.parse(unknown.body), { error: { code: error.code } });
+    assert.deepEqual(calls, [['install', id]]);
+    deny = false;
     assert.equal((await request(app, url.replace(id, `${id}%0A`), authorized)).status, 400);
     process.env.C3_REBUILD_ENABLED = 'false';
     const classic = express();

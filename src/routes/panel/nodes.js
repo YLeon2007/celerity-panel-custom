@@ -23,6 +23,8 @@ const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { relayRoleBlock, saveNodeRole, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
+const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
+const { canPreviewRemoval, issueRemovalTicket } = require('./rebuildRelayRemove');
 
 const {
     render,
@@ -574,13 +576,25 @@ router.get('/nodes/:id', async (req, res) => {
         // PEM replaced by ***SET*** (or empty). Sibling fields are unchanged.
         const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
         renderNode.xray = sanitizeXrayForRender(node.xray);
-        const roleBlock = isRebuildEnabled() && node.cascadeRole === 'relay' ? await relayRoleBlock(node._id) : null;
+        const preview = canPreviewRemoval(req);
+        if (preview) res.set('Cache-Control', 'no-store');
+        const roleBlock = isRebuildEnabled() && node.cascadeRole === 'relay'
+            ? await relayRoleBlock(node._id, preview ? id => require('../../services/rebuildService').createRebuildService().previewRemoveRelay(id) : null)
+            : null;
+        const removal = preview && roleBlock?.counts ? {
+            summary: res.locals.t('nodes.rebuildRemoveConfirmSummary').replace('{counts}', formatRelayCounts(roleBlock.counts, res.locals.t)),
+            ticket: issueRemovalTicket(req, roleBlock.estimate),
+            blocked: roleBlock.counts.activeSessions > 0 ? 'nodes.rebuildRemoveBusy'
+                : (roleBlock.counts.activeSessions === null || roleBlock.counts.accountCount === null)
+                    ? 'nodes.rebuildRemoveCountUnavailable' : 'nodes.rebuildRemoveNotOwned',
+        } : null;
 
         render(res, 'node-form', {
             title: `${res.locals.t('nodes.editNode')}: ${node.name}`,
             page: 'nodes',
             node: renderNode,
             l2tpRoleBlock: roleBlock ? describeRoleError(roleBlock, res.locals.t).message : '',
+            rebuildRemoval: removal,
             nodeConfigPreview,
             groups,
             candidateNodes,

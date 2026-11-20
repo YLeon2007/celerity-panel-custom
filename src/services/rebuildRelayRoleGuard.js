@@ -3,6 +3,7 @@
 const { isRebuildEnabled } = require('./rebuildMode');
 const { makeLocks, withNode } = require('./rebuildLocks');
 const { t: translate } = require('../middleware/i18n');
+const { readAccountCount, formatRelayCounts } = require('./rebuildRelayCounts');
 
 const BLOCKED = 'REBUILD_L2TP_ROLE_BLOCKED';
 const UNAVAILABLE = 'REBUILD_L2TP_ROLE_STATE_UNAVAILABLE';
@@ -16,7 +17,7 @@ const reasons = Object.freeze({
 const fail = code => Object.assign(new Error(code), { code });
 const primary = query => query.read('primary').readConcern('majority').maxTimeMS(5000);
 
-async function relayRoleBlock(nodeId) {
+async function relayRoleBlock(nodeId, preview) {
     let state;
     try {
         const State = require('../modules/relay-l2tp/models/relayL2tpStateModel');
@@ -28,15 +29,17 @@ async function relayRoleBlock(nodeId) {
     // contradictory install intent or an unknown/nonterminal status pass.
     if (!state || (state.status === 'not_installed' && ['absent', 'not_installed', undefined].includes(state.desiredState))) return null;
 
-    // Panel account records (including disabled/pending ones), NOT live PPP
-    // credentials or sessions. Rebuild has no relay-scoped session producer.
-    let accountCount = null;
+    // Role writes never connect to the host just to decide a refusal. The
+    // authenticated panel preview may supply a live estimate for display only.
+    let estimate;
     try {
-        const User = require('../modules/relay-l2tp/models/l2tpUserModel');
-        const count = await primary(User.countDocuments({ relayNode: nodeId }));
-        if (Number.isSafeInteger(count) && count >= 0) accountCount = count;
-    } catch { /* Keep blocking even if the count could not be read. */ }
-    return Object.assign(fail(BLOCKED), { accountCount, activeSessions: null });
+        if (preview) estimate = await preview(String(nodeId));
+    } catch { /* Keep blocking on a busy, unowned, or unavailable preview. */ }
+    const counts = estimate ?? Object.freeze({
+        accountCount: await readAccountCount(require('../modules/relay-l2tp/models/l2tpUserModel'), nodeId),
+        activeSessions: null,
+    });
+    return Object.assign(fail(BLOCKED), { counts, estimate });
 }
 
 async function saveNodeRole(nodeId, requestedRole, persist, { expectedRole } = {}) {
@@ -62,9 +65,9 @@ async function saveNodeRole(nodeId, requestedRole, persist, { expectedRole } = {
 function describeRoleError(error, t = translate) {
     const code = error?.code;
     if (code === BLOCKED) {
-        const key = error.accountCount === null ? 'nodes.rebuildRoleCountUnavailable' : 'nodes.rebuildRoleBlocked';
-        return { status: 409, code, message: t(key).replace('{count}', String(error.accountCount)),
-            accountCount: error.accountCount, activeSessions: null };
+        const { accountCount, activeSessions } = error.counts;
+        return { status: 409, code, message: t('nodes.rebuildRoleBlocked').replace('{counts}', formatRelayCounts(error.counts, t)),
+            accountCount, activeSessions };
     }
     if (!Object.hasOwn(reasons, code)) return null;
     return { status: code === UNAVAILABLE ? 503 : 409, code, message: t(reasons[code]) };

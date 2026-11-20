@@ -187,6 +187,23 @@ Object.assign(locals, {
                 <a href="/panel/nodes" class="btn"><%= t('common.cancel') %></a>
             </div>
         </form>
+        <% if (typeof rebuildRemoval !== 'undefined' && rebuildRemoval) { %>
+        <details class="form-section">
+            <summary><%= t('nodes.rebuildRemoveOpen') %></summary>
+            <p><%= rebuildRemoval.summary %></p>
+            <% if (rebuildRemoval.ticket && typeof csrfToken !== 'undefined' && csrfToken) { %>
+                <form method="POST" action="/panel/rebuild/relays/<%= node._id %>/l2tp/remove">
+                    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                    <input type="hidden" name="ticket" value="<%= rebuildRemoval.ticket %>">
+                    <p><%= t('nodes.rebuildRemoveWarning') %></p>
+                    <button type="submit" name="decision" value="cancel" formaction="/panel/rebuild/relays/<%= node._id %>/l2tp/remove/cancel" class="btn"><%= t('common.cancel') %></button>
+                    <button type="submit" name="decision" value="confirm" class="btn btn-danger"><%= t('nodes.rebuildRemoveConfirm') %></button>
+                </form>
+            <% } else { %>
+                <p role="status"><%= t(rebuildRemoval.blocked) %></p>
+            <% } %>
+        </details>
+        <% } %>
     </div>
 </div>
 
