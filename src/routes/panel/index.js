@@ -49,13 +49,19 @@ function createPanelRouter({
     l2tpModuleEntry: injectedL2tpModuleEntry = l2tpModuleEntry,
     l2tpRateLimiter: injectedL2tpRateLimiter = l2tpRateLimiter,
     renderL2tpPage: injectedRenderL2tpPage = renderL2tpPage,
+    rebuildL2tpOverview,
 } = {}) {
     const router = express.Router();
+    const rebuildEnabled = isRebuildEnabled();
+    const rebuildL2tp = rebuildEnabled ? require('./rebuildL2tp').createRoutes(rebuildL2tpOverview) : null;
+
+    // Cache control must be set even if a guard denies the request.
+    rebuildL2tp?.mountNoStore(router);
 
     // IP whitelist applies to all panel routes
     router.use(checkIpWhitelist);
 
-    const rebuildEnabled = isRebuildEnabled();
+    rebuildL2tp?.mountOverview(router, exposePanelCsrfToken);
     if (rebuildEnabled) router.use(['/l2tp', '/nodes/:id/l2tp'], rejectRebuildRoute);
 
     // Auth routes are public (login, setup, totp, logout)
@@ -63,6 +69,8 @@ function createPanelRouter({
 
     // Authenticated templates and scripts can submit the session-bound CSRF token.
     router.use('/', exposePanelCsrfToken);
+
+    rebuildL2tp?.mountReveals(router);
 
     // Wizard routes require auth but bypass requireOnboarding (they ARE the onboarding)
     router.use('/', requireAuth, wizardRoutes);

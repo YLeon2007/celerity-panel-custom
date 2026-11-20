@@ -8,6 +8,14 @@ const entry = path.resolve(__dirname, '../../../index.js');
 const probe = `
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const fs = require('node:fs');
+const originalRead = fs.readFileSync;
+fs.readFileSync = function(filename, ...args) {
+    if (typeof filename === 'string' && filename.endsWith('/views/rebuild-l2tp.ejs')) {
+        return '<main id="startup-rebuild-overview"><%= page %>:<%= relays.length %></main>';
+    }
+    return originalRead.call(this, filename, ...args);
+};
 const noIO = name => () => assert.fail('unexpected ' + name);
 const net = require('node:net');
 net.Socket.prototype.connect = noIO('network connect');
@@ -16,9 +24,11 @@ const http = require('node:http');
 const { EventEmitter } = require('node:events');
 const requests = (app, method, url) => new Promise(resolve => {
     const req = new http.IncomingMessage(new net.Socket());
-    Object.assign(req, { url, method, session: { authenticated: true } });
+    Object.assign(req, { url, method, session: { authenticated: true }, sessionID: 'startup-fixture' });
+    req.push(null);
     const res = new http.ServerResponse(req);
-    res.end = bytes => resolve({ status: res.statusCode, body: JSON.parse(String(bytes)) });
+    res.end = bytes => resolve({ status: res.statusCode, body: String(res.getHeader('content-type')).startsWith('application/json')
+        ? JSON.parse(String(bytes)) : String(bytes), cacheControl: res.getHeader('cache-control') });
     app(req, res);
 });
 const load = Module._load;
@@ -26,6 +36,7 @@ const ddl = { collections: [], indexes: [] };
 const cron = new Map();
 const startup = [];
 let connect;
+let overviewLoads = 0;
 Module._load = function(id, parent) {
     if (id === 'dotenv') return { config() {
         if (process.env.DUMMY_DOTENV_CONFLICT) process.env.L2TP_MIGRATIONS_ENABLED = 'true';
@@ -49,6 +60,13 @@ Module._load = function(id, parent) {
         } };
     }
     if (id === './src/services/accessLogs/processService') return { start() { startup.push('access-logs'); } };
+    if (id === '../../services/rebuildL2tpOverview') {
+        overviewLoads++;
+        return { createRebuildL2tpOverview: () => ({ overview: async () => ({ relays: [], accounts: [], canManageAccounts: false }) }) };
+    }
+    if (id === '../../models/settingsModel' && parent?.filename.endsWith('/routes/panel/rebuildL2tp.js')) {
+        return { findById: () => ({ select: () => ({ lean: async () => ({ deployment: { completed: true } }) }) }) };
+    }
     const value = load.apply(this, arguments);
     if (id.endsWith('/modules/relay-l2tp')) return {
         ...value,
@@ -116,11 +134,21 @@ async function verify(app) {
         assert.equal(result.status, 403); assert.equal(result.body.code, 'CSRF_TOKEN_INVALID');
     }
     assert.deepEqual((await requests(app,'GET','/api/cascade/rebuild/mode')).body,{mode:'rebuild'});
-    await assertBlocked('GET', '/panel/l2tp');
+    assert.equal(overviewLoads, 0, 'overview service must not load at startup');
+    await assertBlocked('GET', '/panel/l2tp/simple/overview');
+    await assertBlocked('GET', '/panel/l2tp/');
+    await assertBlocked('POST', '/panel/l2tp');
+    await assertBlocked('GET', '/panel/nodes/dummy/l2tp/status');
     await assertBlocked('POST', '/panel/nodes/dummy/l2tp/install');
+    assert.equal(overviewLoads, 0, 'stock requests must not load the rebuild overview');
+    const overview = await requests(app, 'GET', '/panel/l2tp');
+    assert.equal(overview.status, 200);
+    assert.equal(overview.cacheControl, 'no-store');
+    assert.ok(overview.body.includes('<main id="startup-rebuild-overview">l2tp:0</main>'));
+    assert.equal(overviewLoads, 1);
     assert.equal((await requests(app, 'GET', '/health')).status, 200);
     assert.deepEqual(await requests(app, 'GET', '/api/cascade/topology'), {
-        status: 200, body: { nodes: [], edges: [] },
+        status: 200, body: { nodes: [], edges: [] }, cacheControl: undefined,
     });
     const { manageCascade } = require(require('node:path').join(process.argv[1], '../src/mcp/tools/cascade'));
     await assert.rejects(manageCascade({ action: 'delete' }), { code: 'REBUILD_STRICT_DISABLED' });
