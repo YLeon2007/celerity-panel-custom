@@ -572,7 +572,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         }
         assert.deepEqual(intent.writes, ['create', 'disable', 'create', 'disable', 'delete']
             .flatMap(action => [`begin:${action}`, `settle:${action}`]));
-        assert.deepEqual(commits, Array(14).fill('commit'));
+        // First list-mode Install now commits both its reservation and settlement.
+        assert.deepEqual(commits, Array(16).fill('commit'));
         assert.deepEqual(hosts.map(h => h.refusals), [[], []]);
         assert.equal(f.lockHeld, false);
     });
