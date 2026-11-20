@@ -108,11 +108,13 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
     assert.deepEqual(calls, actions.map(([action]) => action));
     for (const [action, code, status, expected] of [
         ['create', 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN', 409, { code: 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN', retryAllowed: false }],
+        ['create', 'REBUILD_L2TP_ACCOUNTS_OPERATOR_LIST_REQUIRED', 409, { code: 'REBUILD_L2TP_ACCOUNTS_OPERATOR_LIST_REQUIRED' }],
         ['disable', 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE', 503, { code: 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE' }],
         ['delete', privateDetail, 409, { code: 'REBUILD_L2TP_ACCOUNTS_FAILED' }],
     ]) {
         failure = code;
-        const denied = await send(action, alternate);
+        const peer = code.endsWith('OPERATOR_LIST_REQUIRED') ? { ...authorized, ip: '192.0.2.12' } : alternate;
+        const denied = await send(action, peer);
         assert.equal(denied.status, status);
         assert.deepEqual(JSON.parse(denied.body), { error: expected });
     }
@@ -131,5 +133,5 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
     for (const [action] of actions) assert.equal((await send(action, authorized)).status, 429);
     const install = await request(app, `/panel/rebuild/relays/${'a'.repeat(24)}/l2tp/install`, authorized);
     assert.equal(install.status, 429);
-    assert.deepEqual(calls, ['create', 'disable', 'delete', 'create', 'disable', 'delete', 'delete', ...Array(7).fill('disable')]);
+    assert.deepEqual(calls, ['create', 'disable', 'delete', 'create', 'create', 'disable', 'delete', 'delete', ...Array(7).fill('disable')]);
 });

@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createRebuildRelayAccounts } = require('../rebuildRelayAccounts');
+const { resolveRelayBinding } = require('../rebuildRelayAuthorization');
 const { accountError } = require('../rebuildRelayAccountsStore');
 const { encrypt, decrypt } = require('../../modules/relay-l2tp/services/secretBoxService');
 
@@ -15,8 +16,9 @@ const bootstrapCipher = encrypt('fixture-bootstrap', key);
 const ip = (i, end) => `10.255.${16 + i}.${end}`;
 const code = suffix => ({ code: `REBUILD_L2TP_ACCOUNTS_${suffix}` });
 
-function fixture({ shared = false, fault = () => {} } = {}) {
-    const rows = [A, B].map((id, i) => ({
+function fixture({ shared = false, single = false, legacy = false, disabled = false, fault = () => {} } = {}) {
+    const ids = single ? [A] : [A, B];
+    const rows = ids.map((id, i) => ({
         node: { _id: id, ip: `192.0.2.${i + 1}`, ssh: { port: 22, username: 'root' },
             active: true, type: 'xray', cascadeRole: 'relay' },
         state: { _id: id, node: id, rebuildMachineId: String(i + 1).repeat(32), backupId: String(i + 2).repeat(32),
@@ -29,12 +31,17 @@ function fixture({ shared = false, fault = () => {} } = {}) {
         enabled: true, passwordEncrypted, desiredRevision: 1, appliedRevision: 1, syncStatus: 'synced' });
     const users = rows.flatMap(({ node: { _id: id } }, i) => [
         user(id, i, bootstrap, 10, bootstrapCipher),
-        ...(shared ? [user(id, i, credentials.login, 11, sharedCipher)] : []),
+        ...(shared ? [{ ...user(id, i, credentials.login, 11, sharedCipher), enabled: !disabled }] : []),
     ]);
-    const hosts = Object.fromEntries([A, B].map(id => [id, users.filter(u => u.relayNode === id).map(u => ({
+    const hosts = Object.fromEntries(ids.map(id => [id, users.filter(u => u.relayNode === id).map(u => ({
         login: u.login, password: decrypt(u.passwordEncrypted, key), ipAddress: u.ip, enabled: u.enabled,
     }))]));
-    const env = { C3_REBUILD_ENABLED: 'true', ENCRYPTION_KEY: key };
+    const operatorList = rows.map(({ node, state }, i) => ({ nodeId: node._id, host: node.ip, ...node.ssh,
+        machineId: state.rebuildMachineId, sshHostKeySha256: String(i + 1).repeat(64) }));
+    const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', ENCRYPTION_KEY: key,
+        C3_REBUILD_L2TP_RELAY_ID: A, C3_REBUILD_L2TP_RELAY_MACHINE_ID: operatorList[0].machineId,
+        C3_REBUILD_L2TP_SSH_SHA256: operatorList[0].sshHostKeySha256,
+        ...(!legacy && { C3_REBUILD_L2TP_RELAYS_JSON: JSON.stringify(operatorList) }) };
     const events = [];
     let pending, held = false;
     const f = { rows, users, hosts, events, env, get pending() { return pending; } };
@@ -47,18 +54,21 @@ function fixture({ shared = false, fault = () => {} } = {}) {
             return structuredClone({ nodes: rows.map(r => r.node),
                 users: users.filter(u => ids.includes(u.relayNode) || u.login === login) });
         },
-        async begin(intent) { step('intent'); assert.equal(pending, undefined); pending = structuredClone(intent); step('intent-ack'); },
+        async begin(intent) { step('intent'); assert.equal(pending, undefined); pending = structuredClone(intent); await step('intent-ack'); },
         async verifyIntent(intentId) { step('own'); assert.equal(intentId, pending.intentId); },
-        async publish({ action, changes, recheck }) {
+        async publish({ intentId, action, changes, recheck, verifyAuthority }) {
             step('publish'); await recheck();
+            assert.equal(intentId, pending.intentId);
+            await verifyAuthority();
+            step('settle');
             for (const { before, after } of changes) {
                 if (action === 'create') users.push({ _id: `${after.relayNode}:${after.login}`, ...after });
                 else if (action === 'delete') users.splice(users.findIndex(u => u._id === before._id), 1);
                 else Object.assign(users.find(u => u._id === before._id), after);
             }
+            pending = undefined;
             step('publish-ack');
         },
-        async release(intentId) { step('release'); assert.equal(intentId, pending.intentId); pending = undefined; },
     };
     const deps = { env, store,
         locks: { async run(fn) {
@@ -68,9 +78,7 @@ function fixture({ shared = false, fault = () => {} } = {}) {
         } },
         resolveRelayBinding(_, id, node) {
             const altered = step('binding', id);
-            return altered ?? { nodeId: id, host: node.ip, port: node.ssh.port, username: node.ssh.username,
-                machineId: rows.find(r => r.node._id === id).state.rebuildMachineId,
-                sshHostKeySha256: (id === A ? '1' : '2').repeat(64) };
+            return altered ?? resolveRelayBinding(env, id, node);
         },
         createRelayDirect({ node, binding }) {
             const id = node._id;
@@ -84,7 +92,7 @@ function fixture({ shared = false, fault = () => {} } = {}) {
                 async checkChap(install, current, desired, verifyLock) {
                     await verifyLock(); check(install, current);
                     assert.ok(Array.isArray(desired));
-                    return step('check', id) ?? { changed: true };
+                    return step('check', id) ?? { changed: !disabled };
                 },
                 async syncChap(install, current, desired, verifyLock) {
                     await verifyLock(); check(install, current);
@@ -102,8 +110,32 @@ function fixture({ shared = false, fault = () => {} } = {}) {
     return f;
 }
 
-const effects = f => f.events.filter(x => /^(check:|intent$|sync:|publish$|release$)/.test(x));
+const effects = f => f.events.filter(x => /^(check:|intent$|sync:|publish$|settle$)/.test(x));
 const noWrites = f => assert.deepEqual(effects(f).filter(x => !x.startsWith('check:')), []);
+
+for (const action of ['create', 'disable', 'delete']) {
+    test(`legacy singleton refuses mutating ${action} before DIRECT or persistence`, async () => {
+        const f = fixture({ single: true, legacy: true, shared: action !== 'create' });
+        await assert.rejects(f.service[action](credentials), code('OPERATOR_LIST_REQUIRED'));
+        noWrites(f);
+        assert.ok(!f.events.includes(`connect:${A}`));
+    });
+}
+
+test('legacy singleton already-disabled account still allows a verified read-only no-op', async () => {
+    const f = fixture({ single: true, legacy: true, shared: true, disabled: true });
+    assert.deepEqual(await f.service.disable({ login: credentials.login }),
+        { executionMode: 'rebuild', status: 'disabled', login: credentials.login, relayCount: 1 });
+    assert.deepEqual(effects(f), [`check:${A}`]);
+});
+
+test('losing operator list mode with an identical legacy binding revokes writes', async () => {
+    const f = fixture({ single: true, fault(step, _, fixture) {
+        if (step === 'check') delete fixture.env.C3_REBUILD_L2TP_RELAYS_JSON;
+    } });
+    await assert.rejects(f.service.create(credentials), code('CHANGED'));
+    assert.deepEqual(effects(f), [`check:${A}`]);
+});
 
 for (const [action, status] of [['create', 'created'], ['disable', 'disabled'], ['delete', 'deleted']]) {
     test(`${action}: checks both relays before intent, confirms both before publishing rows`, async () => {
@@ -111,7 +143,7 @@ for (const [action, status] of [['create', 'created'], ['disable', 'disabled'], 
         const before = structuredClone(f.users.filter(u => u.login === bootstrap));
         assert.deepEqual(await f.service[action](action === 'create' ? credentials : { login: credentials.login }),
             { executionMode: 'rebuild', status, login: credentials.login, relayCount: 2 });
-        assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'release']);
+        assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'settle']);
         assert.equal(f.pending, undefined);
         assert.deepEqual(f.users.filter(u => u.login === bootstrap), before);
         const rows = f.users.filter(u => u.login === credentials.login);
@@ -230,13 +262,36 @@ test('intent acknowledgement loss never dispatches, a committed intent still blo
     await assert.rejects(f.restart().create(credentials), code('BLOCKED'));
 });
 
-test('publication acknowledgement loss retains the exact intent, never retries or rolls back', async () => {
-    const f = fixture({ fault(step) { if (step === 'publish-ack' || step === 'unlock') throw Error('ack lost'); } });
+test('visible intent is not permission to dispatch before its commit acknowledgement', async () => {
+    let entered, acknowledge;
+    const committing = new Promise(resolve => { entered = resolve; });
+    const ack = new Promise(resolve => { acknowledge = resolve; });
+    const f = fixture({ fault(step) { if (step === 'intent-ack') { entered(); return ack; } } });
+    const result = f.service.create(credentials);
+    await committing;
+    assert.ok(f.pending);
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent']);
+    acknowledge();
+    assert.equal((await result).status, 'created');
+    assert.deepEqual(effects(f).filter(e => e.startsWith('sync:')), [`sync:${A}`, `sync:${B}`]);
+});
+
+test('publication CAS loss retains the intent and never publishes or rolls back hosts', async () => {
+    const f = fixture({ fault(step) { if (step === 'settle') throw Error('settlement conflict'); } });
     await assert.rejects(f.service.create(credentials), { ...code('FINISH_UNKNOWN'), retryAllowed: false, confirmedNodeIds: [A, B] });
     assert.ok(f.pending);
-    assert.deepEqual(f.users.filter(u => u.login === credentials.login).map(u => u.ip), [ip(0, 11), ip(1, 11)]);
-    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish']);
+    assert.deepEqual(f.users.map(u => u.login), [bootstrap, bootstrap]);
     await assert.rejects(f.restart().create(credentials), code('BLOCKED'));
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'settle']);
+});
+
+test('lost publication acknowledgement remains unknown after atomic settlement and never replays', async () => {
+    const f = fixture({ fault(step) { if (step === 'publish-ack' || step === 'unlock') throw Error('ack lost'); } });
+    await assert.rejects(f.service.create(credentials), { ...code('FINISH_UNKNOWN'), retryAllowed: false, confirmedNodeIds: [A, B] });
+    assert.equal(f.pending, undefined);
+    assert.deepEqual(f.users.filter(u => u.login === credentials.login).map(u => u.ip), [ip(0, 11), ip(1, 11)]);
+    await assert.rejects(f.restart().create(credentials), code('ACCOUNT_CONFLICT'));
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'settle']);
 });
 
 test('ordinary guard rejects strict flags before resolving any binding', async () => {

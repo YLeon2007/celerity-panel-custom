@@ -16,6 +16,7 @@ const installToken = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a
 const loginPattern = /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/;
 const passwordPattern = /^[A-Za-z0-9_-]{1,256}(?![\s\S])/;
 const bootstrap = 'relay-bootstrap';
+const operatorList = 'C3_REBUILD_L2TP_RELAYS_JSON';
 const matches = (re, value) => typeof value === 'string' && re.test(value);
 const int = (v, lo, hi) => Number.isSafeInteger(v) && v >= lo && v <= hi;
 const ipv4 = ip => isIPv4(ip) ? ip.split('.').reduce((n, s) => n * 256 + Number(s), 0) : NaN;
@@ -151,6 +152,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
     };
     async function run(action, input) {
         allow();
+        const listMode = Object.hasOwn(env, operatorList);
         const { login, password } = input ?? {};
         if (!matches(loginPattern, login) || login === bootstrap || (action === 'create' && !matches(passwordPattern, password))) {
             throw fail('INVALID_REQUEST');
@@ -167,7 +169,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                         allow();
                         if (await verifyLock() === false) throw Object.assign(new Error('REBUILD_LOCK_LOST'), { code: 'REBUILD_LOCK_LOST' });
                         allow();
-                        if (env.ENCRYPTION_KEY !== key) throw fail('CHANGED');
+                        if (env.ENCRYPTION_KEY !== key || Object.hasOwn(env, operatorList) !== listMode) throw fail('CHANGED');
                     };
                     await authority();
                     await store.assertNoPending();
@@ -192,6 +194,10 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                         };
                         const baseline = await load();
                         const plans = makePlans(baseline, action, login, password, key);
+                        const noChange = action === 'disable' && !plans[0].after;
+                        // Legacy Remove only owns the exact bootstrap row. Do
+                        // not introduce account changes under that contract.
+                        if (!listMode && !noChange) throw fail('OPERATOR_LIST_REQUIRED');
                         let intentId, phase, uncertainNodeId;
                         const confirmedNodeIds = [];
                         const verifyAuthority = async () => {
@@ -233,7 +239,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             }
                             await store.assertNoPending();
                             await recheck();
-                            if (action === 'disable' && !plans[0].after) {
+                            if (noChange) {
                                 if (calls.some(call => call[4] !== false)) throw fail('PREFLIGHT_REFUSED');
                                 await closeAll();
                                 return { ...result, relayCount: ids.length };
@@ -263,13 +269,8 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             const changes = plans.map(({ before, after }) => ({ before, after: after && {
                                 ...after, lastSyncedAt: now, updatedAt: now, ...(action === 'create' && { createdAt: now }),
                             } }));
-                            await store.publish({ action, changes, recheck, verifyAuthority });
-                            // A failed release can only happen after both host and
-                            // DB acknowledgements; if it landed, exposing DB is safe.
+                            await store.publish({ intentId: id, action, changes, recheck, verifyAuthority });
                             completed = true;
-                            phase = 'RELEASE_UNKNOWN';
-                            await verifyAuthority();
-                            await store.release(id);
                             return { ...result, relayCount: ids.length };
                         } catch (error) {
                             if (phase) throw outcome(phase);

@@ -214,6 +214,7 @@ function sessionFixture(t, f) {
     }
     function commit(session) {
         for (const rows of [f.states, f.users]) rows.splice(0, rows.length, ...session.rows.get(rows));
+        session.commitAccountIntent?.();
         return { ok: 1 };
     }
     t.mock.method(State.db, 'startSession', async () => new Session());
@@ -549,17 +550,22 @@ function accountIntentFixture(t, f) {
             },
             async updateMany(where, { $setOnInsert }, options) {
                 assert.deepEqual(where, { _id: 'pending', intentId: $setOnInsert.intentId });
-                assert.deepEqual(options, { writeConcern: { w: 'majority' }, upsert: true });
+                assert.ok(options.session?.inTransaction());
+                assert.equal(options.upsert, true);
                 assert.equal(pending, undefined);
-                pending = { ...copy($setOnInsert), _id: 'pending' };
-                writes.push(`begin:${pending.action}`);
+                options.session.commitAccountIntent = () => {
+                    pending = { ...copy($setOnInsert), _id: 'pending' };
+                    writes.push(`begin:${pending.action}`);
+                };
                 return { acknowledged: true, upsertedCount: 1 };
             },
             async deleteMany(where, options) {
-                assert.deepEqual(options, { writeConcern: { w: 'majority' } });
+                assert.ok(options.session?.inTransaction());
                 assert.deepEqual(where, { _id: 'pending', intentId: pending?.intentId });
-                writes.push(`release:${pending.action}`);
-                pending = undefined;
+                options.session.commitAccountIntent = () => {
+                    writes.push(`settle:${pending.action}`);
+                    pending = undefined;
+                };
                 return { acknowledged: true, deletedCount: 1 };
             },
         };

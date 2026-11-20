@@ -4,9 +4,28 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { assertNoPendingRelayAccounts, createRebuildRelayAccountsStore } = require('../rebuildRelayAccountsStore');
 
+const code = suffix => ({ code: `REBUILD_L2TP_ACCOUNTS_${suffix}` });
+const intent = { intentId: 'original', action: 'create', login: 'fixture-account' };
+const item = { _id: 'user-on-a', syncOperationId: null, ip: '10.255.16.11' };
+
 function fixture() {
-    let pending, session;
-    const events = [];
+    let pending, users = [];
+    const events = [], hooks = {};
+    class Session {
+        transaction = { transition: state => { assert.equal(state, 'TRANSACTION_COMMITTED'); this.active = false; } };
+        startTransaction(options) {
+            assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
+            events.push('start');
+            this.active = true;
+            this.pending = structuredClone(pending);
+            this.users = structuredClone(users);
+        }
+        inTransaction() { return this.active; }
+        commitTransaction() { assert.fail('driver commitTransaction may automatically retry'); }
+        abortTransaction() { events.push('abort'); this.active = false; }
+        endSession() { assert.equal(this.active, false); events.push('end'); }
+    }
+    const inTxn = session => assert.ok(session instanceof Session && session.inTransaction());
     const collection = {
         async findOne(filter, options) {
             assert.equal(filter._id, 'pending');
@@ -15,88 +34,118 @@ function fixture() {
             assert.deepEqual(options.projection, { _id: 1 });
             return pending && (!filter.intentId || pending.intentId === filter.intentId) ? { _id: 'pending' } : null;
         },
-        async updateMany(filter, update, options) {
-            assert.equal(options.writeConcern.w, 'majority');
-            assert.equal(options.upsert, true);
+        async updateMany(filter, update, { session, ...options }) {
+            inTxn(session);
+            assert.deepEqual(options, { upsert: true });
             assert.deepEqual(filter, { _id: 'pending', intentId: update.$setOnInsert.intentId });
-            if (pending) throw Object.assign(new Error('duplicate'), { code: 11000 });
-            pending = structuredClone(update.$setOnInsert);
+            events.push('intent');
+            if (session.pending) throw Object.assign(new Error('duplicate'), { code: 11000 });
+            session.pending = structuredClone(update.$setOnInsert);
             return { acknowledged: true, upsertedCount: 1 };
         },
-        async deleteMany(filter, options) {
-            assert.equal(options.writeConcern.w, 'majority');
+        async deleteMany(filter, { session, ...options }) {
+            inTxn(session);
+            assert.deepEqual(options, {});
             assert.equal(filter._id, 'pending');
-            if (!pending || pending.intentId !== filter.intentId) return { acknowledged: true, deletedCount: 0 };
-            pending = undefined;
+            events.push('settle');
+            if (!session.pending || session.pending.intentId !== filter.intentId) return { acknowledged: true, deletedCount: 0 };
+            session.pending = undefined;
             return { acknowledged: true, deletedCount: 1 };
         },
     };
     const db = { collection(name) { assert.equal(name, 'c3_rebuild_relay_accounts'); return collection; },
-        async startSession() { assert.ok(session); return session; } };
-    const item = { _id: 'user-on-a', syncOperationId: null, ip: '10.255.16.11' };
+        startSession: () => new Session(),
+        getClient: () => ({ db(name) {
+            assert.equal(name, 'admin');
+            return { async command(command, { session }) {
+                inTxn(session);
+                assert.equal(command.commitTransaction, 1);
+                assert.equal(command.writeConcern.w, 'majority');
+                events.push('commit');
+                const land = () => { pending = session.pending; users = session.users; return { ok: 1 }; };
+                return hooks.commit ? hooks.commit(land) : land();
+            } };
+        } }),
+    };
     const User = { db,
-        async insertMany(rows, opts) { assert.equal(opts.session, session); events.push('insert'); return rows; },
-        async updateMany(filter, update, opts) {
+        async insertMany(rows, { session }) { inTxn(session); events.push('insert'); session.users.push(...rows); return rows; },
+        async updateMany(filter, update, options) {
             assert.deepEqual(filter, { _id: { $eq: item._id }, ip: { $eq: item.ip },
                 syncOperationId: { $eq: null, $exists: true } });
             assert.deepEqual(update, { $set: { enabled: false } });
-            assert.equal(opts.session, session);
-            assert.equal(opts.timestamps, false);
+            inTxn(options.session);
+            assert.equal(options.timestamps, false);
             events.push('update');
             return { acknowledged: true, matchedCount: 1 };
         },
-        async deleteMany(filter, opts) {
+        async deleteMany(filter, options) {
             assert.equal(filter._id.$eq, item._id);
-            assert.equal(opts.session, session);
+            inTxn(options.session);
             events.push('delete');
             return { acknowledged: true, deletedCount: 1 };
         },
     };
     const store = createRebuildRelayAccountsStore({ Node: { db }, State: { db }, L2tpUser: User });
-    return { db, collection, store, item, events, setSession(s) { session = s; } };
+    const publish = (action, intentId = intent.intentId) => store.publish({ action, intentId,
+        changes: [{ before: item, after: { enabled: false } }],
+        async recheck(session) { inTxn(session); events.push('snapshot'); },
+        async verifyAuthority() { await store.verifyIntent(intentId); events.push('guard'); },
+    });
+    return { db, collection, store, publish, events, hooks, get pending() { return pending; }, get users() { return users; } };
 }
 
-test('separate global majority fence blocks other callers and cannot be released by a different owner', async () => {
-    const { db, store } = fixture();
-    await assertNoPendingRelayAccounts(db);
-    await store.begin({ intentId: 'original', action: 'create' });
-    await assert.rejects(store.begin({ intentId: 'different' }), { code: 11000 });
-    await assert.rejects(store.verifyIntent('different'), { code: 'REBUILD_L2TP_ACCOUNTS_CHANGED' });
-    await assert.rejects(store.release('different'), { code: 'REBUILD_L2TP_ACCOUNTS_CHANGED' });
-    await assert.rejects(assertNoPendingRelayAccounts(db), { code: 'REBUILD_L2TP_ACCOUNTS_BLOCKED', retryAllowed: false });
-    await store.verifyIntent('original');
-    await store.release('original');
-    await assertNoPendingRelayAccounts(db);
+test('transaction commits the actual majority intent; another owner cannot overwrite or settle it', async () => {
+    const f = fixture();
+    f.hooks.commit = land => { assert.equal(f.pending, undefined); return land(); };
+    await assertNoPendingRelayAccounts(f.db);
+    await f.store.begin(intent);
+    assert.deepEqual(f.pending, intent);
+    assert.deepEqual(f.events.splice(0), ['start', 'intent', 'commit', 'end']);
+    await assert.rejects(f.store.begin({ intentId: 'different' }), { code: 11000 });
+    assert.deepEqual(f.events.splice(0), ['start', 'intent', 'abort', 'end']);
+    await assert.rejects(f.store.verifyIntent('different'), code('CHANGED'));
+    await assert.rejects(f.publish('create', 'different'), code('CHANGED'));
+    assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'settle', 'abort', 'end']);
+    assert.deepEqual(f.users, []);
+    await assert.rejects(assertNoPendingRelayAccounts(f.db), { ...code('BLOCKED'), retryAllowed: false });
+    await f.store.verifyIntent(intent.intentId);
+});
+
+test('committed intent with lost majority acknowledgement stays visible, without retry or abort', async () => {
+    const f = fixture();
+    f.hooks.commit = land => ({ ...land(), writeConcernError: { code: 91 }, errorLabels: ['RetryableWriteError'] });
+    await assert.rejects(f.store.begin(intent), /transaction commit unconfirmed/);
+    assert.deepEqual(f.events, ['start', 'intent', 'commit', 'end']);
+    assert.deepEqual(f.pending, intent);
+    await assert.rejects(assertNoPendingRelayAccounts(f.db), { ...code('BLOCKED'), retryAllowed: false });
 });
 
 test('global fence read failure is a refusal and does not expose storage diagnostics', async () => {
     const { db, collection } = fixture();
     collection.findOne = async () => { throw new Error('private storage detail'); };
-    await assert.rejects(assertNoPendingRelayAccounts(db), { code: 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE' });
+    await assert.rejects(assertNoPendingRelayAccounts(db), code('PERSISTENCE_UNAVAILABLE'));
 });
 
 for (const [action, write] of [['create', 'insert'], ['disable', 'update'], ['delete', 'delete']]) {
-    test(`${action} publication uses one transaction and leaves the intent intact on commit acknowledgement loss`, async () => {
-        const { db, store, item, setSession, events } = fixture();
-        const lost = new Error('lost commit acknowledgment');
-        const session = {
-            startTransaction(opts) {
-                assert.equal(opts.readConcern.level, 'snapshot');
-                assert.equal(opts.writeConcern.w, 'majority');
-                events.push('start');
-            },
-            async commitTransaction() { events.push('commit'); throw lost; },
-            inTransaction() { return true; },
-            async abortTransaction() { events.push('abort'); },
-            async endSession() { events.push('end'); },
-        };
-        setSession(session);
-        await store.begin({ intentId: 'original', action });
-        await assert.rejects(store.publish({ action, changes: [{ before: item, after: { enabled: false } }],
-            async recheck(s) { assert.equal(s, session); events.push('snapshot'); },
-            async verifyAuthority() { events.push('guard'); },
-        }), err => err === lost);
-        await assert.rejects(assertNoPendingRelayAccounts(db), { code: 'REBUILD_L2TP_ACCOUNTS_BLOCKED' });
-        assert.deepEqual(events, ['start', 'snapshot', write, 'guard', 'commit', 'end']);
+    test(`${action} publishes accounts and settles the intent in the same transaction`, async () => {
+        const f = fixture();
+        await f.store.begin(intent);
+        f.events.length = 0;
+        f.hooks.commit = land => { assert.deepEqual(f.pending, intent); return land(); };
+        await f.publish(action);
+        assert.deepEqual(f.events, ['start', 'snapshot', write, 'settle', 'guard', 'commit', 'end']);
+        await assertNoPendingRelayAccounts(f.db);
     });
 }
+
+test('lost publish acknowledgement does not retry or abort; an uncommitted attempt preserves its intent', async () => {
+    const f = fixture();
+    await f.store.begin(intent);
+    const lost = new Error('lost commit acknowledgement');
+    f.events.length = 0;
+    f.hooks.commit = () => { throw lost; };
+    await assert.rejects(f.publish('create'), err => err === lost);
+    assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'settle', 'guard', 'commit', 'end']);
+    assert.deepEqual(f.users, []);
+    await f.store.verifyIntent(intent.intentId);
+});

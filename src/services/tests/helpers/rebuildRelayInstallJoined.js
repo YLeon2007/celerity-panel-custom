@@ -565,8 +565,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             if (h === b) assert.deepEqual(survivor(), beforeRemove, 'removing B did not change A DB/host');
         }
         assert.deepEqual(intent.writes, ['create', 'disable', 'create', 'disable', 'delete']
-            .flatMap(action => [`begin:${action}`, `release:${action}`]));
-        assert.deepEqual(commits, Array(9).fill('commit'));
+            .flatMap(action => [`begin:${action}`, `settle:${action}`]));
+        assert.deepEqual(commits, Array(14).fill('commit'));
         assert.deepEqual(hosts.map(h => h.refusals), [[], []]);
         assert.equal(f.lockHeld, false);
     });

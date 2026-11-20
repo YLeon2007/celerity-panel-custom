@@ -1,11 +1,12 @@
 'use strict';
 
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
+const { transactOnce } = require('./rebuildRelayInstallTransaction');
 
 const COLLECTION = 'c3_rebuild_relay_accounts';
 const singleton = { _id: 'pending' };
 const readOptions = { readPreference: 'primary', readConcern: { level: 'majority' }, maxTimeMS: 5000 };
-const writeOptions = { writeConcern: { w: 'majority' } };
+
 class RelayAccountsError extends Error {
     constructor(suffix, details) {
         const code = `REBUILD_L2TP_ACCOUNTS_${suffix}`;
@@ -53,23 +54,22 @@ function createRebuildRelayAccountsStore({ Node, State, L2tpUser }) {
             return { nodes, users };
         },
         async begin(intent) {
-            // _id is unique. A competing owner cannot match this write; the
-            // resulting duplicate key is not authority to adopt their intent.
-            // Multi forms are not automatically replayed by retryWrites.
-            requireOne(await fence().updateMany(owner(intent.intentId), { $setOnInsert: intent },
-                { ...writeOptions, upsert: true }), 'upsertedCount');
+            // Commit the actual pending intent before any host write. A
+            // standalone cannot perform this upsert. An unknown commit is
+            // not permission to dispatch, even if the row later appears.
+            await transactOnce(State, L2tpUser, async session => {
+                // A competing owner cannot match the unique singleton _id.
+                requireOne(await fence().updateMany(owner(intent.intentId), { $setOnInsert: intent },
+                    { session, upsert: true }), 'upsertedCount');
+            });
         },
         async verifyIntent(intentId) {
             if (!(await fence().findOne(owner(intentId), { ...readOptions, projection: { _id: 1 } }))) {
                 throw accountError('CHANGED');
             }
         },
-        async publish({ action, changes, recheck, verifyAuthority }) {
-            const session = await db.startSession();
-            let commitAttempted = false, primary;
-            try {
-                session.startTransaction({ readPreference: 'primary', readConcern: { level: 'snapshot' },
-                    writeConcern: { w: 'majority' } });
+        async publish({ intentId, action, changes, recheck, verifyAuthority }) {
+            await transactOnce(State, L2tpUser, async session => {
                 // Re-read the whole original scope before the first account write.
                 await recheck(session);
                 if (action === 'create') {
@@ -85,24 +85,11 @@ function createRebuildRelayAccountsStore({ Node, State, L2tpUser }) {
                         }
                     }
                 }
+                // Settle the exact owner's intent with the account rows. A
+                // failed CAS cannot publish any of the account changes.
+                requireOne(await fence().deleteMany(owner(intentId), { session }), 'deletedCount');
                 await verifyAuthority();
-                // No withTransaction callback replay. Never abort or retry the
-                // workflow on an uncertain commit; the separate fence remains.
-                commitAttempted = true;
-                await session.commitTransaction();
-            } catch (error) {
-                primary = error;
-                if (!commitAttempted && session.inTransaction()) {
-                    try { await session.abortTransaction(); } catch { /* Preserve original failure. */ }
-                }
-                throw error;
-            } finally {
-                try { await session.endSession(); }
-                catch (error) { if (!primary) throw error; }
-            }
-        },
-        async release(intentId) {
-            requireOne(await fence().deleteMany(owner(intentId), writeOptions), 'deletedCount');
+            });
         },
     };
 }
