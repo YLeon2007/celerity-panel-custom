@@ -27,7 +27,24 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
         active.add(token);let lost=false;
         const verify=async()=>{if(lost || !(await store.findOne({_id:rowId,token})))throw error('REBUILD_LOCK_LOST');};
         const timer=setInterval(()=>{store.updateOne({_id:rowId,token},{$set:{heartbeat:beat()}}).then(x=>{if(x.matchedCount!==1)lost=true;},()=>{lost=true;});},15000);timer.unref();
-        try{return await fn(verify);}finally{clearInterval(timer);try{await store.deleteOne({_id:rowId,token});}finally{active.delete(token);}}
+        let completed=false;
+        try {
+            const result=await fn(verify);
+            completed=true;
+            return result;
+        } finally {
+            clearInterval(timer);
+            let released=false;
+            try {
+                // The exact singleton predicate matches at most one row. Use
+                // the non-retryable MongoDB delete form even on retryWrites clients.
+                const result=await store.deleteMany({_id:rowId,token});
+                released=result?.acknowledged===true && result.deletedCount===1;
+            } catch {
+                // Do not expose DB details or replace a primary callback refusal.
+            } finally { active.delete(token); }
+            if(completed&&!released)throw error('REBUILD_LOCK_RELEASE_UNCONFIRMED');
+        }
     };
     const status=async()=>{const row=await store.findOne({_id:rowId});return row?{locked:true,token:row.token,stale:!active.has(row.token)&&new Date(row.heartbeat).getTime()<=clock()-staleMs}:{locked:false};};
     const unlock=async token=>{if(typeof token!=='string'||active.has(token))throw error('REBUILD_LOCK_NOT_STALE');const res=await store.deleteOne({_id:rowId,token,heartbeat:{$lte:new Date(clock()-staleMs)}});if(res.deletedCount!==1)throw error('REBUILD_LOCK_NOT_STALE');return {locked:false};};

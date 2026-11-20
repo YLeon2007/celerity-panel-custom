@@ -61,11 +61,11 @@ test('pending relay-account intent fences public Install, confirmed Remove, Appl
             lockEvents.push('verify');
             return loseLock && lockEvents.includes('intent') ? null : held;
         },
-        async deleteOne(filter) {
+        async deleteMany(filter) {
             assert.deepEqual(filter, { _id: 'apply', token: held?.token });
             lockEvents.push('release');
             held = null;
-            return { deletedCount: 1 };
+            return { acknowledged: true, deletedCount: 1 };
         },
     };
     const collection = mongoose.connection.collection.bind(mongoose.connection);

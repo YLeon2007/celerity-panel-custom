@@ -61,7 +61,7 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     const lockStore = {
         async insertOne(row) { if (held) throw Object.assign(new Error('busy'), { code: 11000 }); held = row; },
         async findOne({ _id, token }) { return held?._id === _id && held.token === token ? held : null; },
-        async deleteOne({ token }) { assert.equal(held.token, token); held = null; return { deletedCount: 1 }; },
+        async deleteMany(filter) { assert.deepEqual(filter, { _id: 'apply', token: held.token }); held = null; return { acknowledged: true, deletedCount: 1 }; },
     };
     const collection = mongoose.connection.collection.bind(mongoose.connection);
     t.mock.method(mongoose.connection, 'collection', (name, ...options) => {

@@ -3,8 +3,9 @@ const express=require('express'),crypto=require('node:crypto');
 const {requireScope}=require('../middleware/auth');
 const {requirePanelCsrf}=require('./panel/csrf');
 const {createRebuildService}=require('../services/rebuildService');
-const {componentFor}=require('../services/rebuildCoordinator');
+const {componentFor,previewForError}=require('../services/rebuildCoordinator');
 const fail=code=>Object.assign(new Error(code),{code});
+const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
 const objectId=id=>typeof id==='string'&&/^[a-f\d]{24}$/i.test(id);
 const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelTransport tunnelDomain tcpFastOpen tcpKeepAlive tcpNoDelay wsPath wsHost grpcServiceName xhttpPath xhttpHost xhttpMode muxEnabled muxConcurrency geoRouting priority autoDeploy realityDest realitySni realityShortIds realityFingerprint').split(' ');
 // Mounted ONLY in rebuild, behind regular requireAuth. API key credentials are
@@ -12,10 +13,13 @@ const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelTranspor
 function routerForRebuild({service=createRebuildService(),Link=require('../models/cascadeLinkModel'),Node=require('../models/hyNodeModel')}={}){
  const router=express.Router(), write=[requireScope('nodes:write'),(req,res,next)=>req.apiKey?next():requirePanelCsrf(req,res,next)], read=requireScope('nodes:read');
  const wrap=fn=>async(req,res)=>{
-    try{res.json(await fn(req));}catch(e){
-        const code=typeof e?.code==='string'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(e.code)?e.code:'REBUILD_FAILED';
+    const outcome={};
+    try{res.json(await fn(req,outcome));}catch(e){
+        const rawCode=errorField(e,'code');
+        const code=typeof rawCode==='string'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(rawCode)?rawCode:'REBUILD_FAILED';
+        const preview=previewForError(e);
         res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:code==='REBUILD_INVALID_REQUEST'?400:409)
-            .json({error:{code},...(e?.saved?{desiredSaved:true,linkId:e.saved}:{}),...(e?.preview?{preview:e.preview}:{})});
+            .json({error:{code},...(outcome.linkId?{desiredSaved:true,linkId:outcome.linkId}:{}),...(preview?{preview}:{})});
     }
  };
  const run=async(req,preview=false,remove=false)=>{const linkId=req.params.id??req.body?.linkId??req.body?.domainLinkId;
@@ -32,7 +36,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
  router.post('/rebuild/preview',...write,wrap(req=>run(req,true,req.body?.remove===true)));
  for(const p of ['/topology/deploy','/links/:id/deploy','/chain/deploy'])router.post(p,...write,wrap(async req=>({executionMode:'rebuild',status:'succeeded',...(await run(req))})));
  router.delete('/links/:id',...write,wrap(async req=>({executionMode:'rebuild',deleted:req.params.id,...(await run(req,false,true))})));
- const save=(editing)=>async req=>service.locks.run(async verify=>{
+ const save=(editing)=>async (req,outcome)=>service.locks.run(async verify=>{
     const b=req.body||{};if(editing&&!objectId(req.params.id))throw fail('REBUILD_INVALID_REQUEST');
     const link=editing?await Link.findById(req.params.id):new Link({tunnelUuid:crypto.randomUUID(),rebuildApplied:null});
     if(!link)throw fail('REBUILD_LINK_NOT_FOUND');if(link.rebuildDelete||link.lifecycle)throw fail('REBUILD_DELETION_PENDING');
@@ -73,11 +77,13 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     if(!Number.isInteger(link.tunnelPort)||link.tunnelPort<1||link.tunnelPort>65535||!Number.isSafeInteger(link.priority)||typeof link.name!=='string'||!link.name.trim())throw fail('REBUILD_INVALID_REQUEST');
     if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject(),verify);
     await verify();link.status='pending';await link.save();const linkId=String(link._id);
+    // Latch the acknowledged draft independently of preview and lock cleanup.
+    outcome.linkId=linkId;
     require('../services/cascadeService')._invalidateTopologyCache();
     if(b.autoDeploy!==true)return {executionMode:'rebuild',desiredSaved:true,linkId,status:'saved'};
     // Creating a link assigns its identity. Only the resulting component can
     // be previewed. Return that preview before dispatching any node write.
-    try{return {executionMode:'rebuild',desiredSaved:true,linkId,status:'awaiting_preview',preview:await service.execute({linkId,preview:true},verify)};}catch(error){error.saved=linkId;throw error;}
+    return {executionMode:'rebuild',desiredSaved:true,linkId,status:'awaiting_preview',preview:await service.execute({linkId,preview:true},verify)};
  });
  router.post('/links',...write,wrap(save(false)));router.put('/links/:id',...write,wrap(save(true)));
  router.get('/rebuild/mode',read,wrap(()=>({mode:'rebuild'})));

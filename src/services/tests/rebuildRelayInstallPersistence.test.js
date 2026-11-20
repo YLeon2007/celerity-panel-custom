@@ -112,7 +112,11 @@ function fixture(t) {
             lock = row;
         },
         async findOne(filter) { return lock && matches(lock, filter) ? lock : null; },
-        async deleteOne(filter) { if (lock && matches(lock, filter)) lock = null; },
+        async deleteMany(filter) {
+            const matched = !!lock && matches(lock, filter);
+            if (matched) lock = null;
+            return { acknowledged: true, deletedCount: Number(matched) };
+        },
     };
     const plan = { backupId };
     let prepared;

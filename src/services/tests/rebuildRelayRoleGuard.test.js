@@ -58,7 +58,7 @@ test('mounted role guard and Remove use one estimate, require a current session-
     const lockStore = {
         async insertOne(token) { if (held) throw Object.assign(new Error('busy fixture'), { code: 11000 }); held = token; },
         async findOne({ _id, token }) { return held?._id === _id && held.token === token ? held : null; },
-        async deleteOne({ token }) { assert.equal(held.token, token); held = null; },
+        async deleteMany(filter) { assert.deepEqual(filter, { _id: 'apply', token: held.token }); held = null; return { acknowledged: true, deletedCount: 1 }; },
     };
     let pendingAccounts = false;
     t.mock.method(mongoose.connection, 'collection', name => {

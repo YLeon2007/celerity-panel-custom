@@ -4,6 +4,14 @@ const {createHmac,randomBytes}=require('node:crypto');
 // The preview fingerprint is opaque and expires when the panel restarts.
 const previewKey=randomBytes(32);
 const fail = code => Object.assign(new Error(code), {code});
+// Only coordinator-generated refusal reports are safe to send over HTTP.
+const publicPreviews = new WeakMap();
+function previewRefusal(code, preview) {
+    const error = Object.assign(fail(code), { preview });
+    publicPreviews.set(error, preview);
+    return error;
+}
+const previewForError = error => publicPreviews.get(error);
 const id = obj => String(obj?._id ?? obj);
 const ends = row => [id(row.portalNode), id(row.bridgeNode)];
 function componentFor(links, seeds) {
@@ -78,8 +86,8 @@ async function runRebuild(d, req) {
             }
             const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:fingerprint.digest('hex')};
             if(req.preview) return result;
-            if(!result.allowed)throw Object.assign(fail('REBUILD_CLIENT_CHANGE'),{preview:result});
-            if(req.expectedPreview!==undefined && req.expectedPreview!==result.previewId)throw Object.assign(fail('REBUILD_PREVIEW_CHANGED'),{preview:result});
+            if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);
+            if(req.expectedPreview!==undefined && req.expectedPreview!==result.previewId)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();
             await d.persistKeys?.(verify);
             if(req.remove && !anchor?.rebuildDelete) await d.markDelete?.(req.linkId);
@@ -94,4 +102,4 @@ async function runRebuild(d, req) {
         });
     });
 }
-module.exports={runRebuild,componentFor,profilePreview,hasProtectedClientInbound};
+module.exports={runRebuild,componentFor,profilePreview,hasProtectedClientInbound,previewForError};

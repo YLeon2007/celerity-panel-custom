@@ -67,7 +67,7 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     assert.deepEqual(await applied(pr.linkId),oldApplied);
     const newer=await make(edge(relay,replacement,4,{priority:1,autoDeploy:true,interactivePreview:true}));assert.equal(newer.status,'awaiting_preview');assert.equal(writes.length,before);
     const preview=await ok('POST','/rebuild/preview',{linkId:newer.linkId});assert.equal(preview.allowed,true);assert.equal(writes.length,before);assert.equal(JSON.stringify(preview).includes(uuid),false);
-    const changed=await request('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:'1'.repeat(64)});assert.equal(changed.body.error.code,'REBUILD_PREVIEW_CHANGED');assert.equal(writes.length,before);
+    const changed=await request('POST',deploy,{linkId:newer.linkId,expectedPreview:'1'.repeat(64)});assert.equal(changed.body.error.code,'REBUILD_PREVIEW_CHANGED');assert.deepEqual(changed.body.preview,preview);assert.equal(writes.length,before);
     assert.equal(await applied(newer.linkId),null);assert.deepEqual(await applied(pr.linkId),oldApplied);
     await ok('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:preview.previewId});assert.equal(socks().port,port);assert.equal(policy().at(-1).outboundTag,`rebuild-rp-egress-${newer.linkId.slice(-8)}`);
     assert.equal((await applied(pr.linkId)).port,41011);

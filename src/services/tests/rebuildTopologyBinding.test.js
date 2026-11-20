@@ -64,7 +64,11 @@ function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } 
     const locks = makeLocks({
         async insertOne(row) { assert.equal(lock, undefined); lock = row; },
         async findOne({ token }) { return lock?.token === token ? lock : null; },
-        async deleteOne({ token }) { if (lock?.token === token) lock = undefined; },
+        async deleteMany({ _id, token }) {
+            const matched = !!lock && lock._id === _id && lock.token === token;
+            if (matched) lock = undefined;
+            return { acknowledged: true, deletedCount: Number(matched) };
+        },
     });
     const inLock = () => assert.ok(lock, 'remote command or DB effect ran outside Apply lock');
     const effect = (...args) => { inLock(); effects.push(args); };
