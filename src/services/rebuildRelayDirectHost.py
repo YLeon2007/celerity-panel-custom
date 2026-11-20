@@ -2206,7 +2206,8 @@ def session_sample(libc, proc, group, owner, held, watch):
     native = session_l2tp_interfaces(session_read(proc, 'self/net/pppol2tp', 2**20), set(sample))
     result = []
     if sample:
-        # Unlike ip(), do not request numeric scope; refuse dump warnings.
+        # session_links needs named link types and scopes; the RPDB ip()
+        # deliberately uses -N. Keep this dump separate and refuse warnings.
         links = json.loads(command('/usr/sbin/ip', '-j', '-4', '-details', 'addr', 'show', quiet=True))
         seen_names, seen_peers, seen_inodes = set(), set(), set()
         for key, (pid, start, inode, name, local, peer, generation) in sample.items():

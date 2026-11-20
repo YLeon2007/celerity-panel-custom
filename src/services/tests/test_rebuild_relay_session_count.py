@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import errno
+import fcntl
 import io
 import ipaddress
 import json
@@ -11,6 +12,8 @@ import re
 import runpy
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -91,6 +94,79 @@ class SessionCount(unittest.TestCase):
         start, rows = self.sample()
         self.assertEqual(start, 510)
         self.assertEqual([row[3] for row in rows], [501, 502])
+
+    def test_positive_sample_uses_real_named_ip_json(self):
+        parent = os.environ.get('C3_TEST_SESSION_PARENT_NETNS')
+        if parent is None:
+            unshare = '/usr/bin/unshare'
+            ip = '/usr/sbin/ip'
+            if not all(Path(path).exists() for path in (unshare, ip, '/dev/net/tun')):
+                self.skipTest('unshare, iproute2 and /dev/net/tun required')
+            flags = [unshare, '--user', '--map-root-user', '--net']
+            probe = subprocess.run([*flags, '/usr/bin/true'], capture_output=True, timeout=4)
+            if probe.returncode:
+                self.skipTest('private user/network namespace unavailable')
+            replay = subprocess.run([*flags, sys.executable, '-I', '-B', str(Path(__file__).resolve()),
+                                     f'{type(self).__name__}.{self._testMethodName}'],
+                                    env={'C3_TEST_SESSION_PARENT_NETNS': os.readlink('/proc/self/ns/net'),
+                                         'LC_ALL': 'C'}, text=True, capture_output=True, timeout=12)
+            self.assertEqual(replay.returncode, 0, replay.stderr)
+            if 'OK (skipped=1)' in replay.stderr:
+                self.skipTest('TUN fixture unavailable in private netns')
+            self.assertRegex(replay.stderr, r'(?m)^OK$')
+            return
+
+        # Exercise the real iproute2 formatter with an ARPHRD_PPP link in a
+        # throwaway netns. TUN supplies the link metadata, not a live PPP/L2TP
+        # session; process, socket and PPP inventories below remain modeled.
+        self.assertNotEqual(parent, os.readlink('/proc/self/ns/net'))
+        ip = '/usr/sbin/ip'
+
+        def dump(*args):
+            return json.loads(subprocess.check_output([ip, '-j', *args], timeout=3))
+
+        self.assertEqual([link['ifname'] for link in dump('link', 'show')], ['lo'])
+        try:
+            tun = os.open('/dev/net/tun', os.O_RDWR)
+        except PermissionError as err:
+            self.skipTest(f'TUN device unavailable: {err.errno}')
+        self.addCleanup(os.close, tun)
+        try:
+            # TUNSETIFF with IFF_TUN|IFF_NO_PI; TUNSETLINK with ARPHRD_PPP.
+            fcntl.ioctl(tun, 0x400454ca, struct.pack('16sH22x', b'ppp1', 0x1001))
+            fcntl.ioctl(tun, 0x400454cd, 512)
+        except OSError as err:
+            if err.errno not in (errno.EACCES, errno.EPERM, errno.ENOTTY, errno.EOPNOTSUPP):
+                raise
+            self.skipTest(f'TUN fixture unavailable: {err.errno}')
+        subprocess.run([ip, 'link', 'set', 'ppp1', 'up'], check=True, timeout=3)
+        subprocess.run([ip, '-4', 'addr', 'add', '10.255.1.1', 'peer', '10.255.1.10/32', 'dev', 'ppp1'],
+                       check=True, timeout=3)
+        args = ('-4', '-details', 'addr', 'show')
+        numeric, = dump('-N', *args, 'dev', 'ppp1')
+        self.assertEqual(numeric['addr_info'][0]['scope'], '0')
+        self.assertNotEqual(numeric['link_type'], 'ppp')
+        with self.assertRaises(self.refusal):
+            self.g['session_links']([numeric], 'ppp1', '10.255.1.1', '10.255.1.10')
+
+        self.pids = [500, 501]
+        self.data = (self.g['SESSION_L2TP_HEADER'] + tunnel(1) + inventory(1701, 1, 21, 4, 41, 'ppp1'))
+        calls = []
+        command = self.g['command']
+
+        def real_command(*argv, **kwargs):
+            raw = command(*argv, **kwargs)
+            calls.append((argv, kwargs, json.loads(raw)))
+            return raw
+
+        start, rows = self.sample(command=real_command)
+        self.assertEqual(start, 510)
+        self.assertEqual([row[3] for row in rows], [501])
+        (argv, kwargs, observed), = calls
+        self.assertEqual(argv, (ip, '-j', *args))
+        self.assertEqual(kwargs, {'quiet': True})
+        selected, = [link for link in observed if link['ifname'] == 'ppp1']
+        self.assertEqual((selected['link_type'], selected['addr_info'][0]['scope']), ('ppp', 'global'))
 
     def test_zero_with_control_socket_and_foreign(self):
         self.pids = [500]
