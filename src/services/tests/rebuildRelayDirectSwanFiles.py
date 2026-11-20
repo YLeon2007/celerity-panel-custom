@@ -15,6 +15,7 @@ args.add_argument('source', type=Path)
 args.add_argument('etc_archive', type=Path)
 args.add_argument('fixture', type=Path)
 args.add_argument('parent_netns')
+args.add_argument('--test', action='append', default=[], help='unittest case to run (repeatable)')
 a = args.parse_args()
 assert os.geteuid() == 0 and os.readlink('/proc/self/ns/net') != a.parent_netns
 assert a.fixture.is_absolute() and a.fixture.is_dir() and not list(a.fixture.iterdir())
@@ -296,6 +297,79 @@ class Files(unittest.TestCase):
         self.refusal_no_write(self.before, 'PREREQUISITE')
         self.assertEqual(global_config.read_bytes(), altered)
 
+    def test_debian_conffile_closure_is_fingerprinted(self):
+        # Run with either extracted Debian 6.0.1-6+deb13u7 conffile tree. The full
+        # fixture adds libcharon-extra-plugins, charon-systemd and strongswan-swanctl.
+        n = len(list((self.path.parent / 'charon').iterdir()))
+        expected = {
+            21: 'ddc103e3bab4b312ab390428dd64ec6606ea6793d715d536d2fa2c0025e5d77e',
+            44: '96e6ee8439e324f56cb9e1cc3eb10871c3ef32d0b653b3aa407ed5ce3af7866b',
+        }
+        self.assertIn(n, expected)
+        before, _, backup, saved = self.create()
+        h = self.h
+        self.assertEqual(before['swanInputs'], expected[n])
+        self.assertEqual(h['swan_inputs'](True, 'ROLLBACK_DRIFT'), expected[n])
+        if n == 44:
+            # One missing conffile is not a stock package set. Removing both
+            # strongswan-swanctl conffiles yields a valid but different set:
+            # fresh preflight could accept it; this transaction must refuse it.
+            top = self.path.with_name('swanctl.conf')
+            vici = top.parent / 'charon' / 'vici.conf'
+            self.assertTrue(self.path.with_name('charon-systemd.conf').is_file())
+            self.assertTrue(self.path.with_name('tnc.conf').is_file())
+            files = {p: p.read_bytes() for p in (top, vici)}
+            top.write_bytes(files[top] + b'\ninclude /etc/alternate.conf\n')
+            self.refusal_no_write(lambda: h['load_after'](backup), 'ROLLBACK_DRIFT')
+            top.unlink()
+            self.refusal_no_write(lambda: h['swan_inputs'](True, 'ROLLBACK_DRIFT'), 'ROLLBACK_DRIFT')
+            vici.unlink()
+            self.assertNotEqual(h['swan_inputs'](True, 'ROLLBACK_DRIFT'), expected[n])
+            self.refusal_no_write(lambda: h['load_after'](backup), 'ROLLBACK_DRIFT')
+            self.assertEqual(h['read_manifest'](TOKEN)[1], saved)
+            self.assertEqual(self.path.read_bytes(), PAYLOAD)
+            for path, data in files.items():
+                path.write_bytes(data)
+        self.rollback(before, backup, saved)
+        self.assertEqual(h['swan_inputs'](False, 'ROLLBACK_DRIFT'), expected[n])
+
+    def test_foreign_settings_refuse_before_write(self):
+        for leaf, suffix in (
+            ('strongswan.conf', b'\ninclude /etc/alternate/*.conf\n'),
+            ('strongswan.d/charon.conf', b'\ncharon { routing_table_prio = 220 }\n'),
+            ('strongswan.d/charon/openssl.conf', b'\ninclude ../alternate.conf\n'),
+            ('strongswan.d/charon/kernel-netlink.conf', b'\ncharon { install_routes = yes }\n'),
+            ('strongswan.d/local.conf', b'# unowned even if inert\n'),
+            ('strongswan.d/.hidden.conf', b'charon { install_virtual_ip = no }\n'),
+        ):
+            with self.subTest(leaf=leaf):
+                path = self.real('/etc/' + leaf)
+                original = path.read_bytes() if path.exists() else None
+                path.write_bytes((original or b'') + suffix)
+                try:
+                    self.refusal_no_write(self.before, 'PREREQUISITE')
+                    self.assertFalse(self.path.exists())
+                finally:
+                    if original is not None:
+                        path.write_bytes(original)
+                    else:
+                        path.unlink()
+
+    def test_stock_leaf_must_be_single_link_regular_file_with_stock_mode(self):
+        leaf = self.path.parent / 'charon' / 'openssl.conf'
+        data = leaf.read_bytes()
+        leaf.chmod(0o600)
+        self.refusal_no_write(self.before, 'PREREQUISITE')
+        leaf.chmod(0o644)
+        outside = self.real('/etc/outside.conf')
+        leaf.rename(outside)
+        leaf.symlink_to(outside)
+        self.refusal_no_write(self.before, 'PREREQUISITE')
+        leaf.unlink()
+        os.link(outside, leaf)
+        self.refusal_no_write(self.before, 'PREREQUISITE')
+        self.assertEqual(outside.read_bytes(), data)
+
     def test_unrecorded_file_after_creation_gap_not_owned(self):
         h = self.h
         before = self.before()
@@ -557,4 +631,4 @@ class Files(unittest.TestCase):
 
 if __name__ == '__main__':
     os.umask(0o022)
-    unittest.main(argv=['file-regressions'], verbosity=2)
+    unittest.main(argv=['file-regressions', *a.test], verbosity=2)

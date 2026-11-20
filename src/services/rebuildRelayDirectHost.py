@@ -49,9 +49,24 @@ SWAN_DIR = '/etc/strongswan.d'
 SWAN_PROFILE = SWAN_DIR + '/celerity-rebuild-l2tp.conf'
 SWAN_SETTINGS = b'charon {\n    routing_table = 0\n    install_routes = no\n}\n'
 SWAN_START_UNITS = (XL, IKE, NET_UNIT)
-# Complete settings include closure from authenticated Debian trixie amd64
-# strongSwan 6.0.1-6+deb13u7 (path -> [mode, gid, SHA256], relative to /etc).
+# Base and optional conffile sets from authenticated Debian trixie-security
+# amd64 strongSwan 6.0.1-6+deb13u7. Each pin is the SHA256 of that set's
+# canonical {path relative to /etc: [mode, gid, SHA256 of bytes]} projection.
 STOCK_SWAN_SHA = 'ddc103e3bab4b312ab390428dd64ec6606ea6793d715d536d2fa2c0025e5d77e'
+STOCK_SWAN_ADDONS = (
+    # charon-systemd
+    ('charon-systemd.conf', 'ae3da3badf12f70aba2c90e6ada3e68106ae37e281722292a44af467306a9c16'),
+    # strongswan-swanctl
+    ('swanctl.conf charon/vici.conf', '281f18aaf17874e2eab779b1a12516a4d67fc6e2909897dddec30a94b824a132'),
+    # libcharon-extra-plugins
+    ('tnc.conf charon/addrblock.conf charon/certexpire.conf charon/dhcp.conf '
+     'charon/eap-aka.conf charon/eap-gtc.conf charon/eap-identity.conf charon/eap-md5.conf '
+     'charon/eap-radius.conf charon/eap-tls.conf charon/eap-tnc.conf charon/eap-ttls.conf '
+     'charon/error-notify.conf charon/farp.conf charon/forecast.conf charon/ha.conf '
+     'charon/kernel-libipsec.conf charon/led.conf charon/lookip.conf charon/tnc-tnccs.conf '
+     'charon/unity.conf charon/xauth-eap.conf charon/xauth-pam.conf',
+     '9217d22d0b888e08f27e4df29a871e8dd459822d312b57bde761508161a307cf'),
+)
 UNITS = (XL, IKE, X, B, NET_UNIT)
 TABLE = 'celerity_rebuild_l2tp'
 PRIORITY = 10077
@@ -564,28 +579,37 @@ def ike_include_matches(starter, expected):
 
 
 def swan_inputs(present, bad):
-    # Accept only the reviewed Debian include tree, not arbitrary files whose
-    # parsing/ordering could override the profile or load unmanaged settings.
+    # The reviewed bytes close both stock globs. Do not validate just individual
+    # setting names: alternate includes, section references and other settings
+    # could still bypass the managed routing configuration.
     profile = os.path.basename(SWAN_PROFILE)
-    with directory(SWAN_DIR) as fd:
-        top = set(os.listdir(fd))
-    top_stock = {'charon', 'charon.conf', 'charon-logging.conf', 'starter.conf'}
-    need(top == (top_stock | {profile} if present else top_stock), bad)
-    plugins = SWAN_DIR + '/charon'
-    with directory(plugins) as fd:
-        names = os.listdir(fd)
-    need(len(names) == 21 and all(name.endswith('.conf') for name in names), bad)
-    paths = [SWAN_CONF, *(SWAN_DIR + '/' + n for n in top_stock - {'charon'}),
-             *(plugins + '/' + n for n in names)]
     rows = {}
-    for path in paths:
-        record = read(path, 262144)
-        if record is None or record.get('uid', 0) != 0:
-            raise Refusal(bad)
-        rows[path.removeprefix('/etc/')] = [record['mode'], record['gid'], digest(raw(record))]
-    value = digest(encode(rows))
-    need(value == STOCK_SWAN_SHA, bad)
-    return value
+    try:
+        with directory(SWAN_DIR) as fd:
+            top = set(os.listdir(fd))
+        need('charon' in top and (profile in top) == present, bad)
+        top -= {'charon', profile}
+        plugins = SWAN_DIR + '/charon'
+        with directory(plugins) as fd:
+            names = os.listdir(fd)
+        need(len(top) + len(names) <= 50 and all(n.endswith('.conf') for n in (*top, *names)), bad)
+        paths = [SWAN_CONF, *(SWAN_DIR + '/' + n for n in top), *(plugins + '/' + n for n in names)]
+        for path in paths:
+            record = read(path, 262144)
+            if record is None or record.get('uid', 0) != 0:
+                raise Refusal(bad)
+            rows[path.removeprefix('/etc/')] = [record['mode'], record['gid'], digest(raw(record))]
+    except (OSError, Refusal):
+        raise Refusal(bad) from None
+
+    base = rows.copy()
+    for leaves, expected in STOCK_SWAN_ADDONS:
+        keys = [SWAN_DIR.removeprefix('/etc/') + '/' + name for name in leaves.split()]
+        addon = {key: base.pop(key) for key in keys if key in base}
+        need(not addon or (len(addon) == len(keys) and digest(encode(addon)) == expected), bad)
+    need(digest(encode(base)) == STOCK_SWAN_SHA, bad)
+    # Pin the actual complete tree for phase comparisons, not the base projection.
+    return digest(encode(rows))
 
 
 def no_swan_rule():

@@ -24,7 +24,7 @@ function seed(root) {
     }
     copy('strongswan.conf');
     copy('strongswan.d');
-    assert.equal(leaves.length, 25);
+    assert.ok([25, 51].includes(leaves.length), 'use the extracted base or expanded Debian settings tree');
     assert.ok(!leaves.includes(profile));
     return leaves;
 }
