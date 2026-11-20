@@ -734,6 +734,15 @@ test('later Apply retains ownership and adds the new policy to the live follow-r
     const pppTag = 'rebuild-relay-ingress';
     const oldPort = files.main.inbounds.find(x => x.tag === pppTag).port;
     f.nodes[0].aclRules = ['reject(example.invalid)'];
+    const { bindProfileWire, pin } = require('./helpers/rebuildBoundProfileWire');
+    f.env.C3_REBUILD_L2TP_SSH_SHA256 = pin;
+    f.nodes[0].ssh.password = 'fixture-ssh-auth';
+    bindProfileWire(t.mock.method.bind(t.mock), f.nodes[0].ip, machineId, () => ({
+        requireSupportedCore: async () => {}, read: async name => structuredClone(files[name]),
+        close: async () => {}, stagePair: async () => {}, putPair: async pair => {
+            for (const { profile, config } of pair) files[profile] = structuredClone(config);
+        },
+    }));
     assert.equal((await service.execute({ nodeId: id })).allowed, true);
     assert.equal(files.main.inbounds.find(x => x.tag === pppTag).port, oldPort);
     assert.ok(files.main.routing.rules.some(x => x.outboundTag === 'block' && x.inboundTag.includes(pppTag)

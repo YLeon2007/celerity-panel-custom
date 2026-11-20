@@ -262,7 +262,13 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             stream.write = chunk => { chunks.push(Buffer.from(chunk)); return true; };
             const execute = stdin => {
                 if (!command.startsWith('/usr/bin/timeout -k ')) {
-                    assert.ok(!peer.pinned && applyHandlers.has(peer.ip));
+                    const host = routes.get(peer.ip);
+                    assert.equal(peer.pinned, Boolean(host));
+                    if (command === '/usr/bin/head -c 34 /etc/machine-id') {
+                        assert.ok(host && stdin === undefined);
+                        return { status: 0, stdout: `${host.machineId}\n`, stderr: '' };
+                    }
+                    assert.ok(applyHandlers.has(peer.ip));
                     return applyHandlers.get(peer.ip)(command, stdin);
                 }
                 const host = routes.get(peer.ip);

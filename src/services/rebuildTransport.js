@@ -5,17 +5,44 @@ const {generateBridgeSystemdService}=require('./configGenerator');
 const {READ_CHAIN,VERIFY_CHAIN}=require('./rebuildTunnelTls');
 const fail=code=>Object.assign(new Error(code),{code});
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
+const readMachineId='/usr/bin/head -c 34 /etc/machine-id';
 // All shell strings are fixed or constructed from locally generated constants.
 // Profile contents (including REALITY private keys) are only passed via stdin.
-function createTransport(node, SSH=require('./nodeSSH')) {
-    const ssh=new SSH(node), token=randomUUID(), staged=new Map();let connected=false, attemptedStage=false;
+function createTransport(node, SSH=require('./nodeSSH'), authority) {
+    const ssh=new SSH(node,authority?.sshOptions), token=randomUUID(), staged=new Map();
+    let connected=false, attemptedStage=false, attestationStarted=false, attested=false, closed=false;
+    // A pooled channel can reconnect between commands. A bound transport keeps
+    // one direct client from machine-ID attestation through cleanup, with no replay.
+    if(authority)ssh.usePool=false;
     const temp=profile=>`${paths[profile]}.rebuild-${token}.json`;
-    async function check(command,stdin) {
+    async function attest(){
+        if(closed||attestationStarted)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+        attestationStarted=true;
+        await authority.verify();
+        try{await ssh.connect();}catch{ssh.disconnect();throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');}
+        connected=true;
+        await authority.verify();
+        let result;
+        try{result=await ssh.exec(readMachineId,{timeout:10000});}catch{throw fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');}
+        if(result?.code!==0 || result.stderr!=='' || ![authority.machineId,`${authority.machineId}\n`].includes(result.stdout)){
+            throw fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');
+        }
+        await authority.verify();attested=true;
+    }
+    async function run(command,options){
+        if(closed || authority && !attested)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+        if(authority)await authority.verify();
         if(!connected){await ssh.connect();connected=true;}
-        const result=await ssh.exec(command,{timeout:60000,...(stdin===undefined?{}:{stdin})});
+        return ssh.exec(command,options);
+    }
+    async function check(command,stdin) {
+        const result=await run(command,{timeout:60000,...(stdin===undefined?{}:{stdin})});
         if(result?.code!==0)throw fail('REBUILD_NODE_COMMAND_FAILED');return result.stdout;
     }
-    async function read(profile){if(!Object.hasOwn(paths,profile))throw fail('REBUILD_INVALID_PROFILE');if(!connected){await ssh.connect();connected=true;}return readClassicProfile(ssh,paths[profile],{allowAbsent:profile==='bridge'});}
+    async function read(profile){
+        if(!Object.hasOwn(paths,profile))throw fail('REBUILD_INVALID_PROFILE');
+        return readClassicProfile({exec:command=>run(command,authority?{timeout:60000}:undefined)},paths[profile],{allowAbsent:profile==='bridge'});
+    }
     async function requireSupportedCore(){
         // Probe the exact binary used by the checked units, not a cached DB
         // value or the agent's PATH. Do not include remote output in errors.
@@ -62,8 +89,22 @@ function createTransport(node, SSH=require('./nodeSSH')) {
         if(side.active)await check('systemctl enable xray-bridge.service && systemctl restart xray-bridge.service && systemctl is-active --quiet xray-bridge.service');
         else if(side.state==='loaded') await check('systemctl disable xray-bridge.service');
     }
-    async function close(){if(connected){try{if(attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`);}finally{ssh.disconnect();}}}
+    async function close(){
+        if(closed)return;
+        try{if(connected&&attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`);}
+        finally{closed=true;if(connected)ssh.disconnect();}
+    }
     return {read,requireSupportedCore,stagePair,putPair,close,
+        ...(authority&&{attest}),
         readTunnelCertificate:()=>check(READ_CHAIN),verifyTunnelCertificate:input=>check(VERIFY_CHAIN,input)};
 }
-module.exports={createTransport};
+
+function createBoundRelayTransport(node,fence,verifyLock){
+    const {nodeId,host:ip,port,username,sshHostKeySha256,machineId}=fence.binding;
+    // Same binding as DIRECT. In list mode, use the operator endpoint and
+    // take only authentication material from the corroborating card.
+    const target={_id:nodeId,name:nodeId,ip,ssh:{port,username,password:node.ssh.password,privateKey:node.ssh.privateKey}};
+    return createTransport(target,undefined,{machineId,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
+        expectedEndpoint:{ip,port,username}},async verify(){await verifyLock();fence.check();}});
+}
+module.exports={createTransport,createBoundRelayTransport};

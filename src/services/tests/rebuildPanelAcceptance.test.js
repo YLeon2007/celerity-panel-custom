@@ -6,6 +6,7 @@ const mongoose = require('mongoose');
 const {fixture} = require('../../modules/relay-l2tp/tests/helpers/installedEditMongoFixture');
 const {generateXrayConfigWithApi} = require('../configGenerator');
 const cryptoService = require('../cryptoService');
+const {pin}=require('./helpers/rebuildBoundProfileWire');
 
 // Only a synthetic inventory, an owned replica set, a loopback HTTP listener and
 // disposable profile files. Never accepts a panel URL, node address or credential.
@@ -22,6 +23,9 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
     const {port:dbPort,database,replicaSet} = f.lifecycle;
     const env = Object.fromEntries(['PATH','HOME','TMPDIR','NODE_PATH','SESSION_SECRET','ENCRYPTION_KEY','C3_XRAY','C3_XRAY_26_11_9'].map(k=>[k,process.env[k]]));
     Object.assign(env,{NODE_ENV:'test',LOG_LEVEL:'error',PORT:'0',USE_CADDY:'true',C3_REBUILD_ENABLED:'true',PANEL_DOMAIN:'fixture.invalid',ACME_EMAIL:'fixture@fixture.invalid',MONGO_URI:`mongodb://127.0.0.1:${dbPort}/${database}?replicaSet=${replicaSet}`});
+    const relayId = new mongoose.Types.ObjectId();
+    Object.assign(env,{C3_REBUILD_L2TP_INSTALL_ENABLED:'true',C3_REBUILD_L2TP_RELAY_ID:String(relayId),
+        C3_REBUILD_L2TP_RELAY_MACHINE_ID:'b'.repeat(32),C3_REBUILD_L2TP_SSH_SHA256:pin});
     panel=fork(require.resolve('./helpers/rebuildPanelChild.cjs'),[],{cwd:dir,env,execArgv:[],stdio:['ignore','ignore','ignore','ipc']});
     exited = new Promise(resolve=>panel.once('exit',resolve));
     const httpPort=await new Promise((resolve,reject)=>{
@@ -41,6 +45,7 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
     const nodes={}, nodeIds={}, roles={p:'portal',u:'relay',r:'relay',a:'bridge',b:'bridge',c:'bridge',x:'portal',y:'bridge'};
     for (const [i,[n,role]] of Object.entries(roles).entries()) {
         const node={_id:id(),name:n,cascadeRole:role,type:'xray',active:true,ip:`192.0.2.${i+1}`,port:22000+i,xray:{inboundTag:'client',apiPort:31000+i,transport:'tcp',security:'none'}};
+        if(n==='r') Object.assign(node,{_id:relayId,ssh:{port:22,username:'root',password:'fixture-ssh-auth'}});
         if(n==='p') Object.assign(node.xray,{security:'reality',realitySni:['site.invalid'],realityDest:'site.invalid:443',realityPrivateKey:keys.privateKey,realityPublicKey:keys.publicKey,realityShortIds:['0123abcd']});
         await Node.collection.insertOne(node); nodes[n]=node; nodeIds[n]=String(node._id);
     }

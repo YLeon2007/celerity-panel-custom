@@ -6,6 +6,7 @@ const {routerForRebuild}=require('../../routes/cascadeRebuild');
 const {createRebuildService}=require('../rebuildService');
 const {generateXrayConfigWithApi}=require('../configGenerator');
 const {randomUUID}=require('node:crypto');
+const {bindProfileWire,pin}=require('./helpers/rebuildBoundProfileWire');
 
 test('public rebuild actions use the DB component; read-only preview, user guard, explicit AutoDeploy, bridged DELETE retry',async t=>{
     const f=fixture();t.after(()=>f.stop());await f.start();
@@ -18,6 +19,7 @@ test('public rebuild actions use the DB component; read-only preview, user guard
         await Node.collection.insertOne(n);nodes.push(n);
     }
     const [portal,relay,exit,geo,replacement,x,y]=nodes, id=n=>String(n._id);
+    relay.ssh={port:22,username:'root',password:'fixture-ssh-auth'};await Node.collection.updateOne({_id:relay._id},{$set:{ssh:relay.ssh}});
     const uuid=randomUUID();await User.collection.insertOne({userId:'local-user',enabled:true,xrayUuid:uuid,nodes:[],groups:[group]});
     const retainedGroup=new mongoose.Types.ObjectId();const groups=f.models.CascadeRouteGroup.collection;
     const oldGroup={_id:retainedGroup,name:'local-legacy',mode:'reverse',strategy:'priority-failover',paths:[{pathKey:'old',priority:1,enabled:true,linkIds:[new mongoose.Types.ObjectId()]}]}; await groups.insertOne(oldGroup);
@@ -26,7 +28,12 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     files.get(id(relay)).main.inbounds.push(tproxy);
     const installed={node:relay._id,routeGroup:retainedGroup,status:'installed',desiredState:'installed',secretRevision:1,tproxyPort:tproxy.port};await State.collection.insertOne({...installed});
     let interrupt=null;
-    const service=createRebuildService({env:{C3_REBUILD_ENABLED:'true',PANEL_DOMAIN:'fixture.invalid',ENCRYPTION_KEY:process.env.ENCRYPTION_KEY},cache:{async invalidateAllSubscriptions(){}},connect(node){const key=id(node),row=files.get(key);return {requireSupportedCore:async()=>{},read:async p=>structuredClone(row[p]),close:async()=>{},stagePair:async()=>{stages.push(key)},putPair:async pair=>{if(interrupt===key)throw new Error('interrupted');for(const p of pair)row[p.profile]=structuredClone(p.config);writes.push(key);}};}});
+    const connect=node=>{const key=id(node),row=files.get(key);return {requireSupportedCore:async()=>{},read:async p=>structuredClone(row[p]),close:async()=>{},stagePair:async()=>{stages.push(key)},putPair:async pair=>{if(interrupt===key)throw new Error('interrupted');for(const p of pair)row[p.profile]=structuredClone(p.config);writes.push(key);}};};
+    const machine='b'.repeat(32);
+    bindProfileWire(t.mock.method.bind(t.mock),relay.ip,machine,()=>connect(relay));
+    const service=createRebuildService({env:{C3_REBUILD_ENABLED:'true',PANEL_DOMAIN:'fixture.invalid',ENCRYPTION_KEY:process.env.ENCRYPTION_KEY,
+        C3_REBUILD_L2TP_INSTALL_ENABLED:'true',C3_REBUILD_L2TP_RELAY_ID:id(relay),C3_REBUILD_L2TP_RELAY_MACHINE_ID:machine,C3_REBUILD_L2TP_SSH_SHA256:pin},
+        cache:{async invalidateAllSubscriptions(){}},connect});
     const csrf=randomUUID(),app=express();app.use(express.json());app.use((req,_res,next)=>{req.session={authenticated:true,panelCsrfToken:csrf};next()});app.use('/api/cascade',routerForRebuild({service,Link,Node}));
     const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});t.after(()=>new Promise(resolve=>server.close(resolve)));
     const request=async(method,path,body,token=csrf)=>{const result=await fetch(`http://127.0.0.1:${server.address().port}/api/cascade${path}`,{method,headers:{'content-type':'application/json','x-csrf-token':token},...(body?{body:JSON.stringify(body)}:{})});return {status:result.status,body:await result.json()};};

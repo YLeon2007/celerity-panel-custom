@@ -3,14 +3,14 @@ const {isRebuildEnabled}=require('./rebuildMode');
 const {runRebuild,hasProtectedClientInbound}=require('./rebuildCoordinator');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
-const {createTransport}=require('./rebuildTransport');
+const {createTransport,createBoundRelayTransport}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {prepareLinks}=require('./rebuildLinkKeys');
 const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
 const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
 const {createRebuildRelayAccounts}=require('./rebuildRelayAccounts');
 const {assertNoPendingRelayAccounts}=require('./rebuildRelayAccountsStore');
-const {resolveRelayBinding}=require('./rebuildRelayAuthorization');
+const {resolveRelayBinding,captureRelayBinding}=require('./rebuildRelayAuthorization');
 const {appliedLink}=require('./rebuildAppliedLink');
 const {createPrivateKey,createPublicKey}=require('node:crypto');
 const fail=code=>Object.assign(new Error(code),{code});
@@ -43,38 +43,100 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         if (await verify() === false) throw fail('REBUILD_LOCK_LOST');
         return fn(verify);
     };
-    const guardedLocks = { ...locks, run: fn => locks.run(verify => checked(verify, fn)) };
+    // Reentry must use the active verifier issued by this service, not an
+    // arbitrary callback passed to execute().
+    const heldVerifiers=new WeakSet();
+    const guardedLocks = { ...locks, run: fn => locks.run(raw=>checked(raw,async()=>{
+        const verify=async()=>{
+            if(!heldVerifiers.has(verify)||await raw()===false||!heldVerifiers.has(verify))throw fail('REBUILD_LOCK_LOST');
+        };
+        heldVerifiers.add(verify);
+        try{return await fn(verify);}finally{heldVerifiers.delete(verify);}
+    })) };
+    const underApply=(alreadyHeld,fn)=>alreadyHeld===undefined?guardedLocks.run(fn):
+        checked(heldVerifiers.has(alreadyHeld)?alreadyHeld:undefined,fn);
     const panelTLS=()=>{const cert=require('./configGenerator').buildPanelInlineCertificate();return {...cert,serverName:cert?.domain||env.PANEL_DOMAIN};};
-    async function verifyDraftTls(link){
-        gate();const transports=new Map();
-        try {
-            const rows=await Node.find({_id:{$in:[link.portalNode,link.bridgeNode]},active:true,type:'xray'}).lean();
-            if(rows.length!==2)throw fail('REBUILD_NODE_UNSUPPORTED');
-            for(const n of rows)transports.set(String(n._id),connect(n));
-            await verifyTunnelTrust([link],panelTLS(),transports);
-        } finally {await closeAll(transports);}
+    async function installedStates(ids){
+        const states=new Map(), seen=new Set();
+        const records=await State.find({node:{$in:ids}}).select('node status desiredState routingMode routingVersion routeGroup activePathKey tproxyPort secretRevision +rebuildMachineId').lean();
+        for(const row of records){
+            const id=String(row.node);
+            if(seen.has(id))throw fail('REBUILD_L2TP_STATE_TRANSITION');
+            seen.add(id);
+            if(row.status==='not_installed'&&row.desiredState!=='installed')continue;
+            if(row.status!=='installed'||row.desiredState!=='installed')throw fail('REBUILD_L2TP_STATE_TRANSITION');
+            if(row.routingMode && !['follow-relay','route-group'].includes(row.routingMode))throw fail('REBUILD_L2TP_MODE');
+            states.set(id,row);
+        }
+        return states;
     }
-    async function closeAll(transports){const results=await Promise.allSettled([...transports.values()].map(t=>t.close()));if(results.some(x=>x.status==='rejected'))throw fail('REBUILD_TRANSPORT_CLEANUP_FAILED');}
+    async function openTransports(nodes,states,transports,bindings,verifyLock){
+        await verifyLock();
+        // Resolve the complete affected set before opening any transport. A
+        // missing list entry is a refusal, never authority to use the card.
+        for(const node of nodes){
+            const id=String(node._id), state=states.get(id);
+            if(!state)continue;
+            const binding=captureRelayBinding(env,id,node);
+            // Historical route-group state may predate a rebuild receipt.
+            // When a receipt exists it must agree with the operator binding.
+            if(state.rebuildMachineId!=null && state.rebuildMachineId!==binding.binding.machineId)throw fail('REBUILD_L2TP_BINDING_MISMATCH');
+            bindings.set(id,binding);
+        }
+        for(const node of nodes){
+            const id=String(node._id), binding=bindings.get(id);
+            if(!binding)continue;
+            // The general-purpose connector is only for ordinary Xray nodes;
+            // it cannot supply or replace an installed relay's attested writer.
+            const transport=createBoundRelayTransport(node,binding,verifyLock);
+            transports.set(id,transport);
+            await transport.attest();
+        }
+        for(const node of nodes){const id=String(node._id);if(!bindings.has(id))transports.set(id,connect(node));}
+    }
+    async function usingTransports(transports,fn){
+        let failed=false;
+        try{return await fn();}
+        catch(error){failed=true;throw error;}
+        finally{
+            const results=await Promise.allSettled([...transports.values()].map(async t=>t.close()));
+            if(!failed&&results.some(x=>x.status==='rejected'))throw fail('REBUILD_TRANSPORT_CLEANUP_FAILED');
+        }
+    }
+    async function verifyDraftTls(link,alreadyHeld){
+        gate();const ids=[link.portalNode,link.bridgeNode];
+        return underApply(alreadyHeld,verify=>withNodes(ids,async()=>{
+            const transports=new Map();
+            return usingTransports(transports,async()=>{
+                const nodes=await Node.find({_id:{$in:ids},active:true,type:'xray'}).lean();
+                if(nodes.length!==2)throw fail('REBUILD_NODE_UNSUPPORTED');
+                await openTransports(nodes,await installedStates(ids),transports,new Map(),verify);
+                await verifyTunnelTrust([link],panelTLS(),transports);
+            });
+        }));
+    }
     async function execute(req,alreadyHeld){
-        gate();const transports=new Map(),states=new Map();let prepared;
-        try{return await runRebuild({global:alreadyHeld?fn=>checked(alreadyHeld,fn):guardedLocks.run,withNodes,
+        gate();const transports=new Map(), bindings=new Map();let prepared,states,verifyLock;
+        const verifyApply=async()=>{
+            await verifyLock();
+            // Recheck all captured grants before the coordinator effects,
+            // including persistence and writes to non-L2TP members.
+            for(const binding of bindings.values())binding.check();
+        };
+        return runRebuild({global:fn=>underApply(alreadyHeld,verify=>{
+            verifyLock=verify;
+            return fn(verifyApply);
+        }),withNodes:(ids,fn)=>withNodes(ids,()=>usingTransports(transports,fn)),
             links:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]}).lean(),
             async build(ids,links){
                 const nodes=await Node.find({_id:{$in:ids}}).select('+xray.manualKey').lean();
                 if(nodes.length!==ids.length||nodes.some(n=>n.type!=='xray'||!n.active||n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
-                const records=await State.find({node:{$in:ids}}).select('node status desiredState routingMode routingVersion routeGroup activePathKey tproxyPort secretRevision').lean();
-                const followRelayStates=[];
-                for(const row of records){
-                    if(row.status==='not_installed'&&row.desiredState!=='installed')continue;
-                    if(row.status!=='installed'||row.desiredState!=='installed')throw fail('REBUILD_L2TP_STATE_TRANSITION');
-                    if(row.routingMode && !['follow-relay','route-group'].includes(row.routingMode))throw fail('REBUILD_L2TP_MODE');
-                    states.set(String(row.node),row);
-                    followRelayStates.push({...row,routingMode:'follow-relay',routingVersion:1});
-                }
+                states=await installedStates(ids);
+                await openTransports(nodes,states,transports,bindings,verifyLock);
+                const followRelayStates=[...states.values()].map(row=>({...row,routingMode:'follow-relay',routingVersion:1}));
                 const panelTls=panelTLS();
                 const usersByNode=new Map();for(const node of nodes){
                     const users=await sync._getUsersForNode(node);usersByNode.set(String(node._id),users.filter(u=>u.xrayUuid));
-                    transports.set(String(node._id),connect(node));
                 }
                 const controlPlaneAddresses=[...new Set([env.PANEL_DOMAIN,...nodes.flatMap(n=>[n.ip,n.domain])].filter(Boolean))];
                 for(const id of ids)await transports.get(id).requireSupportedCore();
@@ -98,12 +160,13 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 if(ingress.length || installed){if(ingress.length!==1 || !installed || ingress[0].port!==installed.tproxyPort || ingress[0].tag!==`relay-l2tp-${installed.routeGroup||id}` || ingress[0].protocol!=='dokodemo-door' || ingress[0].settings?.followRedirect!==true || ingress[0].streamSettings?.sockopt?.tproxy!=='tproxy')throw fail('REBUILD_L2TP_BASELINE_MISMATCH');}
             }return current;},
             persistKeys:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
-            markDelete:async id=>{const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
+            markDelete:async id=>{if(bindings.size)await verifyApply();const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
             stagePair:(id,pair)=>transports.get(id).stagePair(pair),putPair:(id,pair)=>transports.get(id).putPair(pair),
             async finish({desired,removed}){
                 // Not a recovery journal. A single Mongo transaction publishes the
                 // desired result; on failure the tombstone still roots both halves.
                 await Link.db.transaction(async session=>{
+                    if(bindings.size)await verifyApply();
                     for(const state of states.values()){
                         const result=await State.updateOne({_id:state._id,status:'installed',desiredState:'installed',secretRevision:state.secretRevision,tproxyPort:state.tproxyPort,routeGroup:state.routeGroup??null},{$set:{routingMode:'follow-relay',routingVersion:1}},{session});if(result.matchedCount!==1)throw fail('REBUILD_L2TP_STATE_TRANSITION');
                     }
@@ -115,7 +178,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     if(removed.length){const result=await Link.deleteMany({_id:{$in:removed.map(l=>l._id)},rebuildDelete:true},{session});if(result.deletedCount!==removed.length)throw fail('REBUILD_LINK_CHANGED');}
                 });await cache.invalidateAllSubscriptions();require('./cascadeService')._invalidateTopologyCache();
             }
-        },req);}finally{await closeAll(transports);}
+        },req);
     }
     const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});
     const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});

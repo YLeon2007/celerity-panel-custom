@@ -33,7 +33,7 @@ require('../../accessLogs/processService').start = () => {};
 require('../../syncService').healthCheck = async () => {};
 require('../../statsService').saveHourlySnapshot = async () => {};
 const event = (kind,id) => fs.appendFileSync(path.join(dir,'events'), `${kind}:${id}\n`);
-require('../../rebuildTransport').createTransport = node => {
+const profileFixture = node => {
     const id = String(node._id); assert.match(id,/^[a-f\d]{24}$/);
     const file = profile => { assert.ok(['main','bridge'].includes(profile)); return path.join(dir,`${id}-${profile}.json`); };
     const staged = new Set();
@@ -67,5 +67,9 @@ require('../../rebuildTransport').createTransport = node => {
         async close() { for (const candidate of staged) fs.rmSync(candidate,{force:true}); }
     };
 };
+require('../../rebuildTransport').createTransport = profileFixture;
+const {bindProfileWire}=require('./rebuildBoundProfileWire');
+bindProfileWire((target, name, fn) => { target[name]=fn; },'192.0.2.3',process.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID,
+    ()=>profileFixture({_id:process.env.C3_REBUILD_L2TP_RELAY_ID}));
 process.once('disconnect',()=>process.exit(1));
 require('../../../../index');

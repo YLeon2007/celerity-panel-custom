@@ -174,13 +174,15 @@ test('pending relay-account intent fences public Install, confirmed Remove, Appl
     // Apply is refused at its outer lock, so it cannot reach this second check.
     const locks = makeLocks();
     lockEvents.length = 0;
-    await locks.run(async verify => {
+    pending = null;
+    await service.locks.run(async verify => {
         const original = held;
+        pending = { _id: 'pending' };
         await assert.rejects(service.execute({ linkId, expectedPreview }, verify), { code: blocked });
         assert.equal(held, original, 'do not reacquire or unlock someone else’s Apply generation');
-        assert.deepEqual(lockEvents, ['acquire', 'verify', 'intent']);
+        assert.deepEqual(lockEvents, ['acquire', 'verify', 'intent', 'verify', 'verify', 'intent']);
     });
-    assert.deepEqual(lockEvents, ['acquire', 'verify', 'intent', 'release']);
+    assert.deepEqual(lockEvents, ['acquire', 'verify', 'intent', 'verify', 'verify', 'intent', 'release']);
     assert.deepEqual(effects, []);
     assert.equal(node.cascadeRole, 'relay');
 

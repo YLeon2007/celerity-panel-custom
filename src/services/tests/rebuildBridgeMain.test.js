@@ -19,7 +19,8 @@ function fixture(t, tag = 'vless-in') {
     const f = { original, writes: 0 };
     const write = () => { f.writes++; assert.fail('unexpected dispatch'); };
     const service = createRebuildService({ Node: model([node]), Link: model([]), State: model([]),
-        locks: { run: fn => fn() }, env: { C3_REBUILD_ENABLED: 'true' }, cache: {},
+        locks: { run: fn => fn(async () => {}) }, assertNoRelayAccountIntent: async () => {},
+        env: { C3_REBUILD_ENABLED: 'true' }, cache: {},
         sync: { _getUsersForNode: async () => [] }, connect: () => ({ requireSupportedCore: async () => {},
             read: async profile => profile === 'main' ? structuredClone(original) : null,
             stagePair: write, putPair: write, close: async () => {} }),

@@ -75,7 +75,8 @@ test('actual TLS chain gates Preview, fresh Apply and draft before persistence',
                 return { code:res.status,stdout:res.stdout };
             }
         }
-        const service=createRebuildService({ Node:model(nodes), Link:model([link]), State:model([]), locks:{run:fn=>fn()},
+        const service=createRebuildService({ Node:model(nodes), Link:model([link]), State:model([]), locks:{run:fn=>fn(async()=>{})},
+            assertNoRelayAccountIntent:async()=>{},
             env:{C3_REBUILD_ENABLED:'true'}, cache:{},sync:{_getUsersForNode:async()=>[]},connect(n){const tr=createTransport(n,LocalSSH);
                 return {...tr,requireSupportedCore:async()=>{},read:async p=>baseline.find(b=>b.nodeId===n._id&&b.profile===p).config,
                     putPair:async()=>{writes++;},stagePair:async()=>{writes++;} };} });

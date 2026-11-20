@@ -71,7 +71,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
         Object.assign(link,require('./cascadeLinks').resolveRealitySettings({...link.toObject(),realityPrivateKey:b.realityPrivateKey||link.realityPrivateKey,realityPublicKey:b.realityPublicKey||link.realityPublicKey},listener));
     }
     if(!Number.isInteger(link.tunnelPort)||link.tunnelPort<1||link.tunnelPort>65535||!Number.isSafeInteger(link.priority)||typeof link.name!=='string'||!link.name.trim())throw fail('REBUILD_INVALID_REQUEST');
-    if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject());
+    if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject(),verify);
     await verify();link.status='pending';await link.save();const linkId=String(link._id);
     require('../services/cascadeService')._invalidateTopologyCache();
     if(b.autoDeploy!==true)return {executionMode:'rebuild',desiredSaved:true,linkId,status:'saved'};

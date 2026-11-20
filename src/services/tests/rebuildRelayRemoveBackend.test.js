@@ -513,13 +513,16 @@ test('a later Apply preserves the ownership receipt and normal Apply works after
     const profiles = followRelayStates => composeRebuildProfiles({ nodes: f.nodes, links: [], followRelayStates,
         controlPlaneAddresses: [f.env.PANEL_DOMAIN, f.nodes[0].ip, f.nodes[0].domain] });
     f.hooks.verify = async () => { writeProfiles(profiles([{ ...f.states[0], status: 'installed' }])); return true; };
-    const service = f.create({ sync: { _getUsersForNode: async () => [] }, cache: { invalidateAllSubscriptions: async () => {} },
-        connect: () => ({ requireSupportedCore: async () => {}, close: async () => {}, stagePair: async () => {},
-            read: async profile => structuredClone(files.get(profile)), putPair: async pair => writeProfiles(pair) }),
-    });
+    const connect = () => ({ requireSupportedCore: async () => {}, close: async () => {}, stagePair: async () => {},
+        read: async profile => structuredClone(files.get(profile)), putPair: async pair => writeProfiles(pair) });
+    const service = f.create({ sync: { _getUsersForNode: async () => [] }, cache: { invalidateAllSubscriptions: async () => {} }, connect });
     await service.installRelay(id);
     const { installedAt, rebuildInstallToken } = copy(f.states[0]);
     f.nodes[0].aclRules = ['reject(example.invalid)'];
+    const { bindProfileWire, pin } = require('./helpers/rebuildBoundProfileWire');
+    f.env.C3_REBUILD_L2TP_SSH_SHA256 = pin;
+    f.nodes[0].ssh = { port: 22, username: 'root', password: 'fixture-ssh-auth' };
+    bindProfileWire(t.mock.method.bind(t.mock), f.nodes[0].ip, f.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID, connect);
     assert.equal((await service.execute({ nodeId: id })).allowed, true);
     assert.deepEqual([f.states[0].installedAt, f.states[0].rebuildInstallToken], [installedAt, rebuildInstallToken]);
     const main = files.get('main'), bridge = files.get('bridge');
@@ -529,7 +532,7 @@ test('a later Apply preserves the ownership receipt and normal Apply works after
     f.hooks.remove = async guard => {
         await guard();
         // Model the sibling driver's postproof, retaining the latest non-PPP
-        // policy and the BRIDGE config. No SSH session runs in this fixture.
+        // policy and the BRIDGE config. No socket is opened in this fixture.
         files.set('main', withoutPpp.config);
         return true;
     };
