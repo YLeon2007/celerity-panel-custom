@@ -265,7 +265,11 @@ test('mounted role guard and Remove use one estimate, require a current session-
                 if (count instanceof Error) throw count;
                 return count;
             } }),
-            async prepareRemove() { events.push('prepare'); return plan; },
+            async prepareRemove(input) {
+                assert.deepEqual(input, { nodeId: id, backupId, network, transit: [], expectedCensus: validCensus });
+                events.push('prepare');
+                return plan;
+            },
             async remove(proof, guard) {
                 assert.equal(proof, plan);
                 await guard();
@@ -286,7 +290,11 @@ test('mounted role guard and Remove use one estimate, require a current session-
         assert.equal(form.body.split(text).length, 3, 'both strings must use exactly the same estimate');
         assert.doesNotMatch(form.body, new RegExp(`${validCensus}|fixture-psk|fixture-password|private fixture details`));
         const ticket = form.body.match(/name="ticket" value="([a-f0-9]{64})"/)?.[1];
-        if (ticket) assert.ok(form.body.includes(`value="cancel" formaction="${removeUrl}/cancel"`));
+        if (ticket) {
+            assert.ok(form.body.includes(`<form method="POST" action="${removeUrl}">`));
+            assert.ok(form.body.includes(`name="decision" value="confirm"`));
+            assert.ok(form.body.includes(`value="cancel" formaction="${removeUrl}/cancel"`));
+        }
         return ticket;
     };
 
@@ -363,6 +371,14 @@ test('mounted role guard and Remove use one estimate, require a current session-
     assert.deepEqual(JSON.parse(holdingApply.body), { error: { code: 'REBUILD_BUSY' } });
     assert.deepEqual(events.splice(0), ['create', 'count', 'close'], 'a busy Apply lock prevents a fresh census and removal');
 
+    ticket = await matchesCount(1, 0);
+    accounts = null;
+    const missingRecount = await submit(ticket);
+    assert.equal(missingRecount.status, 409);
+    assert.deepEqual(JSON.parse(missingRecount.body), { error: { code: 'REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE' } });
+    assert.deepEqual(events.splice(0), ['create', 'count', 'close'], 'an unavailable account recount prevents transport');
+    accounts = 1;
+
     for (const [fresh, code] of [[{ activeSessions: 2, census: validCensus }, 'SESSIONS_BUSY'],
         [{ activeSessions: 0, census: 'e'.repeat(64) }, 'PREVIEW_CHANGED'], [Error('lost census'), 'COUNT_UNAVAILABLE']]) {
         count = { activeSessions: 0, census: validCensus };
@@ -376,8 +392,12 @@ test('mounted role guard and Remove use one estimate, require a current session-
     assert.equal(removeWrites, 0);
     count = { activeSessions: 0, census: validCensus };
     ticket = await matchesCount(1, 0);
-    const outcomes = await Promise.all([submit(ticket), submit(ticket)]);
-    assert.deepEqual(outcomes.map(result => result.status).sort(), [200, 409]);
+    const browser = { headers: { accept: 'text/html,application/xhtml+xml,*/*;q=0.8' } };
+    const outcomes = await Promise.all([submit(ticket, 'confirm', browser), submit(ticket, 'confirm', browser)]);
+    assert.deepEqual(outcomes.map(result => result.status), [303, 303]);
+    assert.deepEqual(outcomes.map(result => result.location.split('?')[0]), [url, url]);
+    assert.equal(outcomes.filter(result => result.location === url).length, 1, 'one successful form POST');
+    assert.equal(outcomes.filter(result => result.location.includes('REMOVE_CONFIRMATION_REQUIRED')).length, 1);
     assert.deepEqual(events, ['create', 'count', 'close', 'create', 'count', 'prepare', 'remove', 'close']);
     assert.equal(removeWrites, 3);
     assert.equal(state.status, 'not_installed');

@@ -270,16 +270,20 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         },
         prepareRemove: input => serial(async () => {
             requireThat(!held && input?.nodeId === nodeId
-                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit'].includes(key))
+                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'expectedCensus'].includes(key))
                 && typeof input.backupId === 'string'
                 && input.backupId.length === 32 && TOKEN.test(input.backupId), 'REMOVE_INPUT_INVALID');
+            const hasCensus = Object.hasOwn(input, 'expectedCensus');
+            const { expectedCensus } = input;
+            requireThat(!hasCensus || (tokenMatches(PIN, expectedCensus) && expectedCensus.length === 64), 'REMOVE_INPUT_INVALID');
             const params = { nodeId, backupId: input.backupId, network: removeNetwork(input.network),
                 ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
             const proof = await exec('prepare-remove', params, false, value => exactAck(params.backupId)(value)
                 && value.machineId === machineId && typeof value.baseline === 'string' && value.baseline.length === 64
                 && PIN.test(value.baseline));
             const plan = Object.freeze({});
-            held = { plan, params: { ...params, baseline: proof.baseline }, phase: 'remove-prepared' };
+            held = { plan, params: { ...params, baseline: proof.baseline, ...(hasCensus && { expectedCensus }) },
+                phase: 'remove-prepared' };
             return plan;
         }),
         remove(plan, verifyLock) {

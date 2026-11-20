@@ -1771,6 +1771,11 @@ def remove_installation(request, state):
     need(boot_enrollment is None or boot_link() == boot_enrollment, 'ROLLBACK_DRIFT')
     if 'swan' in current:
         check_swan_profile(state['swanBackup'], read(SWAN_PROFILE))
+    if 'expectedCensus' in request:
+        # Still under the exclusive DIRECT flock. The prior panel recount and
+        # prepare snapshot cannot authorize a write against a now-unknown census.
+        census = session_census({k: request[k] for k in ('machineId', 'nodeId', 'backupId', 'network')})
+        session_need(census['activeSessions'] == 0 and census['census'] == request['expectedCensus'])
     # Retain the install manifest unchanged. Durable no-replace intent
     # prevents blind replay even if the first stop's result is unknown.
     REMOVE_ENTERED = True
@@ -2222,48 +2227,62 @@ def session_sample(libc, proc, group, owner, held, watch):
     return main_start, result
 
 
-def read_session_count(request):
+def session_census(request):
+    # Caller holds the shared (preview) or exclusive (Remove) DIRECT flock.
     global DEADLINE
-    session_need(set(request) == {'action', 'machineId', 'nodeId', 'backupId', 'network'}
-                 and re.fullmatch(r'[a-f0-9]{32}', request['machineId']) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
-                 and re.fullmatch(r'[a-f0-9]{32}', request['backupId']) and os.uname().machine == 'x86_64')
-    routing(request['network'])
-    DEADLINE = min(DEADLINE, time.monotonic() + 7)
+    session_need(os.uname().machine == 'x86_64')
+    outer_deadline = DEADLINE
+    DEADLINE = min(outer_deadline, time.monotonic() + 7)
+    try:
+        return collect_session_census(request)
+    finally:
+        DEADLINE = outer_deadline
+
+
+def collect_session_census(request):
     libc = ctypes.CDLL(None, use_errno=True)
-    with directory(SYSTEM) as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        owner = session_owner(request)
-        group_path = '/sys/fs/cgroup' + SESSION_GROUP
-        with directory('/proc') as proc, directory(group_path) as group, contextlib.ExitStack() as stack:
-            session_fs(libc, proc, 0x9fa0)  # PROC_SUPER_MAGIC
-            session_fs(libc, group, 0x63677270)  # CGROUP2_SUPER_MAGIC
-            route = stack.enter_context(socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK, 0))
-            route.bind((0, 1 | 16))  # RTMGRP_LINK | RTMGRP_IPV4_IFADDR; overflow also refuses.
-            poll = select.poll()
-            poll.register(route, select.POLLIN)
-            pids = {}
+    owner = session_owner(request)
+    group_path = '/sys/fs/cgroup' + SESSION_GROUP
+    with directory('/proc') as proc, directory(group_path) as group, contextlib.ExitStack() as stack:
+        session_fs(libc, proc, 0x9fa0)  # PROC_SUPER_MAGIC
+        session_fs(libc, group, 0x63677270)  # CGROUP2_SUPER_MAGIC
+        route = stack.enter_context(socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK, 0))
+        route.bind((0, 1 | 16))  # RTMGRP_LINK | RTMGRP_IPV4_IFADDR; overflow also refuses.
+        poll = select.poll()
+        poll.register(route, select.POLLIN)
+        pids = {}
 
-            def held(pid):
-                if pid not in pids:
-                    fd = os.pidfd_open(pid)
-                    stack.callback(os.close, fd)
-                    poll.register(fd, select.POLLIN)
-                    pids[pid] = fd
-                return pids[pid]
+        def held(pid):
+            if pid not in pids:
+                fd = os.pidfd_open(pid)
+                stack.callback(os.close, fd)
+                poll.register(fd, select.POLLIN)
+                pids[pid] = fd
+            return pids[pid]
 
-            def watch():
-                session_need(not poll.poll(0) and time.monotonic() < DEADLINE)
+        def watch():
+            session_need(not poll.poll(0) and time.monotonic() < DEADLINE)
 
-            sample = session_sample(libc, proc, group, owner, held, watch)
-            session_need(owner == session_owner(request))
-            session_need(sample == session_sample(libc, proc, group, owner, held, watch)
-                         and session_generation(os.fstat(group)) == session_generation(os.lstat(group_path)))
-            watch()
-        session_need(time.monotonic() < DEADLINE)
+        sample = session_sample(libc, proc, group, owner, held, watch)
+        session_need(owner == session_owner(request))
+        session_need(sample == session_sample(libc, proc, group, owner, held, watch)
+                     and session_generation(os.fstat(group)) == session_generation(os.lstat(group_path)))
+        watch()
+    session_need(time.monotonic() < DEADLINE)
     # Hash generation identifiers, excluding manifest bytes, tunnel IDs and IPs.
     return {'activeSessions': len(sample[1]), 'census': digest(encode([
         'ppp-census-v1', request['nodeId'], request['backupId'], owner[:4], sample[0],
         [row[3:] for row in sample[1]]]))}
+
+
+def read_session_count(request):
+    session_need(set(request) == {'action', 'machineId', 'nodeId', 'backupId', 'network'}
+                 and re.fullmatch(r'[a-f0-9]{32}', request['machineId']) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
+                 and re.fullmatch(r'[a-f0-9]{32}', request['backupId']))
+    routing(request['network'])
+    with directory(SYSTEM) as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return session_census({k: v for k, v in request.items() if k != 'action'})
 
 
 def dispatch(request: dict[str, Any]):
@@ -2288,8 +2307,10 @@ def dispatch(request: dict[str, Any]):
             token = request['backupId']
             keys = {'action', 'machineId', 'backupId', 'network', 'nodeId'}
             keys |= {'baseline'} if action == 'remove' else set()
+            optional = {'transit'} | ({'expectedCensus'} if action == 'remove' else set())
             need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
-                 and keys <= set(request) <= keys | {'transit'}
+                 and keys <= set(request) <= keys | optional
+                 and ('expectedCensus' not in request or re.fullmatch(r'[a-f0-9]{64}', request['expectedCensus']))
                  and ('transit' not in request or type(request['transit']) is list), 'CANDIDATE_INVALID')
             state = observe_removal(request)
             if action == 'prepare-remove':

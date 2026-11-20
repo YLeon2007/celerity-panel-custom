@@ -182,10 +182,10 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         checkPreview();
                     }
                     // No saved MAIN is sent or rebuilt here. The direct driver
-                    // prepares subtraction against the current physical profiles
-                    // and still owns the physical PPP-busy checks through remove.
+                    // prepares subtraction against the current physical profiles.
+                    // The actual host Remove must recheck the confirmed census.
                     const plan = await remote.prepareRemove({ nodeId: id, backupId: state.backupId, network,
-                        ...(transit && { transit }) });
+                        ...(transit && { transit }), ...(proof && { expectedCensus: proof.census }) });
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
                     await checkInventory(state, true);
                     checkPreview();

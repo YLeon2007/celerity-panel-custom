@@ -310,9 +310,35 @@ else:
         p = stale[scenario]
         q = p.with_suffix('.new'); q.write_bytes(p.read_bytes()); q.replace(p)
     recheck = snapshot()
-    b = wire('remove', baseline=proof['baseline'])
-    if scenario in stale:
+    censuses = []
+    census_mode = scenario.removeprefix('census-') if scenario.startswith('census-') else None
+    expected = 'e' * 64
+    deadline = h['DEADLINE']
+    if census_mode is not None:
+        def census(request):
+            assert request == req
+            assert h['DEADLINE'] < deadline and h['DEADLINE'] <= h['time'].monotonic() + 7
+            with directory(h['SYSTEM']) as contender:
+                try:
+                    h['fcntl'].flock(contender, h['fcntl'].LOCK_SH | h['fcntl'].LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise AssertionError('destructive census not under the exclusive Remove flock')
+            assert not changes and not intent.exists()
+            censuses.append(request)
+            if census_mode == 'unknown':
+                raise Refusal('SESSION_COUNT_UNPROVED')
+            if census_mode == 'timeout':
+                raise subprocess.TimeoutExpired([], 7)
+            return {'activeSessions': int(census_mode == 'busy'), 'census': 'f' * 64 if census_mode == 'changed' else expected}
+        h['collect_session_census'] = census
+    b = wire('remove', baseline=proof['baseline'], **({'expectedCensus': expected} if census_mode else {}))
+    assert len(censuses) == int(census_mode is not None) and h['DEADLINE'] == deadline
+    if scenario in stale or census_mode in ('unknown', 'busy', 'changed'):
         assert b == (70,'','DIRECT_REMOVE_REFUSED\n') and not changes and snapshot() == recheck and not intent.exists()
+    elif census_mode == 'timeout':
+        assert b == (75,'','') and not changes and snapshot() == recheck and not intent.exists()
     elif scenario in ('unknown-stop','lingering-listener','lingering-route'):
         assert b == (75,'','') and intent.is_file(), b
         assert policy['route'] and policy['nft']
@@ -333,7 +359,8 @@ print('ok')
 for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation',
     'foreign-drop', 'foreign-dep', 'foreign-ike', 'foreign-rule', 'foreign-listener', 'ambiguous', 'ambiguous-shared',
     'duplicate-json', 'nft-drift', 'invalid-candidate', 'active-ppp', 'wrong-network', 'wrong-machine', 'wrong-node',
-    'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route']) {
+    'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route',
+    'census-idle', 'census-unknown', 'census-busy', 'census-changed', 'census-timeout']) {
     test(`direct remove fixture: ${scenario}`, () => {
         const dir = mkdtempSync(join(process.cwd(), '.direct-remove-fixture-'));
         try {

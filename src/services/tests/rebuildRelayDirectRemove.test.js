@@ -13,7 +13,7 @@ const network = { clientCidr: '10.255.1.0/24', tproxyPort: 12345, fwmark: 77, ro
 const request = { nodeId, backupId, network };
 const ok = value => ({ code: 0, stdout: JSON.stringify(value), stderr: '' });
 
-function fixture(handler = () => undefined) {
+function fixture(handler = () => undefined, expectedCensus) {
     const calls = [];
     class SSH {
         constructor(selected, options) {
@@ -26,7 +26,10 @@ function fixture(handler = () => undefined) {
             const input = JSON.parse(stdin);
             calls.push(input.action);
             assert.ok(!command.includes(backupId));
-            assert.deepEqual(input, { action: input.action, machineId, ...request, ...(input.action === 'remove' ? { baseline } : {}) });
+            assert.deepEqual(input, { action: input.action, machineId, ...request, ...(input.action === 'remove' ? {
+                baseline, ...(expectedCensus && { expectedCensus }),
+            } : {}) });
+            if (expectedCensus) assert.ok(!command.includes(expectedCensus));
             return handler(input) ?? (input.action === 'prepare-remove'
                 ? ok({ ok: true, machineId, backupId, baseline }) : ok({ ok: true, backupId, removed: true }));
         }
@@ -51,7 +54,7 @@ test('remove prepares an opaque, driver-bound single-use plan over pinned SSH', 
 test('remove gate rejects wrong inputs and refuses a lost lock without write dispatch', async () => {
     const { remote, calls } = fixture();
     for (const invalid of [{ nodeId: 'f'.repeat(24) }, { backupId: '../anything' },
-        { command: 'ignored?' },
+        { command: 'ignored?' }, { expectedCensus: 'f'.repeat(64) + '\n' }, { expectedCensus: null },
         { backupId: backupId + '\n' }, { network: { ...network, fwmark: '77' } }, { network: { ...network, command: 'ignored?' } }]) {
         await assert.rejects(remote.prepareRemove({ ...request, ...invalid }));
     }
@@ -60,6 +63,18 @@ test('remove gate rejects wrong inputs and refuses a lost lock without write dis
     assert.equal(await remote.remove(plan, () => { throw Error('private lock error'); }), false);
     assert.equal(await remote.remove(plan, () => assert.fail()), false);
     assert.deepEqual(calls, ['connect', 'prepare-remove']);
+    await remote.close();
+});
+
+test('confirmed Remove binds the census to the destructive command through the opaque plan', async () => {
+    const expectedCensus = 'f'.repeat(64);
+    const { remote, calls } = fixture(undefined, expectedCensus);
+    const input = { ...request, expectedCensus };
+    const plan = await remote.prepareRemove(input);
+    input.expectedCensus = 'a'.repeat(64);
+    assert.deepEqual(Object.keys(plan), []);
+    assert.equal(await remote.remove(plan, () => true), true);
+    assert.deepEqual(calls, ['connect', 'prepare-remove', 'remove']);
     await remote.close();
 });
 
