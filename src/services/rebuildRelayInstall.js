@@ -12,21 +12,26 @@ async function runFreshRelayInstall(id, deps) {
     let primary, installed = false;
     try {
         return await deps.lock(async verifyLock => {
+            let inventory;
             const checkAuthorization = () => {
                 if (!deps.authorize()) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
             };
             const checkAuthority = async () => {
                 checkAuthorization();
                 if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
-                if (deps.verifyBinding) await deps.verifyBinding();
+                if (deps.verifyBinding) {
+                    await deps.verifyBinding(inventory);
+                    if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
+                }
                 checkAuthorization();
             };
             let remote;
             try {
                 await checkAuthority();
-                const inventory = await deps.inventory(id);
+                inventory = await deps.inventory(id);
                 if (inventory.eligible !== true || inventory.pristine !== true) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
                 if (deps.verifyBinding) await checkAuthority();
+                if (deps.precheckSources) await deps.precheckSources(inventory, checkAuthority);
                 checkAuthorization();
                 remote = await deps.connect(inventory);
                 checkAuthorization();

@@ -5,7 +5,6 @@ const assert = require('node:assert/strict');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { Types, mongo } = require('mongoose');
 const { createRebuildService } = require('../rebuildService');
-const authorization = require('../rebuildRelayAuthorization');
 const { makeDesired } = require('../rebuildRelayBackendDesired');
 const { makeLocks, withNode } = require('../rebuildLocks');
 const { decrypt, encrypt } = require('../../modules/relay-l2tp/services/secretBoxService');
@@ -83,7 +82,7 @@ function fixture(t) {
     const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: id,
         C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, ENCRYPTION_KEY: 'test-only-credential-key-'.repeat(2), PANEL_DOMAIN: 'fixture.invalid' };
     const nodes = [{ _id: oid(id), ip: '192.0.2.4', domain: 'relay.fixture.invalid', type: 'xray', active: true,
-        cascadeRole: 'relay', ssh: { port: 22, username: 'fixture' } }];
+        cascadeRole: 'relay', ssh: { port: 22, username: 'root' } }];
     const links = [], states = [], users = [], events = [];
     const stateHooks = bind(t, State, states, events);
     const userHooks = bind(t, User, users, events);
@@ -107,12 +106,26 @@ function fixture(t) {
         verify: async () => true,
         rollback: async guard => { await guard(); return true; },
         close: async () => {},
+        checkChap: async () => ({ changed: false }),
     };
     const deps = { Node, Link, State, L2tpUser: User, env, cache: {}, sync: {}, locks: makeLocks(lockCollection),
         createRelayDirect: ({ node, env: driverEnv }) => {
+            assert.equal(driverEnv, env);
+            if (String(node._id) !== id) {
+                events.push('source-connect');
+                assert.ok(lock);
+                return {
+                    async checkChap(installation, current, desired, guard) {
+                        await guard();
+                        events.push('source-check');
+                        assert.ok(lock);
+                        return hooks.checkChap(installation, current, desired);
+                    },
+                    async close() { events.push('source-close'); },
+                };
+            }
             events.push('connect');
             assert.deepEqual(node.ssh, nodes[0].ssh);
-            assert.equal(driverEnv, env);
             return {
                 async preflight() { events.push('preflight'); return hooks.preflight(); },
                 async prepare(args) { events.push('prepare'); prepared = args; return hooks.prepare(); },
@@ -124,23 +137,15 @@ function fixture(t) {
         },
     };
     const create = overrides => createRebuildService({ ...deps, ...overrides });
-    const enroll = () => {
-        const resolve = (driverEnv, peerId, node) => {
-            assert.ok(lock);
-            assert.equal(driverEnv, env);
-            assert.equal(peerId, String(node._id));
-            return { nodeId: peerId, machineId: states.find(row => String(row.node) === peerId)?.rebuildMachineId };
-        };
-        // Standalone base has no export yet; after the binding-agent commit,
-        // mock only the existing production resolver at the same seam.
-        if (authorization.resolveRelayBinding) t.mock.method(authorization, 'resolveRelayBinding', resolve);
-        else {
-            authorization.resolveRelayBinding = resolve;
-            t.after(() => { delete authorization.resolveRelayBinding; });
-        }
+    const enrollment = () => nodes.map(({ _id, ip: host, ssh: { port, username } }, i) => ({
+        nodeId: String(_id), host, port, username, sshHostKeySha256: String(i + 1).repeat(64),
+        machineId: i === 0 ? machineId : states.find(row => String(row.node) === String(_id))?.rebuildMachineId,
+    }));
+    const enroll = (rows = enrollment()) => {
+        env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(rows);
         return create().installRelay;
     };
-    return { env, events, create, enroll, nodes, links, states, users, hooks, stateHooks, userHooks,
+    return { env, events, create, enroll, enrollment, nodes, links, states, users, hooks, stateHooks, userHooks,
         get prepared() { return prepared; },
         get lockHeld() { return !!lock; },
         loseLock: () => { lock = undefined; } };
@@ -154,12 +159,13 @@ function priorRow() {
 const sourceId = '6'.repeat(24), sourceMachineId = '7'.repeat(32);
 function addSource(f, { source = sourceId, machine = sourceMachineId, prefix = '10.255.31', accounts } = {}) {
     const clock = new Date('2026-01-02');
-    const node = { ...f.nodes[0], _id: oid(source), ip: '192.0.2.31' };
+    const node = { ...f.nodes[0], _id: oid(source), ip: `192.0.2.${30 + f.nodes.length}` };
     const state = { _id: oid(), node: node._id, status: 'installed', desiredState: 'installed', routingMode: 'follow-relay',
         routingVersion: 1, rebuildMachineId: machine, rebuildInstallToken: '00000000-0000-4000-8000-000000000003',
         backupId: '1'.repeat(32), secretRevision: 1, pskEncrypted: 'fixture-opaque-psk',
         installedAt: clock, lastVerifiedAt: clock, lastSyncAt: clock,
-        clientCidr: `${prefix}.0/24`, localAddress: `${prefix}.1`, poolStart: `${prefix}.10`, poolEnd: `${prefix}.250` };
+        clientCidr: `${prefix}.0/24`, localAddress: `${prefix}.1`, poolStart: `${prefix}.10`, poolEnd: `${prefix}.250`,
+        tproxyPort: 12345, fwmark: 100, routeTable: 100 };
     const users = (accounts ?? [
         { login: 'relay-bootstrap', enabled: true, passwordEncrypted: encrypt('inherited-one', f.env.ENCRYPTION_KEY) },
         { login: 'disabled-user', enabled: false, passwordEncrypted: encrypt('inherited-two', f.env.ENCRYPTION_KEY) },
@@ -210,6 +216,14 @@ test('second relay inherits every login and exact ciphertext, including disabled
     const source = addSource(f);
     const original = source.users.map(copy);
     const targets = () => f.users.filter(row => String(row.relayNode) === id);
+    f.hooks.checkChap = async (installation, current, desired) => {
+        assert.deepEqual(installation, { nodeId: sourceId, backupId: source.state.backupId,
+            network: { clientCidr: source.state.clientCidr, tproxyPort: 12345, fwmark: 100, routeTable: 100 } });
+        assert.deepEqual(current, original.map(row => ({ login: row.login, enabled: row.enabled, ipAddress: row.ip,
+            password: decrypt(row.passwordEncrypted, f.env.ENCRYPTION_KEY) })).sort((a, b) => a.login.localeCompare(b.login)));
+        assert.deepEqual(current, desired);
+        return { changed: false };
+    };
     f.hooks.install = async guard => {
         await guard();
         const rows = targets();
@@ -228,6 +242,8 @@ test('second relay inherits every login and exact ciphertext, including disabled
     assert.deepEqual(session.events, ['commit', 'commit']);
     assert.deepEqual(targets().map(row => row.syncStatus), ['synced', 'synced']);
     const { desired } = f.prepared;
+    assert.equal(targets().find(row => row.login === 'relay-bootstrap').ip, desired.poolStart);
+    assert.deepEqual(f.events.slice(0, 4), ['source-connect', 'source-check', 'source-close', 'connect']);
     assert.notEqual(desired.clientCidr, source.state.clientCidr);
     for (const row of targets()) {
         assert.notEqual(row.ip, desired.localAddress);
@@ -254,8 +270,9 @@ test('second relay refuses an unbound source, missing rows, invalid credentials 
     for (const [name, alter, code] of cases) await t.test(name, async child => {
         const f = fixture(child);
         addSource(f);
+        const rows = f.enrollment();
         alter(f);
-        const install = name === 'no binding' ? f.create().installRelay : f.enroll();
+        const install = f.enroll(name === 'no binding' ? rows.slice(0, 1) : rows);
         await assert.rejects(install(id), { code: `REBUILD_L2TP_${code}` });
         assert.deepEqual(f.events, []);
     });
@@ -271,11 +288,117 @@ test('independent legacy bootstraps conflict even when plaintext is the same', a
     assert.deepEqual(f.events, []);
 });
 
+test('cohort install refuses source binding, physical and logical disagreements before reservation', async t => {
+    for (const [name, expected, alter] of [
+        ['persisted machine mismatch', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ rows }) => { rows[1].machineId = 'f'.repeat(32); }],
+        ['source endpoint mismatch', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ f }) => { f.nodes[1].ssh = { port: 2322, username: 'root' }; }],
+        ['legacy singleton cannot inherit', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ f }) => f.create().installRelay],
+        ['bootstrap disabled', 'ACCOUNT_INVENTORY_INVALID', ({ source }) => { source.users[0].enabled = false; }],
+        ['enrollment pin changed after prepare', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ f, rows }) => {
+            f.hooks.prepare = async () => {
+                rows[1].sshHostKeySha256 = 'f'.repeat(64);
+                f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(rows);
+                return { backupId };
+            };
+        }],
+        ['source has unapplied CHAP', 'ACCOUNT_SOURCE_PREFLIGHT_REFUSED', ({ f }) => {
+            f.hooks.checkChap = async () => { throw new Error('source CHAP no longer agrees with persisted rows'); };
+        }],
+        ['ambiguous CHAP reply', 'ACCOUNT_SOURCE_PREFLIGHT_REFUSED', ({ f }) => {
+            f.hooks.checkChap = async () => ({ changed: true });
+        }],
+    ]) await t.test(name, async child => {
+        const f = fixture(child);
+        const source = addSource(f);
+        const rows = f.enrollment();
+        const install = alter({ f, source, rows }) ?? f.enroll(rows);
+        const before = [f.states.map(copy), f.users.map(copy)];
+        await assert.rejects(install(id), { code: `REBUILD_L2TP_${expected}` });
+        assert.deepEqual([f.states, f.users], before);
+        assert.ok(!f.events.some(x => x.includes(':') || x === 'install'));
+        if (expected === 'ACCOUNT_SOURCE_PREFLIGHT_REFUSED') {
+            assert.deepEqual(f.events, ['source-connect', 'source-check', 'source-close']);
+        }
+    });
+});
+
+test('third relay requires every source to agree and to pass read-only CHAP before opening the target', async t => {
+    for (const scenario of ['agrees', 'login drift', 'enablement drift', 'CHAP refusal on last source']) {
+        await t.test(scenario, async child => {
+            const f = fixture(child);
+            const session = sessionFixture(child, f);
+            const first = addSource(f);
+            const second = addSource(f, { source: '8'.repeat(24), machine: '9'.repeat(32), prefix: '10.255.32', accounts: first.users });
+            second.node.ip = 'SOURCE2.fixture.invalid.';
+            const rows = f.enrollment();
+            rows[2].host = 'source2.fixture.invalid';
+            // Per-relay revisions need only be locally settled.
+            Object.assign(second.users[1], { desiredRevision: 8, appliedRevision: 8 });
+            if (scenario === 'login drift') second.users[1].login = 'different-login';
+            if (scenario === 'enablement drift') second.users[1].enabled = true;
+            let checked = 0;
+            f.hooks.checkChap = async () => {
+                if (++checked === 2 && scenario === 'CHAP refusal on last source') throw new Error('refused');
+                return { changed: false };
+            };
+            const install = f.enroll(rows);
+            if (scenario === 'agrees') {
+                assert.equal((await install(id)).status, 'installed');
+                assert.equal(checked, 2);
+                assert.ok(f.events.indexOf('connect') > f.events.lastIndexOf('source-close'));
+                assert.deepEqual(session.events, ['commit', 'commit']);
+            } else {
+                const before = [f.states.map(copy), f.users.map(copy)];
+                await assert.rejects(install(id), { code: scenario === 'CHAP refusal on last source'
+                    ? 'REBUILD_L2TP_ACCOUNT_SOURCE_PREFLIGHT_REFUSED' : 'REBUILD_L2TP_ACCOUNT_SOURCE_CONFLICT' });
+                assert.equal(checked, scenario === 'CHAP refusal on last source' ? 2 : 0);
+                assert.deepEqual(session.events, []);
+                assert.deepEqual([f.states, f.users], before);
+                assert.ok(!f.events.includes('connect'));
+            }
+        });
+    }
+});
+
+test('Install passes the pinned source and persisted projection to real DIRECT, with no write on CHAP refusal', async t => {
+    const f = fixture(t);
+    const { node, state, users } = addSource(f);
+    const rows = f.enrollment();
+    f.enroll(rows);
+    const { createRelayDirect } = require('../rebuildRelayDirect');
+    let sent, disconnected = false;
+    class SSH {
+        constructor(selected, { expectedEndpoint, expectedHostKeySha256 }) {
+            assert.equal(selected._id, String(node._id));
+            assert.deepEqual(expectedEndpoint, { ip: rows[1].host, port: rows[1].port, username: rows[1].username });
+            assert.ok(expectedHostKeySha256 === rows[1].sshHostKeySha256);
+        }
+        async connect() { assert.ok(f.lockHeld); }
+        disconnect() { disconnected = true; }
+        async exec(command, { stdin }) {
+            assert.ok(f.lockHeld);
+            assert.equal(sent, undefined);
+            sent = JSON.parse(stdin);
+            return { code: 70, stderr: 'DIRECT_CHAP_REFUSED\n', stdout: '' };
+        }
+    }
+    const install = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) }).installRelay;
+    await assert.rejects(install(id), { code: 'REBUILD_L2TP_ACCOUNT_SOURCE_PREFLIGHT_REFUSED' });
+    assert.equal(sent?.action, 'check-chap');
+    assert.equal(sent.machineId, state.rebuildMachineId);
+    assert.equal(sent.backupId, state.backupId);
+    assert.deepEqual(sent.currentUsers.map(row => [row.login, row.ipAddress, row.enabled]), users
+        .map(row => [row.login, row.ip, row.enabled]).sort((a, b) => a[0].localeCompare(b[0])));
+    assert.ok(equal(sent.currentUsers, sent.desiredUsers));
+    assert.ok(disconnected);
+    assert.deepEqual(f.events, []);
+});
+
 test('second relay fails pool exhaustion before opening transport', async t => {
     const f = fixture(t);
     const passwordEncrypted = encrypt('fixture-only', f.env.ENCRYPTION_KEY);
     const source = addSource(f, { accounts: Array.from({ length: 242 }, (_, i) =>
-        ({ login: `account-${i}`, enabled: i % 2 === 0, passwordEncrypted })) });
+        ({ login: i === 0 ? 'relay-bootstrap' : `account-${i}`, enabled: i % 2 === 0, passwordEncrypted })) });
     source.state.poolEnd = '10.255.31.251';
     await assert.rejects(f.enroll()(id), { code: 'REBUILD_L2TP_ACCOUNT_POOL_EXHAUSTED' });
     assert.deepEqual(f.events, []);
@@ -300,7 +423,7 @@ test('second relay rejects a changed source snapshot after Prepare without persi
     f.hooks.prepare = async () => { f.users[0].enabled = false; return { backupId }; };
     await assert.rejects(f.enroll()(id), { code: 'REBUILD_L2TP_RESERVATION_FAILED' });
     assert.deepEqual(session.events, ['abort']);
-    assert.deepEqual(f.events, ['connect', 'preflight', 'prepare', 'close']);
+    assert.deepEqual(f.events, ['source-connect', 'source-check', 'source-close', 'connect', 'preflight', 'prepare', 'close']);
 });
 
 test('second relay aborts the complete reservation when the second replica write fails', async t => {
@@ -397,6 +520,7 @@ joined({ fixture, id, oid, machineId });
 
 test('operator list installs two relays under Apply exclusion and records their distinct physical IDs', async t => {
     const f = fixture(t);
+    sessionFixture(t, f);
     const second = { ...f.nodes[0], _id: oid('c'.repeat(24)), ip: '192.0.2.20', ssh: { port: 2222, username: 'root' } };
     const rows = [f.nodes[0], second].map(({ _id, ip, ssh }, i) => ({ nodeId: String(_id), host: ip,
         ...ssh, machineId: (i ? 'd' : 'e').repeat(32), sshHostKeySha256: (i ? '1' : '2').repeat(64) }));
@@ -411,7 +535,14 @@ test('operator list installs two relays under Apply exclusion and records their 
                 preflight.push(selected.nodeId);
                 return { machineId: selected.machineId, ppp: true, masked: false };
             },
-            async prepare({ nodeId }) { assert.equal(nodeId, selected.nodeId); return { backupId }; },
+            async prepare({ nodeId }) { assert.equal(nodeId, selected.nodeId); return { backupId: selected.machineId }; },
+            async checkChap(installation, current, desired, guard) {
+                await guard();
+                assert.ok(f.lockHeld);
+                assert.equal(installation.nodeId, rows[0].nodeId);
+                assert.deepEqual(desired, current);
+                return { changed: false };
+            },
             async install(plan, guard) { await guard(); },
             async verify() { return true; },
             async close() {},

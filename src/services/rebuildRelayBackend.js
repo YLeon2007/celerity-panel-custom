@@ -45,9 +45,30 @@ async function readTopology(Node, Link, node, panelDomain) {
     };
 }
 
-// The production driver is loaded only on authorized, eligible first install.
+// Load the production driver only after the locked inventory checks.
 function defaultDriver(options) {
     return require('./rebuildRelayDirect').createRelayDirect(options);
+}
+
+async function precheckSource({ node, binding, installation, currentUsers }, createRelayDirect, env, checkAuthority) {
+    await checkAuthority();
+    const refused = () => fail('REBUILD_L2TP_ACCOUNT_SOURCE_PREFLIGHT_REFUSED');
+    let remote, primary;
+    try {
+        remote = await createRelayDirect({ node, env, binding });
+        if (typeof remote?.checkChap !== 'function' || typeof remote?.close !== 'function') throw refused();
+        // The persisted source projection is an expected preimage, not evidence
+        // of host state. DIRECT authenticates the host, receipt and actual CHAP
+        // rows. This is an inspection only, with no requested CHAP delta.
+        if ((await remote.checkChap(installation, currentUsers, currentUsers, checkAuthority))?.changed !== false) throw refused();
+    } catch (error) {
+        primary = error?.code === 'REBUILD_LOCK_LOST' ? error : refused();
+        throw primary;
+    } finally {
+        try { await remote?.close?.(); }
+        catch { if (!primary) throw refused(); }
+    }
+    await checkAuthority();
 }
 
 function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
@@ -55,7 +76,7 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
         const fence = captureRelayBinding(env, id);
         const { machineId } = fence.binding;
         const authorize = () => { try { fence.check(); return true; } catch { return false; } };
-        const getNode = () => read(Node.findById(id).select('ip domain active type cascadeRole useCustomConfig ssh'));
+        const getNode = (nodeId = id) => read(Node.findById(nodeId).select('ip domain active type cascadeRole useCustomConfig ssh'));
         let store;
         return runFreshRelayInstall(id, {
             authorize, machineId,
@@ -72,17 +93,25 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
                 if (!snapshot.pristine) return snapshot;
                 const topology = await readTopology(Node, Link, node, env.PANEL_DOMAIN);
                 const sourceSnapshot = await store.sourceRows(id);
-                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env,
-                    readNode: (peerId, fields) => read(Node.findById(peerId).select(fields)) });
-                const payload = makeDesired(id, sourceInventory.occupied, topology.controlPlaneAddresses, env.ENCRYPTION_KEY, sourceInventory);
+                const key = env.ENCRYPTION_KEY;
+                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env, key, readNode: getNode });
+                const payload = makeDesired(id, sourceInventory.occupied, topology.controlPlaneAddresses, key, sourceInventory);
+                if (sourceInventory.inherited && payload.desired.users[0].ipAddress !== payload.desired.poolStart) {
+                    throw fail('REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID');
+                }
                 return { ...snapshot, ...topology, ...payload, sourceSnapshot, replicated: !!sourceInventory.inherited,
-                    node, eligible: true, nodeId: id };
+                    sources: sourceInventory.prechecks, key, node, eligible: true, nodeId: id };
             },
-            verifyBinding: fence.listMode ? async () => {
+            verifyBinding: fence.listMode ? async inventory => {
                 const current = await getNode();
                 if (!eligible(current, id, true)) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
                 fence.check(current);
+                if (inventory?.replicated && env.ENCRYPTION_KEY !== inventory.key) throw fail('REBUILD_L2TP_CREDENTIAL_KEY_INVALID');
+                for (const source of inventory?.sources ?? []) await source.verifyBinding();
             } : undefined,
+            precheckSources: async ({ sources }, checkAuthority) => {
+                for (const source of sources) await precheckSource(source, createRelayDirect, env, checkAuthority);
+            },
             connect: inventory => createRelayDirect({ node: inventory.node, env }),
             prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit }, remote) =>
                 remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, ...(transit && { transit }) }),

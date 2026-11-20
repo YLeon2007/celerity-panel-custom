@@ -1,16 +1,17 @@
 'use strict';
 
-const { isIPv4, isIP } = require('node:net');
+const { isIPv4 } = require('node:net');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
+const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 const { ipv4, occupiedRange, validLogin } = require('./rebuildRelayBackendDesired');
-const authorization = require('./rebuildRelayAuthorization');
+const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 
 const fail = code => Object.assign(new Error(`REBUILD_L2TP_${code}`), { code: `REBUILD_L2TP_${code}` });
 const inventoryInvalid = () => fail('ACCOUNT_INVENTORY_INVALID');
 const exactToken = (value, re) => typeof value === 'string' && re.exec(value)?.[0] === value;
 const objectId = value => exactToken(String(value), /^[a-f0-9]{24}$/);
 const empty = value => value == null || value === '';
-const nodeFields = 'ip active type cascadeRole useCustomConfig ssh.port ssh.username';
+const bootstrap = 'relay-bootstrap';
 const transitional = new Set(['queued', 'preflight', 'installing', 'removing']);
 
 function sourcePool(row) {
@@ -21,7 +22,7 @@ function sourcePool(row) {
     }
     const lo = ipv4(poolStart), hi = ipv4(poolEnd), local = ipv4(localAddress);
     if (lo > hi || (local >= lo && local <= hi)) throw inventoryInvalid();
-    return [lo, hi];
+    return { first, last, lo, hi };
 }
 
 function installedSource(row) {
@@ -32,17 +33,36 @@ function installedSource(row) {
         || ![null, undefined, 0].includes(row.replacementFence)
         || !exactToken(row.rebuildMachineId, /^[a-f0-9]{32}$/)
         || !exactToken(row.rebuildInstallToken, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/)
-        || !exactToken(row.backupId, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/)
-        || !Number.isSafeInteger(row.secretRevision) || row.secretRevision < 1
+        || !exactToken(row.backupId, /^[a-f0-9]{32}$/) || row.secretRevision !== 1
         || typeof row.pskEncrypted !== 'string' || !row.pskEncrypted
         || !(row.installedAt instanceof Date) || !Number.isFinite(row.installedAt.getTime())) throw inventoryInvalid();
     return sourcePool(row);
 }
 
+async function enrollSource(env, id, state, readNode) {
+    const getNode = async () => {
+        const node = await readNode(id);
+        if (String(node?._id) !== id || node.type !== 'xray' || node.active !== true || node.cascadeRole !== 'relay'
+            || node.useCustomConfig) throw inventoryInvalid();
+        return node;
+    };
+    const node = await getNode();
+    const notEnrolled = () => fail('ACCOUNT_SOURCE_NOT_ENROLLED');
+    let fence;
+    try { fence = captureRelayBinding(env, id, node); }
+    catch { throw notEnrolled(); }
+    // The singleton can authorize a standalone first install, not a cohort.
+    if (!fence.listMode || fence.binding.machineId !== state.rebuildMachineId) throw notEnrolled();
+    return { node, binding: fence.binding, async verifyBinding() {
+        const current = await getNode();
+        try { fence.check(current); } catch { throw notEnrolled(); }
+    } };
+}
+
 // Login is the logical key. Source IP and the per-row sync revision are local
 // to each relay. Agreement is on the actual envelope and enablement, not on
 // decrypted passwords (independent historical bootstraps must not be merged).
-async function resolveAccountSources({ nodeId, rows, env, readNode }) {
+async function resolveAccountSources({ nodeId, rows, env, key, readNode }) {
     const sources = new Map();
     const stateIds = new Set(), machineIds = new Set();
     const occupied = [], allocations = [];
@@ -63,7 +83,8 @@ async function resolveAccountSources({ nodeId, rows, env, readNode }) {
             continue;
         }
         const pool = installedSource(state);
-        if (machineIds.has(state.rebuildMachineId)) throw inventoryInvalid();
+        if (machineIds.has(state.rebuildMachineId) || [...sources.values()].some(source =>
+            pool.first <= source.pool.last && pool.last >= source.pool.first)) throw inventoryInvalid();
         machineIds.add(state.rebuildMachineId);
         sources.set(id, { state, pool, accounts: new Map() });
     }
@@ -73,34 +94,45 @@ async function resolveAccountSources({ nodeId, rows, env, readNode }) {
         if (!source || !objectId(row._id) || !validLogin(row.login) || !isIPv4(row.ip)
             || typeof row.enabled !== 'boolean' || typeof row.passwordEncrypted !== 'string' || !row.passwordEncrypted
             || source.accounts.has(row.login) || assigned.has(row.ip)
-            || ipv4(row.ip) < source.pool[0] || ipv4(row.ip) > source.pool[1]) throw inventoryInvalid();
+            || ipv4(row.ip) < source.pool.lo || ipv4(row.ip) > source.pool.hi) throw inventoryInvalid();
         if (row.syncStatus !== 'synced' || row.syncOperationId != null || !Number.isSafeInteger(row.desiredRevision)
             || row.desiredRevision < 1 || row.desiredRevision !== row.appliedRevision) throw fail('ACCOUNT_SOURCE_BUSY');
-        source.accounts.set(row.login, { login: row.login, enabled: row.enabled, passwordEncrypted: row.passwordEncrypted });
+        source.accounts.set(row.login, { login: row.login, enabled: row.enabled, passwordEncrypted: row.passwordEncrypted, ip: row.ip });
         assigned.add(row.ip);
         allocations.push(row.ip);
     }
     let canonical;
     for (const [id, source] of sources) {
-        if (!source.accounts.size) throw inventoryInvalid();
+        const initial = source.accounts.get(bootstrap);
+        if (!initial?.enabled || initial.ip !== source.state.poolStart) throw inventoryInvalid();
         if (canonical && (canonical.size !== source.accounts.size || [...canonical].some(([login, account]) => {
             const replica = source.accounts.get(login);
             return !replica || replica.enabled !== account.enabled || replica.passwordEncrypted !== account.passwordEncrypted;
         }))) throw fail('ACCOUNT_SOURCE_CONFLICT');
         canonical ??= source.accounts;
-        const node = await readNode(id, nodeFields);
-        if (String(node?._id) !== id || node.type !== 'xray' || node.active !== true || node.cascadeRole !== 'relay'
-            || node.useCustomConfig || !isIP(node.ip)) throw inventoryInvalid();
-        // Other relays are DB sources only; Install does not open SSH to them
-        // or change their CHAP files. Their enrollment must still be present.
-        let binding;
-        try { binding = await authorization.resolveRelayBinding?.(env, id, node); }
-        catch { throw fail('ACCOUNT_SOURCE_NOT_ENROLLED'); }
-        if (binding?.machineId !== source.state.rebuildMachineId || (binding.nodeId !== undefined && binding.nodeId !== id)) {
-            throw fail('ACCOUNT_SOURCE_NOT_ENROLLED');
-        }
     }
-    return { occupied, allocations, inherited: canonical && [...canonical.keys()].sort().map(login => canonical.get(login)) };
+    const prechecks = [];
+    for (const [id, { state, accounts }] of sources) {
+        const enrollment = await enrollSource(env, id, state, readNode);
+        const { backupId, clientCidr, tproxyPort, fwmark, routeTable } = state;
+        const installation = { nodeId: id, backupId, network: { clientCidr, tproxyPort, fwmark, routeTable } };
+        let currentUsers;
+        try {
+            currentUsers = [...accounts.keys()].sort().map(login => {
+                const { ip, enabled, passwordEncrypted } = accounts.get(login);
+                return { login, ipAddress: ip, enabled, password: decrypt(passwordEncrypted, key) };
+            });
+        } catch { throw inventoryInvalid(); }
+        prechecks.push({ ...enrollment, installation, currentUsers });
+    }
+    // Allocate bootstrap first: account lifecycle requires it at poolStart on
+    // each relay, regardless of where its login sorts among inherited accounts.
+    const inherited = canonical && [bootstrap, ...[...canonical.keys()].filter(login => login !== bootstrap).sort()]
+        .map(login => {
+            const { enabled, passwordEncrypted } = canonical.get(login);
+            return { login, enabled, passwordEncrypted };
+        });
+    return { occupied, allocations, inherited, prechecks };
 }
 
 module.exports = { resolveAccountSources };
