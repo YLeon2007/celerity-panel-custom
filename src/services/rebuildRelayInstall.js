@@ -1,5 +1,7 @@
 'use strict';
 
+const { AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
+
 const fail = code => Object.assign(new Error(code), { code });
 const UNKNOWN = 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN';
 const ROLLBACK_UNKNOWN = 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN';
@@ -50,7 +52,12 @@ async function runFreshRelayInstall(id, deps) {
                 await checkAuthority();
                 let reservation;
                 try { reservation = await deps.reserve(inventory, backupId, checkAuthority); }
-                catch { throw fail('REBUILD_L2TP_RESERVATION_FAILED'); }
+                catch (error) {
+                    // No host dispatch without both a checked commit and a
+                    // clean handoff, even when the reservation is durable.
+                    throw fail(error instanceof AcknowledgedCommitCleanupError
+                        ? 'REBUILD_L2TP_RESERVATION_CLEANUP_FAILED' : 'REBUILD_L2TP_RESERVATION_FAILED');
+                }
                 const guard = async () => {
                     await checkAuthority();
                     await deps.verifyReservation(reservation);
@@ -63,7 +70,10 @@ async function runFreshRelayInstall(id, deps) {
                         if (!noHostChanges && await remote.rollback(plan, guard) !== true) throw fail(ROLLBACK_UNKNOWN);
                         await guard();
                         await deps.restore(reservation, checkAuthority);
-                    } catch { throw fail(ROLLBACK_UNKNOWN); }
+                    } catch (error) {
+                        throw fail(error instanceof AcknowledgedCommitCleanupError
+                            ? 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED' : ROLLBACK_UNKNOWN);
+                    }
                     throw fail(code);
                 };
 
@@ -89,7 +99,10 @@ async function runFreshRelayInstall(id, deps) {
                     // Once settlement is attempted, never retry or restore the
                     // host: the final CAS may have reached majority already.
                     await deps.finish(reservation, checkAuthority);
-                } catch { throw fail('REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN'); }
+                } catch (error) {
+                    throw fail(error instanceof AcknowledgedCommitCleanupError
+                        ? 'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED' : 'REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN');
+                }
                 installed = true;
                 return { executionMode: 'rebuild', status: 'installed', nodeId: id };
             } catch (error) {

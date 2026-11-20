@@ -38,7 +38,7 @@ const requireOne = (result, field) => {
 };
 const byId = (a, b) => String(a._id).localeCompare(String(b._id));
 
-function createStore(State, User) {
+function createStore(State, User, listMode) {
     async function snapshot(nodeId) {
         const prior = await read(State.findOne({ node: nodeId }).select(privateStateFields));
         const pristine = isPristine(prior) && !(await read(User.findOne({ relayNode: nodeId }).select('_id')));
@@ -50,12 +50,12 @@ function createStore(State, User) {
         return { states: states.sort(byId), users: users.sort(byId) };
     }
 
-    // Replicas always use a transaction (even when the logical set has one
-    // login). Keep the historical singleton bootstrap persistence contract.
-    const mutate = (replicated, work) => replicated ? transactOnce(State, User, work) : work();
+    // List enrollment joins state and accounts even for the first relay, with
+    // no source and only one login. Only legacy no-list supports standalone.
+    const mutate = work => listMode ? transactOnce(State, User, work) : work();
 
-    async function reserve({ nodeId, prior, machineId, backupId, state, accounts, sourceSnapshot, replicated }, verifyLock) {
-        if (!Array.isArray(accounts) || accounts.length === 0 || (!replicated && accounts.length !== 1)) throw fail(STATE_CHANGED);
+    async function reserve({ nodeId, prior, machineId, backupId, state, accounts, sourceSnapshot }, verifyLock) {
+        if (!Array.isArray(accounts) || accounts.length === 0 || (!listMode && accounts.length !== 1)) throw fail(STATE_CHANGED);
         const now = new Date();
         const stateId = prior?._id ?? nodeId;
         const fields = {
@@ -67,8 +67,8 @@ function createStore(State, User) {
         const fence = { ...key, ...exact({ ...prior, ...fields }, [...Object.keys(fields), ...zeroFields, ...emptyFields]) };
         const replicas = accounts.map(account => ({ _id: new Types.ObjectId(), relayNode: new Types.ObjectId(nodeId),
             ...account, appliedRevision: 0, syncStatus: 'pending', createdAt: now, updatedAt: now }));
-        const reservation = { nodeId, fence, fields, prior, replicas, replicated };
-        return mutate(replicated, async session => {
+        const reservation = { nodeId, fence, fields, prior, replicas };
+        return mutate(async session => {
             // Prepare can take time. Recheck the source and absence of target
             // accounts before making any row durable.
             if (!equal(await sourceRows(nodeId, session), sourceSnapshot)) throw fail(STATE_CHANGED);
@@ -103,7 +103,7 @@ function createStore(State, User) {
     }
 
     function finish(reservation, verifyLock) {
-        return mutate(reservation.replicated, async session => {
+        return mutate(async session => {
             await verifyReservation(reservation, session);
             await verifyLock();
             const now = new Date(), options = writeIn(session);
@@ -119,8 +119,8 @@ function createStore(State, User) {
     }
 
     function restore(reservation, verifyLock) {
-        const { fence, fields, prior, replicas, replicated } = reservation;
-        return mutate(replicated, async session => {
+        const { fence, fields, prior, replicas } = reservation;
+        return mutate(async session => {
             await verifyReservation(reservation, session);
             await verifyLock();
             const options = writeIn(session);

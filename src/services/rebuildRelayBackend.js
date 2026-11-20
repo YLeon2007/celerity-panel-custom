@@ -88,7 +88,7 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
                 const node = await getNode();
                 if (!eligible(node, id, fence.listMode)) return { eligible: false };
                 fence.check(node);
-                store = createStore(State, L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel'));
+                store = createStore(State, L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel'), fence.listMode);
                 const snapshot = await store.snapshot(id);
                 if (!snapshot.pristine) return snapshot;
                 const topology = await readTopology(Node, Link, node, env.PANEL_DOMAIN);

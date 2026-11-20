@@ -200,7 +200,10 @@ function addSource(f, { source = sourceId, machine = sourceMachineId, prefix = '
 function sessionFixture(t, f) {
     const events = [], hooks = {};
     class Session {
-        transaction = { transition: state => { this.active = state !== 'TRANSACTION_COMMITTED'; } };
+        transaction = { transition: state => {
+            hooks.transition?.();
+            this.active = state !== 'TRANSACTION_COMMITTED';
+        } };
         startTransaction(options) {
             assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
             this.active = true;
@@ -214,7 +217,11 @@ function sessionFixture(t, f) {
             commit(this);
             this.active = false;
         }
-        endSession() { assert.equal(this.active, false); }
+        endSession() {
+            const result = hooks.end?.();
+            assert.equal(this.active, false);
+            return result;
+        }
     }
     function commit(session) {
         for (const rows of [f.states, f.users]) rows.splice(0, rows.length, ...session.rows.get(rows));
@@ -534,6 +541,113 @@ test('second relay never replays or rolls back an unacknowledged transaction com
         assert.equal(f.states.find(row => String(row.node) === id).status, status);
         const sync = phase === 'reservation' ? 'pending' : 'synced';
         assert.deepEqual(f.users.filter(row => String(row.relayNode) === id).map(row => row.syncStatus), [sync, sync]);
+    });
+});
+
+test('first list Install commits the bootstrap reservation before host dispatch and commits settlement after verification', async t => {
+    const f = fixture(t);
+    const { events } = sessionFixture(t, f);
+    f.hooks.install = async guard => {
+        await guard();
+        assert.deepEqual(events, ['commit']);
+        assert.deepEqual(f.states.map(row => row.status), ['installing']);
+        assert.deepEqual(f.users.map(row => [row.login, row.syncStatus]), [['relay-bootstrap', 'pending']]);
+        return true;
+    };
+    assert.equal((await f.enroll()(id)).status, 'installed');
+    assert.deepEqual(events, ['commit', 'commit']);
+    assert.deepEqual(f.states.map(row => row.status), ['installed']);
+    assert.deepEqual(f.users.map(row => row.syncStatus), ['synced']);
+});
+
+test('first list Install aborts both collections when the later CAS fails', async t => {
+    for (const phase of ['reserve', 'finish', 'restore']) await t.test(phase, async child => {
+        const f = fixture(child);
+        const { events } = sessionFixture(child, f);
+        const refusal = { acknowledged: true, matchedCount: 0, upsertedCount: 0, deletedCount: 0 };
+        if (phase === 'reserve') f.userHooks.update = () => refusal;
+        if (phase === 'finish') f.stateHooks.update = ({ update, apply }) => update.$set?.status === 'installed' ? refusal : apply();
+        if (phase === 'restore') {
+            f.hooks.verify = async () => false;
+            f.stateHooks.delete = () => refusal;
+        }
+        const code = { reserve: 'REBUILD_L2TP_RESERVATION_FAILED', finish: 'REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN',
+            restore: 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN' }[phase];
+        await assert.rejects(f.enroll()(id), { code });
+        assert.deepEqual(events, phase === 'reserve' ? ['abort'] : ['commit', 'abort']);
+        assert.deepEqual(f.states.map(row => row.status), phase === 'reserve' ? [] : ['installing']);
+        assert.deepEqual(f.users.map(row => row.syncStatus), phase === 'reserve' ? [] : ['pending']);
+        assert.equal(f.events.includes('install'), phase !== 'reserve');
+        assert.equal(f.events.filter(event => event === 'rollback').length, Number(phase === 'restore'));
+    });
+});
+
+test('first list Install never replays or compensates for a lost commit acknowledgement', async t => {
+    for (const phase of ['reserve', 'finish', 'restore']) await t.test(phase, async child => {
+        const f = fixture(child);
+        const { events, hooks } = sessionFixture(child, f);
+        const loseAt = phase === 'reserve' ? 1 : 2;
+        hooks.commit = commit => {
+            const reply = commit();
+            if (events.length === loseAt) throw new Error('fixture acknowledgement loss after commit');
+            return reply;
+        };
+        if (phase === 'restore') f.hooks.verify = async () => false;
+        const code = { reserve: 'REBUILD_L2TP_RESERVATION_FAILED', finish: 'REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN',
+            restore: 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN' }[phase];
+        const install = f.enroll();
+        await assert.rejects(install(id), { code });
+        if (phase !== 'restore') await assert.rejects(install(id), { code: 'REBUILD_L2TP_NOT_FRESH_RELAY' });
+        assert.deepEqual(events, Array(loseAt).fill('commit'));
+        assert.deepEqual(f.states.map(row => row.status), { reserve: ['installing'], finish: ['installed'], restore: [] }[phase]);
+        assert.deepEqual(f.users.map(row => row.syncStatus), { reserve: ['pending'], finish: ['synced'], restore: [] }[phase]);
+        assert.equal(f.events.filter(event => event === 'install').length, Number(phase !== 'reserve'));
+        assert.equal(f.events.filter(event => event === 'rollback').length, Number(phase === 'restore'));
+    });
+});
+
+test('first list Install reports acknowledged commit plus cleanup failure without dispatch or reversal', async t => {
+    for (const phase of ['reserve', 'finish', 'restore']) await t.test(phase, async child => {
+        const f = fixture(child);
+        const { events, hooks } = sessionFixture(child, f);
+        const failAt = phase === 'reserve' ? 1 : 2;
+        hooks.end = () => {
+            if (events.length === failAt) throw new Error('fixture cleanup failure after acknowledged commit');
+        };
+        if (phase === 'restore') {
+            f.states.push(priorRow());
+            f.hooks.verify = async () => false;
+        }
+        const before = f.states.map(copy);
+        const code = { reserve: 'REBUILD_L2TP_RESERVATION_CLEANUP_FAILED', finish: 'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED',
+            restore: 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED' }[phase];
+        await assert.rejects(f.enroll()(id), { code, message: code });
+        assert.deepEqual(events, Array(failAt).fill('commit'));
+        assert.deepEqual(f.states.map(row => row.status), { reserve: ['installing'], finish: ['installed'], restore: ['not_installed'] }[phase]);
+        if (phase === 'restore') assert.deepEqual(f.states, before);
+        assert.deepEqual(f.users.map(row => row.syncStatus), { reserve: ['pending'], finish: ['synced'], restore: [] }[phase]);
+        assert.equal(f.events.filter(event => event === 'install').length, Number(phase !== 'reserve'));
+        assert.equal(f.events.filter(event => event === 'rollback').length, Number(phase === 'restore'));
+    });
+});
+
+test('first list Install never ends a still-active session after attempting commit', async t => {
+    for (const committedReply of [true, false]) await t.test(`commit acknowledged: ${committedReply}`, async child => {
+        const f = fixture(child);
+        const { events, hooks } = sessionFixture(child, f);
+        hooks.commit = commit => {
+            const reply = commit();
+            if (!committedReply) throw new Error('fixture acknowledgement loss');
+            return reply;
+        };
+        hooks.transition = () => { throw new Error('fixture local transition failure'); };
+        hooks.end = () => { events.push('end'); };
+        await assert.rejects(f.enroll()(id), { code: committedReply
+            ? 'REBUILD_L2TP_RESERVATION_CLEANUP_FAILED' : 'REBUILD_L2TP_RESERVATION_FAILED' });
+        assert.deepEqual(events, ['commit']);
+        assert.deepEqual(f.states.map(row => row.status), ['installing']);
+        assert.deepEqual(f.users.map(row => row.syncStatus), ['pending']);
+        assert.ok(!f.events.includes('install') && !f.events.includes('rollback'));
     });
 });
 
