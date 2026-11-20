@@ -325,7 +325,8 @@ chap = Path(P['chap'])
 old_users = [dict(login='alice', password='test-old', ipAddress='10.255.1.10', enabled=True)]
 new_users = [dict(login='bob', password='test-new', ipAddress='10.255.1.11', enabled=True),
              dict(login='disabled', password='not-written', ipAddress='10.255.1.12', enabled=False)]
-stock_chap = h['raw'](before['files']['chap']) + b'\n'
+chap_preimage = h['raw'](before['files']['chap'])
+stock_chap = chap_preimage + b'\n'  # Install adds this separator before the managed block.
 if scenario == 'apply-quiescent-dependent':
     chap.write_bytes(stock_chap + begin + new_row + end)
     req['currentUsers'] = new_users
@@ -552,7 +553,9 @@ else:
         assert R(h['BRIDGE']) == side and units[B] == side_unit
         assert all(R(p) == before['files'][k] for k,p in P.items() if k not in ('main','chap'))
         preserved = b'# later prefix\r\n' + stock_chap + foreign + b'\n# appended during Remove\r\n'
-        assert chap.read_bytes() == (preserved if scenario == 'chap-sync-remove' else stock_chap)
+        # Without foreign edits the separator disappears with the block. The
+        # edited prefix above no longer matches the preimage; preserve it whole.
+        assert chap.read_bytes() == (preserved if scenario == 'chap-sync-remove' else chap_preimage)
         assert R(P['chap'])['mode'] == 0o600
         assert not any(policy.values()) and intent.is_file() and wire('prepare-remove')[0] != 0
         assert not Path(h['DROP_DIR']).exists() and not Path(h['NFT_DIR']).exists()

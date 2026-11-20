@@ -13,11 +13,13 @@ const { join, dirname } = require('node:path');
 const applyWire = require('./rebuildRelayApplyWire');
 const stockSwan = require('./rebuildRelayStockSwan');
 
-module.exports = ({ fixture, id, oid, machineId }) => {
+module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt }) => {
     test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
 
-    function host(t, scenario, { preEnabled = false, idleIke = false, subscribers = [], lifecycle = false, mainUid = 65534 } = {}) {
-        const f = fixture(t);
+    function seedHost(t, f, relay, machineId, scenario, { preEnabled = false, idleIke = false, subscribers = [], lifecycle = false,
+        mainUid = 65534, cohort = false } = {}) {
+        const id = String(relay._id);
+        const number = f.nodes.indexOf(relay);
         const root = fs.mkdtempSync(join(process.cwd(), '.relay-install-join-'));
         t.after(() => fs.rmSync(root, { recursive: true, force: true }));
         const put = (file, bytes, mode = 0o600) => {
@@ -32,14 +34,14 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         const net = 'celerity-rebuild-l2tp-network.service';
         const bootLink = '/etc/systemd/system/multi-user.target.wants/' + xl;
         const stock = join(__dirname, '../../../modules/relay-l2tp/node-artifacts/l2tp');
-        const key = Buffer.from('synthetic SSH wire key');
+        const key = Buffer.from('synthetic SSH wire key:' + id);
         const pin = createHash('sha256').update(key).digest('hex');
-        f.env.C3_REBUILD_L2TP_SSH_SHA256 = pin;
-        const relay = Object.assign(f.nodes[0], { port: 21443, xray: { apiPort: 61001, security: 'none' },
+        Object.assign(relay, { port: 21443, xray: { apiPort: 61001, security: 'none' },
             aclRules: ['reject(denied.invalid)'], ssh: { username: 'root', port: 22, password: 'local-fixture-only' } });
-        const exit = { _id: oid('d'.repeat(24)), type: 'xray', active: true, ip: '192.0.2.99', cascadeRole: 'bridge', ssh: relay.ssh };
+        const exit = { _id: oid((number ? '9' : 'd').repeat(24)), type: 'xray', active: true, ip: `192.0.2.${99 - number}`,
+            cascadeRole: 'bridge', ssh: relay.ssh };
         f.nodes.push(exit);
-        f.links.push({ _id: oid('e'.repeat(24)), portalNode: relay._id, bridgeNode: exit._id,
+        f.links.push({ _id: oid((number ? '5' : 'e').repeat(24)), portalNode: relay._id, bridgeNode: exit._id,
             tunnelProtocol: 'vmess', tunnelPort: 20443, tunnelUuid: '7b159424-f38c-4869-bbf8-cb426fa00354',
             mode: 'forward', active: true, status: scenario === 'offline' ? 'offline' : 'deployed' });
         if (scenario === 'transit-forward') {
@@ -147,7 +149,8 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         const foreign = { rules: [], routes: [{ dst: '198.51.100.0/24', table: 201, dev: 'fixture0' }],
             tables: [{ table: { family: 'inet', name: 'foreign', comment: 'operator-owned' } }],
             sockets: [['tcp', '192.0.2.4', 39491, '999']] };
-        const manager = put('manager.json', JSON.stringify({ packages, machine: machineId, original, units: original,
+        if (cohort) put('/etc/machine-id', machineId + '\n', 0o644);
+        const manager = put('manager.json', JSON.stringify({ packages, machine: machineId, address: relay.ip, cohort, original, units: original,
             running: { [x]: main, ...(bridgeActive && { [b]: bridge }) }, nextPid: 300, charonPid: '201', ikeConnection: false,
             lnsMd5: createHash('md5').update(lns).digest('hex'), effects: [], rule: null, route: null, nft: null, foreign,
             stockRules: [[0, 255], [32766, 254], [32767, 253]].map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
@@ -178,16 +181,72 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             }
             applyHandlers.set(exit.ip, applyWire({ root: peerRoot, records: () => peer, writeRecords: () => {}, mainPath, bridgePath }));
         }
+        const execute = (command, stdin) => {
+            const request = JSON.parse(stdin);
+            const { action } = request;
+            actions.push(action);
+            const state = f.states.find(row => String(row.node) === id);
+            const rows = f.users.filter(row => String(row.relayNode) === id);
+            if (action === 'install') assert.ok(state?.status === 'installing' && rows.length
+                && rows.every(user => user.syncStatus === 'pending'));
+            if (cohort) {
+                assert.ok(f.lockHeld);
+                assert.equal(request.machineId, machineId);
+                if (request.nodeId) assert.equal(request.nodeId, id);
+                if (['session-count', 'prepare-remove', 'remove', 'check-chap', 'sync-chap'].includes(action)) {
+                    assert.equal(request.currentUsers.length, rows.length);
+                    assert.deepEqual(request.currentUsers.map(u => [u.login, u.enabled, u.ipAddress]).sort(), rows
+                        .map(u => [u.login, u.enabled, u.ip]).sort());
+                }
+            }
+            if (action === 'prepare-remove' || action === 'remove') {
+                assert.ok(f.lockHeld);
+                assert.equal(state.status, action === 'remove' ? 'removing' : 'installed');
+                assert.ok(rows.length && rows.every(user => user.syncStatus === 'synced'));
+                if (!cohort) assert.equal(rows.length, 1);
+                const network = Object.fromEntries(['clientCidr', 'tproxyPort', 'fwmark', 'routeTable'].map(key => [key, state[key]]));
+                const transit = expectedRemoveTransit ?? [];
+                const { currentUsers, expectedCensus, ...rest } = request;
+                assert.deepEqual(rest, { action, machineId, nodeId: id, backupId: state.backupId, network, transit,
+                    ...(action === 'remove' ? { baseline: removeBaseline } : {}) });
+                if (!cohort) assert.ok(!Object.hasOwn(request, 'currentUsers') && !Object.hasOwn(request, 'expectedCensus'));
+                if (cohort && action === 'remove') assert.match(expectedCensus, /^[a-f0-9]{64}$/);
+            }
+            const result = spawnSync('/usr/bin/python3', ['-I', '-B', join(__dirname, 'rebuildRelayInstallHost.py'), root, scenario],
+                { input: JSON.stringify(command) + '\n' + stdin, env: {}, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
+            assert.ok(!result.error && [0, 70, 75].includes(result.status), 'local DIRECT harness exit: ' + (result.error?.code ?? result.status));
+            assert.deepEqual(records().faults ?? [], [], 'closed DIRECT command model');
+            if (/^DIRECT_[A-Z_]+\n$/.test(result.stderr)) refusals.push(result.stderr.trim());
+            if (action === 'prepare-remove' && result.status === 0) removeBaseline = JSON.parse(result.stdout).baseline;
+            return result;
+        };
+        const before = Object.fromEntries([mainPath, bridgePath, '/etc/ipsec.conf', '/etc/ppp/chap-secrets', '/etc/ipsec.secrets',
+            '/etc/xl2tpd/xl2tpd.conf', '/etc/ppp/options', '/etc/systemd/system/' + x, '/etc/systemd/system/' + xl,
+            '/etc/systemd/system/foreign.service', '/usr/lib/systemd/system/' + ike, '/usr/local/bin/xray',
+            ...swanLeaves, ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
+            .map(path => [path, fs.readFileSync(join(root, path))]));
+        return { id, relay, machineId, key, pin, execute, applyHandlers, actions, refusals, root, before, mainPath, bridgePath,
+            mpath, bpath, bridge, bootLink, generated, usersByNode, x, b, xl, ike, net, records, writeRecords, removeBaseline: () => removeBaseline,
+            expectRemoveTransit: value => { expectedRemoveTransit = value; },
+        };
+    }
+
+    function wire(t, hosts) {
+        const routes = new Map(hosts.map(host => [host.relay.ip, host]));
+        const applyHandlers = new Map(hosts.flatMap(h => [...h.applyHandlers]));
+        const wireFaults = [], frames = [];
         // Model ssh2 at the connection/channel boundary. Production NodeSSH
         // still pins the endpoint, opens the direct client and ships stdin.
         const peers = new WeakMap(), liveClients = new Set();
         t.mock.method(Client.prototype, 'connect', function (options) {
-            assert.ok(options.host === relay.ip || applyHandlers.has(options.host));
+            const host = routes.get(options.host);
+            assert.ok(host || applyHandlers.has(options.host));
             assert.equal(options.port, 22);
             assert.equal(options.username, 'root');
             if (options.hostVerifier) {
-                assert.equal(options.host, relay.ip);
-                assert.equal(options.hostVerifier(key), true);
+                assert.ok(host);
+                assert.equal(options.hostVerifier(host.key), true);
+                for (const other of hosts.filter(candidate => candidate !== host)) assert.equal(options.hostVerifier(other.key), false);
                 assert.equal(options.hostVerifier(Buffer.from('other key')), false);
             }
             peers.set(this, { ip: options.host, pinned: typeof options.hostVerifier === 'function' });
@@ -206,29 +265,10 @@ module.exports = ({ fixture, id, oid, machineId }) => {
                     assert.ok(!peer.pinned && applyHandlers.has(peer.ip));
                     return applyHandlers.get(peer.ip)(command, stdin);
                 }
-                assert.ok(peer.pinned && peer.ip === relay.ip);
-                const request = JSON.parse(stdin);
-                const { action } = request;
-                actions.push(action);
-                if (action === 'install') assert.ok(f.states[0]?.status === 'installing'
-                    && f.users.some(user => String(user.relayNode) === id && user.syncStatus === 'pending'));
-                if (action === 'prepare-remove' || action === 'remove') {
-                    assert.ok(f.lockHeld);
-                    const [state] = f.states;
-                    assert.equal(state.status, action === 'remove' ? 'removing' : 'installed');
-                    assert.equal(f.users.filter(user => String(user.relayNode) === id && user.syncStatus === 'synced').length, 1);
-                    const network = Object.fromEntries(['clientCidr', 'tproxyPort', 'fwmark', 'routeTable'].map(key => [key, state[key]]));
-                    const transit = expectedRemoveTransit ?? [];
-                    assert.deepEqual(request, { action, machineId, nodeId: id, backupId: state.backupId, network, transit,
-                        ...(action === 'remove' ? { baseline: removeBaseline } : {}) });
-                }
-                const result = spawnSync('/usr/bin/python3', ['-I', '-B', join(__dirname, 'rebuildRelayInstallHost.py'), root, scenario],
-                    { input: JSON.stringify(command) + '\n' + stdin, env: {}, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
-                assert.ok(!result.error && [0, 70, 75].includes(result.status), 'local DIRECT harness exit: ' + (result.error?.code ?? result.status));
-                assert.deepEqual(records().faults ?? [], [], 'closed DIRECT command model');
-                if (/^DIRECT_[A-Z_]+\n$/.test(result.stderr)) refusals.push(result.stderr.trim());
-                if (action === 'prepare-remove' && result.status === 0) removeBaseline = JSON.parse(result.stdout).baseline;
-                return result;
+                const host = routes.get(peer.ip);
+                assert.ok(peer.pinned && host);
+                frames.push([host.id, JSON.parse(stdin).action]);
+                return host.execute(command, stdin);
             };
             let ended = false;
             const finish = stdin => {
@@ -251,18 +291,17 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             assert.deepEqual(wireFaults, [], 'fixture wire must handle every dispatched frame');
             assert.equal(liveClients.size, 0, 'all SSH clients closed');
         });
-        const before = Object.fromEntries([mainPath, bridgePath, '/etc/ipsec.conf', '/etc/ppp/chap-secrets', '/etc/ipsec.secrets',
-            '/etc/xl2tpd/xl2tpd.conf', '/etc/ppp/options', '/etc/systemd/system/' + x, '/etc/systemd/system/' + xl,
-            '/etc/systemd/system/foreign.service', '/usr/lib/systemd/system/' + ike, '/usr/local/bin/xray',
-            ...swanLeaves, ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
-            .map(path => [path, fs.readFileSync(join(root, path))]));
+        return frames;
+    }
+
+    function host(t, scenario, options) {
+        const f = fixture(t);
+        const seeded = seedHost(t, f, f.nodes[0], machineId, scenario, options);
+        wire(t, [seeded]);
+        f.env.C3_REBUILD_L2TP_SSH_SHA256 = seeded.pin;
         const build = f.create;
         const create = overrides => build({ createRelayDirect: undefined, ...overrides });
-        return Object.assign(f, { create, actions, refusals, root, before, mainPath, bridgePath, mpath, bpath, bridge,
-            bootLink, generated, usersByNode, x, b, xl, ike, net,
-            records, writeRecords, removeBaseline: () => removeBaseline,
-            expectRemoveTransit: value => { expectedRemoveTransit = value; },
-        });
+        return Object.assign(f, seeded, { create });
     }
 
     for (const scenario of ['transit-ok', 'transit-forward', 'transit-missing-client', 'transit-drift',
@@ -408,6 +447,129 @@ module.exports = ({ fixture, id, oid, machineId }) => {
     const installedActions = ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify'];
     const status = outcome => outcome.code ?? outcome.status;
     const diagnostic = f => JSON.stringify({ action: f.actions.at(-1), wire: f.refusals.at(-1), guard: f.records().lastRefusal });
+
+    test('joined two-relay DIRECT: install, inherit, mutate shared accounts and confirm selected removal', async t => {
+        const f = fixture(t);
+        const { events: commits } = sessionFixture(t, f);
+        const intent = accountIntentFixture(t, f);
+        const a = seedHost(t, f, f.nodes[0], machineId, 'main', { cohort: true });
+        const second = { ...a.relay, _id: oid('c'.repeat(24)), ip: '192.0.2.20', domain: 'relay-b.fixture.invalid' };
+        f.nodes.push(second);
+        const b = seedHost(t, f, second, 'd'.repeat(32), 'main', { cohort: true });
+        const hosts = [a, b];
+        const frames = wire(t, hosts);
+        f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(hosts.map(h => ({
+            nodeId: h.id, host: h.relay.ip, username: h.relay.ssh.username, port: h.relay.ssh.port,
+            machineId: h.machineId, sshHostKeySha256: h.pin,
+        })));
+        const service = f.create({ createRelayDirect: undefined, assertNoRelayAccountIntent: undefined });
+        const state = h => f.states.find(row => String(row.node) === h.id);
+        const users = h => f.users.filter(row => String(row.relayNode) === h.id).sort((l, r) => l.login.localeCompare(r.login));
+        const receipt = h => users(h).map(digestAccount);
+        const chapPath = '/etc/ppp/chap-secrets';
+        const readChap = h => fs.readFileSync(join(h.root, chapPath), 'utf8');
+        const proveChap = (h, expected) => {
+            assert.deepEqual(users(h).map(u => [u.login, u.enabled]), Object.entries(expected).sort());
+            const rows = readChap(h).match(/# BEGIN CELERITY MANAGED L2TP USERS\n([\s\S]*)# END CELERITY MANAGED L2TP USERS\n/);
+            assert.ok(rows, 'managed CHAP markers present');
+            const expectedRows = users(h).filter(u => u.enabled).map(u =>
+                `"${u.login}" l2tpd "${decrypt(u.passwordEncrypted, f.env.ENCRYPTION_KEY)}" ${u.ip}\n`).sort().join('');
+            assert.ok(rows[1] === expectedRows, 'complete enabled CHAP projection matches persisted rows');
+            for (const row of users(h)) {
+                assert.equal(row.syncStatus, 'synced');
+                assert.equal(row.desiredRevision, row.appliedRevision);
+                const octets = ip => ip.split('.');
+                assert.deepEqual(octets(row.ip).slice(0, 3), octets(state(h).poolStart).slice(0, 3));
+                assert.ok(+octets(state(h).poolStart)[3] <= +octets(row.ip)[3] && +octets(row.ip)[3] <= +octets(state(h).poolEnd)[3]);
+            }
+        };
+        const bootstrap = { 'relay-bootstrap': true };
+        const inherited = { ...bootstrap, 'early-disabled': false };
+        const install = async h => {
+            const result = await service.installRelay(h.id).catch(error => error);
+            assert.equal(status(result), 'installed', diagnostic(h));
+            assert.deepEqual(result, { executionMode: 'rebuild', status: 'installed', nodeId: h.id });
+            assert.equal(state(h).rebuildMachineId, h.machineId);
+        };
+        const mutate = async (action, login, selected) => {
+            const n = frames.length;
+            const effects = selected.map(h => h.records().effects);
+            const result = await service[`${action}RelayAccount`]({ login,
+                ...(action === 'create' && { password: 'offline-fixture-account-value' }),
+            }).catch(error => error);
+            assert.equal(status(result), { create: 'created', disable: 'disabled', delete: 'deleted' }[action],
+                JSON.stringify(selected.map(diagnostic)));
+            assert.equal(result.relayCount, selected.length);
+            assert.deepEqual(frames.slice(n), ['check-chap', 'sync-chap'].flatMap(op => selected.map(h => [h.id, op])));
+            assert.deepEqual(selected.map(h => h.records().effects), effects, 'CHAP updates do not restart services or change network policy');
+            assert.equal(intent.pending, undefined);
+        };
+        const replicas = () => {
+            assert.notEqual(state(a).clientCidr, state(b).clientCidr);
+            assert.notEqual(state(a).poolStart, state(b).poolStart);
+            assert.deepEqual(users(a).map(u => u.login), users(b).map(u => u.login));
+            for (const [i, row] of users(a).entries()) {
+                const other = users(b)[i];
+                assert.equal(row.enabled, other.enabled);
+                assert.ok(row.passwordEncrypted === other.passwordEncrypted, 'same encrypted envelope');
+                assert.notEqual(row.ip, other.ip);
+                assert.notEqual(String(row._id), String(other._id));
+            }
+        };
+        await install(a);
+        assert.equal(state(b), undefined);
+        assert.deepEqual(users(b), []);
+        assert.deepEqual(b.actions, []);
+        proveChap(a, bootstrap);
+        await mutate('create', 'early-disabled', [a]);
+        proveChap(a, { ...bootstrap, 'early-disabled': true });
+        await mutate('disable', 'early-disabled', [a]);
+        proveChap(a, inherited);
+        const beforeInheritance = [receipt(a), fingerprint(a, chapPath), a.records().effects];
+        const n = frames.length;
+        await install(b);
+        assert.deepEqual(frames.slice(n), [[a.id, 'check-chap'], ...installedActions.map(op => [b.id, op])]);
+        assert.deepEqual([receipt(a), fingerprint(a, chapPath), a.records().effects], beforeInheritance);
+        proveChap(b, inherited);
+        replicas();
+
+        for (const [action, expected] of [['create', { ...inherited, 'late-shared': true }],
+            ['disable', { ...inherited, 'late-shared': false }], ['delete', inherited]]) {
+            await mutate(action, 'late-shared', hosts);
+            for (const h of hosts) proveChap(h, expected);
+            replicas();
+        }
+        // Add a foreign CHAP neighbor after Install. Remove must subtract the
+        // managed block, not restore a stale whole-file backup.
+        const neighbor = '# unrelated CHAP data added after install\n';
+        fs.appendFileSync(join(b.root, chapPath), neighbor);
+        const survivor = () => [digestAccount(state(a)), receipt(a), a.records(), a.actions.slice(),
+            [chapPath, a.mainPath, a.bridgePath, a.bootLink, stockSwan.profile].map(path => fingerprint(a, path))];
+        const beforeRemove = survivor();
+
+        for (const h of [b, a]) {
+            const n = frames.length;
+            const preview = await service.previewRemoveRelay(h.id);
+            assert.deepEqual(preview, { nodeId: h.id, accountCount: 2, activeSessions: 0, confirmable: true }, diagnostic(h));
+            const result = await service.confirmRemoveRelay(h.id, preview).catch(error => error);
+            assert.equal(status(result), 'not_installed', diagnostic(h));
+            assert.deepEqual(result, { executionMode: 'rebuild', status: 'not_installed', nodeId: h.id });
+            assert.deepEqual(frames.slice(n), ['session-count', 'session-count', 'prepare-remove', 'remove'].map(op => [h.id, op]));
+            assert.deepEqual(h.records().censusCalls, ['session-count', 'session-count', 'remove']);
+            assert.deepEqual(users(h), []);
+            assert.deepEqual([state(h).status, state(h).desiredState], ['not_installed', 'absent']);
+            assert.equal(readChap(h), h.before[chapPath].toString() + (h === b ? neighbor : ''));
+            assert.deepEqual(readJson(h.mpath), JSON.parse(h.before[h.mainPath]), 'selected MAIN restored');
+            assert.ok(!present(join(h.root, h.bootLink)));
+            assert.deepEqual([h.records().rule, h.records().route, h.records().nft], [null, null, null]);
+            if (h === b) assert.deepEqual(survivor(), beforeRemove, 'removing B did not change A DB/host');
+        }
+        assert.deepEqual(intent.writes, ['create', 'disable', 'create', 'disable', 'delete']
+            .flatMap(action => [`begin:${action}`, `release:${action}`]));
+        assert.deepEqual(commits, Array(9).fill('commit'));
+        assert.deepEqual(hosts.map(h => h.refusals), [[], []]);
+        assert.equal(f.lockHeld, false);
+    });
 
     async function laterApply(f, service) {
         const ownership = ownerReceipt(f.states[0]);

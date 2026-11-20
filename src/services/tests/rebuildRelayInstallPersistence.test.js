@@ -19,6 +19,7 @@ const oid = value => new Types.ObjectId(value);
 const copy = value => mongo.BSON.deserialize(mongo.BSON.serialize(value));
 const matches = (row, where) => Object.entries(where).every(([key, value]) => {
     if (key === '$or') return value.some(filter => matches(row, filter));
+    if (key === '$nor') return !value.some(filter => matches(row, filter));
     if (value && Object.hasOwn(value, '$exists')) return Object.hasOwn(row, key) === value.$exists
         && (!Object.hasOwn(value, '$eq') || equal(row[key], value.$eq));
     if (value && Object.hasOwn(value, '$eq')) return equal(row[key], value.$eq);
@@ -68,6 +69,18 @@ function bind(t, model, data, traces) {
     t.mock.method(model.collection, 'find', (where, { projection, limit, session } = {}) => ({
         toArray: async () => selectRows(session).filter(row => matches(row, where)).slice(0, limit).map(row => project(row, projection)),
     }));
+    t.mock.method(model.collection, 'countDocuments', async (where, { session } = {}) =>
+        selectRows(session).filter(row => matches(row, where)).length);
+    if (model === User) t.mock.method(model.collection, 'insertMany', async (documents, options) => {
+        assert.ok(options.session);
+        const rows = selectRows(options.session);
+        for (const row of documents) {
+            assert.ok(!rows.some(existing => equal(existing._id, row._id) || (equal(existing.relayNode, row.relayNode)
+                && (existing.login === row.login || existing.ip === row.ip))));
+            rows.push(copy(row));
+        }
+        return { acknowledged: true, insertedCount: documents.length, insertedIds: documents.map(row => row._id) };
+    });
     t.mock.method(model.collection, 'updateMany', (where, update, options) => invoke('update', where, update, options));
     t.mock.method(model.collection, 'deleteMany', (where, options) => invoke('delete', where, null, options));
     return handlers;
@@ -187,11 +200,21 @@ function sessionFixture(t, f) {
         startTransaction(options) {
             assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
             this.active = true;
-            this.rows = new Map([f.states, f.users].map(rows => [rows, rows.map(copy)]));
+            this.rows = new Map([f.states, f.users, f.nodes, f.links].map(rows => [rows, rows.map(copy)]));
         }
         inTransaction() { return this.active; }
         abortTransaction() { events.push('abort'); this.active = false; }
+        async commitTransaction() {
+            assert.ok(this.active);
+            events.push('commit');
+            commit(this);
+            this.active = false;
+        }
         endSession() { assert.equal(this.active, false); }
+    }
+    function commit(session) {
+        for (const rows of [f.states, f.users]) rows.splice(0, rows.length, ...session.rows.get(rows));
+        return { ok: 1 };
     }
     t.mock.method(State.db, 'startSession', async () => new Session());
     t.mock.method(State.db, 'getClient', () => ({ db(name) {
@@ -201,11 +224,7 @@ function sessionFixture(t, f) {
             assert.equal(command.writeConcern.w, 'majority');
             assert.ok(session.inTransaction());
             events.push('commit');
-            const commit = () => {
-                for (const [rows, pending] of session.rows) rows.splice(0, rows.length, ...pending);
-                return { ok: 1 };
-            };
-            return hooks.commit ? hooks.commit(commit) : commit();
+            return hooks.commit ? hooks.commit(() => commit(session)) : commit(session);
         } };
     } }));
     return { events, hooks };
@@ -517,7 +536,38 @@ function addLink(f, portalNode, bridgeNode, geoRouting) {
     f.links.push({ _id: oid(), portalNode, bridgeNode, mode: 'reverse', active: true, status: 'deployed', ...(geoRouting ? { geoRouting } : {}) });
 }
 
-joined({ fixture, id, oid, machineId });
+function accountIntentFixture(t, f) {
+    let pending;
+    const writes = [];
+    t.mock.method(User.db, 'collection', name => {
+        assert.equal(name, 'c3_rebuild_relay_accounts');
+        assert.ok(f.lockHeld);
+        return {
+            async findOne(where) {
+                assert.equal(where._id, 'pending');
+                return pending && matches(pending, where) ? { _id: pending._id } : null;
+            },
+            async updateMany(where, { $setOnInsert }, options) {
+                assert.deepEqual(where, { _id: 'pending', intentId: $setOnInsert.intentId });
+                assert.deepEqual(options, { writeConcern: { w: 'majority' }, upsert: true });
+                assert.equal(pending, undefined);
+                pending = { ...copy($setOnInsert), _id: 'pending' };
+                writes.push(`begin:${pending.action}`);
+                return { acknowledged: true, upsertedCount: 1 };
+            },
+            async deleteMany(where, options) {
+                assert.deepEqual(options, { writeConcern: { w: 'majority' } });
+                assert.deepEqual(where, { _id: 'pending', intentId: pending?.intentId });
+                writes.push(`release:${pending.action}`);
+                pending = undefined;
+                return { acknowledged: true, deletedCount: 1 };
+            },
+        };
+    });
+    return { writes, get pending() { return pending; } };
+}
+
+joined({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt });
 
 test('operator list installs two relays under Apply exclusion and records their distinct physical IDs', async t => {
     const f = fixture(t);

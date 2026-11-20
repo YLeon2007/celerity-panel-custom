@@ -19,9 +19,10 @@ args = parser.parse_args()
 root, scenario = args.root, args.scenario
 line = sys.stdin.buffer.readline()
 command_line = shlex.split(json.loads(line))
-assert command_line[:-1] == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c']
 wire = sys.stdin.buffer.read()
 request = json.loads(wire)
+timeout = ['1s', '9s'] if request['action'] == 'session-count' else ['4s', '125s']
+assert command_line[:-1] == ['/usr/bin/timeout', '-k', *timeout, '/usr/bin/python3', '-I', '-B', '-c']
 state_path = root / 'manager.json'
 s = json.loads(state_path.read_text())
 h: dict[str, Any] = {'__name__': 'direct_fixture'}
@@ -72,7 +73,7 @@ class LocalOS:
     def __getattr__(self, name):
         assert name in ('O_RDONLY', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_WRONLY', 'O_CREAT', 'O_EXCL', 'O_DIRECTORY',
                         'fdopen', 'listxattr', 'mkdir', 'rmdir', 'fsync', 'close', 'fchmod', 'link',
-                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'readlink', 'symlink'), name
+                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'readlink', 'symlink', 'uname'), name
         return getattr(os, name)
 
     def open(self, path, flags, mode=0o777, *, dir_fd=None):
@@ -113,6 +114,8 @@ class LocalOS:
 
 
 def stock_open(path, mode='r'):
+    if path == '/etc/machine-id' and s.get('cohort'):
+        return backing(path).open(mode)
     facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n108 ppp\nBlock devices:\n',
              '/proc/net/dev': 'header\nheader\n eth0: 0\n', '/proc/sys/kernel/random/boot_id': 'fixture-boot\n',
              '/proc/999/cgroup': '0::/system.slice/foreign.service\n'}
@@ -261,7 +264,7 @@ def run(argv, **kwargs):
         if v == ['-j', '-N', '-4', 'route', 'show', 'table', 'all']:
             return js(s['foreign']['routes'] + ([s['route']] if s['route'] else []))
         if v == ['-j', '-N', '-4', 'addr', 'show']:
-            return js([dict(addr_info=[dict(local='192.0.2.4', prefixlen=24)])])
+            return js([dict(addr_info=[dict(local=s.get('address', '192.0.2.4'), prefixlen=24)])])
         if v in (['xfrm', 'policy', 'list'], ['xfrm', 'policy', 'list', 'nosock'], ['xfrm', 'state', 'list', 'nokeys']):
             return reply()
         if v[:3] == ['-4', 'rule', 'del'] and s['rule']:
@@ -338,10 +341,33 @@ def modeled_open(path, mode='r'):
         raise
 
 
+def modeled_session_collection(query):
+    # There are no real PPP processes or kernel PPP objects in the fixture.
+    # Model collection, not the DIRECT dispatch/lock, CHAP validation, or
+    # Remove's comparison against the receipt under the exclusive lock.
+    assert request['action'] in ('session-count', 'remove')
+    s.setdefault('censusCalls', []).append(request['action'])
+    _, manifest, backup, _ = h['owned_installation'](query)
+    _, _, rows = h['owned_chap'](h['read'](h['NAMES']['chap']), backup,
+                                h['chap_expected'](query, h['read'](h['NAMES']['lns'])))
+    xl = h['unit'](XL)
+    assert xl['ActiveState'] == 'active' and xl['InvocationID'] == backup['runtime']['invocations'][1]
+    count = s.get('activeSessions', 0)
+    return {'activeSessions': count, 'census': h['digest'](h['encode']([
+        'fixture-only-session-collection', query['nodeId'], query['machineId'], query['backupId'],
+        h['digest'](h['raw'](manifest)), h['chap_rows_digest'](rows), xl['InvocationID'], count,
+    ]))}
+
+
 h.update(os=LocalOS(), open=modeled_open,
-         subprocess=SimpleNamespace(run=modeled_run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired),
-         pwd=SimpleNamespace(getpwnam=lambda name: SimpleNamespace(pw_uid=STOCK_UID, pw_gid=STOCK_UID)),
-         grp=SimpleNamespace(getgrnam=lambda name: SimpleNamespace(gr_gid=STOCK_UID)))
+         subprocess=SimpleNamespace(run=modeled_run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired))
+if s.get('cohort'):
+    assert h['pwd'].getpwnam('nobody').pw_uid == h['grp'].getgrnam('nogroup').gr_gid == STOCK_UID
+    assert h['pwd'].getpwuid(0).pw_dir == '/root'
+    h['collect_session_census'] = modeled_session_collection
+else:
+    h.update(pwd=SimpleNamespace(getpwnam=lambda name: SimpleNamespace(pw_uid=STOCK_UID, pw_gid=STOCK_UID)),
+             grp=SimpleNamespace(getgrnam=lambda name: SimpleNamespace(gr_gid=STOCK_UID)))
 # Model a real external baseline change after CHECK, but no DIRECT mutations.
 if scenario == 'prewrite' and request['action'] == 'install':
     backing('/etc/ppp/options').write_bytes(b'# external change\n')
