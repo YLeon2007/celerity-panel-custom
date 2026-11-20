@@ -108,6 +108,7 @@ function fixture(t) {
         close: async () => {},
     };
     const create = (overrides = {}) => createRebuildService({ Node, Link, State, L2tpUser: User, env, cache: {}, sync: {}, locks: makeLocks(lockCollection),
+        assertNoRelayAccountIntent: async () => {},
         createRelayDirect: ({ node, env: driverEnv }) => {
             events.push('connect');
             assert.deepEqual(node.ssh, nodes[0].ssh);

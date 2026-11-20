@@ -94,7 +94,8 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
                 const topology = await readTopology(Node, Link, node, env.PANEL_DOMAIN);
                 const sourceSnapshot = await store.sourceRows(id);
                 const key = env.ENCRYPTION_KEY;
-                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env, key, readNode: getNode });
+                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env, key,
+                    readNode: getNode, listMode: fence.listMode });
                 const payload = makeDesired(id, sourceInventory.occupied, topology.controlPlaneAddresses, key, sourceInventory);
                 if (sourceInventory.inherited && payload.desired.users[0].ipAddress !== payload.desired.poolStart) {
                     throw fail('REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID');

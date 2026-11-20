@@ -47,7 +47,7 @@ function chapUsers(users, invalid) {
     return Array.from(users, row => {
         const { login, password, ipAddress, enabled } = row ?? {};
         requireThat(typeof login === 'string' && /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/.test(login)
-            && typeof password === 'string' && /^[ -~]{1,255}(?![\s\S])/.test(password) && !password.startsWith('@')
+            && typeof password === 'string' && (/^[ -~]{1,255}(?![\s\S])/.test(password) || /^[A-Za-z0-9_-]{256}(?![\s\S])/.test(password)) && !password.startsWith('@')
             && typeof ipAddress === 'string' && isIPv4(ipAddress) && typeof enabled === 'boolean'
             && !logins.has(login) && !addresses.has(ipAddress), invalid);
         logins.add(login); addresses.add(ipAddress);

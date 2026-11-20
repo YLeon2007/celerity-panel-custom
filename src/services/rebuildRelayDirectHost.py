@@ -1058,7 +1058,8 @@ def chap_user_rows(users: Any, pool):
         need(type(row) is dict and set(row) == {'login', 'password', 'ipAddress', 'enabled'}
              and type(row['enabled']) is bool and all(type(row[k]) is str for k in ('login', 'password', 'ipAddress')), bad)
         login, password, address = (row[k].encode('ascii') for k in ('login', 'password', 'ipAddress'))
-        need(re.fullmatch(CHAP_LOGIN, login) and re.fullmatch(rb'[ -~]{1,255}', password)
+        need(re.fullmatch(CHAP_LOGIN, login) and (re.fullmatch(rb'[ -~]{1,255}', password)
+             or re.fullmatch(rb'[A-Za-z0-9_-]{256}', password))
              and not password.startswith(b'@') and login not in logins and address not in addresses
              and pool[0] <= ipaddress.IPv4Address(row['ipAddress']) <= pool[1], bad)
         logins.add(login)
@@ -1154,7 +1155,13 @@ def chap_rows_digest(rows):
 def remove_chap(record, backup, expected):
     prefix, suffix, rows = owned_chap(record, backup, expected)
     need(record is not None, 'ROLLBACK_DRIFT')
-    # Even the LF preceding the marker is outside the managed block.
+    # Install added one separator LF. Remove it only when the saved preimage
+    # proves the whole prefix is unchanged; otherwise preserve the prefix bytes.
+    original = backup['before']['files']['chap']
+    if original is not None and prefix == raw(original) + b'\n':
+        if not suffix:
+            return original, chap_rows_digest(rows)
+        prefix = prefix[:-1]
     return {**record, 'data': b64(prefix + suffix)}, chap_rows_digest(rows)
 
 
@@ -2649,9 +2656,9 @@ def collect_session_census(request):
                      and session_generation(os.fstat(group)) == session_generation(os.lstat(group_path)))
         watch()
     session_need(time.monotonic() < DEADLINE)
-    # Hash generation identifiers, excluding manifest bytes, tunnel IDs and IPs.
+    # Include the authenticated managed rows, not the surrounding file/inode.
     return {'activeSessions': len(sample[1]), 'census': digest(encode([
-        'ppp-census-v1', request['nodeId'], request['backupId'], owner[:4], sample[0],
+        'ppp-census-v2', request['nodeId'], request['backupId'], owner[:4], owner[5], sample[0],
         [row[3:] for row in sample[1]]]))}
 
 

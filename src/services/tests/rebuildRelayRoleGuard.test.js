@@ -60,7 +60,14 @@ test('mounted role guard and Remove use one estimate, require a current session-
         async findOne({ _id, token }) { return held?._id === _id && held.token === token ? held : null; },
         async deleteOne({ token }) { assert.equal(held.token, token); held = null; },
     };
+    let pendingAccounts = false;
     t.mock.method(mongoose.connection, 'collection', name => {
+        if (name === 'c3_rebuild_relay_accounts') return { async findOne(filter, options) {
+            assert.ok(held);
+            assert.deepEqual(filter, { _id: 'pending' });
+            assert.equal(options.readConcern.level, 'majority');
+            return pendingAccounts ? filter : null;
+        } };
         assert.equal(name, 'c3_rebuild_locks');
         return lockStore;
     });
@@ -144,6 +151,13 @@ test('mounted role guard and Remove use one estimate, require a current session-
     const body = { name: 'Relay fixture', type: 'xray', ip: row.ip, active: 'on' };
     const post = role => request(app, url, 'POST', { ...body, ...(role !== undefined && { cascadeRole: role }) });
     const put = role => request(app, api, 'PUT', { cascadeRole: role });
+
+    pendingAccounts = true;
+    const unknownAccounts = await put('portal');
+    assert.equal(unknownAccounts.status, 409);
+    assert.equal(JSON.parse(unknownAccounts.body).code, 'REBUILD_L2TP_ACCOUNTS_BLOCKED');
+    assert.equal(writes, 0);
+    pendingAccounts = false;
 
     for (const role of ['portal', 'bridge', 'standalone']) {
         const refused = await post(role);

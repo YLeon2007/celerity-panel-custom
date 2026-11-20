@@ -184,12 +184,12 @@ test('stock install refuses in runFreshRelayInstall before reserve; direct insta
         uploadRootFile: mustNot('upload'), runArtifactCommand: mustNot('dispatch'), exec: mustNot('exec'),
     };
     await assert.rejects(() => runFreshRelayInstall(nodeId, {
-        ...adapter, authorize: () => true, lock: fn => fn(mustNot('verifyLock')),
+        ...adapter, authorize: () => true, lock: fn => fn(async () => { calls.push('verifyLock'); }),
         inventory: async () => f.args.inventory, connect: async () => remote,
         reserve: mustNot('reserve'), finish: mustNot('finish'), uncertain: mustNot('uncertain'),
     }), { code: blocked });
     const plan = adapter.materialize(f.args);
     await assert.rejects(() => adapter.install(plan, remote, mustNot('verifyLock')), { code: blocked });
     assert.equal(await adapter.verify(plan, remote), false);
-    assert.deepEqual(calls, ['close']);
+    assert.deepEqual(calls, ['verifyLock', 'close']);
 });

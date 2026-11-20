@@ -109,6 +109,7 @@ function fixture(t) {
         checkChap: async () => ({ changed: false }),
     };
     const deps = { Node, Link, State, L2tpUser: User, env, cache: {}, sync: {}, locks: makeLocks(lockCollection),
+        assertNoRelayAccountIntent: async () => {},
         createRelayDirect: ({ node, env: driverEnv }) => {
             assert.equal(driverEnv, env);
             if (String(node._id) !== id) {

@@ -11,6 +11,7 @@ const key = 'unit-fixture-key-'.repeat(3);
 const credentials = { login: 'shared', password: 'fixture-only' };
 const sharedCipher = encrypt(credentials.password, key);
 const bootstrap = 'relay-bootstrap';
+const bootstrapCipher = encrypt('fixture-bootstrap', key);
 const ip = (i, end) => `10.255.${16 + i}.${end}`;
 const code = suffix => ({ code: `REBUILD_L2TP_ACCOUNTS_${suffix}` });
 
@@ -27,7 +28,7 @@ function fixture({ shared = false, fault = () => {} } = {}) {
     const user = (id, i, login, end, passwordEncrypted) => ({ _id: `${id}:${login}`, relayNode: id, login, ip: ip(i, end),
         enabled: true, passwordEncrypted, desiredRevision: 1, appliedRevision: 1, syncStatus: 'synced' });
     const users = rows.flatMap(({ node: { _id: id } }, i) => [
-        user(id, i, bootstrap, 10, encrypt(`bootstrap-${i}`, key)),
+        user(id, i, bootstrap, 10, bootstrapCipher),
         ...(shared ? [user(id, i, credentials.login, 11, sharedCipher)] : []),
     ]);
     const hosts = Object.fromEntries([A, B].map(id => [id, users.filter(u => u.relayNode === id).map(u => ({
@@ -83,14 +84,14 @@ function fixture({ shared = false, fault = () => {} } = {}) {
                 async checkChap(install, current, desired, verifyLock) {
                     await verifyLock(); check(install, current);
                     assert.ok(Array.isArray(desired));
-                    return step('check', id) ?? true;
+                    return step('check', id) ?? { changed: true };
                 },
                 async syncChap(install, current, desired, verifyLock) {
                     await verifyLock(); check(install, current);
                     assert.ok(pending);
                     const result = step('sync', id);
-                    if (result === undefined || result === true) hosts[id] = structuredClone(desired);
-                    return result ?? true;
+                    if (result === undefined) hosts[id] = structuredClone(desired);
+                    return result ?? { changed: true };
                 },
                 async close() { step('close', id); },
             };

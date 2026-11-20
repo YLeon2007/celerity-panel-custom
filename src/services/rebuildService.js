@@ -8,6 +8,9 @@ const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {prepareLinks}=require('./rebuildLinkKeys');
 const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
 const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
+const {createRebuildRelayAccounts}=require('./rebuildRelayAccounts');
+const {assertNoPendingRelayAccounts}=require('./rebuildRelayAccountsStore');
+const {resolveRelayBinding}=require('./rebuildRelayAuthorization');
 const {appliedLink}=require('./rebuildAppliedLink');
 const {createPrivateKey,createPublicKey}=require('node:crypto');
 const fail=code=>Object.assign(new Error(code),{code});
@@ -30,8 +33,17 @@ function inconsistentPublishedKey(node){
 function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=require('../models/hyNodeModel'),
     State=require('../modules/relay-l2tp/models/relayL2tpStateModel'),sync=require('./syncService'),locks=makeLocks(),connect=createTransport,
     compose=composeRebuildProfiles,env=process.env,cache=require('./cacheService'),
-    L2tpUser,createRelayDirect}={}){
+    L2tpUser=require('../modules/relay-l2tp/models/l2tpUserModel'),
+    createRelayDirect=options=>require('./rebuildRelayDirect').createRelayDirect(options),
+    assertNoRelayAccountIntent=()=>assertNoPendingRelayAccounts(L2tpUser.db)}={}){
     const gate=()=>{if(!isRebuildEnabled(env))throw fail('REBUILD_DISABLED');};
+    const checked = async (verify, fn) => {
+        if (typeof verify !== 'function' || await verify() === false) throw fail('REBUILD_LOCK_LOST');
+        await assertNoRelayAccountIntent();
+        if (await verify() === false) throw fail('REBUILD_LOCK_LOST');
+        return fn(verify);
+    };
+    const guardedLocks = { ...locks, run: fn => locks.run(verify => checked(verify, fn)) };
     const panelTLS=()=>{const cert=require('./configGenerator').buildPanelInlineCertificate();return {...cert,serverName:cert?.domain||env.PANEL_DOMAIN};};
     async function verifyDraftTls(link){
         gate();const transports=new Map();
@@ -45,7 +57,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     async function closeAll(transports){const results=await Promise.allSettled([...transports.values()].map(t=>t.close()));if(results.some(x=>x.status==='rejected'))throw fail('REBUILD_TRANSPORT_CLEANUP_FAILED');}
     async function execute(req,alreadyHeld){
         gate();const transports=new Map(),states=new Map();let prepared;
-        try{return await runRebuild({global:alreadyHeld?fn=>fn(alreadyHeld):locks.run,withNodes,
+        try{return await runRebuild({global:alreadyHeld?fn=>checked(alreadyHeld,fn):guardedLocks.run,withNodes,
             links:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]}).lean(),
             async build(ids,links){
                 const nodes=await Node.find({_id:{$in:ids}}).select('+xray.manualKey').lean();
@@ -105,8 +117,12 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             }
         },req);}finally{await closeAll(transports);}
     }
-    const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks,env,createRelayDirect});
-    const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks,env,createRelayDirect});
-    return {execute,verifyDraftTls,locks,installRelay,...relayRemoval};
+    const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});
+    const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});
+    const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,resolveRelayBinding,createRelayDirect});
+    return {execute,verifyDraftTls,locks:guardedLocks,installRelay,...relayRemoval,
+        createRelayAccount: input=>relayAccounts().create(input),
+        disableRelayAccount: input=>relayAccounts().disable(input),
+        deleteRelayAccount: input=>relayAccounts().delete(input)};
 }
 module.exports={createRebuildService};

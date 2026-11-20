@@ -1,7 +1,7 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
-const { isIPv4, isIP } = require('node:net');
+const { isIPv4 } = require('node:net');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { withNodes } = require('./rebuildLocks');
 const { validateRebuildMode } = require('./rebuildMode');
@@ -57,13 +57,13 @@ function networkFor({ clientCidr, tproxyPort, fwmark, routeTable, poolStart, poo
 async function bindingFor(resolve, env, state, node) {
     const nodeId = String(state.node);
     if (!node || node.type !== 'xray' || node.active !== true || node.cascadeRole !== 'relay' || node.useCustomConfig
-        || !isIP(node.ip) || node.ssh?.username !== 'root' || !int(node.ssh?.port, 1, 65535)) {
+        || String(node._id) !== nodeId) {
         throw fail('BINDING_MISMATCH', { nodeId });
     }
     let binding;
     try { binding = await resolve(env, nodeId, node); } catch { throw fail('BINDING_MISMATCH', { nodeId }); }
     const { nodeId: resolvedId, host, port, username, machineId, sshHostKeySha256 } = binding ?? {};
-    if (resolvedId !== nodeId || host !== node.ip || port !== node.ssh.port || username !== 'root'
+    if (resolvedId !== nodeId || typeof host !== 'string' || !host || !int(port, 1, 65535) || typeof username !== 'string' || !username
         || machineId !== state.rebuildMachineId || !matches(pinPattern, sshHostKeySha256)) throw fail('BINDING_MISMATCH', { nodeId });
     return Object.freeze({ nodeId, host, port, username, machineId, sshHostKeySha256 });
 }
@@ -77,7 +77,7 @@ function makePlans({ states, users, nodes, bindings }, action, login, password, 
     }
     const plans = [];
     const passwordEncrypted = action === 'create' ? encrypt(password, key) : undefined;
-    let shared;
+    let shared, logical;
     for (const [i, state] of states.entries()) {
         const binding = bindings[i];
         const { nodeId } = binding;
@@ -99,6 +99,11 @@ function makePlans({ states, users, nodes, bindings }, action, login, password, 
         }));
         const initial = byLogin.get(bootstrap);
         if (!initial?.enabled || initial.ip !== state.poolStart) throw fail('ACCOUNT_CONFLICT');
+        if (logical && (logical.size !== byLogin.size || [...logical].some(([name, row]) => {
+            const other = byLogin.get(name);
+            return !other || other.passwordEncrypted !== row.passwordEncrypted || other.enabled !== row.enabled;
+        }))) throw fail('ACCOUNT_CONFLICT');
+        logical ??= byLogin;
         const before = byLogin.get(login);
         let candidate, after;
         if (action === 'create') {
@@ -134,7 +139,9 @@ function makePlans({ states, users, nodes, bindings }, action, login, password, 
 // Parent supplies the one ordinary resolver and DIRECT factory. The factory
 // must bind the supplied endpoint, pin and machine identity. checkChap is
 // read-only. syncChap must call verifyLock at dispatch, attest the installation
-// and preimage under its host lock, and return true only after exact readback.
+// and preimage under its host lock, and return a checked change receipt.
+const chapReceipt = result => result !== null && typeof result === 'object'
+    && Object.keys(result).length === 1 && typeof result.changed === 'boolean';
 function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = process.env, resolveRelayBinding,
     createRelayDirect, store = createRebuildRelayAccountsStore({ Node, State, L2tpUser }) }) {
     const allow = () => {
@@ -215,16 +222,19 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                 }
                                 calls.push([remote, installation, currentUsers, desiredUsers]);
                             }
-                            for (const [remote, installation, currentUsers, desiredUsers] of calls) {
+                            for (const call of calls) {
+                                const [remote, installation, currentUsers, desiredUsers] = call;
                                 await recheck();
                                 let checked;
                                 try { checked = await remote.checkChap(installation, currentUsers, desiredUsers, () => recheck()); }
                                 catch { throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId }); }
-                                if (checked !== true) throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId });
+                                if (!chapReceipt(checked)) throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId });
+                                call.push(checked.changed);
                             }
                             await store.assertNoPending();
                             await recheck();
                             if (action === 'disable' && !plans[0].after) {
+                                if (calls.some(call => call[4] !== false)) throw fail('PREFLIGHT_REFUSED');
                                 await closeAll();
                                 return { ...result, relayCount: ids.length };
                             }
@@ -238,10 +248,11 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                 relays: plans.map(({ installation, binding, before, after }) => ({ ...installation, ...binding,
                                     ip: before?.ip ?? after?.ip, revision: before?.desiredRevision ?? 0 })) });
                             phase = 'OUTCOME_UNKNOWN';
-                            for (const [remote, installation, currentUsers, desiredUsers] of calls) {
+                            for (const [remote, installation, currentUsers, desiredUsers, changed] of calls) {
                                 await recheck();
                                 uncertainNodeId = installation.nodeId;
-                                if (await remote.syncChap(installation, currentUsers, desiredUsers, () => recheck()) !== true) throw fail(phase);
+                                const synced = await remote.syncChap(installation, currentUsers, desiredUsers, () => recheck());
+                                if (!chapReceipt(synced) || synced.changed !== changed) throw fail(phase);
                                 confirmedNodeIds.push(uncertainNodeId);
                                 uncertainNodeId = undefined;
                             }

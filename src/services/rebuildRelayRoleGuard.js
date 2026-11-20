@@ -4,6 +4,7 @@ const { isRebuildEnabled } = require('./rebuildMode');
 const { makeLocks, withNode } = require('./rebuildLocks');
 const { t: translate } = require('../middleware/i18n');
 const { readAccountCount, formatRelayCounts } = require('./rebuildRelayCounts');
+const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 
 const BLOCKED = 'REBUILD_L2TP_ROLE_BLOCKED';
 const UNAVAILABLE = 'REBUILD_L2TP_ROLE_STATE_UNAVAILABLE';
@@ -13,6 +14,8 @@ const reasons = Object.freeze({
     [STALE]: 'nodes.rebuildRoleChanged',
     REBUILD_BUSY: 'nodes.rebuildRoleBusy',
     REBUILD_LOCK_LOST: 'nodes.rebuildRoleBusy',
+    REBUILD_L2TP_ACCOUNTS_BLOCKED: 'nodes.rebuildRoleBusy',
+    REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE: 'nodes.rebuildRoleStateUnavailable',
 });
 const fail = code => Object.assign(new Error(code), { code });
 const primary = query => query.read('primary').readConcern('majority').maxTimeMS(5000);
@@ -49,6 +52,7 @@ async function saveNodeRole(nodeId, requestedRole, persist, { expectedRole } = {
     const Node = require('../models/hyNodeModel');
     return makeLocks().run(verify => withNode(nodeId, async () => {
         await verify();
+        await assertNoPendingRelayAccounts(Node.db);
         const node = await primary(Node.findById(nodeId).select('cascadeRole')).lean();
         if (!node) return null;
         if (node.cascadeRole === 'relay' && requestedRole !== 'relay') {

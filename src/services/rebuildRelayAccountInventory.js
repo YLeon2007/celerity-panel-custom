@@ -83,7 +83,8 @@ function projectRelayChap(state, rows, key) {
         addresses.add(row.ip);
         let password;
         try { password = decrypt(row.passwordEncrypted, key); } catch { throw inventoryInvalid(); }
-        if (!/^[ -~]{1,255}(?![\s\S])/.test(password) || password.startsWith('@')) throw inventoryInvalid();
+        if (!(/^[ -~]{1,255}(?![\s\S])/.test(password) || /^[A-Za-z0-9_-]{256}(?![\s\S])/.test(password))
+            || password.startsWith('@')) throw inventoryInvalid();
         return Object.freeze({ login: row.login, password, ipAddress: row.ip, enabled: row.enabled });
     });
     return Object.freeze(currentUsers.sort((a, b) => (a.login > b.login) - (a.login < b.login)));
@@ -92,7 +93,7 @@ function projectRelayChap(state, rows, key) {
 // Login is the logical key. Source IP and the per-row sync revision are local
 // to each relay. Agreement is on the actual envelope and enablement, not on
 // decrypted passwords (independent historical bootstraps must not be merged).
-async function resolveAccountSources({ nodeId, rows, env, key, readNode }) {
+async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMode }) {
     const sources = new Map();
     const stateIds = new Set(), machineIds = new Set();
     const occupied = [], allocations = [];
@@ -121,6 +122,9 @@ async function resolveAccountSources({ nodeId, rows, env, key, readNode }) {
     const assigned = new Set();
     for (const row of rows.users) {
         const source = sources.get(String(row.relayNode));
+        // Historical singleton did not take ownership of another node's
+        // account rows. Keep that behavior when no installed source exists.
+        if (!source && !listMode && sources.size === 0 && String(row.relayNode) !== nodeId) continue;
         if (!source) throw inventoryInvalid();
         validateAccount(row, source.pool, source.accounts, assigned);
         source.accounts.set(row.login, { login: row.login, enabled: row.enabled, passwordEncrypted: row.passwordEncrypted, ip: row.ip });

@@ -15,6 +15,7 @@ const {
 const { checkIpWhitelist, requireAuth, requireOnboarding, render } = require('./helpers');
 const { issuePanelCsrfToken, requirePanelCsrf } = require('./csrf');
 const { canPreviewRemoval, submitRemoval, cancelRemoval } = require('./rebuildRelayRemove');
+const { accountHandler } = require('./rebuildRelayAccounts');
 
 const authRoutes = require('./auth');
 const wizardRoutes = require('./wizard');
@@ -87,6 +88,10 @@ function createPanelRouter({
             requirePanelCsrf, injectedL2tpRateLimiter, submitRemoval);
         router.post('/rebuild/relays/:id/l2tp/remove/cancel', requireAuth, requireOnboarding,
             requirePanelCsrf, injectedL2tpRateLimiter, cancelRemoval);
+        for (const action of ['create', 'disable', 'delete']) {
+            router.post(`/rebuild/relays/l2tp/accounts/${action}`, requireAuth, requireOnboarding,
+                requirePanelCsrf, injectedL2tpRateLimiter, accountHandler(action));
+        }
         return router;
     }
 
