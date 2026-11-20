@@ -2,6 +2,8 @@
 # actions/paths below. No remote runner, package installs, or global flushes.
 import base64
 import contextlib
+import ctypes
+import errno
 import fcntl
 import grp
 import hashlib
@@ -10,7 +12,10 @@ import json
 import os
 import pwd
 import re
+import select
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -1883,10 +1888,389 @@ def remove_installation(request, state):
     removal_neighbors(state)
 
 
+SESSION_UNKNOWN = 'SESSION_COUNT_UNPROVED'
+SESSION_GROUP = '/system.slice/xl2tpd.service'
+SESSION_XL = '/usr/sbin/xl2tpd'
+SESSION_PPP = '/usr/sbin/pppd'
+# Debian trixie amd64 xl2tpd 1.3.18-1+b1 and ppp 2.5.2-1+1 (dpkg-deb -x).
+SESSION_STOCK = {
+    SESSION_XL: '48bd1fd6a7b9d4cdd3a5f20386654b2fa03ee19a9abdc9a1012ddf605290654b',
+    SESSION_PPP: 'eb93a25616854a7bdeeff5e6317601eac9f33c69d68bc5a1d127a9eb4530c3bf',
+    '/usr/lib/pppd/2.5.2/pppol2tp.so': 'e5bbd060e4bfd87661f14f9a766a0b2fcf17c7f4eb352127e8da9210b52fc3b8',
+}
+SESSION_GLOBAL = {
+    '/etc/ppp/options': '5ec5ff67de7a81f6fedb5a32ef06b839f543a410a42055da169c8d2ef3d04246',
+    '/etc/ppp/ip-pre-up': '4c94ffad8f1eed66bdccd9456f50a1f0aae54978cf6c1e84f439bcb46a32db57',
+    '/etc/ppp/ip-up': '3a7c1bf309a3fa4ea4b324fccc5ca2c5d907ada04c6b3b7c35ef9893f0e0eab1',
+    '/etc/ppp/ip-down': '57c4112f686ce228078d964555dec9ebf6f07f5dbf77daae01a7ba8e717cfb3f',
+    '/etc/ppp/ip-up.d/0000usepeerdns': 'c6642e9baa8a2a489eb0ba1bdac1289aafa5e8e58aa5e46c078eece4eaa8cc4d',
+    '/etc/ppp/ip-down.d/0000usepeerdns': 'a2f8eff7abd676b154d11b89522a5556263fdbc0cd43d3474a6122cf983ae492',
+}
+
+
+def session_need(ok):
+    need(ok, SESSION_UNKNOWN)
+
+
+def session_fs(libc, fd, magic):
+    # x86_64 Linux: struct statfs begins with a native long f_type.
+    buf = (ctypes.c_long * 32)()
+    session_need(libc.fstatfs(fd, ctypes.byref(buf)) == 0 and buf[0] == magic)
+
+
+def session_read(fd, name, maximum):
+    with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), 'rb') as f:
+        data = f.read(maximum + 1)
+    session_need(len(data) <= maximum)
+    return data
+
+
+def session_generation(st):
+    return st.st_dev, st.st_ino, st.st_ctime_ns
+
+
+def session_binary(path):
+    # pppd is legitimately setuid in the stock archive; don't weaken read().
+    folder, name = os.path.split(path)
+    with directory(folder) as fd:
+        with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), 'rb') as f:
+            st = os.fstat(f.fileno())
+            session_need(stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and not st.st_mode & 0o022
+                         and 0 < st.st_size <= 2**21)
+            data = f.read(2**21 + 1)
+            generation = session_generation(st)
+            session_need(len(data) == st.st_size and digest(data) == SESSION_STOCK[path]
+                         and generation == session_generation(os.fstat(f.fileno()))
+                         == session_generation(os.stat(name, dir_fd=fd, follow_symlinks=False)))
+    return generation
+
+
+def session_profile(lns, options, network):
+    addr = rb'([0-9.]{7,15})'
+    match = re.fullmatch(rb'\[global\]\nport = 1701\n\n\[lns default\]\nip range = ' + addr + rb'-' + addr
+                         + rb'\nlocal ip = ' + addr + rb'\nrequire authentication = yes\n'
+                         rb'pppoptfile = /etc/ppp/options\.xl2tpd\nlength bit = yes\n', lns)
+    if match is None:
+        raise Refusal(SESSION_UNKNOWN)
+    start, end, local = (ipaddress.IPv4Address(item.decode('ascii')) for item in match.groups())
+    cidr = ipaddress.IPv4Network(network['clientCidr'])
+    session_need(cidr.network_address < start <= end < cidr.broadcast_address
+                 and cidr.network_address < local < cidr.broadcast_address and not start <= local <= end)
+    match = re.fullmatch(rb'auth\nrefuse-pap\nrefuse-chap\nrefuse-mschap\nrequire-mschap-v2\nrefuse-eap\nname l2tpd\n'
+                         rb'mtu ([0-9]{3,4})\nmru ([0-9]{3,4})\nnoipv6\nnodefaultroute\n'
+                         rb'(ms-dns [0-9.]{7,15}\n){1,4}', options)
+    session_need(match is not None and all(576 <= int(n) <= 1500 for n in match.groups()[:2]))
+    for line in options.split(b'\n'):
+        if line.startswith(b'ms-dns '):
+            ipaddress.IPv4Address(line[7:].decode('ascii'))
+    return local, start, end
+
+
+def session_owner(request):
+    token, machine, network = (request[k] for k in ('backupId', 'machineId', 'network'))
+    identity = read('/etc/machine-id', 34)
+    session_need(identity is not None and raw(identity) in (machine.encode('ascii'), (machine + '\n').encode('ascii')))
+    path, manifest, backup = read_manifest(token)
+    before, runtime = backup['before'], backup['runtime']
+    session_need(backup['phase'] == 'installed' and backup['backupId'] == token and backup['machineId'] == machine
+                 and encode(backup['network']) == encode(network) and before['boot'] == boot()
+                 and directory_absent(os.path.dirname(path) + '/remove-attempt.json'))
+    no_jobs((XL, NET_UNIT, IKE))
+    info = unit(XL)
+    session_need(info['FragmentPath'] == SYSTEM + '/' + XL and removal_native(info, XL, before, installed=True)
+                 and working(info) and info['SubState'] == 'running' and info['Type'] == 'simple'
+                 and info['InvocationID'] == runtime['invocations'][1]
+                 and re.fullmatch(r'[a-f0-9]{32}', info['InvocationID']) and info['ControlGroup'] == SESSION_GROUP
+                 and re.fullmatch(r'[1-9][0-9]*', info['MainPID'])
+                 and re.fullmatch(r'\{ path=/usr/sbin/xl2tpd ; argv\[\]=/usr/sbin/xl2tpd -D ;[^{}]*\}', info['ExecStart'])
+                 and not any(info.get(k) for k in ('SourcePath', 'ExecCondition', 'ExecReload', 'PassEnvironment', 'UnsetEnvironment'))
+                 and set(info['Requires'].split()) >= {NET_UNIT, IKE} and set(info['After'].split()) >= {NET_UNIT, IKE})
+    rows = [owners for proto, _, port, owners in sock_rows() if proto == 'udp' and port == 1701]
+    session_need(rows and all(owners == [info['MainPID']] for owners in rows))
+    records, generations = {}, {}
+    for k in ('lns', 'options', 'drop', 'net', 'nft'):
+        file = NAMES[k]
+        generation = remove_generation(file)
+        record = read(file, 65536)
+        if record is None:
+            raise Refusal(SESSION_UNKNOWN)
+        records[k] = record
+        session_need(encode({**record, 'data': digest(raw(record))}) == encode(backup['after'][k])
+                     and encode(generation) == encode(runtime['files'][k]) and generation == remove_generation(file))
+        generations[k] = generation
+    session_need(nft_marker(raw(records['nft']), token))
+    for folder, leaves in (('/etc/ppp/ip-pre-up.d', []), ('/etc/ppp/ip-up.d', ['0000usepeerdns']),
+                           ('/etc/ppp/ip-down.d', ['0000usepeerdns'])):
+        with directory(folder) as fd:
+            session_need(os.listdir(fd) == leaves)
+    session_need(pwd.getpwuid(0).pw_dir == '/root')
+    for p in ('/root/.ppprc', '/etc/ppp/auth-up', '/etc/ppp/auth-down', '/etc/ppp/net-init', '/etc/ppp/net-pre-up',
+              '/etc/ppp/net-down', '/etc/ppp/ip-pre-up.local', '/etc/ppp/ip-up.local', '/etc/ppp/ip-down.local'):
+        session_need(directory_absent(p))
+    for p, sha in SESSION_GLOBAL.items():
+        current = read(p, 65536)
+        session_need(current is not None and digest(raw(current)) == sha
+                     and (p != '/etc/ppp/options' or current == before['globalFiles'][p]))
+    profile = session_profile(raw(records['lns']), raw(records['options']), network)
+    return (before['boot'], info['InvocationID'], int(info['MainPID']), remove_generation(path), digest(raw(manifest)),
+            generations, {p: session_binary(p) for p in SESSION_STOCK}, profile)
+
+
+def session_cgroup(fd):
+    data = session_read(fd, 'cgroup.procs', 32768)
+    counts = session_read(fd, 'cgroup.stat', 65536).split(b'\n')
+    session_need(re.fullmatch(rb'(?:[1-9][0-9]{0,9}\n)+', data) and b'nr_descendants 0' in counts
+                 and b'nr_dying_descendants 0' in counts)
+    pids = [int(p) for p in data.split()]
+    session_need(len(pids) <= 2049 and len(pids) == len(set(pids)))
+    return sorted(pids)
+
+
+@contextlib.contextmanager
+def session_process(proc, pid, main, binaries, watch):
+    with contextlib.ExitStack() as stack:
+        task = os.open(str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=proc)
+        stack.callback(os.close, task)
+        data = session_read(task, 'stat', 4096)
+        fields = data.rsplit(b') ', 1)[1].split()
+        session_need(data.startswith(str(pid).encode() + b' (') and fields[0] in (b'R', b'S')
+                     and (pid == main or int(fields[1]) == main) and int(fields[19]) > 0
+                     and session_read(task, 'cgroup', 4096) == ('0::' + SESSION_GROUP + '\n').encode())
+        for name in ('ns/net', 'ns/mnt', 'ns/pid', 'ns/user', 'ns/cgroup', 'root'):
+            ours, theirs = os.stat('self/' + name, dir_fd=proc), os.stat(name, dir_fd=task)
+            session_need((ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino))
+        exe = SESSION_XL if pid == main else SESSION_PPP
+        session_need(os.fstat(task).st_uid == 0 and os.readlink('exe', dir_fd=task) == exe
+                     and session_generation(os.stat('exe', dir_fd=task)) == binaries[exe])
+        argv = session_read(task, 'cmdline', 4096)
+        watch()
+        yield task, int(fields[19]), argv
+
+
+def session_ppp_argv(argv, pool):
+    # xl2tpd 1.3.18 control.c:ICCN -> start_pppd(), kernel LNS path.
+    match = re.fullmatch(rb'/usr/sbin/pppd\0plugin\0pppol2tp\.so\0pppol2tp\0([1-9][0-9]{0,8})\0'
+                         rb'pppol2tp_lns_mode\0pppol2tp_tunnel_id\0([1-9][0-9]{0,4})\0'
+                         rb'pppol2tp_session_id\0([1-9][0-9]{0,4})\0passive\0nodetach\0'
+                         rb'([0-9.]{7,15}):([0-9.]{7,15})\0auth\0file\0/etc/ppp/options\.xl2tpd\0', argv)
+    if match is None:
+        raise Refusal(SESSION_UNKNOWN)
+    fd, tid, sid = map(int, match.groups()[:3])
+    local, peer = (ipaddress.IPv4Address(row.decode()) for row in match.groups()[3:])
+    session_need(tid <= 65535 and sid <= 65535 and local == pool[0] and pool[1] <= peer <= pool[2])
+    return fd, tid, sid, str(local), str(peer)
+
+
+@contextlib.contextmanager
+def session_dup(libc, pidfd, fd):
+    # Getters only; never open /dev/ppp, attach a channel, or open the control FIFO.
+    dup = libc.pidfd_getfd(pidfd, fd, 0)
+    session_need(dup >= 0)
+    try:
+        yield dup
+    finally:
+        os.close(dup)
+
+
+def session_kernel(libc, task, pidfd, l2fd, main, tid, sid):
+    with session_dup(libc, pidfd, l2fd) as fd:
+        st = os.fstat(fd)
+        session_need(stat.S_ISSOCK(st.st_mode) and os.readlink('fd/' + str(l2fd), dir_fd=task) == f'socket:[{st.st_ino}]')
+        data = ctypes.create_string_buffer(128)
+        length = ctypes.c_uint(len(data))
+        abi = '=HIii16sHHHH'  # linux/if_pppox.h: packed v2 IPv4 sockaddr_pppol2tp
+        session_need(libc.getsockname(fd, ctypes.byref(data), ctypes.byref(length)) == 0
+                     and length.value == struct.calcsize(abi))
+        family, proto, owner, tunnel_fd, address, t, s, remote_t, remote_s = struct.unpack_from(abi, data)
+        session_need((family, proto, owner, t, s) == (24, 1, main, tid, sid) and address[:2] == b'\x02\x00'
+                     and tunnel_fd >= 0 and remote_t > 0 and remote_s > 0)
+    with contextlib.ExitStack() as stack:
+        fds = os.open('fd', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=task)
+        stack.callback(os.close, fds)
+        entries = os.listdir(fds)
+        session_need(len(entries) <= 128 and all(re.fullmatch(r'[0-9]{1,10}', x) for x in entries))
+        ppp_fds = [int(x) for x in entries if os.readlink(x, dir_fd=fds) == '/dev/ppp']
+        session_need(len(ppp_fds) == 2)
+        units = []
+        for number in ppp_fds:
+            with session_dup(libc, pidfd, number) as fd:
+                dev = os.fstat(fd)
+                session_need(stat.S_ISCHR(dev.st_mode) and (os.major(dev.st_rdev), os.minor(dev.st_rdev)) == (108, 0))
+                try:
+                    index, = struct.unpack('=i', fcntl.ioctl(fd, 0x80047456, b'\0' * 4))  # PPPIOCGUNIT
+                except OSError as error:
+                    if error.errno != errno.ENOTTY:  # channel ENOIOCTLCMD is mapped by vfs_ioctl
+                        raise
+                    continue
+                mode = fcntl.ioctl(fd, 0xc008744c, struct.pack('=ii', 0x21, -1))  # PPPIOCGNPMODE IPv4
+                flags, = struct.unpack('=I', fcntl.ioctl(fd, 0x8004745a, b'\0' * 4))  # PPPIOCGFLAGS
+                session_need(index >= 0 and mode == struct.pack('=ii', 0x21, 0)  # NPMODE_PASS
+                             and not flags & 0x200)  # SC_LOOP_TRAFFIC
+                units.append(index)
+        session_need(len(units) == 1)
+    return units[0], (t, s, remote_t, remote_s), st.st_ino
+
+
+SESSION_L2TP_HEADER = (b'PPPoL2TP driver info, V2.0\nTUNNEL name, user-data-ok session-count\n'
+                       b' debug tx-pkts/bytes/errs rx-pkts/bytes/errs\n'
+                       b'  SESSION name, addr/port src-tid/sid dest-tid/sid state user-data-ok\n'
+                       b'   mtu/mru/rcvseq/sendseq/lns debug reorderto\n'
+                       b'   nr/ns tx-pkts/bytes/errs rx-pkts/bytes/errs\n')
+SESSION_TUNNEL_ROW = re.compile(rb"\nTUNNEL 'tunl ([0-9]{1,5})', [YN] -?[0-9]+\n [0-9a-f]{8} (?:-?[0-9]+/){2}-?[0-9]+ "
+                                rb'(?:-?[0-9]+/){2}-?[0-9]+\n')
+SESSION_L2TP_ROW = re.compile(rb"  SESSION '[^'\n]*' [0-9A-F]{8}/([0-9]+) ([0-9A-F]{4})/([0-9A-F]{4}) -> "
+                              rb'([0-9A-F]{4})/([0-9A-F]{4}) ([0-9]+) ([YN])\n'
+                              rb'   0/0/[R-]/[S-]/(LNS|LAC) [0-9a-f]{8} [0-9]+\n'
+                              rb'   [0-9]+/[0-9]+ (?:-?[0-9]+/){2}-?[0-9]+ (?:-?[0-9]+/){2}-?[0-9]+\n'
+                              rb'(?:   interface ([^\n]*)\n)?')
+
+
+def session_l2tp_interfaces(data, keys):
+    # Linux 6.12 l2tp_ppp.c resolves the channel's current netdev. Parse to
+    # EOF, including foreign rows, so an unsupported format is not absence.
+    session_need(data.startswith(SESSION_L2TP_HEADER))
+    rows = {}
+    offset = len(SESSION_L2TP_HEADER)
+    tunnel_id = 0
+    while offset < len(data):
+        tunnel = SESSION_TUNNEL_ROW.match(data, offset)
+        if tunnel is not None:
+            next_id = int(tunnel[1])
+            session_need(tunnel_id < next_id <= 65535)
+            tunnel_id = next_id
+            offset = tunnel.end()
+            continue
+        match = SESSION_L2TP_ROW.match(data, offset)
+        if match is None:
+            raise Refusal(SESSION_UNKNOWN)
+        offset = match.end()
+        port, *ids, state, associated, role, iface = match.groups()
+        key = tuple(int(x, 16) for x in ids)
+        session_need(key[0] == tunnel_id and tunnel_id > 0)
+        if key not in keys and port != b'1701':
+            continue
+        # l2tp_v2_session_get_next() skips the synthetic session 0 used by
+        # the tunnel's control socket. A TUNNEL row alone isn't a call.
+        if iface is None:
+            raise Refusal(SESSION_UNKNOWN)
+        session_need(key in keys and key not in rows and all(key) and port == b'1701' and state == b'3'
+                     and associated == b'Y' and role == b'LNS' and re.fullmatch(rb'ppp[0-9]+', iface))
+        rows[key] = iface.decode('ascii')
+    session_need(set(rows) == keys)
+    return rows
+
+
+def session_links(rows, name, local, peer):
+    session_need(type(rows) is list)
+    selected = [row for row in rows if row['ifname'] == name]
+    session_need(len(selected) == 1)
+    link = selected[0]
+    session_need(link.get('link_type') == 'ppp' and {'UP', 'POINTOPOINT', 'LOWER_UP'} <= set(link['flags'])
+                 and type(link['ifindex']) is int and link['ifindex'] > 0
+                 and len([row for row in rows if row['ifindex'] == link['ifindex']]) == 1)
+    (addr,) = link['addr_info']
+    session_need(addr.get('family') == 'inet' and addr.get('local') == local and addr.get('address') == peer
+                 and addr.get('prefixlen') == 32 and addr.get('scope') == 'global')
+    return link['ifindex']
+
+
+def session_pid_stamp(name, pid):
+    path = '/run/' + name + '.pid'
+    st = remove_generation(path)
+    stamp = read(path, 32)
+    session_need(st is not None and stamp is not None and raw(stamp) == (str(pid) + '\n').encode()
+                 and st == remove_generation(path))
+    return st
+
+
+def session_sample(libc, proc, group, owner, held, watch):
+    _, _, main, _, _, _, binaries, pool = owner
+    pids = session_cgroup(group)
+    session_need(main in pids)
+    sample = {}
+    main_start = 0
+    for pid in pids:
+        pfd = held(pid)
+        with session_process(proc, pid, main, binaries, watch) as (task, start, argv):
+            if pid == main:
+                session_need(argv == b'/usr/sbin/xl2tpd\0-D\0')
+                main_start = start
+            else:
+                l2fd, tid, sid, local, peer = session_ppp_argv(argv, pool)
+                number, key, inode = session_kernel(libc, task, pfd, l2fd, main, tid, sid)
+                name = 'ppp' + str(number)
+                generation = session_pid_stamp(name, pid)
+                session_need(key not in sample)
+                sample[key] = pid, start, inode, name, local, peer, generation
+    # No LNS/debug command; read even for zero to distinguish missing inventory.
+    native = session_l2tp_interfaces(session_read(proc, 'self/net/pppol2tp', 2**20), set(sample))
+    result = []
+    if sample:
+        # Unlike ip(), do not request numeric scope; refuse dump warnings.
+        links = json.loads(command('/usr/sbin/ip', '-j', '-4', '-details', 'addr', 'show', quiet=True))
+        seen_names, seen_peers, seen_inodes = set(), set(), set()
+        for key, (pid, start, inode, name, local, peer, generation) in sample.items():
+            session_need(native[key] == name and name not in seen_names and peer not in seen_peers and inode not in seen_inodes)
+            seen_names.add(name)
+            seen_peers.add(peer)
+            seen_inodes.add(inode)
+            ifindex = session_links(links, name, local, peer)
+            result.append((key, local, peer, pid, start, inode, ifindex, generation))
+    session_need(pids == session_cgroup(group))
+    watch()
+    return main_start, result
+
+
+def read_session_count(request):
+    global DEADLINE
+    session_need(set(request) == {'action', 'machineId', 'nodeId', 'backupId', 'network'}
+                 and re.fullmatch(r'[a-f0-9]{32}', request['machineId']) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
+                 and re.fullmatch(r'[a-f0-9]{32}', request['backupId']) and os.uname().machine == 'x86_64')
+    routing(request['network'])
+    DEADLINE = min(DEADLINE, time.monotonic() + 7)
+    libc = ctypes.CDLL(None, use_errno=True)
+    with directory(SYSTEM) as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        owner = session_owner(request)
+        group_path = '/sys/fs/cgroup' + SESSION_GROUP
+        with directory('/proc') as proc, directory(group_path) as group, contextlib.ExitStack() as stack:
+            session_fs(libc, proc, 0x9fa0)  # PROC_SUPER_MAGIC
+            session_fs(libc, group, 0x63677270)  # CGROUP2_SUPER_MAGIC
+            route = stack.enter_context(socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK, 0))
+            route.bind((0, 1 | 16))  # RTMGRP_LINK | RTMGRP_IPV4_IFADDR; overflow also refuses.
+            poll = select.poll()
+            poll.register(route, select.POLLIN)
+            pids = {}
+
+            def held(pid):
+                if pid not in pids:
+                    fd = os.pidfd_open(pid)
+                    stack.callback(os.close, fd)
+                    poll.register(fd, select.POLLIN)
+                    pids[pid] = fd
+                return pids[pid]
+
+            def watch():
+                session_need(not poll.poll(0) and time.monotonic() < DEADLINE)
+
+            sample = session_sample(libc, proc, group, owner, held, watch)
+            session_need(owner == session_owner(request))
+            session_need(sample == session_sample(libc, proc, group, owner, held, watch)
+                         and session_generation(os.fstat(group)) == session_generation(os.lstat(group_path)))
+            watch()
+        session_need(time.monotonic() < DEADLINE)
+    # Hash generation identifiers, excluding manifest bytes, tunnel IDs and IPs.
+    return {'activeSessions': len(sample[1]), 'census': digest(encode([
+        'ppp-census-v1', request['nodeId'], request['backupId'], owner[:4], sample[0],
+        [row[3:] for row in sample[1]]]))}
+
+
 def dispatch(request: dict[str, Any]):
     global STAGE, NO_INSTALL_WRITES
     need(os.geteuid() == 0 and type(request) is dict, 'PREREQUISITE')
     action, machine = request['action'], request['machineId']
+    if action == 'session-count':
+        return read_session_count(request)
     need(re.fullmatch(r'[a-f0-9]{32}', machine) and action in
          ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove'), 'PREREQUISITE')
     NO_INSTALL_WRITES = action == 'install'
@@ -1958,13 +2342,15 @@ def main():
     except Refusal as error:
         if REMOVE_ENTERED or str(error) == 'IN_FLIGHT':
             return 75
-        print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else str(error)), file=sys.stderr)
+        print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
+              SESSION_UNKNOWN if action == 'session-count' else str(error)), file=sys.stderr)
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
         if REMOVE_ENTERED:
             return 75
-        print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else STAGE), file=sys.stderr)
+        print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
+              SESSION_UNKNOWN if action == 'session-count' else STAGE), file=sys.stderr)
         return 70
     print(json.dumps(result, ensure_ascii=True, separators=(',', ':')), flush=True)
     return 0

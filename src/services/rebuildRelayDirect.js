@@ -11,6 +11,7 @@ const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfi
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
 
 const TIMEOUT = 145000;
+const SESSION_COUNT_TIMEOUT = 12000;
 const PIN = /^[a-f0-9]{64}$/;
 const TOKEN = /^[a-f0-9]{32}$/;
 const fail = (suffix, uncertain = false) => Object.assign(new Error(`REBUILD_L2TP_${suffix}`), {
@@ -23,10 +24,10 @@ const ipv4 = value => typeof value === 'string' && isIPv4(value)
 const safeSecret = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/.test(value);
 const tokenMatches = (re, value) => typeof value === 'string' && re.test(value);
 
-function removeNetwork(value) {
+function removeNetwork(value, invalid = 'REMOVE_INPUT_INVALID') {
     const keys = ['clientCidr', 'tproxyPort', 'fwmark', 'routeTable'];
     requireThat(value && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)),
-        'REMOVE_INPUT_INVALID');
+        invalid);
     const { clientCidr, tproxyPort, fwmark, routeTable } = value;
     const match = typeof clientCidr === 'string' && /^(\d+\.\d+\.\d+\.\d+)\/(1[6-9]|2\d|30)(?![\s\S])/.exec(clientCidr);
     const first = match ? ipv4(match[1]) : NaN;
@@ -35,7 +36,7 @@ function removeNetwork(value) {
         .some(([lo, hi]) => first >= lo && first + size - 1 <= hi)
         && integer(tproxyPort, 1024, 65535) && ![1701, 4500].includes(tproxyPort)
         && integer(fwmark, 1, 0x7fffffff) && integer(routeTable, 1, 0x7fffffff)
-        && ![253, 254, 255].includes(routeTable), 'REMOVE_INPUT_INVALID');
+        && ![253, 254, 255].includes(routeTable), invalid);
     return { clientCidr, tproxyPort, fwmark, routeTable };
 }
 
@@ -114,7 +115,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     // The source is static; the entire request, including config and credentials,
     // travels in stdin only, never in SSH command text, environment, or SFTP paths.
     // No sudo I/O logging path for the credential-bearing stdin.
-    const command = `/usr/bin/timeout -k 4s 125s /usr/bin/python3 -I -B -c '${script.replace(/'/g, `'"'"'`)}'`;
+    const command = limits => `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script.replace(/'/g, `'"'"'`)}'`;
     const ssh = new (SSH || require('./nodeSSH'))(node, {
         expectedHostKeySha256: pin, expectedEndpoint: { ip, port, username },
     });
@@ -123,12 +124,12 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     let held;
     const disconnect = () => { try { ssh.disconnect(); } catch { /* cleanup cannot replace outcome */ } };
 
-    async function connect() {
+    async function connect(timeout) {
         if (connected) return;
         let timer;
         const pending = Promise.resolve().then(() => ssh.connect());
         try {
-            await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(reject, 30000); })]);
+            await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(reject, timeout); })]);
             requireThat(!closed, 'DIRECT_CLOSED');
             connected = true;
         } catch {
@@ -140,8 +141,9 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     }
 
     async function exec(action, params = {}, write = false, validate = () => true) {
+        const count = action === 'session-count';
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
-        await connect();
+        await connect(count ? 5000 : 30000);
         requireThat(!closed, 'DIRECT_CLOSED');
         const stdin = JSON.stringify({ action, machineId, ...params });
         requireThat(Buffer.byteLength(stdin) <= 25 * 1024 * 1024, 'INSTALL_INPUT_INVALID');
@@ -150,16 +152,21 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             return fail('DIRECT_OUTCOME_UNKNOWN', write);
         };
         let result;
-        try { result = await ssh.exec(command, { stdin, timeout: TIMEOUT }); }
+        try { result = await ssh.exec(command(count ? '-k 1s 9s' : '-k 4s 125s'), {
+            stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
+        }); }
         catch { throw unknown(); }
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
             const refusal = typeof result.stderr === 'string' && /^DIRECT_(NO_WRITE_)?([A-Z_]+)\n$/.exec(result.stderr);
             const raw = refusal?.[2];
+            if (count && (result.code !== 70 || result.stdout !== ''
+                || result.stderr !== 'DIRECT_SESSION_COUNT_UNPROVED\n')) throw unknown();
             if (action === 'remove' && (result.code !== 70 || result.stdout !== ''
                 || result.stderr !== 'DIRECT_REMOVE_REFUSED\n')) throw unknown();
             const codes = ['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
                 'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED', 'REMOVE_REFUSED'];
+            if (count) codes.push('SESSION_COUNT_UNPROVED');
             // Only the installed helper's closed refusal frame certifies a settled write.
             // A shell/transport exit alone is not authority to race a remote mutation.
             if (write && (result.code !== 70 || result.stdout !== '' || !codes.includes(raw))) throw unknown();
@@ -170,8 +177,9 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             throw error;
         }
         try {
-            if (result.stderr !== '' || Buffer.byteLength(result.stdout) > 46 * 1024 * 1024) throw Error();
+            if (result.stderr !== '' || Buffer.byteLength(result.stdout) > (count ? 128 : 46 * 1024 * 1024)) throw Error();
             const reply = JSON.parse(result.stdout);
+            if (count && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
             if (!validate(reply)) throw Error();
             return reply;
         } catch { throw unknown(); }
@@ -196,6 +204,17 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
 
     return Object.freeze({
         preflight: () => serial(preflight),
+        readSessionCount: input => serial(async () => {
+            const invalid = 'SESSION_COUNT_INPUT_INVALID';
+            requireThat(input?.nodeId === nodeId && Object.keys(input).length === 3
+                && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(input, key))
+                && input.backupId?.length === 32 && tokenMatches(TOKEN, input.backupId), invalid);
+            const { backupId } = input;
+            const network = removeNetwork(input.network, invalid);
+            return exec('session-count', { nodeId, backupId, network }, false, reply => reply
+                && Object.keys(reply).length === 2 && integer(reply.activeSessions, 0, Number.MAX_SAFE_INTEGER)
+                && reply.census?.length === 64 && tokenMatches(PIN, reply.census));
+        }),
         prepare: input => serial(async () => {
             requireThat(!held && input?.nodeId === nodeId && typeof input.carryDomain === 'boolean'
                 && Array.isArray(input.controlPlaneAddresses), 'INSTALL_INPUT_INVALID');
