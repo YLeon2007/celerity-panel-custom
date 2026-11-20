@@ -11,6 +11,7 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const { join, dirname } = require('node:path');
 const applyWire = require('./rebuildRelayApplyWire');
+const stockSwan = require('./rebuildRelayStockSwan');
 
 module.exports = ({ fixture, id, oid, machineId }) => {
     test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
@@ -102,8 +103,9 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         const lns = '; package conffile\n[global]\n';
         put('/etc/xl2tpd/xl2tpd.conf', lns, 0o644);
         put('/etc/ipsec.secrets', '# stock secrets\n');
-        const starter = put('/etc/ipsec.conf', '# stock starter\nconfig setup\n');
+        put('/etc/ipsec.conf', '# stock starter\nconfig setup\n');
         fs.mkdirSync(join(root, 'etc/ipsec.d'), { mode: 0o755 });
+        const swanLeaves = stockSwan.seed(root);
         const packages = ['strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables'];
         // One absolute path projected; the shipped ensure helper is used unchanged.
         put('bin/dpkg-query', `#!/bin/sh\n[ "$#" -eq 3 ] && [ "$1" = -W ] && [ "$2" = '-f=\${db:Status-Abbrev}' ] || exit 91\ncase "$3" in ${packages.join('|')}) printf 'ii ';; *) exit 91;; esac\n`, 0o700);
@@ -124,24 +126,23 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             FragmentPath: path, MainPID: '0', InvocationID: '', DropInPaths: '', NeedDaemonReload: 'no', PrivateNetwork: 'no',
             KillMode: 'control-group', User: '', ...extra });
         const stockX = (name, path, active, pid) => unit('/etc/systemd/system/' + name, { User: 'nobody',
-            UnitFileState: active ? 'enabled' : 'disabled', ...(active && { ActiveState: 'active', SubState: 'running', MainPID: pid, InvocationID: 'original-' + name }),
+            UnitFileState: active ? 'enabled' : 'disabled', ...(active && { ActiveState: 'active', SubState: 'running',
+                MainPID: pid, InvocationID: Number(pid).toString(16).padStart(32, '0'), ControlGroup: '/system.slice/' + name }),
             ExecStart: `{ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${path} ; }` });
         const original = {
             [x]: stockX(x, mainPath, true, '101'), [b]: bridgeActive ? stockX(b, bridgePath, true, '103') : unit('', { LoadState: 'not-found', UnitFileState: '' }),
             [xl]: unit('/etc/systemd/system/' + xl, { LoadState: scenario === 'masked' ? 'masked' : 'loaded',
                 UnitFileState: scenario === 'masked' ? 'masked' : preEnabled || scenario === 'prewrite' ? 'enabled' : 'disabled',
-                ExecStart: '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }' }),
+                ControlGroup: '/system.slice/' + xl, ExecStart: '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }' }),
             [ike]: unit('/usr/lib/systemd/system/' + ike, { ExecStart: '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }',
                 ControlGroup: '/system.slice/' + ike, ...((idleIke || scenario.startsWith('ike-')) && { ActiveState: 'active', SubState: 'running',
-                    MainPID: '200', InvocationID: 'stock-ike', UnitFileState: 'enabled' }) }),
+                    MainPID: '200', InvocationID: 'c'.repeat(32), UnitFileState: 'enabled' }) }),
             [net]: unit('', { LoadState: 'not-found', UnitFileState: '' }),
         };
         if (preEnabled || scenario === 'prewrite') {
             fs.symlinkSync(original[xl].FragmentPath, join(root, bootLink));
         }
-        if (scenario === 'prewrite') {
-            fs.writeFileSync(starter, '# stock starter\nconfig setup\n');
-        }
+
         if (scenario === 'unit-drift') fs.appendFileSync(join(root, original[xl].FragmentPath), '# changed\n');
         const foreign = { rules: [], routes: [{ dst: '198.51.100.0/24', table: 201, dev: 'fixture0' }],
             tables: [{ table: { family: 'inet', name: 'foreign', comment: 'operator-owned' } }],
@@ -150,6 +151,9 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             running: { [x]: main, ...(bridgeActive && { [b]: bridge }) }, nextPid: 300, charonPid: '201', ikeConnection: false,
             lnsMd5: createHash('md5').update(lns).digest('hex'), effects: [], rule: null, route: null, nft: null, foreign,
             stockRules: [[0, 255], [32766, 254], [32767, 253]].map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
+            rules6: [[0, 255], [32766, 254], ...(scenario === 'foreign-rpdb6' ? [[220, 220]] : [])]
+                .map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
+            managerEnvironment: scenario === 'manager-override' ? 'STRONGSWAN_CONF=/fixture-foreign.conf\n' : 'LANG=C\n',
             owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534], [fs.statSync(bpath).ino]: [0, 65534] } }));
         const actions = [], refusals = [], wireFaults = [];
         let removeBaseline, expectedRemoveTransit;
@@ -250,7 +254,7 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         const before = Object.fromEntries([mainPath, bridgePath, '/etc/ipsec.conf', '/etc/ppp/chap-secrets', '/etc/ipsec.secrets',
             '/etc/xl2tpd/xl2tpd.conf', '/etc/ppp/options', '/etc/systemd/system/' + x, '/etc/systemd/system/' + xl,
             '/etc/systemd/system/foreign.service', '/usr/lib/systemd/system/' + ike, '/usr/local/bin/xray',
-            ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
+            ...swanLeaves, ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
             .map(path => [path, fs.readFileSync(join(root, path))]));
         const build = f.create;
         const create = overrides => build({ createRelayDirect: undefined, ...overrides });
@@ -269,7 +273,7 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             ] });
             const result = await f.create().installRelay(id).catch(error => error);
             if (scenario === 'transit-ok' || scenario === 'transit-forward') {
-                assert.equal(result.status ?? result.code, 'installed');
+                assert.equal(result.status ?? result.code, 'installed', diagnostic(f));
                 assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
                 const current = JSON.parse(fs.readFileSync(f.mpath));
                 assert.deepEqual(current.inbounds.slice(0, -2), JSON.parse(f.before[f.mainPath]).inbounds);
@@ -278,7 +282,7 @@ module.exports = ({ fixture, id, oid, machineId }) => {
             } else {
                 const expected = scenario.startsWith('transit-ambiguous') ? 'CANDIDATE_INVALID'
                     : scenario === 'transit-loopback-listener' ? 'RUNTIME_UNPROVED' : 'PROFILE_USERS';
-                assert.equal(result.code, `REBUILD_L2TP_DIRECT_${expected}`);
+                assert.equal(result.code, `REBUILD_L2TP_DIRECT_${expected}`, diagnostic(f));
                 assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
                 assert.equal(f.states.length + f.users.length + f.records().effects.length, 0);
                 assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
@@ -288,16 +292,18 @@ module.exports = ({ fixture, id, oid, machineId }) => {
     }
 
     for (const scenario of ['main', 'sidecar', 'offline', 'settled', 'sidecar-refusal', 'prewrite', 'masked', 'package',
-        'ike-active', 'ike-refusal', 'unit-drift', 'user-rpc-error', 'sidecar-unsafe']) {
+        'ike-active', 'unit-drift', 'user-rpc-error', 'sidecar-unsafe', 'foreign-rpdb6', 'manager-override', 'unacknowledged-start']) {
         test(`joined DIRECT + stock prerequisites: ${scenario}`, async t => {
             const f = host(t, scenario);
             const expected = { settled: 'REBUILD_L2TP_INSTALL_FAILED', 'sidecar-refusal': 'REBUILD_L2TP_INSTALL_FAILED',
-                'ike-refusal': 'REBUILD_L2TP_INSTALL_FAILED', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'ike-active': 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'foreign-rpdb6': 'REBUILD_L2TP_DIRECT_NETWORK_CONFLICT', 'manager-override': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'unacknowledged-start': 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN',
                 prewrite: 'REBUILD_L2TP_INSTALL_FAILED', masked: 'REBUILD_L2TP_HOST_NOT_READY',
                 package: 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'user-rpc-error': 'REBUILD_L2TP_DIRECT_PROFILE_USERS',
                 'sidecar-unsafe': 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' }[scenario];
             const outcome = await f.create().installRelay(id).catch(error => error);
-            assert.equal(outcome.code ?? outcome.status, expected ?? 'installed', `host refusals: ${f.refusals.join(', ')}`);
+            assert.equal(outcome.code ?? outcome.status, expected ?? 'installed', diagnostic(f));
             if (!expected) {
                 assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
                 assert.ok(fs.lstatSync(join(f.root, f.bootLink)).isSymbolicLink());
@@ -318,16 +324,32 @@ module.exports = ({ fixture, id, oid, machineId }) => {
                 assert.equal(f.users[0].syncStatus, 'synced');
                 return;
             }
+            if (scenario === 'unacknowledged-start') {
+                assert.equal(f.actions.at(-1), 'rollback');
+                assert.deepEqual(f.refusals, ['DIRECT_COMMAND_FAILED', 'DIRECT_ROLLBACK_DRIFT']);
+                const [state] = f.states;
+                assert.equal(state.status, 'installing');
+                assert.equal(f.users[0].syncStatus, 'pending');
+                const backup = readJson(join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${state.backupId}/manifest.json`));
+                assert.equal(backup.phase, 'applying');
+                assert.ok(!Object.hasOwn(backup, 'swanStart'));
+                assert.equal(f.records().units[f.ike].ActiveState, 'active');
+                assert.ok(!f.records().effects.some(effect => effect[0] === 'stop'));
+                assert.equal(f.records().nft, state.backupId);
+                return;
+            }
             assert.equal(f.states.length + f.users.length, 0);
             for (const [path, bytes] of Object.entries(f.before)) {
                 if (scenario === 'prewrite' && path === '/etc/ppp/options') {
                     assert.equal(fs.readFileSync(join(f.root, path), 'utf8'), '# external change\n');
                 } else assert.ok(fs.readFileSync(join(f.root, path)).equals(bytes), path);
             }
-            if (['settled', 'sidecar-refusal', 'ike-refusal'].includes(scenario)) {
+            if (['settled', 'sidecar-refusal'].includes(scenario)) {
                 assert.equal(f.actions.at(-1), 'rollback');
+                assert.ok(f.refusals.includes('DIRECT_RUNTIME_UNPROVED'));
                 assert.equal(f.records().nft, null);
-                if (scenario === 'ike-refusal') assert.equal(f.records().units['strongswan-starter.service'].ActiveState, 'active');
+                assert.ok(!present(join(f.root, stockSwan.profile)));
+                assert.equal(f.records().units[f.ike].ActiveState, 'inactive');
                 assert.equal(fs.existsSync(join(f.root, f.bootLink)), false);
                 assert.deepEqual(f.records().owners[String(fs.statSync(f.mpath).ino)], [65534, 65534]);
                 if (scenario === 'sidecar-refusal') assert.deepEqual(f.records().owners[String(fs.statSync(f.bpath).ino)], [0, 65534]);
@@ -337,6 +359,12 @@ module.exports = ({ fixture, id, oid, machineId }) => {
                 assert.equal(f.records().effects.length, 0);
                 assert.equal(fs.existsSync(join(f.root, 'var/lib/celerity-rebuild-l2tp-direct')), false);
                 if (scenario === 'prewrite') assert.deepEqual(f.refusals, ['DIRECT_NO_WRITE_BASELINE_CHANGED']);
+                if (scenario === 'ike-active') {
+                    assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
+                    assert.deepEqual(f.records().units[f.ike], f.records().original[f.ike]);
+                    assert.deepEqual(f.records().sockets.filter(row => [500, 4500].includes(row[2])),
+                        [500, 4500].map(port => ['udp', '0.0.0.0', port, '201']));
+                }
             }
         });
     }
@@ -484,6 +512,18 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         // Distinct node and same login: a broad cleanup would delete both.
         f.users.push(foreignUser);
         const installed = await service.installRelay(id).catch(error => error);
+        if (idleIke) {
+            assert.equal(status(installed), 'REBUILD_L2TP_DIRECT_PREREQUISITE', diagnostic(f));
+            assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
+            assert.deepEqual(f.records().effects, []);
+            assert.deepEqual(f.records().units[f.ike], stockUnits[f.ike]);
+            assert.deepEqual(leaves(), beforeLeaves);
+            assert.deepEqual(Object.fromEntries(Object.keys(f.before).map(path => [path, fingerprint(f, path)])), before);
+            assert.deepEqual(fingerprint(f, f.bootLink), bootBefore);
+            assert.deepEqual(f.states, []);
+            assert.deepEqual(f.users.map(digestAccount), [foreignAccountReceipt]);
+            return;
+        }
         assert.equal(status(installed), 'installed', diagnostic(f));
         assert.deepEqual(f.actions, installedActions);
         const state = { ...f.states[0] };
@@ -508,7 +548,7 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         for (const port of [state.tproxyPort, installedHandoff.port, 1701, 500, 4500]) assert.ok(ports(staged).has(port), `installed listener ${port}`);
         assert.equal(fs.readlinkSync(join(f.root, f.bootLink)), '/etc/systemd/system/' + f.xl);
 
-        const ownedFiles = ['/etc/ppp/options.xl2tpd', '/etc/ipsec.d/celerity-rebuild-l2tp.conf',
+        const ownedFiles = [stockSwan.profile, '/etc/ppp/options.xl2tpd', '/etc/ipsec.d/celerity-rebuild-l2tp.conf',
             '/etc/celerity-rebuild-l2tp/ingress.nft', '/etc/systemd/system/' + f.net,
             '/etc/systemd/system/xl2tpd.service.d/50-celerity-rebuild-l2tp.conf'];
         for (const path of ownedFiles) assert.ok(fs.lstatSync(join(f.root, path)).isFile(), path);
@@ -517,7 +557,9 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         const manifest = fingerprint(f, manifestPath);
         assert.equal(readJson(join(f.root, manifestPath)).phase, 'installed');
 
+        const ownedSwan = fingerprint(f, stockSwan.profile);
         if (apply) await laterApply(f, service);
+        assert.deepEqual(fingerprint(f, stockSwan.profile), ownedSwan);
         const beforeRemove = f.records();
         const currentHandoff = handoffIn(readJson(f.mpath))?.port;
         const bridgeBeforeRemove = fingerprint(f, f.bridgePath);
@@ -553,15 +595,12 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         assert.deepEqual([current.rule, current.route, current.nft, current.ikeConnection], [null, null, null, false]);
         assert.deepEqual(current.foreign, preserve);
         assert.deepEqual(current.stockRules, staged.stockRules);
+        assert.deepEqual(current.rules6, staged.rules6);
         assert.ok(current.sockets.some(row => JSON.stringify(row) === JSON.stringify(preserve.sockets[0])));
-        const reserved = [state.tproxyPort, 1701];
+        const reserved = [state.tproxyPort, 1701, 500, 4500];
         if (!sidecar) reserved.push(installedHandoff.port);
         if (currentHandoff) reserved.push(currentHandoff);
-        if (!idleIke) reserved.push(500, 4500);
         for (const port of reserved) assert.ok(!ports(current).has(port), `lingering listener ${port}`);
-        if (idleIke) for (const port of [500, 4500]) {
-            assert.deepEqual(current.sockets.filter(row => row[2] === port), [['udp', '0.0.0.0', port, current.charonPid]]);
-        }
         for (const name of [f.xl, f.ike, f.net]) {
             for (const prop of ['LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'DropInPaths', 'FragmentPath']) {
                 assert.equal(current.units[name][prop], stockUnits[name][prop], `${name}:${prop}`);

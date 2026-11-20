@@ -39,6 +39,14 @@ STOCK_XL_DEFAULT_SHA = '37b5938f462ec60b4f8c179b34f70b548c09da4691c938e88ce111ce
 STOCK_XL_DEFAULT_MD5 = b'fadc31f26078d8c3fb033d7d4516500b'
 REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables')
 STOCK_IKE_INCLUDE = b'include /etc/ipsec.d/*.conf'
+SWAN_CONF = '/etc/strongswan.conf'
+SWAN_DIR = '/etc/strongswan.d'
+SWAN_PROFILE = SWAN_DIR + '/celerity-rebuild-l2tp.conf'
+SWAN_SETTINGS = b'charon {\n    routing_table = 0\n    install_routes = no\n}\n'
+SWAN_START_UNITS = (XL, IKE, NET_UNIT)
+# Complete settings include closure from authenticated Debian trixie amd64
+# strongSwan 6.0.1-6+deb13u7 (path -> [mode, gid, SHA256], relative to /etc).
+STOCK_SWAN_SHA = 'ddc103e3bab4b312ab390428dd64ec6606ea6793d715d536d2fa2c0025e5d77e'
 UNITS = (XL, IKE, X, B, NET_UNIT)
 TABLE = 'celerity_rebuild_l2tp'
 PRIORITY = 10077
@@ -550,6 +558,49 @@ def ike_include_matches(starter, expected):
     return True
 
 
+def swan_inputs(present, bad):
+    # Accept only the reviewed Debian include tree, not arbitrary files whose
+    # parsing/ordering could override the profile or load unmanaged settings.
+    profile = os.path.basename(SWAN_PROFILE)
+    with directory(SWAN_DIR) as fd:
+        top = set(os.listdir(fd))
+    top_stock = {'charon', 'charon.conf', 'charon-logging.conf', 'starter.conf'}
+    need(top == (top_stock | {profile} if present else top_stock), bad)
+    plugins = SWAN_DIR + '/charon'
+    with directory(plugins) as fd:
+        names = os.listdir(fd)
+    need(len(names) == 21 and all(name.endswith('.conf') for name in names), bad)
+    paths = [SWAN_CONF, *(SWAN_DIR + '/' + n for n in top_stock - {'charon'}),
+             *(plugins + '/' + n for n in names)]
+    rows = {}
+    for path in paths:
+        record = read(path, 262144)
+        if record is None or record.get('uid', 0) != 0:
+            raise Refusal(bad)
+        rows[path.removeprefix('/etc/')] = [record['mode'], record['gid'], digest(raw(record))]
+    value = digest(encode(rows))
+    need(value == STOCK_SWAN_SHA, bad)
+    return value
+
+
+def no_swan_rule():
+    # The existing IPv4 projector remains unchanged (including on Remove).
+    # Its removal mode allows unrelated rules; neither family may have 220/220
+    # before this operation starts or stops the managed IKE invocation.
+    rules4 = ip('rule', 'show')
+    rules6 = json.loads(command('/usr/sbin/ip', '-j', '-N', '-6', 'rule', 'show'))
+    need(type(rules4) is list and type(rules6) is list and all(
+        isinstance(row, dict) and not (row.get('priority') == 220 and str(row.get('table')) == '220')
+        for row in (*rules4, *rules6)), 'NETWORK_CONFLICT')
+
+
+def swan_default_environment(bad):
+    # Environment/PassEnvironment on the unit alone do not cover the manager's
+    # global service environment. Never expose the other variable values.
+    env = command('/usr/bin/systemctl', '--no-pager', 'show-environment', quiet=True)
+    need(not any(line.startswith(b'STRONGSWAN_CONF=') for line in env.splitlines()), bad)
+
+
 def idle_ike(info, rows):
     sockets = [(p, a, n, owners) for p, a, n, owners in rows if n in (500, 4500)]
     if not working(info) or {n for _, _, n, _ in sockets} != {500, 4500} or not all(
@@ -597,7 +648,7 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     need(ike_include_matches(files['starter'], []), 'PREREQUISITE')
     bridge = read(BRIDGE)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
-    global_paths = ('/etc/ppp/options', '/etc/strongswan.conf', XL_DEFAULT)
+    global_paths = ('/etc/ppp/options', SWAN_CONF, XL_DEFAULT)
     for path in global_paths:
         # Fingerprint stock/default inputs that this installer never edits.
         if os.path.lexists(path):
@@ -618,6 +669,18 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     need(not any(n in reserved for _, _, n, _ in rows)
          and vpn_empty(allow_socket_policies=bool(ike_sockets)) and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
     need(not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
+    no_swan_rule()
+    # Startup must be ours: do not replace or restart a previously running IKE
+    # instance. Retain the old network refusal above for stock 220 conflicts.
+    need(units[IKE]['ActiveState'] == 'inactive' and not units[IKE].get('PassEnvironment')
+         and STOCK_IKE_INCLUDE in starter, 'PREREQUISITE')
+    need(all(removal_native(units[n], n, {'units': units}, installed=False)
+             and not units[n].get('ExecCondition') for n in (XL, IKE)), 'PREREQUISITE')
+    removal_dependencies({n: units[n] for n in (XL, IKE)}, installed=False)
+    swan_default_environment('PREREQUISITE')
+    files['swan'] = read(SWAN_PROFILE, 8192)
+    need(files['swan'] is None, 'PREREQUISITE')
+    swan = swan_inputs(False, 'PREREQUISITE')
     STAGE = 'PROFILE_USERS'
     sockets = xray_users(files['main'], units[X], rows, transit)
     need(sockets, 'RUNTIME_UNPROVED')
@@ -626,7 +689,8 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
                  ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID', 'FragmentPath', 'DropInPaths')}
                  for name in UNITS}
     return dict(boot=boot(), files=files, units=unit_pins, bridge=bridge, sockets=sockets, globalFiles=globals_before,
-                installBoot=install_boot, ikeSockets=ike_sockets, **({'transit': transit} if transit is not None else {}))
+                installBoot=install_boot, ikeSockets=ike_sockets, swanInputs=swan,
+                **({'transit': transit} if transit is not None else {}))
 
 
 def candidate(request, before):
@@ -687,6 +751,8 @@ ExecStart=/usr/sbin/ip -4 rule add priority {PRIORITY} from {d['clientCidr']} fw
     for k in ('chap', 'secrets'):
         after[k] = entry(raw(original[k]) + b'\n' + bytes_[k])
     after['net'], after['drop'] = entry(net_unit, 0o644), entry(drop, 0o644)
+    if 'swan' in original:
+        after['swan'] = entry(SWAN_SETTINGS, 0o644)
     need(nft_marker(bytes_['nft'], token), 'CANDIDATE_INVALID')
     return after
 
@@ -736,7 +802,12 @@ def bound_manifest(request):
 
 
 def operation_files(records):
-    return {**NAMES, **({'bridge': BRIDGE} if 'bridge' in records else {})}
+    return {**NAMES, **({'swan': SWAN_PROFILE} if 'swan' in records else {}),
+            **({'bridge': BRIDGE} if 'bridge' in records else {})}
+
+
+def operation_order(records):
+    return (*(('swan',) if 'swan' in records else ()), *ORDER, *(('bridge',) if 'bridge' in records else ()))
 
 
 def original_files(before, records):
@@ -812,9 +883,42 @@ def installed_runtime(d, token, before, after):
     need(policy['rule'] and policy['route'] and policy['nft'] is not None, 'RUNTIME_UNPROVED')
     need(all(read(path) == after[k] for k, path in operation_files(after).items()), 'RUNTIME_UNPROVED')
     need(ike_include_matches(after['starter'], [os.path.basename(NAMES['ike'])]), 'RUNTIME_UNPROVED')
+    if 'swan' in after:
+        need(not ike.get('PassEnvironment') and swan_inputs(True, STAGE) == before['swanInputs'], STAGE)
+        no_swan_rule()
     return {'nft': policy['nft'], 'invocations': [u['InvocationID'] for u in (x, lns, ike, net_unit)]
             + ([bridge_info['InvocationID']] if bridge_info is not None else []),
             'files': file_generations(after), 'bootEnrollment': boot_link() if before.get('installBoot') else None}
+
+
+def write_swan_profile(path, old_manifest, backup, after):
+    before = backup['before']
+    need(before['files']['swan'] is None and not before['ikeSockets']
+         and after['swan'] == entry(SWAN_SETTINGS, 0o644)
+         and swan_inputs(False, 'ROLLBACK_DRIFT') == before['swanInputs'], 'ROLLBACK_DRIFT')
+    no_swan_rule()
+    write(SWAN_PROFILE, None, after['swan'])
+    backup['swanGeneration'] = remove_generation(SWAN_PROFILE)
+    check_swan_profile(backup, read(SWAN_PROFILE))
+    updated = entry(encode(backup))
+    write(path, old_manifest, updated)
+    return updated
+
+
+def swan_unstarted(info, before, name):
+    old = before['units'][name].get('InvocationID') or '0' * 32
+    return (info.get('ActiveState'), info.get('SubState'), info.get('MainPID'), info.get('InvocationID') or '0' * 32) == (
+        'inactive', 'dead', '0', old)
+
+
+def swan_started_units(before):
+    units = {n: unit(n) for n in SWAN_START_UNITS}
+    removal_dependencies(units, installed=True)
+    births = [units[n].get('InvocationID') for n in SWAN_START_UNITS]
+    need(len(set(births)) == len(SWAN_START_UNITS) and all(isinstance(i, str) and re.fullmatch(r'[0-9a-f]{32}', i) and i != '0' * 32
+             and i != before['units'][n].get('InvocationID') and units[n]['ActiveState'] == 'active'
+             for n, i in zip(SWAN_START_UNITS, births)), 'RUNTIME_UNPROVED')
+    return births
 
 
 def install(request, before, after):
@@ -830,6 +934,8 @@ def install(request, before, after):
     path = manifest_path(token)
     old_manifest = entry(payload)
     write(path, None, old_manifest)
+    if 'swan' in after:
+        old_manifest = write_swan_profile(path, old_manifest, backup, after)
     mkdir(NFT_DIR, 0o755)
     mkdir(DROP_DIR, 0o755)
     paths, originals = operation_files(after), original_files(before, after)
@@ -852,7 +958,26 @@ def install(request, before, after):
     if before.get('ikeSockets'):
         sc('restart', IKE, wait=22)
     no_jobs(UNITS)
+    if 'swan' in after:
+        check_swan_profile(backup, read(SWAN_PROFILE))
+        units = {n: unit(n) for n in SWAN_START_UNITS}
+        ike = units[IKE]
+        removal_dependencies(units, installed=True)
+        need(all(swan_unstarted(units[n], before, n) for n in SWAN_START_UNITS)
+             and not any(port in (500, 4500, 1701) for _, _, port, _ in sock_rows()), 'ROLLBACK_DRIFT')
+        need(removal_native(ike, IKE, before, installed=False) and not ike.get('PassEnvironment')
+             and not ike.get('ExecCondition') and all(ike.get(k) == v for k, v in before['units'][IKE].items()),
+             'ROLLBACK_DRIFT')
+        swan_default_environment('ROLLBACK_DRIFT')
     sc('start', XL, wait=26)
+    if 'swan' in after:
+        # A successful manager start and fresh, named invocations are distinct
+        # from the full Install receipt. Persist them before later verification.
+        # An uncertain start without this record has no stop authority.
+        backup['swanStart'] = swan_started_units(before)
+        started = entry(encode(backup))
+        write(path, old_manifest, started)
+        old_manifest = started
     # Type=simple may be active before its API/UDP listeners are present.
     ready_by = min(DEADLINE, time.monotonic() + 6)
     while True:
@@ -864,6 +989,9 @@ def install(request, before, after):
                 raise
             time.sleep(0.2)
     need(runtime.get('bootEnrollment') == backup.get('bootEnrollment'), 'ROLLBACK_DRIFT')
+    if 'swan' in after:
+        need(runtime['files']['swan'] == backup['swanGeneration']
+             and runtime['invocations'][1:4] == backup['swanStart'], 'ROLLBACK_DRIFT')
     backup.update(phase='installed', runtime=runtime)
     write(path, old_manifest, entry(encode(backup)))
 
@@ -872,8 +1000,27 @@ def after_match(record, expected):
     return record is not None and {**record, 'data': digest(raw(record))} == expected
 
 
+def check_swan_profile(backup, record, bad='ROLLBACK_DRIFT'):
+    before = backup['before']
+    if 'swan' not in before['files']:
+        # No enrollment or rebinding of an older manifest.
+        need('swan' not in backup['after'] and 'swanGeneration' not in backup, bad)
+        return
+    generation = backup.get('swanGeneration')
+    need('swan' in backup['after'] and before['files']['swan'] is None
+         and before['units'][IKE]['ActiveState'] == 'inactive' and not before.get('ikeSockets')
+         and swan_inputs(record is not None, bad) == before['swanInputs'], bad)
+    if record is None:
+        need(backup['phase'] == 'applying' and generation is None, bad)
+    else:
+        need(generation is not None and record == entry(SWAN_SETTINGS, 0o644)
+             and after_match(record, backup['after']['swan']) and remove_generation(SWAN_PROFILE) == generation, bad)
+    no_swan_rule()
+
+
 def load_after(backup, require_all=False):
     current = {key: read(path) for key, path in operation_files(backup['after']).items()}
+    check_swan_profile(backup, current.get('swan'))
     original = original_files(backup['before'], current)
     for key, value in current.items():
         need(after_match(value, backup['after'][key]) or (not require_all and value == original[key]),
@@ -886,6 +1033,7 @@ def rollback(request, path, old_manifest, backup):
     STAGE = 'COMMAND_FAILED'
     before, d, token = backup['before'], request['network'], request['backupId']
     need(backup['phase'] in ('applying', 'installed'), 'ROLLBACK_DRIFT')
+    was_installed = backup['phase'] == 'installed'
     no_jobs(UNITS)
     sidecar = 'bridge' in backup['after']
     neighbors(before, sidecar)
@@ -897,11 +1045,33 @@ def rollback(request, path, old_manifest, backup):
     need(vpn_empty(allow_socket_policies=True), 'ROLLBACK_DRIFT')
     policy = network_projection(d, token)
     watched = (X, XL, IKE, NET_UNIT, B) if sidecar else (X, XL, IKE, NET_UNIT)
-    if backup['phase'] == 'installed':
+    swan_units = None
+    started = None
+    partial_start = False
+    if 'swan' in current:
+        swan_units = {n: unit(n) for n in SWAN_START_UNITS}
+        started = backup.get('swanStart')
+        if started is None:
+            need(not was_installed and all(swan_unstarted(swan_units[n], before, n) for n in SWAN_START_UNITS)
+                 and not any(port in (500, 4500, 1701) for _, _, port, _ in sock_rows()), 'ROLLBACK_DRIFT')
+        else:
+            need(current['swan'] is not None and started == [swan_units[n].get('InvocationID') for n in SWAN_START_UNITS]
+                 and (not was_installed or started == backup['runtime']['invocations'][1:4]), 'ROLLBACK_DRIFT')
+            removal_dependencies(swan_units, installed=True)
+            ike = swan_units[IKE]
+            need(removal_native(ike, IKE, before, installed=True) and not ike.get('PassEnvironment'), 'ROLLBACK_DRIFT')
+            partial_start = not was_installed
+            if partial_start:
+                need(removal_native(swan_units[XL], XL, before, installed=True), 'ROLLBACK_DRIFT')
+                applying_vpn_ownership(sock_rows(), swan_units)
+            else:
+                removal_vpn_runtime(sock_rows(), swan_units)
+    if was_installed:
         expected = backup['runtime']
         need(policy == {'nft': expected['nft'], 'rule': True, 'route': True}
              and file_generations(current) == expected['files']
              and [unit(n).get('InvocationID') for n in watched] == expected['invocations'], 'ROLLBACK_DRIFT')
+
     # Do not stop an administrator replacement or unmask a unit. Failed
     # first start can leave a failed (but never active at baseline) stock unit.
     for n in watched:
@@ -922,11 +1092,54 @@ def rollback(request, path, old_manifest, backup):
                 xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows(), before.get('transit'))
         if n == B and working(info):
             xray_argv(info, BRIDGE)
+    if swan_units is not None and partial_start:
+        no_jobs(UNITS)
+        need(all(unit(n) == info for n, info in swan_units.items()), 'ROLLBACK_DRIFT')
     backup['phase'] = 'rolling-back'
     rolling = entry(encode(backup))
     write(path, old_manifest, rolling)
-    for n in (XL, IKE, NET_UNIT):
+    for n in SWAN_START_UNITS:
         info = unit(n)
+        if swan_units is not None:
+            if started is None:
+                need(swan_unstarted(info, before, n), 'ROLLBACK_DRIFT')
+            else:
+                initial = swan_units[n]
+                need(info.get('InvocationID') == initial.get('InvocationID'), 'ROLLBACK_DRIFT')
+                if partial_start:
+                    # Do not rebaseline ownership after recording rollback intent.
+                    need(all(info.get(k) == initial.get(k) for k in ('MainPID', 'ControlGroup')), 'ROLLBACK_DRIFT')
+                removal_dependencies({n: info}, installed=True)
+        if swan_units is not None and partial_start and n == XL:
+            ike = unit(IKE)
+            need(ike == swan_units[IKE] and removal_native(info, XL, before, installed=True), 'ROLLBACK_DRIFT')
+            check_swan_profile(backup, read(SWAN_PROFILE))
+            applying_vpn_ownership(sock_rows(), {IKE: ike, XL: info})
+            no_jobs(UNITS)
+            need(unit(IKE) == ike and unit(n) == info, 'ROLLBACK_DRIFT')
+        if n == IKE and 'swan' in current:
+            if current['swan'] is None:
+                need(read(SWAN_PROFILE) is None and swan_inputs(False, 'ROLLBACK_DRIFT') == before['swanInputs'],
+                     'ROLLBACK_DRIFT')
+                no_swan_rule()
+            else:
+                check_swan_profile(backup, read(SWAN_PROFILE))
+            if started is not None:
+                need(removal_native(info, IKE, before, installed=True) and not info.get('PassEnvironment'), 'ROLLBACK_DRIFT')
+                xl = unit(XL)
+                if partial_start:
+                    need(rollback_quiescent(xl), 'ROLLBACK_DRIFT')
+                removal_vpn_runtime(sock_rows(), {IKE: info, XL: xl})
+                if partial_start:
+                    no_jobs(UNITS)
+                    need(unit(XL) == xl and unit(n) == info, 'ROLLBACK_DRIFT')
+        if partial_start and n == NET_UNIT:
+            # Stopping this dependency must not stop a new dependent generation.
+            dependents = {name: unit(name) for name in (XL, IKE)}
+            need(all(rollback_quiescent(u) for u in dependents.values()), 'ROLLBACK_DRIFT')
+            removal_vpn_runtime(sock_rows(), dependents)
+            no_jobs(UNITS)
+            need(all(unit(name) == u for name, u in dependents.items()) and unit(n) == info, 'ROLLBACK_DRIFT')
         if info['LoadState'] == 'loaded' and info['ActiveState'] != 'inactive':
             sc('stop', n, wait=14)
             no_jobs(UNITS)
@@ -943,8 +1156,10 @@ def rollback(request, path, old_manifest, backup):
         need(nft_projection(token) == policy['nft'], 'ROLLBACK_DRIFT')
         command('/usr/sbin/nft', 'delete', 'table', 'inet', TABLE)
     paths, originals = operation_files(current), original_files(before, current)
-    for k in reversed((*ORDER, 'bridge') if sidecar else ORDER):
+    for k in reversed(operation_order(current)):
         if current[k] != originals[k]:
+            if k == 'swan':
+                check_swan_profile(backup, read(SWAN_PROFILE))
             write(paths[k], current[k], originals[k])
     if boot_enrollment:
         enroll_boot(before['units'][XL]['FragmentPath'], boot_enrollment)
@@ -961,6 +1176,8 @@ def rollback(request, path, old_manifest, backup):
         sc('start', IKE, wait=22)
     no_jobs(UNITS)
     neighbors(before, sidecar)
+    if 'swan' in current:
+        need(swan_inputs(False, STAGE) == before['swanInputs'], STAGE)
     if sidecar:
         bpid = xray_argv(unit(B), BRIDGE)
         handoff = next(i['port'] for i in json.loads(raw(originals['bridge']))['inbounds'] if i['tag'] == 'rebuild-relay-ingress')
@@ -1319,12 +1536,29 @@ def removal_boot(before, backup, runtime):
     return None
 
 
+def rollback_quiescent(info):
+    return (info['ActiveState'], info['SubState'], info['MainPID']) == ('inactive', 'dead', '0')
+
+
 def removal_vpn_runtime(rows, units):
+    vpn_stop_checks(rows, units, require_xl_listener=True)
+
+
+def applying_vpn_ownership(rows, units):
+    # The caller already matched the persisted start receipt. An active XL
+    # invocation still needs a proven PID; it need not have bound UDP/1701.
+    xl = units[XL]
+    need(xl['ActiveState'] != 'active' or working(xl), 'RUNTIME_UNPROVED')
+    vpn_stop_checks(rows, units, require_xl_listener=False)
+
+
+def vpn_stop_checks(rows, units, *, require_xl_listener):
     xl, ike = units[XL], units[IKE]
     lns_active, ike_active = (info['ActiveState'] == 'active' for info in (xl, ike))
     lns_rows = [(p, owners) for p, _, n, owners in rows if n == 1701]
     ike_rows = [(p, n, owners) for p, _, n, owners in rows if n in (500, 4500)]
-    need(bool(lns_rows) == lns_active and all(p == 'udp' and owners == [xl['MainPID']] for p, owners in lns_rows)
+    lns_ready = bool(lns_rows) == lns_active or (not require_xl_listener and not lns_rows)
+    need(lns_ready and all(p == 'udp' and owners == [xl['MainPID']] for p, owners in lns_rows)
          and {n for _, n, _ in ike_rows} == ({500, 4500} if ike_active else set())
          and all(p == 'udp' and owners and all(in_cgroup(pid, ike) for pid in owners) for p, _, owners in ike_rows),
          'RUNTIME_UNPROVED')
@@ -1369,15 +1603,17 @@ def observe_removal(request):
     boot_enrollment = removal_boot(before, backup, runtime)
     original_ike = before.get('ikeSockets', [])
     need(bool(original_ike) == (before['units'][IKE]['ActiveState'] == 'active'), bad)
-    current = {k: read(p) for k, p in NAMES.items()}
+    paths = operation_files({'swan': None} if 'swan' in backup['after'] else {})
+    current = {k: read(p) for k, p in paths.items()}
+    check_swan_profile(backup, current.get('swan'), bad)
     main = current['main']
     if main is None:
         raise Refusal(bad)
-    generations = file_generations()
+    generations = file_generations(current)
     # Apply can replace Xray profiles. Every other owned file must still be
     # the exact installed generation, even if a replacement has the same bytes.
     need(all(after_match(current[k], backup['after'][k]) and generations[k] == runtime['files'][k]
-             for k in NAMES if k != 'main'), bad)
+             for k in paths if k != 'main'), bad)
     removal_owned_dirs()
     need(ike_include_matches(current['starter'], [os.path.basename(NAMES['ike'])]), bad)
     side, side_generation = read(BRIDGE), remove_generation(BRIDGE)
@@ -1412,7 +1648,7 @@ def observe_removal(request):
                 bridge_sockets=bridge_sockets, retained_handoff=handoff if handoff_unit == B else None,
                 reserved=reserved, policy=policy, generations=generations, binary=binary,
                 boot_enrollment=boot_enrollment, ike_sockets=original_ike, manifest_generation=manifest_generation,
-                transit=transit)
+                transit=transit, **({'swanBackup': backup} if 'swan' in current else {}))
 
 
 def removal_owned_dirs():
@@ -1455,10 +1691,13 @@ def removal_units_after(state, restore_ike=False):
 
 def removal_files_after(state):
     before = state['before']
-    need(all(read(p) == (state['profiles']['main'] if k == 'main' else before['files'][k]) for k, p in NAMES.items())
+    paths = operation_files(state['current'])
+    need(all(read(p) == (state['profiles']['main'] if k == 'main' else before['files'][k]) for k, p in paths.items())
          and all(directory_absent(p) for p in (DROP_DIR, NFT_DIR))
          and (state['boot_enrollment'] is None or boot_link() is None)
          and ike_include_matches(before['files']['starter'], []), 'RUNTIME_UNPROVED')
+    if 'swan' in paths:
+        need(swan_inputs(False, 'RUNTIME_UNPROVED') == before['swanInputs'], 'RUNTIME_UNPROVED')
 
 
 def removal_bridge_unit(state, restarted=False):
@@ -1525,6 +1764,8 @@ def remove_installation(request, state):
     STAGE = 'RUNTIME_UNPROVED'
     no_jobs(UNITS)
     need(boot_enrollment is None or boot_link() == boot_enrollment, 'ROLLBACK_DRIFT')
+    if 'swan' in current:
+        check_swan_profile(state['swanBackup'], read(SWAN_PROFILE))
     # Retain the install manifest unchanged. Durable no-replace intent
     # prevents blind replay even if the first stop's result is unknown.
     REMOVE_ENTERED = True
@@ -1539,6 +1780,8 @@ def remove_installation(request, state):
         if info['ActiveState'] == 'active':
             if name in (XL, IKE):
                 removal_vpn_runtime(sock_rows(), fresh)
+            if name == IKE and 'swan' in current:
+                check_swan_profile(state['swanBackup'], read(SWAN_PROFILE))
             sc('stop', name, wait=14)
             no_jobs(UNITS)
         elif info['ActiveState'] == 'failed':
@@ -1550,7 +1793,7 @@ def remove_installation(request, state):
          and network_projection(d, token, removing=True) == policy, STAGE)
     removal_neighbors(state)
     removal_owned_dirs()
-    need(file_generations() == state['generations'] and (boot_enrollment is None or boot_link() == boot_enrollment),
+    need(file_generations(current) == state['generations'] and (boot_enrollment is None or boot_link() == boot_enrollment),
          'ROLLBACK_DRIFT')
     # Keep the ingress firewall in place until the owned listeners are gone.
     x = unit(X)
@@ -1561,11 +1804,14 @@ def remove_installation(request, state):
     if split:
         write(BRIDGE, state['side'], profiles['bridge'])
         side_generation = remove_generation(BRIDGE)
-    for k in reversed(ORDER):
-        need(remove_generation(NAMES[k]) == state['generations'][k], STAGE)
+    paths = operation_files(current)
+    for k in reversed(operation_order(current)):
+        need(remove_generation(paths[k]) == state['generations'][k], STAGE)
         restored = profiles[k] if k == 'main' else before['files'][k]
         if current[k] != restored:
-            write(NAMES[k], current[k], restored)
+            if k == 'swan':
+                check_swan_profile(state['swanBackup'], read(SWAN_PROFILE))
+            write(paths[k], current[k], restored)
     if boot_enrollment is not None:
         enroll_boot(before['units'][XL]['FragmentPath'], boot_enrollment)
     main_generation = remove_generation(MAIN)

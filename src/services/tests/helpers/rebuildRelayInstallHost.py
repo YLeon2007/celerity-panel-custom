@@ -114,7 +114,8 @@ class LocalOS:
 
 def stock_open(path, mode='r'):
     facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n108 ppp\nBlock devices:\n',
-             '/proc/net/dev': 'header\nheader\n eth0: 0\n', '/proc/sys/kernel/random/boot_id': 'fixture-boot\n'}
+             '/proc/net/dev': 'header\nheader\n eth0: 0\n', '/proc/sys/kernel/random/boot_id': 'fixture-boot\n',
+             '/proc/999/cgroup': '0::/system.slice/foreign.service\n'}
     if s['units'][IKE]['ActiveState'] == 'active':
         facts[f"/proc/{s['charonPid']}/cgroup"] = '0::/system.slice/' + IKE + '\n'
     for name, config in XRAY_PATHS.items():
@@ -158,7 +159,8 @@ def start(name):
     assert info['LoadState'] == 'loaded'
     s['nextPid'] += 1
     pid = s['nextPid']
-    info.update(ActiveState='active', SubState='running', MainPID=str(pid), InvocationID=f'fixture-{pid}')
+    info.update(ActiveState='active', SubState='exited' if name == NET else 'running',
+                MainPID='0' if name == NET else str(pid), InvocationID=f'{pid:032x}')
     if name in XRAY_PATHS:
         s['running'][name] = json.loads(backing(XRAY_PATHS[name]).read_bytes())
     elif name == IKE:
@@ -180,7 +182,7 @@ def sockets():
             result.extend((proto, address, inbound['port'], info['MainPID']) for proto in protocols)
     if s['units'][IKE]['ActiveState'] == 'active':
         result.extend(('udp', '0.0.0.0', port, s['charonPid']) for port in (500, 4500))
-    if s['units'][XL]['ActiveState'] == 'active':
+    if s['units'][XL]['ActiveState'] == 'active' and scenario not in ('settled', 'sidecar-refusal'):
         result.append(('udp', '0.0.0.0', 1701, s['units'][XL]['MainPID']))
     return result
 
@@ -205,6 +207,9 @@ def run(argv, **kwargs):
         if action == 'list-jobs':
             assert rest == ['--no-legend', '--plain']
             return reply()
+        if action == 'show-environment':
+            assert not rest
+            return reply(s['managerEnvironment'])
         s['effects'].append(v)
         if v == ['daemon-reload']:
             reloaded()
@@ -225,10 +230,10 @@ def run(argv, **kwargs):
             s['rule'] = dict(priority=h['PRIORITY'], src=d['clientCidr'], table=str(d['routeTable']), fwmark=hex(d['fwmark']))
             s['route'] = dict(type='local', dst='default', dev='lo', table=str(d['routeTable']), scope='254')
             s['nft'] = request['backupId']
-            s['units'][NET].update(ActiveState='active', SubState='exited', InvocationID='net')
+            start(NET)
             if s['units'][IKE]['ActiveState'] != 'active':
                 start(IKE)
-            if scenario in ('settled', 'sidecar-refusal', 'ike-refusal'):
+            if scenario == 'unacknowledged-start':
                 s['units'][XL].update(ActiveState='failed', SubState='failed')
                 return reply(code=1)
             start(XL)
@@ -251,6 +256,8 @@ def run(argv, **kwargs):
     if prog == '/usr/sbin/ip':
         if v == ['-j', '-N', '-4', 'rule', 'show']:
             return js(s['stockRules'] + s['foreign']['rules'] + ([s['rule']] if s['rule'] else []))
+        if v == ['-j', '-N', '-6', 'rule', 'show']:
+            return js(s['rules6'])
         if v == ['-j', '-N', '-4', 'route', 'show', 'table', 'all']:
             return js(s['foreign']['routes'] + ([s['route']] if s['route'] else []))
         if v == ['-j', '-N', '-4', 'addr', 'show']:
@@ -313,17 +320,25 @@ def run(argv, **kwargs):
         candidate = json.loads(kwargs['input'] if v[-1] == 'stdin:' else backing(v[-1]).read_bytes())
         assert isinstance(candidate['inbounds'], list)
         return reply()
-    raise AssertionError('unexpected command: ' + prog)
+    raise AssertionError('unexpected command: ' + repr(argv))
 
 
 def modeled_run(argv, **kwargs):
     try:
         return run(argv, **kwargs)
     except Exception as error:
-        s.setdefault('faults', []).append([type(error).__name__, argv[0]])
+        s.setdefault('faults', []).append([type(error).__name__, list(argv)])
         raise
 
-h.update(os=LocalOS(), open=stock_open,
+def modeled_open(path, mode='r'):
+    try:
+        return stock_open(path, mode)
+    except AssertionError:
+        s.setdefault('faults', []).append(['unmodeled observer', path])
+        raise
+
+
+h.update(os=LocalOS(), open=modeled_open,
          subprocess=SimpleNamespace(run=modeled_run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired),
          pwd=SimpleNamespace(getpwnam=lambda name: SimpleNamespace(pw_uid=STOCK_UID, pw_gid=STOCK_UID)),
          grp=SimpleNamespace(getgrnam=lambda name: SimpleNamespace(gr_gid=STOCK_UID)))

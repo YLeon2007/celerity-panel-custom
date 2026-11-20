@@ -4,10 +4,11 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { mkdtempSync, rmSync } = require('node:fs');
+const { mkdirSync, mkdtempSync, rmSync } = require('node:fs');
 const { join } = require('node:path');
 const { composeRebuildRelayPair } = require('../rebuildRelayInstallSteps');
 const { composeRebuildProfiles, syntheticTunnelSettings } = require('../../modules/relay-l2tp/tests/helpers/rebuildComposerFixture');
+const stockSwan = require('./helpers/rebuildRelayStockSwan');
 
 const nodeId = 'a'.repeat(24), backupId = 'b'.repeat(32), machineId = 'c'.repeat(32);
 const network = { clientCidr: '10.255.1.0/24', tproxyPort: 12345, fwmark: 77, routeTable: 177 };
@@ -91,6 +92,7 @@ put(XRAY, 'executable')
 put(MAIN, f['main'], (65534,65534))
 if f['bridge'] is not None: put(BRIDGE, f['bridge'], (0,65534))
 for k in ('lns','starter','secrets','chap'): put(P[k], '# stock\n')
+put(P['starter'], '# stock\nconfig setup\ninclude /etc/ipsec.d/*.conf\n')
 for path in (SYSTEM, str(Path(P['ike']).parent), str(Path(h['VAULT']).parent)):
     backing(path).mkdir(parents=True, exist_ok=True)
 
@@ -140,7 +142,7 @@ for n in (X,B,XL,IKE,NET):
         ControlGroup='/system.slice/'+n)
 for n, path, pid, present in [(X,MAIN,'101',True),(B,BRIDGE,'102',f['bridge'] is not None)]:
     units[n].update(User='nobody', ExecStart=f'{{ path={XRAY} ; argv[]={XRAY} run -config {path} ; }}')
-    if present: units[n].update(ActiveState='active', SubState='running', MainPID=pid, InvocationID='original-'+n, UnitFileState='enabled')
+    if present: units[n].update(ActiveState='active', SubState='running', MainPID=pid, InvocationID=f'{int(pid):032x}', UnitFileState='enabled')
 units[XL]['ExecStart'] = '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }'
 units[IKE]['ExecStart'] = '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }'
 stock = copy.deepcopy(units)
@@ -160,24 +162,37 @@ def proc(path, mode='r'):
     return io.BytesIO(facts[path].encode()) if mode == 'rb' else io.StringIO(facts[path])
 
 def load(n, path, generation):
-    units[n].update(ActiveState='active',SubState='running',MainPID=str(generation),InvocationID='run-'+str(generation))
+    units[n].update(ActiveState='active',SubState='running',MainPID=str(generation),InvocationID=f'{generation:032x}')
     loaded[n] = json.loads(backing(path).read_bytes())
 
 def run(argv, **kw):
     exe,*a = argv
-    def reply(value=b''):
-        return NS(returncode=0, stdout=value if isinstance(value,bytes) else value.encode(), stderr=b'')
+    def reply(value=b'', code=0):
+        return NS(returncode=code, stdout=value if isinstance(value,bytes) else value.encode(), stderr=b'')
     def js(value): return reply(h['encode'](value))
     if exe == '/usr/bin/systemctl':
         assert a.pop(0) == '--no-pager'
         op,*rest = a
         if op == 'show':
-            return reply(''.join(k+'='+units[rest[-1]].get(k,'')+'\n' for k in rest[1].split('=',1)[1].split(',')))
-        if op == 'list-jobs': return reply()
+            assert len(rest) == 3 and rest[0] == '--all' and rest[1].startswith('--property=')
+            info = units[rest[2]]
+            rows = []
+            for k in rest[1].split('=',1)[1].split(','):
+                value = info.get(k,'')
+                rows.extend(f'{k}={entry}\n' for entry in (value if isinstance(value,list) else [value]))
+            return reply(''.join(rows), 1 if info['LoadState'] == 'not-found' else 0)
+        if op == 'list-jobs':
+            assert rest == ['--no-legend','--plain']
+            return reply()
+        if op == 'show-environment':
+            assert not rest
+            return reply('LANG=C\n')
         changes.append(tuple(a))
         if op == 'daemon-reload':
             if backing(P['net']).exists():
-                units[NET].update(LoadState='loaded',FragmentPath=P['net'],UnitFileState='static',Type='oneshot',Requires=X,RequiredBy=XL)
+                commands = [l.removeprefix('ExecStart=') for l in backing(P['net']).read_text().splitlines() if l.startswith('ExecStart=')]
+                records = [f'{{ path={cmd.split()[0]} ; argv[]={cmd} ; ignore_errors=no ; }}' for cmd in commands]
+                units[NET].update(LoadState='loaded',FragmentPath=P['net'],UnitFileState='static',Type='oneshot',Requires=X,RequiredBy=XL,ExecStart=records)
                 units[XL].update(DropInPaths=h['DROP'],Requires=NET+' '+IKE,After=NET+' '+IKE)
                 units[X]['RequiredBy'], units[IKE]['RequiredBy'] = NET, XL
             else:
@@ -186,11 +201,11 @@ def run(argv, **kw):
         elif op == 'restart' and rest[0] in (X,B):
             n = rest[0]; load(n, MAIN if n == X else BRIDGE, 300 + len(changes))
         elif op == 'start' and rest == [XL]:
-            for n,pid,sub in [(XL,'202','running'),(IKE,'201','running'),(NET,'0','exited')]:
-                units[n].update(ActiveState='active',MainPID=pid,SubState=sub,InvocationID='installed-'+n)
+            for n,pid,sub,generation in [(XL,'202','running',202),(IKE,'201','running',201),(NET,'0','exited',203)]:
+                units[n].update(ActiveState='active',MainPID=pid,SubState=sub,InvocationID=f'{generation:032x}')
             policy.update(rule=True,route=True,nft=True)
-        elif op == 'stop' and rest[0] in (XL,IKE,NET):
-            units[rest[0]].update(ActiveState='inactive',SubState='dead',MainPID='0')
+        elif op == 'stop' and len(rest) == 1 and rest[0] in (XL,IKE,NET):
+            units[rest[0]].update(ActiveState='inactive',SubState='dead',MainPID='0',InvocationID='')
         else: raise AssertionError(a)
         return reply()
     if exe == '/usr/bin/dpkg-query' and a[1] == '-f=$'+'{db:Status-Abbrev}': return reply('ii ')
@@ -222,8 +237,10 @@ def run(argv, **kw):
     if exe == '/usr/sbin/ipsec' and a == ['statusall']:
         return reply('Status:\nConnections:\n   celerity-l2tp: transport\nSecurity Associations (0 up, 0 connecting):\n')
     if exe == '/usr/sbin/ip':
-        if a[:1] == ['xfrm']: return reply()
+        if a in (['xfrm','policy','list'],['xfrm','policy','list','nosock'],['xfrm','state','list','nokeys']): return reply()
         if a == ['-j','-N','-4','addr','show']: return js([])
+        if a == ['-j','-N','-6','rule','show']:
+            return js([dict(priority=0,src='all',table=255),dict(priority=32766,src='all',table=254)])
         if a == ['-j','-N','-4','rule','show']:
             rules = [dict(priority=p,src='all',table=t) for p,t in [(0,255),(32766,254),(32767,253)]]
             if policy['rule']: rules.append(dict(priority=h['PRIORITY'],src=d['clientCidr'],table=d['routeTable'],fwmark=hex(d['fwmark'])))
@@ -247,13 +264,29 @@ def run(argv, **kw):
         policy['nft'] = False; changes.append(tuple(a)); return reply()
     raise AssertionError(argv)
 
-h.update(os=OSBoundary(),open=proc,pwd=NS(getpwnam=lambda name:NS(pw_uid=65534,pw_gid=65534)),
-    subprocess=NS(run=run,PIPE=-1,DEVNULL=-3,TimeoutExpired=h['subprocess'].TimeoutExpired))
+faults = []
+def model(fn):
+    def checked(*args, **kw):
+        try: return fn(*args, **kw)
+        except Exception as e:
+            faults.append((fn.__name__, args[0], type(e).__name__))
+            raise
+    return checked
+
+def no_host_dispatch(event, _):
+    if event in {'subprocess.Popen','os.system','os.posix_spawn','os.exec','os.fork'} or event.startswith('socket.'):
+        faults.append(('unexpected host dispatch',event))
+        raise AssertionError('unmodeled host dispatch')
+
+sys.addaudithook(no_host_dispatch)
+h.update(os=OSBoundary(),open=model(proc),pwd=NS(getpwnam=lambda name:NS(pw_uid=65534,pw_gid=65534)),
+    subprocess=NS(run=model(run),PIPE=-1,DEVNULL=-3,TimeoutExpired=h['subprocess'].TimeoutExpired))
 
 def wire(action, **extra):
     out, err = io.StringIO(),io.StringIO()
     sys.stdin = NS(buffer=io.BytesIO(h['encode'](dict(req,action=action,**extra))))
     with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err): status=h['main']()
+    assert not faults, faults
     return status,out.getvalue(),err.getvalue()
 
 status, out, err = wire('prepare')
@@ -324,6 +357,7 @@ else:
     else:
         assert a[0] == 0 and json.loads(a[1]) == dict(ok=True,backupId=token,removed=True), a
         assert ('restart',X) in changes and not any(policy.values()) and intent.exists()
+        assert not backing(h['SWAN_PROFILE']).exists() and units[IKE]['MainPID'] == '0'
         main_after, side_after = h['read'](MAIN),h['read'](BRIDGE)
         assert json.loads(h['raw'](main_after)) == json.loads(f['expected'])
         assert {**main_after,'data':None} == {**main_before,'data':None}
@@ -349,6 +383,8 @@ for (const scenario of ['split', 'apply', 'apply-nobody-main', 'apply-empty-brid
         const originals = { main: stringify(split ? main : localMain), bridge: split ? stringify(bridge) : null };
         const dir = mkdtempSync(join(process.cwd(), '.remove-layout-fixture-'));
         try {
+            mkdirSync(join(dir, 'etc'), { mode: 0o755 });
+            stockSwan.seed(dir);
             const result = spawnSync('python3', ['-I', '-B', '-c', fixture, join(__dirname, '../rebuildRelayDirectHost.py'), dir, scenario], {
                 input: JSON.stringify({ ...originals, installed: installPair(originals.main, originals.bridge), split,
                     applied: stringify(applied), appliedSide: stringify(appliedSide), appliedEmptySide: stringify(appliedEmptySide),

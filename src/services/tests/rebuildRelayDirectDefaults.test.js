@@ -60,7 +60,8 @@ backing(boot).parent.mkdir()
 if opts.get('enabled'):
     backing(boot).symlink_to(local_xl)
 for k in ('lns', 'chap', 'secrets', 'starter', 'main'):
-    put(h['NAMES'][k], b'{}' if k == 'main' else b'# minimal\n')
+    put(h['NAMES'][k], b'{}' if k == 'main' else (b'config setup\ninclude /etc/ipsec.d/*.conf\n' if k == 'starter' else b'# minimal\n'))
+backing('/etc/ipsec.d').mkdir()
 backing(h['NFT_DIR']).parent.mkdir(exist_ok=True)
 backing(path).parent.mkdir()
 if opts['defaults'] is not None:
@@ -110,6 +111,7 @@ commands = []
 unmodeled = []
 rpdb = opts.get('rpdbNetns')
 ip_show = ('/usr/sbin/ip', '-j', '-N', '-4', 'rule', 'show')
+ip6_show = ('/usr/sbin/ip', '-j', '-N', '-6', 'rule', 'show')
 if rpdb:
     assert os.readlink('/proc/self/ns/net') != rpdb
     subprocess.run(['/usr/sbin/ip', '-4', 'rule', 'add', 'priority', '220', 'table', '220'], check=True, timeout=4)
@@ -117,7 +119,7 @@ if rpdb:
 
 def run(argv, **kw):
     commands.append(list(argv))
-    if rpdb and argv in (ip_show, ('/usr/sbin/ip', '-j', '-N', '-4', 'route', 'show', 'table', 'all'),
+    if rpdb and argv in (ip_show, ip6_show, ('/usr/sbin/ip', '-j', '-N', '-4', 'route', 'show', 'table', 'all'),
                          ('/usr/sbin/ip', '-j', '-N', '-4', 'addr', 'show')):
         return subprocess.run(argv, **kw)
     if argv[:4] == ('/usr/bin/systemctl','--no-pager','show','--all'):
@@ -125,6 +127,10 @@ def run(argv, **kw):
         data = ''.join(f'{k}={units[argv[5]].get(k, "")}\n' for k in props).encode()
     elif argv == ('/usr/bin/systemctl','--no-pager','list-jobs','--no-legend','--plain'):
         data = b''
+    elif argv == ('/usr/bin/systemctl','--no-pager','show-environment'):
+        data = b'LANG=C\n'
+    elif argv == ip6_show:
+        data = b'[]'
     elif argv == ('/usr/bin/dpkg-query', '-W', '-f=$'+'{Version}\\n$'+'{Architecture}\\n$'+'{Conffiles}', 'xl2tpd'):
         version = opts.get('version','1.3.18-1+b1')
         arch = opts.get('arch','amd64')
@@ -146,6 +152,12 @@ h.update(subprocess=NS(run=run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subproces
          preflight=lambda machine: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
          boot=lambda: 'fixture-boot', vpn_empty=lambda **kw: True, sock_rows=lambda: [], nft_tables=lambda: [],
          xray_users=lambda *args: [['tcp','127.0.0.1',8080]])
+# The signed settings tree is exercised by rebuildRelayDirectSwanFiles.py;
+# this fixture independently exercises the xl2tpd package/defaults gate.
+def settings_tree(present, _bad):
+    assert not present and h['read'](h['SWAN_PROFILE']) is None
+    return h['STOCK_SWAN_SHA']
+h['swan_inputs'] = settings_tree
 if not rpdb:
     h.update(ip=lambda *args: [], network_projection=lambda *args: dict(nft=None, rule=False, route=False))
 
