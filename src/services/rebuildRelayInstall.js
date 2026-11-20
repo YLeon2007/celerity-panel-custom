@@ -23,7 +23,7 @@ async function runFreshRelayInstall(id, deps) {
             };
             let remote;
             try {
-                checkAuthorization();
+                await checkAuthority();
                 const inventory = await deps.inventory(id);
                 if (inventory.eligible !== true || inventory.pristine !== true) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
                 if (deps.verifyBinding) await checkAuthority();
@@ -44,12 +44,12 @@ async function runFreshRelayInstall(id, deps) {
                 }
                 await checkAuthority();
                 let reservation;
-                try { reservation = await deps.reserve(inventory, backupId); }
+                try { reservation = await deps.reserve(inventory, backupId, checkAuthority); }
                 catch { throw fail('REBUILD_L2TP_RESERVATION_FAILED'); }
                 const guard = async () => {
                     await checkAuthority();
                     await deps.verifyReservation(reservation);
-                    checkAuthorization();
+                    await checkAuthority();
                 };
 
                 const rollback = async (code, noHostChanges = false) => {

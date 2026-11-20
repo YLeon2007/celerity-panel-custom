@@ -7,6 +7,7 @@ const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { runFreshRelayInstall } = require('./rebuildRelayInstall');
 const { createStore, read } = require('./rebuildRelayBackendStore');
 const { makeDesired } = require('./rebuildRelayBackendDesired');
+const { resolveAccountSources } = require('./rebuildRelayAccountInventory');
 const { compileRebuildGraph } = require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -70,8 +71,12 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
                 const snapshot = await store.snapshot(id);
                 if (!snapshot.pristine) return snapshot;
                 const topology = await readTopology(Node, Link, node, env.PANEL_DOMAIN);
-                const payload = makeDesired(id, await store.occupied(id), topology.controlPlaneAddresses, env.ENCRYPTION_KEY);
-                return { ...snapshot, ...topology, ...payload, node, eligible: true, nodeId: id };
+                const sourceSnapshot = await store.sourceRows(id);
+                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env,
+                    readNode: (peerId, fields) => read(Node.findById(peerId).select(fields)) });
+                const payload = makeDesired(id, sourceInventory.occupied, topology.controlPlaneAddresses, env.ENCRYPTION_KEY, sourceInventory);
+                return { ...snapshot, ...topology, ...payload, sourceSnapshot, replicated: !!sourceInventory.inherited,
+                    node, eligible: true, nodeId: id };
             },
             verifyBinding: fence.listMode ? async () => {
                 const current = await getNode();
@@ -81,7 +86,7 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
             connect: inventory => createRelayDirect({ node: inventory.node, env }),
             prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit }, remote) =>
                 remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, ...(transit && { transit }) }),
-            reserve: (inventory, backupId) => store.reserve({ ...inventory, backupId, machineId }),
+            reserve: (inventory, backupId, verifyLock) => store.reserve({ ...inventory, backupId, machineId }, verifyLock),
             verifyReservation: reservation => store.verifyReservation(reservation),
             finish: (reservation, verifyLock) => store.finish(reservation, verifyLock),
             restore: (reservation, verifyLock) => store.restore(reservation, verifyLock),

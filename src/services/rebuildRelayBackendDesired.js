@@ -2,10 +2,12 @@
 
 const { createHash, randomBytes } = require('node:crypto');
 const { isIP } = require('node:net');
-const { encrypt } = require('../modules/relay-l2tp/services/secretBoxService');
+const { decrypt, encrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 
 const fail = code => Object.assign(new Error(code), { code });
 const ipv4 = ip => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0);
+const addressAt = n => [24, 16, 8, 0].map(shift => (n >>> shift) & 255).join('.');
+const validLogin = login => typeof login === 'string' && /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/.test(login);
 
 function occupiedRange(cidr) {
     const match = typeof cidr === 'string' && /^([^/]+)\/(\d{1,2})$/.exec(cidr);
@@ -15,7 +17,7 @@ function occupiedRange(cidr) {
     return [first, first + size - 1];
 }
 
-function makeDesired(nodeId, occupied, controlPlaneAddresses, key) {
+function makeDesired(nodeId, occupied, controlPlaneAddresses, key, { inherited, allocations = [] } = {}) {
     if (typeof key !== 'string' || key.length < 32) throw fail('REBUILD_L2TP_CREDENTIAL_KEY_INVALID');
     const ranges = occupied.map(row => occupiedRange(row.clientCidr));
     for (const address of controlPlaneAddresses) {
@@ -38,15 +40,38 @@ function makeDesired(nodeId, occupied, controlPlaneAddresses, key) {
         clientCidr: `${prefix}.0/24`, localAddress: `${prefix}.1`, poolStart: `${prefix}.10`, poolEnd: `${prefix}.250`,
         dnsServers: ['1.1.1.1', '8.8.8.8'], tproxyPort: 12345, fwmark: 100, routeTable: 100, mtu: 1400, mru: 1400,
     };
+    const reserved = new Set([network.localAddress, ...allocations]);
+    if ([...reserved].some(ip => isIP(ip) !== 4)) throw fail('REBUILD_L2TP_ADDRESS_INVENTORY_INVALID');
+    const nextAddresses = [];
+    for (let n = ipv4(network.poolStart); n <= ipv4(network.poolEnd); n++) {
+        const address = addressAt(n);
+        if (!reserved.has(address)) nextAddresses.push(address);
+    }
+    if (inherited?.length === 0) throw fail('REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID');
+    if (nextAddresses.length < (inherited?.length ?? 1)) throw fail('REBUILD_L2TP_ACCOUNT_POOL_EXHAUSTED');
+    let accounts;
+    if (inherited) {
+        try {
+            accounts = inherited.map(account => {
+                const password = decrypt(account.passwordEncrypted, key);
+                // The DIRECT serializer owns quoting and format checks. Keep
+                // failure secret-free and never fall back to a new password.
+                if (!password || /[\r\n\0]/.test(password)) throw new Error();
+                return { ...account, password };
+            });
+        } catch { throw fail('REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID'); }
+    } else {
+        const password = randomBytes(24).toString('base64url');
+        accounts = [{ login: 'relay-bootstrap', enabled: true, password, passwordEncrypted: encrypt(password, key) }];
+    }
     const psk = randomBytes(24).toString('base64url');
-    const password = randomBytes(24).toString('base64url');
-    const login = 'relay-bootstrap';
-    const ip = network.poolStart;
     return {
-        desired: { ...network, psk, credentialRevision: 1, users: [{ login, password, ipAddress: ip, enabled: true }] },
+        desired: { ...network, psk, credentialRevision: 1, users: accounts.map(({ login, password, enabled }, i) =>
+            ({ login, password, ipAddress: nextAddresses[i], enabled })) },
         state: { ...network, secretRevision: 1, pskEncrypted: encrypt(psk, key), pskHint: psk.slice(-4) },
-        user: { login, ip, enabled: true, passwordEncrypted: encrypt(password, key), desiredRevision: 1 },
+        accounts: accounts.map(({ login, passwordEncrypted, enabled }, i) =>
+            ({ login, ip: nextAddresses[i], enabled, passwordEncrypted, desiredRevision: 1 })),
     };
 }
 
-module.exports = { makeDesired };
+module.exports = { makeDesired, ipv4, occupiedRange, validLogin };
