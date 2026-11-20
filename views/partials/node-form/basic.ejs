@@ -35,13 +35,17 @@
             <div class="form-section xray-only" id="cascadeRoleSection" style="<%= node?.type === 'xray' ? '' : 'display:none' %>">
                 <h3><i class="ti ti-topology-star-3"></i> <%= t('nodes.cascadeRole') %></h3>
                 <small class="section-hint"><%= t('nodes.cascadeRoleHint') %></small>
+                <% const roleBlocked = typeof l2tpRoleBlock !== 'undefined' && !!l2tpRoleBlock; %>
+                <% if (roleBlocked) { %>
+                <div class="alert alert-error" role="status"><%= l2tpRoleBlock %></div>
+                <% } %>
 
                 <%# Hidden input carries the actual value %>
-                <input type="hidden" id="cascadeRole" name="cascadeRole" value="<%= node?.cascadeRole || 'standalone' %>">
+                <input type="hidden" id="cascadeRole" name="cascadeRole" value="<%= node?.cascadeRole || 'standalone' %>"<% if (roleBlocked) { %> data-l2tp-role-blocked="true"<% } %>>
 
                 <div class="cascade-role-picker">
                     <label class="role-card <%= (node?.cascadeRole || 'standalone') === 'standalone' ? 'active' : '' %>"
-                           onclick="selectCascadeRole('standalone', this)">
+                           <% if (roleBlocked) { %>aria-disabled="true"<% } else { %>onclick="selectCascadeRole('standalone', this)"<% } %>>
                         <span class="role-card-icon role-standalone"><i class="ti ti-server"></i></span>
                         <span class="role-card-body">
                             <span class="role-card-name">Standalone</span>
@@ -49,7 +53,7 @@
                         </span>
                     </label>
                     <label class="role-card <%= node?.cascadeRole === 'portal' ? 'active' : '' %>"
-                           onclick="selectCascadeRole('portal', this)">
+                           <% if (roleBlocked) { %>aria-disabled="true"<% } else { %>onclick="selectCascadeRole('portal', this)"<% } %>>
                         <span class="role-card-icon role-portal"><i class="ti ti-door-enter"></i></span>
                         <span class="role-card-body">
                             <span class="role-card-name">Portal</span>
@@ -57,7 +61,7 @@
                         </span>
                     </label>
                     <label class="role-card <%= node?.cascadeRole === 'bridge' ? 'active' : '' %>"
-                           onclick="selectCascadeRole('bridge', this)">
+                           <% if (roleBlocked) { %>aria-disabled="true"<% } else { %>onclick="selectCascadeRole('bridge', this)"<% } %>>
                         <span class="role-card-icon role-bridge"><i class="ti ti-door-exit"></i></span>
                         <span class="role-card-body">
                             <span class="role-card-name">Bridge</span>

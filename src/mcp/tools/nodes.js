@@ -10,6 +10,7 @@ const HyUser = require('../../models/hyUserModel');
 const cache = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
 const logger = require('../../utils/logger');
+const { saveNodeRole, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 
 async function invalidateNodesCache() {
     await cache.invalidateNodes();
@@ -459,8 +460,17 @@ async function manageNode(args, emit) {
                 return { error: `Node type ${nextType} requires ip`, code: 400 };
             }
 
-            const node = await HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true })
-                .populate('groups', 'name color');
+            let node;
+            try {
+                node = await saveNodeRole(id, updates.cascadeRole, options => HyNode.findByIdAndUpdate(
+                    id, { $set: updates }, { new: true, ...options }
+                ).populate('groups', 'name color'));
+            } catch (error) {
+                const conflict = describeRoleError(error);
+                if (!conflict) throw error;
+                const { status, message, code, ...details } = conflict;
+                return { error: message, code: status, reason: code, ...details };
+            }
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             await invalidateNodesCache();
 

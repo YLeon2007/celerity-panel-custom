@@ -1,4 +1,5 @@
 <style>
+.role-card[aria-disabled="true"] { cursor: not-allowed; opacity: 0.65; }
 .proto-switcher {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -611,7 +612,9 @@ function switchProto(proto) {
 }
 
 function selectCascadeRole(role, cardEl) {
-    document.getElementById('cascadeRole').value = role;
+    const roleInput = document.getElementById('cascadeRole');
+    if (roleInput.dataset.l2tpRoleBlocked === 'true' && role !== 'relay') return;
+    roleInput.value = role;
     document.querySelectorAll('.role-card').forEach(function(c) { c.classList.remove('active'); });
     if (cardEl) cardEl.classList.add('active');
     onCascadeRoleChange();

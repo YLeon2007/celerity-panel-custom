@@ -21,6 +21,8 @@ const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers')
 const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
+const { isRebuildEnabled } = require('../../services/rebuildMode');
+const { relayRoleBlock, saveNodeRole, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 
 const {
     render,
@@ -572,11 +574,13 @@ router.get('/nodes/:id', async (req, res) => {
         // PEM replaced by ***SET*** (or empty). Sibling fields are unchanged.
         const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
         renderNode.xray = sanitizeXrayForRender(node.xray);
+        const roleBlock = isRebuildEnabled() && node.cascadeRole === 'relay' ? await relayRoleBlock(node._id) : null;
 
         render(res, 'node-form', {
             title: `${res.locals.t('nodes.editNode')}: ${node.name}`,
             page: 'nodes',
             node: renderNode,
+            l2tpRoleBlock: roleBlock ? describeRoleError(roleBlock, res.locals.t).message : '',
             nodeConfigPreview,
             groups,
             candidateNodes,
@@ -602,7 +606,7 @@ router.post('/nodes/:id', async (req, res) => {
             return res.redirect('/panel/nodes');
         }
 
-        const { name } = req.body;
+        const { name, cascadeRole } = req.body;
         const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
         const ip = req.body.ip || '';
 
@@ -638,17 +642,15 @@ router.post('/nodes/:id', async (req, res) => {
                 password: req.body['obfs.password'] || '',
             },
             flag: req.body.flag || '',
-            // Keep the existing role when the form omits the field instead of
-            // silently dropping the node back to 'standalone'.
-            cascadeRole: req.body.cascadeRole !== undefined
-                ? req.body.cascadeRole
-                : (existingNode.cascadeRole || 'standalone'),
             country: req.body.country || '',
             comment: typeof req.body.comment === 'string'
                 ? req.body.comment.trim().slice(0, 500)
                 : '',
             initScript: req.body.initScript || '',
         };
+        // In rebuild an omitted role must not overwrite a concurrent role edit.
+        if (cascadeRole !== undefined) updates.cascadeRole = cascadeRole;
+        else if (!isRebuildEnabled()) updates.cascadeRole = existingNode.cascadeRole || 'standalone';
 
         if (req.body.statsSecret) {
             updates.statsSecret = req.body.statsSecret;
@@ -713,8 +715,17 @@ router.post('/nodes/:id', async (req, res) => {
 
         // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
         const before = existingNode.toObject({ depopulate: true });
-        existingNode.set(updates);
-        await existingNode.save();
+        const saved = await saveNodeRole(nodeId, cascadeRole, async options => {
+            existingNode.set(updates);
+            // Mongoose also persists hydrated schema defaults on existing rows.
+            // An omitted role is not a role write, even on a legacy row.
+            if (cascadeRole === undefined && !Object.hasOwn(updates, 'cascadeRole')) {
+                existingNode.$ignore('cascadeRole');
+            }
+            await existingNode.save(options);
+            return true;
+        }, { expectedRole: existingNode.cascadeRole || 'standalone' });
+        if (!saved) return res.redirect('/panel/nodes');
 
         // The form always submits config defaults and replaces xray. Classify
         // the actual schema-cast saved delta, not the presence of those fields.
@@ -745,7 +756,9 @@ router.post('/nodes/:id', async (req, res) => {
         // Invalidate active-nodes, subscription, and dashboard caches so ranking/config changes apply immediately
         await invalidateNodesCache();
         res.redirect('/panel/nodes');
-    } catch {
+    } catch (error) {
+        const conflict = describeRoleError(error, res.locals.t);
+        if (conflict) return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(conflict.message)}`);
         // Casting and persistence errors can contain the submitted values.
         logger.error('[Panel] Update node failed');
         res.redirect(`/panel/nodes/${nodeId}?error=Failed%20to%20update%20node`);

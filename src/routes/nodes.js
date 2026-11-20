@@ -13,6 +13,7 @@ const { requireScope } = require('../middleware/auth');
 const { invalidateNodesCache } = require('../utils/helpers');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
+const { saveNodeRole, describeRoleError } = require('../services/rebuildRelayRoleGuard');
 
 function hasSshCredentials(node) {
     return !!(node?.ssh?.password || node?.ssh?.privateKey);
@@ -417,11 +418,11 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             return res.status(400).json({ error: `Node type ${nextType} requires ip` });
         }
 
-        const node = await HyNode.findByIdAndUpdate(
+        const node = await saveNodeRole(req.params.id, updates.cascadeRole, options => HyNode.findByIdAndUpdate(
             req.params.id,
             { $set: updates },
-            { new: true }
-        ).select('-ssh.password -ssh.privateKey').populate('groups', 'name color');
+            { new: true, ...options }
+        ).select('-ssh.password -ssh.privateKey').populate('groups', 'name color'));
 
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
@@ -444,7 +445,12 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         logger.info(`[Nodes API] Updated node ${node.name}`);
         
         res.json(node);
-    } catch {
+    } catch (error) {
+        const conflict = describeRoleError(error, res.locals.t);
+        if (conflict) {
+            const { status, message, ...details } = conflict;
+            return res.status(status).json({ error: message, ...details });
+        }
         // Casting and persistence errors can contain the submitted values.
         logger.error('[Nodes API] Update node failed');
         res.status(500).json({ error: 'Failed to update node' });
