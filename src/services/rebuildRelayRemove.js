@@ -6,7 +6,7 @@ const { withNode } = require('./rebuildLocks');
 const { captureRelayBinding, sameRelayBinding } = require('./rebuildRelayAuthorization');
 const { read } = require('./rebuildRelayBackendStore');
 const { projectRelayChap } = require('./rebuildRelayAccountInventory');
-const { transactOnce } = require('./rebuildRelayInstallTransaction');
+const { transactOnce, AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
 const { readAccountCount, readSessionCensus } = require('./rebuildRelayCounts');
 const { readAppliedTransit } = require('./rebuildAppliedLink');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
@@ -17,6 +17,8 @@ const NOT_OWNED = 'REBUILD_L2TP_REMOVE_NOT_OWNED';
 const CHANGED = 'REBUILD_L2TP_REMOVE_CHANGED';
 const UNKNOWN = 'REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN';
 const FINISH_UNKNOWN = 'REBUILD_L2TP_REMOVE_FINISH_OUTCOME_UNKNOWN';
+const RESERVATION_FAILED = 'REBUILD_L2TP_REMOVE_RESERVATION_FAILED';
+const RESERVATION_UNKNOWN = 'REBUILD_L2TP_REMOVE_RESERVATION_OUTCOME_UNKNOWN';
 const CLEANUP = 'REBUILD_L2TP_REMOVED_CLEANUP_FAILED';
 const CONFIRM = 'REBUILD_L2TP_REMOVE_CONFIRMATION_REQUIRED';
 const PREVIEW_CHANGED = 'REBUILD_L2TP_REMOVE_PREVIEW_CHANGED';
@@ -26,8 +28,8 @@ const PREVIEW_TTL_MS = 120_000;
 // Private proof accompanying the immutable public estimate. Neither the
 // installation receipt nor the host census is sent to the browser.
 const previews = new WeakMap();
-const safe = error => fail(typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$(?!\n)/.test(error.code)
-    ? error.code : 'REBUILD_L2TP_REMOVE_FAILED');
+const safe = (error, fallback = 'REBUILD_L2TP_REMOVE_FAILED') => fail(
+    typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$(?!\n)/.test(error.code) ? error.code : fallback);
 const write = { writeConcern: { w: 'majority' }, timestamps: false };
 const defaultDriver = options => require('./rebuildRelayDirect').createRelayDirect(options);
 const nodeFields = 'ip domain active type cascadeRole useCustomConfig ssh';
@@ -45,7 +47,8 @@ const unsetInstalled = Object.fromEntries(installedFields.map(key => [key, '']))
 const exact = (row, keys) => Object.fromEntries(keys.map(key => [key, Object.hasOwn(row, key)
     ? { $eq: row[key], ...(row[key] === null && { $exists: true }) } : { $exists: false }]));
 const orderedAccounts = rows => [...rows].sort((a, b) => String(a._id).localeCompare(String(b._id)));
-const exactAccount = row => ({ ...exact(row, ['_id', 'relayNode']), $expr: { $eq: ['$$ROOT', { $literal: row }] } });
+const exactDocument = (row, ownerKey) => ({ ...exact(row, ['_id', ownerKey]),
+    $expr: { $eq: ['$$ROOT', { $literal: row }] } });
 const integer = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
 const nonempty = value => typeof value === 'string' && value.length > 0;
 const empty = value => value == null || value === '';
@@ -229,11 +232,39 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     const reservation = { ...state, ...transition };
                     // All mutation filters bind the unique _id. Multi forms
                     // opt out of the driver's automatic retryable writes.
-                    let result;
-                    try { result = await State.updateMany(stateFence, { $set: transition }, write); }
-                    catch { throw fail('REBUILD_L2TP_REMOVE_RESERVATION_OUTCOME_UNKNOWN'); }
-                    if (result?.acknowledged !== true) throw fail('REBUILD_L2TP_REMOVE_RESERVATION_OUTCOME_UNKNOWN');
-                    if (result.matchedCount !== 1) throw fail(CHANGED);
+                    if (fence.listMode) {
+                        // Include the actual reservation, not a topology probe,
+                        // in the one-shot majority commit. All snapshot reads
+                        // must belong to the session's model connection.
+                        let readyToCommit = false;
+                        try {
+                            if (Node.db !== State.db) throw fail(RESERVATION_FAILED);
+                            await transactOnce(State, User, async session => {
+                                await checkInventory(state, accounts, session);
+                                checkPreview();
+                                const result = await State.updateMany(exactDocument(state, 'node'), { $set: transition },
+                                    { session, timestamps: false });
+                                if (result?.acknowledged !== true) throw fail(RESERVATION_FAILED);
+                                if (result.matchedCount !== 1) throw fail(CHANGED);
+                                await authority();
+                                checkPreview();
+                                readyToCommit = true;
+                            });
+                        } catch (error) {
+                            if (error instanceof AcknowledgedCommitCleanupError) {
+                                throw fail('REBUILD_L2TP_REMOVE_RESERVATION_CLEANUP_FAILED');
+                            }
+                            // A later observation of `removing` cannot replace
+                            // the missing commit ACK or permit a retry/restore.
+                            throw readyToCommit ? fail(RESERVATION_UNKNOWN) : safe(error, RESERVATION_FAILED);
+                        }
+                    } else {
+                        let result;
+                        try { result = await State.updateMany(stateFence, { $set: transition }, write); }
+                        catch { throw fail(RESERVATION_UNKNOWN); }
+                        if (result?.acknowledged !== true) throw fail(RESERVATION_UNKNOWN);
+                        if (result.matchedCount !== 1) throw fail(CHANGED);
+                    }
 
                     let revoked;
                     const guard = async () => {
@@ -271,7 +302,8 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             for (const row of accounts) {
                                 // Match the entire list-mode row: enumerating known
                                 // fields could miss a field added since the snapshot.
-                                const filter = session ? exactAccount(row) : exact(row, [...new Set([...accountKeys, ...Object.keys(row)])]);
+                                const filter = session ? exactDocument(row, 'relayNode')
+                                    : exact(row, [...new Set([...accountKeys, ...Object.keys(row)])]);
                                 const deleted = await User.deleteMany(filter, options);
                                 if (deleted?.acknowledged !== true || deleted.deletedCount !== 1) throw fail(CHANGED);
                             }

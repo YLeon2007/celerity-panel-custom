@@ -131,6 +131,7 @@ function fixture(t) {
         ...overrides,
     });
     return { env, events, create, nodes, links, states, users, hooks, stateHooks, userHooks, get removeInput() { return removeInput; },
+        get lock() { return lock; },
         loseLock: () => { lock = undefined; } };
 }
 
@@ -139,7 +140,7 @@ async function installed(t) {
     const service = f.create();
     await service.installRelay(id);
     f.events.length = 0;
-    return { ...f, get removeInput() { return f.removeInput; }, service };
+    return { ...f, get removeInput() { return f.removeInput; }, get lock() { return f.lock; }, service };
 }
 
 const outcomeUnknown = { code: 'REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN' };
@@ -172,7 +173,7 @@ async function sharedFixture(t, { singleton = false } = {}) {
         rebuildApplied: { listener: oid(id), mode: 'reverse', protocol: 'vless', port: 22010,
             uuid: '00000000-0000-4000-8000-000000000009' } });
 
-    const { attempts, dbHooks } = modelTransactions(t, f);
+    const { attempts, dbHooks, sessions } = modelTransactions(t, f);
     const frames = [], census = '3'.repeat(64), baseline = '4'.repeat(64);
     const wire = {};
     const { createRelayDirect } = require('../rebuildRelayDirect');
@@ -188,6 +189,8 @@ async function sharedFixture(t, { singleton = false } = {}) {
             assert.deepEqual(frame.transit, [{ linkId: String(f.links[0]._id), mode: 'reverse', port: 22010,
                 uuid: '00000000-0000-4000-8000-000000000009' }]);
             if (frame.action === 'remove') {
+                assert.deepEqual(attempts, ['reserve']);
+                assert.equal(sessions[0].ended, true);
                 assert.equal(frame.baseline, baseline);
                 assert.equal(frame.expectedCensus, census);
                 assert.equal(f.states[0].status, 'removing');
@@ -202,43 +205,147 @@ async function sharedFixture(t, { singleton = false } = {}) {
         login, enabled, ipAddress: ip, password: decrypt(passwordEncrypted, f.env.ENCRYPTION_KEY),
     })).sort((a, b) => a.login.localeCompare(b.login));
     const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
-    return { ...f, service, selected, sibling, frames, attempts, dbHooks, wire };
+    return { ...f, service, selected, sibling, frames, attempts, dbHooks, wire, sessions, get lock() { return f.lock; } };
 }
 
-function modelTransactions(t, { states, users }) {
-    const attempts = [], dbHooks = {};
+function modelTransactions(t, { states, users, nodes }) {
+    const attempts = [], dbHooks = {}, sessions = [];
     class Session {
         transaction = { transition: value => { assert.equal(value, 'TRANSACTION_COMMITTED'); this.active = false; } };
         startTransaction(options) {
             assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
             this.active = true;
-            this.rows = new Map([states, users].map(rows => [rows, rows.map(copy)]));
+            this.rows = new Map([states, users, nodes].map(rows => [rows, rows.map(copy)]));
         }
         inTransaction() { return this.active; }
         abortTransaction() { attempts.push('abort'); this.active = false; }
-        endSession() { assert.equal(this.active, false); }
+        endSession() {
+            assert.equal(this.active, false);
+            this.ended = true;
+            return dbHooks.end?.(this);
+        }
     }
-    t.mock.method(State.db, 'startSession', async () => new Session());
+    t.mock.method(State.db, 'startSession', async () => {
+        const session = new Session();
+        sessions.push(session);
+        return session;
+    });
     t.mock.method(State.db, 'getClient', () => ({ db(name) {
         assert.equal(name, 'admin');
         return { async command(command, { session }) {
             assert.equal(command.commitTransaction, 1);
-            assert.equal(command.writeConcern.w, 'majority');
-            assert.ok(session.inTransaction());
-            attempts.push('commit');
+            assert.deepEqual(command.writeConcern, { w: 'majority', wtimeout: 5000 });
+            assert.equal(session, sessions.at(-1));
+            assert.equal(session.inTransaction(), true);
             // Nothing is visible outside the session before the commit.
-            assert.equal(states[0].status, 'removing');
+            const next = session.rows.get(states)[0];
+            const reserving = next.status === 'removing';
+            attempts.push(reserving ? 'reserve' : 'settle');
+            assert.equal(states[0].status, reserving ? 'installed' : 'removing');
+            assert.equal(next.status, reserving ? 'removing' : 'not_installed');
+            assert.equal(next.desiredState, 'absent');
+            assert.equal(equal(next._id, states[0]._id), true);
+            assert.equal(equal(next.node, states[0].node), true);
             assert.ok(users.some(row => String(row.relayNode) === id));
-            assert.equal(session.rows.get(states)[0].status, 'not_installed');
-            assert.equal(session.rows.get(users).some(row => String(row.relayNode) === id), false);
+            const pendingUsers = session.rows.get(users);
+            if (reserving) assert.ok(equal(pendingUsers, users));
+            else assert.equal(pendingUsers.some(row => String(row.relayNode) === id), false);
             const apply = () => {
-                for (const [rows, pending] of session.rows) rows.splice(0, rows.length, ...pending);
+                if (reserving) states[0] = next;
+                else for (const rows of [states, users]) rows.splice(0, rows.length, ...session.rows.get(rows));
                 return { ok: 1 };
             };
-            return dbHooks.commit ? dbHooks.commit(apply) : apply();
+            const commit = reserving ? dbHooks.reserve : dbHooks.settle;
+            return commit ? commit(apply, session) : apply();
         } };
     } }));
-    return { attempts, dbHooks };
+    return { attempts, dbHooks, sessions };
+}
+
+const reservationFailed = { code: 'REBUILD_L2TP_REMOVE_RESERVATION_FAILED' };
+const reservationUnknown = { code: 'REBUILD_L2TP_REMOVE_RESERVATION_OUTCOME_UNKNOWN' };
+
+test('list Remove waits for an acknowledged exact reservation on the model session before host mutation', async t => {
+    const f = await sharedFixture(t, { singleton: true });
+    const before = copy(f.states[0]);
+    const committed = deferred(), ack = deferred();
+    let reserveSession, owner;
+    f.stateHooks.update = ({ where, update, apply, session }) => {
+        if (update.$set.status === 'removing') {
+            reserveSession = session;
+            owner = f.lock?.token;
+            assert.equal(session, f.sessions[0]);
+            assert.equal(session?.inTransaction(), true);
+            assert.ok(owner);
+            assert.deepEqual(where._id, { $eq: before._id });
+            assert.deepEqual(where.node, { $eq: before.node });
+            assert.ok(equal(where.$expr, { $eq: ['$$ROOT', { $literal: before }] }));
+            assert.deepEqual(Object.keys(update.$set).sort(), ['desiredState', 'status', 'updatedAt']);
+            assert.equal(update.$set.desiredState, 'absent');
+        }
+        return apply();
+    };
+    f.dbHooks.reserve = async (apply, session) => {
+        assert.equal(session, reserveSession);
+        assert.equal(f.lock?.token, owner);
+        const reply = apply();
+        committed.done();
+        await ack.promise;
+        return reply;
+    };
+    const operation = f.service.removeRelay(id);
+    try {
+        await Promise.race([committed.promise, operation]);
+        assert.equal(f.states[0].status, 'removing');
+        assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove']);
+    } finally { ack.done(); }
+    assert.equal((await operation).status, 'not_installed');
+    assert.deepEqual(f.attempts, ['reserve', 'settle']);
+});
+
+for (const fault of ['CAS miss', 'unacknowledged update', 'persistence failure', 'lease lost']) {
+    test(`list Remove aborts reservation with zero host mutation: ${fault}`, async t => {
+        const f = await sharedFixture(t, { singleton: true });
+        const before = f.states.map(copy), users = f.users.map(copy);
+        f.stateHooks.update = ({ apply, rows, session }) => {
+            assert.equal(session, f.sessions[0]);
+            if (fault === 'persistence failure') throw privateError();
+            if (fault === 'unacknowledged update') { apply(); return { acknowledged: false }; }
+            if (fault === 'CAS miss') rows[0].foreignField = 'concurrent extra field';
+            if (fault === 'lease lost') f.loseLock();
+            return apply();
+        };
+        const code = fault === 'lease lost' ? { code: 'REBUILD_LOCK_LOST' }
+            : fault === 'CAS miss' ? { code: 'REBUILD_L2TP_REMOVE_CHANGED' } : reservationFailed;
+        await assert.rejects(f.service.removeRelay(id), code);
+        assert.deepEqual(f.attempts, ['abort']);
+        assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove']);
+        assert.ok(equal(f.states, before) && equal(f.users, users));
+    });
+}
+
+for (const fault of ['lost before commit', 'lost after commit', 'write concern error', 'session cleanup failure']) {
+    test(`list Remove does not dispatch or replay an unconfirmed reservation handoff: ${fault}`, async t => {
+        const f = await sharedFixture(t, { singleton: true });
+        const users = f.users.map(copy), peer = copy(f.states[1]);
+        const cleanup = fault === 'session cleanup failure';
+        if (cleanup) f.dbHooks.end = () => { throw privateError(); };
+        else f.dbHooks.reserve = apply => {
+            if (fault !== 'lost before commit') apply();
+            if (fault === 'write concern error') return { ok: 1, writeConcernError: { code: 64 } };
+            throw privateError();
+        };
+        await assert.rejects(f.service.removeRelay(id), cleanup
+            ? { code: 'REBUILD_L2TP_REMOVE_RESERVATION_CLEANUP_FAILED' } : reservationUnknown);
+        assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove']);
+        assert.deepEqual(f.attempts, ['reserve']);
+        assert.equal(f.sessions.length, 1);
+        assert.equal(f.sessions[0].ended, true);
+        assert.equal(f.states[0].status, fault === 'lost before commit' ? 'installed' : 'removing');
+        if (f.states[0].status === 'removing') await assert.rejects(f.service.removeRelay(id), noOwner);
+        assert.deepEqual(f.attempts, ['reserve']);
+        assert.ok(equal(f.users, users) && equal(f.states[1], peer));
+    });
 }
 
 test('shared Remove sends the same private DB projection to DIRECT and retires only the selected relay', async t => {
@@ -252,7 +359,7 @@ test('shared Remove sends the same private DB projection to DIRECT and retires o
     assert.deepEqual(f.selected(), []);
     assert.deepEqual(f.sibling().reverse(), before);
     assert.deepEqual(f.states[1], peer);
-    assert.deepEqual(f.attempts, ['commit']);
+    assert.deepEqual(f.attempts, ['reserve', 'settle']);
 });
 
 test('shared Remove invalidates a preview when a disabled row revision changes without changing CHAP', async t => {
@@ -282,14 +389,14 @@ test('shared Remove rechecks disabled rows after prepare and the confirmed censu
 
 test('shared Remove rechecks a disabled row identity after reserving and before DIRECT mutation', async t => {
     const f = await sharedFixture(t);
-    f.stateHooks.update = ({ update, apply }) => {
+    f.dbHooks.reserve = apply => {
         const result = apply();
-        if (update.$set.status === 'removing') f.selected().find(row => !row.enabled)._id = oid();
+        f.selected().find(row => !row.enabled)._id = oid();
         return result;
     };
     await assert.rejects(f.service.removeRelay(id), { code: 'REBUILD_L2TP_REMOVE_CHANGED' });
     assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove']);
-    assert.deepEqual(f.attempts, []);
+    assert.deepEqual(f.attempts, ['reserve']);
     assert.equal(f.states[0].status, 'removing');
     assert.equal(f.selected().length, 2);
 });
@@ -302,7 +409,7 @@ test('shared Remove restores the exact reservation on known pre-intent host refu
     await assert.rejects(f.service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_REFUSED' });
     assert.deepEqual(f.states[0], initial);
     assert.deepEqual(f.users, rows);
-    assert.deepEqual(f.attempts, []);
+    assert.deepEqual(f.attempts, ['reserve']);
 });
 
 test('lost DIRECT Remove acknowledgement leaves all list rows and never starts settlement or replays', async t => {
@@ -312,7 +419,7 @@ test('lost DIRECT Remove acknowledgement leaves all list rows and never starts s
     await assert.rejects(f.service.removeRelay(id), outcomeUnknown);
     await assert.rejects(f.service.removeRelay(id), noOwner);
     assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove', 'remove']);
-    assert.deepEqual(f.attempts, []);
+    assert.deepEqual(f.attempts, ['reserve']);
     assert.equal(f.states[0].status, 'removing');
     assert.deepEqual(f.users, rows);
 });
@@ -339,7 +446,7 @@ test('list Remove aborts all retirement when a later, disabled-row CAS misses', 
     await assert.rejects(f.service.removeRelay(id), finishUnknown);
     await assert.rejects(f.service.removeRelay(id), noOwner);
     assert.deepEqual(deletedCounts, [1, 0]);
-    assert.deepEqual(f.attempts, ['abort']);
+    assert.deepEqual(f.attempts, ['reserve', 'abort']);
     assert.equal(f.frames.filter(x => x.action === 'remove').length, 1);
     assert.equal(f.states[0].status, 'removing');
     assert.deepEqual(f.users, rows);
@@ -352,7 +459,7 @@ test('single-account list Remove aborts the retirement when the final reservatio
         ? { acknowledged: true, matchedCount: 0 } : apply();
     await assert.rejects(f.service.removeRelay(id), finishUnknown);
     await assert.rejects(f.service.removeRelay(id), noOwner);
-    assert.deepEqual(f.attempts, ['abort']);
+    assert.deepEqual(f.attempts, ['reserve', 'abort']);
     assert.equal(f.frames.filter(x => x.action === 'remove').length, 1);
     assert.deepEqual(f.users, rows);
     assert.equal(f.states[0].status, 'removing');
@@ -377,17 +484,17 @@ test('trusted shared Remove also requires a fresh zero census before dispatch', 
     delete f.wire['session-count'];
     await f.service.removeRelay(id);
     assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove', 'remove']);
-    assert.deepEqual(f.attempts, ['commit']);
+    assert.deepEqual(f.attempts, ['reserve', 'settle']);
 });
 
 for (const [singleton, committed] of [[false, false], [false, true], [true, false], [true, true]]) {
     test(`list Remove never retries an unacknowledged settlement commit (singleton=${singleton}, committed=${committed})`, async t => {
         const f = await sharedFixture(t, { singleton });
         const selected = f.selected().map(copy), sibling = f.sibling().map(copy);
-        f.dbHooks.commit = apply => { if (committed) apply(); throw privateError(); };
+        f.dbHooks.settle = apply => { if (committed) apply(); throw privateError(); };
         await assert.rejects(f.service.removeRelay(id), finishUnknown);
         await assert.rejects(f.service.removeRelay(id), noOwner);
-        assert.deepEqual(f.attempts, ['commit']);
+        assert.deepEqual(f.attempts, ['reserve', 'settle']);
         assert.equal(f.frames.filter(x => x.action === 'remove').length, 1);
         assert.equal(f.states[0].status, committed ? 'not_installed' : 'removing');
         assert.deepEqual(f.selected(), committed ? [] : selected);
@@ -434,7 +541,7 @@ test('list Remove requires card corroboration and a preview from the same bindin
     const current = await service.previewRemoveRelay(id);
     assert.equal((await service.confirmRemoveRelay(id, current)).status, 'not_installed');
     assert.deepEqual(actions, ['session-count', 'session-count', 'session-count', 'prepare-remove', 'remove']);
-    assert.deepEqual(attempts, ['commit']);
+    assert.deepEqual(attempts, ['reserve', 'settle']);
 });
 
 test('final host refusal restores only the exact reservation; unknown outcomes retain it', async t => {
