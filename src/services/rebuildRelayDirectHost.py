@@ -409,13 +409,23 @@ def network_projection(d, token, removing=False):
     if removing:
         need(all(str(r.get('table')) != str(table) for r in others), 'NETWORK_CONFLICT')
     else:
-        need(len(others) == 3 and {r.get('priority') for r in others} == set(names) and all(
+        need(len(others) == 3 and all(type(r.get('priority')) is int for r in others)
+             and {r['priority'] for r in others} == set(names) and all(
             r.get('src') == 'all' and r.get('table') in names[r['priority']]
             and not (set(r) - {'priority', 'src', 'table', 'protocol'}) for r in others), 'NETWORK_CONFLICT')
     own_routes = [r for r in routes if str(r.get('table')) == str(table)]
-    need(len(own_rules) <= 1 and all(r.get('src') == d['clientCidr'] and str(r.get('table')) == str(table)
-         and 'fwmark' in r and number(r['fwmark']) == d['fwmark'] and 'fwmask' not in r
-         and not (set(r) - {'priority', 'src', 'table', 'fwmark', 'protocol'}) for r in own_rules), 'NETWORK_CONFLICT')
+    # iproute2's ip/iprule.c prints IPv4 source addresses and prefix lengths
+    # separately in JSON. Match the canonical candidate exactly in either
+    # encoding; do not accept a hybrid or infer a missing prefix length.
+    cidr = d['clientCidr']
+    address, length = cidr.split('/')
+    need(len(own_rules) <= 1 and all(
+         type(r['priority']) is int and str(r.get('table')) == str(table)
+         and ((r.get('src') == cidr and 'srclen' not in r)
+              or (r.get('src') == address and type(r.get('srclen')) is int and r['srclen'] == int(length)))
+         and type(r.get('fwmark')) in (int, str) and number(r['fwmark']) == d['fwmark']
+         and not (set(r) - {'priority', 'src', 'srclen', 'table', 'fwmark', 'protocol'}) for r in own_rules),
+         'NETWORK_CONFLICT')
     need(len(own_routes) <= 1 and all(r.get('type') in ('local', 2, '2') and r.get('dst') in ('default', '0.0.0.0/0') and r.get('dev') == 'lo'
          and r.get('scope') in ('host', 254, '254') and not (set(r) - {'type', 'dst', 'dev', 'table', 'scope', 'flags', 'protocol'})
          for r in own_routes), 'NETWORK_CONFLICT')

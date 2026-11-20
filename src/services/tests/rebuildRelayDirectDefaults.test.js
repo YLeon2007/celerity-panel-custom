@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { join } = require('node:path');
-const { mkdtempSync, rmSync } = require('node:fs');
+const { existsSync, mkdtempSync, readlinkSync, rmSync } = require('node:fs');
 
 // Exact data member of the signed trixie/amd64 xl2tpd 1.3.18-1+b1 package.
 const defaults = `# Defaults for xl2tpd initscript
@@ -26,7 +26,7 @@ DAEMON_OPTS=""
 // a private scratch tree; each modeled observation is read-only. No systemd,
 // dpkg, sockets, /dev/ppp or host configuration are accessed by this test.
 const harness = String.raw`
-import io, json, os, runpy, sys
+import io, json, os, runpy, subprocess, sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -108,9 +108,18 @@ units[XL].update(opts.get('unit', {}))
 units[IKE]['ExecStart'] = '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }'
 commands = []
 unmodeled = []
+rpdb = opts.get('rpdbNetns')
+ip_show = ('/usr/sbin/ip', '-j', '-N', '-4', 'rule', 'show')
+if rpdb:
+    assert os.readlink('/proc/self/ns/net') != rpdb
+    subprocess.run(['/usr/sbin/ip', '-4', 'rule', 'add', 'priority', '220', 'table', '220'], check=True, timeout=4)
+    with_foreign_rule = subprocess.check_output(ip_show, timeout=4)
 
 def run(argv, **kw):
     commands.append(list(argv))
+    if rpdb and argv in (ip_show, ('/usr/sbin/ip', '-j', '-N', '-4', 'route', 'show', 'table', 'all'),
+                         ('/usr/sbin/ip', '-j', '-N', '-4', 'addr', 'show')):
+        return subprocess.run(argv, **kw)
     if argv[:4] == ('/usr/bin/systemctl','--no-pager','show','--all'):
         props = argv[4].removeprefix('--property=').split(',')
         data = ''.join(f'{k}={units[argv[5]].get(k, "")}\n' for k in props).encode()
@@ -136,8 +145,9 @@ def run(argv, **kw):
 h.update(subprocess=NS(run=run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired),
          preflight=lambda machine: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
          boot=lambda: 'fixture-boot', vpn_empty=lambda **kw: True, sock_rows=lambda: [], nft_tables=lambda: [],
-         ip=lambda *args: [], network_projection=lambda *args: dict(nft=None, rule=False, route=False),
          xray_users=lambda *args: [['tcp','127.0.0.1',8080]])
+if not rpdb:
+    h.update(ip=lambda *args: [], network_projection=lambda *args: dict(nft=None, rule=False, route=False))
 
 machine = 'a'*32
 network = dict(clientCidr='10.255.1.0/24', tproxyPort=12345, fwmark=77, routeTable=177)
@@ -150,6 +160,9 @@ assert status == (0 if opts['accept'] else 70), status
 assert not backing(h['VAULT']).exists()
 assert not backing(h['DROP_DIR']).exists()
 assert backing(boot).is_symlink() == bool(opts.get('enabled'))
+if rpdb:
+    assert h['NO_INSTALL_WRITES'] and list(ip_show) in commands
+    assert subprocess.check_output(ip_show, timeout=4) == with_foreign_rule
 if opts['accept']:
     before = h['observe'](machine, network)
     assert before['globalFiles'][path] == h['read'](path)
@@ -249,3 +262,29 @@ for (const [name, changes] of scenarios) {
         } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 }
+
+test('DIRECT install refuses an unattributed rule 220 before any write', t => {
+    const unshare = '/usr/bin/unshare';
+    const flags = ['--user', '--map-root-user', '--net', '--'];
+    if (process.platform !== 'linux' || ![unshare, '/usr/sbin/ip', '/usr/bin/python3'].every(existsSync)) {
+        t.skip('requires Linux local namespace tools');
+        return;
+    }
+    const probe = spawnSync(unshare, [...flags, '/usr/bin/true'], { encoding: 'utf8', timeout: 3000 });
+    if (probe.status !== 0 && /Operation not permitted|Permission denied/.test(probe.stderr ?? '')) {
+        t.skip('unprivileged user/network namespaces unavailable');
+        return;
+    }
+    assert.equal(probe.status, 0, probe.stderr || probe.error?.message);
+    const dir = mkdtempSync(join(process.cwd(), '.direct-rpdb-fixture-'));
+    try {
+        const result = spawnSync(unshare, [...flags, '/usr/bin/python3', '-I', '-B', '-c', harness,
+            join(__dirname, '../rebuildRelayDirectHost.py'),
+            join(__dirname, '../../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'), dir],
+        { encoding: 'utf8', input: JSON.stringify({ accept: false, defaults: null,
+            rpdbNetns: readlinkSync('/proc/self/ns/net') }), timeout: 10000 });
+        assert.equal(result.status, 0, result.stderr || result.error?.message);
+        assert.equal(result.stdout, '');
+        assert.equal(result.stderr, 'DIRECT_NO_WRITE_NETWORK_CONFLICT\n');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+});
