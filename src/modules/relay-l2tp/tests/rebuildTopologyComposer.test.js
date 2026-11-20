@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { createPrivateKey, createPublicKey, generateKeyPairSync } = require('node:crypto');
 const { Types } = require('mongoose');
 const { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX, syntheticTunnelSettings } = require('./helpers/rebuildComposerFixture');
 
@@ -253,6 +254,45 @@ test('TLS tunnels use explicitly supplied certs, not ambient environment', () =>
     assert.equal(inbound.settings.decryption, 'none');
     assert.equal(outbound.settings.encryption, 'none');
 });
+
+for (const mode of ['reverse', 'forward']) {
+    test(`${mode} REALITY emits a matching key pair on the listener and dialer`, () => {
+        const nodes = [node('p', 'portal', 1), node('b', 'bridge', 2)];
+        const reverse = mode === 'reverse';
+        const listenerNode = nodes[reverse ? 0 : 1];
+        const destination = reverse ? '127.0.0.1:8444' : 'decoy.test:8443';
+        const { privateKey, publicKey } = generateKeyPairSync('x25519');
+        const reality = { realityDest: destination, realitySni: ['cover.test', 'other.test'],
+            realityPrivateKey: privateKey.export({ format: 'jwk' }).d, realityPublicKey: publicKey.export({ format: 'jwk' }).x,
+            realityShortIds: ['aabbccddeeff1122'] };
+        const link = edge('pair', 'p', 'b', 1, { ...reality, mode, tunnelSecurity: 'reality', _rebuildVless: undefined });
+        const output = composeRebuildProfiles({ nodes, links: [link] });
+        const listener = byNode(output, listenerNode._id, reverse ? 'main' : 'bridge').inbounds.find(i => i.port === link.tunnelPort);
+        const dialer = byNode(output, reverse ? 'b' : 'p', reverse ? 'bridge' : 'main').outbounds
+            .find(o => o.tag === (reverse ? 'rebuild-rp-dial-pair' : 'fwd-pair'));
+        const { security: serverSecurity, realitySettings: server } = listener.streamSettings;
+        const { security: dialSecurity, realitySettings: client } = dialer.streamSettings;
+        assert.equal(serverSecurity, 'reality');
+        assert.equal(dialSecurity, 'reality');
+        assert.equal(server.dest, destination);
+        assert.deepEqual(server.serverNames, ['cover.test', 'other.test']);
+        assert.equal(client.serverName, server.serverNames[0]);
+        assert.match(client.shortId, /^[0-9a-f]{16}$/);
+        assert.ok(server.shortIds.includes(client.shortId));
+        const privateDer = Buffer.concat([Buffer.from('302e020100300506032b656e04220420', 'hex'), Buffer.from(server.privateKey, 'base64url')]);
+        const derived = createPublicKey(createPrivateKey({ key: privateDer, format: 'der', type: 'pkcs8' })).export({ format: 'jwk' }).x;
+        assert.ok(derived === client.publicKey, 'REALITY listener/dialer key mismatch');
+        assert.ok(!Object.hasOwn(client, 'privateKey'), 'dialer must not contain the private key');
+        assert.ok(!Object.hasOwn(server, 'publicKey'), 'listener must not contain the public key field');
+        const remote = reverse ? dialer.settings : dialer.settings.vnext[0];
+        const dialUser = reverse ? remote : remote.users[0];
+        assert.equal(remote.address, listenerNode.ip);
+        assert.equal(remote.port, listener.port);
+        assert.equal(dialUser.id, listener.settings.clients[0].id);
+        assert.equal(dialUser.encryption, 'none');
+        assert.equal(listener.settings.decryption, 'none');
+    });
+}
 
 test('forward VMess retains its wire settings without VLESS keys', () => {
     const nodes = [node('p', 'portal', 1), node('b', 'bridge', 2)];

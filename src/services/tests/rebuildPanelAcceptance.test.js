@@ -65,6 +65,7 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
     async function create(key,autoDeploy=true) {
         const [a,b]=spec[key]; const at=events().length;
         const res=await call('POST','/links',{name:key,portalNodeId:nodeIds[a],bridgeNodeId:nodeIds[b],mode:'reverse',tunnelPort:41000+Object.keys(spec).indexOf(key),priority:key==='rc'?1:20,autoDeploy,
+            ...(key==='xy'?{tunnelSecurity:'none'}:{}), // Legacy non-REALITY migration fixture, not a new-link default.
             ...(key==='rb'?{geoRouting:{enabled:true,domains:['full:geo.invalid'],geoip:['198.51.100.0/24']}}:{})});
         assert.equal(events().length,at,'no effects before confirmation'); links[key]=res.linkId;
         if(autoDeploy){assert.equal(res.status,'awaiting_preview'); assert.ok(res.preview.allowed); await apply(res.linkId,res.preview);}

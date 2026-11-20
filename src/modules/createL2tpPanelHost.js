@@ -288,8 +288,10 @@ function createL2tpPanelHost({
                 prepareLink: async link => {
                     // Invoked by the real service only AFTER persisted-key replay.
                     // Defaults come from trusted node metadata, never HTTP fields.
-                    const targetNode = await injectedHyNode.findById(link.bridgeNode).lean();
-                    return require('../routes/cascadeLinks').prepareIntentLink(link, targetNode);
+                    const listenerId = link.mode === 'forward' ? link.bridgeNode : link.portalNode;
+                    const listenerNode = link.tunnelSecurity === 'reality'
+                        ? await injectedHyNode.findById(listenerId).lean() : null;
+                    return require('../routes/cascadeLinks').prepareIntentLink(link, listenerNode);
                 },
             });
         }

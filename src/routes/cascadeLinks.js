@@ -230,15 +230,15 @@ function generateRealityKeyPair() {
     return { privateKey: privateJwk.d, publicKey: publicJwk.x };
 }
 
-function resolveRealitySettings(input = {}, targetNode = null, { generate = true } = {}) {
-    // When the link form leaves realityDest/realitySni empty, inherit them
-    // from the TARGET node's card (xray.realityDest/realitySni); the global
-    // google defaults apply only when the target node has none configured.
-    const targetXray = targetNode && typeof targetNode.xray === 'object' ? targetNode.xray : null;
-    const nodeDest = String(targetXray?.realityDest || '').trim();
-    const nodeSni = Array.isArray(targetXray?.realitySni)
-        ? targetXray.realitySni.map(value => String(value).trim()).filter(Boolean)
-        : [];
+function resolveRealitySettings(input = {}, listenerNode = null, { generate = true } = {}) {
+    // Inherit each empty field independently from the node accepting the
+    // connection. The global fallback is only for an unset listener field.
+    const nodeDest = String(listenerNode?.xray?.realityDest || '').trim();
+    // Keep the legacy v2 create fingerprint stable before preparation.
+    const parseSni = value => normalizeStringArray(value)
+        .flatMap(entry => generate ? entry.split(',').map(name => name.trim()) : [entry])
+        .filter(Boolean);
+    const nodeSni = parseSni(listenerNode?.xray?.realitySni);
     let privateKey = String(input.realityPrivateKey || '').trim();
     let publicKey = String(input.realityPublicKey || '').trim();
     if (generate && (!privateKey || !publicKey)) {
@@ -264,7 +264,7 @@ function resolveRealitySettings(input = {}, targetNode = null, { generate = true
             );
         }
     }
-    const realitySni = normalizeStringArray(input.realitySni).filter(Boolean);
+    const realitySni = parseSni(input.realitySni);
     return {
         realityDest: String(input.realityDest || '').trim() || nodeDest || (generate ? 'www.google.com:443' : ''),
         realitySni: realitySni.length > 0 ? realitySni : (nodeSni.length > 0 ? nodeSni : generate ? ['www.google.com'] : []),
@@ -279,9 +279,9 @@ function resolveRealitySettings(input = {}, targetNode = null, { generate = true
 
 // Inject into the real intent service as prepareLink. Admission invokes this
 // only after persisted-key replay; HTTP does not generate credentials first.
-function prepareIntentLink(link, targetNode = null) {
+function prepareIntentLink(link, listenerNode = null) {
     return { ...link, tunnelUuid: link.tunnelUuid || crypto.randomUUID(),
-        ...(link.tunnelSecurity === 'reality' ? resolveRealitySettings(link, targetNode) : {}) };
+        ...(link.tunnelSecurity === 'reality' ? resolveRealitySettings(link, listenerNode) : {}) };
 }
 
 function acceptedIntentResponse(job, { autoDeploy = false } = {}) {
@@ -963,7 +963,7 @@ function createCascadeLinksRouter({
                     realityPublicKey,
                     realityShortIds,
                     realityFingerprint,
-                }, bridgeNode, { generate: !durableAutoDeploy }));
+                }, linkMode === 'forward' ? bridgeNode : portalNode, { generate: !durableAutoDeploy }));
             }
             if (geoRouting && typeof geoRouting === 'object') {
                 link.geoRouting = {
@@ -1095,6 +1095,7 @@ function createCascadeLinksRouter({
             for (const key of allowedFields) {
                 if (req.body?.[key] !== undefined) changes[key] = req.body[key];
             }
+            const requestedSni = normalizeStringArray(req.body?.realitySni).filter(Boolean);
             // The editable shipped form uses the same endpoint ID names as
             // create. Preserve them in the existing structural mutation path;
             // silently ignoring a requested move can falsely report a no-op.
@@ -1140,7 +1141,7 @@ function createCascadeLinksRouter({
                     if (Array.isArray(geoRouting.domains)) changes['geoRouting.domains'] = geoRouting.domains.map(String);
                     if (Array.isArray(geoRouting.geoip)) changes['geoRouting.geoip'] = geoRouting.geoip.map(String);
                 }
-                if (req.body?.realitySni !== undefined) changes.realitySni = normalizeStringArray(req.body.realitySni).filter(Boolean);
+                if (req.body?.realitySni !== undefined) changes.realitySni = requestedSni;
                 if (req.body?.realityShortIds !== undefined) changes.realityShortIds = normalizeStringArray(req.body.realityShortIds);
                 // Freeze requested content in the real intent service before any
                 // row-dependent defaults/credentials. Its joined writer owns the
@@ -1151,11 +1152,15 @@ function createCascadeLinksRouter({
                 return res.status(202).json(acceptedIntentResponse(job, { autoDeploy: true }));
             }
 
+            if (changes.realityDest === null || (typeof changes.realityDest === 'string' && !changes.realityDest.trim())) delete changes.realityDest;
+            if (requestedSni.length) changes.realitySni = requestedSni;
             const needsCurrentLink = changes.tunnelPort !== undefined
                 || changes.mode !== undefined
+                || changes.portalNode !== undefined
+                || changes.bridgeNode !== undefined
                 || changes.tunnelSecurity !== undefined
                 || changes.tunnelTransport !== undefined
-                || changes.realityDest !== undefined
+                || req.body?.realityDest !== undefined
                 || changes.realityFingerprint !== undefined
                 || changes.realityPrivateKey !== undefined
                 || changes.realityPublicKey !== undefined
@@ -1223,9 +1228,6 @@ function createCascadeLinksRouter({
                     changes['geoRouting.geoip'] = geoRouting.geoip.map(String);
                 }
             }
-            if (req.body?.realitySni !== undefined) {
-                changes.realitySni = normalizeStringArray(req.body.realitySni).filter(Boolean);
-            }
             if (req.body?.realityShortIds !== undefined) {
                 changes.realityShortIds = normalizeStringArray(req.body.realityShortIds);
             }
@@ -1235,8 +1237,9 @@ function createCascadeLinksRouter({
             if (effectiveSecurity === 'reality') {
                 const unchangedFingerprint = changes.realityFingerprint !== undefined
                     && changes.realityFingerprint === currentLink?.realityFingerprint;
-                const targetNodeId = changes.bridgeNode || currentLink?.bridgeNode;
-                const targetNode = targetNodeId ? await Node.findById(targetNodeId) : null;
+                const listenerField = (changes.mode || currentLink?.mode) === 'forward' ? 'bridgeNode' : 'portalNode';
+                const listenerId = changes[listenerField] || currentLink?.[listenerField];
+                const listenerNode = listenerId ? await Node.findById(listenerId) : null;
                 Object.assign(changes, resolveRealitySettings({
                     realityDest: changes.realityDest !== undefined
                         ? changes.realityDest
@@ -1256,7 +1259,7 @@ function createCascadeLinksRouter({
                     realityFingerprint: changes.realityFingerprint !== undefined
                         ? changes.realityFingerprint
                         : currentLink?.realityFingerprint,
-                }, targetNode));
+                }, listenerNode));
                 // Only a new link or a changed fingerprint adopts the Random
                 // default. Preserve a legacy value even if an edit resubmits it.
                 if (req.body?.realityFingerprint === undefined) {

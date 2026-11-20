@@ -13,7 +13,7 @@ const snapshot = (extra = {}) => ({ topologyRevision: 7, deployedRevision: 6, li
 
 function browserHarness({ persistedAutoDeploy = true, operation = null, job = null,
     links = [], deployResponse = null, confirmResult = true, autoDeployError = null,
-    livePorts = false, locale = 'en' } = {}) {
+    livePorts = false, locale = 'en', rebuild = false } = {}) {
     const requests = [];
     const toasts = [];
     const timers = [];
@@ -95,7 +95,7 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
             'quickLinkForm', 'quickLinkSubmit', 'quickPortalName', 'quickBridgeName', 'quickModeSwitcher']) element(id);
         for (const [id, value] of Object.entries({ quickPortalId: PORTAL_ID, quickBridgeId: BRIDGE_ID,
             quickTunnelPort: '10086', quickLinkMode: 'reverse', quickLinkName: 'Quick link',
-            quickTunnelProtocol: 'vless' })) element(id, value);
+            quickTunnelProtocol: 'vless', ...(rebuild ? { quickTunnelSecurity: 'reality' } : {}) })) element(id, value);
         element('quickAutoDeploy').checked = false;
         for (const id of ['modeSwitcher', 'quickModeSwitcher']) {
             elements[id].querySelectorAll = selector => {
@@ -153,7 +153,7 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
         }));
         throw Error('Unexpected request: ' + url);
     };
-    const window = { crypto: { randomUUID: require('node:crypto').randomUUID }, _networkI18n: { save: 'Save', saveAndDeploy: 'Save & Deploy',
+    const window = { _c3Rebuild: rebuild, crypto: { randomUUID: require('node:crypto').randomUUID }, _networkI18n: { save: 'Save', saveAndDeploy: 'Save & Deploy',
         deployAfterEdit: 'Deploy this link after saving', autoDeploy: 'Auto Deploy', createLink: 'Create',
         syncChain: 'Sync Chain', syncingChain: 'Syncing entire chain...',
         confirmDeployChain: 'Deploy entire chain? This will sync all connected nodes in the correct order.' },
@@ -196,6 +196,38 @@ async function save(harness) {
 }
 
 // UI-only evidence: modeled API responses, not SSH/backend or browser proof.
+test('only rebuild new-link forms default to REALITY; edits and explicit none are preserved', async () => {
+    for (const rebuild of [false, true]) {
+        const h = browserHarness({ rebuild });
+        await h.ui.openAddLinkModal();
+        assert.equal(h.form.tunnelSecurity.value, rebuild ? 'reality' : 'none');
+        assert.equal(h.elements.realitySection.style.display, rebuild ? '' : 'none');
+        await h.ui.openEditLinkModal(LINK_ID);
+        assert.equal(h.form.tunnelSecurity.value, 'none');
+        h.ui.closeModal();
+        await h.ui.openAddLinkModal();
+        assert.equal(h.form.tunnelSecurity.value, rebuild ? 'reality' : 'none');
+    }
+    for (const quick of [false, true]) {
+        const h = browserHarness({ rebuild: true, livePorts: true });
+        if (!quick) await h.ui.openAddLinkModal();
+        const field = quick ? h.elements.quickTunnelSecurity : h.form.tunnelSecurity;
+        assert.equal(field.value, 'reality');
+        field.value = 'none';
+        h.form.autoDeploy.checked = false;
+        if (quick) await h.ui.onQuickLinkSubmit({ preventDefault() {} });
+        else await save(h);
+        assert.equal(h.requests.find(r => r.method === 'POST').body.tunnelSecurity, 'none');
+    }
+    const h = browserHarness({ rebuild: true, livePorts: true });
+    await h.ui.openAddLinkModal();
+    h.form.tunnelTransport.value = 'ws';
+    await save(h);
+    assert.equal(h.form.tunnelSecurity.value, 'reality');
+    assert.equal(h.requests.filter(r => r.method === 'POST').length, 0);
+    assert.match(h.toasts.at(-1)[0], /REALITY.*WebSocket/);
+});
+
 test('main form warns about a source-config-only listener absent from cached DB links', async () => {
     const h = browserHarness({ livePorts: true });
     await h.ui.openAddLinkModal();

@@ -411,7 +411,7 @@
             if (!secSelect) return;
             var realityOpt = secSelect.querySelector('option[value="reality"]');
             if (!realityOpt) return;
-            if (this.value === 'ws') {
+            if (this.value === 'ws' && !rebuild) {
                 realityOpt.disabled = true;
                 if (secSelect.value === 'reality') {
                     secSelect.value = 'none';
@@ -1201,7 +1201,7 @@
         select.value = value;
     }
 
-    async function openAddLinkModal() {
+    async function openAddLinkModal({ editing = false } = {}) {
         resetPortWarning('main');
         const modal       = document.getElementById('addLinkModal');
         const portalSelect = document.getElementById('selectPortal');
@@ -1215,7 +1215,14 @@
         if (title) title.textContent = i18n.addLink || 'Add Link';
         if (submit) submit.textContent = i18n.createLink || 'Create';
         if (linkIdInput) linkIdInput.value = '';
-        document.getElementById('addLinkForm').autoDeploy.checked = true;
+        const form = document.getElementById('addLinkForm');
+        form.autoDeploy.checked = true;
+        if (rebuild && !editing) {
+            form.tunnelTransport.value = 'tcp';
+            form.tunnelSecurity.value = 'reality';
+        }
+        const realitySection = document.getElementById('realitySection');
+        if (realitySection) realitySection.style.display = form.tunnelSecurity.value === 'reality' ? '' : 'none';
         updateLinkSubmitIntent();
         // A brand-new link starts from the Random REALITY fingerprint, even if
         // the form still carries an injected option from a previous edit.
@@ -1246,7 +1253,7 @@
             portalSelect.innerHTML = bridgeSelect.innerHTML = err;
         }
         updateLinkFormWarnings();
-        modal.classList.add('active');
+        if (!editing) modal.classList.add('active');
     }
 
     async function openEditLinkModal(linkId) {
@@ -1255,7 +1262,7 @@
         const submit = document.getElementById('linkModalSubmit');
         const linkIdInput = document.getElementById('linkIdInput');
 
-        await openAddLinkModal();
+        await openAddLinkModal({ editing: true });
         linkModalMode = 'edit';
         if (title) title.textContent = (i18n.edit || 'Edit') + ' Link';
         if (submit) submit.textContent = i18n.save || 'Save';
@@ -1281,11 +1288,11 @@
         form.autoDeploy.checked = false;
         updateLinkSubmitIntent();
 
-        form.realityDest.value = link.realityDest || '';
-        form.realitySni.value = Array.isArray(link.realitySni) ? link.realitySni.join(', ') : (link.realitySni || '');
-        form.realityPrivateKey.value = link.realityPrivateKey || '';
-        form.realityPublicKey.value = link.realityPublicKey || '';
-        form.realityShortIds.value = Array.isArray(link.realityShortIds) ? link.realityShortIds.join(', ') : (link.realityShortIds || '');
+        if (form.realityDest) form.realityDest.value = link.realityDest || '';
+        if (form.realitySni) form.realitySni.value = Array.isArray(link.realitySni) ? link.realitySni.join(', ') : (link.realitySni || '');
+        if (form.realityPrivateKey) form.realityPrivateKey.value = link.realityPrivateKey || '';
+        if (form.realityPublicKey) form.realityPublicKey.value = link.realityPublicKey || '';
+        if (form.realityShortIds) form.realityShortIds.value = Array.isArray(link.realityShortIds) ? link.realityShortIds.join(', ') : (link.realityShortIds || '');
         // Preserve the saved fingerprint exactly; inject an option if the saved
         // value is outside the builtin list so re-saving never rewrites it.
         linkModalSavedFingerprint = link.realityFingerprint;
@@ -1319,6 +1326,7 @@
                 b.classList.toggle('active', b.getAttribute('data-mode') === form.mode.value);
             });
         }
+        document.getElementById('addLinkModal').classList.add('active');
         updateLinkFormWarnings();
     }
 
@@ -1535,6 +1543,10 @@
 
         // REALITY fields
         if (data.tunnelSecurity === 'reality') {
+            if (rebuild && data.tunnelTransport === 'ws') {
+                showToast(i18n.realityWsUnsupported || 'REALITY несовместим с WebSocket. Выберите другой транспорт или режим защиты.', 'error');
+                return;
+            }
             data.realityDest = form.realityDest?.value || '';
             data.realitySni = form.realitySni?.value || '';
             data.realityPrivateKey = form.realityPrivateKey?.value || '';
@@ -2142,6 +2154,8 @@
         resetPortWarning('quick');
         var modal = document.getElementById('quickLinkModal');
         if (modal) modal.classList.remove('active');
+        var security = document.getElementById('quickTunnelSecurity');
+        if (rebuild && security) security.value = 'reality';
     }
 
     function onQuickSwap() {
@@ -2167,6 +2181,7 @@
             tunnelProtocol: document.getElementById('quickTunnelProtocol').value,
             autoDeploy: document.getElementById('quickAutoDeploy')?.checked || false,
         };
+        if (rebuild) data.tunnelSecurity = document.getElementById('quickTunnelSecurity')?.value || 'reality';
         if (!data.name || !data.portalNodeId || !data.bridgeNodeId) {
             alert(i18n.fillRequired || 'Please fill in all required fields');
             return;

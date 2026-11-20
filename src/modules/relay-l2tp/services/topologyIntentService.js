@@ -44,6 +44,9 @@ function applyLinkChanges(link, changes) {
         if (['tunnelUuid', 'realityPrivateKey', 'realityPublicKey'].includes(key)
             && typeof value === 'string' && !value.trim()) continue;
         if (key === 'realityShortIds' && !value.some(Boolean)) continue;
+        // Keep the request fingerprint stable; ignore blank controls after lookup.
+        if (key === 'realityDest' && (value === null || (typeof value === 'string' && !value.trim()))) continue;
+        if (key === 'realitySni' && (!value || !value.some(Boolean))) continue;
         const parts = key.split('.');
         if (parts.length === 1) candidate[key] = value;
         else candidate[parts[0]] = { ...candidate[parts[0]], [parts[1]]: value };

@@ -503,7 +503,7 @@ function nodeMetaFor(node) {
                         <select name="tunnelSecurity" class="form-input" id="selectSecurity">
                             <option value="none">None</option>
                             <option value="tls">TLS</option>
-                            <option value="reality">REALITY</option>
+                            <option value="reality"<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %> selected<% } %>>REALITY</option>
                         </select>
                     </div>
                 </div>
@@ -667,6 +667,15 @@ function nodeMetaFor(node) {
                             <option value="vmess">VMess</option>
                         </select>
                     </div>
+                    <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+                    <div class="form-group">
+                        <label for="quickTunnelSecurity"><%= t('network.tunnelSecurity') %></label>
+                        <select id="quickTunnelSecurity" class="form-input">
+                            <option value="reality" selected>REALITY</option>
+                            <option value="none">None</option>
+                        </select>
+                    </div>
+                    <% } %>
                 </div>
                 <div class="form-actions">
                     <label class="form-checkbox" style="margin-right:auto">
@@ -1304,7 +1313,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=rebuild1' : '/js/network.min.js?v=8c1440573d630ba3'
+        window._c3Rebuild ? '/js/network.js?v=rebuild2' : '/js/network.min.js?v=8c1440573d630ba3'
     ];
 
     let idx = 0;

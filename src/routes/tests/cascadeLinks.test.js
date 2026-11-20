@@ -473,6 +473,41 @@ test('POST REALITY defaults the link fingerprint to literal random but preserves
         'an explicitly selected fingerprint is never rewritten');
 });
 
+test('classic POST/PUT inherit from the listener, preserve populated fields, and keep the classic default', async () => {
+    const portal = { realityDest: 'portal.example:8444', realitySni: ['portal.example'] };
+    const bridge = { realityDest: 'bridge.example:8443', realitySni: ['bridge.example'] };
+    let row;
+    const router = createCascadeLinksRouter({
+        maintainAutoL2tpPathsFn: async () => {}, invalidateSubscriptions: async () => {}, invalidateTopology: async () => {},
+        Node: { async findById(id) { return { _id: id, xray: id === PORTAL_A ? portal : bridge }; } },
+        Link: { find() { return queryResult([row], {}, 'link'); }, async findOne() { return null; }, async findById() { return row; } },
+        topologyDraftWriteService: {
+            async createLink({ link }) { row = link; return { revision: 2, deployedRevision: 1 }; },
+            async updateLink({ changes }) { Object.assign(row, changes); return { revision: 3, deployedRevision: 1 }; },
+        },
+    });
+    const post = fields => request(router, { method: 'POST', body: validCreateBody({ autoDeploy: false, ...fields }) });
+    const put = fields => request(router, { method: 'PUT', path: `/${LINK_A}`, body: { expectedTopologyRevision: 2, ...fields } });
+    const saved = () => ({ realityDest: row.realityDest, realitySni: row.realitySni });
+    assert.equal((await post({ tunnelSecurity: undefined })).status, 201);
+    assert.equal(row.tunnelSecurity, 'none');
+    assert.equal((await post({ tunnelSecurity: 'reality', mode: 'reverse' })).status, 201);
+    assert.deepEqual(saved(), portal);
+    assert.equal((await put({ realitySni: 'first.example, second.example' })).status, 200);
+    assert.deepEqual(row.realitySni, ['first.example', 'second.example']);
+    assert.equal((await put({ realitySni: portal.realitySni })).status, 200);
+    assert.equal((await put({ realityDest: ' ', realitySni: [] })).status, 200);
+    assert.deepEqual(saved(), portal);
+    assert.equal((await post({ tunnelSecurity: 'reality', mode: 'forward', realityDest: 'explicit.example:443' })).status, 201);
+    assert.deepEqual(saved(), { ...bridge, realityDest: 'explicit.example:443' });
+    row.realitySni = [];
+    assert.equal((await put({ mode: 'reverse', realitySni: [] })).status, 200);
+    assert.deepEqual(saved(), { ...portal, realityDest: 'explicit.example:443' });
+    row.realityDest = '';
+    assert.equal((await put({ realityDest: ' ' })).status, 200);
+    assert.deepEqual(saved(), portal);
+});
+
 test('PUT of other REALITY settings does not rewrite a saved legacy fingerprint', async () => {
     const calls = [];
     const current = {

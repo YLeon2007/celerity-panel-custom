@@ -37,14 +37,33 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     const inventory=await Node.find({_id:{$in:[source,target]},active:true,type:'xray'}).select('_id cascadeRole xray.realitySni xray.realityDest').lean();
     const from=inventory.find(n=>String(n._id)===source),to=inventory.find(n=>String(n._id)===target);
     if(!from||!to||!['portal','relay'].includes(from.cascadeRole)||!['relay','bridge'].includes(to.cascadeRole))throw fail('REBUILD_INVALID_EDGE_ROLE');
-    for(const field of fields)if(Object.hasOwn(b,field))link.set(field,b[field]);
+    if(Object.hasOwn(b,'tunnelSecurity')&&!['none','tls','reality'].includes(b.tunnelSecurity))throw fail('REBUILD_INVALID_REQUEST');
+    if(!editing&&!Object.hasOwn(b,'tunnelSecurity'))link.tunnelSecurity='reality';
+    for(const field of fields){
+        if(!Object.hasOwn(b,field))continue;
+        // Blank form controls are not a request to discard stored settings.
+        const value=b[field];
+        if(field==='realityDest'&&(value==null||typeof value==='string'&&!value.trim()))continue;
+        if(field==='realitySni'||field==='realityShortIds'){
+            const entries=(Array.isArray(value)?value:[value]).filter(v=>v!=null);
+            if(entries.some(v=>typeof v!=='string'))throw fail('REBUILD_INVALID_REQUEST');
+            const list=entries.flatMap(v=>v.split(',').map(s=>s.trim())).filter(Boolean);
+            if(list.length)link.set(field,list);
+            continue;
+        }
+        link.set(field,value);
+    }
     if(link.tunnelSecurity==='tls'&&Object.hasOwn(b,'tlsServerName')){
         if(typeof b.tlsServerName!=='string')throw fail('REBUILD_TLS_SERVER_NAME_REQUIRED');
         link.rebuildTlsServerName=b.tlsServerName;
     }
     if(Object.hasOwn(b,'tunnelUuid'))link.tunnelUuid=b.tunnelUuid;
     link.portalNode=source;link.bridgeNode=target;
-    if(link.tunnelSecurity==='reality')Object.assign(link,require('./cascadeLinks').resolveRealitySettings({...link.toObject(),...b,realityPrivateKey:b.realityPrivateKey||link.realityPrivateKey,realityPublicKey:b.realityPublicKey||link.realityPublicKey},to));
+    if(link.tunnelSecurity==='reality'){
+        if(link.tunnelTransport==='ws')throw fail('REBUILD_INVALID_REQUEST');
+        const listener=link.mode==='reverse'?from:to;
+        Object.assign(link,require('./cascadeLinks').resolveRealitySettings({...link.toObject(),realityPrivateKey:b.realityPrivateKey||link.realityPrivateKey,realityPublicKey:b.realityPublicKey||link.realityPublicKey},listener));
+    }
     if(!Number.isInteger(link.tunnelPort)||link.tunnelPort<1||link.tunnelPort>65535||!Number.isSafeInteger(link.priority)||typeof link.name!=='string'||!link.name.trim())throw fail('REBUILD_INVALID_REQUEST');
     if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject());
     await verify();link.status='pending';await link.save();const linkId=String(link._id);
