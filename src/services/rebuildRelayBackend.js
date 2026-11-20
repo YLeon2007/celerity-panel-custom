@@ -3,15 +3,15 @@
 const { isIP } = require('node:net');
 const { withNode } = require('./rebuildLocks');
 const { componentFor } = require('./rebuildCoordinator');
-const { canInstallRelay } = require('./rebuildRelayAuthorization');
+const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { runFreshRelayInstall } = require('./rebuildRelayInstall');
 const { createStore, read } = require('./rebuildRelayBackendStore');
 const { makeDesired } = require('./rebuildRelayBackendDesired');
 const { compileRebuildGraph } = require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
 
 const fail = code => Object.assign(new Error(code), { code });
-const eligible = node => node?.type === 'xray' && node.active === true && node.cascadeRole === 'relay'
-    && !node.useCustomConfig && !!isIP(node.ip);
+const eligible = (node, id, listMode) => String(node?._id) === id && node.type === 'xray'
+    && node.active === true && node.cascadeRole === 'relay' && !node.useCustomConfig && (listMode || !!isIP(node.ip));
 
 async function readTopology(Node, Link, node, panelDomain) {
     const id = String(node._id);
@@ -50,19 +50,22 @@ function defaultDriver(options) {
 }
 
 function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
-    return function installRelay(id) {
-        const machineId = env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
-        const authorize = () => canInstallRelay(env, id) && env.C3_REBUILD_L2TP_RELAY_MACHINE_ID === machineId;
+    return async function installRelay(id) {
+        const fence = captureRelayBinding(env, id);
+        const { machineId } = fence.binding;
+        const authorize = () => { try { fence.check(); return true; } catch { return false; } };
+        const getNode = () => read(Node.findById(id).select('ip domain active type cascadeRole useCustomConfig ssh'));
         let store;
         return runFreshRelayInstall(id, {
             authorize, machineId,
             lock: fn => locks.run(verifyLock => withNode(id, async () => {
-                await verifyLock();
+                if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                 return fn(verifyLock);
             })),
             async inventory() {
-                const node = await read(Node.findById(id).select('ip domain active type cascadeRole useCustomConfig ssh'));
-                if (!eligible(node)) return { eligible: false };
+                const node = await getNode();
+                if (!eligible(node, id, fence.listMode)) return { eligible: false };
+                fence.check(node);
                 store = createStore(State, L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel'));
                 const snapshot = await store.snapshot(id);
                 if (!snapshot.pristine) return snapshot;
@@ -70,6 +73,11 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
                 const payload = makeDesired(id, await store.occupied(id), topology.controlPlaneAddresses, env.ENCRYPTION_KEY);
                 return { ...snapshot, ...topology, ...payload, node, eligible: true, nodeId: id };
             },
+            verifyBinding: fence.listMode ? async () => {
+                const current = await getNode();
+                if (!eligible(current, id, true)) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
+                fence.check(current);
+            } : undefined,
             connect: inventory => createRelayDirect({ node: inventory.node, env }),
             prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit }, remote) =>
                 remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, ...(transit && { transit }) }),

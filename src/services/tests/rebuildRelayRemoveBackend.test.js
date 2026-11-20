@@ -139,6 +139,46 @@ const finishUnknown = { code: 'REBUILD_L2TP_REMOVE_FINISH_OUTCOME_UNKNOWN' };
 const noOwner = { code: 'REBUILD_L2TP_REMOVE_NOT_OWNED' };
 const privateError = () => new Error('private fixture details');
 
+test('list Remove requires card corroboration and a preview from the same binding generation', async t => {
+    const f = await installed(t);
+    const row = { nodeId: id, host: f.nodes[0].ip, port: 22, username: 'root', machineId, sshHostKeySha256: '1'.repeat(64) };
+    const key = 'C3_REBUILD_L2TP_RELAYS_JSON';
+    f.env[key] = JSON.stringify([row]);
+    await assert.rejects(f.service.removeRelay(id), { code: 'REBUILD_L2TP_BINDING_MISMATCH' });
+    assert.deepEqual(f.events, []);
+    f.nodes[0].ssh.username = row.username;
+
+    const actions = [];
+    const { createRelayDirect } = require('../rebuildRelayDirect');
+    class SSH {
+        connect() {}
+        disconnect() {}
+        exec(_, { stdin }) {
+            const { action, machineId: machine, expectedCensus } = JSON.parse(stdin);
+            actions.push(action);
+            assert.equal(machine, row.machineId);
+            if (action === 'remove') assert.equal(expectedCensus, '3'.repeat(64));
+            const reply = action === 'session-count' ? { activeSessions: 0, census: '3'.repeat(64) }
+                : { ok: true, machineId: machine, backupId, baseline: '4'.repeat(64), removed: true };
+            return { code: 0, stderr: '', stdout: JSON.stringify(reply) + '\n' };
+        }
+    }
+    t.mock.method(User.collection, 'countDocuments', async () => f.users.length);
+    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
+    const preview = await service.previewRemoveRelay(id);
+    assert.equal(preview.confirmable, true);
+    f.env[key] = JSON.stringify([{ ...row, sshHostKeySha256: '2'.repeat(64) }]);
+    await assert.rejects(service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_PREVIEW_CHANGED' });
+    assert.equal(f.states[0].status, 'installed');
+    assert.equal(f.users.length, 1);
+    assert.deepEqual(f.events, []);
+    assert.deepEqual(actions, ['session-count']);
+
+    const current = await service.previewRemoveRelay(id);
+    assert.equal((await service.confirmRemoveRelay(id, current)).status, 'not_installed');
+    assert.deepEqual(actions, ['session-count', 'session-count', 'session-count', 'prepare-remove', 'remove']);
+});
+
 test('final host refusal restores only the exact reservation; unknown outcomes retain it', async t => {
     const f = await installed(t);
     const prior = copy(f.states[0]), account = copy(f.users[0]);

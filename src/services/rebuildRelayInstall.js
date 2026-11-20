@@ -17,20 +17,25 @@ async function runFreshRelayInstall(id, deps) {
             };
             const checkAuthority = async () => {
                 checkAuthorization();
-                await verifyLock();
+                if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
+                if (deps.verifyBinding) await deps.verifyBinding();
+                checkAuthorization();
             };
             let remote;
             try {
                 checkAuthorization();
                 const inventory = await deps.inventory(id);
                 if (inventory.eligible !== true || inventory.pristine !== true) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
+                if (deps.verifyBinding) await checkAuthority();
                 checkAuthorization();
                 remote = await deps.connect(inventory);
+                checkAuthorization();
                 const host = await remote.preflight();
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
                     throw fail('REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
                 }
                 if (host?.ppp !== true || host.masked !== false) throw fail('REBUILD_L2TP_HOST_NOT_READY');
+                if (deps.verifyBinding) await checkAuthority();
                 checkAuthorization();
                 const plan = await deps.prepare(inventory, remote);
                 const backupId = plan?.backupId;
@@ -44,6 +49,7 @@ async function runFreshRelayInstall(id, deps) {
                 const guard = async () => {
                     await checkAuthority();
                     await deps.verifyReservation(reservation);
+                    checkAuthorization();
                 };
 
                 const rollback = async (code, noHostChanges = false) => {

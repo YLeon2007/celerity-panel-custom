@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const { join } = require('node:path');
 const { createHash } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
-const { canInstallRelay } = require('./rebuildRelayAuthorization');
+const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { applyFollowRelay, attachLocalFollowRelay, REBUILD_RELAY_INGRESS_TAG, FOLLOW_RELAY_OUTBOUND_TAG } = require('../modules/relay-l2tp/services/l2tpFollowRelay');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const MAIN_ARTIFACT = Object.freeze({ type: 'xrayCandidate', path: 'xray-candidate.json' });
@@ -193,16 +193,17 @@ function composeRebuildRelayPair(snapshot, options) {
 
 /** Snapshot and independent byte pins must come from a trusted TEST caller, never an HTTP body. */
 function createRebuildRelayInstallSteps({ env = process.env } = {}) {
+    const plans = new WeakMap();
     function requireFresh(inventory) {
-        const nodeId = inventory?.nodeId;
-        requireThat(typeof nodeId === 'string' && canInstallRelay(env, nodeId), 'REBUILD_L2TP_INSTALL_DISABLED');
+        const fence = captureRelayBinding(env, inventory?.nodeId);
         requireThat(inventory.eligible === true && inventory.pristine === true, 'REBUILD_L2TP_NOT_FRESH_RELAY');
-        return nodeId;
+        fence.check(inventory.node);
+        return fence;
     }
 
     function materialize({ inventory, snapshot, profilePins, tproxyPort, controlPlaneAddresses, carryDomain } = {}) {
-        const nodeId = requireFresh(inventory);
-        requireThat(snapshot?.nodeId === nodeId && snapshot.machineId === env.C3_REBUILD_L2TP_RELAY_MACHINE_ID,
+        const { nodeId, machineId } = requireFresh(inventory).binding;
+        requireThat(snapshot?.nodeId === nodeId && snapshot.machineId === machineId,
             'REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
         requireThat(snapshot.pristine === true, 'REBUILD_L2TP_NOT_FRESH_RELAY');
         requireThat(snapshot.ppp === true && snapshot.masked === false, 'REBUILD_L2TP_HOST_NOT_READY');
@@ -224,18 +225,43 @@ function createRebuildRelayInstallSteps({ env = process.env } = {}) {
     // Only a trusted server-generated desired may enter DIRECT. A legacy
     // inventory/transport without that contract cannot opt into dispatch.
     async function prepare(inventory, remote) {
-        const nodeId = requireFresh(inventory);
+        const fence = requireFresh(inventory);
+        const { nodeId } = fence.binding;
         requireThat(inventory.desired && typeof remote.prepare === 'function', BLOCKER);
-        return remote.prepare({ nodeId, desired: inventory.desired,
+        const plan = await remote.prepare({ nodeId, desired: inventory.desired,
             controlPlaneAddresses: inventory.controlPlaneAddresses, carryDomain: inventory.carryDomain });
+        const check = () => fence.check(inventory.node);
+        check();
+        requireThat(plan && typeof plan === 'object', 'REBUILD_L2TP_INSTALL_PLAN_INVALID');
+        plans.set(plan, { check, remote });
+        return plan;
     }
+    function checkPlan(plan, remote) {
+        const proof = plans.get(plan);
+        requireThat(proof && proof.remote === remote, BLOCKER);
+        proof.check();
+        return proof.check;
+    }
+    const guarded = (check, verifyLock) => async () => {
+        check();
+        const result = await verifyLock();
+        check();
+        return result;
+    };
     async function install(plan, remote, verifyLock) {
         requireThat(typeof remote.install === 'function', BLOCKER);
-        return remote.install(plan, verifyLock);
+        return remote.install(plan, guarded(checkPlan(plan, remote), verifyLock));
     }
-    async function verify(plan, remote) { return typeof remote.verify === 'function' && await remote.verify(plan) === true; }
+    async function verify(plan, remote) {
+        if (typeof remote.verify !== 'function') return false;
+        const check = checkPlan(plan, remote);
+        const verified = await remote.verify(plan) === true;
+        check();
+        return verified;
+    }
     async function rollback(plan, remote, verifyLock) {
-        return typeof remote.rollback === 'function' && await remote.rollback(plan, verifyLock) === true;
+        return typeof remote.rollback === 'function'
+            && await remote.rollback(plan, guarded(checkPlan(plan, remote), verifyLock)) === true;
     }
 
     return Object.freeze({ materialize, prepare, install, verify, rollback });

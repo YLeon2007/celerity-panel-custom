@@ -136,6 +136,70 @@ function addLink(f, portalNode, bridgeNode, geoRouting) {
 
 joined({ fixture, id, oid, machineId });
 
+test('operator list installs two relays under Apply exclusion and records their distinct physical IDs', async t => {
+    const f = fixture(t);
+    const second = { ...f.nodes[0], _id: oid('c'.repeat(24)), ip: '192.0.2.20', ssh: { port: 2222, username: 'root' } };
+    const rows = [f.nodes[0], second].map(({ _id, ip, ssh }, i) => ({ nodeId: String(_id), host: ip,
+        ...ssh, machineId: (i ? 'd' : 'e').repeat(32), sshHostKeySha256: (i ? '1' : '2').repeat(64) }));
+    f.nodes.push(second);
+    f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(rows);
+    const preflight = [];
+    const service = f.create({ createRelayDirect: ({ node }) => {
+        const selected = rows.find(row => row.nodeId === String(node._id));
+        return {
+            async preflight() {
+                assert.equal(f.lockHeld, true);
+                preflight.push(selected.nodeId);
+                return { machineId: selected.machineId, ppp: true, masked: false };
+            },
+            async prepare({ nodeId }) { assert.equal(nodeId, selected.nodeId); return { backupId }; },
+            async install(plan, guard) { await guard(); },
+            async verify() { return true; },
+            async close() {},
+        };
+    } });
+    for (const { nodeId } of rows) assert.equal((await service.installRelay(nodeId)).status, 'installed');
+    assert.deepEqual(preflight, rows.map(({ nodeId }) => nodeId));
+    assert.deepEqual(f.states.map(row => [String(row.node), row.rebuildMachineId]), rows.map(row => [row.nodeId, row.machineId]));
+});
+
+test('list Install refuses a bad card, host machine, or changed binding before reservation', async t => {
+    const f = fixture(t);
+    const row = { nodeId: id, host: f.nodes[0].ip, ...f.nodes[0].ssh, machineId, sshHostKeySha256: '1'.repeat(64) };
+    f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([row]);
+    const noLock = f.create({ locks: { run: () => assert.fail('invalid list must not acquire Apply lock') } });
+    for (const entries of [[], [row, row]]) {
+        f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(entries);
+        await assert.rejects(noLock.installRelay(id), { code: 'REBUILD_L2TP_INSTALL_DISABLED' });
+    }
+    f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([row]);
+    const driftAtLock = f.create({ locks: { run: async fn => {
+        f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([{ ...row, sshHostKeySha256: '2'.repeat(64) }]);
+        return fn(async () => true);
+    } } });
+    await assert.rejects(driftAtLock.installRelay(id), { code: 'REBUILD_L2TP_INSTALL_DISABLED' });
+    assert.deepEqual(f.events, []);
+    f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([row]);
+    const service = f.create();
+    f.nodes[0].ssh.port++;
+    await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_BINDING_MISMATCH' });
+    assert.deepEqual(f.events, []);
+    f.nodes[0].ssh.port--;
+    const preflight = f.hooks.preflight;
+    f.hooks.preflight = async () => ({ ...await preflight(), machineId: 'e'.repeat(32) });
+    await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH' });
+    assert.deepEqual(f.events.splice(0), ['connect', 'preflight', 'close']);
+    f.hooks.preflight = preflight;
+    const prepare = f.hooks.prepare;
+    f.hooks.prepare = async () => {
+        f.nodes[0].ssh.port++;
+        return prepare();
+    };
+    await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_BINDING_MISMATCH' });
+    assert.deepEqual(f.events, ['connect', 'preflight', 'prepare', 'close']);
+    assert.deepEqual([f.states, f.users], [[], []]);
+});
+
 test('createRebuildService installs follow-relay, reserves encrypted usable credentials before dispatch, and persists an owner receipt', async t => {
     const f = fixture(t);
     const downstream = { _id: oid(), type: 'xray', active: true, cascadeRole: 'relay', ip: '192.0.2.5' };

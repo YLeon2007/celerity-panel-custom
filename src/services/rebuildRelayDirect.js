@@ -6,7 +6,7 @@ const { join } = require('node:path');
 const { randomBytes } = require('node:crypto');
 const { isIPv4 } = require('node:net');
 const { performance } = require('node:perf_hooks');
-const { canInstallRelay } = require('./rebuildRelayAuthorization');
+const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
@@ -105,39 +105,48 @@ function buildFiles(d, profiles, backupId) {
 
 function createRelayDirect({ node, env = process.env, SSH } = {}) {
     const nodeId = String(node?._id ?? node?.id ?? '');
-    const machineId = env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
-    const pin = env.C3_REBUILD_L2TP_SSH_SHA256;
-    requireThat(canInstallRelay(env, nodeId), 'INSTALL_DISABLED');
-    requireThat(tokenMatches(PIN, pin), 'SSH_PIN_INVALID');
-    const { ip, ssh: { port, username } = {} } = node;
-    requireThat(typeof ip === 'string' && ip.length > 0 && integer(port, 1, 65535)
-        && username === 'root', 'SSH_ENDPOINT_INVALID');
+    const fence = captureRelayBinding(env, nodeId, node);
+    const { host: ip, port, username, machineId, sshHostKeySha256 } = fence.binding;
+    // In list mode the card corroborates the endpoint but supplies only auth
+    // material to the transport: no socket, proxy, or host verification options.
+    const transportNode = fence.listMode ? Object.freeze({ _id: nodeId, name: nodeId, ip,
+        ssh: Object.freeze({ port, username, password: node.ssh.password, privateKey: node.ssh.privateKey }),
+    }) : node;
     // Keep the static helper below Linux's per-argument limit, including the
     // remote login shell's -c argument. Only local source enters this envelope;
     // the entire request, including secrets, still travels in stdin.
     const source = deflateSync(readFileSync(join(__dirname, 'rebuildRelayDirectHost.py'))).toString('base64');
     const script = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("${source}")),"<DIRECT host>","exec"))`;
     const command = limits => `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script}'`;
-    const ssh = new (SSH || require('./nodeSSH'))(node, {
-        expectedHostKeySha256: pin, expectedEndpoint: { ip, port, username },
+    const ssh = new (SSH || require('./nodeSSH'))(transportNode, {
+        expectedHostKeySha256: sshHostKeySha256, expectedEndpoint: { ip, port, username },
     });
     ssh.usePool = false;
     let connected = false, closed = false, busy = false, poisoned = false;
     let held;
     const disconnect = () => { try { ssh.disconnect(); } catch { /* cleanup cannot replace outcome */ } };
+    function checkBinding() {
+        try {
+            fence.check();
+        } catch (error) {
+            poisoned = true;
+            disconnect();
+            throw error;
+        }
+    }
 
     async function connect(timeout) {
         if (connected) return;
-        let timer;
-        const pending = Promise.resolve().then(() => ssh.connect());
+        let timer, pending;
         try {
+            pending = Promise.resolve(ssh.connect());
             await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(reject, timeout); })]);
             requireThat(!closed, 'DIRECT_CLOSED');
             connected = true;
         } catch {
             closed = true;
             disconnect();
-            void pending.then(disconnect, () => {});
+            void pending?.then(disconnect, () => {});
             throw fail('SSH_CONNECT_FAILED');
         } finally { clearTimeout(timer); }
     }
@@ -145,8 +154,10 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     async function exec(action, params = {}, write = false, validate = () => true) {
         const count = action === 'session-count';
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
+        checkBinding();
         await connect(count ? 5000 : 30000);
         requireThat(!closed, 'DIRECT_CLOSED');
+        checkBinding();
         const stdin = JSON.stringify({ action, machineId, ...params });
         requireThat(Buffer.byteLength(stdin) <= 25 * 1024 * 1024, 'INSTALL_INPUT_INVALID');
         const unknown = () => {
@@ -158,6 +169,8 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
         }); }
         catch { throw unknown(); }
+        try { checkBinding(); }
+        catch (error) { if (write) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
             const refusal = typeof result.stderr === 'string' && /^DIRECT_(NO_WRITE_)?([A-Z_]+)\n$/.exec(result.stderr);

@@ -3,7 +3,7 @@
 const { isIP } = require('node:net');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
-const { canInstallRelay } = require('./rebuildRelayAuthorization');
+const { captureRelayBinding, sameRelayBinding } = require('./rebuildRelayAuthorization');
 const { read } = require('./rebuildRelayBackendStore');
 const { readAccountCount, readSessionCensus } = require('./rebuildRelayCounts');
 const { readAppliedTransit } = require('./rebuildAppliedLink');
@@ -84,11 +84,15 @@ function ownedAccount(rows, state, nodeId) {
 function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
     const run = async (id, phase, estimate) => {
         if (typeof id !== 'string' || id.length !== 24 || !/^[a-f0-9]{24}$/.test(id)) throw fail('REBUILD_INVALID_REQUEST');
-        const machineId = env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
-        const authorize = () => {
-            if (!canInstallRelay(env, id) || env.C3_REBUILD_L2TP_RELAY_MACHINE_ID !== machineId) throw fail(DISABLED);
+        let fence;
+        try { fence = captureRelayBinding(env, id); } catch { throw fail(DISABLED); }
+        const { machineId } = fence.binding;
+        const authorize = node => {
+            try { fence.check(node); } catch (error) {
+                if (error.code === 'REBUILD_L2TP_INSTALL_DISABLED') throw fail(DISABLED);
+                throw error;
+            }
         };
-        authorize();
         const proof = phase === 'confirm' ? previews.get(estimate) : undefined;
         const checkPreview = () => {
             if (phase === 'confirm' && (!proof || estimate.nodeId !== id || performance.now() >= proof.expires)) {
@@ -96,6 +100,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
             }
         };
         checkPreview();
+        if (proof && (proof.listMode !== fence.listMode || !sameRelayBinding(proof.binding, fence.binding))) throw fail(PREVIEW_CHANGED);
         let primary, removed = false;
         try {
             return await locks.run(verifyLock => withNode(id, async () => {
@@ -110,7 +115,12 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     const getNode = () => read(Node.findById(id).select(nodeFields));
                     const node = await getNode();
                     if (String(node?._id) !== id || node.active !== true || node.type !== 'xray' || node.cascadeRole !== 'relay'
-                        || node.useCustomConfig || typeof node.ip !== 'string' || !isIP(node.ip)) throw fail(NOT_OWNED);
+                        || node.useCustomConfig || (!fence.listMode && !isIP(node.ip))) throw fail(NOT_OWNED);
+                    authorize(node);
+                    const checkNode = async () => {
+                        if (fence.listMode && !equal(await getNode(), node)) throw fail(CHANGED);
+                        await authority();
+                    };
                     const state = await read(State.findOne({ node: id }).select(stateFields));
                     const network = installedNetwork(state, id, machineId);
                     const User = L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel');
@@ -124,7 +134,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         // live PPP count, but it cannot authorize confirmation.
                         try { if (Link) input.transit = await readAppliedTransit(Link, id); }
                         catch { transitProved = false; }
-                        await authority();
+                        await checkNode();
                         let census = null;
                         try {
                             remote = createRelayDirect({ node, env });
@@ -150,7 +160,8 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions: census?.activeSessions ?? null,
                             confirmable: !!account });
                         if (account) previews.set(snapshot, { node, stateFence, accountFence: exact(account, accountKeys),
-                            census: census.census, expires: performance.now() + PREVIEW_TTL_MS });
+                            binding: fence.binding, listMode: fence.listMode, census: census.census,
+                            expires: performance.now() + PREVIEW_TTL_MS });
                         return snapshot;
                     }
                     const account = ownedAccount(await users(), state, id);
@@ -176,7 +187,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         if (accountCount !== estimate.accountCount) throw fail(PREVIEW_CHANGED);
                         checkPreview();
                     }
-                    await authority();
+                    await checkNode();
                     remote = createRelayDirect({ node, env });
                     if (typeof remote?.prepareRemove !== 'function' || typeof remote.remove !== 'function' || typeof remote.close !== 'function') {
                         throw fail('REBUILD_L2TP_REMOVE_BACKEND_UNAVAILABLE');
@@ -187,6 +198,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         if (!census) throw fail(COUNT_UNAVAILABLE);
                         if (census.activeSessions !== 0) throw fail(SESSIONS_BUSY);
                         if (census.census !== proof.census) throw fail(PREVIEW_CHANGED);
+                        await checkNode();
                         checkPreview();
                     }
                     // No saved MAIN is sent or rebuilt here. The direct driver
