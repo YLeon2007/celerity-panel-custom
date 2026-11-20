@@ -10,6 +10,7 @@ const State = require('../../modules/relay-l2tp/models/relayL2tpStateModel');
 const User = require('../../modules/relay-l2tp/models/l2tpUserModel');
 const Node = require('../../models/hyNodeModel');
 const Link = require('../../models/cascadeLinkModel');
+const { encrypt, decrypt } = require('../../modules/relay-l2tp/services/secretBoxService');
 
 const id = 'a'.repeat(24), machineId = 'b'.repeat(32), backupId = 'c'.repeat(32);
 const oid = value => new Types.ObjectId(value);
@@ -37,30 +38,32 @@ function bind(t, model, data, traces) {
     const handlers = {};
     const invoke = async (kind, where, update, options) => {
         assert.ok((where._id?.$eq ?? where._id) instanceof Types.ObjectId);
-        assert.deepEqual(options.writeConcern, { w: 'majority' });
+        if (!options.session) assert.deepEqual(options.writeConcern, { w: 'majority' });
         traces.push(`${model.modelName}:${kind}`);
+        const rows = options.session?.rows.get(data) ?? data;
         const apply = () => {
-            const index = data.findIndex(row => matches(row, where));
+            const index = rows.findIndex(row => matches(row, where));
             if (kind === 'delete') {
-                if (index !== -1) data.splice(index, 1);
+                if (index !== -1) rows.splice(index, 1);
                 return { acknowledged: true, deletedCount: Number(index !== -1) };
             }
             if (index === -1 && options.upsert) {
-                data.push(copy(update.$setOnInsert));
+                rows.push(copy(update.$setOnInsert));
                 return { acknowledged: true, upsertedCount: 1, matchedCount: 0 };
             }
             if (index !== -1) {
-                Object.assign(data[index], copy(update.$set ?? {}));
-                for (const key of Object.keys(update.$unset ?? {})) delete data[index][key];
+                Object.assign(rows[index], copy(update.$set ?? {}));
+                for (const key of Object.keys(update.$unset ?? {})) delete rows[index][key];
             }
             return { acknowledged: true, matchedCount: Number(index !== -1), upsertedCount: 0 };
         };
-        return handlers[kind] ? handlers[kind]({ update, apply }) : apply();
+        return handlers[kind] ? handlers[kind]({ where, update, apply, session: options.session }) : apply();
     };
-    t.mock.method(model.collection, 'findOne', async (where, { projection } = {}) => project(
-        data.find(row => matches(row, where)), projection));
-    t.mock.method(model.collection, 'find', (where, { projection, limit } = {}) => ({
-        toArray: async () => data.filter(row => matches(row, where)).slice(0, limit ?? data.length).map(row => project(row, projection)),
+    t.mock.method(model.collection, 'findOne', async (where, { projection, session } = {}) => project(
+        (session?.rows.get(data) ?? data).find(row => matches(row, where)), projection));
+    t.mock.method(model.collection, 'find', (where, { projection, limit, session } = {}) => ({
+        toArray: async () => (session?.rows.get(data) ?? data).filter(row => matches(row, where))
+            .slice(0, limit).map(row => project(row, projection)),
     }));
     t.mock.method(model.collection, 'updateMany', (where, update, options) => invoke('update', where, update, options));
     t.mock.method(model.collection, 'deleteMany', (where, options) => invoke('delete', where, null, options));
@@ -138,6 +141,191 @@ const outcomeUnknown = { code: 'REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN' };
 const finishUnknown = { code: 'REBUILD_L2TP_REMOVE_FINISH_OUTCOME_UNKNOWN' };
 const noOwner = { code: 'REBUILD_L2TP_REMOVE_NOT_OWNED' };
 const privateError = () => new Error('private fixture details');
+
+async function sharedFixture(t) {
+    const f = await installed(t);
+    const peerId = 'e'.repeat(24), peerMachine = 'd'.repeat(32), peerIp = '192.0.2.200';
+    for (const node of f.nodes) node.ssh.username = 'root';
+    f.nodes.push({ ...f.nodes[0], _id: oid(peerId), ip: peerIp });
+    f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(f.nodes.map(({ _id, ip, ssh }, i) => ({
+        nodeId: String(_id), host: ip, ...ssh, machineId: i ? peerMachine : machineId,
+        sshHostKeySha256: (i ? '2' : '1').repeat(64),
+    })));
+    const target = f.states[0], prefix = target.poolStart.replace(/\.\d+$/, '');
+    const peerPrefix = prefix === '10.255.16' ? '10.255.17' : '10.255.16';
+    f.states.push({ ...copy(target), _id: oid(), node: oid(peerId), rebuildMachineId: peerMachine,
+        backupId: 'f'.repeat(32), rebuildInstallToken: 'eeeeeeee-eeee-4eee-aeee-eeeeeeeeeeee',
+        clientCidr: `${peerPrefix}.0/24`, localAddress: `${peerPrefix}.1`, poolStart: `${peerPrefix}.10`, poolEnd: `${peerPrefix}.250` });
+    f.users.push({ ...copy(f.users[0]), _id: oid(), login: 'disabled-user', ip: `${prefix}.11`, enabled: false,
+        desiredRevision: 3, appliedRevision: 3, passwordEncrypted: encrypt('fixture-disabled', f.env.ENCRYPTION_KEY) });
+    f.users.push(...f.users.map(row => ({ ...copy(row), _id: oid(), relayNode: oid(peerId), ip: row.ip.replace(prefix, peerPrefix) })));
+    const selected = () => f.users.filter(row => String(row.relayNode) === id);
+    const sibling = () => f.users.filter(row => String(row.relayNode) === peerId);
+    t.mock.method(User.collection, 'countDocuments', async where => f.users.filter(row => matches(row, where)).length);
+    const bridgeNode = oid();
+    f.links.push({ _id: oid(), portalNode: oid(id), bridgeNode, mode: 'reverse', active: true, status: 'deployed',
+        rebuildApplied: { listener: oid(id), mode: 'reverse', protocol: 'vless', port: 22010,
+            uuid: '00000000-0000-4000-8000-000000000009' } });
+
+    const attempts = [];
+    const dbHooks = {};
+    class Session {
+        transaction = { transition: value => { assert.equal(value, 'TRANSACTION_COMMITTED'); this.active = false; } };
+        startTransaction(options) {
+            assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
+            this.active = true;
+            this.rows = new Map([f.states, f.users].map(rows => [rows, rows.map(copy)]));
+        }
+        inTransaction() { return this.active; }
+        abortTransaction() { attempts.push('abort'); this.active = false; }
+        endSession() { assert.equal(this.active, false); }
+    }
+    t.mock.method(State.db, 'startSession', async () => new Session());
+    t.mock.method(State.db, 'getClient', () => ({ db(name) {
+        assert.equal(name, 'admin');
+        return { async command(command, { session }) {
+            assert.equal(command.commitTransaction, 1);
+            assert.equal(command.writeConcern.w, 'majority');
+            assert.ok(session.inTransaction());
+            attempts.push('commit');
+            const apply = () => {
+                for (const [rows, pending] of session.rows) rows.splice(0, rows.length, ...pending);
+                return { ok: 1 };
+            };
+            return dbHooks.commit ? dbHooks.commit(apply) : apply();
+        } };
+    } }));
+    const frames = [], census = '3'.repeat(64), baseline = '4'.repeat(64);
+    const wire = {};
+    const { createRelayDirect } = require('../rebuildRelayDirect');
+    class SSH {
+        connect() {}
+        disconnect() {}
+        async exec(_, { stdin }) {
+            const frame = JSON.parse(stdin);
+            if (!equal(frame.currentUsers, expectedUsers)) throw new Error('incorrect DB-derived CHAP proof');
+            frames.push(frame);
+            assert.equal(frame.nodeId, id);
+            assert.equal(frame.machineId, machineId);
+            assert.deepEqual(frame.transit, [{ linkId: String(f.links[0]._id), mode: 'reverse', port: 22010,
+                uuid: '00000000-0000-4000-8000-000000000009' }]);
+            if (frame.action === 'remove') {
+                assert.equal(frame.baseline, baseline);
+                assert.equal(frame.expectedCensus, census);
+                assert.equal(f.states[0].status, 'removing');
+                assert.equal(selected().length, 2);
+            }
+            const reply = await wire[frame.action]?.() ?? (frame.action === 'session-count' ? { activeSessions: 0, census }
+                : { ok: true, machineId, backupId, baseline, removed: true });
+            return Object.hasOwn(reply, 'code') ? reply : { code: 0, stderr: '', stdout: JSON.stringify(reply) + '\n' };
+        }
+    }
+    const expectedUsers = selected().map(({ login, enabled, ip, passwordEncrypted }) => ({
+        login, enabled, ipAddress: ip, password: decrypt(passwordEncrypted, f.env.ENCRYPTION_KEY),
+    })).sort((a, b) => a.login.localeCompare(b.login));
+    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
+    return { ...f, service, selected, sibling, frames, attempts, dbHooks, wire };
+}
+
+test('shared Remove sends the same private DB projection to DIRECT and retires only the selected relay', async t => {
+    const f = await sharedFixture(t);
+    const before = f.sibling().map(copy), peer = copy(f.states[1]);
+    const preview = await f.service.previewRemoveRelay(id);
+    assert.deepEqual(preview, { nodeId: id, accountCount: 2, activeSessions: 0, confirmable: true });
+    f.users.reverse(); // query order alone must not invalidate this proof
+    assert.deepEqual(await f.service.confirmRemoveRelay(id, preview), { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
+    assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'session-count', 'prepare-remove', 'remove']);
+    assert.deepEqual(f.selected(), []);
+    assert.deepEqual(f.sibling().reverse(), before);
+    assert.deepEqual(f.states[1], peer);
+    assert.deepEqual(f.attempts, ['commit']);
+});
+
+test('shared Remove invalidates a preview when a disabled row revision changes without changing CHAP', async t => {
+    const f = await sharedFixture(t);
+    const preview = await f.service.previewRemoveRelay(id);
+    assert.equal(preview.confirmable, true);
+    const disabled = f.selected().find(row => !row.enabled);
+    disabled.desiredRevision++;
+    disabled.appliedRevision++;
+    await assert.rejects(f.service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_PREVIEW_CHANGED' });
+    assert.deepEqual(f.frames.map(x => x.action), ['session-count']);
+    assert.deepEqual(f.events, []);
+});
+
+test('shared Remove rechecks disabled rows after prepare and the confirmed census before preparing', async t => {
+    const f = await sharedFixture(t);
+    const preview = await f.service.previewRemoveRelay(id);
+    f.wire['session-count'] = () => ({ activeSessions: 0, census: '9'.repeat(64) });
+    await assert.rejects(f.service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_PREVIEW_CHANGED' });
+    assert.deepEqual(f.frames.splice(0).map(x => x.action), ['session-count', 'session-count']);
+    delete f.wire['session-count'];
+    f.wire['prepare-remove'] = () => { f.selected().find(row => !row.enabled).comment = 'drift'; };
+    await assert.rejects(f.service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_CHANGED' });
+    assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove']);
+    assert.deepEqual(f.events, []);
+});
+
+test('shared Remove restores the reservation on known host refusal and aborts an incomplete account retirement', async t => {
+    const f = await sharedFixture(t);
+    const rows = f.users.map(copy), initial = copy(f.states[0]);
+    const preview = await f.service.previewRemoveRelay(id);
+    f.wire.remove = () => ({ code: 70, stdout: '', stderr: 'DIRECT_REMOVE_REFUSED\n' });
+    await assert.rejects(f.service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_REFUSED' });
+    assert.deepEqual(f.states[0], initial);
+    assert.deepEqual(f.users, rows);
+    assert.deepEqual(f.attempts, []);
+
+    delete f.wire.remove;
+    let deletes = 0;
+    f.userHooks.delete = ({ where, apply, session }) => {
+        assert.ok(session.inTransaction());
+        assert.equal(String(where.relayNode.$eq), id);
+        assert.deepEqual(f.users, rows);
+        return ++deletes === 1 ? apply() : { acknowledged: true, deletedCount: 0 };
+    };
+    await assert.rejects(f.service.confirmRemoveRelay(id, preview), finishUnknown);
+    assert.equal(deletes, 2);
+    assert.deepEqual(f.attempts, ['abort']);
+    assert.equal(f.states[0].status, 'removing');
+    assert.deepEqual(f.users, rows);
+});
+
+test('shared Remove refuses invalid disabled credentials rather than falling back to the install receipt', async t => {
+    const f = await sharedFixture(t);
+    f.selected().find(row => !row.enabled).passwordEncrypted = 'invalid-envelope';
+    assert.deepEqual(await f.service.previewRemoveRelay(id), { nodeId: id, accountCount: 2, activeSessions: null, confirmable: false });
+    await assert.rejects(f.service.removeRelay(id), noOwner);
+    assert.deepEqual(f.frames, []);
+    assert.deepEqual(f.events, []);
+});
+
+test('trusted shared Remove also requires a fresh zero census before dispatch', async t => {
+    const f = await sharedFixture(t);
+    f.wire['session-count'] = () => ({ activeSessions: 1, census: '3'.repeat(64) });
+    await assert.rejects(f.service.removeRelay(id), { code: 'REBUILD_L2TP_REMOVE_SESSIONS_BUSY' });
+    assert.deepEqual(f.frames.splice(0).map(x => x.action), ['session-count']);
+    assert.deepEqual(f.events, []);
+    delete f.wire['session-count'];
+    await f.service.removeRelay(id);
+    assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'prepare-remove', 'remove']);
+    assert.deepEqual(f.attempts, ['commit']);
+});
+
+for (const committed of [false, true]) {
+    test(`shared Remove never retries an unacknowledged settlement commit (committed=${committed})`, async t => {
+        const f = await sharedFixture(t);
+        const selected = f.selected().map(copy), sibling = f.sibling().map(copy);
+        f.dbHooks.commit = apply => { if (committed) apply(); throw privateError(); };
+        await assert.rejects(f.service.removeRelay(id), finishUnknown);
+        await assert.rejects(f.service.removeRelay(id), noOwner);
+        assert.deepEqual(f.attempts, ['commit']);
+        assert.equal(f.frames.filter(x => x.action === 'remove').length, 1);
+        assert.equal(f.states[0].status, committed ? 'not_installed' : 'removing');
+        assert.deepEqual(f.selected(), committed ? [] : selected);
+        assert.deepEqual(f.sibling(), sibling);
+    });
+}
 
 test('list Remove requires card corroboration and a preview from the same binding generation', async t => {
     const f = await installed(t);
@@ -277,6 +465,9 @@ test('installed candidate -> removing before dispatch -> verified absence; only 
     assert.deepEqual(f.events, ['connect', 'prepareRemove', 'RelayL2tpState:update', 'remove', 'L2tpUser:delete',
         'RelayL2tpState:update', 'close']);
     await assert.rejects(f.service.removeRelay(id), noOwner);
+    // The synthetic unrelated row is intentionally an orphan. Install now
+    // validates its global source inventory; Remove did not touch that row.
+    f.users.pop();
     await f.service.installRelay(id); // confirmed absence is a genuinely fresh install admission
 });
 

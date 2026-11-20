@@ -59,6 +59,36 @@ async function enrollSource(env, id, state, readNode) {
     } };
 }
 
+function validateAccount(row, pool, logins, addresses) {
+    if (!objectId(row._id) || !validLogin(row.login) || !isIPv4(row.ip) || typeof row.enabled !== 'boolean'
+        || typeof row.passwordEncrypted !== 'string' || !row.passwordEncrypted || logins.has(row.login)
+        || addresses.has(row.ip) || ipv4(row.ip) < pool.lo || ipv4(row.ip) > pool.hi) throw inventoryInvalid();
+    if (row.syncStatus !== 'synced' || row.syncOperationId != null || !Number.isSafeInteger(row.desiredRevision)
+        || row.desiredRevision < 1 || row.desiredRevision !== row.appliedRevision) throw fail('ACCOUNT_SOURCE_BUSY');
+}
+
+// Remove needs the selected installation's physical preimage, not the
+// logical account set inherited by another relay. Keep disabled rows in the
+// projection: DIRECT validates their login/IP ownership, but renders no row.
+function projectRelayChap(state, rows, key) {
+    const pool = installedSource(state);
+    if (!Array.isArray(rows) || !rows.length || rows.length > 2048 || typeof key !== 'string' || key.length < 32) {
+        throw inventoryInvalid();
+    }
+    const logins = new Set(), addresses = new Set();
+    const currentUsers = rows.map(row => {
+        if (String(row.relayNode) !== String(state.node)) throw inventoryInvalid();
+        validateAccount(row, pool, logins, addresses);
+        logins.add(row.login);
+        addresses.add(row.ip);
+        let password;
+        try { password = decrypt(row.passwordEncrypted, key); } catch { throw inventoryInvalid(); }
+        if (!/^[ -~]{1,255}(?![\s\S])/.test(password) || password.startsWith('@')) throw inventoryInvalid();
+        return Object.freeze({ login: row.login, password, ipAddress: row.ip, enabled: row.enabled });
+    });
+    return Object.freeze(currentUsers.sort((a, b) => (a.login > b.login) - (a.login < b.login)));
+}
+
 // Login is the logical key. Source IP and the per-row sync revision are local
 // to each relay. Agreement is on the actual envelope and enablement, not on
 // decrypted passwords (independent historical bootstraps must not be merged).
@@ -91,12 +121,8 @@ async function resolveAccountSources({ nodeId, rows, env, key, readNode }) {
     const assigned = new Set();
     for (const row of rows.users) {
         const source = sources.get(String(row.relayNode));
-        if (!source || !objectId(row._id) || !validLogin(row.login) || !isIPv4(row.ip)
-            || typeof row.enabled !== 'boolean' || typeof row.passwordEncrypted !== 'string' || !row.passwordEncrypted
-            || source.accounts.has(row.login) || assigned.has(row.ip)
-            || ipv4(row.ip) < source.pool.lo || ipv4(row.ip) > source.pool.hi) throw inventoryInvalid();
-        if (row.syncStatus !== 'synced' || row.syncOperationId != null || !Number.isSafeInteger(row.desiredRevision)
-            || row.desiredRevision < 1 || row.desiredRevision !== row.appliedRevision) throw fail('ACCOUNT_SOURCE_BUSY');
+        if (!source) throw inventoryInvalid();
+        validateAccount(row, source.pool, source.accounts, assigned);
         source.accounts.set(row.login, { login: row.login, enabled: row.enabled, passwordEncrypted: row.passwordEncrypted, ip: row.ip });
         assigned.add(row.ip);
         allocations.push(row.ip);
@@ -135,4 +161,4 @@ async function resolveAccountSources({ nodeId, rows, env, key, readNode }) {
     return { occupied, allocations, inherited, prechecks };
 }
 
-module.exports = { resolveAccountSources };
+module.exports = { resolveAccountSources, projectRelayChap };

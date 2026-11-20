@@ -5,6 +5,8 @@ const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
 const { captureRelayBinding, sameRelayBinding } = require('./rebuildRelayAuthorization');
 const { read } = require('./rebuildRelayBackendStore');
+const { projectRelayChap } = require('./rebuildRelayAccountInventory');
+const { transactOnce } = require('./rebuildRelayInstallTransaction');
 const { readAccountCount, readSessionCensus } = require('./rebuildRelayCounts');
 const { readAppliedTransit } = require('./rebuildAppliedLink');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
@@ -38,10 +40,12 @@ const stateKeys = [...installedFields, '_id', 'node', 'status', 'desiredState', 
     'operationId', 'appliedTopologyRevision', 'pppDriftQueueFence', 'replacementFence', 'lastErrorCode', 'lastError'];
 const accountKeys = ['_id', 'relayNode', 'login', 'ip', 'enabled', 'passwordEncrypted', 'desiredRevision', 'appliedRevision',
     'syncStatus', 'syncOperationId', 'createdAt', 'updatedAt', 'lastSyncedAt', 'createdBy', 'updatedBy', 'comment',
-    'lastErrorCode', 'lastError'];
+    'lastErrorCode', 'lastError', '__v'];
 const unsetInstalled = Object.fromEntries(installedFields.map(key => [key, '']));
 const exact = (row, keys) => Object.fromEntries(keys.map(key => [key, Object.hasOwn(row, key)
     ? { $eq: row[key], ...(row[key] === null && { $exists: true }) } : { $exists: false }]));
+const exactAccounts = rows => rows.map(row => exact(row, [...new Set([...accountKeys, ...Object.keys(row)])]))
+    .sort((a, b) => String(a._id.$eq).localeCompare(String(b._id.$eq)));
 const integer = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
 const nonempty = value => typeof value === 'string' && value.length > 0;
 const empty = value => value == null || value === '';
@@ -87,6 +91,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
         let fence;
         try { fence = captureRelayBinding(env, id); } catch { throw fail(DISABLED); }
         const { machineId } = fence.binding;
+        const chapKey = fence.listMode ? env.ENCRYPTION_KEY : undefined;
         const authorize = node => {
             try { fence.check(node); } catch (error) {
                 if (error.code === 'REBUILD_L2TP_INSTALL_DISABLED') throw fail(DISABLED);
@@ -109,10 +114,11 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     authorize();
                     if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                     authorize();
+                    if (fence.listMode && env.ENCRYPTION_KEY !== chapKey) throw fail(CHANGED);
                 };
                 try {
                     await authority();
-                    const getNode = () => read(Node.findById(id).select(nodeFields));
+                    const getNode = session => read(Node.findById(id).select(nodeFields), session);
                     const node = await getNode();
                     if (String(node?._id) !== id || node.active !== true || node.type !== 'xray' || node.cascadeRole !== 'relay'
                         || node.useCustomConfig || (!fence.listMode && !isIP(node.ip))) throw fail(NOT_OWNED);
@@ -124,10 +130,39 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     const state = await read(State.findOne({ node: id }).select(stateFields));
                     const network = installedNetwork(state, id, machineId);
                     const User = L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel');
-                    const users = () => read(User.find({ relayNode: id }).select('+passwordEncrypted').limit(2));
+                    // One overflow row is enough to refuse an inventory too
+                    // large for DIRECT. Never dispatch a partial projection.
+                    const users = session => read(User.find({ relayNode: id }).select('+passwordEncrypted')
+                        .limit(2049).maxTimeMS(5000), session);
+                    const getState = session => read(State.findOne({ _id: state._id, node: id }).select(stateFields), session);
+                    const stateFence = exact(state, stateKeys);
+                    let rows, approved = false, currentUsers;
+                    try { rows = await users(); }
+                    catch (error) { if (phase !== 'preview') throw error; }
+                    const accountFences = rows && exactAccounts(rows);
+                    if (proof && (!equal(proof.node, node) || !equal(proof.stateFence, stateFence)
+                        || !equal(proof.accountFences, accountFences))) throw fail(PREVIEW_CHANGED);
+                    try {
+                        if (fence.listMode) currentUsers = projectRelayChap(state, rows, chapKey);
+                        else ownedAccount(rows, state, id);
+                        approved = true;
+                    } catch { if (phase !== 'preview') throw fail(NOT_OWNED); }
+
+                    const checkInventory = async (expected, accounts, session) => {
+                        // Mongo transactions cannot issue concurrent operations on one session.
+                        const [currentNode, currentState, currentRows] = session
+                            ? [await getNode(session), await getState(session), accounts && await users(session)]
+                            : await Promise.all([getNode(), getState(), accounts && users()]);
+                        if (!equal(currentNode, node) || !currentState || !equal(exact(currentState, stateKeys), exact(expected, stateKeys))
+                            || (accounts && !equal(exactAccounts(currentRows), accounts))) throw fail(CHANGED);
+                        await authority();
+                    };
+                    // Legacy singleton still authenticates its unchanged block
+                    // against the original host receipt. A list enrollment never
+                    // falls back to it if the current DB projection is unavailable.
+                    const input = { nodeId: id, backupId: state.backupId, network, ...(currentUsers && { currentUsers }) };
                     if (phase === 'preview') {
                         const accountCount = await readAccountCount(User, id);
-                        const input = { nodeId: id, backupId: state.backupId, network };
                         let transitProved = true;
                         // The stopped-path proof uses the same applied listener
                         // ownership as Remove. Missing link proof needn't hide a
@@ -137,8 +172,10 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         await checkNode();
                         let census = null;
                         try {
-                            remote = createRelayDirect({ node, env });
-                            census = await readSessionCensus(remote, input);
+                            if (!fence.listMode || approved) {
+                                remote = createRelayDirect({ node, env });
+                                census = await readSessionCensus(remote, input);
+                            }
                         } catch { /* Refusal or unavailable driver, not zero. */ }
                         finally {
                             if (typeof remote?.close === 'function') {
@@ -147,40 +184,18 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             remote = undefined;
                         }
                         if (!transitProved && census?.activeSessions === 0) census = null;
-                        let account;
-                        if (accountCount === 1 && census?.activeSessions === 0) {
-                            try { account = ownedAccount(await users(), state, id); } catch { /* No removal authority. */ }
-                        }
-                        const [currentNode, currentState] = await Promise.all([getNode(),
-                            read(State.findOne({ _id: state._id, node: id }).select(stateFields)),
-                        ]);
-                        const stateFence = exact(state, stateKeys);
-                        if (!equal(currentNode, node) || !currentState || !equal(exact(currentState, stateKeys), stateFence)) throw fail(CHANGED);
-                        await authority();
+                        const confirmable = approved && accountCount === accountFences.length && census?.activeSessions === 0;
+                        await checkInventory(state, approved ? accountFences : undefined);
                         const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions: census?.activeSessions ?? null,
-                            confirmable: !!account });
-                        if (account) previews.set(snapshot, { node, stateFence, accountFence: exact(account, accountKeys),
+                            confirmable });
+                        if (confirmable) previews.set(snapshot, { node, stateFence, accountFences,
                             binding: fence.binding, listMode: fence.listMode, census: census.census,
                             expires: performance.now() + PREVIEW_TTL_MS });
                         return snapshot;
                     }
-                    const account = ownedAccount(await users(), state, id);
-                    const accountFence = exact(account, accountKeys);
-                    if (proof && (!equal(proof.node, node) || !equal(proof.stateFence, exact(state, stateKeys))
-                        || !equal(proof.accountFence, accountFence))) throw fail(PREVIEW_CHANGED);
-                    const checkInventory = async (expected, expectAccount) => {
-                        const [currentNode, currentState, currentUsers] = await Promise.all([
-                            getNode(), read(State.findOne({ _id: state._id, node: id }).select(stateFields)), users(),
-                        ]);
-                        if (!equal(currentNode, node) || !currentState || !equal(exact(currentState, stateKeys), exact(expected, stateKeys))
-                            || (expectAccount ? currentUsers.length !== 1 || !equal(exact(currentUsers[0], accountKeys), accountFence)
-                                : currentUsers.length !== 0)) throw fail(CHANGED);
-                        await authority();
-                    };
-
                     // Only a confirmed Apply receipt can classify the physical
                     // MAIN listener as transport. A PUT can change draft fields.
-                    const transit = Link && await readAppliedTransit(Link, id);
+                    if (Link) input.transit = await readAppliedTransit(Link, id);
                     if (proof) {
                         const accountCount = await readAccountCount(User, id);
                         if (accountCount === null) throw fail(COUNT_UNAVAILABLE);
@@ -192,22 +207,22 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     if (typeof remote?.prepareRemove !== 'function' || typeof remote.remove !== 'function' || typeof remote.close !== 'function') {
                         throw fail('REBUILD_L2TP_REMOVE_BACKEND_UNAVAILABLE');
                     }
-                    if (proof) {
-                        const census = await readSessionCensus(remote, { nodeId: id, backupId: state.backupId, network,
-                            ...(transit && { transit }) });
+                    let expectedCensus;
+                    if (proof || currentUsers) {
+                        const census = await readSessionCensus(remote, input);
                         if (!census) throw fail(COUNT_UNAVAILABLE);
                         if (census.activeSessions !== 0) throw fail(SESSIONS_BUSY);
-                        if (census.census !== proof.census) throw fail(PREVIEW_CHANGED);
-                        await checkNode();
+                        if (proof && census.census !== proof.census) throw fail(PREVIEW_CHANGED);
+                        expectedCensus = census.census;
+                        await checkInventory(state, accountFences);
                         checkPreview();
                     }
                     // No saved MAIN is sent or rebuilt here. The direct driver
                     // prepares subtraction against the current physical profiles.
                     // The actual host Remove must recheck the confirmed census.
-                    const plan = await remote.prepareRemove({ nodeId: id, backupId: state.backupId, network,
-                        ...(transit && { transit }), ...(proof && { expectedCensus: proof.census }) });
+                    const plan = await remote.prepareRemove({ ...input, ...(expectedCensus && { expectedCensus }) });
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
-                    await checkInventory(state, true);
+                    await checkInventory(state, accountFences);
                     checkPreview();
 
                     const transition = { status: 'removing', desiredState: 'absent', updatedAt: new Date() };
@@ -215,7 +230,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     // All mutation filters bind the unique _id. Multi forms
                     // opt out of the driver's automatic retryable writes.
                     let result;
-                    try { result = await State.updateMany(exact(state, stateKeys), { $set: transition }, write); }
+                    try { result = await State.updateMany(stateFence, { $set: transition }, write); }
                     catch { throw fail('REBUILD_L2TP_REMOVE_RESERVATION_OUTCOME_UNKNOWN'); }
                     if (result?.acknowledged !== true) throw fail('REBUILD_L2TP_REMOVE_RESERVATION_OUTCOME_UNKNOWN');
                     if (result.matchedCount !== 1) throw fail(CHANGED);
@@ -223,7 +238,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     let revoked;
                     const guard = async () => {
                         if (revoked) throw revoked;
-                        try { await checkInventory(reservation, true); }
+                        try { await checkInventory(reservation, accountFences); }
                         catch (error) { revoked = safe(error); throw revoked; }
                     };
                     await guard();
@@ -243,20 +258,31 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             await guard();
                             const reverted = await State.updateMany(exact(reservation, stateKeys), restore, write);
                             if (reverted?.acknowledged !== true || reverted.matchedCount !== 1) throw fail(CHANGED);
-                            await checkInventory(state, true);
+                            await checkInventory(state, accountFences);
                         } catch { throw fail(UNKNOWN); }
                         throw fail('REBUILD_L2TP_REMOVE_REFUSED');
                     }
 
                     try {
                         await guard();
-                        const deleted = await User.deleteMany(accountFence, write);
-                        if (deleted?.acknowledged !== true || deleted.deletedCount !== 1) throw fail(CHANGED);
-                        await checkInventory(reservation, false);
-                        const finished = await State.updateMany(exact(reservation, stateKeys), {
-                            $set: { status: 'not_installed', updatedAt: new Date() }, $unset: unsetInstalled,
-                        }, write);
-                        if (finished?.acknowledged !== true || finished.matchedCount !== 1) throw fail(CHANGED);
+                        const settle = async session => {
+                            if (session) await checkInventory(reservation, accountFences, session);
+                            const options = session ? { session, timestamps: false } : write;
+                            for (const accountFence of accountFences) {
+                                const deleted = await User.deleteMany(accountFence, options);
+                                if (deleted?.acknowledged !== true || deleted.deletedCount !== 1) throw fail(CHANGED);
+                            }
+                            await checkInventory(reservation, [], session);
+                            const finished = await State.updateMany(exact(reservation, stateKeys), {
+                                $set: { status: 'not_installed', updatedAt: new Date() }, $unset: unsetInstalled,
+                            }, options);
+                            if (finished?.acknowledged !== true || finished.matchedCount !== 1) throw fail(CHANGED);
+                            if (session) await authority();
+                        };
+                        // A multi-row retirement and the final State CAS must
+                        // publish together; never retry an uncertain commit.
+                        if (accountFences.length > 1) await transactOnce(State, User, settle);
+                        else await settle();
                     } catch { throw fail(FINISH_UNKNOWN); }
                     removed = true;
                     return { executionMode: 'rebuild', status: 'not_installed', nodeId: id };
