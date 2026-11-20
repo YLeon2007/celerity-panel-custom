@@ -259,7 +259,7 @@ def wire(action, **extra):
 status, out, err = wire('prepare')
 assert status == 0, err
 baseline = json.loads(out)['baseline']
-nft = f'create table inet {h["TABLE"]}\ntable inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
+nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
 files = dict(f['installed'],nft=nft,**{k:'fixture-only' for k in ('ike','lns','options','chap','secrets')})
 if scenario == 'non-invertible-receipt':
     cfg = json.loads(files['bridge'])

@@ -178,7 +178,7 @@ token = 'd' * 32
 req = dict(machineId='a' * 32, backupId=token, baseline=h['digest'](h['encode'](before)), network=d)
 raw = dict(main=h['encode']({'inbounds': [{'tag':'relay-l2tp-a','port':12345},
     {'tag':'rebuild-relay-ingress','listen':'127.0.0.1','port':23456}]}),
-    nft=('create table inet ' + h['TABLE'] + '\n' + 'table inet ' + h['TABLE'] + ' {\n    comment "' + token + '"\n}').encode(),
+    nft=('create table inet ' + h['TABLE'] + ' {\n    comment "' + token + '"\n}').encode(),
     **{k: ('generated-' + k).encode() for k in ('ike','lns','options','chap','secrets')})
 files = {k: h['b64'](v) for k,v in raw.items()}
 assert h['dispatch'](dict(req, action='check', files=files)) == {'ok': True, 'backupId': token}

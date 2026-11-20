@@ -4,6 +4,8 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+const { existsSync, readlinkSync } = require('node:fs');
+const { join } = require('node:path');
 const { createRelayDirect } = require('../rebuildRelayDirect');
 
 const nodeId = 'a'.repeat(24);
@@ -101,6 +103,99 @@ test('prepare and validate before mutation, bind private desired and lock, then 
     assert.equal(await remote.verify(plan), true);
     await remote.close();
     assert.deepEqual(calls.slice(5), ['lock', 'install', 'verify', 'close']);
+});
+
+const nftMarkerProbe = String.raw`
+import json, os, runpy, subprocess, sys
+
+# Never write into the caller's netns. Only netlink table/ordinary chain
+# operations here: no TPROXY modules, service, SSH, PPP, or stand fixture.
+assert os.readlink('/proc/self/ns/net') != sys.argv[2]
+host = runpy.run_path(sys.argv[1])
+req = json.load(sys.stdin)
+network, token = req['network'], req['token']
+other = 'f' * 32 if token != 'f' * 32 else 'e' * 32
+raw = req['nft'].encode()
+name = host['TABLE']
+header, sep, _ = raw.partition(b'    chain prerouting {\n')
+assert sep, 'missing first generated chain'
+batch = header + b'    chain marker_probe {\n    }\n}\n'
+
+
+def nft(*args, data=None):
+    return subprocess.run(['/usr/sbin/nft', *args], input=data, capture_output=True, timeout=5, env={'LC_ALL': 'C'})
+
+
+def checked(*args, data=None):
+    result = nft(*args, data=data)
+    assert result.returncode == 0, result.stderr.decode()
+    return result.stdout
+
+
+def snapshot():
+    return json.loads(checked('-j', '-a', 'list', 'ruleset'))
+
+
+assert all('metainfo' in row for row in snapshot()['nftables']), 'netns starts with a nonempty ruleset'
+if sys.argv[3] == 'fresh':
+    checked('-f', '-', data=batch)
+    tables = [row['table'] for row in snapshot()['nftables'] if 'table' in row]
+    assert len(tables) == 1 and tables[0].get('comment') == token, 'generated operation marker missing from kernel table'
+    assert host['nft_marker'](raw, token)
+    assert not host['nft_marker'](raw, other)
+    legacy = f'create table inet {name}\ntable inet {name} {{\n    comment "{token}"\n}}\n'.encode()
+    assert not host['nft_marker'](legacy, token)
+    assert not host['nft_marker'](raw.removeprefix(b'create '), token)
+    assert host['nft_projection'](token) is not None
+else:
+    comment = f'    comment "{other}"\n' if sys.argv[3] == 'foreign' else ''
+    checked('-f', '-', data=f'create table inet {name} {{\n{comment}    chain original {{\n    }}\n}}\n'.encode())
+    before = snapshot()
+    # Use the real readback in both pristine-Install and operation-token checks.
+    for expected in ('', token):
+        try:
+            host['network_projection'](network, expected)
+        except host['Refusal'] as error:
+            assert str(error) == 'ROLLBACK_DRIFT', str(error)
+        else:
+            raise AssertionError('network guard admitted an existing table')
+    assert snapshot() == before
+    # Even if a competing table appears after the guard, the exclusive kernel
+    # transaction cannot insert the generated chain or overwrite the marker.
+    result = nft('-f', '-', data=batch)
+    assert result.returncode != 0 and b'File exists' in result.stderr, result.stderr.decode()
+    assert snapshot() == before, 'existing kernel table changed despite refusal'
+`;
+
+
+test('generated nft operation marker persists on exclusive creation; existing tables stay unchanged', async t => {
+    const unshare = '/usr/bin/unshare';
+    const opts = ['--user', '--map-root-user', '--net', '--'];
+    if (process.platform !== 'linux' || ![unshare, '/usr/sbin/nft', '/usr/sbin/ip',
+        '/usr/bin/python3', '/sys/module/nf_tables'].every(existsSync)) {
+        t.skip('requires Linux with nftables already loaded and local namespace tools');
+        return;
+    }
+    const probe = spawnSync(unshare, [...opts, '/usr/bin/true'], { encoding: 'utf8', timeout: 3000 });
+    if (probe.status !== 0 && /Operation not permitted|Permission denied/.test(probe.stderr ?? '')) {
+        t.skip('unprivileged user/network namespaces unavailable');
+        return;
+    }
+    assert.equal(probe.status, 0, probe.stderr || probe.error?.message);
+    let generated;
+    const { remote } = fixture(request => {
+        if (request.action === 'check') generated = { token: request.backupId, network: request.network,
+            nft: Buffer.from(request.files.nft, 'base64').toString('utf8') };
+    });
+    try { await remote.prepare(args); } finally { await remote.close(); }
+    assert.ok(generated);
+    const netns = readlinkSync('/proc/self/ns/net');
+    const host = join(__dirname, '..', 'rebuildRelayDirectHost.py');
+    for (const mode of ['fresh', 'unmarked', 'foreign']) await t.test(mode, () => {
+        const result = spawnSync(unshare, [...opts, '/usr/bin/python3', '-I', '-B', '-c', nftMarkerProbe, host, netns, mode],
+            { input: JSON.stringify(generated), encoding: 'utf8', timeout: 12000 });
+        assert.equal(result.status, 0, result.stderr || result.error?.message);
+    });
 });
 
 test('masked or wrong machine and invalid generated addresses cannot dispatch writes', async () => {

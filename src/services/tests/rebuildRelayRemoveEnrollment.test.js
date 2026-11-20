@@ -28,7 +28,7 @@ const xl = 'xl2tpd.service', ike = 'strongswan-starter.service', x = 'xray.servi
 const net = 'celerity-rebuild-l2tp-network.service', system = '/etc/systemd/system';
 const boot = `${system}/multi-user.target.wants/${xl}`, mpath = '/usr/local/etc/xray/config.json';
 const bpath = '/usr/local/etc/xray-bridge/config.json';
-const nft = `create table inet celerity_rebuild_l2tp\ntable inet celerity_rebuild_l2tp {\n    comment "${backupId}"\n}\n`;
+const nft = `create table inet celerity_rebuild_l2tp {\n    comment "${backupId}"\n}\n`;
 const v = { machineId, backupId, network, nodeId };
 
 // Reuse the joined install host's filesystem and command facade, adding only

@@ -71,8 +71,8 @@ function makeDesired(input) {
 
 function buildFiles(d, profiles, backupId) {
     const stock = Object.fromEntries(buildL2tpArtifacts(d).files.map(row => [row.path, row.content]));
-    const nft = `create table inet celerity_rebuild_l2tp
-table inet celerity_rebuild_l2tp {
+    // Include the marker in the exclusive NEWTABLE, not in a later declaration.
+    const nft = `create table inet celerity_rebuild_l2tp {
     comment "${backupId}"
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;

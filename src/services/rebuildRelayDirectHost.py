@@ -682,7 +682,7 @@ ExecStart=/usr/sbin/ip -4 rule add priority {PRIORITY} from {d['clientCidr']} fw
 
 
 def nft_marker(data, token):
-    return data.startswith(f'create table inet {TABLE}\ntable inet {TABLE} {{\n    comment "{token}"\n'.encode())
+    return data.startswith(f'create table inet {TABLE} {{\n    comment "{token}"\n'.encode())
 
 
 def validate_profiles(after):

@@ -237,7 +237,7 @@ before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stoc
               sockets=h['owned_sockets'](h['sock_rows'](), units[X]['MainPID']))
 h['observe'] = lambda m,d,transit: before
 req = {k: f[k] for k in ('network','backupId','machineId')}
-nft = f'create table inet {h["TABLE"]}\ntable inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
+nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
 files = dict(main=f['installed'], nft=nft, **{k: 'secret-fixture-only' for k in ('ike','lns','options','chap','secrets')})
 assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()},
     baseline=h['digest'](h['encode'](before))))['ok']
