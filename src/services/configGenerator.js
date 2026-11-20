@@ -1698,7 +1698,8 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
         } else {
             stream.tlsSettings = {};
             if (link.tlsServerName) stream.tlsSettings.serverName = link.tlsServerName;
-            if (!wantPanelCert) stream.tlsSettings.allowInsecure = true;
+            if (opts.rebuildTunnel === true) stream.tlsSettings.useSystemCA = true;
+            else if (!wantPanelCert) stream.tlsSettings.allowInsecure = true;
         }
     } else if (security === 'reality') {
         if (opts.server) {

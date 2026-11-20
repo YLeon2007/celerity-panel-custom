@@ -2,6 +2,7 @@
 
 const generator = require('../../../services/configGenerator');
 const { tunnelSettings } = require('../../../services/rebuildLinkKeys');
+const { tunnelName } = require('../../../services/rebuildTunnelTls');
 const { composeXrayConfig } = require('./xrayConfigComposer');
 const { compileRebuildGraph, rebuildId, requireRebuild } = require('../domain/rebuildTopologyCompiler');
 
@@ -23,6 +24,7 @@ function projectLinks(graph, options) {
         const security = link.tunnelSecurity ?? 'none';
         const port = link.tunnelPort;
         const id = link.tunnelUuid;
+        const wire = security === 'tls' ? { ...link, tlsServerName: tunnelName(link) } : link;
         requireRebuild(address(server), 'REBUILD_INVALID_NODE_ADDRESS');
         requireRebuild(validPort(port) && typeof id === 'string' && /^\S+$/.test(id)
             && ['none', 'tls', 'reality'].includes(security)
@@ -56,13 +58,13 @@ function projectLinks(graph, options) {
                 tag: reverse ? `rebuild-rp-conn-${short(entry)}` : ingressTag(entry),
                 listen: '0.0.0.0', port, protocol,
                 settings: { clients: [client], ...(protocol === 'vless' ? { decryption } : {}) },
-                streamSettings: generator.buildCascadeTunnelStreamSettings(link, { ...options, server: true }),
+                streamSettings: generator.buildCascadeTunnelStreamSettings(wire, { ...options, server: true }),
                 ...(!reverse ? { sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true } } : {}),
             },
             dialer: {
                 tag: reverse ? `rebuild-rp-dial-${short(entry)}` : egressTag(entry),
                 protocol, settings: dialSettings,
-                streamSettings: generator.buildCascadeTunnelStreamSettings(link, options),
+                streamSettings: generator.buildCascadeTunnelStreamSettings(wire, { ...options, rebuildTunnel: true }),
                 ...(!reverse && link.muxEnabled ? { mux: { enabled: true, concurrency: link.muxConcurrency || 8 } } : {}),
             },
         });

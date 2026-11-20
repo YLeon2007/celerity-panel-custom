@@ -44,6 +44,8 @@ const cascadeLinkSchema = new mongoose.Schema({
     tunnelDomain: { type: String, default: 'reverse.tunnel.internal' },
     tunnelProtocol: { type: String, enum: ['vless', 'vmess'], default: 'vless' },
     tunnelSecurity: { type: String, enum: ['none', 'tls', 'reality'], default: 'none' },
+    // Rebuild-only SNI; Classic tunnel generation/CRUD do not consume it.
+    rebuildTlsServerName: { type: String, default: undefined },
     tunnelTransport: { type: String, enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'], default: 'tcp' },
 
     // TCP settings

@@ -38,10 +38,15 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     const from=inventory.find(n=>String(n._id)===source),to=inventory.find(n=>String(n._id)===target);
     if(!from||!to||!['portal','relay'].includes(from.cascadeRole)||!['relay','bridge'].includes(to.cascadeRole))throw fail('REBUILD_INVALID_EDGE_ROLE');
     for(const field of fields)if(Object.hasOwn(b,field))link.set(field,b[field]);
+    if(link.tunnelSecurity==='tls'&&Object.hasOwn(b,'tlsServerName')){
+        if(typeof b.tlsServerName!=='string')throw fail('REBUILD_TLS_SERVER_NAME_REQUIRED');
+        link.rebuildTlsServerName=b.tlsServerName;
+    }
     if(Object.hasOwn(b,'tunnelUuid'))link.tunnelUuid=b.tunnelUuid;
     link.portalNode=source;link.bridgeNode=target;
     if(link.tunnelSecurity==='reality')Object.assign(link,require('./cascadeLinks').resolveRealitySettings({...link.toObject(),...b,realityPrivateKey:b.realityPrivateKey||link.realityPrivateKey,realityPublicKey:b.realityPublicKey||link.realityPublicKey},to));
     if(!Number.isInteger(link.tunnelPort)||link.tunnelPort<1||link.tunnelPort>65535||!Number.isSafeInteger(link.priority)||typeof link.name!=='string'||!link.name.trim())throw fail('REBUILD_INVALID_REQUEST');
+    if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject());
     await verify();link.status='pending';await link.save();const linkId=String(link._id);
     require('../services/cascadeService')._invalidateTopologyCache();
     if(b.autoDeploy!==true)return {executionMode:'rebuild',desiredSaved:true,linkId,status:'saved'};

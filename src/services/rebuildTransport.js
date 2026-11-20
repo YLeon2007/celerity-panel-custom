@@ -2,6 +2,7 @@
 const { randomUUID } = require('node:crypto');
 const { MAIN, BRIDGE, readClassicProfile }=require('./classicAppliedConfig');
 const {generateBridgeSystemdService}=require('./configGenerator');
+const {READ_CHAIN,VERIFY_CHAIN}=require('./rebuildTunnelTls');
 const fail=code=>Object.assign(new Error(code),{code});
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
 // All shell strings are fixed or constructed from locally generated constants.
@@ -62,6 +63,7 @@ function createTransport(node, SSH=require('./nodeSSH')) {
         else if(side.state==='loaded') await check('systemctl disable xray-bridge.service');
     }
     async function close(){if(connected){try{if(attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`);}finally{ssh.disconnect();}}}
-    return {read,requireSupportedCore,stagePair,putPair,close};
+    return {read,requireSupportedCore,stagePair,putPair,close,
+        readTunnelCertificate:()=>check(READ_CHAIN),verifyTunnelCertificate:input=>check(VERIFY_CHAIN,input)};
 }
 module.exports={createTransport};
