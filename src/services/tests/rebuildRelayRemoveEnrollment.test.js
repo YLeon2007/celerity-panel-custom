@@ -93,7 +93,7 @@ def run(argv, **kwargs):
         if case == 'foreign-ike-after-stop':
             s['units'][IKE]['InvocationID'] = 'f' * 32
         if case in ('owned-file-after-stop', 'swan-generation-after-stop'):
-            p = backing(h['SWAN_PROFILE'] if case == 'swan-generation-after-stop' else h['NAMES']['chap'])
+            p = backing(h['SWAN_PROFILE'] if case == 'swan-generation-after-stop' else h['NAMES']['options'])
             q = p.with_suffix('.replacement')
             q.write_bytes(p.read_bytes()); q.chmod(p.stat().st_mode & 0o777); q.replace(p)
     return result
@@ -198,7 +198,8 @@ function host(t, scenario) {
         return { prepareRefused: true };
     }
     const plan = ok(prepared);
-    const files = { main: installed, nft, ...Object.fromEntries(['ike', 'lns', 'options', 'secrets', 'chap'].map(k => [k, 'fixture-only'])) };
+    const files = { main: installed, nft, chap: '# BEGIN CELERITY MANAGED L2TP USERS\n# END CELERITY MANAGED L2TP USERS\n',
+        ...Object.fromEntries(['ike', 'lns', 'options', 'secrets'].map(k => [k, 'fixture-only'])) };
     ok(wire('install', { machineId, network, backupId, baseline: plan.baseline,
         files: Object.fromEntries(Object.entries(files).map(([k, text]) => [k, Buffer.from(text).toString('base64')])) }));
     ok(wire('verify', { machineId, network, backupId, baseline: plan.baseline }));

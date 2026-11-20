@@ -293,7 +293,8 @@ status, out, err = wire('prepare')
 assert status == 0, err
 baseline = json.loads(out)['baseline']
 nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
-files = dict(f['installed'],nft=nft,**{k:'fixture-only' for k in ('ike','lns','options','chap','secrets')})
+files = dict(f['installed'],nft=nft,chap='# BEGIN CELERITY MANAGED L2TP USERS\n# END CELERITY MANAGED L2TP USERS\n',
+             **{k:'fixture-only' for k in ('ike','lns','options','secrets')})
 if scenario == 'non-invertible-receipt':
     cfg = json.loads(files['bridge'])
     cfg['routing']['rules'][-1]['inboundTag'] = ['neighbor']

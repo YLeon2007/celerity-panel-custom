@@ -5,6 +5,7 @@ import errno
 import fcntl
 import io
 import ipaddress
+from itertools import cycle
 import json
 import os
 from pathlib import Path
@@ -265,6 +266,13 @@ class SessionCount(unittest.TestCase):
         native = runpy.run_path(str(HOST.parents[1] / 'modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'))['UNIT']
         unit_file = g['SYSTEM'] + '/' + g['XL']
         files = {g['NAMES'][key]: g['entry'](record, 0o644) for key, record in records.items()}
+        chap_path = g['NAMES']['chap']
+        stock = b'# stock\n'
+        begin = b'# BEGIN CELERITY MANAGED L2TP USERS\n'
+        end = b'# END CELERITY MANAGED L2TP USERS\n'
+        row = b'"alice" l2tpd "original" 10.255.1.10\n'
+        installed_chap = stock + b'\n' + begin + row + end
+        files[chap_path] = g['entry'](installed_chap)
         files[unit_file] = g['entry'](native, 0o644)
         files['/etc/machine-id'] = g['entry']((machine + '\n').encode(), 0o444)
         global_files = {path: g['entry'](path.encode(), 0o644) for path in g['SESSION_GLOBAL']}
@@ -277,17 +285,30 @@ class SessionCount(unittest.TestCase):
                     Requires=g['NET_UNIT'] + ' ' + g['IKE'], After=g['NET_UNIT'] + ' ' + g['IKE'], User='root', Group='root')
         backup: dict[str, Any] = dict(phase='installed', machineId=machine, backupId=token, network=REQUEST['network'],
                       before=dict(boot='boot', units={g['XL']: {**info, 'UnitFileState': 'disabled'}}, installBoot=True,
-                                  globalFiles=global_files),
+                                  globalFiles=global_files, files={'chap': g['entry'](stock)}),
                       after={key: {**files[g['NAMES'][key]], 'data': g['digest'](value)} for key, value in records.items()},
                       runtime=dict(invocations=['xray', invocation], files={k: [1, 2, 3] for k in records}))
+        backup['after']['chap'] = {**files[chap_path], 'data': g['digest'](installed_chap)}
+        leaves = cycle([[], ['0000usepeerdns'], ['0000usepeerdns']])
         with patch.dict(g, dict(directory=lambda _: contextlib.nullcontext(50), unit=lambda _: info,
-                                no_jobs=lambda _: None, read=lambda p, _: files.get(p),
+                                no_jobs=lambda _: None, read=lambda p, *_: files.get(p),
                                 read_manifest=lambda _: (manifest_path, g['entry'](g['encode'](backup)), backup),
                                 directory_absent=lambda _: True, boot=lambda: 'boot', remove_generation=lambda _: [1, 2, 3],
                                 session_binary=lambda _: (1, 2, 3), sock_rows=lambda: [('udp', '*', 1701, ['500'])],
                                 SESSION_GLOBAL={p: g['digest'](p.encode()) for p in global_files})), \
-                patch('os.listdir', side_effect=[[], ['0000usepeerdns'], ['0000usepeerdns']]):
+                patch('os.listdir', side_effect=lambda _: next(leaves)):
             self.assertEqual(g['session_owner'](REQUEST)[-1], self.pool)
+            changed_chap = installed_chap.replace(b'"original"', b'"updated"') + b'# foreign \xff\r\n'
+            with patch.dict(files, {chap_path: g['entry'](changed_chap)}):
+                with self.assertRaises(self.refusal):
+                    g['session_owner'](REQUEST)
+                for password in ('original', 'updated'):
+                    request = {**REQUEST, 'currentUsers': [dict(login='alice', password=password, ipAddress='10.255.1.10', enabled=True)]}
+                    if password == 'original':
+                        with self.assertRaises(self.refusal):
+                            g['session_owner'](request)
+                    else:
+                        self.assertEqual(g['session_owner'](request)[-1], self.pool)
             for field, value in (('phase', 'applying'), ('machineId', 'e' * 32), ('backupId', 'f' * 32),
                                  ('network', {**REQUEST['network'], 'fwmark': 78})):
                 with patch.dict(backup, {field: value}), self.assertRaises(self.refusal):

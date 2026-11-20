@@ -41,6 +41,20 @@ function removeNetwork(value, invalid = 'REMOVE_INPUT_INVALID') {
     return { clientCidr, tproxyPort, fwmark, routeTable };
 }
 
+function chapUsers(users, invalid) {
+    requireThat(Array.isArray(users) && users.length <= 2048, invalid);
+    const logins = new Set(), addresses = new Set();
+    return Array.from(users, row => {
+        const { login, password, ipAddress, enabled } = row ?? {};
+        requireThat(typeof login === 'string' && /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/.test(login)
+            && typeof password === 'string' && /^[ -~]{1,255}(?![\s\S])/.test(password) && !password.startsWith('@')
+            && typeof ipAddress === 'string' && isIPv4(ipAddress) && typeof enabled === 'boolean'
+            && !logins.has(login) && !addresses.has(ipAddress), invalid);
+        logins.add(login); addresses.add(ipAddress);
+        return { login, password, ipAddress, enabled };
+    });
+}
+
 function makeDesired(input) {
     const bad = () => fail('INSTALL_INPUT_INVALID');
     try {
@@ -153,6 +167,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
 
     async function exec(action, params = {}, write = false, validate = () => true) {
         const count = action === 'session-count';
+        const chap = action === 'check-chap' || action === 'sync-chap';
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         checkBinding();
         await connect(count ? 5000 : 30000);
@@ -179,22 +194,25 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 || result.stderr !== 'DIRECT_SESSION_COUNT_UNPROVED\n')) throw unknown();
             if (action === 'remove' && (result.code !== 70 || result.stdout !== ''
                 || result.stderr !== 'DIRECT_REMOVE_REFUSED\n')) throw unknown();
+            if (chap && (result.code !== 70 || result.stdout !== ''
+                || result.stderr !== 'DIRECT_CHAP_REFUSED\n')) throw unknown();
             const codes = ['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
                 'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED', 'REMOVE_REFUSED'];
             if (count) codes.push('SESSION_COUNT_UNPROVED');
+            if (chap) codes.push('CHAP_REFUSED');
             // Only the installed helper's closed refusal frame certifies a settled write.
             // A shell/transport exit alone is not authority to race a remote mutation.
             if (write && (result.code !== 70 || result.stdout !== '' || !codes.includes(raw))) throw unknown();
             if (refusal?.[1] && action !== 'install') throw unknown();
             const error = fail(codes.includes(raw) ? `DIRECT_${raw}` : 'DIRECT_COMMAND_FAILED');
             if (write) error.commandSettled = true;
-            if (refusal?.[1]) error.noHostChanges = true;
+            if (refusal?.[1] || chap) error.noHostChanges = true;
             throw error;
         }
         try {
-            if (result.stderr !== '' || Buffer.byteLength(result.stdout) > (count ? 128 : 46 * 1024 * 1024)) throw Error();
+            if (result.stderr !== '' || Buffer.byteLength(result.stdout) > (count || chap ? 128 : 46 * 1024 * 1024)) throw Error();
             const reply = JSON.parse(result.stdout);
-            if (count && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
+            if ((count || chap) && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
             if (!validate(reply)) throw Error();
             return reply;
         } catch { throw unknown(); }
@@ -217,18 +235,46 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     }
     const exactAck = backupId => value => value?.ok === true && value.backupId === backupId;
 
+    const chapOperation = (action, installation, currentUsers, desiredUsers, verifyLock) => serial(async () => {
+        const invalid = 'CHAP_INPUT_INVALID', write = action === 'sync-chap';
+        requireThat(!held && installation?.nodeId === nodeId && Object.keys(installation).length === 3
+            && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(installation, key))
+            && installation.backupId?.length === 32 && tokenMatches(TOKEN, installation.backupId), invalid);
+        const { backupId } = installation;
+        const params = { nodeId, backupId, network: removeNetwork(installation.network, invalid),
+            currentUsers: chapUsers(currentUsers, invalid), desiredUsers: chapUsers(desiredUsers, invalid) };
+        requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
+        await connect(30000);
+        await lock(verifyLock);
+        const { changed } = await exec(action, params, write, reply => exactAck(backupId)(reply)
+            && Object.keys(reply).length === 3 && typeof reply.changed === 'boolean');
+        try {
+            await lock(verifyLock);
+            requireThat(!closed, 'DIRECT_CLOSED');
+        } catch (error) {
+            if (!write) throw error;
+            poisoned = true;
+            disconnect();
+            throw fail('DIRECT_OUTCOME_UNKNOWN', true);
+        }
+        return { changed };
+    });
+
     return Object.freeze({
         preflight: () => serial(preflight),
+        checkChap: (...args) => chapOperation('check-chap', ...args),
+        syncChap: (...args) => chapOperation('sync-chap', ...args),
         readSessionCount: input => serial(async () => {
             const invalid = 'SESSION_COUNT_INPUT_INVALID';
             requireThat(input?.nodeId === nodeId
                 && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(input, key))
-                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit'].includes(key))
+                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'currentUsers'].includes(key))
                 && (!Object.hasOwn(input, 'transit') || Array.isArray(input.transit))
                 && input.backupId?.length === 32 && tokenMatches(TOKEN, input.backupId), invalid);
             const { backupId } = input;
             const network = removeNetwork(input.network, invalid);
             const params = { nodeId, backupId, network,
+                ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
                 ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
             return exec('session-count', params, false, reply => reply
                 && Object.keys(reply).length === 2 && integer(reply.activeSessions, 0, Number.MAX_SAFE_INTEGER)
@@ -288,14 +334,16 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             });
         },
         prepareRemove: input => serial(async () => {
+            const invalid = 'REMOVE_INPUT_INVALID';
             requireThat(!held && input?.nodeId === nodeId
-                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'expectedCensus'].includes(key))
+                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'expectedCensus', 'currentUsers'].includes(key))
                 && typeof input.backupId === 'string'
                 && input.backupId.length === 32 && TOKEN.test(input.backupId), 'REMOVE_INPUT_INVALID');
             const hasCensus = Object.hasOwn(input, 'expectedCensus');
             const { expectedCensus } = input;
             requireThat(!hasCensus || (tokenMatches(PIN, expectedCensus) && expectedCensus.length === 64), 'REMOVE_INPUT_INVALID');
             const params = { nodeId, backupId: input.backupId, network: removeNetwork(input.network),
+                ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
                 ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
             const proof = await exec('prepare-remove', params, false, value => exactAck(params.backupId)(value)
                 && value.machineId === machineId && typeof value.baseline === 'string' && value.baseline.length === 64

@@ -82,6 +82,7 @@ MAX_REQUEST = 25 * 1024 * 1024
 DEADLINE = time.monotonic() + 115
 STAGE = 'PREREQUISITE'
 REMOVE_ENTERED = False
+CHAP_ENTERED = False
 NO_INSTALL_WRITES = False
 
 
@@ -855,9 +856,11 @@ def neighbors(before, sidecar=False):
         need(read(BRIDGE) == before['bridge'] and all(b.get(k) == v for k, v in before['units'][B].items()), 'ROLLBACK_DRIFT')
 
 
-def file_generations(records=None):
+def file_generations(records=None, *, include_chap=True):
     result = {}
     for k, path in operation_files(records or {}).items():
+        if k == 'chap' and not include_chap:
+            continue
         st = os.lstat(path)
         need(stat.S_ISREG(st.st_mode), 'ROLLBACK_DRIFT')
         result[k] = [st.st_dev, st.st_ino, st.st_ctime_ns]
@@ -1027,6 +1030,132 @@ def install(request, before, after):
 
 def after_match(record, expected):
     return record is not None and {**record, 'data': digest(raw(record))} == expected
+
+
+CHAP_ACTIONS = ('check-chap', 'sync-chap')
+CHAP_BEGIN = b'# BEGIN CELERITY MANAGED L2TP USERS'
+CHAP_END = b'# END CELERITY MANAGED L2TP USERS'
+CHAP_LOGIN = rb'[A-Za-z0-9._@-]{1,64}'
+CHAP_QUOTED_BYTE = rb'(?:[ !#-\[\]-~]|\\["\\])'
+CHAP_ROW = re.compile(rb'"(' + CHAP_LOGIN + rb')" l2tpd "(' + CHAP_QUOTED_BYTE + rb'{1,255}|[A-Za-z0-9_-]{256})" ([0-9.]{7,15})')
+CHAP_FOREIGN_TOKEN = re.compile(rb'(?:"' + CHAP_QUOTED_BYTE + rb'''*"|'[ -&(-\[\]-~]*'|[!$-&(-\[\]-~]+)''')
+
+
+def chap_pool(lns, cidr):
+    bounds = re.findall(rb'^ip range = ([0-9.]{7,15})-([0-9.]{7,15})$', lns, re.M)
+    need(len(bounds) == 1, 'ROLLBACK_DRIFT')
+    first, last = (ipaddress.IPv4Address(v.decode('ascii')) for v in bounds[0])
+    network = ipaddress.IPv4Network(cidr)
+    need(network.network_address < first <= last < network.broadcast_address, 'ROLLBACK_DRIFT')
+    return first, last
+
+
+def chap_user_rows(users: Any, pool):
+    bad = 'CANDIDATE_INVALID'
+    need(type(users) is list and len(users) <= 2048, bad)
+    rows, logins, addresses = {}, set(), set()
+    for row in cast(list[dict[str, Any]], users):
+        need(type(row) is dict and set(row) == {'login', 'password', 'ipAddress', 'enabled'}
+             and type(row['enabled']) is bool and all(type(row[k]) is str for k in ('login', 'password', 'ipAddress')), bad)
+        login, password, address = (row[k].encode('ascii') for k in ('login', 'password', 'ipAddress'))
+        need(re.fullmatch(CHAP_LOGIN, login) and re.fullmatch(rb'[ -~]{1,255}', password)
+             and not password.startswith(b'@') and login not in logins and address not in addresses
+             and pool[0] <= ipaddress.IPv4Address(row['ipAddress']) <= pool[1], bad)
+        logins.add(login)
+        addresses.add(address)
+        if row['enabled']:
+            quoted = password.replace(b'\\', b'\\\\').replace(b'"', b'\\"')
+            rows[login] = b'"' + login + b'" l2tpd "' + quoted + b'" ' + address + b'\n'
+    return rows, logins
+
+
+def chap_parts(record):
+    bad = 'ROLLBACK_DRIFT'
+    need(record is not None and (record['mode'], record['gid'], record.get('uid', 0)) == (0o600, 0, 0), bad)
+    data = raw(record)
+    markers, offset = [], 0
+    for line in data.split(b'\n'):
+        if line.strip(b' \t\r\v\f') in (CHAP_BEGIN, CHAP_END):
+            markers.append((line, offset))
+        offset += len(line) + 1
+    need([line for line, _ in markers] == [CHAP_BEGIN, CHAP_END], bad)
+    start, end = markers[0][1], markers[1][1] + len(CHAP_END) + 1
+    need(data[end-1:end] == b'\n', bad)
+    block = data[start:end]
+    lines = block.split(b'\n')[1:-2]
+    need(len(lines) <= 2048, bad)
+    rows, addresses = {}, set()
+    for line in lines:
+        match = CHAP_ROW.fullmatch(line)
+        if match is None:
+            raise Refusal(bad)
+        login, password, address = match.groups()
+        # Legacy Install allowed a 256-byte base64url secret; its original
+        # block remains removable even without a DB projection on the wire.
+        need(not password.startswith(b'@') and login not in rows and address not in addresses, bad)
+        rows[login] = line + b'\n'
+        addresses.add(address)
+    return data[:start], block, data[end:], rows
+
+
+def check_chap_neighbors(data, logins):
+    for source in data.split(b'\n'):
+        line = source.removesuffix(b'\r').lstrip(b' \t')
+        if not line or line.startswith(b'#'):
+            continue
+        # Do not interpret a continuation, escaped name or ambiguous active
+        # line as unrelated. Inline and full-line comments remain opaque.
+        names, count = [], 0
+        need(len(line) <= 8192, 'ROLLBACK_DRIFT')
+        while line and not line.startswith(b'#'):
+            match = CHAP_FOREIGN_TOKEN.match(line)
+            if not match:
+                raise Refusal('ROLLBACK_DRIFT')
+            if count < 2:
+                word = match.group()
+                need(b'\\' not in word and len(word) <= 255, 'ROLLBACK_DRIFT')
+                names.append(word[1:-1] if word.startswith((b'"', b"'")) else word)
+            count += 1
+            tail = line[match.end():]
+            need(not tail or tail[:1] in (b' ', b'\t', b'#'), 'ROLLBACK_DRIFT')
+            line = tail.lstrip(b' \t')
+        need(count >= 3, 'ROLLBACK_DRIFT')
+        login, server = names
+        need(login not in logins and not (logins and login == b'*' and server in (b'*', b'l2tpd')), 'ROLLBACK_DRIFT')
+
+
+def owned_chap(record, backup, expected=None):
+    prefix, block, suffix, rows = chap_parts(record)
+    if expected is None:
+        # Released Install appended LF + managed block to the saved preimage.
+        # Authenticate against that install receipt, never the current prefix.
+        original = backup['before']['files']['chap']
+        need(original is not None and after_match(entry(raw(original) + b'\n' + block), backup['after']['chap']), 'ROLLBACK_DRIFT')
+        logins = rows.keys()
+    else:
+        expected_rows, logins = expected
+        need(rows == expected_rows, 'ROLLBACK_DRIFT')
+    check_chap_neighbors(prefix, logins)
+    check_chap_neighbors(suffix, logins)
+    return prefix, suffix, rows
+
+
+def chap_expected(request, lns):
+    if 'currentUsers' in request:
+        need(lns is not None, 'ROLLBACK_DRIFT')
+        return chap_user_rows(request['currentUsers'], chap_pool(raw(lns), request['network']['clientCidr']))
+    return None
+
+
+def chap_rows_digest(rows):
+    return digest(b''.join(rows[key] for key in sorted(rows)))
+
+
+def remove_chap(record, backup, expected):
+    prefix, suffix, rows = owned_chap(record, backup, expected)
+    need(record is not None, 'ROLLBACK_DRIFT')
+    # Even the LF preceding the marker is outside the managed block.
+    return {**record, 'data': b64(prefix + suffix)}, chap_rows_digest(rows)
 
 
 def check_swan_profile(backup, record, bad='ROLLBACK_DRIFT'):
@@ -1703,15 +1832,67 @@ def removal_main_sockets(rows, pid, reserved, udp_endpoints):
     return sorted(tcp + udp)
 
 
+def owned_installation(request):
+    bad = 'ROLLBACK_DRIFT'
+    token = request['backupId']
+    path, manifest, backup = read_manifest(token)
+    need(backup['phase'] == 'installed' and backup['machineId'] == request['machineId']
+         and backup['backupId'] == token and encode(backup['network']) == encode(request['network'])
+         and backup['before']['boot'] == boot(), bad)
+    intent = os.path.join(os.path.dirname(path), 'remove-attempt.json')
+    need(directory_absent(intent), bad)
+    return path, manifest, backup, intent
+
+
+def sync_chap(request, *, write_changes):
+    global CHAP_ENTERED
+    bad = 'ROLLBACK_DRIFT'
+    path, manifest, backup, intent = owned_installation(request)
+    before, runtime = backup['before'], backup['runtime']
+    no_jobs(UNITS)
+    removal_boot(before, backup, runtime)
+    records = {}
+    for key, file in operation_files(backup['after']).items():
+        if key in ('main', 'bridge', 'chap'):
+            continue
+        generation = remove_generation(file)
+        records[key] = read(file)
+        need(after_match(records[key], backup['after'][key]) and generation == runtime['files'][key]
+             and remove_generation(file) == generation, bad)
+    check_swan_profile(backup, records.get('swan'), bad)
+    pool = chap_pool(raw(records['lns']), request['network']['clientCidr'])
+    current_rows, current_logins = chap_user_rows(request['currentUsers'], pool)
+    desired_rows, desired_logins = chap_user_rows(request['desiredUsers'], pool)
+    xl = unit(XL)
+    need(all(read(p, 262144) == record for p, record in before['globalFiles'].items())
+         and removal_native(xl, XL, before, installed=True)
+         and ((working(xl) and xl['InvocationID'] == runtime['invocations'][1])
+              or rollback_quiescent(xl) or (xl['ActiveState'], xl['SubState'], xl['MainPID']) == ('failed', 'failed', '0')), bad)
+    target = NAMES['chap']
+    record = read(target)
+    prefix, suffix, rows = owned_chap(record, backup, (current_rows, current_logins | desired_logins))
+    need(record is not None, bad)
+    after = record
+    if rows != desired_rows:
+        data = prefix + CHAP_BEGIN + b'\n' + b''.join(desired_rows[k] for k in sorted(desired_rows)) + CHAP_END + b'\n' + suffix
+        need(len(data) <= MAX_FILE, bad)
+        after = {**record, 'data': b64(data)}
+    need(read(path, 2 * MAX_FILE) == manifest and directory_absent(intent) and read(target) == record, bad)
+    if after == record:
+        return False
+    if write_changes:
+        # The control-plane intent owns DB settlement. Do not accept the desired
+        # projection in place of current, or attempt a physical retry/rollback.
+        CHAP_ENTERED = True
+        write(target, record, after)
+    return True
+
+
 def observe_removal(request, *, quiescent=False):
     bad = 'ROLLBACK_DRIFT'
     token, d = request['backupId'], request['network']
-    path, manifest, backup = read_manifest(token)
+    path, manifest, backup, intent = owned_installation(request)
     before, runtime = backup['before'], backup['runtime']
-    need(backup['phase'] == 'installed' and backup['machineId'] == request['machineId']
-         and backup['backupId'] == token and backup['network'] == d and before['boot'] == boot(), bad)
-    intent = os.path.join(os.path.dirname(path), 'remove-attempt.json')
-    need(directory_absent(intent), bad)
     no_jobs(UNITS)
     boot_enrollment = removal_boot(before, backup, runtime)
     original_ike = before.get('ikeSockets', [])
@@ -1722,11 +1903,13 @@ def observe_removal(request, *, quiescent=False):
     main = current['main']
     if main is None:
         raise Refusal(bad)
-    generations = file_generations(current)
-    # Apply can replace Xray profiles. Every other owned file must still be
-    # the exact installed generation, even if a replacement has the same bytes.
+    generations = file_generations(current, include_chap=False)
+    # Apply can replace Xray profiles; CHAP owns only its managed rows. Other
+    # owned files must still be the exact installed generation and bytes.
     need(all(after_match(current[k], backup['after'][k]) and generations[k] == runtime['files'][k]
-             for k in paths if k != 'main'), bad)
+             for k in paths if k not in ('main', 'chap')), bad)
+    expected_chap = chap_expected(request, current['lns'])
+    chap_after, chap_digest = remove_chap(current['chap'], backup, expected_chap)
     removal_owned_dirs()
     need(ike_include_matches(current['starter'], [os.path.basename(NAMES['ike'])]), bad)
     side, side_generation = read(BRIDGE), remove_generation(BRIDGE)
@@ -1760,14 +1943,15 @@ def observe_removal(request, *, quiescent=False):
     baseline = digest(encode([request['nodeId'], digest(raw(manifest)), manifest_generation, generations, boot_enrollment,
                               current['main'], {k: digest(raw(v)) for k, v in profiles.items()}, binary,
                               side, side_generation, units, policy, sockets, bridge_sockets, sorted(reserved),
-                              handoff, handoff_unit, transit]))
+                              handoff, handoff_unit, transit, chap_digest]))
     return dict(baseline=baseline, intent=intent, path=path, manifest=manifest, before=before, current=current,
                 profiles=profiles, units=units, side=side, side_generation=side_generation, sockets=sockets,
                 udp_endpoints=udp_endpoints,
                 bridge_sockets=bridge_sockets, retained_handoff=handoff if handoff_unit == B else None,
                 reserved=reserved, policy=policy, generations=generations, binary=binary,
                 boot_enrollment=boot_enrollment, ike_sockets=original_ike, manifest_generation=manifest_generation,
-                transit=transit, **({'swanBackup': backup} if 'swan' in current else {}))
+                transit=transit, chap_after=chap_after, chap_digest=chap_digest, chap_expected=expected_chap, chap_backup=backup,
+                **({'swanBackup': backup} if 'swan' in current else {}))
 
 
 def removal_owned_dirs():
@@ -1811,7 +1995,8 @@ def removal_units_after(state, restore_ike=False):
 def removal_files_after(state):
     before = state['before']
     paths = operation_files(state['current'])
-    need(all(read(p) == (state['profiles']['main'] if k == 'main' else before['files'][k]) for k, p in paths.items())
+    expected = {**before['files'], 'main': state['profiles']['main'], 'chap': state['chap_after']}
+    need(all(read(p) == expected[k] for k, p in paths.items())
          and all(directory_absent(p) for p in (DROP_DIR, NFT_DIR))
          and (state['boot_enrollment'] is None or boot_link() is None)
          and ike_include_matches(before['files']['starter'], []), 'RUNTIME_UNPROVED')
@@ -1889,10 +2074,18 @@ def remove_installation(request, state):
     if 'expectedCensus' in request:
         # Still under the exclusive DIRECT flock. The prior panel recount and
         # prepare snapshot cannot authorize a write against a now-unknown census.
-        census = session_census({k: request[k] for k in ('machineId', 'nodeId', 'backupId', 'network', 'transit') if k in request})
+        census = session_census({k: request[k] for k in ('machineId', 'nodeId', 'backupId', 'network', 'transit', 'currentUsers') if k in request})
         session_need(census['activeSessions'] == 0 and census['census'] == request['expectedCensus'])
         if rollback_quiescent(units[XL]):
             session_need(census['census'] == quiescent_session_token(state['baseline']))
+
+    def live_chap():
+        record = read(NAMES['chap'])
+        restored, chap_digest = remove_chap(record, state['chap_backup'], state['chap_expected'])
+        need(chap_digest == state['chap_digest'], 'ROLLBACK_DRIFT')
+        return record, restored
+
+    live_chap()
     # Retain the install manifest unchanged. Durable no-replace intent
     # prevents blind replay even if the first stop's result is unknown.
     REMOVE_ENTERED = True
@@ -1926,8 +2119,9 @@ def remove_installation(request, state):
          and network_projection(d, token, removing=True) == policy, STAGE)
     removal_neighbors(state)
     removal_owned_dirs()
-    need(file_generations(current) == state['generations'] and (boot_enrollment is None or boot_link() == boot_enrollment),
+    need(file_generations(current, include_chap=False) == state['generations'] and (boot_enrollment is None or boot_link() == boot_enrollment),
          'ROLLBACK_DRIFT')
+    live_chap()
     # Keep the ingress firewall in place until the owned listeners are gone.
     x = unit(X)
     need(all(x[k] == units[X][k] for k in ('InvocationID', 'MainPID')), STAGE)
@@ -1939,6 +2133,12 @@ def remove_installation(request, state):
         side_generation = remove_generation(BRIDGE)
     paths = operation_files(current)
     for k in reversed(operation_order(current)):
+        if k == 'chap':
+            # Re-read the foreign bytes at the actual write boundary; only the
+            # owned rows are bound by the preview and the census.
+            record, state['chap_after'] = live_chap()
+            write(paths[k], record, state['chap_after'])
+            continue
         need(remove_generation(paths[k]) == state['generations'][k], STAGE)
         restored = profiles[k] if k == 'main' else before['files'][k]
         if current[k] != restored:
@@ -2140,6 +2340,8 @@ def session_owner(request):
         session_need(current is not None and digest(raw(current)) == sha
                      and (p != '/etc/ppp/options' or current == before['globalFiles'][p]))
     profile = session_profile(raw(records['lns']), raw(records['options']), network)
+    _, _, chap_rows = owned_chap(read(NAMES['chap']), backup, chap_expected(request, records['lns']))
+    generations['chapRows'] = chap_rows_digest(chap_rows)
     return (before['boot'], info['InvocationID'], int(info['MainPID']), remove_generation(path), digest(raw(manifest)),
             generations, {p: session_binary(p) for p in SESSION_STOCK}, profile)
 
@@ -2455,7 +2657,7 @@ def collect_session_census(request):
 
 def read_session_count(request):
     keys = {'action', 'machineId', 'nodeId', 'backupId', 'network'}
-    session_need(keys <= set(request) <= keys | {'transit'}
+    session_need(keys <= set(request) <= keys | {'transit', 'currentUsers'}
                  and ('transit' not in request or type(request['transit']) is list)
                  and re.fullmatch(r'[a-f0-9]{32}', request['machineId']) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
                  and re.fullmatch(r'[a-f0-9]{32}', request['backupId']))
@@ -2472,7 +2674,7 @@ def dispatch(request: dict[str, Any]):
     if action == 'session-count':
         return read_session_count(request)
     need(re.fullmatch(r'[a-f0-9]{32}', machine) and action in
-         ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove'), 'PREREQUISITE')
+         ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove') + CHAP_ACTIONS, 'PREREQUISITE')
     NO_INSTALL_WRITES = action == 'install'
     ready = preflight(machine)
     if action == 'preflight':
@@ -2483,11 +2685,17 @@ def dispatch(request: dict[str, Any]):
     # administrative writers. No locks from the old runners are consulted.
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if action in CHAP_ACTIONS:
+            token = request['backupId']
+            need(set(request) == {'action', 'machineId', 'backupId', 'network', 'nodeId', 'currentUsers', 'desiredUsers'}
+                 and re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId']), 'CANDIDATE_INVALID')
+            need(ready['ppp'] and ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
+            return {'ok': True, 'backupId': token, 'changed': sync_chap(request, write_changes=action == 'sync-chap')}
         if action in ('prepare-remove', 'remove'):
             token = request['backupId']
             keys = {'action', 'machineId', 'backupId', 'network', 'nodeId'}
             keys |= {'baseline'} if action == 'remove' else set()
-            optional = {'transit'} | ({'expectedCensus'} if action == 'remove' else set())
+            optional = {'transit', 'currentUsers'} | ({'expectedCensus'} if action == 'remove' else set())
             need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
                  and keys <= set(request) <= keys | optional
                  and ('expectedCensus' not in request or re.fullmatch(r'[a-f0-9]{64}', request['expectedCensus']))
@@ -2542,16 +2750,18 @@ def main():
     except (subprocess.TimeoutExpired, BlockingIOError):
         return 75
     except Refusal as error:
-        if REMOVE_ENTERED or str(error) == 'IN_FLIGHT':
+        if REMOVE_ENTERED or CHAP_ENTERED or str(error) == 'IN_FLIGHT':
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
+              'CHAP_REFUSED' if action in CHAP_ACTIONS else
               SESSION_UNKNOWN if action == 'session-count' else str(error)), file=sys.stderr)
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
-        if REMOVE_ENTERED:
+        if REMOVE_ENTERED or CHAP_ENTERED:
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
+              'CHAP_REFUSED' if action in CHAP_ACTIONS else
               SESSION_UNKNOWN if action == 'session-count' else STAGE), file=sys.stderr)
         return 70
     print(json.dumps(result, ensure_ascii=True, separators=(',', ':')), flush=True)

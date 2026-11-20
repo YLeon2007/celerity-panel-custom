@@ -153,6 +153,8 @@ def sc(*args):
     elif cmd in ('stop', 'reset-failed') and len(rest) == 1 and rest[0] in (XL, IKE, NET):
         if testing and scenario == 'unknown-stop':
             raise Refusal('COMMAND_FAILED')
+        if args == ('stop', XL) and scenario == 'chap-sync-remove':
+            chap.write_bytes(chap.read_bytes() + b'\n# appended during Remove\r\n')
         name = rest[0]
         if testing and cmd == 'stop' and ((name == XL and scenario.startswith(('xl-stop-', 'xl-reset-')))
                                           or (name == IKE and scenario == 'ike-stop-failed')):
@@ -287,7 +289,13 @@ before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stoc
 h['observe'] = lambda m,d,transit: before
 req = {k: f[k] for k in ('network','backupId','machineId')}
 nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
-files = dict(main=f['installed'], nft=nft, **{k: 'secret-fixture-only' for k in ('ike','lns','options','chap','secrets')})
+begin = b'# BEGIN CELERITY MANAGED L2TP USERS\n'
+end = b'# END CELERITY MANAGED L2TP USERS\n'
+old_row = b'"alice" l2tpd "test-old" 10.255.1.10\n'
+new_row = b'"bob" l2tpd "test-new" 10.255.1.11\n'
+foreign = b'elsewhere other "foreign # value" *\r\n# opaque \xff'
+files = dict(main=f['installed'], nft=nft, chap=(begin + old_row + end).decode(),
+             lns='ip range = 10.255.1.10-10.255.1.19\n', **{k: 'secret-fixture-only' for k in ('ike','options','secrets')})
 assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()},
     baseline=h['digest'](h['encode'](before))))['ok']
 manifest = Path(h['manifest_path'](token))
@@ -310,8 +318,17 @@ req['nodeId'] = f['nodeId']
 if scenario == 'apply-quiescent-dependent': req['transit'] = []
 if scenario == 'foreign-drop': Path(h['DROP_DIR'], 'foreign.conf').write_text('untouched')
 if scenario == 'foreign-dep': units[X]['RequiredBy'] += ' ' + B
-if scenario == 'vpn-generation':
-    p = Path(P['chap']); q = p.with_suffix('.new'); q.write_bytes(p.read_bytes()); q.replace(p)
+if scenario in ('vpn-generation', 'chap-legacy-replaced'):
+    p = Path(P['chap' if scenario.startswith('chap') else 'lns']); q = p.with_suffix('.new')
+    q.write_bytes(p.read_bytes()); q.chmod(p.stat().st_mode & 0o777); q.replace(p)
+chap = Path(P['chap'])
+old_users = [dict(login='alice', password='test-old', ipAddress='10.255.1.10', enabled=True)]
+new_users = [dict(login='bob', password='test-new', ipAddress='10.255.1.11', enabled=True),
+             dict(login='disabled', password='not-written', ipAddress='10.255.1.12', enabled=False)]
+stock_chap = h['raw'](before['files']['chap']) + b'\n'
+if scenario == 'apply-quiescent-dependent':
+    chap.write_bytes(stock_chap + begin + new_row + end)
+    req['currentUsers'] = new_users
 if scenario == 'ambiguous':
     cfg = json.loads(Path(P['main']).read_text())
     cfg['routing']['rules'].insert(0, dict(type='field', outboundTag='rebuild-l2tp-block', inboundTag=['client']))
@@ -331,6 +348,7 @@ def wire(action, **kw):
     stdout, stderr = io.StringIO(), io.StringIO()
     saved = sys.stdin
     try:
+        h['CHAP_ENTERED'] = False  # one invocation per process on the host
         sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(h['encode'](dict(req, action=action, **kw))))
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = h['main']()
@@ -344,6 +362,98 @@ def snapshot():
                    p.read_bytes() if p.is_file() else None) for p in root.rglob('*'))
 
 initial = snapshot()
+if scenario.startswith('chap-sync-'):
+    chap.write_bytes(stock_chap + begin + old_row + end + foreign)
+    params = dict(currentUsers=old_users, desiredUsers=new_users)
+    changed = {'ok': True, 'backupId': token, 'changed': True}
+    no_change = dict(changed, changed=False)
+    def expect(action, payload, **kw):
+        code, stdout, stderr = wire(action, **kw)
+        assert code == 0 and not stderr and json.loads(stdout) == payload, (code, stderr)
+    initial = snapshot()
+    expect('check-chap', changed, **params)
+    assert snapshot() == initial and not changes
+    if scenario == 'chap-sync-drift':
+        # A file looking exactly like DESIRED does not authorize replay.
+        chap.write_bytes(stock_chap + begin + new_row + end + foreign)
+        pre = snapshot()
+        assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n')
+        assert snapshot() == pre and not changes
+    elif scenario == 'chap-sync-guards':
+        invalid_blocks = {
+            'missing': stock_chap + foreign,
+            'nested': stock_chap + begin + begin + old_row + end + foreign,
+            'duplicate-marker': stock_chap + begin + old_row + end + b'  ' + end,
+            'duplicate-row': stock_chap + begin + old_row + old_row + end,
+            'drift-password': stock_chap + begin + old_row.replace(b'test-old', b'test-other') + end,
+            'drift-address': stock_chap + begin + old_row.replace(b'.10', b'.12') + end,
+            'no-end-lf': stock_chap + begin + old_row + end.rstrip(b'\n'),
+            'foreign-current-login': stock_chap + begin + old_row + end + b"'alice' * dummy *\n",
+            'foreign-desired-login': stock_chap + b'bob l2tpd dummy *\n' + begin + old_row + end,
+            'disabled-login': stock_chap + begin + old_row + end + b'disabled l2tpd dummy *\n',
+            'wildcard': stock_chap + begin + old_row + end + b'"*" "l2tpd" dummy *\n',
+            'ambiguous-foreign': stock_chap + begin + old_row + end + b'"unfinished dummy *\n',
+            'continued': stock_chap + b'outsider other dummy \\\n' + begin + old_row + end,
+        }
+        for label, invalid in invalid_blocks.items():
+            chap.write_bytes(invalid)
+            pre = snapshot()
+            assert wire('check-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
+            assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
+            assert snapshot() == pre and not changes, label
+        chap.write_bytes(stock_chap + begin + old_row + end + foreign)
+        chap.chmod(0o644)
+        pre = snapshot()
+        assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n') and snapshot() == pre
+        chap.chmod(0o600)
+        chap.rename(chap.with_suffix('.original'))
+        chap.symlink_to(chap.with_suffix('.original'))
+        assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n')
+        assert chap.is_symlink() and chap.read_bytes() == stock_chap + begin + old_row + end + foreign
+        chap.unlink()
+        chap.with_suffix('.original').rename(chap)
+        pre = snapshot()
+        for invalid in ([dict(new_users[0], ipAddress='10.255.1.20')], [dict(new_users[0], password='@indirect')],
+                        [new_users[0], dict(new_users[0], login='duplicate-ip')]):
+            assert wire('check-chap', currentUsers=old_users, desiredUsers=invalid) == (70, '', 'DIRECT_CHAP_REFUSED\n')
+        with directory(h['SYSTEM']) as held:
+            h['fcntl'].flock(held, h['fcntl'].LOCK_SH | h['fcntl'].LOCK_NB)
+            for action in ('check-chap', 'sync-chap'):
+                assert wire(action, **params) == (75, '', '')
+        assert snapshot() == pre and not changes
+        escaped = [dict(old_users[0], password='quote" slash\\ and # hash')]
+        expect('sync-chap', changed, currentUsers=old_users, desiredUsers=escaped)
+        assert chap.read_bytes() == stock_chap + begin + b'"alice" l2tpd "quote\\" slash\\\\ and # hash" 10.255.1.10\n' + end + foreign
+        expect('sync-chap', changed, currentUsers=escaped, desiredUsers=[])
+        assert chap.read_bytes() == stock_chap + begin + end + foreign
+    elif scenario == 'chap-sync-unknown':
+        write = h['write']
+        def lost(*args):
+            write(*args)
+            raise Refusal('RUNTIME_UNPROVED')
+        h['write'] = lost
+        assert wire('sync-chap', **params) == (75, '', '')
+        assert chap.read_bytes() == stock_chap + begin + new_row + end + foreign and not changes
+    else:
+        def other_files():
+            return [w for w in snapshot() if w[-1] is not None and w[0] != str(chap.relative_to(root))]
+        other_before = other_files()
+        expect('sync-chap', changed, **params)
+        assert chap.read_bytes() == stock_chap + begin + new_row + end + foreign and not changes
+        assert other_files() == other_before
+        # New no-op cannot toggle disabled rows on disk or replace the inode.
+        initial = snapshot()
+        expect('sync-chap', no_change, currentUsers=new_users, desiredUsers=new_users[:1])
+        assert snapshot() == initial
+        assert wire('prepare-remove') == (70, '', 'DIRECT_ROLLBACK_DRIFT\n')  # changed block, no DB projection
+        assert wire('prepare-remove', currentUsers=old_users) == (70, '', 'DIRECT_ROLLBACK_DRIFT\n')
+        assert snapshot() == initial and not changes and not intent.exists()
+        req['currentUsers'] = new_users
+    if scenario != 'chap-sync-remove':
+        assert (manifest.read_bytes(), manifest.stat().st_ino) == manifest_saved and not intent.exists()
+        print('ok')
+        sys.exit(0)
+    initial = snapshot()
 a = wire('prepare-remove')
 assert snapshot() == initial and not changes and not intent.exists()
 if scenario in ('udp-missing-preview','udp-wrong-owner-preview'):
@@ -368,6 +478,9 @@ else:
     if scenario in stale:
         p = stale[scenario]
         q = p.with_suffix('.new'); q.write_bytes(p.read_bytes()); q.replace(p)
+    if scenario == 'chap-sync-remove':
+        # Unrelated edit after prepare, including CRLF and a non-UTF8 comment.
+        chap.write_bytes(b'# later prefix\r\n' + chap.read_bytes())
     recheck = snapshot()
     censuses = []
     census_mode = scenario.removeprefix('census-') if scenario.startswith('census-') else None
@@ -437,7 +550,10 @@ else:
             assert ('reset-failed', XL) not in changes
         assert json.loads(Path(P['main']).read_text()) == (f['expected'] if scenario.startswith('apply') else json.loads(f['old']))
         assert R(h['BRIDGE']) == side and units[B] == side_unit
-        assert all(R(p) == before['files'][k] for k,p in P.items() if k != 'main')
+        assert all(R(p) == before['files'][k] for k,p in P.items() if k not in ('main','chap'))
+        preserved = b'# later prefix\r\n' + stock_chap + foreign + b'\n# appended during Remove\r\n'
+        assert chap.read_bytes() == (preserved if scenario == 'chap-sync-remove' else stock_chap)
+        assert R(P['chap'])['mode'] == 0o600
         assert not any(policy.values()) and intent.is_file() and wire('prepare-remove')[0] != 0
         assert not Path(h['DROP_DIR']).exists() and not Path(h['NFT_DIR']).exists()
         assert all(B not in cmd for cmd in changes) and ('restart',X) in changes
@@ -447,6 +563,7 @@ print('ok')
 `;
 
 for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation',
+    'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown',
     'foreign-drop', 'foreign-dep', 'foreign-ike', 'foreign-rule', 'foreign-listener', 'ambiguous', 'ambiguous-shared',
     'duplicate-json', 'nft-drift', 'invalid-candidate', 'active-ppp', 'wrong-network', 'wrong-machine', 'wrong-node',
     'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route',
