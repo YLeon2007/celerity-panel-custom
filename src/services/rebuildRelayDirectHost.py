@@ -1827,8 +1827,14 @@ def remove_installation(request, state):
         elif info['ActiveState'] == 'failed':
             sc('reset-failed', name)
             no_jobs(UNITS)
-        info = unit(name)
-        need((info['ActiveState'], info['SubState'], info['MainPID']) == ('inactive', 'dead', '0'), STAGE)
+        after = unit(name)
+        # xl2tpd exits 1 on SIGTERM even when systemctl stop itself succeeds.
+        if (name == XL and info['ActiveState'] == 'active'
+                and (after['ActiveState'], after['SubState'], after['MainPID']) == ('failed', 'failed', '0')):
+            sc('reset-failed', name)
+            no_jobs(UNITS)
+            after = unit(name)
+        need((after['ActiveState'], after['SubState'], after['MainPID']) == ('inactive', 'dead', '0'), STAGE)
     need(vpn_empty() and not any(n in (500, 4500, 1701) for _, _, n, _ in sock_rows())
          and network_projection(d, token, removing=True) == policy, STAGE)
     removal_neighbors(state)

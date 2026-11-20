@@ -129,7 +129,9 @@ testing = False
 
 def sc(*args):
     cmd, *rest = args
-    if args == ('list-jobs','--no-legend','--plain'): return b''
+    if args == ('list-jobs','--no-legend','--plain'):
+        pending_after = {'xl-stop-job': ('stop', XL), 'xl-reset-job': ('reset-failed', XL)}.get(scenario)
+        return f'42 {XL} stop running\n'.encode() if pending_after in changes else b''
     changes.append(args)
     if args == ('daemon-reload',):
         if Path(h['NET']).exists():
@@ -149,7 +151,17 @@ def sc(*args):
     elif cmd in ('stop', 'reset-failed') and len(rest) == 1 and rest[0] in (XL, IKE, NET):
         if testing and scenario == 'unknown-stop':
             raise Refusal('COMMAND_FAILED')
-        units[rest[0]].update(ActiveState='inactive', SubState='dead', MainPID='0', InvocationID='')
+        name = rest[0]
+        if testing and cmd == 'stop' and ((name == XL and scenario.startswith(('xl-stop-', 'xl-reset-')))
+                                          or (name == IKE and scenario == 'ike-stop-failed')):
+            # The stop client can succeed even when xl2tpd exits 1 on SIGTERM.
+            units[name].update(ActiveState='failed', SubState='failed',
+                               MainPID='11' if scenario == 'xl-stop-live-pid' else '0')
+            if scenario == 'xl-stop-nonzero':
+                raise Refusal('COMMAND_FAILED')
+        else:
+            units[name].update(ActiveState='inactive', SubState='dead', InvocationID='',
+                               MainPID='11' if args == ('reset-failed', XL) and scenario == 'xl-reset-live-pid' else '0')
     else:
         raise AssertionError(args)
     return b''
@@ -248,6 +260,8 @@ def run(a, input=None, **kw):
     except Exception as error:
         mock_faults.append((type(error).__name__, a))
         raise
+    if testing and scenario == 'xl-stop-timeout' and a[2:] == ('stop', XL):
+        raise subprocess.TimeoutExpired(a, kw['timeout'])
     return types.SimpleNamespace(stdout=stdout, stderr=b'', returncode=status)
 subprocess = h['subprocess']
 h['subprocess'] = types.SimpleNamespace(run=run, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired)
@@ -379,12 +393,21 @@ else:
         assert b == (70,'','DIRECT_REMOVE_REFUSED\n') and not changes and snapshot() == recheck and not intent.exists()
     elif census_mode == 'timeout':
         assert b == (75,'','') and not changes and snapshot() == recheck and not intent.exists()
+    elif scenario != 'xl-stop-failed' and (scenario.startswith(('xl-stop-', 'xl-reset-')) or scenario == 'ike-stop-failed'):
+        assert b == (75,'','') and intent.is_file(), (b, changes)
+        assert changes == [('stop', XL)] + ([('stop', IKE)] if scenario == 'ike-stop-failed' else
+            [('reset-failed', XL)] if scenario.startswith('xl-reset-') else []), changes
+        assert all(policy.values()) and wire('prepare-remove')[0] != 0
     elif scenario in ('unknown-stop','lingering-listener','lingering-route'):
         assert b == (75,'','') and intent.is_file(), b
         assert policy['route'] and policy['nft']
         assert wire('prepare-remove')[0] != 0
     else:
-        assert b[0] == 0 and b[2] == '' and json.loads(b[1]) == dict(ok=True, backupId=token, removed=True), b
+        assert b[0] == 0 and b[2] == '' and json.loads(b[1]) == dict(ok=True, backupId=token, removed=True), (b, changes)
+        if scenario == 'xl-stop-failed':
+            assert changes[:4] == [('stop', XL), ('reset-failed', XL), ('stop', IKE), ('stop', NET)], changes
+        if scenario == 'normal':
+            assert ('reset-failed', XL) not in changes
         assert json.loads(Path(P['main']).read_text()) == (f['expected'] if scenario.startswith('apply') else json.loads(f['old']))
         assert R(h['BRIDGE']) == side and units[B] == side_unit
         assert all(R(p) == before['files'][k] for k,p in P.items() if k != 'main')
@@ -400,6 +423,8 @@ for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-m
     'foreign-drop', 'foreign-dep', 'foreign-ike', 'foreign-rule', 'foreign-listener', 'ambiguous', 'ambiguous-shared',
     'duplicate-json', 'nft-drift', 'invalid-candidate', 'active-ppp', 'wrong-network', 'wrong-machine', 'wrong-node',
     'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route',
+    'xl-stop-failed', 'xl-stop-nonzero', 'xl-stop-timeout', 'xl-stop-job', 'xl-stop-live-pid',
+    'xl-reset-job', 'xl-reset-live-pid', 'ike-stop-failed',
     'census-idle', 'census-unknown', 'census-busy', 'census-changed', 'census-timeout']) {
     test(`direct remove fixture: ${scenario}`, () => {
         const dir = mkdtempSync(join(process.cwd(), '.direct-remove-fixture-'));
