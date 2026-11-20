@@ -154,6 +154,7 @@ def sc(*args):
         raise AssertionError(args)
     return b''
 def command(*a, data=None):
+    global l2tp_reads
     if len(a) == 6 and a[:4] == ('/usr/bin/systemctl','--no-pager','show','--all'):
         flag, name = a[4:]
         assert flag.startswith('--property=') and name in units
@@ -168,6 +169,24 @@ def command(*a, data=None):
             if scenario == 'invalid-candidate': raise Refusal('CANDIDATE_INVALID')
         return b''
     if a == ('/usr/sbin/nft', '-c', '-f', '-'): return b''
+    if scenario == 'apply-quiescent-dependent':
+        if a == ('/usr/bin/stat','-f','--format=%T','/sys/fs/cgroup/system.slice'):
+            return b'cgroup2fs\n'
+        if a == ('/usr/bin/find','-P','/sys/fs/cgroup/system.slice','-mindepth','1','-maxdepth','1',
+                 '-name','xl2tpd.service','-printf','%y\n'):
+            return b'd\n'
+        if a == ('/usr/bin/head','-c','1024','/sys/fs/cgroup/system.slice/xl2tpd.service/cgroup.events'):
+            return b'populated 1\nfrozen 0\n' if group_populated else b'populated 0\nfrozen 0\n'
+        if a == ('/usr/bin/ps','-ww','-e','-o','pid=','-o','comm='):
+            return b'    1 systemd\n   40 ps\n'
+        if a == ('/usr/bin/ss','-H','-aun','sport = :1701'):
+            return b''
+        if a == ('/usr/sbin/ip','-j','-details','link','show'):
+            return b'[{"ifindex":1,"ifname":"lo","link_type":"loopback"}]\n'
+        if a == ('/usr/bin/head','-c','1048577','/proc/self/net/pppol2tp'):
+            l2tp_reads += 1
+            return h['SESSION_L2TP_HEADER'] + (b'\nTUNNEL \'tunl 1\', Y 0\n 00000000 0/0/0 0/0/0\n'
+                                              if l2tp_reads >= lingering_from else b'')
     if a == ('/usr/bin/ss','-H','-lntup'):
         rows = []
         for name, path in [(X,h['MAIN']), (B,h['BRIDGE'])]:
@@ -253,10 +272,12 @@ if scenario.startswith('apply'):
     if scenario == 'apply-quiescent-dependent':
         units[NET].update(ActiveState='failed',SubState='failed',InvocationID='apply-net')
         units[XL].update(ActiveState='inactive',SubState='dead',MainPID='0')
+l2tp_reads, lingering_from, group_populated = 0, float('inf'), False
 side, side_unit = R(h['BRIDGE']), dict(units[B])
 changes.clear()
 testing = True
 req['nodeId'] = f['nodeId']
+if scenario == 'apply-quiescent-dependent': req['transit'] = []
 if scenario == 'foreign-drop': Path(h['DROP_DIR'], 'foreign.conf').write_text('untouched')
 if scenario == 'foreign-dep': units[X]['RequiredBy'] += ' ' + B
 if scenario == 'vpn-generation':
@@ -333,7 +354,26 @@ else:
                 raise subprocess.TimeoutExpired([], 7)
             return {'activeSessions': int(census_mode == 'busy'), 'census': 'f' * 64 if census_mode == 'changed' else expected}
         h['collect_session_census'] = census
-    b = wire('remove', baseline=proof['baseline'], **({'expectedCensus': expected} if census_mode else {}))
+    if scenario == 'apply-quiescent-dependent':
+        preview = wire('session-count')
+        assert preview[0] == 0 and preview[2] == '', preview
+        count = json.loads(preview[1])
+        expected = count['census']
+        assert count['activeSessions'] == 0 and len(expected) == 64
+        assert snapshot() == recheck and not changes and not intent.exists()
+        assert l2tp_reads == 2
+        group_populated = True
+        assert wire('session-count') == (70, '', 'DIRECT_SESSION_COUNT_UNPROVED\n') and l2tp_reads == 2
+        group_populated = False
+        lingering_from = l2tp_reads + 1
+        assert wire('session-count') == (70, '', 'DIRECT_SESSION_COUNT_UNPROVED\n')
+        lingering_from = l2tp_reads + 2  # first final sample clean; second sees a residual tunnel
+        assert wire('remove', baseline=proof['baseline'], expectedCensus=expected) == (70, '', 'DIRECT_REMOVE_REFUSED\n')
+        assert l2tp_reads == lingering_from
+        assert snapshot() == recheck and not changes and not intent.exists()
+        lingering_from = float('inf')
+    b = wire('remove', baseline=proof['baseline'], **({'expectedCensus': expected}
+        if census_mode or scenario == 'apply-quiescent-dependent' else {}))
     assert len(censuses) == int(census_mode is not None) and h['DEADLINE'] == deadline
     if scenario in stale or census_mode in ('unknown', 'busy', 'changed'):
         assert b == (70,'','DIRECT_REMOVE_REFUSED\n') and not changes and snapshot() == recheck and not intent.exists()

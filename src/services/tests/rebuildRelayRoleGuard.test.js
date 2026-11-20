@@ -261,7 +261,7 @@ test('mounted role guard and Remove use one estimate, require a current session-
         return {
             ...(!missingCounter && { async readSessionCount(input) {
                 events.push('count');
-                assert.deepEqual(input, { nodeId: id, backupId, network });
+                assert.deepEqual(input, { nodeId: id, backupId, network, transit: [] });
                 if (count instanceof Error) throw count;
                 return count;
             } }),

@@ -1595,7 +1595,7 @@ def removal_xray_sockets(rows, pid):
     return owned_sockets(rows, pid)
 
 
-def observe_removal(request):
+def observe_removal(request, *, quiescent=False):
     bad = 'ROLLBACK_DRIFT'
     token, d = request['backupId'], request['network']
     path, manifest, backup = read_manifest(token)
@@ -1632,6 +1632,10 @@ def observe_removal(request):
     if b['ActiveState'] == 'active':
         xray_argv(b, BRIDGE)
     removal_units(units, before, runtime, 'bridge' in profiles)
+    if quiescent:
+        # An inactive unit alone does not prove the supported Apply layout.
+        session_need(rollback_quiescent(units[XL])
+                     and units[X]['InvocationID'] != runtime['invocations'][0])
     policy = network_projection(d, token, removing=True)
     need(policy == {'nft': runtime['nft'], 'rule': True, 'route': True} and policy['nft'] is not None, bad)
     rows = sock_rows()
@@ -1774,8 +1778,10 @@ def remove_installation(request, state):
     if 'expectedCensus' in request:
         # Still under the exclusive DIRECT flock. The prior panel recount and
         # prepare snapshot cannot authorize a write against a now-unknown census.
-        census = session_census({k: request[k] for k in ('machineId', 'nodeId', 'backupId', 'network')})
+        census = session_census({k: request[k] for k in ('machineId', 'nodeId', 'backupId', 'network', 'transit') if k in request})
         session_need(census['activeSessions'] == 0 and census['census'] == request['expectedCensus'])
+        if rollback_quiescent(units[XL]):
+            session_need(census['census'] == quiescent_session_token(state['baseline']))
     # Retain the install manifest unchanged. Durable no-replace intent
     # prevents blind replay even if the first stop's result is unknown.
     REMOVE_ENTERED = True
@@ -2239,7 +2245,62 @@ def session_census(request):
         DEADLINE = outer_deadline
 
 
+def quiescent_session_sample(request):
+    ready = preflight(request['machineId'])
+    session_need(ready['machineId'] == request['machineId'] and ready['ppp'])
+    state = observe_removal(request, quiescent=True)
+    xl = state['units'][XL]
+    session_need(xl['ControlGroup'] in ('', SESSION_GROUP))
+    # KillMode and systemd's PID zero are not an inventory. Prove the actual
+    # kernel group absent, or recursively empty. ps can omit cgroup metadata.
+    group = '/sys/fs/cgroup' + SESSION_GROUP
+    parent, name = os.path.split(group)
+    session_need(command('/usr/bin/stat', '-f', '--format=%T', parent, quiet=True) == b'cgroup2fs\n')
+    group_type = command('/usr/bin/find', '-P', parent, '-mindepth', '1', '-maxdepth', '1',
+                         '-name', name, '-printf', '%y\n', quiet=True)
+    session_need(group_type in (b'', b'd\n'))
+    if group_type:
+        events = command('/usr/bin/head', '-c', '1024', group + '/cgroup.events', quiet=True)
+        session_need(events == b'populated 0\nfrozen 0\n')
+    # Also refuse stray stock processes outside the native service cgroup.
+    tasks = command('/usr/bin/ps', '-ww', '-e', '-o', 'pid=', '-o', 'comm=', quiet=True)
+    has_observer = False
+    for line in tasks.splitlines():
+        fields = line.strip().split(None, 1)
+        session_need(len(fields) == 2 and fields[0].isdigit() and fields[1] not in (b'xl2tpd', b'pppd', b'-', b'?'))
+        has_observer |= fields[1] == b'ps'
+    session_need(has_observer and all(remove_generation(p) is None for p in (
+        '/run/xl2tpd.pid', '/run/xl2tpd/l2tp-control'))
+        and not any(re.fullmatch(r'ppp.*\.pid', name) for name in os.listdir('/run')))
+    # Unlike the Remove listener check, examine connected UDP sockets too.
+    session_need(not command('/usr/bin/ss', '-H', '-aun', 'sport = :1701', quiet=True).strip())
+    links = json.loads(command('/usr/sbin/ip', '-j', '-details', 'link', 'show', quiet=True))
+    link_types = set()
+    session_need(type(links) is list)
+    for row in links:
+        session_need(isinstance(row, dict) and type(row.get('link_type')) is str)
+        link_types.add(row['link_type'])
+    session_need('loopback' in link_types and 'ppp' not in link_types)  # includes renamed PPP netdevs
+    # Require the actual empty kernel table, not ENOENT or a filtered empty
+    # set of sessions: even a leftover tunnel without a call blocks Remove.
+    native = command('/usr/bin/head', '-c', '1048577', '/proc/self/net/pppol2tp', quiet=True)
+    session_need(native == SESSION_L2TP_HEADER)
+    session_need(all(unit(name) == info for name, info in state['units'].items()))
+    no_jobs(UNITS)
+    return state['baseline'], group_type
+
+
+def quiescent_session_token(baseline):
+    return digest(encode(['ppp-quiescent-v1', baseline]))
+
+
 def collect_session_census(request):
+    if rollback_quiescent(unit(XL)):
+        snapshot = quiescent_session_sample(request)
+        session_need(quiescent_session_sample(request) == snapshot)
+        if time.monotonic() >= DEADLINE:
+            raise subprocess.TimeoutExpired([], 0)
+        return {'activeSessions': 0, 'census': quiescent_session_token(snapshot[0])}
     libc = ctypes.CDLL(None, use_errno=True)
     owner = session_owner(request)
     group_path = '/sys/fs/cgroup' + SESSION_GROUP
@@ -2276,7 +2337,9 @@ def collect_session_census(request):
 
 
 def read_session_count(request):
-    session_need(set(request) == {'action', 'machineId', 'nodeId', 'backupId', 'network'}
+    keys = {'action', 'machineId', 'nodeId', 'backupId', 'network'}
+    session_need(keys <= set(request) <= keys | {'transit'}
+                 and ('transit' not in request or type(request['transit']) is list)
                  and re.fullmatch(r'[a-f0-9]{32}', request['machineId']) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
                  and re.fullmatch(r'[a-f0-9]{32}', request['backupId']))
     routing(request['network'])

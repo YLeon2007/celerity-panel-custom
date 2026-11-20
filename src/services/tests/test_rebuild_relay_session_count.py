@@ -384,6 +384,7 @@ class SessionCount(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp, patch.dict(self.g, {
             'directory': directory, 'SESSION_GROUP': temp.removeprefix('/sys/fs/cgroup'), 'session_fs': lambda *_: None,
+            'unit': lambda _: {'ActiveState': 'active', 'SubState': 'running', 'MainPID': str(pid)},
             'session_owner': lambda _: self.owner, 'session_sample': observation, 'DEADLINE': time.monotonic() + 10,
         }), patch('os.lstat', wraps=os.lstat) as stat_call:
             actual = os.stat(temp)

@@ -208,12 +208,16 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         preflight: () => serial(preflight),
         readSessionCount: input => serial(async () => {
             const invalid = 'SESSION_COUNT_INPUT_INVALID';
-            requireThat(input?.nodeId === nodeId && Object.keys(input).length === 3
+            requireThat(input?.nodeId === nodeId
                 && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(input, key))
+                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit'].includes(key))
+                && (!Object.hasOwn(input, 'transit') || Array.isArray(input.transit))
                 && input.backupId?.length === 32 && tokenMatches(TOKEN, input.backupId), invalid);
             const { backupId } = input;
             const network = removeNetwork(input.network, invalid);
-            return exec('session-count', { nodeId, backupId, network }, false, reply => reply
+            const params = { nodeId, backupId, network,
+                ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
+            return exec('session-count', params, false, reply => reply
                 && Object.keys(reply).length === 2 && integer(reply.activeSessions, 0, Number.MAX_SAFE_INTEGER)
                 && reply.census?.length === 64 && tokenMatches(PIN, reply.census));
         }),

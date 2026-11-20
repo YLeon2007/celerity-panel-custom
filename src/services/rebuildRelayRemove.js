@@ -118,6 +118,12 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     if (phase === 'preview') {
                         const accountCount = await readAccountCount(User, id);
                         const input = { nodeId: id, backupId: state.backupId, network };
+                        let transitProved = true;
+                        // The stopped-path proof uses the same applied listener
+                        // ownership as Remove. Missing link proof needn't hide a
+                        // live PPP count, but it cannot authorize confirmation.
+                        try { if (Link) input.transit = await readAppliedTransit(Link, id); }
+                        catch { transitProved = false; }
                         await authority();
                         let census = null;
                         try {
@@ -130,6 +136,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             }
                             remote = undefined;
                         }
+                        if (!transitProved && census?.activeSessions === 0) census = null;
                         let account;
                         if (accountCount === 1 && census?.activeSessions === 0) {
                             try { account = ownedAccount(await users(), state, id); } catch { /* No removal authority. */ }
@@ -175,7 +182,8 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         throw fail('REBUILD_L2TP_REMOVE_BACKEND_UNAVAILABLE');
                     }
                     if (proof) {
-                        const census = await readSessionCensus(remote, { nodeId: id, backupId: state.backupId, network });
+                        const census = await readSessionCensus(remote, { nodeId: id, backupId: state.backupId, network,
+                            ...(transit && { transit }) });
                         if (!census) throw fail(COUNT_UNAVAILABLE);
                         if (census.activeSessions !== 0) throw fail(SESSIONS_BUSY);
                         if (census.census !== proof.census) throw fail(PREVIEW_CHANGED);
