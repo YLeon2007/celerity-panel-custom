@@ -23,7 +23,7 @@ const installed = { id, name: hostile, ip: '192.0.2.42', status: 'installed', bo
     canRemove: true, canRevealPsk: true, psk: 'SERVER-ONLY-PSK', pskEncrypted: 'SERVER-ONLY-ENCRYPTED' };
 const fresh = { id: otherId, name: 'East', ip: '192.0.2.43', status: 'not_installed', bound: true, canInstall: true,
     canRemove: false, canRevealPsk: false };
-const account = { login: 'alice.test', enabled: true, consistent: true, password: 'SERVER-ONLY-PASSWORD',
+const account = { login: 'alice.test', enabled: true, consistent: true, canRevealPassword: true, password: 'SERVER-ONLY-PASSWORD',
     addresses: [{ id, ip: '10.66.0.42' }, { id: otherId, ip: '10.67.0.42' }] };
 const unsafeAccount = { login: hostile, enabled: false, consistent: false, addresses: [{ id, ip: hostile }] };
 
@@ -49,6 +49,12 @@ test('rebuild L2TP SSR composes with layout and does not serialize private or un
     assert.ok(layout.includes(`${route}/${otherId}/l2tp/install`));
     const { content } = await render('en', { relays: [{ ...installed, id: '../odd#id?x=1' }], accounts: [] });
     assert.doesNotMatch(content, /\/panel\/nodes\/\.\.|data-secret-url=|data-install-url=/);
+});
+
+test('a read-only singleton exposes password reveal but no account mutation controls', async () => {
+    const { content } = await render('en', { canManageAccounts: false, accounts: [{ ...account, login: 'relay-bootstrap' }] });
+    assert.ok(content.includes(`${route}/l2tp/accounts/reveal`));
+    assert.doesNotMatch(content, /data-create|data-account-action|SERVER-ONLY-PASSWORD/);
 });
 
 test('renders EN, RU and English fallback for every relay status and fails closed for missing binding and load error', async () => {

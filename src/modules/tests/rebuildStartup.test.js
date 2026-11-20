@@ -8,23 +8,16 @@ const entry = path.resolve(__dirname, '../../../index.js');
 const probe = `
 const assert = require('node:assert/strict');
 const Module = require('node:module');
-const fs = require('node:fs');
-const originalRead = fs.readFileSync;
-fs.readFileSync = function(filename, ...args) {
-    if (typeof filename === 'string' && filename.endsWith('/views/rebuild-l2tp.ejs')) {
-        return '<main id="startup-rebuild-overview"><%= page %>:<%= relays.length %></main>';
-    }
-    return originalRead.call(this, filename, ...args);
-};
 const noIO = name => () => assert.fail('unexpected ' + name);
 const net = require('node:net');
 net.Socket.prototype.connect = noIO('network connect');
 net.Server.prototype.listen = noIO('network listen');
 const http = require('node:http');
 const { EventEmitter } = require('node:events');
-const requests = (app, method, url) => new Promise(resolve => {
+const requests = (app, method, url, headers = {}, body) => new Promise(resolve => {
     const req = new http.IncomingMessage(new net.Socket());
-    Object.assign(req, { url, method, session: { authenticated: true }, sessionID: 'startup-fixture' });
+    Object.assign(req, { url, method, headers, session: { authenticated: true }, sessionID: 'startup-fixture' });
+    if (body) req.push(body);
     req.push(null);
     const res = new http.ServerResponse(req);
     res.end = bytes => resolve({ status: res.statusCode, body: String(res.getHeader('content-type')).startsWith('application/json')
@@ -37,6 +30,8 @@ const cron = new Map();
 const startup = [];
 let connect;
 let overviewLoads = 0;
+let secretReads = 0;
+const relay = 'a'.repeat(24);
 Module._load = function(id, parent) {
     if (id === 'dotenv') return { config() {
         if (process.env.DUMMY_DOTENV_CONFLICT) process.env.L2TP_MIGRATIONS_ENABLED = 'true';
@@ -62,7 +57,15 @@ Module._load = function(id, parent) {
     if (id === './src/services/accessLogs/processService') return { start() { startup.push('access-logs'); } };
     if (id === '../../services/rebuildL2tpOverview') {
         overviewLoads++;
-        return { createRebuildL2tpOverview: () => ({ overview: async () => ({ relays: [], accounts: [], canManageAccounts: false }) }) };
+        return { createRebuildL2tpOverview: () => ({
+            overview: async () => ({
+                relays: [{ id: relay, name: 'Fixture relay', ip: '192.0.2.27', status: 'installed', bound: true, canRemove: true, canRevealPsk: true }],
+                accounts: [{ login: 'fixture.user', enabled: true, consistent: true, canRevealPassword: true, addresses: [{ id: relay, ip: '10.66.0.8' }] }],
+                canManageAccounts: true,
+            }),
+            revealPassword: () => { secretReads++; return 'reveal-fixture-only'; },
+            revealPsk: () => { secretReads++; return 'reveal-fixture-only'; },
+        }) };
     }
     if (id === '../../models/settingsModel' && parent?.filename.endsWith('/routes/panel/rebuildL2tp.js')) {
         return { findById: () => ({ select: () => ({ lean: async () => ({ deployment: { completed: true } }) }) }) };
@@ -141,10 +144,24 @@ async function verify(app) {
     await assertBlocked('GET', '/panel/nodes/dummy/l2tp/status');
     await assertBlocked('POST', '/panel/nodes/dummy/l2tp/install');
     assert.equal(overviewLoads, 0, 'stock requests must not load the rebuild overview');
-    const overview = await requests(app, 'GET', '/panel/l2tp');
+    const secretUrl = '/panel/rebuild/relays/l2tp/accounts/reveal';
+    const malformed = '{"login":';
+    const rejected = await requests(app, 'POST', secretUrl, { 'content-type': 'application/json', 'content-length': String(malformed.length) }, malformed);
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.cacheControl, 'no-store');
+    assert.equal(rejected.body.error.code, 'REBUILD_L2TP_REVEAL_INVALID_REQUEST');
+    const preflight = await requests(app, 'OPTIONS', secretUrl, { origin: 'https://unit.example.invalid', 'access-control-request-method': 'POST' });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.cacheControl, 'no-store');
+    const overview = await requests(app, 'GET', '/panel/l2tp', { 'accept-language': 'ru' });
     assert.equal(overview.status, 200);
     assert.equal(overview.cacheControl, 'no-store');
-    assert.ok(overview.body.includes('<main id="startup-rebuild-overview">l2tp:0</main>'));
+    assert.ok(overview.body.includes('id="rebuild-l2tp"'));
+    assert.ok(overview.body.includes('/js/rebuild-l2tp.js'));
+    assert.ok(overview.body.includes('/panel/nodes/' + relay + '#rebuild-l2tp-remove'));
+    assert.ok(overview.body.includes('fixture.user') && overview.body.includes('10.66.0.8'));
+    assert.ok(!overview.body.includes('reveal-fixture-only'));
+    assert.equal(secretReads, 0);
     assert.equal(overviewLoads, 1);
     assert.equal((await requests(app, 'GET', '/health')).status, 200);
     assert.deepEqual(await requests(app, 'GET', '/api/cascade/topology'), {

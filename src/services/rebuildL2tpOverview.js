@@ -24,7 +24,7 @@ const nodeFields = '_id name ip cascadeRole ssh.port ssh.username type active us
 // overrides select:false but is not an allowlist.
 const stateFields = '_id node status desiredState routingMode routingVersion routeGroup operationId activePathKey'
     + ' appliedTopologyRevision pppDriftQueueFence replacementFence secretRevision backupId rebuildInstallToken rebuildMachineId'
-    + ' poolStart installedAt lastVerifiedAt lastSyncAt';
+    + ' poolStart poolEnd installedAt lastVerifiedAt lastSyncAt';
 const userFields = '_id relayNode login ip enabled syncStatus syncOperationId desiredRevision appliedRevision'
     + ' createdAt updatedAt lastSyncedAt createdBy updatedBy';
 const absentState = { status: 'not_installed', desiredState: 'absent' };
@@ -66,6 +66,37 @@ function legacyAccount(row, state) {
         && row.ip === state.poolStart && empty(row.createdBy) && empty(row.updatedBy)
         && stamp(row.createdAt) <= installed && stamp(row.updatedAt) === installed && stamp(row.lastSyncedAt) === installed
         && stamp(state.lastVerifiedAt) === installed && stamp(state.lastSyncAt) === installed;
+}
+
+const bootstrap = 'relay-bootstrap';
+const ipv4 = value => isIPv4(value) ? value.split('.').reduce((n, part) => n * 256 + Number(part), 0) : NaN;
+
+function inventoryMatches(rows, cohort, list) {
+    if (!cohort?.size) return false;
+    if (!list) {
+        if (rows.length !== 1 || !synced(rows[0])) return false;
+        const state = cohort.get(String(rows[0].relayNode));
+        return !!state && legacyAccount(rows[0], state);
+    }
+    const members = new Map([...cohort].map(([id, state]) => [id, { start: ipv4(state.poolStart), end: ipv4(state.poolEnd),
+        logins: new Map(), ips: new Set() }]));
+    for (const row of rows) {
+        const member = members.get(String(row.relayNode));
+        if (!member || !synced(row) || !matches(loginPattern, row.login)) return false;
+        const { start, end, logins, ips } = member;
+        const ip = ipv4(row.ip);
+        if (!(ip >= start && ip <= end) || logins.size >= 2048 || logins.has(row.login) || ips.has(ip)
+            || (row.login === bootstrap && (!row.enabled || ip !== start))) return false;
+        logins.set(row.login, row.enabled);
+        ips.add(ip);
+    }
+    let first;
+    for (const { logins } of members.values()) {
+        if (logins.get(bootstrap) !== true) return false;
+        if (first && !equal(logins, first)) return false;
+        first ??= logins;
+    }
+    return true;
 }
 
 function replicasAgree(rows, cohort, listMode, ciphertext = false) {
@@ -150,9 +181,12 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 canInstall: clear && qualified && !!binding && !withUsers.has(id) && (!state || pristineIds.has(String(state._id))),
                 canRemove: clear && owned.has(id), canRevealPsk: clear && owned.has(id) && hasKey() };
         });
-        const cohort = ownedCohort(states.filter(row => row.status !== 'not_installed' || row.desiredState !== 'absent'), owned, list);
+        const cohort = list ? ownedCohort(states.filter(row => row.status !== 'not_installed' || row.desiredState !== 'absent'), owned, list)
+            : owned.size === 1 ? owned : null;
+        const accountRows = list ? rows : rows.filter(row => owned.has(String(row.relayNode)));
+        const inventoryOk = clear && inventoryMatches(rows.filter(row => owned.has(String(row.relayNode))), cohort, list);
         const grouped = new Map();
-        for (const row of rows) {
+        for (const row of accountRows) {
             if (!matches(loginPattern, row.login)) continue;
             if (!grouped.has(row.login)) grouped.set(row.login, []);
             grouped.get(row.login).push(row);
@@ -164,16 +198,16 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 return state && (list || legacyAccount(row, state));
             });
             if (!visible.length) continue;
+            const consistent = inventoryOk && replicasAgree(copies, cohort, list);
             accounts.push({ login, enabled: visible.every(row => row.enabled === true),
                 // GET can establish membership, sync and enabled agreement,
                 // but intentionally cannot compare the encrypted envelopes.
-                consistent: clear && replicasAgree(copies, cohort, list),
+                consistent, canRevealPassword: consistent && hasKey(),
                 addresses: visible.filter(row => isIPv4(row.ip)).map(row => ({ id: String(row.relayNode), ip: row.ip }))
                     .sort((a, b) => compare(a.id, b.id)) });
         }
         accounts.sort((a, b) => compare(a.login, b.login));
-        return { relays, accounts, canManageAccounts: clear && list && hasKey() && !!cohort
-            && accounts.length > 0 && accounts.every(row => row.consistent) };
+        return { relays, accounts, canManageAccounts: list && hasKey() && inventoryOk && accounts.every(row => row.consistent) };
     }
 
     function passwordCohort(states, nodes, list) {
@@ -190,14 +224,23 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         if (!matches(loginPattern, login)) return null;
         return stableReveal(async () => {
             const list = listMode();
-            const states = await read(State.find({ $nor: [absentState] }).sort('_id'), stateFields);
+            const singleton = env.C3_REBUILD_L2TP_RELAY_ID;
+            if (!list && (!matches(idPattern, singleton) || login !== bootstrap)) return null;
+            const filter = list ? { $nor: [absentState] } : { node: singleton };
+            const states = await read(State.find(filter).sort('_id'), stateFields);
             if (!states.length || states.some(row => !matches(idPattern, String(row.node)))) return null;
             const nodes = await findNodes({ _id: { $in: states.map(row => row.node) } });
-            if (!passwordCohort(states, nodes, list)) return null;
+            const cohort = passwordCohort(states, nodes, list);
+            if (!cohort) return null;
+            const scope = list ? {} : { relayNode: singleton };
+            const inventoryScope = list ? { $or: [{ relayNode: { $in: states.map(row => row.node) } }, { login }] } : scope;
+            const inventory = await read(L2tpUser.find(inventoryScope).sort('_id'), userFields);
+            if (!inventoryMatches(inventory, cohort, list)) return null;
             // An unexpected same-login replica invalidates the account; don't
             // filter down to a good-looking subset of the installed cohort.
-            const copies = await read(L2tpUser.find({ login }).sort('_id'), `${userFields} passwordEncrypted`);
-            return { list, nodes, states, copies };
+            const copies = await read(L2tpUser.find({ ...scope, login }).sort('_id'), `${userFields} passwordEncrypted`);
+            if (!equal(inventory.filter(row => row.login === login), copies.map(({ passwordEncrypted: _, ...row }) => row))) return null;
+            return { list, nodes, states, inventory, copies };
         }, ({ list, states, nodes, copies }) => {
             if (list !== listMode() || !replicasAgree(copies, passwordCohort(states, nodes, list), list, true)) return null;
             return copies[0].passwordEncrypted;

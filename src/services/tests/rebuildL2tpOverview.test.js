@@ -60,7 +60,7 @@ function fixture(t, { legacy = false } = {}) {
         routingMode: FOLLOW_RELAY_MODE, routingVersion: FOLLOW_RELAY_VERSION, secretRevision: 1,
         backupId: String(i + 4).repeat(32), rebuildMachineId: bindings[i].machineId,
         rebuildInstallToken: `12345678-1234-4abc-8123-00000000000${i}`, pskHint: 'fixture-hint',
-        pskEncrypted: encrypt(`fixture-psk-${i + 1}`, key), poolStart: `10.66.${i}.11`, installedAt: stamp,
+        pskEncrypted: encrypt(`fixture-psk-${i + 1}`, key), poolStart: `10.66.${i}.11`, poolEnd: `10.66.${i}.200`, installedAt: stamp,
         lastVerifiedAt: stamp, lastSyncAt: stamp }));
     const passwordEncrypted = encrypt(password, key);
     const users = replicas.map(i => ({ _id: cards[i]._id, relayNode: cards[i]._id, login,
@@ -113,7 +113,7 @@ test('overview uses real model projections, showing only safe relay and per-rela
     assert.deepEqual(result, {
         relays: [relay(idA, 1, 'installed', false, true, true), relay(idB, 2, 'installed', false, true, true),
             relay(idC, 3, 'not_installed', true, false, false)],
-        accounts: [{ login, enabled: true, consistent: true, addresses: [{ id: idA, ip: '10.66.0.11' }, { id: idB, ip: '10.66.1.11' }] }],
+        accounts: [{ login, enabled: true, consistent: true, canRevealPassword: true, addresses: [{ id: idA, ip: '10.66.0.11' }, { id: idB, ip: '10.66.1.11' }] }],
         canManageAccounts: true,
     });
     assert.equal(f.decipher.mock.callCount(), 0);
@@ -145,10 +145,12 @@ test('install affordance reflects static node eligibility, state and residual ac
 
 test('legacy singleton supports display and explicit reads, but not account mutations or list fallback', async t => {
     const f = fixture(t, { legacy: true });
+    f.users.push({ ...f.users[0], _id: oid('d'), relayNode: oid('d') });
     const overview = await f.service.overview();
     assert.equal(overview.canManageAccounts, false);
     assert.equal(overview.accounts.length, 1);
     assert.equal(overview.accounts[0].consistent, true);
+    assert.equal(overview.accounts[0].canRevealPassword, true);
     assert.equal(overview.relays[0].canRevealPsk, true);
     assert.equal(await f.service.revealPassword(login) === password, true);
     assert.equal(await f.service.revealPsk(idA) === 'fixture-psk-1', true);
@@ -161,8 +163,33 @@ test('legacy singleton supports display and explicit reads, but not account muta
     assert.equal(f.decipher.mock.callCount(), 2);
 });
 
+test('legacy singleton does not reveal a bootstrap alongside unknown local accounts', async t => {
+    const f = fixture(t, { legacy: true });
+    f.users.push({ ...f.users[0], _id: oid('d'), login: 'unowned' });
+    assert.equal((await f.service.overview()).accounts[0].canRevealPassword, false);
+    assert.ok((await f.service.revealPassword(login)) === null, 'unexpected legacy reveal');
+    assert.equal(f.decipher.mock.callCount(), 0);
+});
+
+test('list mode requires a settled in-pool replica and enabled bootstrap on each member before reveal', async t => {
+    const f = fixture(t);
+    const [a, b] = f.users;
+    f.users.push({ ...a, _id: oid('d'), login: 'subscriber', ip: '10.66.0.12' },
+        { ...b, _id: oid('e'), login: 'subscriber', ip: '10.77.1.12' });
+    assert.equal((await f.service.overview()).canManageAccounts, false);
+    assert.ok((await f.service.revealPassword('subscriber')) === null, 'unexpected out-of-pool reveal');
+    f.users[3].ip = '10.66.1.12';
+    b.enabled = false;
+    assert.equal((await f.service.overview()).canManageAccounts, false);
+    assert.ok((await f.service.revealPassword('subscriber')) === null, 'unexpected reveal without valid bootstrap');
+    assert.equal(f.decipher.mock.callCount(), 0);
+});
+
 test('explicit reveals decrypt exactly one envelope each, scoped to the requested field', async t => {
     const f = fixture(t);
+    f.users.push({ ...f.users[0], _id: oid('d'), relayNode: oid('c'), login: 'unrelated' });
+    assert.equal((await f.service.overview()).canManageAccounts, true);
+    f.queries.length = 0;
     assert.equal(await f.service.revealPassword(login) === password, true);
     assert.equal(f.decipher.mock.callCount(), 1);
     assert.ok(f.queries.some(({ model, fields }) => model === User && fields.passwordEncrypted === 1));
@@ -180,7 +207,7 @@ test('disabled list replicas can agree without sharing a relay IP or sync revisi
     f.users.push({ ...a, _id: oid('d'), login: 'subscriber', ip: '10.66.0.12', enabled: false, desiredRevision: 2, appliedRevision: 2 },
         { ...b, _id: oid('e'), login: 'subscriber', ip: '10.66.1.17', enabled: false, desiredRevision: 3, appliedRevision: 3 });
     assert.deepEqual((await f.service.overview()).accounts[1], {
-        login: 'subscriber', enabled: false, consistent: true, addresses: [{ id: idA, ip: '10.66.0.12' }, { id: idB, ip: '10.66.1.17' }],
+        login: 'subscriber', enabled: false, consistent: true, canRevealPassword: true, addresses: [{ id: idA, ip: '10.66.0.12' }, { id: idB, ip: '10.66.1.17' }],
     });
     assert.equal(await f.service.revealPassword('subscriber') === password, true);
     assert.equal(f.decipher.mock.callCount(), 1);
@@ -228,7 +255,7 @@ test('overview excludes classic account addresses and reveal is not inferred fro
     delete f.states[1].rebuildInstallToken;
     const result = await f.service.overview();
     assert.equal(result.canManageAccounts, false);
-    assert.deepEqual(result.accounts, [{ login, enabled: true, consistent: false, addresses: [{ id: idA, ip: '10.66.0.11' }] }]);
+    assert.deepEqual(result.accounts, [{ login, enabled: true, consistent: false, canRevealPassword: false, addresses: [{ id: idA, ip: '10.66.0.11' }] }]);
     assert.equal(result.relays[1].status, 'installed');
     assert.equal(result.relays[1].canRemove, false);
     assert.equal(result.relays[1].canRevealPsk, false);

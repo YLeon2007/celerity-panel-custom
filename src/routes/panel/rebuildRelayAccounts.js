@@ -28,7 +28,7 @@ function accountHandler(action, service = createRebuildService) {
             const status = statuses[action], relayCount = result?.relayCount;
             if (result?.executionMode !== 'rebuild' || result.status !== status || result.login !== login
                 || !Number.isSafeInteger(relayCount) || relayCount < 1) {
-                return res.status(409).json({ error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED' } });
+                return res.status(409).json({ error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false } });
             }
             // Only the public receipt crosses this boundary, even if the
             // service starts returning private inventory or transport metadata.
@@ -38,7 +38,8 @@ function accountHandler(action, service = createRebuildService) {
             if (code === invalid) return res.status(400).json({ error: { code } });
             if (blocked.has(code)) return res.status(409).json({ error: { code, retryAllowed: false } });
             if (unavailable.has(code)) return res.status(503).json({ error: { code } });
-            return res.status(409).json({ error: { code: rejected.has(code) ? code : 'REBUILD_L2TP_ACCOUNTS_FAILED' } });
+            if (rejected.has(code)) return res.status(409).json({ error: { code } });
+            return res.status(409).json({ error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false } });
         }
     };
 }

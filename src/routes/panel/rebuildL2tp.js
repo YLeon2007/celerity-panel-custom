@@ -47,6 +47,7 @@ const parseRevealJson = express.json({
 function revealIngress(req, res, next) {
     if (!/^\/panel\//i.test(req.path)) return next();
     const path = req.path.slice('/panel'.length);
+    if (req.method === 'GET' && pagePath.test(path)) return noStore(req, res, next);
     if (!accountPath.test(path) && !pskPath.test(path)) return next();
     res.set('Cache-Control', 'no-store');
     if (req.method !== 'POST') return next();

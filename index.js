@@ -191,6 +191,12 @@ app.use(compression({
     level: 6,
 }));
 
+if (rebuildEnabled) {
+    // Secret reveal requests get a bounded parser and no-store before the
+    // CORS preflight or general body parser can complete the response.
+    app.use(require('./src/routes/panel/rebuildL2tp').revealIngress);
+}
+
 app.use(cors({
     origin: config.BASE_URL,
     credentials: true,

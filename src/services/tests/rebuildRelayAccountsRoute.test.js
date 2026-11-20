@@ -110,7 +110,7 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
         ['create', 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN', 409, { code: 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN', retryAllowed: false }],
         ['create', 'REBUILD_L2TP_ACCOUNTS_OPERATOR_LIST_REQUIRED', 409, { code: 'REBUILD_L2TP_ACCOUNTS_OPERATOR_LIST_REQUIRED' }],
         ['disable', 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE', 503, { code: 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE' }],
-        ['delete', privateDetail, 409, { code: 'REBUILD_L2TP_ACCOUNTS_FAILED' }],
+        ['delete', privateDetail, 409, { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false }],
     ]) {
         failure = code;
         const peer = code.endsWith('OPERATOR_LIST_REQUIRED') ? { ...authorized, ip: '192.0.2.12' } : alternate;
@@ -122,7 +122,7 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
     invalidReceipt = true;
     const malformed = await send('delete', alternate);
     assert.equal(malformed.status, 409);
-    assert.deepEqual(JSON.parse(malformed.body), { error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED' } });
+    assert.deepEqual(JSON.parse(malformed.body), { error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false } });
     invalidReceipt = false;
     // Seven more admitted requests fill the same bucket. Install shares it.
     for (let i = 0; i < 7; i++) {

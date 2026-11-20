@@ -188,7 +188,7 @@ Object.assign(locals, {
             </div>
         </form>
         <% if (typeof rebuildRemoval !== 'undefined' && rebuildRemoval) { %>
-        <details class="form-section">
+        <details class="form-section" id="rebuild-l2tp-remove">
             <summary><%= t('nodes.rebuildRemoveOpen') %></summary>
             <p><%= rebuildRemoval.summary %></p>
             <% if (rebuildRemoval.ticket && typeof csrfToken !== 'undefined' && csrfToken) { %>
@@ -203,6 +203,11 @@ Object.assign(locals, {
                 <p role="status"><%= t(rebuildRemoval.blocked) %></p>
             <% } %>
         </details>
+        <script>
+            if (location.hash === '#rebuild-l2tp-remove') {
+                document.getElementById('rebuild-l2tp-remove').open = true;
+            }
+        </script>
         <% } %>
     </div>
 </div>

@@ -113,7 +113,8 @@ function secretControl(kind, url, index, login) {
                     </tr></thead>
                     <tbody>
                     <% accounts.forEach((account, index) => {
-                        const actionable = available && canManageAccounts === true && account.consistent === true && validLogin(account.login);
+                        const valid = available && account.consistent === true && validLogin(account.login);
+                        const actionable = valid && canManageAccounts === true;
                     %>
                         <tr>
                             <th scope="row"><code><%= account.login %></code></th>
@@ -128,7 +129,7 @@ function secretControl(kind, url, index, login) {
                                 <span class="badge <%= account.enabled ? 'badge-success' : 'badge-secondary' %>"><%= l(account.enabled ? 'enabled' : 'disabled') %></span>
                                 <% if (!account.consistent) { %><div class="text-muted"><%= l('inconsistent') %></div><% } %>
                             </td>
-                            <td><% if (actionable) { secretControl('password', `${accountPath}/reveal`, index, account.login); } %></td>
+                            <td><% if (valid && account.canRevealPassword === true) { secretControl('password', `${accountPath}/reveal`, index, account.login); } %></td>
                             <td>
                                 <% if (actionable && account.login !== 'relay-bootstrap') { %>
                                     <% if (account.enabled === true) { %>
