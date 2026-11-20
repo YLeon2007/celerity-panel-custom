@@ -5,6 +5,7 @@ const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
 const { canInstallRelay } = require('./rebuildRelayAuthorization');
 const { read } = require('./rebuildRelayBackendStore');
+const { readTopology } = require('./rebuildRelayBackend');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -71,7 +72,7 @@ function ownedAccount(rows, state, nodeId) {
     return account;
 }
 
-function createRebuildRelayRemove({ Node, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
+function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
     return async function removeRelay(id) {
         if (typeof id !== 'string' || id.length !== 24 || !/^[a-f0-9]{24}$/.test(id)) throw fail('REBUILD_INVALID_REQUEST');
         const machineId = env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
@@ -117,7 +118,13 @@ function createRebuildRelayRemove({ Node, State, L2tpUser, locks, env, createRel
                     }
                     // No saved MAIN is sent or rebuilt here. The direct driver
                     // prepares subtraction against the current physical profiles.
-                    const plan = await remote.prepareRemove({ nodeId: id, backupId: state.backupId, network });
+                    // Apply may have changed transport listeners since Install.
+                    // Unrelated drafts do not override the applied graph or the
+                    // full HandlerService check for unrecognized inbounds.
+                    const topology = Link && await readTopology(Node, Link, node, env.PANEL_DOMAIN, { appliedOnly: true });
+                    await authority();
+                    const plan = await remote.prepareRemove({ nodeId: id, backupId: state.backupId, network,
+                        ...(topology && { transit: topology.transit ?? [] }) });
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
                     await checkInventory(state, true);
 

@@ -13,15 +13,17 @@ const fail = code => Object.assign(new Error(code), { code });
 const eligible = node => node?.type === 'xray' && node.active === true && node.cascadeRole === 'relay'
     && !node.useCustomConfig && !!isIP(node.ip);
 
-async function readTopology(Node, Link, node, panelDomain) {
+async function readTopology(Node, Link, node, panelDomain, { appliedOnly = false } = {}) {
     const id = String(node._id);
-    const links = await read(Link.find({ $or: [{ active: true }, { rebuildDelete: true }] })
-        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol'));
+    const inventory = await read(Link.find({ $or: [{ active: true }, { rebuildDelete: true }] })
+        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelPort tunnelUuid'));
+    // Offline also describes an applied link whose tunnel is unconfirmed.
+    const applied = link => !link.rebuildDelete && !link.lifecycle && ['deployed', 'online', 'offline'].includes(link.status);
+    const links = appliedOnly ? inventory.filter(applied) : inventory;
     const ids = new Set(componentFor(links, [id]));
     const scoped = links.filter(link => ids.has(String(link.portalNode)) && ids.has(String(link.bridgeNode)));
-    // Offline also describes an applied link whose tunnel is unconfirmed.
     // This is a graph inventory, not evidence that the data plane works.
-    if (scoped.some(link => link.rebuildDelete || link.lifecycle || !['deployed', 'online', 'offline'].includes(link.status))) {
+    if (!appliedOnly && scoped.some(link => !applied(link))) {
         throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
     }
     const peers = ids.size > 1 ? await read(Node.find({ _id: { $in: [...ids].filter(n => n !== id) } })
@@ -31,9 +33,14 @@ async function readTopology(Node, Link, node, panelDomain) {
     }
     const nodes = [node, ...peers];
     const { byNodeId } = compileRebuildGraph({ nodes, links: scoped, affectedNodeIds: [...ids] });
+    const relay = byNodeId.get(id);
+    const transit = [...relay.outgoing.filter(edge => edge.mode === 'reverse'),
+        ...relay.incoming.filter(edge => edge.mode === 'forward' && edge.protocol === 'vless')]
+        .map(({ id: linkId, mode, link }) => ({ linkId, mode, port: link.tunnelPort, uuid: link.tunnelUuid }));
     return {
         controlPlaneAddresses: [...new Set([panelDomain, ...nodes.flatMap(n => [n.ip, n.domain])].filter(Boolean))],
-        carryDomain: byNodeId.get(id).carryDomain,
+        carryDomain: relay.carryDomain,
+        ...(transit.length && { transit }),
     };
 }
 
@@ -64,8 +71,8 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
                 return { ...snapshot, ...topology, ...payload, node, eligible: true, nodeId: id };
             },
             connect: inventory => createRelayDirect({ node: inventory.node, env }),
-            prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain }, remote) =>
-                remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain }),
+            prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit }, remote) =>
+                remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, ...(transit && { transit }) }),
             reserve: (inventory, backupId) => store.reserve({ ...inventory, backupId, machineId }),
             verifyReservation: reservation => store.verifyReservation(reservation),
             finish: (reservation, verifyLock) => store.finish(reservation, verifyLock),
@@ -74,4 +81,4 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
     };
 }
 
-module.exports = { createRebuildRelayBackend };
+module.exports = { createRebuildRelayBackend, readTopology };

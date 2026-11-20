@@ -283,7 +283,13 @@ def run(argv, **kwargs):
         profile = s['running'][X]
         api = next(i for i in profile['inbounds'] if i['tag'] == 'API_INBOUND')
         assert v[2] == f"--server=127.0.0.1:{api['port']}"
-        clients = next(i['settings']['clients'] for i in profile['inbounds'] if i['tag'] == v[3][5:])
+        tag = v[3][5:]
+        s.setdefault('inboundUserCalls', []).append(tag)
+        clients = next(i['settings']['clients'] for i in profile['inbounds'] if i['tag'] == tag)
+        # Real Xray enumerates its email index, not its UUID index.
+        clients = [a for a in clients if a.get('email')]
+        if scenario == 'transit-missing-client' and tag == 'vless-in':
+            return js({})
         if not clients and scenario == 'main':
             return js({})  # protobuf JSON omits empty repeated fields
         if scenario == 'user-rpc-error':

@@ -41,10 +41,38 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         f.links.push({ _id: oid('e'.repeat(24)), portalNode: relay._id, bridgeNode: exit._id,
             tunnelProtocol: 'vmess', tunnelPort: 20443, tunnelUuid: '7b159424-f38c-4869-bbf8-cb426fa00354',
             mode: 'forward', active: true, status: scenario === 'offline' ? 'offline' : 'deployed' });
+        if (scenario === 'transit-forward') {
+            const [link] = f.links;
+            const portal = { ...exit, _id: oid('8'.repeat(24)), cascadeRole: 'portal', ip: '192.0.2.88' };
+            f.nodes.push(portal);
+            f.links.push({ ...link, _id: oid('d'.repeat(24)), portalNode: portal._id, bridgeNode: relay._id,
+                tunnelPort: 20444, tunnelProtocol: 'vless', tunnelSecurity: 'tls', tlsServerName: 'test.invalid' });
+        } else if (scenario.startsWith('transit-') && scenario !== 'transit-foreign') {
+            Object.assign(f.links[0], { mode: 'reverse', tunnelProtocol: 'vless', tunnelSecurity: 'reality',
+                realityDest: 'test.invalid:443', realitySni: ['test.invalid'], realityShortIds: ['0123abcd'],
+                realityPrivateKey: 'fixture-private', realityPublicKey: 'fixture-public' });
+        }
         const usersByNode = { [id]: subscribers };
         const generated = composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode });
         const main = generated.find(row => row.nodeId === id && row.profile === 'main').config;
         const bridge = generated.find(row => row.nodeId === id && row.profile === 'bridge').config;
+        if (scenario === 'transit-drift') {
+            main.inbounds.find(row => row.tag === 'rebuild-rp-conn-eeeeeeee').settings.clients[0].id =
+                '00000000-0000-4000-8000-000000000007';
+        }
+        if (scenario === 'transit-mixed') {
+            main.inbounds.find(row => row.tag === 'rebuild-rp-conn-eeeeeeee').settings.clients.push({
+                email: 'fixture-other', id: '00000000-0000-4000-8000-000000000007',
+            });
+        }
+        if (scenario.startsWith('transit-ambiguous')) {
+            const field = scenario === 'transit-ambiguous-ascii' ? 'Clients' : 'client\u017f';
+            main.inbounds.find(row => row.tag === 'rebuild-rp-conn-eeeeeeee').settings[field] = [];
+        }
+        if (scenario === 'transit-foreign') {
+            main.inbounds.push({ tag: 'rebuild-rp-conn-eeeeeeee', port: 20444, listen: '0.0.0.0', protocol: 'vless',
+                settings: { clients: [{ id: '00000000-0000-4000-8000-000000000007' }] } });
+        }
         if (scenario.startsWith('sidecar')) {
             // Put the stock decision suffix behind an already-owned loopback listener.
             const shared = 'rebuild-relay-ingress', port = 24081;
@@ -186,7 +214,9 @@ module.exports = ({ fixture, id, oid, machineId }) => {
                     assert.equal(state.status, action === 'remove' ? 'removing' : 'installed');
                     assert.equal(f.users.filter(user => String(user.relayNode) === id && user.syncStatus === 'synced').length, 1);
                     const network = Object.fromEntries(['clientCidr', 'tproxyPort', 'fwmark', 'routeTable'].map(key => [key, state[key]]));
-                    assert.deepEqual(request, { action, machineId, nodeId: id, backupId: state.backupId, network,
+                    const transit = scenario === 'transit-ok' ? [{ linkId: String(f.links[0]._id), mode: 'reverse',
+                        port: f.links[0].tunnelPort, uuid: f.links[0].tunnelUuid }] : [];
+                    assert.deepEqual(request, { action, machineId, nodeId: id, backupId: state.backupId, network, transit,
                         ...(action === 'remove' ? { baseline: removeBaseline } : {}) });
                 }
                 const result = spawnSync('/usr/bin/python3', ['-I', '-B', join(__dirname, 'rebuildRelayInstallHost.py'), root, scenario],
@@ -228,6 +258,31 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         return Object.assign(f, { create, actions, refusals, root, before, mainPath, bridgePath, mpath, bpath, bridge,
             bootLink, generated, usersByNode, x, b, xl, ike, net,
             records, writeRecords, removeBaseline: () => removeBaseline,
+        });
+    }
+
+    for (const scenario of ['transit-ok', 'transit-forward', 'transit-missing-client', 'transit-drift',
+        'transit-mixed', 'transit-foreign', 'transit-ambiguous-ascii', 'transit-ambiguous-unicode']) {
+        test(`joined DIRECT: ${scenario}`, async t => {
+            const f = host(t, scenario, { subscribers: [
+                { userId: 'fixture-subscriber', xrayUuid: '00000000-0000-4000-8000-000000000005' },
+            ] });
+            const result = await f.create().installRelay(id).catch(error => error);
+            if (scenario === 'transit-ok' || scenario === 'transit-forward') {
+                assert.equal(result.status ?? result.code, 'installed');
+                assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
+                const current = JSON.parse(fs.readFileSync(f.mpath));
+                assert.deepEqual(current.inbounds.slice(0, -2), JSON.parse(f.before[f.mainPath]).inbounds);
+                assert.ok(f.records().inboundUserCalls.includes('vless-in'));
+                assert.ok(!f.records().inboundUserCalls.some(tag => /^(rebuild-rp-conn-|fwd-hop-)/.test(tag)));
+            } else {
+                assert.equal(result.code, scenario.startsWith('transit-ambiguous')
+                    ? 'REBUILD_L2TP_DIRECT_CANDIDATE_INVALID' : 'REBUILD_L2TP_DIRECT_PROFILE_USERS');
+                assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
+                assert.equal(f.states.length + f.users.length + f.records().effects.length, 0);
+                assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
+                if (scenario === 'transit-foreign') assert.ok(f.records().inboundUserCalls.includes('rebuild-rp-conn-eeeeeeee'));
+            }
         });
     }
 
@@ -352,6 +407,31 @@ module.exports = ({ fixture, id, oid, machineId }) => {
         const service = f.create(applyOptions(t, f));
         assert.equal((await service.installRelay(id)).status, 'installed');
         await laterApply(f, service);
+    });
+
+    test('joined DIRECT: Remove verifies the current transport after Apply and an unrelated draft', async t => {
+        const f = host(t, 'transit-ok', { lifecycle: true, subscribers: [
+            { userId: 'fixture-subscriber', xrayUuid: '00000000-0000-4000-8000-000000000005' },
+        ] });
+        const service = f.create(applyOptions(t, f));
+        const installed = await service.installRelay(id).catch(error => error);
+        assert.equal(status(installed), 'installed', diagnostic(f));
+        const tag = 'rebuild-rp-conn-eeeeeeee';
+        const connector = () => readJson(f.mpath).inbounds.find(row => row.tag === tag);
+        const old = connector();
+        f.links[0].tunnelPort++;
+        await laterApply(f, service);
+        const applied = { ...old, port: f.links[0].tunnelPort };
+        assert.deepEqual(connector(), applied);
+        const draft = { ...f.links[0], _id: oid('d'.repeat(24)), mode: 'forward', tunnelPort: applied.port + 1,
+            status: 'draft' };
+        f.links.push(draft);
+        const removed = await service.removeRelay(id).catch(error => error);
+        assert.equal(status(removed), 'not_installed', diagnostic(f));
+        assert.deepEqual(connector(), applied);
+        assert.deepEqual(f.links[1], draft);
+        assert.ok(f.records().inboundUserCalls.includes('vless-in'));
+        assert.ok(!f.records().inboundUserCalls.includes(tag));
     });
 
     // The pre-enabled control separates the baseline removal path from the

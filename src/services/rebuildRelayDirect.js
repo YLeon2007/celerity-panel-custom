@@ -204,12 +204,13 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             const host = await preflight();
             requireThat(host.ppp && !host.masked && host.unitsLoaded, 'HOST_NOT_READY');
             const network = { clientCidr: d.clientCidr, tproxyPort: d.tproxyPort, fwmark: d.fwmark, routeTable: d.routeTable };
-            const snapshot = await exec('prepare', { network }, false, v => v && tokenMatches(PIN, v.baseline));
+            const topology = input.transit === undefined ? {} : { transit: structuredClone(input.transit) };
+            const snapshot = await exec('prepare', { network, ...topology }, false, v => v && tokenMatches(PIN, v.baseline));
             requireThat(snapshot.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
             const profiles = composeRebuildRelayPair(snapshot, { nodeId, tproxyPort: d.tproxyPort, controlPlaneAddresses,
                 carryDomain, mainSha256: snapshot.mainSha256, bridgeSha256: snapshot.bridgeSha256 });
             const backupId = randomBytes(16).toString('hex');
-            const params = { backupId, baseline: snapshot.baseline, network, files: buildFiles(d, profiles, backupId) };
+            const params = { backupId, baseline: snapshot.baseline, network, ...topology, files: buildFiles(d, profiles, backupId) };
             await exec('check', params, false, v => v?.ok === true);
             const plan = { nodeId, backupId };
             Object.defineProperty(plan, 'getDesired', { value: () => d });
@@ -249,9 +250,12 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             });
         },
         prepareRemove: input => serial(async () => {
-            requireThat(!held && input?.nodeId === nodeId && Object.keys(input).length === 3 && typeof input.backupId === 'string'
+            requireThat(!held && input?.nodeId === nodeId
+                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit'].includes(key))
+                && typeof input.backupId === 'string'
                 && input.backupId.length === 32 && TOKEN.test(input.backupId), 'REMOVE_INPUT_INVALID');
-            const params = { nodeId, backupId: input.backupId, network: removeNetwork(input.network) };
+            const params = { nodeId, backupId: input.backupId, network: removeNetwork(input.network),
+                ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
             const proof = await exec('prepare-remove', params, false, value => exactAck(params.backupId)(value)
                 && value.machineId === machineId && typeof value.baseline === 'string' && value.baseline.length === 64
                 && PIN.test(value.baseline));

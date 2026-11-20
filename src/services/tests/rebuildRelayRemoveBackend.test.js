@@ -146,7 +146,8 @@ test('installed candidate -> removing before dispatch -> verified absence; only 
     f.users.push(other);
     const bridge = { _id: oid(), ip: '192.0.2.6', type: 'xray', active: true, cascadeRole: 'bridge' };
     f.nodes.push(bridge);
-    const link = { _id: oid(), portalNode: oid(id), bridgeNode: bridge._id, mode: 'reverse', status: 'online', active: true };
+    const link = { _id: oid(), portalNode: oid(id), bridgeNode: bridge._id, mode: 'reverse', status: 'online', active: true,
+        tunnelPort: 22001, tunnelUuid: '00000000-0000-4000-8000-000000000008' };
     f.links.push(link);
     f.hooks.remove = async guard => {
         await guard();
@@ -157,7 +158,8 @@ test('installed candidate -> removing before dispatch -> verified absence; only 
     };
     assert.deepEqual(await f.service.removeRelay(id), { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
     assert.deepEqual(f.removeInput, { nodeId: id, backupId, network: { clientCidr: before.clientCidr,
-        tproxyPort: before.tproxyPort, fwmark: before.fwmark, routeTable: before.routeTable } });
+        tproxyPort: before.tproxyPort, fwmark: before.fwmark, routeTable: before.routeTable },
+        transit: [{ linkId: String(link._id), mode: 'reverse', port: link.tunnelPort, uuid: link.tunnelUuid }] });
     assert.deepEqual(f.links, [link]);
     assert.deepEqual(f.users, [other]);
     const [row] = f.states;

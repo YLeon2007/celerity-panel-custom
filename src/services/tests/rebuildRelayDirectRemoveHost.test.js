@@ -235,7 +235,7 @@ h['subprocess'] = types.SimpleNamespace(run=run, PIPE=subprocess.PIPE, DEVNULL=s
 before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stock_units, bridge=None,
               globalFiles={}, installBoot=False, ikeSockets=[],
               sockets=h['owned_sockets'](h['sock_rows'](), units[X]['MainPID']))
-h['observe'] = lambda m,d: before
+h['observe'] = lambda m,d,transit: before
 req = {k: f[k] for k in ('network','backupId','machineId')}
 nft = f'create table inet {h["TABLE"]}\ntable inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
 files = dict(main=f['installed'], nft=nft, **{k: 'secret-fixture-only' for k in ('ike','lns','options','chap','secrets')})

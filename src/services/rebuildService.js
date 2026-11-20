@@ -101,7 +101,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         },req);}finally{await closeAll(transports);}
     }
     const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks,env,createRelayDirect});
-    const removeRelay=createRebuildRelayRemove({Node,State,L2tpUser,locks,env,createRelayDirect});
+    const removeRelay=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks,env,createRelayDirect});
     return {execute,verifyDraftTls,locks,installRelay,removeRelay};
 }
 module.exports={createRebuildService};

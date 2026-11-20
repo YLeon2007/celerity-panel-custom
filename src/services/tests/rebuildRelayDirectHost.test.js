@@ -72,14 +72,14 @@ original_units = {k: dict(v) for k, v in units.items()}
 before = dict(boot='boot-fixture', files={k: h['read'](p) for k, p in names.items()},
               units=original_units, bridge=None, globalFiles={}, sockets=[['tcp', '127.0.0.1', 8080]])
 h['unit'] = lambda name: dict(units[name])
-h['observe'] = lambda machine, d: before
+h['observe'] = lambda machine, d, transit: before
 h['validate_candidate'] = lambda after: None
 policy = dict(nft=None, rule=False, route=False)
 commands = []
 h['network_projection'] = lambda d, t: dict(policy)
 h['nft_projection'] = lambda t: policy['nft']
 h['no_jobs'] = lambda names: None
-h['xray_users'] = lambda record, info, rows: before['sockets']
+h['xray_users'] = lambda record, info, rows, transit: before['sockets']
 h['sock_rows'] = lambda: []
 
 def sc(*args, **kw):

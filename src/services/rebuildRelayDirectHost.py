@@ -282,9 +282,35 @@ def xray_argv(info, path=MAIN):
     return pid
 
 
-def xray_users(config, info, rows):
+def transit_inbounds(data: dict[str, Any], transit: Any) -> dict[str, int]:
+    # The applied graph under the panel's Apply lock supplies these descriptors.
+    # HandlerService lists the email index, not generated anonymous accounts.
+    need(type(transit) is list and len(transit) <= 32, 'PROFILE_USERS')
+    owned: dict[str, int] = {}
+    for edge in transit:
+        need(type(edge) is dict and set(edge) == {'linkId', 'mode', 'port', 'uuid'}
+             and type(edge['linkId']) is str and re.fullmatch(r'[a-f0-9]{24}', edge['linkId'])
+             and edge['mode'] in ('forward', 'reverse') and type(edge['port']) is int and 1 <= edge['port'] <= 65535
+             and type(edge['uuid']) is str and re.fullmatch(r'\S{1,128}', edge['uuid']), 'PROFILE_USERS')
+        suffix = edge['linkId'][-8:]
+        reverse = edge['mode'] == 'reverse'
+        tag = ('rebuild-rp-conn-' if reverse else 'fwd-hop-') + suffix
+        client = {'id': edge['uuid']}
+        if reverse:
+            client['reverse'] = {'tag': 'rebuild-rp-egress-' + suffix}
+        matching = [i for i in data['inbounds'] if i.get('tag') == tag]
+        need(tag not in owned and len(matching) == 1, 'PROFILE_USERS')
+        row = matching[0]
+        need(row.get('protocol') == 'vless' and row.get('listen') == '0.0.0.0'
+             and type(row.get('port')) is int and row['port'] == edge['port']
+             and row.get('settings', {}).get('clients') == [client], 'PROFILE_USERS')
+        owned[tag] = int(row['port'])
+    return owned
+
+
+def xray_users(config, info, rows, transit=None):
     pid = xray_argv(info)
-    data = json.loads(raw(config))
+    data = unique_profile(config) if transit else json.loads(raw(config))
     ib = data['inbounds']
     api = [row for row in ib if row.get('tag') == 'API_INBOUND']
     targets = [row for row in ib if row.get('protocol') == 'vless']
@@ -296,12 +322,17 @@ def xray_users(config, info, rows):
          and data.get('api', {}).get('tag') == 'API' and 'HandlerService' in data['api'].get('services', [])
          and any(p == 'tcp' and a == '127.0.0.1' and n == port and owners == [pid] for p, a, n, owners in rows),
          'PROFILE_USERS')
+    owned = transit_inbounds(data, transit) if transit is not None else {}
     for row in targets:
         tag = row.get('tag', '')
         clients = row.get('settings', {}).get('clients')
         need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', tag) and isinstance(clients, list), 'PROFILE_USERS')
-        # The installed Xray must expose the complete HandlerService list, not
-        # just a count. Refuse dynamic or unrecognised account shapes.
+        if tag in owned:
+            listeners = [owners for p, _, n, owners in rows if p == 'tcp' and n == owned[tag]]
+            need(listeners and all(owners == [pid] for owners in listeners), 'RUNTIME_UNPROVED')
+            continue
+        # Subscriber inventory still requires the full HandlerService list,
+        # not a count. Refuse dynamic or unrecognised account shapes.
         result = json.loads(command(XRAY, 'api', 'inbounduser', '--server=127.0.0.1:' + str(port), '-tag=' + tag,
                                     wait=4, quiet=True))
         # Protobuf JSON can omit an empty repeated field. A nonempty expected
@@ -511,7 +542,7 @@ def boot():
     return open('/proc/sys/kernel/random/boot_id').read(64).strip()
 
 
-def observe(machine, d) -> dict[str, Any]:
+def observe(machine, d, transit=None) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
     ready = preflight(machine)
@@ -565,14 +596,14 @@ def observe(machine, d) -> dict[str, Any]:
          and vpn_empty(allow_socket_policies=bool(ike_sockets)) and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
     need(not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
     STAGE = 'PROFILE_USERS'
-    sockets = xray_users(files['main'], units[X], rows)
+    sockets = xray_users(files['main'], units[X], rows, transit)
     need(sockets, 'RUNTIME_UNPROVED')
     # Project stable unit fields only; systemctl ExecStart includes runtime timestamps.
     unit_pins = {name: {key: units[name].get(key) for key in
                  ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID', 'FragmentPath', 'DropInPaths')}
                  for name in UNITS}
     return dict(boot=boot(), files=files, units=unit_pins, bridge=bridge, sockets=sockets, globalFiles=globals_before,
-                installBoot=install_boot, ikeSockets=ike_sockets)
+                installBoot=install_boot, ikeSockets=ike_sockets, **({'transit': transit} if transit is not None else {}))
 
 
 def candidate(request, before):
@@ -582,7 +613,12 @@ def candidate(request, before):
     bytes_ = {k: base64.b64decode(value, validate=True) for k, value in files.items()}
     need(all(0 < len(value) <= (MAX_FILE if k in ('main', 'bridge') else 1024 * 1024) for k, value in bytes_.items()), 'CANDIDATE_INVALID')
     d, token = request['network'], request['backupId']
-    main = json.loads(bytes_['main'])
+    main = unique_profile({'data': files['main']}) if 'transit' in before else json.loads(bytes_['main'])
+    if 'transit' in before:
+        protected = transit_inbounds(main, before['transit'])
+        original_main = unique_profile(before['files']['main'])
+        need(encode([i for i in main['inbounds'] if i.get('tag') in protected])
+             == encode([i for i in original_main['inbounds'] if i.get('tag') in protected]), 'CANDIDATE_INVALID')
     ppp = [i for i in main['inbounds'] if i.get('tag', '').startswith('relay-l2tp-')]
     owner = json.loads(bytes_['bridge']) if sidecar else main
     handoff = [i for i in owner['inbounds'] if i.get('tag') == 'rebuild-relay-ingress']
@@ -728,7 +764,7 @@ def installed_runtime(d, token, before, after):
          'RUNTIME_UNPROVED')
     rows = sock_rows()
     pid = xray_argv(x)
-    sockets = xray_users(after['main'], x, rows)
+    sockets = xray_users(after['main'], x, rows, before.get('transit'))
     need(set(tuple(s) for s in before['sockets']) <= set(tuple(s) for s in sockets)
          and x['InvocationID'] != before['units'][X]['InvocationID'], 'RUNTIME_UNPROVED')
     bridge_info = unit(B) if sidecar else None
@@ -860,7 +896,7 @@ def rollback(request, path, old_manifest, backup):
             need(info['FragmentPath'] == before['units'][n]['FragmentPath'] and not info.get('DropInPaths'), 'ROLLBACK_DRIFT')
             if working(info):
                 original_invocation = info['InvocationID'] == before['units'][n]['InvocationID']
-                xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows())
+                xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows(), before.get('transit'))
         if n == B and working(info):
             xray_argv(info, BRIDGE)
     backup['phase'] = 'rolling-back'
@@ -921,7 +957,7 @@ def rollback(request, path, old_manifest, backup):
     if restored_ike:
         need(idle_ike(unit(IKE), rows) == restored_ike, 'RUNTIME_UNPROVED')
     reserved = (1701, d['tproxyPort']) if restored_ike else (500, 4500, 1701, d['tproxyPort'])
-    need(xray_users(before['files']['main'], unit(X), rows) == before['sockets'] and
+    need(xray_users(before['files']['main'], unit(X), rows, before.get('transit')) == before['sockets'] and
          not any(port in reserved for p, a, port, owners in rows), 'RUNTIME_UNPROVED')
     backup['phase'] = 'rolled-back'
     write(path, rolling, entry(encode(backup)))
@@ -930,8 +966,8 @@ def rollback(request, path, old_manifest, backup):
 def unique_profile(record):
     def unique(pairs):
         result = dict(pairs)
-        # Go's struct parser also accepts case-insensitive field aliases.
-        need(len({k.lower() for k, _ in pairs}) == len(pairs), 'CANDIDATE_INVALID')
+        # Go's struct parser folds Unicode aliases too (e.g. long s → s).
+        need(len({k.casefold() for k, _ in pairs}) == len(pairs), 'CANDIDATE_INVALID')
         return result
 
     def invalid(_):
@@ -1337,7 +1373,8 @@ def observe_removal(request):
     rows = sock_rows()
     removal_vpn_runtime(rows, units)
     reserved = removal_sockets(rows, units, d, handoff, handoff_unit)
-    xray_users(current['main'], units[X], rows)
+    transit = request.get('transit', before.get('transit'))
+    xray_users(current['main'], units[X], rows, transit)
     sockets = [row for row in removal_xray_sockets(rows, units[X]['MainPID']) if row[2] not in reserved]
     bridge_sockets = removal_xray_sockets(rows, b['MainPID'])
     binary = remove_generation(XRAY)
@@ -1346,12 +1383,13 @@ def observe_removal(request):
     baseline = digest(encode([request['nodeId'], digest(raw(manifest)), manifest_generation, generations, boot_enrollment,
                               current['main'], {k: digest(raw(v)) for k, v in profiles.items()}, binary,
                               side, side_generation, units, policy, sockets, bridge_sockets, sorted(reserved),
-                              handoff, handoff_unit]))
+                              handoff, handoff_unit, transit]))
     return dict(baseline=baseline, intent=intent, path=path, manifest=manifest, before=before, current=current,
                 profiles=profiles, units=units, side=side, side_generation=side_generation, sockets=sockets,
                 bridge_sockets=bridge_sockets, retained_handoff=handoff if handoff_unit == B else None,
                 reserved=reserved, policy=policy, generations=generations, binary=binary,
-                boot_enrollment=boot_enrollment, ike_sockets=original_ike, manifest_generation=manifest_generation)
+                boot_enrollment=boot_enrollment, ike_sockets=original_ike, manifest_generation=manifest_generation,
+                transit=transit)
 
 
 def removal_owned_dirs():
@@ -1429,7 +1467,7 @@ def removal_xray_ready(state, split):
         need(not any(n in state['reserved'] for _, _, n, _ in rows), 'RUNTIME_UNPROVED')
         try:
             need(x['InvocationID'] != state['units'][X]['InvocationID']
-                 and xray_users(state['profiles']['main'], x, rows) == state['sockets']
+                 and xray_users(state['profiles']['main'], x, rows, state.get('transit')) == state['sockets']
                  and removal_xray_sockets(rows, x['MainPID']) == state['sockets'], 'RUNTIME_UNPROVED')
             b = removal_bridge_unit(state, restarted=split)
             removal_bridge_sockets(state, rows, b)
@@ -1566,7 +1604,8 @@ def remove_installation(request, state):
     removal_bridge_sockets(state, rows, final_b)
     profiles_unchanged()
     need(all(final_x[k] == x[k] and final_b[k] == b[k] for k in ('InvocationID', 'MainPID'))
-         and xray_users(profiles['main'], final_x, rows) == sockets and removal_xray_sockets(rows, final_x['MainPID']) == sockets
+         and xray_users(profiles['main'], final_x, rows, state.get('transit')) == sockets
+         and removal_xray_sockets(rows, final_x['MainPID']) == sockets
          and not any(n in absent for _, _, n, _ in rows)
          and network_projection(d, token, removing=True) == {'nft': None, 'rule': False, 'route': False}
          and vpn_empty(allow_socket_policies=restore_ike) and read(state['path'], 2 * MAX_FILE) == state['manifest'] and before['boot'] == boot()
@@ -1594,8 +1633,10 @@ def dispatch(request: dict[str, Any]):
         if action in ('prepare-remove', 'remove'):
             token = request['backupId']
             keys = {'action', 'machineId', 'backupId', 'network', 'nodeId'}
+            keys |= {'baseline'} if action == 'remove' else set()
             need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
-                 and set(request) == (keys | {'baseline'} if action == 'remove' else keys), 'CANDIDATE_INVALID')
+                 and keys <= set(request) <= keys | {'transit'}
+                 and ('transit' not in request or type(request['transit']) is list), 'CANDIDATE_INVALID')
             state = observe_removal(request)
             if action == 'prepare-remove':
                 STAGE = 'CANDIDATE_INVALID'
@@ -1604,8 +1645,10 @@ def dispatch(request: dict[str, Any]):
             need(state['baseline'] == request['baseline'], 'BASELINE_CHANGED')
             remove_installation(request, state)
             return {'ok': True, 'backupId': token, 'removed': True}
+        transit = request.get('transit')
+        need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
         if action == 'prepare':
-            before = observe(machine, d)
+            before = observe(machine, d, transit)
             main = raw(before['files']['main'])
             bridge = raw(before['bridge']) if before['bridge'] is not None else None
             return {**ready, 'baseline': digest(encode(before)), 'main': main.decode(), 'mainSha256': digest(main),
@@ -1613,12 +1656,12 @@ def dispatch(request: dict[str, Any]):
         token = request['backupId']
         need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{64}', request['baseline']), 'CANDIDATE_INVALID')
         if action in ('check', 'install'):
-            before = observe(machine, d)
+            before = observe(machine, d, transit)
             need(digest(encode(before)) == request['baseline'], 'BASELINE_CHANGED')
             after = candidate(request, before)
             validate_candidate(after)
             if action == 'install':
-                need(observe(machine, d) == before, 'BASELINE_CHANGED')
+                need(observe(machine, d, transit) == before, 'BASELINE_CHANGED')
                 NO_INSTALL_WRITES = False
                 install(request, before, after)
         else:
