@@ -126,6 +126,8 @@ network, token = f['network'], f['backupId']
 policy = {'nft': False, 'rule': False, 'route': False}
 changes, checks = [], []
 testing = False
+udp_address, udp_port = '192.0.2.19', 54453
+after_preview = False
 
 def sc(*args):
     cmd, *rest = args
@@ -207,13 +209,27 @@ def command(*a, data=None):
                 rows.append(('tcp',i.get('listen','0.0.0.0'),i['port'],units[name]['MainPID']))
                 if i['tag'].startswith('relay-l2tp-') or i['protocol'] == 'socks':
                     rows.append(('udp',i.get('listen','0.0.0.0'),i['port'],units[name]['MainPID']))
+                if i['tag'] == 'retained-udp':
+                    assert name == X and i['port'] == udp_port and i['listen'] == udp_address
+                    assert i['protocol'] == 'dokodemo-door' and i['settings']['network'] == ['tcp','udp']
+                    if not (testing and scenario == 'udp-missing-preview'):
+                        wrong_address = testing and scenario == 'udp-wrong-address-final' and not policy['nft']
+                        rows.append(('udp','192.0.2.20' if wrong_address else udp_address,udp_port,units[X]['MainPID']))
         for name, ports in [(XL,[1701]), (IKE,[500,4500])]:
             if units[name]['ActiveState'] == 'active':
                 rows.extend(('udp','0.0.0.0',port,units[name]['MainPID']) for port in ports)
         if testing and scenario == 'foreign-listener': rows.append(('tcp','0.0.0.0',network['tproxyPort'],'999'))
         if testing and scenario == 'lingering-listener' and ('restart', X) in changes:
             rows.append(('tcp','0.0.0.0',network['tproxyPort'],'999'))
-        return ''.join(f'{proto} LISTEN 0 0 {addr}:{port} 0.0.0.0:* users:(("fixture",pid={pid},fd=3))\n'
+        if testing and scenario == 'udp-wrong-owner-preview':
+            rows.append(('udp',udp_address,udp_port,'999'))
+        if testing and scenario == 'udp-outbound-preview' and not after_preview:
+            # This can even share the configured port on a distinct local address.
+            rows.extend([('udp','192.0.2.20',udp_port,units[X]['MainPID']), ('udp','0.0.0.0',21153,units[X]['MainPID'])])
+        if testing and scenario == 'udp-outbound-restart':
+            ports = (54001, 21153) if ('restart',X) not in changes else ((54002,) if policy['nft'] else (21154,))
+            rows.extend(('udp','0.0.0.0',port,units[X]['MainPID']) for port in ports)
+        return ''.join(f'{proto} {"UNCONN" if proto == "udp" else "LISTEN"} 0 0 {addr}:{port} 0.0.0.0:* users:(("fixture",pid={pid},fd=3))\n'
                        for proto,addr,port,pid in rows).encode()
     if len(a) == 5 and a[:3] == (h['XRAY'],'api','inbounduser') and a[-1].startswith('-tag='):
         tag = a[-1].split('=',1)[1]
@@ -330,7 +346,11 @@ def snapshot():
 initial = snapshot()
 a = wire('prepare-remove')
 assert snapshot() == initial and not changes and not intent.exists()
-if scenario in ('foreign-drop','foreign-dep','vpn-generation','foreign-ike','foreign-rule','foreign-listener', 'dynamic-user','ambiguous',
+if scenario in ('udp-missing-preview','udp-wrong-owner-preview'):
+    assert a == (70, '', 'DIRECT_RUNTIME_UNPROVED\n'), a
+elif scenario == 'udp-unproved-transport':
+    assert a == (70, '', 'DIRECT_CANDIDATE_INVALID\n'), a
+elif scenario in ('foreign-drop','foreign-dep','vpn-generation','foreign-ike','foreign-rule','foreign-listener', 'dynamic-user','ambiguous',
                 'ambiguous-shared','duplicate-json','nft-drift','invalid-candidate','active-ppp','wrong-network','wrong-node',
                 'wrong-machine','missing-manifest'):
     assert a[0] == 70 and a[1] == '' and a[2].startswith('DIRECT_'), a
@@ -340,6 +360,10 @@ else:
     assert a[0] == 0 and a[2] == '', a
     proof = json.loads(a[1])
     assert set(proof) == {'ok','machineId','backupId','baseline'}
+    if scenario == 'udp-outbound-preview':
+        after_preview = True
+        assert wire('prepare-remove') == a, 'outbound UDP changed the Remove baseline'
+        assert snapshot() == initial and not changes and not intent.exists()
     stale = {'stale-main': Path(P['main']), 'apply-stale-bridge': Path(h['BRIDGE']), 'stale-manifest': manifest}
     if scenario in stale:
         p = stale[scenario]
@@ -402,6 +426,9 @@ else:
         assert b == (75,'','') and intent.is_file(), b
         assert policy['route'] and policy['nft']
         assert wire('prepare-remove')[0] != 0
+    elif scenario == 'udp-wrong-address-final':
+        assert b == (75,'','') and intent.is_file(), b
+        assert not any(policy.values())  # readiness passed; the final listener proof did not
     else:
         assert b[0] == 0 and b[2] == '' and json.loads(b[1]) == dict(ok=True, backupId=token, removed=True), (b, changes)
         if scenario == 'xl-stop-failed':
@@ -425,12 +452,28 @@ for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-m
     'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route',
     'xl-stop-failed', 'xl-stop-nonzero', 'xl-stop-timeout', 'xl-stop-job', 'xl-stop-live-pid',
     'xl-reset-job', 'xl-reset-live-pid', 'ike-stop-failed',
-    'census-idle', 'census-unknown', 'census-busy', 'census-changed', 'census-timeout']) {
+    'census-idle', 'census-unknown', 'census-busy', 'census-changed', 'census-timeout',
+    'udp-outbound-preview', 'udp-outbound-restart', 'udp-missing-preview', 'udp-wrong-owner-preview', 'udp-wrong-address-final',
+    'udp-unproved-transport']) {
     test(`direct remove fixture: ${scenario}`, () => {
         const dir = mkdtempSync(join(process.cwd(), '.direct-remove-fixture-'));
         try {
+            const stock = JSON.parse(old);
+            if (scenario.startsWith('udp-')) stock.inbounds.push({ tag: 'retained-udp',
+                listen: '192.0.2.19', port: 54453, protocol: 'dokodemo-door',
+                settings: { network: ['tcp', 'udp'], address: '127.0.0.1', port: 53 } });
+            if (scenario === 'udp-unproved-transport') {
+                stock.inbounds.find(i => i.protocol === 'vless').streamSettings = {
+                    network: 'xhttp', security: 'tls', tlsSettings: { alpn: ['h3'] },
+                };
+            }
+            const main = scenario.startsWith('udp-') ? JSON.stringify(stock) : old;
+            const withUdp = main === old ? installed : composeRebuildRelayMain({ main, bridge: null }, {
+                nodeId, controlPlaneAddresses: controls, carryDomain: false, tproxyPort: network.tproxyPort,
+                mainSha256: sha(main), bridgeSha256: null,
+            });
             const result = spawnSync('python3', ['-I', '-B', '-c', fixture, join(__dirname, '../rebuildRelayDirectHost.py'), dir, scenario],
-                { input: JSON.stringify({ old, installed, applied, expected, network, backupId, nodeId, machineId }), encoding: 'utf8', timeout: 10000 });
+                { input: JSON.stringify({ old: main, installed: withUdp, applied, expected, network, backupId, nodeId, machineId }), encoding: 'utf8', timeout: 10000 });
             assert.equal(result.status, 0, result.stderr || result.error?.message);
             assert.equal(result.stdout, 'ok\n');
         } finally { rmSync(dir, { recursive: true, force: true }); }

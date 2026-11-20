@@ -1619,6 +1619,90 @@ def removal_xray_sockets(rows, pid):
     return owned_sockets(rows, pid)
 
 
+def removal_udp_endpoints(profile):
+    # Read the admitted post-Remove profile, not a port range or the current
+    # socket inventory. TPROXY and the handoff are checked separately.
+    bad = 'CANDIDATE_INVALID'
+
+    def fields(obj):
+        # unique_profile has already rejected case-folded duplicate keys.
+        need(type(obj) is dict, bad)
+        return {k.casefold(): v for k, v in obj.items()}
+
+    def string_list(value):
+        if type(value) is str:
+            return value.split(',')
+        need(type(value) is list and all(type(v) is str for v in value), bad)
+        return value
+
+    config = unique_profile(profile)
+    need(not fields(config).get('transport'), bad)
+    endpoints = set()
+    for row in config['inbounds']:
+        inbound = fields(row)
+        stream = fields(inbound.get('streamsettings', {}))
+        transport = stream.get('network', 'tcp')
+        need(stream.get('method') is None and type(transport) is str, bad)
+        transport = transport.lower()
+        if transport in ('xhttp', 'splithttp'):
+            # Xray's splithttp listener uses UDP for TLS ALPN ["h3"].
+            # Do not project an unreviewed transport as TCP-only.
+            security = stream.get('security', 'none')
+            need(type(security) is str and security.lower() in ('', 'none', 'reality', 'tls'), bad)
+            if security.lower() == 'tls':
+                alpn = string_list(fields(stream.get('tlssettings', {})).get('alpn', []))
+                need('h3' not in alpn, bad)
+        else:
+            need(transport in ('tcp', 'raw', 'ws', 'websocket', 'grpc', 'httpupgrade'), bad)
+
+        protocol = inbound.get('protocol')
+        if protocol == 'vless':
+            continue  # proxied UDP over a stream does not imply a UDP bind
+        settings = fields(inbound.get('settings', {}))
+        if protocol == 'socks':
+            # UDP ASSOCIATE is a fixed bind in older cores but per-session
+            # in newer cores. Only the separately guarded handoff is supported.
+            need(settings.get('udp', False) is False, bad)
+            continue
+        need(protocol == 'dokodemo-door', bad)
+        # DokodemoConfig.Network overrides AllowedNetwork; nil defaults to TCP.
+        networks = settings.get('network')
+        if networks is None:
+            networks = settings.get('allowednetwork')
+        networks = ['tcp'] if networks is None else [v.lower() for v in string_list(networks)]
+        need(networks and set(networks) <= {'tcp', 'udp'}, bad)
+        if 'udp' in networks:
+            port, listen = inbound.get('port'), inbound.get('listen', '0.0.0.0')
+            need(type(port) is int and 1 <= port <= 65535 and type(listen) is str and '%' not in listen, bad)
+            try:
+                address = ipaddress.ip_address(listen)
+            except ValueError:
+                raise Refusal(bad) from None
+            endpoint = (str(address) if address.version == 4 else f'[{address}]', port)
+            need(endpoint not in endpoints, bad)
+            endpoints.add(endpoint)
+    return endpoints
+
+
+def removal_main_sockets(rows, pid, reserved, udp_endpoints):
+    # ss -lu reports unconnected outbound sockets too. Their tuples can
+    # change between preview, restart and readback; keep only proved binds.
+    tcp = [row for row in removal_xray_sockets(rows, pid) if row[0] == 'tcp' and row[2] not in reserved]
+    need(all(port not in reserved for _, port in udp_endpoints), 'RUNTIME_UNPROVED')
+    seen, udp = set(), []
+    for proto, address, port, owners in rows:
+        if proto != 'udp':
+            continue
+        matches = [(address, port)] if address != '*' else [('0.0.0.0', port), ('[::]', port)]
+        matches = udp_endpoints.intersection(matches)
+        if matches:
+            need(len(matches) == 1 and not seen.intersection(matches) and owners == [pid], 'RUNTIME_UNPROVED')
+            seen.update(matches)
+            udp.append([proto, address, port])
+    need(seen == udp_endpoints, 'RUNTIME_UNPROVED')
+    return sorted(tcp + udp)
+
+
 def observe_removal(request, *, quiescent=False):
     bad = 'ROLLBACK_DRIFT'
     token, d = request['backupId'], request['network']
@@ -1667,7 +1751,8 @@ def observe_removal(request, *, quiescent=False):
     reserved = removal_sockets(rows, units, d, handoff, handoff_unit)
     transit = request.get('transit', before.get('transit'))
     xray_users(current['main'], units[X], rows, transit)
-    sockets = [row for row in removal_xray_sockets(rows, units[X]['MainPID']) if row[2] not in reserved]
+    udp_endpoints = removal_udp_endpoints(profiles['main'])
+    sockets = removal_main_sockets(rows, units[X]['MainPID'], reserved, udp_endpoints)
     bridge_sockets = removal_xray_sockets(rows, b['MainPID'])
     binary = remove_generation(XRAY)
     need(binary is not None, bad)
@@ -1678,6 +1763,7 @@ def observe_removal(request, *, quiescent=False):
                               handoff, handoff_unit, transit]))
     return dict(baseline=baseline, intent=intent, path=path, manifest=manifest, before=before, current=current,
                 profiles=profiles, units=units, side=side, side_generation=side_generation, sockets=sockets,
+                udp_endpoints=udp_endpoints,
                 bridge_sockets=bridge_sockets, retained_handoff=handoff if handoff_unit == B else None,
                 reserved=reserved, policy=policy, generations=generations, binary=binary,
                 boot_enrollment=boot_enrollment, ike_sockets=original_ike, manifest_generation=manifest_generation,
@@ -1761,9 +1847,10 @@ def removal_xray_ready(state, split):
         rows, x = sock_rows(), unit(X)
         need(not any(n in state['reserved'] for _, _, n, _ in rows), 'RUNTIME_UNPROVED')
         try:
-            need(x['InvocationID'] != state['units'][X]['InvocationID']
-                 and xray_users(state['profiles']['main'], x, rows, state.get('transit')) == state['sockets']
-                 and removal_xray_sockets(rows, x['MainPID']) == state['sockets'], 'RUNTIME_UNPROVED')
+            need(x['InvocationID'] != state['units'][X]['InvocationID'], 'RUNTIME_UNPROVED')
+            xray_users(state['profiles']['main'], x, rows, state.get('transit'))
+            need(removal_main_sockets(rows, x['MainPID'], state['reserved'], state['udp_endpoints'])
+                 == state['sockets'], 'RUNTIME_UNPROVED')
             b = removal_bridge_unit(state, restarted=split)
             removal_bridge_sockets(state, rows, b)
             return x, b
@@ -1918,9 +2005,9 @@ def remove_installation(request, state):
     final_b = removal_bridge_unit(state, restarted=split)
     removal_bridge_sockets(state, rows, final_b)
     profiles_unchanged()
-    need(all(final_x[k] == x[k] and final_b[k] == b[k] for k in ('InvocationID', 'MainPID'))
-         and xray_users(profiles['main'], final_x, rows, state.get('transit')) == sockets
-         and removal_xray_sockets(rows, final_x['MainPID']) == sockets
+    need(all(final_x[k] == x[k] and final_b[k] == b[k] for k in ('InvocationID', 'MainPID')), STAGE)
+    xray_users(profiles['main'], final_x, rows, state.get('transit'))
+    need(removal_main_sockets(rows, final_x['MainPID'], reserved, state['udp_endpoints']) == sockets
          and not any(n in absent for _, _, n, _ in rows)
          and network_projection(d, token, removing=True) == {'nft': None, 'rule': False, 'route': False}
          and vpn_empty(allow_socket_policies=restore_ike) and read(state['path'], 2 * MAX_FILE) == state['manifest'] and before['boot'] == boot()

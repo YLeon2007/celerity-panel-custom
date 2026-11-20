@@ -77,7 +77,11 @@ class Files(unittest.TestCase):
         self.original_units[self.XL]['ExecStart'] = '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }'
         for k in ('lns', 'chap', 'secrets', 'starter', 'main'):
             p = self.real(h['NAMES'][k]); p.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-            p.write_bytes((b'config setup\ninclude /etc/ipsec.d/*.conf\n' if k == 'starter' else b'{}' if k == 'main' else b'# stock\n'))
+            p.write_bytes({
+                'starter': b'config setup\ninclude /etc/ipsec.d/*.conf\n',
+                'main': h['encode'](dict(inbounds=[dict(tag='API_INBOUND', protocol='dokodemo-door',
+                    port=8080, listen='127.0.0.1')], outbounds=[], routing={'rules': []})),
+            }.get(k, b'# stock\n'))
         self.policy: dict[str, Any] = dict(nft=None, rule=False, route=False)
         self.sock = [['tcp', '127.0.0.1', 8080]]
         self.units = {k: v.copy() for k, v in self.original_units.items()}
