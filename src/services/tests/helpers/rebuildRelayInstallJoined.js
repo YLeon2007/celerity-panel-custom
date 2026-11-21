@@ -34,6 +34,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const xl = 'xl2tpd.service', ike = 'strongswan-starter.service', x = 'xray.service', b = 'xray-bridge.service';
         const net = 'celerity-rebuild-l2tp-network.service';
         const bootLink = '/etc/systemd/system/multi-user.target.wants/' + xl;
+        const nativePath = '/etc/systemd/system/' + xl;
+        const freshStock = scenario === 'fresh-stock-runtime';
         const stock = join(__dirname, '../../../modules/relay-l2tp/node-artifacts/l2tp');
         const key = Buffer.from('synthetic SSH wire key:' + id);
         const pin = createHash('sha256').update(key).digest('hex');
@@ -108,23 +110,27 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         put('/etc/ipsec.secrets', '# stock secrets\n');
         put('/etc/ipsec.conf', '# stock starter\nconfig setup\n');
         fs.mkdirSync(join(root, 'etc/ipsec.d'), { mode: 0o755 });
-        const swanLeaves = stockSwan.seed(root);
+        // The refusal-only variant cannot reach settings-tree observation.
+        // Use the authenticated fixture when supplied; do not invent its bytes.
+        const swanLeaves = !freshStock || process.env.C3_FIXTURE_SWAN_ETC ? stockSwan.seed(root) : [];
         const packages = ['strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables'];
-        // One absolute path projected; the shipped ensure helper is used unchanged.
-        put('bin/dpkg-query', `#!/bin/sh\n[ "$#" -eq 3 ] && [ "$1" = -W ] && [ "$2" = '-f=\${db:Status-Abbrev}' ] || exit 91\ncase "$3" in ${packages.join('|')}) printf 'ii ';; *) exit 91;; esac\n`, 0o700);
-        put('bin/apt-get', '#!/bin/sh\nexit 92\n', 0o700);
-        put('bin/systemctl', '#!/bin/sh\ncase "$*" in "show xl2tpd.service --value -p LoadState") printf "not-found\\n";; daemon-reload) test -f "$ROOT/etc/systemd/system/xl2tpd.service";; *) exit 93;; esac\n', 0o700);
-        put('bin/python3', '#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = "$ROOT/ensure-xl2tpd-unit.py" ] || exit 94\nexec /usr/bin/python3 -I -B "$1" "$ROOT"\n', 0o700);
-        for (const name of ['grep', 'dirname']) fs.symlinkSync('/usr/bin/' + name, join(root, 'bin', name));
-        const script = fs.readFileSync(join(stock, 'install-runtime.sh'), 'utf8');
-        const absolute = "readonly IPSEC_CONF='/etc/ipsec.conf'";
-        assert.equal(script.split(absolute).length, 2);
-        fs.symlinkSync(join(stock, 'ensure-xl2tpd-unit.py'), join(root, 'ensure-xl2tpd-unit.py'));
-        const runtime = put('install-runtime.sh', script.replace(absolute, 'readonly IPSEC_CONF="$ROOT/etc/ipsec.conf"'));
-        const prereq = spawnSync('/bin/bash', [runtime],
-            { env: { ROOT: root, PATH: join(root, 'bin') }, encoding: 'utf8', timeout: 10000 });
-        assert.equal(prereq.status, 0, prereq.stderr);
-        assert.deepEqual(JSON.parse(prereq.stdout), { status: 'ok', changed: 2, present: 6 });
+        if (!freshStock) {
+            // One absolute path projected; the shipped ensure helper is used unchanged.
+            put('bin/dpkg-query', `#!/bin/sh\n[ "$#" -eq 3 ] && [ "$1" = -W ] && [ "$2" = '-f=\${db:Status-Abbrev}' ] || exit 91\ncase "$3" in ${packages.join('|')}) printf 'ii ';; *) exit 91;; esac\n`, 0o700);
+            put('bin/apt-get', '#!/bin/sh\nexit 92\n', 0o700);
+            put('bin/systemctl', '#!/bin/sh\ncase "$*" in "show xl2tpd.service --value -p LoadState") printf "not-found\\n";; daemon-reload) test -f "$ROOT/etc/systemd/system/xl2tpd.service";; *) exit 93;; esac\n', 0o700);
+            put('bin/python3', '#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = "$ROOT/ensure-xl2tpd-unit.py" ] || exit 94\nexec /usr/bin/python3 -I -B "$1" "$ROOT"\n', 0o700);
+            for (const name of ['grep', 'dirname']) fs.symlinkSync('/usr/bin/' + name, join(root, 'bin', name));
+            const script = fs.readFileSync(join(stock, 'install-runtime.sh'), 'utf8');
+            const absolute = "readonly IPSEC_CONF='/etc/ipsec.conf'";
+            assert.equal(script.split(absolute).length, 2);
+            fs.symlinkSync(join(stock, 'ensure-xl2tpd-unit.py'), join(root, 'ensure-xl2tpd-unit.py'));
+            const runtime = put('install-runtime.sh', script.replace(absolute, 'readonly IPSEC_CONF="$ROOT/etc/ipsec.conf"'));
+            const prereq = spawnSync('/bin/bash', [runtime],
+                { env: { ROOT: root, PATH: join(root, 'bin') }, encoding: 'utf8', timeout: 10000 });
+            assert.equal(prereq.status, 0, prereq.stderr);
+            assert.deepEqual(JSON.parse(prereq.stdout), { status: 'ok', changed: 2, present: 6 });
+        }
         const unit = (path, extra = {}) => ({ LoadState: 'loaded', UnitFileState: 'disabled', ActiveState: 'inactive', SubState: 'dead',
             FragmentPath: path, MainPID: '0', InvocationID: '', DropInPaths: '', NeedDaemonReload: 'no', PrivateNetwork: 'no',
             KillMode: 'control-group', User: '', ...extra });
@@ -134,7 +140,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             ExecStart: `{ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${path} ; }` });
         const original = {
             [x]: stockX(x, mainPath, true, '101'), [b]: bridgeActive ? stockX(b, bridgePath, true, '103') : unit('', { LoadState: 'not-found', UnitFileState: '' }),
-            [xl]: unit('/etc/systemd/system/' + xl, { LoadState: scenario === 'masked' ? 'masked' : 'loaded',
+            [xl]: freshStock ? unit('', { LoadState: 'not-found', UnitFileState: '' }) : unit(nativePath, { LoadState: scenario === 'masked' ? 'masked' : 'loaded',
                 UnitFileState: scenario === 'masked' ? 'masked' : preEnabled || scenario === 'prewrite' ? 'enabled' : 'disabled',
                 ControlGroup: '/system.slice/' + xl, ExecStart: '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }' }),
             [ike]: unit('/usr/lib/systemd/system/' + ike, { ExecStart: '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }',
@@ -153,7 +159,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         put('/etc/machine-id', machineId + '\n', 0o644);
         const modulesPath = '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf';
         put('/etc/modules-load.d/10-unrelated.conf', '# operator-owned\nloop\n', 0o644);
-        if (!scenario.startsWith('ppp-') || ['ppp-ready', 'ppp-container-ready'].includes(scenario)) {
+        if (!freshStock && (!scenario.startsWith('ppp-') || ['ppp-ready', 'ppp-container-ready'].includes(scenario))) {
             put(modulesPath, '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n', 0o644);
         }
         if (scenario === 'ppp-conflict') put(modulesPath, '# foreign\n', 0o644);
@@ -163,7 +169,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             fs.symlinkSync('/dev/null', join(root, '/etc/modules-load.d/50-stock.conf'));
         }
         const manager = put('manager.json', JSON.stringify({ packages, machine: machineId, address: relay.ip, cohort, original, units: original,
-            modules: ['ppp-both', 'ppp-reservation-ack'].includes(scenario) ? []
+            missingPackages: freshStock ? ['strongswan-starter', 'xl2tpd'] : scenario === 'package' ? ['ppp'] : [],
+            modules: freshStock || ['ppp-both', 'ppp-reservation-ack'].includes(scenario) ? []
                 : ['ppp-l2tp', 'ppp-load-failure', 'ppp-load-timeout', 'ppp-no-readback', 'ppp-lost-ack'].includes(scenario)
                 ? ['ppp_generic'] : ['ppp_generic', 'l2tp_ppp'],
             running: { [x]: main, ...(bridgeActive && { [b]: bridge }) }, nextPid: 300, charonPid: '201', ikeConnection: false,
@@ -240,7 +247,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             return result;
         };
         const before = Object.fromEntries([mainPath, bridgePath, '/etc/ipsec.conf', '/etc/ppp/chap-secrets', '/etc/ipsec.secrets',
-            '/etc/xl2tpd/xl2tpd.conf', '/etc/ppp/options', '/etc/systemd/system/' + x, '/etc/systemd/system/' + xl,
+            '/etc/xl2tpd/xl2tpd.conf', '/etc/ppp/options', '/etc/systemd/system/' + x, ...(!freshStock ? [nativePath] : []),
             '/etc/systemd/system/foreign.service', '/usr/lib/systemd/system/' + ike, '/usr/local/bin/xray',
             ...swanLeaves, ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
             .map(path => [path, fs.readFileSync(join(root, path))]));
@@ -443,6 +450,50 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         });
     }
 
+    test('joined Install from unprepared Debian refuses unsafe package autostart before any effects', async t => {
+        const f = host(t, 'fresh-stock-runtime');
+        const absent = [f.bootLink, '/etc/systemd/system/' + f.xl, '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf',
+            '/var/lib/celerity-rebuild-l2tp-direct', '/install-runtime.sh'];
+        const checkUnchanged = () => {
+            assert.ok(absent.every(path => !fs.lstatSync(join(f.root, path), { throwIfNoEntry: false })));
+            for (const [path, bytes] of Object.entries(f.before)) assert.ok(fs.readFileSync(join(f.root, path)).equals(bytes), path);
+            assert.deepEqual(f.records().modules, []);
+            assert.deepEqual(f.records().effects, []);
+            assert.deepEqual(f.records().moduleLoads ?? [], []);
+            assert.deepEqual(f.records().units, f.records().original);
+            assert.equal(f.states.length + f.users.length, 0);
+        };
+        const submit = async expected => {
+            let status = 200, result;
+            await installHandler(f.create)({ params: { id }, body: {} }, {
+                status(value) { status = value; return this; }, json(value) { result = value; },
+            });
+            assert.deepEqual(result.error, { code: 'REBUILD_L2TP_DIRECT_PREREQUISITE', check: expected, outcome: 'refused' }, diagnostic(f));
+            assert.equal(status, 409);
+            checkUnchanged();
+        };
+        checkUnchanged();
+        await submit('RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
+        assert.deepEqual(f.actions, ['preflight']);
+        assert.deepEqual(f.refusals, ['DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE']);
+        assert.deepEqual(f.records().packageChecks, ['strongswan', 'strongswan-starter']);
+
+        // xl2tpd has its own SysV postinst autostart path. Removing only the
+        // strongSwan blocker must not allow dispatch either.
+        f.writeRecords({ ...f.records(), missingPackages: ['xl2tpd'], packageChecks: [] });
+        await submit('RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
+        assert.deepEqual(f.records().packageChecks, ['strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd']);
+
+        // Change only the external dpkg observation, not the runtime. The
+        // same Install route must now identify the next fresh-host blocker.
+        f.writeRecords({ ...f.records(), missingPackages: [], packageChecks: [] });
+        await submit('RUNTIME_NATIVE_UNIT_REQUIRED');
+        assert.deepEqual(f.records().packageChecks, f.records().packages);
+        assert.deepEqual(f.actions, ['preflight', 'preflight', 'preflight']);
+        assert.deepEqual(f.refusals, ['DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE',
+            'DIRECT_RUNTIME_NATIVE_UNIT_REQUIRED']);
+    });
+
     test('joined Install PPP preparation cannot dispatch after lock is lost at stdin', async t => {
         const f = host(t, 'ppp-lock-lost');
         await assert.rejects(f.create().installRelay(id), { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' });
@@ -507,6 +558,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 'sidecar-unsafe': 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' }[scenario];
             const outcome = await f.create().installRelay(id).catch(error => error);
             assert.equal(outcome.code ?? outcome.status, expected ?? 'installed', diagnostic(f));
+            if (scenario === 'package') assert.equal(outcome.check, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
             if (scenario === 'ike-active' || scenario === 'foreign-rpdb6') {
                 assert.equal(outcome.check, scenario === 'ike-active' ? 'IKE_ACTIVE_UNMANAGED' : 'RULE_220_CONFLICT');
                 assert.equal(outcome.outcome, 'refused');

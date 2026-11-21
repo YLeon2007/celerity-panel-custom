@@ -1862,6 +1862,8 @@
       "XL2TPD_CONFIG_MISSING": "The xl2tpd configuration is missing. Ask the relay administrator to restore the supported package configuration.",
       "XRAY_CONFIG_WRITABLE": "Review Xray config ownership and permissions. The running service must be able to read the configuration without being able to modify it.",
       "XL2TPD_NATIVE_UNIT_REQUIRED": "A supported native xl2tpd systemd unit is required. Check the installed xl2tpd package and service setup.",
+      "RUNTIME_PACKAGE_AUTOSTART_UNSAFE": "Install could not confirm all six required Debian packages. It did not run APT: package configuration can start IKE or xl2tpd early. Verify the packages and arrange provisioning with service autostart controlled in a maintenance window.",
+      "RUNTIME_NATIVE_UNIT_REQUIRED": "Install found no supported native unit for the inactive xl2tpd service. Verify the Debian package and follow the rebuild native-unit preparation procedure. Install has not created a unit or started a service.",
       "XL2TPD_NATIVE_UNIT_CONFLICT": "An existing xl2tpd unit conflicts with the supported native unit. Identify its owner before changing it.",
       "VPN_UNITS_MASKED": "Check why the xl2tpd or strongSwan unit is masked. Confirm with the relay administrator before unmasking it.",
       "VPN_UNITS_NOT_LOADED": "systemd did not report both xl2tpd and strongSwan units loaded. Check the installed packages and unit setup.",

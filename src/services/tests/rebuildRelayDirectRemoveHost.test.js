@@ -127,7 +127,7 @@ machine_file = root / 'etc/machine-id'
 machine_file.write_text(f['machineId'] + '\n')
 h['read'] = lambda path, *args: R(str(machine_file) if path == '/etc/machine-id' else path, *args)
 
-def preflight(machine):
+def preflight(machine, *, fresh=False):
     h['need'](machine == f['machineId'], 'IDENTITY')
     return dict(machineId=machine, ppp=True, masked=False, unitsLoaded=True)
 h['preflight'] = preflight

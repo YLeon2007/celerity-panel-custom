@@ -15,6 +15,8 @@ const hostChecks = new Map([
     ['XL2TPD_CONFIG_MISSING', 'XL2TPD_CONFIG_MISSING'],
     ['XRAY_CONFIG_WRITABLE', 'XRAY_CONFIG_WRITABLE'],
     ['XL2TPD_NATIVE_UNIT_REQUIRED', 'XL2TPD_NATIVE_UNIT_REQUIRED'],
+    ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'fresh-pre-write'],
+    ['RUNTIME_NATIVE_UNIT_REQUIRED', 'RUNTIME_NATIVE_UNIT_REQUIRED', 'fresh-pre-write'],
     ['XL2TPD_NATIVE_UNIT_CONFLICT', 'XL2TPD_NATIVE_UNIT_CONFLICT'],
 ].map(([suffix, check, scope]) => [suffix, { check, scope }]));
 const stages = new Map([
@@ -30,8 +32,9 @@ const isInstallCheck = check => checks.has(check);
 const isInstallStage = action => stages.has(action);
 function specificHostRefusal(action, suffix, noWrite) {
     const match = hostChecks.get(suffix);
-    if (!isInstallStage(action) || !match || (match.scope && action === 'preflight')) return undefined;
-    if (match.scope === 'pre-write-only' && action === 'install' && !noWrite) return undefined;
+    if (!isInstallStage(action) || !match) return undefined;
+    if (match.scope && match.scope !== 'fresh-pre-write' && action === 'preflight') return undefined;
+    if (['pre-write-only', 'fresh-pre-write'].includes(match.scope) && action === 'install' && !noWrite) return undefined;
     return { check: match.check, prerequisitePartial: match.scope === 'shared-prerequisite'
         && action === 'install' && !noWrite };
 }

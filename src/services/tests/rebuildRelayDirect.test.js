@@ -285,6 +285,21 @@ test('IKE admission codes survive prepare, check and settled no-write install re
     }
 });
 
+test('fresh runtime gate needs an exact no-write receipt after install dispatch', async () => {
+    for (const reason of ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_NATIVE_UNIT_REQUIRED']) {
+        for (const noWrite of [false, true]) {
+            const stderr = `DIRECT_${noWrite ? 'NO_WRITE_' : ''}${reason}\n`;
+            const { remote } = fixture(req => req.action === 'install' ? { code: 70, stdout: '', stderr } : undefined);
+            const plan = await remote.prepare(args);
+            await assert.rejects(remote.install(plan, async () => {}), noWrite ?
+                { code: 'REBUILD_L2TP_DIRECT_PREREQUISITE', check: reason, noHostChanges: true, commandSettled: true } :
+                { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', remoteOutcomeUncertain: true });
+            assert.equal(await remote.rollback(plan, async () => {}), false);
+            await remote.close();
+        }
+    }
+});
+
 test('IKE refusal without the exact install no-write frame leaves the outcome unknown', async () => {
     for (const stderr of ['DIRECT_IKE_ACTIVE_RULE_220\n', 'DIRECT_NO_WRITE_IKE_ACTIVE_RULE_220\n\n']) {
         const { remote } = fixture(request => request.action === 'install' ? { code: 70, stdout: '', stderr } : undefined);

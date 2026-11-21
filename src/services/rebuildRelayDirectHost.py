@@ -49,6 +49,8 @@ XL2TPD_CONFIG_MISSING = 'XL2TPD_CONFIG_MISSING'
 STOCK_XL_DEFAULT_SHA = '37b5938f462ec60b4f8c179b34f70b548c09da4691c938e88ce111ce41268833'
 STOCK_XL_DEFAULT_MD5 = b'fadc31f26078d8c3fb033d7d4516500b'
 REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables')
+PACKAGE_AUTOSTART_UNSAFE = 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
+NATIVE_UNIT_REQUIRED = 'RUNTIME_NATIVE_UNIT_REQUIRED'
 STOCK_IKE_INCLUDE = b'include /etc/ipsec.d/*.conf'
 SWAN_CONF = '/etc/strongswan.conf'
 SWAN_DIR = '/etc/strongswan.d'
@@ -308,15 +310,35 @@ def ppp_registered():
     return re.search(rb'^\s*108\s+ppp\s*$', registered, re.M) is not None
 
 
-def preflight(machine):
+def require_runtime_packages(refusal):
+    for package in REQUIRED_PACKAGES:
+        status = command('/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}', package, refusal=refusal)
+        need(status.startswith(b'ii '), refusal)
+
+
+def preflight(machine, *, fresh=False):
     machine_id = open('/etc/machine-id', 'rb').read(34).strip().decode('ascii')
     need(re.fullmatch(r'[a-f0-9]{32}', machine_id) and machine_id == machine, 'IDENTITY')
+    if fresh:
+        # A missing runtime package can start IKE/LNS in its maintainer
+        # scripts. Check dpkg before interpreting unit state or preparing PPP;
+        # never call apt, change service policy, or stop an existing service.
+        require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
     ppp = ppp_device() is True and ppp_registered()
-    units = [unit(name)['LoadState'] for name in (XL, IKE)]
-    if units == ['loaded'] * 2:
-        for package in REQUIRED_PACKAGES:
-            status = command('/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}', package)
-            need(status.startswith(b'ii '), 'PREREQUISITE')
+    xl, ike = (unit(name) for name in (XL, IKE))
+    units = [xl['LoadState'], ike['LoadState']]
+    if not fresh and units == ['loaded'] * 2:
+        require_runtime_packages('PREREQUISITE')
+    if fresh and (xl['LoadState'] == 'not-found' or (
+            xl.get('UnitFileState') == 'generated' and xl.get('FragmentPath') == '/run/systemd/generator.late/' + XL
+            and xl.get('SourcePath') == '/etc/init.d/xl2tpd')):
+        # Diagnosis, not preparation authority: a generated unit need not be
+        # stock. Keep the native unit gate unchanged; never promote this layout.
+        inactive = all((u['ActiveState'], u['SubState'], u.get('MainPID'), u.get('Job')) == ('inactive', 'dead', '0', '')
+                       and u.get('NeedDaemonReload') == 'no' and not u.get('DropInPaths') for u in (xl, ike))
+        if inactive and ike.get('UnitFileState') in ('enabled', 'disabled') and not ike.get('ExecCondition') and (
+                removal_native(ike, IKE, {'units': {IKE: ike}}, installed=False)):
+            raise Refusal(NATIVE_UNIT_REQUIRED)
     return dict(machineId=machine_id, ppp=ppp, masked='masked' in units, unitsLoaded=units == ['loaded'] * 2)
 
 
@@ -3636,7 +3658,7 @@ def dispatch(request: dict[str, Any]):
          ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove')
          + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
     NO_INSTALL_WRITES = action == 'install'
-    ready = preflight(machine)
+    ready = preflight(machine, fresh=True) if action in ('preflight', 'prepare', 'check', 'install') else preflight(machine)
     if action == 'preflight':
         return {**ready, 'pppPreparation': True}
     d = routing(request['network'])

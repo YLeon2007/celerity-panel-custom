@@ -338,7 +338,10 @@ def run(argv, **kwargs):
             assert v[2:] == ['xl2tpd']
             return reply(' /etc/xl2tpd/xl2tpd.conf ' + s['lnsMd5'] + '\n')
         assert v[1] == '-f=${db:Status-Abbrev}' and v[2] in s['packages']
-        return reply('ii ' if scenario != 'package' or v[2] != 'ppp' else '', 1 if scenario == 'package' and v[2] == 'ppp' else 0)
+        if scenario == 'fresh-stock-runtime':
+            s.setdefault('packageChecks', []).append(v[2])
+        missing = v[2] in s.get('missingPackages', ())
+        return reply('' if missing else 'ii ', int(missing))
     if prog == '/usr/bin/ss' and v == ['-H', '-lntup']:
         return reply(''.join(f'{p} LISTEN 0 0 {a}:{n} *:* users:(("fixture",pid={pid},fd=3))\n' for p, a, n, pid in sockets()))
     if prog == '/usr/sbin/ip':

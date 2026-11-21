@@ -106,7 +106,7 @@ def directory(path, private=False):
         os.close(fd)
 h['directory'] = directory
 h['boot'] = lambda: 'boot-fixture'
-h['preflight'] = lambda machine: {'machineId': machine, 'ppp': True, 'unitsLoaded': True, 'masked': False}
+h['preflight'] = lambda machine, **kwargs: {'machineId': machine, 'ppp': True, 'unitsLoaded': True, 'masked': False}
 h['vpn_empty'] = lambda **kw: True
 h['working'] = lambda u: u['ActiveState'] == 'active'
 h['native_vpn'] = lambda info, name: True

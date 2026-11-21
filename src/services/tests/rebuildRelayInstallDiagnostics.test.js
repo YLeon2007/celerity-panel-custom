@@ -137,6 +137,7 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
                     assert.deepEqual([result.status, result.stdout, result.stderr], [70, '', 'DIRECT_PREREQUISITE\n']);
                     return { code: result.status, stdout: result.stdout, stderr: result.stderr };
                 }
+                if (freshChecks.includes(scenario)) return refusal(`DIRECT_${scenario}\n`);
                 if (scenario === 'missing-ppp') return ok({ ...ready, ppp: false });
                 if (scenario === 'pending-ppp-bad-capability') return ok({ ...ready, ppp: false, pppPreparation: 1 });
                 if (scenario === 'pending-ppp-missing-units') return ok({ ...ready, ppp: false, pppPreparation: true, unitsLoaded: false });
@@ -217,7 +218,9 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
     const hostChecks = ['XRAY_DROPIN_UNSUPPORTED', 'PPP_MODULES_REQUIRED', 'PPP_MODULES_PERSISTENCE_CONFLICT',
         'PPP_MODULES_LOAD_FAILED', 'NETWORK_OBSERVATION_REQUIRED', 'IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED',
         'XL2TPD_CONFIG_MISSING', 'XRAY_CONFIG_WRITABLE', 'XL2TPD_NATIVE_UNIT_REQUIRED', 'XL2TPD_NATIVE_UNIT_CONFLICT'];
+    const freshChecks = ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_NATIVE_UNIT_REQUIRED'];
     const matrix = [
+        ...freshChecks.map(check => [check, 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', check, 'installRefused', ['preflight']]),
         ['host-preflight', 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', 'HOST_PREFLIGHT', 'installRefused', ['preflight']],
         ['missing-ppp', 'REBUILD_L2TP_HOST_NOT_READY', 'refused', 'PPP_MODULES_REQUIRED', 'installRefused', ['preflight']],
         ['pending-ppp-bad-capability', 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', 'unknown', undefined, 'uncertain', ['preflight']],
