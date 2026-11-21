@@ -162,7 +162,7 @@ test('already-disabled settlement closes the intent transaction without writing 
     await f.store.begin(intent);
     f.events.length = 0;
     await f.publish('disable', intent.intentId, false);
-    assert.deepEqual(f.events, ['start', 'snapshot', 'settle', 'guard', 'commit', 'end']);
+    assert.deepEqual(f.events, ['start', 'snapshot', 'directory', 'settle', 'guard', 'commit', 'end']);
     await assertNoPendingRelayAccounts(f.db);
 });
 
