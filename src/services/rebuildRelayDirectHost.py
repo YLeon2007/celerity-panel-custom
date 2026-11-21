@@ -2079,7 +2079,10 @@ def observe_removal(request, *, quiescent=False):
     policy = network_projection(d, token, removing=True)
     need(policy == {'nft': runtime['nft'], 'rule': True, 'route': True} and policy['nft'] is not None, bad)
     rows = sock_rows()
-    removal_vpn_runtime(rows, units)
+    if quiescent:
+        removal_vpn_runtime(rows, units)
+    else:
+        removal_idle(request, rows, units)
     reserved = removal_sockets(rows, units, d, handoff, handoff_unit)
     transit = request.get('transit', before.get('transit'))
     xray_users(current['main'], units[X], rows, transit)
@@ -2220,13 +2223,6 @@ def remove_installation(request, state):
     need(boot_enrollment is None or boot_link() == boot_enrollment, 'ROLLBACK_DRIFT')
     if 'swan' in current:
         check_swan_profile(state['swanBackup'], read(SWAN_PROFILE))
-    if 'expectedCensus' in request:
-        # Still under the exclusive DIRECT flock. The prior panel recount and
-        # prepare snapshot cannot authorize a write against a now-unknown census.
-        census = session_census({k: request[k] for k in ('machineId', 'nodeId', 'backupId', 'network', 'transit', 'currentUsers') if k in request})
-        session_need(census['activeSessions'] == 0 and census['census'] == request['expectedCensus'])
-        if rollback_quiescent(units[XL]):
-            session_need(census['census'] == quiescent_session_token(state['baseline']))
 
     def live_chap():
         record = read(NAMES['chap'])
@@ -2235,6 +2231,21 @@ def remove_installation(request, state):
         return record, restored
 
     live_chap()
+    if 'expectedCensus' in request:
+        # Still under the exclusive DIRECT flock. A panel recount and prepare
+        # snapshot cannot authorize a write against a busy or unknown census.
+        census = relay_session_census(request, state['baseline'] if rollback_quiescent(units[XL]) else None)
+        if census['activeIpsec'] is not None:
+            need(census['activeIpsec'] == 0, 'REMOVE_IPSEC_BUSY')
+        session_need(census['activeSessions'] == census['activeIpsec'] == 0
+                     and census['census'] == request['expectedCensus'])
+    else:
+        # Older trusted callers don't supply a PPP census token. They still
+        # need a positive IPsec zero, not an unreadable/unrecognized status.
+        count, _ = ipsec_session_sample(request)
+        need(count == 0, 'REMOVE_IPSEC_BUSY')
+    # Keep the original residual guards, including unscoped/foreign state.
+    removal_idle(request, sock_rows(), units)
     # Retain the install manifest unchanged. Durable no-replace intent
     # prevents blind replay even if the first stop's result is unknown.
     REMOVE_ENTERED = True
@@ -2922,6 +2933,142 @@ def quiescent_session_token(baseline):
     return digest(encode(['ppp-quiescent-v1', baseline]))
 
 
+def ipsec_status_inventory(status):
+    # strongSwan starter/stroke statusall prints each CHILD under its parent
+    # IKE SA. Count managed IKEv1 connections, never ESP directions, overlapping
+    # CHILD rekeys, address pairs or kernel policy templates.
+    session_need(len(status) <= 2**20 and status.endswith(b'\n'))
+    match = re.search(rb'^Connections:[ \t]*\n(.*?)^Security Associations '
+                      rb'\(([0-9]{1,5}) up, 0 connecting\):[ \t]*\n([^\r]*)\Z', status, re.M | re.S)
+    if match is None:
+        raise Refusal(SESSION_UNKNOWN)
+    config, up, body = match.groups()
+    session_need(config.strip() and all(line.lstrip().startswith(b'celerity-l2tp:')
+                                       for line in config.split(b'\n') if line.strip()))
+    if int(up) == 0:
+        session_need(body.strip() == b'none')
+        return []
+    inventory, children, parent, last_child = {}, set(), None, None
+    for line in body.split(b'\n')[:-1]:
+        row = re.fullmatch(rb'[ \t]+celerity-l2tp(?:\[([1-9][0-9]{0,9})\]|\{([1-9][0-9]{0,9})\}):[ \t]+([^\x00-\x1f]+)', line)
+        if row is None:
+            raise Refusal(SESSION_UNKNOWN)
+        ike, child, detail = row.groups()
+        if ike and detail.startswith(b'ESTABLISHED '):
+            parent = int(ike)
+            session_need(parent not in inventory)
+            inventory[parent] = None
+            last_child = None
+        elif ike:
+            session_need(parent == int(ike) and last_child is None)
+            spi = re.fullmatch(rb'IKEv1 SPIs: ([a-f0-9]{16})_i\*? ([a-f0-9]{16})_r\*?(?:, .+)?', detail)
+            if spi:
+                session_need(inventory[parent] is None)
+                inventory[parent] = tuple(value.decode('ascii') for value in spi.groups())
+            else:
+                session_need(detail.startswith(b'IKE proposal: '))
+        else:
+            child = int(child)
+            session_need(parent is not None)
+            sa = re.fullmatch(rb'(?:INSTALLED|REKEYING|REKEYED|DELETING), TRANSPORT, reqid [0-9]+, '
+                              rb'ESP(?: in UDP)? SPIs: [a-f0-9]{8}_i [a-f0-9]{8}_o', detail)
+            if sa:
+                session_need(child not in children)
+                children.add(child)
+                last_child = child
+            else:
+                session_need(last_child == child and (b' === ' in detail or b' bytes_i' in detail))
+    identities = set(inventory.values())
+    session_need(len(inventory) == len(identities) == int(up) and None not in identities)
+    return sorted(inventory.items())
+
+
+def ipsec_session_sample(request):
+    identity = read('/etc/machine-id', 34)
+    session_need(identity is not None and raw(identity).strip() == request['machineId'].encode('ascii'))
+    path, manifest, backup, _ = owned_installation(request)
+    before, runtime = backup['before'], backup['runtime']
+    # Match installed configuration and starter include, not just a connection
+    # name. No IPsec secrets are needed in the census.
+    generations = []
+    for key in ('ike', 'starter'):
+        generation = remove_generation(NAMES[key])
+        record = read(NAMES[key], 65536)
+        session_need(generation == runtime['files'][key] and after_match(record, backup['after'][key])
+                     and generation == remove_generation(NAMES[key]))
+        if key == 'starter':
+            session_need(ike_include_matches(record, [os.path.basename(NAMES['ike'])]))
+        generations.append(generation)
+    check_swan_profile(backup, read(SWAN_PROFILE) if 'swan' in backup['after'] else None)
+    no_jobs((IKE,))
+    ike = unit(IKE)
+    session_need(removal_native(ike, IKE, before, installed=True))
+    sockets = sorted((proto, address, port, sorted(owners)) for proto, address, port, owners in sock_rows()
+                     if port in (500, 4500))
+    if rollback_quiescent(ike):
+        session_need(not sockets)
+        inventory = []
+    else:
+        session_need(working(ike) and ike['SubState'] == 'running' and ike['InvocationID'] == runtime['invocations'][2]
+                     and {port for _, _, port, _ in sockets} == {500, 4500}
+                     and all(proto == 'udp' and owners and all(in_cgroup(pid, ike) for pid in owners)
+                             for proto, _, _, owners in sockets))
+        inventory = ipsec_status_inventory(command('/usr/sbin/ipsec', 'statusall', quiet=True))
+    if not inventory:
+        # A stale child in the kernel or a failed dump is not a known zero.
+        session_need(not command('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys', quiet=True).strip())
+    session_need(ike == unit(IKE))
+    no_jobs((IKE,))
+    return len(inventory), digest(encode([before['boot'], remove_generation(path), digest(raw(manifest)),
+                                         generations, ike['InvocationID'], ike['MainPID'], sockets, inventory]))
+
+
+def removal_idle(request, rows, units):
+    try:
+        removal_vpn_runtime(rows, units)
+    except Refusal as error:
+        # Classify a proven managed SA without accepting anything that the
+        # original Remove guard refused. Foreign/unknown remain refusals.
+        if str(error) != 'IN_FLIGHT':
+            ipsec = census_observation(ipsec_session_sample, request)
+            if ipsec and ipsec[0] > 0:
+                raise Refusal('REMOVE_IPSEC_BUSY') from None
+        raise
+
+
+def census_observation(probe, request):
+    try:
+        return probe(request)
+    except Refusal as error:
+        if str(error) == 'IN_FLIGHT':
+            raise
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        pass  # Unreadable or unsupported, never a count of zero.
+    return None
+
+
+def relay_session_census(request, quiescent_baseline=None):
+    global DEADLINE
+    outer_deadline = DEADLINE
+    DEADLINE = min(outer_deadline, time.monotonic() + 7)
+    try:
+        ipsec = census_observation(ipsec_session_sample, request)
+        ppp = census_observation(session_census, {k: v for k, v in request.items()
+                                                 if k not in ('action', 'baseline', 'expectedCensus')})
+        if ipsec is not None and ipsec != census_observation(ipsec_session_sample, request):
+            ipsec = None
+        if ppp and quiescent_baseline is not None:
+            session_need(ppp['census'] == quiescent_session_token(quiescent_baseline))
+        session_need(ppp is not None or ipsec is not None)
+        if time.monotonic() >= DEADLINE:
+            raise subprocess.TimeoutExpired([], 0)
+        return {'activeSessions': ppp['activeSessions'] if ppp else None,
+                'activeIpsec': ipsec[0] if ipsec else None,
+                'census': digest(encode(['vpn-census-v1', ppp['census'], ipsec[1]])) if ppp and ipsec else None}
+    finally:
+        DEADLINE = outer_deadline
+
+
 def collect_session_census(request):
     if rollback_quiescent(unit(XL)):
         snapshot = quiescent_session_sample(request)
@@ -2973,7 +3120,7 @@ def read_session_count(request):
     routing(request['network'])
     with directory(SYSTEM) as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        return session_census({k: v for k, v in request.items() if k != 'action'})
+        return relay_session_census(request)
 
 
 def dispatch(request: dict[str, Any]):
@@ -3071,7 +3218,9 @@ def main():
     except Refusal as error:
         if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or str(error) == 'IN_FLIGHT':
             return 75
-        print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
+        print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
+              'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
+              'REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
               SESSION_UNKNOWN if action == 'session-count' else str(error)), file=sys.stderr)
         return 70

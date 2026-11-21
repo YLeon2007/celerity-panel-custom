@@ -8,6 +8,7 @@ const { isIPv4 } = require('node:net');
 const { performance } = require('node:perf_hooks');
 const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
+const { validCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
@@ -197,13 +198,15 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             const raw = refusal?.[2];
             if (count && (result.code !== 70 || result.stdout !== ''
                 || result.stderr !== 'DIRECT_SESSION_COUNT_UNPROVED\n')) throw unknown();
-            if (action === 'remove' && (result.code !== 70 || result.stdout !== ''
-                || result.stderr !== 'DIRECT_REMOVE_REFUSED\n')) throw unknown();
+            const ipsecBusy = ['prepare-remove', 'remove'].includes(action) && result.stderr === 'DIRECT_REMOVE_IPSEC_BUSY\n';
+            if ((action === 'remove' || ipsecBusy) && (result.code !== 70 || result.stdout !== ''
+                || (!ipsecBusy && result.stderr !== 'DIRECT_REMOVE_REFUSED\n'))) throw unknown();
             if (chap && (result.code !== 70 || result.stdout !== ''
                 || result.stderr !== 'DIRECT_CHAP_REFUSED\n')) throw unknown();
             const codes = ['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
                 'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED', 'REMOVE_REFUSED'];
             if (count) codes.push('SESSION_COUNT_UNPROVED');
+            if (ipsecBusy) codes.push('REMOVE_IPSEC_BUSY');
             if (chap) codes.push('CHAP_REFUSED');
             // Only the installed helper's closed refusal frame certifies a settled write.
             // A shell/transport exit alone is not authority to race a remote mutation.
@@ -215,7 +218,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             throw error;
         }
         try {
-            const replyLimit = count ? 128 : chap ? 160 : 46 * 1024 * 1024;
+            const replyLimit = (count || chap) ? 160 : 46 * 1024 * 1024;
             if (result.stderr !== '' || Buffer.byteLength(result.stdout) > replyLimit) throw Error();
             const reply = JSON.parse(result.stdout);
             if ((count || chap) && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
@@ -289,9 +292,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             const params = { nodeId, backupId, network,
                 ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
                 ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
-            return exec('session-count', params, false, reply => reply
-                && Object.keys(reply).length === 2 && integer(reply.activeSessions, 0, Number.MAX_SAFE_INTEGER)
-                && reply.census?.length === 64 && tokenMatches(PIN, reply.census));
+            return exec('session-count', params, false, validCensus);
         }),
         prepare: input => serial(async () => {
             requireThat(!held && input?.nodeId === nodeId && typeof input.carryDomain === 'boolean'

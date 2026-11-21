@@ -420,6 +420,7 @@ class SessionCount(unittest.TestCase):
             'directory': directory, 'SESSION_GROUP': temp.removeprefix('/sys/fs/cgroup'), 'session_fs': lambda *_: None,
             'unit': lambda _: {'ActiveState': 'active', 'SubState': 'running', 'MainPID': str(pid)},
             'session_owner': lambda _: self.owner, 'session_sample': observation, 'DEADLINE': time.monotonic() + 10,
+            'ipsec_session_sample': lambda _: (0, 'fixture IPsec identity'),
         }), patch('os.lstat', wraps=os.lstat) as stat_call:
             actual = os.stat(temp)
             stat_call.return_value = actual  # modeled cgroup pathname; held FD is real
@@ -427,12 +428,17 @@ class SessionCount(unittest.TestCase):
             self.pids = [500]
             self.data = self.g['SESSION_L2TP_HEADER']
             zero = self.g['read_session_count'](REQUEST)
-            self.assertEqual(set(zero), {'activeSessions', 'census'})
+            self.assertEqual(set(zero), {'activeSessions', 'activeIpsec', 'census'})
             self.assertEqual(zero['activeSessions'], 0)
+            self.assertEqual(zero['activeIpsec'], 0)
             self.assertRegex(zero['census'], expected)
+            with patch.dict(self.g, {'ipsec_session_sample': lambda _: (1, 'fixture with residual IKE')}):
+                busy = self.g['read_session_count'](REQUEST)
+                self.assertEqual((busy['activeSessions'], busy['activeIpsec']), (0, 1))
+                self.assertNotEqual(busy['census'], zero['census'])
             self.data = None
-            with self.assertRaises(FileNotFoundError):
-                self.g['read_session_count'](REQUEST)
+            self.assertEqual(self.g['read_session_count'](REQUEST),
+                             {'activeSessions': None, 'activeIpsec': 0, 'census': None})
 
 
 if __name__ == '__main__':

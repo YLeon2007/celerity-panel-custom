@@ -122,6 +122,7 @@ function host(t, scenario) {
     fs.mkdirSync(p('/var/lib'), { recursive: true });
     fs.mkdirSync(p('/etc/ipsec.d'));
     const swanLeaves = stockSwan.seed(root);
+    put('/etc/machine-id', machineId + '\n', 0o644);
     put('/usr/local/bin/xray', 'modeled executable', 0o755);
     put(mpath, stockMain, 0o640);
     setFixtureMode(p(mpath), 0o640);

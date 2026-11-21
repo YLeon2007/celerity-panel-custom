@@ -24,6 +24,8 @@ const CONFIRM = 'REBUILD_L2TP_REMOVE_CONFIRMATION_REQUIRED';
 const PREVIEW_CHANGED = 'REBUILD_L2TP_REMOVE_PREVIEW_CHANGED';
 const COUNT_UNAVAILABLE = 'REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE';
 const SESSIONS_BUSY = 'REBUILD_L2TP_REMOVE_SESSIONS_BUSY';
+const IPSEC_BUSY = 'REBUILD_L2TP_REMOVE_IPSEC_BUSY';
+const DIRECT_IPSEC_BUSY = 'REBUILD_L2TP_DIRECT_REMOVE_IPSEC_BUSY';
 const PREVIEW_TTL_MS = 120_000;
 // Private proof accompanying the immutable public estimate. Neither the
 // installation receipt nor the host census is sent to the browser.
@@ -186,11 +188,12 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             }
                             remote = undefined;
                         }
-                        if (!transitProved && census?.activeSessions === 0) census = null;
-                        const confirmable = approved && accountCount === accounts.length && census?.activeSessions === 0;
+                        const activeSessions = !transitProved && census?.activeSessions === 0 ? null : census?.activeSessions ?? null;
+                        const activeIpsec = census?.activeIpsec ?? null;
+                        const confirmable = approved && transitProved && accountCount === accounts.length
+                            && activeSessions === 0 && activeIpsec === 0 && !!census.census;
                         await checkInventory(state, approved ? accounts : undefined);
-                        const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions: census?.activeSessions ?? null,
-                            confirmable });
+                        const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions, activeIpsec, confirmable });
                         if (confirmable) previews.set(snapshot, { node, stateFence, accounts,
                             binding: fence.binding, listMode: fence.listMode, census: census.census,
                             expires: performance.now() + PREVIEW_TTL_MS });
@@ -214,7 +217,9 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     if (proof || currentUsers) {
                         const census = await readSessionCensus(remote, input);
                         if (!census) throw fail(COUNT_UNAVAILABLE);
-                        if (census.activeSessions !== 0) throw fail(SESSIONS_BUSY);
+                        if (census.activeSessions > 0) throw fail(SESSIONS_BUSY);
+                        if (census.activeIpsec > 0) throw fail(IPSEC_BUSY);
+                        if (!census.census) throw fail(COUNT_UNAVAILABLE);
                         if (proof && census.census !== proof.census) throw fail(PREVIEW_CHANGED);
                         expectedCensus = census.census;
                         await checkInventory(state, accounts);
@@ -223,7 +228,9 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     // No saved MAIN is sent or rebuilt here. The direct driver
                     // prepares subtraction against the current physical profiles.
                     // The actual host Remove must recheck the confirmed census.
-                    const plan = await remote.prepareRemove({ ...input, ...(expectedCensus && { expectedCensus }) });
+                    let plan;
+                    try { plan = await remote.prepareRemove({ ...input, ...(expectedCensus && { expectedCensus }) }); }
+                    catch (error) { if (error?.code === DIRECT_IPSEC_BUSY) throw fail(IPSEC_BUSY); throw error; }
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
                     await checkInventory(state, accounts);
                     checkPreview();
@@ -276,7 +283,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     try {
                         if (await remote.remove(plan, guard) !== true) throw fail(UNKNOWN);
                     } catch (error) {
-                        if (error?.code !== 'REBUILD_L2TP_DIRECT_REMOVE_REFUSED' || error.commandSettled !== true
+                        if (!['REBUILD_L2TP_DIRECT_REMOVE_REFUSED', DIRECT_IPSEC_BUSY].includes(error?.code) || error.commandSettled !== true
                             || error.remoteOutcomeUncertain) throw fail(UNKNOWN);
                         // DIRECT guarantees this receipt can only precede intent.
                         // Recheck our lease and exact inventories before a single
@@ -291,7 +298,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             if (reverted?.acknowledged !== true || reverted.matchedCount !== 1) throw fail(CHANGED);
                             await checkInventory(state, accounts);
                         } catch { throw fail(UNKNOWN); }
-                        throw fail('REBUILD_L2TP_REMOVE_REFUSED');
+                        throw fail(error.code === DIRECT_IPSEC_BUSY ? IPSEC_BUSY : 'REBUILD_L2TP_REMOVE_REFUSED');
                     }
 
                     try {

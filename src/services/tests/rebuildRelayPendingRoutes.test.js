@@ -116,7 +116,7 @@ test('pending relay-account intent fences public Install, confirmed Remove, Appl
         connect() { record('Apply driver'); assert.fail('unexpected fixture Apply transport'); },
         createRelayDirect() {
             record('relay driver');
-            return { async readSessionCount() { record('Remove census'); return { activeSessions: 0, census: 'f'.repeat(64) }; },
+            return { async readSessionCount() { record('Remove census'); return { activeSessions: 0, activeIpsec: 0, census: 'f'.repeat(64) }; },
                 async close() { record('close'); } };
         },
     });

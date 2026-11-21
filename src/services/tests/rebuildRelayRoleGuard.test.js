@@ -137,8 +137,9 @@ test('mounted role guard and Remove use one estimate, require a current session-
     }
     const app = express();
     app.use((req, res, next) => {
-        res.locals.t = key => translate(key, 'ru');
-        res.locals.lang = 'ru';
+        const lang = req.headers['accept-language'] ?? 'ru';
+        res.locals.t = key => translate(key, lang);
+        res.locals.lang = lang;
         res.render = (view, data) => { assert.equal(view, 'layout'); res.send(data.content); };
         next();
     });
@@ -265,7 +266,8 @@ test('mounted role guard and Remove use one estimate, require a current session-
         updatedAt: clock, lastSyncedAt: clock };
     accounts = 1;
     const validCensus = 'd'.repeat(64);
-    let count = { activeSessions: 0, census: validCensus }, closeError = false, missingCounter = false;
+    const idle = { activeSessions: 0, activeIpsec: 0, census: validCensus };
+    let count = idle, closeError = false, missingCounter = false;
     const events = [];
     t.mock.method(require('../rebuildRelayDirect'), 'createRelayDirect', ({ node }) => {
         events.push('create');
@@ -297,11 +299,12 @@ test('mounted role guard and Remove use one estimate, require a current session-
     const removeUrl = `/panel/rebuild/relays/${id}/l2tp/remove`;
     const submit = (ticket, decision = 'confirm', options, path = decision === 'cancel' ? `${removeUrl}/cancel` : removeUrl) => request(app, path, 'POST',
         { _csrf: panelSession.panelCsrfToken, ticket, decision }, options);
-    const matchesCount = async (n, m) => {
+    const matchesCount = async (n, m, ike = typeof m === 'number' ? 0 : 'не подтверждено', blocked) => {
         const form = await request(app, url, 'GET');
         assert.equal(form.status, 200, form.body.slice(0, 250));
-        const text = `Учётные записи L2TP: ${n}; активные сессии PPP/L2TP: ${m}.`;
+        const text = `Учётные записи L2TP: ${n}; активные сессии PPP/L2TP: ${m}; активные IPsec-подключения L2TP: ${ike}.`;
         assert.equal(form.body.split(text).length, 3, 'both strings must use exactly the same estimate');
+        if (blocked) assert.ok(form.body.includes(blocked));
         assert.doesNotMatch(form.body, new RegExp(`${validCensus}|fixture-psk|fixture-password|private fixture details`));
         const ticket = form.body.match(/name="ticket" value="([a-f0-9]{64})"/)?.[1];
         if (ticket) {
@@ -322,20 +325,29 @@ test('mounted role guard and Remove use one estimate, require a current session-
     assert.equal((await put('portal')).status, 409);
     assert.deepEqual(events, [], 'no driver on anonymous, limited, cross-site, or blocked role writes');
 
-    count = { activeSessions: 3, census: validCensus };
-    assert.equal(await matchesCount(1, 3), undefined);
+    count = { ...idle, activeSessions: 3, activeIpsec: 2 };
+    assert.equal(await matchesCount(1, 3, 2), undefined);
     assert.deepEqual(events.splice(0), ['create', 'count', 'close']);
     accounts = 0;
-    assert.equal(await matchesCount(0, 3), undefined, 'the two populations are independent');
+    assert.equal(await matchesCount(0, 3, 2), undefined, 'the populations are independent');
     assert.deepEqual(events.splice(0), ['create', 'count', 'close']);
     accounts = 1;
-    for (const refusal of [new Error('private fixture details'), { activeSessions: 0, census: 'F'.repeat(64) },
-        { activeSessions: '0', census: validCensus }, { activeSessions: -1, census: validCensus }]) {
+    for (const refusal of [new Error('private fixture details'), { ...idle, census: 'F'.repeat(64) },
+        { ...idle, activeSessions: '0' }, { ...idle, activeIpsec: -1 }]) {
         count = refusal;
         assert.equal(await matchesCount(1, 'не подтверждено'), undefined);
         assert.deepEqual(events.splice(0), ['create', 'count', 'close']);
     }
-    count = { activeSessions: 0, census: validCensus };
+    const residual = { ...idle, activeIpsec: 1 };
+    count = residual;
+    const ruBusy = require('../../locales/ru.json').nodes.rebuildRemoveIpsecBusy;
+    const enBusy = require('../../locales/en.json').nodes.rebuildRemoveIpsecBusy;
+    assert.equal(await matchesCount(1, 0, 1, ruBusy), undefined, 'residual SA never yields a confirmation ticket');
+    assert.deepEqual(events.splice(0), ['create', 'count', 'close']);
+    count = { activeSessions: 0, activeIpsec: null, census: null };
+    assert.equal(await matchesCount(1, 0, 'не подтверждено'), undefined);
+    assert.deepEqual(events.splice(0), ['create', 'count', 'close']);
+    count = idle;
     accounts = null;
     assert.equal(await matchesCount('не подтверждено', 0), undefined, 'unavailable account count cannot be reconstructed from the session count');
     assert.deepEqual(events.splice(0), ['create', 'count', 'close']);
@@ -393,9 +405,9 @@ test('mounted role guard and Remove use one estimate, require a current session-
     assert.deepEqual(events.splice(0), ['create', 'count', 'close'], 'an unavailable account recount prevents transport');
     accounts = 1;
 
-    for (const [fresh, code] of [[{ activeSessions: 2, census: validCensus }, 'SESSIONS_BUSY'],
-        [{ activeSessions: 0, census: 'e'.repeat(64) }, 'PREVIEW_CHANGED'], [Error('lost census'), 'COUNT_UNAVAILABLE']]) {
-        count = { activeSessions: 0, census: validCensus };
+    for (const [fresh, code] of [[{ ...idle, activeSessions: 2 }, 'SESSIONS_BUSY'], [residual, 'IPSEC_BUSY'],
+        [{ ...idle, census: 'e'.repeat(64) }, 'PREVIEW_CHANGED'], [Error('lost census'), 'COUNT_UNAVAILABLE']]) {
+        count = idle;
         ticket = await matchesCount(1, 0);
         count = fresh;
         const denied = await submit(ticket);
@@ -403,8 +415,17 @@ test('mounted role guard and Remove use one estimate, require a current session-
         assert.deepEqual(JSON.parse(denied.body), { error: { code: `REBUILD_L2TP_REMOVE_${code}` } });
         assert.deepEqual(events.splice(0), ['create', 'count', 'close', 'create', 'count', 'close']);
     }
+    for (const [lang, message] of [['ru', ruBusy], ['en', enBusy]]) {
+        count = idle;
+        ticket = await matchesCount(1, 0);
+        count = residual;
+        const denied = await submit(ticket, 'confirm', { headers: { accept: 'text/html', 'accept-language': lang } });
+        assert.equal(denied.status, 303);
+        assert.ok(decodeURIComponent(denied.location).includes(message));
+        assert.deepEqual(events.splice(0), ['create', 'count', 'close', 'create', 'count', 'close']);
+    }
     assert.equal(removeWrites, 0);
-    count = { activeSessions: 0, census: validCensus };
+    count = idle;
     ticket = await matchesCount(1, 0);
     const browser = { headers: { accept: 'text/html,application/xhtml+xml,*/*;q=0.8' } };
     const outcomes = await Promise.all([submit(ticket, 'confirm', browser), submit(ticket, 'confirm', browser)]);

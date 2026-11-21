@@ -37,9 +37,9 @@ function fixture(reply, override = {}) {
     return { remote: createRelayDirect({ node, env: { ...env, ...override }, SSH }), calls };
 }
 
-for (const n of [0, 3]) {
-    test(`session count admits exactly the bounded receipt (${n}) over pinned transport`, async () => {
-        const receipt = { activeSessions: n, census };
+for (const receipt of [{ activeSessions: 0, activeIpsec: 1, census }, { activeSessions: 3, activeIpsec: null, census: null },
+    { activeSessions: null, activeIpsec: 1, census: null }]) {
+    test(`session count admits exactly the bounded receipt (${receipt.activeSessions}, ${receipt.activeIpsec}) over pinned transport`, async () => {
         const { remote, calls } = fixture(ok(receipt));
         assert.deepEqual(await remote.readSessionCount(request), receipt);
         assert.deepEqual(calls, ['connect', 'exec']);
@@ -60,10 +60,13 @@ test('session count rejects wrong enrollment and input without connecting', asyn
 });
 
 test('session count errors never become zero or expose raw transport data', async () => {
-    const secret = 'mock-session-secret', positive = { activeSessions: 0, census };
+    const secret = 'mock-session-secret', positive = { activeSessions: 0, activeIpsec: 0, census };
     const invalid = [ok({ ...positive, detail: secret }), ok({ activeSessions: '0', census }), ok({ activeSessions: -1, census }),
         ok({ activeSessions: 0.5, census }), ok({ activeSessions: null, census }), ok({ activeSessions: Number.MAX_SAFE_INTEGER + 1, census }),
         ok({ activeSessions: 0, census: secret }), ok({ activeSessions: 0, census: census + '\n' }), ok({}),
+        ok({ ...positive, activeIpsec: -1 }), ok({ ...positive, activeIpsec: null }),
+        ok({ ...positive, activeIpsec: '0' }), ok({ ...positive, census: secret }), ok({ ...positive, census: census + '\n' }),
+        ok({ ...positive, census: null }), ok({ activeSessions: null, activeIpsec: null, census: null }),
         { ...ok(positive), stdout: `{"activeSessions":2,${ok(positive).stdout.slice(1)}` },
         { ...ok(positive), stderr: secret }, { code: 70, stdout: '', stderr: 'DIRECT_SESSION_COUNT_UNPROVED\n' },
         { code: 124, stdout: '', stderr: '' }, new Error(secret)];

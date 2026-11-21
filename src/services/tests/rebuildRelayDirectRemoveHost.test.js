@@ -95,6 +95,9 @@ def directory(path, private=False):
     finally:
         os.close(fd)
 h['directory'] = directory
+machine_file = root / 'etc/machine-id'
+machine_file.write_text(f['machineId'] + '\n')
+h['read'] = lambda path, *args: R(str(machine_file) if path == '/etc/machine-id' else path, *args)
 
 def preflight(machine):
     h['need'](machine == f['machineId'], 'IDENTITY')
@@ -130,6 +133,8 @@ changes, checks = [], []
 testing = False
 udp_address, udp_port = '192.0.2.19', 54453
 after_preview = False
+ipsec_live = False
+ipsec_appears_at_recount = False
 
 def sc(*args):
     cmd, *rest = args
@@ -179,7 +184,7 @@ def sc(*args):
         raise AssertionError(args)
     return b''
 def command(*a, data=None):
-    global l2tp_reads
+    global l2tp_reads, ipsec_live, ipsec_appears_at_recount
     if len(a) == 6 and a[:4] == ('/usr/bin/systemctl','--no-pager','show','--all'):
         flag, name = a[4:]
         assert flag.startswith('--property=') and name in units
@@ -252,7 +257,18 @@ def command(*a, data=None):
     if a == ('/usr/sbin/ipsec','statusall'):
         extra = '   foreign: secret-fixture-only\n' if testing and scenario == 'foreign-ike' else ''
         connection = '   celerity-l2tp: transport\n' if units[IKE]['ActiveState'] == 'active' else ''
+        if ipsec_live:
+            return (b'Status:\nConnections:\n   celerity-l2tp: transport\nSecurity Associations (1 up, 0 connecting):\n'
+                    b'  celerity-l2tp[9]: ESTABLISHED 3 seconds ago, 192.0.2.1[192.0.2.1]...203.0.113.99[203.0.113.99]\n'
+                    b'  celerity-l2tp[9]: IKEv1 SPIs: 8877665544332211_i 0011223344556677_r*\n'
+                    b'  celerity-l2tp{4}:  INSTALLED, TRANSPORT, reqid 1, ESP in UDP SPIs: abcdef11_i fedcba11_o\n'
+                    b'  celerity-l2tp{5}:  REKEYED, TRANSPORT, reqid 1, ESP in UDP SPIs: abcdef22_i fedcba22_o\n')
+        if ipsec_appears_at_recount:
+            ipsec_appears_at_recount = False
+            ipsec_live = True  # Initial Remove observation was still idle.
         return ('Status:\nConnections:\n' + connection + extra + 'Security Associations (0 up, 0 connecting):\n  none\n').encode()
+    if a == ('/usr/sbin/ip','xfrm','state','list','nokeys') and ipsec_live:
+        return b'fixture-only transform (no keys)\n'
     if a in (('/usr/sbin/ip','xfrm','policy','list'),('/usr/sbin/ip','xfrm','policy','list','nosock'),
              ('/usr/sbin/ip','xfrm','state','list','nokeys')): return b''
     if a == ('/usr/sbin/ip','-j','-N','-4','rule','show'):
@@ -363,6 +379,8 @@ if scenario == 'wrong-node': req['nodeId'] = 'f'*24
 if scenario == 'missing-manifest': req['backupId'] = 'f'*32
 
 def wire(action, **kw):
+    global wire_action
+    wire_action = action
     stdout, stderr = io.StringIO(), io.StringIO()
     saved = sys.stdin
     try:
@@ -372,7 +390,8 @@ def wire(action, **kw):
             code = h['main']()
     finally: sys.stdin = saved
     assert not mock_faults, mock_faults
-    assert 'secret-fixture-only' not in stdout.getvalue() + stderr.getvalue()
+    assert all(marker not in stdout.getvalue() + stderr.getvalue() for marker in (
+        'secret-fixture-only', '203.0.113.99', '8877665544332211', 'abcdef11'))
     return code, stdout.getvalue(), stderr.getvalue()
 
 def snapshot():
@@ -540,32 +559,54 @@ else:
             assert h['DEADLINE'] < deadline and h['DEADLINE'] <= h['time'].monotonic() + 7
             with directory(h['SYSTEM']) as contender:
                 try:
-                    h['fcntl'].flock(contender, h['fcntl'].LOCK_SH | h['fcntl'].LOCK_NB)
+                    mode = h['fcntl'].LOCK_SH if wire_action == 'remove' else h['fcntl'].LOCK_EX
+                    h['fcntl'].flock(contender, mode | h['fcntl'].LOCK_NB)
                 except BlockingIOError:
                     pass
                 else:
-                    raise AssertionError('destructive census not under the exclusive Remove flock')
+                    raise AssertionError('census not under the expected DIRECT flock')
             assert not changes and not intent.exists()
             censuses.append(request)
             if census_mode == 'unknown':
                 raise Refusal('SESSION_COUNT_UNPROVED')
             if census_mode == 'timeout':
                 raise subprocess.TimeoutExpired([], 7)
-            return {'activeSessions': int(census_mode == 'busy'), 'census': 'f' * 64 if census_mode == 'changed' else expected}
+            return {'activeSessions': int(census_mode == 'busy'),
+                    'census': 'f' * 64 if census_mode == 'changed' and wire_action == 'remove' else 'e' * 64}
         h['collect_session_census'] = census
+        if census_mode in ('idle', 'changed', 'ipsec-race'):
+            preview = wire('session-count')
+            assert preview[0] == 0 and preview[2] == '', preview
+            expected = json.loads(preview[1])['census']
+            censuses.clear()
+
+        if census_mode == 'ipsec-race':
+            ipsec_live = True
+            preview = wire('session-count')
+            assert preview[0] == 0 and preview[2] == '', preview
+            count = json.loads(preview[1])
+            assert count['activeSessions'] == 0 and count['activeIpsec'] == 1 and len(count['census']) == 64
+            censuses.clear()
+            assert wire('prepare-remove') == (70, '', 'DIRECT_REMOVE_IPSEC_BUSY\n')
+            assert wire('remove', baseline=proof['baseline'], expectedCensus=expected) == (70, '', 'DIRECT_REMOVE_IPSEC_BUSY\n')
+            assert snapshot() == recheck and not changes and not intent.exists()
+            ipsec_live = False
+            ipsec_appears_at_recount = True
     if scenario == 'apply-quiescent-dependent':
         preview = wire('session-count')
         assert preview[0] == 0 and preview[2] == '', preview
         count = json.loads(preview[1])
         expected = count['census']
-        assert count['activeSessions'] == 0 and len(expected) == 64
+        assert count['activeSessions'] == count['activeIpsec'] == 0 and len(expected) == 64
         assert snapshot() == recheck and not changes and not intent.exists()
         assert l2tp_reads == 2
         group_populated = True
-        assert wire('session-count') == (70, '', 'DIRECT_SESSION_COUNT_UNPROVED\n') and l2tp_reads == 2
+        code, stdout, stderr = wire('session-count')
+        assert (code, json.loads(stdout), stderr) == (0, {'activeSessions': None, 'activeIpsec': 0, 'census': None}, '') and l2tp_reads == 2
         group_populated = False
         lingering_from = l2tp_reads + 1
-        assert wire('session-count') == (70, '', 'DIRECT_SESSION_COUNT_UNPROVED\n')
+        code, stdout, stderr = wire('session-count')
+        assert (code, json.loads(stdout), stderr) == (0, {'activeSessions': None, 'activeIpsec': 0, 'census': None}, '')
         lingering_from = l2tp_reads + 2  # first final sample clean; second sees a residual tunnel
         assert wire('remove', baseline=proof['baseline'], expectedCensus=expected) == (70, '', 'DIRECT_REMOVE_REFUSED\n')
         assert l2tp_reads == lingering_from
@@ -574,7 +615,9 @@ else:
     b = wire('remove', baseline=proof['baseline'], **({'expectedCensus': expected}
         if census_mode or scenario == 'apply-quiescent-dependent' else {}))
     assert len(censuses) == int(census_mode is not None) and h['DEADLINE'] == deadline
-    if scenario in stale or census_mode in ('unknown', 'busy', 'changed'):
+    if census_mode == 'ipsec-race':
+        assert b == (70,'','DIRECT_REMOVE_IPSEC_BUSY\n') and not changes and snapshot() == recheck and not intent.exists()
+    elif scenario in stale or census_mode in ('unknown', 'busy', 'changed'):
         assert b == (70,'','DIRECT_REMOVE_REFUSED\n') and not changes and snapshot() == recheck and not intent.exists()
     elif census_mode == 'timeout':
         assert b == (75,'','') and not changes and snapshot() == recheck and not intent.exists()
@@ -626,7 +669,7 @@ for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-m
     'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route',
     'xl-stop-failed', 'xl-stop-nonzero', 'xl-stop-timeout', 'xl-stop-job', 'xl-stop-live-pid',
     'xl-reset-job', 'xl-reset-live-pid', 'ike-stop-failed',
-    'census-idle', 'census-unknown', 'census-busy', 'census-changed', 'census-timeout',
+    'census-idle', 'census-unknown', 'census-busy', 'census-changed', 'census-timeout', 'census-ipsec-race',
     'udp-outbound-preview', 'udp-outbound-restart', 'udp-missing-preview', 'udp-wrong-owner-preview', 'udp-wrong-address-final',
     'udp-unproved-transport']) {
     test(`direct remove fixture: ${scenario}`, () => {

@@ -40,6 +40,7 @@ async function relayRoleBlock(nodeId, preview, code = BLOCKED) {
     const counts = estimate ?? Object.freeze({
         accountCount: await readAccountCount(require('../modules/relay-l2tp/models/l2tpUserModel'), nodeId),
         activeSessions: null,
+        activeIpsec: null,
     });
     return Object.assign(fail(code), { counts, estimate });
 }
@@ -124,10 +125,10 @@ async function assertNodeEditAllowed(node, updates, sshUpdates = {}) {
 function describeRoleError(error, t = translate) {
     const code = error?.code;
     if (code === BLOCKED || code === WRITE_BLOCKED) {
-        const { accountCount, activeSessions } = error.counts;
+        const { accountCount, activeSessions, activeIpsec } = error.counts;
         const key = code === BLOCKED ? 'nodes.rebuildRoleBlocked' : 'nodes.rebuildNodeWriteBlocked';
         return { status: 409, code, message: t(key).replace('{counts}', formatRelayCounts(error.counts, t)),
-            accountCount, activeSessions };
+            accountCount, activeSessions, activeIpsec };
     }
     if (!Object.hasOwn(reasons, code)) return null;
     return { status: code === UNAVAILABLE ? 503 : 409, code, message: t(reasons[code]),

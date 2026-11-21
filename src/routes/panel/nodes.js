@@ -585,8 +585,9 @@ router.get('/nodes/:id', async (req, res) => {
             summary: res.locals.t('nodes.rebuildRemoveConfirmSummary').replace('{counts}', formatRelayCounts(roleBlock.counts, res.locals.t)),
             ticket: issueRemovalTicket(req, roleBlock.estimate),
             blocked: roleBlock.counts.activeSessions > 0 ? 'nodes.rebuildRemoveBusy'
-                : (roleBlock.counts.activeSessions === null || roleBlock.counts.accountCount === null)
-                    ? 'nodes.rebuildRemoveCountUnavailable' : 'nodes.rebuildRemoveNotOwned',
+                : roleBlock.counts.activeIpsec > 0 ? 'nodes.rebuildRemoveIpsecBusy'
+                    : (roleBlock.counts.activeSessions === null || roleBlock.counts.activeIpsec === null
+                        || roleBlock.counts.accountCount === null) ? 'nodes.rebuildRemoveCountUnavailable' : 'nodes.rebuildRemoveNotOwned',
         } : null;
 
         render(res, 'node-form', {

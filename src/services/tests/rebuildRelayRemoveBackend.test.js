@@ -200,7 +200,7 @@ async function sharedFixture(t, { singleton = false } = {}) {
                 assert.equal(f.states[0].status, 'removing');
                 assert.equal(selected().length, expectedUsers.length);
             }
-            const reply = await wire[frame.action]?.() ?? (frame.action === 'session-count' ? { activeSessions: 0, census }
+            const reply = await wire[frame.action]?.() ?? (frame.action === 'session-count' ? { activeSessions: 0, activeIpsec: 0, census }
                 : { ok: true, machineId, backupId, baseline, removed: true });
             return Object.hasOwn(reply, 'code') ? reply : { code: 0, stderr: '', stdout: JSON.stringify(reply) + '\n' };
         }
@@ -356,7 +356,7 @@ test('shared Remove sends the same private DB projection to DIRECT and retires o
     const f = await sharedFixture(t);
     const before = f.sibling().map(copy), peer = copy(f.states[1]);
     const preview = await f.service.previewRemoveRelay(id);
-    assert.deepEqual(preview, { nodeId: id, accountCount: 2, activeSessions: 0, confirmable: true });
+    assert.deepEqual(preview, { nodeId: id, accountCount: 2, activeSessions: 0, activeIpsec: 0, confirmable: true });
     f.users.reverse(); // query order alone must not invalidate this proof
     assert.deepEqual(await f.service.confirmRemoveRelay(id, preview), { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
     assert.deepEqual(f.frames.map(x => x.action), ['session-count', 'session-count', 'prepare-remove', 'remove']);
@@ -381,7 +381,7 @@ test('shared Remove invalidates a preview when a disabled row revision changes w
 test('shared Remove rechecks disabled rows after prepare and the confirmed census before preparing', async t => {
     const f = await sharedFixture(t);
     const preview = await f.service.previewRemoveRelay(id);
-    f.wire['session-count'] = () => ({ activeSessions: 0, census: '9'.repeat(64) });
+    f.wire['session-count'] = () => ({ activeSessions: 0, activeIpsec: 0, census: '9'.repeat(64) });
     await assert.rejects(f.service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_PREVIEW_CHANGED' });
     assert.deepEqual(f.frames.splice(0).map(x => x.action), ['session-count', 'session-count']);
     delete f.wire['session-count'];
@@ -473,7 +473,7 @@ test('single-account list Remove aborts the retirement when the final reservatio
 test('shared Remove refuses invalid disabled credentials rather than falling back to the install receipt', async t => {
     const f = await sharedFixture(t);
     f.selected().find(row => !row.enabled).passwordEncrypted = 'invalid-envelope';
-    assert.deepEqual(await f.service.previewRemoveRelay(id), { nodeId: id, accountCount: 2, activeSessions: null, confirmable: false });
+    assert.deepEqual(await f.service.previewRemoveRelay(id), { nodeId: id, accountCount: 2, activeSessions: null, activeIpsec: null, confirmable: false });
     await assert.rejects(f.service.removeRelay(id), noOwner);
     assert.deepEqual(f.frames, []);
     assert.deepEqual(f.events, []);
@@ -481,7 +481,7 @@ test('shared Remove refuses invalid disabled credentials rather than falling bac
 
 test('trusted shared Remove also requires a fresh zero census before dispatch', async t => {
     const f = await sharedFixture(t);
-    f.wire['session-count'] = () => ({ activeSessions: 1, census: '3'.repeat(64) });
+    f.wire['session-count'] = () => ({ activeSessions: 1, activeIpsec: 1, census: '3'.repeat(64) });
     await assert.rejects(f.service.removeRelay(id), { code: 'REBUILD_L2TP_REMOVE_SESSIONS_BUSY' });
     assert.deepEqual(f.frames.splice(0).map(x => x.action), ['session-count']);
     assert.deepEqual(f.events, []);
@@ -526,7 +526,7 @@ test('list Remove requires card corroboration and a preview from the same bindin
             actions.push(action);
             assert.equal(machine, row.machineId);
             if (action === 'remove') assert.equal(expectedCensus, '3'.repeat(64));
-            const reply = action === 'session-count' ? { activeSessions: 0, census: '3'.repeat(64) }
+            const reply = action === 'session-count' ? { activeSessions: 0, activeIpsec: 0, census: '3'.repeat(64) }
                 : { ok: true, machineId: machine, backupId, baseline: '4'.repeat(64), removed: true };
             return { code: 0, stderr: '', stdout: JSON.stringify(reply) + '\n' };
         }
@@ -570,7 +570,7 @@ test('final host refusal restores only the exact reservation; unknown outcomes r
                 beforeReply?.();
                 return receipt;
             }
-            const reply = frame.action === 'session-count' ? { activeSessions: 0, census }
+            const reply = frame.action === 'session-count' ? { activeSessions: 0, activeIpsec: 0, census }
                 : { ok: true, machineId, backupId, baseline: 'f'.repeat(64) };
             assert.ok(['session-count', 'prepare-remove'].includes(frame.action));
             return { code: 0, stdout: JSON.stringify(reply) + '\n', stderr: '' };
@@ -589,6 +589,15 @@ test('final host refusal restores only the exact reservation; unknown outcomes r
     await tryRemove('REBUILD_L2TP_REMOVE_REFUSED');
     assert.deepEqual(f.states, [prior]);
     assert.deepEqual(f.events.splice(0), ['RelayL2tpState:update', 'RelayL2tpState:update']);
+    receipt = { code: 70, stdout: '', stderr: 'DIRECT_REMOVE_IPSEC_BUSY\n' };
+    await tryRemove('REBUILD_L2TP_REMOVE_IPSEC_BUSY');
+    assert.deepEqual(f.states, [prior]);
+    assert.deepEqual(f.events.splice(0), ['RelayL2tpState:update', 'RelayL2tpState:update']);
+    receipt = { ...receipt, stdout: 'not an empty refusal' };
+    await tryRemove('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
+    assert.equal(f.states[0].status, 'removing');
+    assert.deepEqual(f.events.splice(0), ['RelayL2tpState:update']);
+    f.states[0] = copy(prior);
     receipt = { code: 124, stdout: '', stderr: '' };
     await tryRemove('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
     assert.equal(f.states[0].status, 'removing');

@@ -149,7 +149,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const foreign = { rules: [], routes: [{ dst: '198.51.100.0/24', table: 201, dev: 'fixture0' }],
             tables: [{ table: { family: 'inet', name: 'foreign', comment: 'operator-owned' } }],
             sockets: [['tcp', '192.0.2.4', 39491, '999']] };
-        if (cohort) put('/etc/machine-id', machineId + '\n', 0o644);
+        put('/etc/machine-id', machineId + '\n', 0o644);
         const manager = put('manager.json', JSON.stringify({ packages, machine: machineId, address: relay.ip, cohort, original, units: original,
             running: { [x]: main, ...(bridgeActive && { [b]: bridge }) }, nextPid: 300, charonPid: '201', ikeConnection: false,
             lnsMd5: createHash('md5').update(lns).digest('hex'), effects: [], rule: null, route: null, nft: null, foreign,
@@ -556,7 +556,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         for (const h of [b, a]) {
             const n = frames.length;
             const preview = await service.previewRemoveRelay(h.id);
-            assert.deepEqual(preview, { nodeId: h.id, accountCount: 2, activeSessions: 0, confirmable: true }, diagnostic(h));
+            assert.deepEqual(preview, { nodeId: h.id, accountCount: 2, activeSessions: 0, activeIpsec: 0, confirmable: true }, diagnostic(h));
             const result = await service.confirmRemoveRelay(h.id, preview).catch(error => error);
             assert.equal(status(result), 'not_installed', diagnostic(h));
             assert.deepEqual(result, { executionMode: 'rebuild', status: 'not_installed', nodeId: h.id });

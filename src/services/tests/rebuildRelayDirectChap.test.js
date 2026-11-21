@@ -103,7 +103,7 @@ test('revoke joins the selected login to the existing CHAP write and requires an
 test('census and Remove receive private projection; Remove retains a copied inventory and confirmed token', async () => {
     const baseline = 'e'.repeat(64), census = 'f'.repeat(64);
     const { remote, seen } = driver(action => ({
-        'session-count': ack({ activeSessions: 0, census }),
+        'session-count': ack({ activeSessions: 0, activeIpsec: 0, census }),
         'prepare-remove': ack({ ok: true, backupId, machineId, baseline }),
         remove: ack({ ok: true, backupId, removed: true }),
     })[action]);

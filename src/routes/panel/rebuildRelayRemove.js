@@ -31,6 +31,7 @@ const localizedErrors = Object.freeze({
     REBUILD_L2TP_REMOVE_REFUSED: 'nodes.rebuildRemoveRefresh',
     REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE: 'nodes.rebuildRemoveCountUnavailable',
     REBUILD_L2TP_REMOVE_SESSIONS_BUSY: 'nodes.rebuildRemoveBusy',
+    REBUILD_L2TP_REMOVE_IPSEC_BUSY: 'nodes.rebuildRemoveIpsecBusy',
 });
 
 async function handleRemoval(req, res, decision) {

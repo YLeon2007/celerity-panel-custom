@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { mkdirSync, mkdtempSync, rmSync } = require('node:fs');
+const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { composeRebuildRelayPair } = require('../rebuildRelayInstallSteps');
 const { composeRebuildProfiles, syntheticTunnelSettings } = require('../../modules/relay-l2tp/tests/helpers/rebuildComposerFixture');
@@ -392,6 +392,7 @@ for (const scenario of ['split', 'apply', 'apply-nobody-main', 'apply-empty-brid
         try {
             mkdirSync(join(dir, 'etc'), { mode: 0o755 });
             stockSwan.seed(dir);
+            writeFileSync(join(dir, 'etc/machine-id'), machineId + '\n', { mode: 0o644 });
             const result = spawnSync('python3', ['-I', '-B', '-c', fixture, join(__dirname, '../rebuildRelayDirectHost.py'), dir, scenario], {
                 input: JSON.stringify({ ...originals, installed: installPair(originals.main, originals.bridge), split,
                     applied: stringify(applied), appliedSide: stringify(appliedSide), appliedEmptySide: stringify(appliedEmptySide),
