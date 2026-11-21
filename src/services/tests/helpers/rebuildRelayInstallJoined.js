@@ -12,6 +12,7 @@ const fs = require('node:fs');
 const { join, dirname } = require('node:path');
 const applyWire = require('./rebuildRelayApplyWire');
 const stockSwan = require('./rebuildRelayStockSwan');
+const { handler: installHandler } = require('../../../routes/panel/rebuildRelayInstall');
 
 module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt }) => {
     test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
@@ -150,7 +151,21 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             tables: [{ table: { family: 'inet', name: 'foreign', comment: 'operator-owned' } }],
             sockets: [['tcp', '192.0.2.4', 39491, '999']] };
         put('/etc/machine-id', machineId + '\n', 0o644);
+        const modulesPath = '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf';
+        put('/etc/modules-load.d/10-unrelated.conf', '# operator-owned\nloop\n', 0o644);
+        if (!scenario.startsWith('ppp-') || ['ppp-ready', 'ppp-container-ready'].includes(scenario)) {
+            put(modulesPath, '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n', 0o644);
+        }
+        if (scenario === 'ppp-conflict') put(modulesPath, '# foreign\n', 0o644);
+        if (scenario === 'ppp-mask') fs.symlinkSync('/dev/null', join(root, modulesPath));
+        if (scenario === 'ppp-shadow-mask') {
+            put('/usr/lib/modules-load.d/50-stock.conf', 'l2tp_ppp\n', 0o644);
+            fs.symlinkSync('/dev/null', join(root, '/etc/modules-load.d/50-stock.conf'));
+        }
         const manager = put('manager.json', JSON.stringify({ packages, machine: machineId, address: relay.ip, cohort, original, units: original,
+            modules: ['ppp-both', 'ppp-reservation-ack'].includes(scenario) ? []
+                : ['ppp-l2tp', 'ppp-load-failure', 'ppp-load-timeout', 'ppp-no-readback', 'ppp-lost-ack'].includes(scenario)
+                ? ['ppp_generic'] : ['ppp_generic', 'l2tp_ppp'],
             running: { [x]: main, ...(bridgeActive && { [b]: bridge }) }, nextPid: 300, charonPid: '201', ikeConnection: false,
             lnsMd5: createHash('md5').update(lns).digest('hex'), effects: [], rule: null, route: null, nft: null, foreign,
             stockRules: [[0, 255], [32766, 254], [32767, 253]].map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
@@ -158,7 +173,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 .map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
             managerEnvironment: scenario === 'manager-override' ? 'STRONGSWAN_CONF=/fixture-foreign.conf\n' : 'LANG=C\n',
             owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534], [fs.statSync(bpath).ino]: [0, 65534] } }));
-        const actions = [], refusals = [], wireFaults = [];
+        const actions = [], refusals = [];
         let removeBaseline, expectedRemoveTransit;
         const records = () => JSON.parse(fs.readFileSync(manager, 'utf8'));
         const writeRecords = value => fs.writeFileSync(manager, JSON.stringify(value));
@@ -189,6 +204,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             const rows = f.users.filter(row => String(row.relayNode) === id);
             if (action === 'install') assert.ok(state?.status === 'installing' && rows.length
                 && rows.every(user => user.syncStatus === 'pending'));
+            if (scenario.startsWith('ppp-') && action === 'install') assert.ok(f.lockHeld);
             if (cohort) {
                 assert.ok(f.lockHeld);
                 assert.equal(request.machineId, machineId);
@@ -218,6 +234,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             assert.deepEqual(records().faults ?? [], [], 'closed DIRECT command model');
             if (/^DIRECT_[A-Z_]+\n$/.test(result.stderr)) refusals.push(result.stderr.trim());
             if (action === 'prepare-remove' && result.status === 0) removeBaseline = JSON.parse(result.stdout).baseline;
+            if (scenario === 'ppp-lost-ack' && action === 'install' && result.status === 0) {
+                return { status: 75, stdout: '', stderr: '' };
+            }
             return result;
         };
         const before = Object.fromEntries([mainPath, bridgePath, '/etc/ipsec.conf', '/etc/ppp/chap-secrets', '/etc/ipsec.secrets',
@@ -225,7 +244,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             '/etc/systemd/system/foreign.service', '/usr/lib/systemd/system/' + ike, '/usr/local/bin/xray',
             ...swanLeaves, ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
             .map(path => [path, fs.readFileSync(join(root, path))]));
-        return { id, relay, machineId, key, pin, execute, applyHandlers, actions, refusals, root, before, mainPath, bridgePath,
+        const beforeChannel = () => {
+            if (scenario === 'ppp-lock-lost' && actions.at(-1) === 'check') f.loseLock();
+        };
+        return { id, relay, machineId, key, pin, execute, beforeChannel, applyHandlers, actions, refusals, root, before, mainPath, bridgePath,
             mpath, bpath, bridge, bootLink, generated, usersByNode, x, b, xl, ike, net, records, writeRecords, removeBaseline: () => removeBaseline,
             expectRemoveTransit: value => { expectedRemoveTransit = value; },
         };
@@ -296,6 +318,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 done();
                 queueMicrotask(() => finish(Buffer.concat(chunks).toString('utf8')));
             };
+            if (direct) routes.get(peer.ip)?.beforeChannel?.();
             ready(null, stream);
             // Stdin receivers wait for EOF, even if async authorization delays the first write.
             // Control-only execs never call channel.end().
@@ -354,6 +377,95 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const create = overrides => build({ createRelayDirect: undefined, ...overrides });
         return Object.assign(f, seeded, { create });
     }
+
+    for (const [scenario, expected, loads, retained] of [
+        ['ppp-both', 'installed', ['ppp_generic', 'l2tp_ppp']],
+        ['ppp-l2tp', 'installed', ['l2tp_ppp']],
+        ['ppp-persist', 'installed', []],
+        ['ppp-ready', 'installed', []],
+        ['ppp-container-ready', 'installed', []],
+        ['ppp-container', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-child-userns', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-device-missing', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-blacklist', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-dependency-blacklist', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-install-hook', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-boot-blacklist', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-disabled', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
+        ['ppp-conflict', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-mask', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-shadow-mask', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-service-mask', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-network-observers', 'REBUILD_L2TP_NETWORK_OBSERVATION_REQUIRED', []],
+        ['ppp-publish-race', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', [], true],
+        ['ppp-load-failure', 'REBUILD_L2TP_PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
+        ['ppp-no-readback', 'REBUILD_L2TP_PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
+        ['ppp-load-timeout', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', ['l2tp_ppp'], true],
+        ['ppp-lost-ack', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', ['l2tp_ppp'], true],
+    ]) {
+        test(`joined Install PPP prerequisite: ${scenario}`, async t => {
+            const f = host(t, scenario);
+            const file = join(f.root, '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf');
+            const before = fs.lstatSync(file, { throwIfNoEntry: false });
+            let status = 200, result;
+            const res = { status(value) { status = value; return this; }, json(value) { result = value; } };
+            await installHandler(f.create)({ params: { id }, body: {} }, res);
+            assert.equal(result.error?.code ?? result.status, expected, diagnostic(f));
+            assert.equal(status, expected === 'installed' ? 200 : 409);
+            if (expected.includes('PPP_MODULES') || expected.includes('NETWORK_OBSERVATION')) {
+                assert.match(result.error.operatorAction, /^Have the /);
+                assert.equal(result.error.retryAllowed, retained ? false : undefined);
+            }
+            const { moduleLoads = [], effects } = f.records();
+            assert.deepEqual(moduleLoads, loads);
+            assert.equal(fs.readFileSync(join(f.root, '/etc/modules-load.d/10-unrelated.conf'), 'utf8'), '# operator-owned\nloop\n');
+            if (expected === 'installed' || scenario === 'ppp-lost-ack') {
+                assert.equal(fs.readFileSync(file, 'utf8'), '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n');
+                assert.equal(fs.statSync(file).mode & 0o777, 0o644);
+                if (before) assert.equal(fs.statSync(file).ino, before.ino);
+            } else {
+                assert.equal(effects.length, 0);
+                assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
+                if (scenario === 'ppp-publish-race') assert.equal(fs.readFileSync(file, 'utf8'), '# foreign late arrival\n');
+                else assert.equal(fs.lstatSync(file, { throwIfNoEntry: false })?.ino, before?.ino);
+                if (scenario === 'ppp-mask') assert.equal(fs.readlinkSync(file), '/dev/null');
+            }
+            if (retained) {
+                assert.equal(f.states[0].status, 'installing');
+                assert.equal(f.users[0].syncStatus, 'pending');
+                assert.deepEqual(f.actions.slice(-1), ['install']);
+                await assert.rejects(f.create().installRelay(id), { code: 'REBUILD_L2TP_NOT_FRESH_RELAY' });
+            } else if (expected !== 'installed') {
+                assert.equal(f.states.length + f.users.length, 0);
+                assert.ok(!f.actions.includes('install'));
+            }
+        });
+    }
+
+    test('joined Install PPP preparation cannot dispatch after lock is lost at stdin', async t => {
+        const f = host(t, 'ppp-lock-lost');
+        await assert.rejects(f.create().installRelay(id), { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' });
+        assert.equal(f.states[0].status, 'installing');
+        assert.equal(f.users[0].syncStatus, 'pending');
+        assert.equal(f.actions.at(-1), 'check');
+        assert.deepEqual(f.records().moduleLoads ?? [], []);
+        assert.equal(fs.existsSync(join(f.root, '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf')), false);
+    });
+
+    test('joined Install PPP preparation cannot dispatch after an unacknowledged majority reservation', async t => {
+        const f = host(t, 'ppp-reservation-ack', { cohort: true });
+        const { events, hooks } = sessionFixture(t, f);
+        f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([{ nodeId: id, host: f.relay.ip, port: 22,
+            username: 'root', sshHostKeySha256: f.pin, machineId }]);
+        hooks.commit = commit => { commit(); throw new Error('modeled lost reservation acknowledgement'); };
+        await assert.rejects(f.create().installRelay(id), { code: 'REBUILD_L2TP_RESERVATION_FAILED' });
+        assert.deepEqual(events, ['commit']);
+        assert.equal(f.states[0].status, 'installing');
+        assert.equal(f.users[0].syncStatus, 'pending');
+        assert.equal(f.actions.at(-1), 'check');
+        assert.deepEqual(f.records().moduleLoads ?? [], []);
+        assert.equal(fs.existsSync(join(f.root, '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf')), false);
+    });
 
     for (const scenario of ['transit-ok', 'transit-forward', 'transit-missing-client', 'transit-drift',
         'transit-mixed', 'transit-foreign', 'transit-loopback-listener', 'transit-ambiguous-ascii', 'transit-ambiguous-unicode']) {

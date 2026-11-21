@@ -1,5 +1,6 @@
 """Local SSH endpoint for DIRECT install and removal. Never calls host commands."""
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -78,8 +79,20 @@ class LocalOS:
     def __getattr__(self, name):
         assert name in ('O_RDONLY', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_WRONLY', 'O_CREAT', 'O_EXCL', 'O_DIRECTORY',
                         'fdopen', 'listxattr', 'mkdir', 'rmdir', 'fsync', 'close', 'fchmod', 'link',
-                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'readlink', 'symlink', 'uname'), name
+                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'symlink', 'uname'), name
         return getattr(os, name)
+
+    def readlink(self, path, *, dir_fd=None):
+        if path == '/proc/self/ns/user':
+            return 'user:[4026532500]' if scenario == 'ppp-child-userns' else 'user:[4026531837]'
+        return os.readlink(backing(path)) if dir_fd is None else os.readlink(path, dir_fd=dir_fd)
+
+    def link(self, src, dst, **kwargs):
+        if dst == '70-celerity-rebuild-l2tp.conf':
+            assert_install_intent()
+            if scenario == 'ppp-publish-race':
+                backing('/etc/modules-load.d/' + dst).write_bytes(b'# foreign late arrival\n')
+        os.link(src, dst, **kwargs)
 
     def open(self, path, flags, mode=0o777, *, dir_fd=None):
         # Project only the initial '/' descriptor. The real production
@@ -105,6 +118,8 @@ class LocalOS:
 
     def lstat(self, path):
         if path == '/dev/ppp':
+            if scenario in ('ppp-both', 'ppp-device-missing') and ('ppp_generic' not in s['modules'] or scenario == 'ppp-device-missing'):
+                raise FileNotFoundError(path)
             return SimpleNamespace(st_mode=stat.S_IFCHR | 0o600, st_rdev=os.makedev(108, 0))
         return os.lstat(backing(path))
 
@@ -121,9 +136,16 @@ class LocalOS:
 def stock_open(path, mode='r'):
     if path == '/etc/machine-id' and s.get('cohort'):
         return backing(path).open(mode)
-    facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n108 ppp\nBlock devices:\n',
+    observers = ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user')
+    modules = [*s['modules'], *(name for name in observers if scenario != 'ppp-network-observers' or name != 'xfrm_user')]
+    facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n' +
+             ('108 ppp\n' if 'ppp_generic' in s['modules'] else '') + 'Block devices:\n',
              '/proc/net/dev': 'header\nheader\n eth0: 0\n', '/proc/sys/kernel/random/boot_id': 'fixture-boot\n',
-             '/proc/999/cgroup': '0::/system.slice/foreign.service\n'}
+             '/proc/999/cgroup': '0::/system.slice/foreign.service\n',
+             '/proc/modules': ''.join(f'{name} 4096 0 - Live 0x0\n' for name in modules),
+             '/proc/cmdline': 'root=fixture' + (' module_blacklist=l2tp_ppp' if scenario == 'ppp-boot-blacklist' else ''),
+             '/proc/self/status': 'CapEff:\t0000000000010000\n',
+             '/proc/sys/kernel/modules_disabled': '1\n' if scenario == 'ppp-disabled' else '0\n'}
     if s['units'][IKE]['ActiveState'] == 'active':
         facts[f"/proc/{s['charonPid']}/cgroup"] = '0::/system.slice/' + IKE + '\n'
     for name, config in XRAY_PATHS.items():
@@ -199,18 +221,66 @@ def sockets():
     return result
 
 
+def assert_install_intent():
+    assert request['action'] == 'install'
+    manifest = json.loads(backing(h['manifest_path'](request['backupId'])).read_bytes())
+    assert manifest['phase'] == 'applying' and manifest['machineId'] == request['machineId']
+    assert h['digest'](h['encode'](manifest['before'])) == request['baseline']
+    fd = os.open(backing(SYSTEM), os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # production holds a distinct, exclusive lock for this inode
+        raise AssertionError('module preparation outside host lock')
+    finally:
+        os.close(fd)
+
+
 def run(argv, **kwargs):
     prog, *v = argv
     def reply(value: bytes | str = b'', code=0):
         return SimpleNamespace(returncode=code, stdout=value if isinstance(value, bytes) else value.encode(), stderr=b'')
     def js(value):
         return reply(json.dumps(value))
+    if prog == '/usr/bin/systemd-detect-virt':
+        if v == ['--container']:
+            return reply('lxc\n', 0) if scenario in ('ppp-container', 'ppp-container-ready') else reply('none\n', 1)
+        assert v == ['--chroot']
+        return reply(code=1)
+    if prog == '/usr/sbin/modprobe':
+        if v == ['--showconfig']:
+            return reply({'ppp-blacklist': 'blacklist l2tp-ppp\n', 'ppp-dependency-blacklist': 'blacklist l2tp_core\n',
+                          'ppp-install-hook': 'install l2tp_ppp /bin/false\n'}.get(scenario, 'blacklist unrelated\n'))
+        if v[:3] == ['--show-depends', '--use-blacklist', '--']:
+            if scenario == 'ppp-network-observers' and v[3:] == ['xfrm_user']:
+                return reply('insmod /lib/modules/fixture/kernel/xfrm_user.ko\n')
+            assert v[3:] in (['ppp_generic'], ['l2tp_ppp'])
+            modules = ['slhc', 'ppp_generic'] if v[3] == 'ppp_generic' else ['l2tp_core', 'ppp_generic', 'l2tp_ppp']
+            return reply(''.join(f'insmod /lib/modules/fixture/kernel/{name}.ko\n' for name in modules))
+        assert request['action'] == 'install' and v[:2] == ['--use-blacklist', '--'] and len(v) == 3
+        assert v[2] in ('ppp_generic', 'l2tp_ppp') and v[2] not in s['modules']
+        assert_install_intent()
+        s.setdefault('moduleLoads', []).append(v[2])
+        if scenario == 'ppp-load-timeout':
+            raise h['subprocess'].TimeoutExpired(argv, 1)
+        if scenario == 'ppp-load-failure':
+            return reply(code=1)
+        if scenario != 'ppp-no-readback':
+            s['modules'].append(v[2])
+        return reply()
     if prog == '/usr/bin/systemctl':
         assert v.pop(0) == '--no-pager'
         action, *rest = v
         if action == 'show':
             assert len(rest) == 3 and rest[0] == '--all' and rest[1].startswith('--property=')
-            info = s['units'][rest[2]]
+            if rest[2] == 'systemd-modules-load.service':
+                mask = scenario == 'ppp-service-mask'
+                info = dict(LoadState='masked' if mask else 'loaded', UnitFileState='masked' if mask else 'static',
+                            ActiveState='inactive', NeedDaemonReload='no',
+                            FragmentPath='/usr/lib/systemd/system/systemd-modules-load.service')
+            else:
+                info = s['units'][rest[2]]
             rows = []
             for k in rest[1].split('=', 1)[1].split(','):
                 value = info.get(k, '')
@@ -301,6 +371,7 @@ def run(argv, **kwargs):
         if v == ['-j', '-s', 'list', 'table', 'inet', h['TABLE']]:
             return js(dict(nftables=[table]))
         if v == ['-c', '-f', '-']:
+            assert_install_intent()
             assert h['nft_marker'](kwargs['input'], request['backupId'])
             return reply()
         if v == ['delete', 'table', 'inet', h['TABLE']]:
@@ -344,6 +415,9 @@ def run(argv, **kwargs):
 def modeled_run(argv, **kwargs):
     try:
         return run(argv, **kwargs)
+    except h['subprocess'].TimeoutExpired:
+        assert scenario == 'ppp-load-timeout' and list(argv) == ['/usr/sbin/modprobe', '--use-blacklist', '--', 'l2tp_ppp']
+        raise
     except Exception as error:
         s.setdefault('faults', []).append([type(error).__name__, list(argv)])
         raise

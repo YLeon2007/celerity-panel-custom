@@ -89,10 +89,12 @@ class Files(unittest.TestCase):
         self.native_command = h['command']
         h.update(unit=lambda n: self.units[n].copy(), no_jobs=lambda *_: None, vpn_empty=lambda **kw: True,
                  preflight=lambda machine: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
+                 observe_ppp_preparation=lambda: dict(missing=[], persist=False, builtin=[], policy='fixture'),
+                 require_network_observers=lambda: None,
                  sock_rows=lambda: [], ip=lambda *args: [], xray_users=lambda *args: self.sock,
                  nft_tables=lambda: [], network_projection=lambda *_, **kw: self.policy.copy(),
                  command=Mock(side_effect=self.command), sc=Mock(side_effect=self.systemctl),
-                 validate_candidate=lambda *_: None)
+                 validate_profiles=lambda *_: None)
         self.backup_path = h['manifest_path'](TOKEN)
         # Python executes in a private user/net namespace, no host paths/procs are opened for writes.
 

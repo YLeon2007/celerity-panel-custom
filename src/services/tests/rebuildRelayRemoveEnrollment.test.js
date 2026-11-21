@@ -123,6 +123,9 @@ function host(t, scenario) {
     fs.mkdirSync(p('/etc/ipsec.d'));
     const swanLeaves = stockSwan.seed(root);
     put('/etc/machine-id', machineId + '\n', 0o644);
+    const pppConfig = '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf';
+    put(pppConfig, '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n', 0o644);
+    setFixtureMode(p(pppConfig), 0o644);
     put('/usr/local/bin/xray', 'modeled executable', 0o755);
     put(mpath, stockMain, 0o640);
     setFixtureMode(p(mpath), 0o640);
@@ -164,7 +167,7 @@ function host(t, scenario) {
     const manager = 'manager.json';
     const report = () => JSON.parse(fs.readFileSync(p(manager)));
     const set = state => fs.writeFileSync(p(manager), JSON.stringify(state));
-    set({ machine: machineId, main: JSON.parse(stockMain), original, units: original, effects: [], nft: null,
+    set({ machine: machineId, modules: ['ppp_generic', 'l2tp_ppp'], main: JSON.parse(stockMain), original, units: original, effects: [], nft: null,
         rule: null, route: null, stockRules: [{ priority: 0, src: 'all', table: 255 }, { priority: 32766, src: 'all', table: 254 }, { priority: 32767, src: 'all', table: 253 }],
         rules6: [{ priority: 0, src: 'all', table: 255 }, { priority: 32766, src: 'all', table: 254 }], managerEnvironment: 'LANG=C\n',
         foreign: { sockets: [], routes: [], tables: [], rules: [] },

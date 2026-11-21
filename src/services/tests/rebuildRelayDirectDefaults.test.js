@@ -94,7 +94,8 @@ class ProjectedOS:
     def fstat(self, fd):
         st = os.fstat(fd)
         uid,gid = owners.get(st.st_ino, (0,0))
-        return NS(st_mode=st.st_mode, st_uid=uid, st_gid=gid, st_nlink=st.st_nlink, st_size=st.st_size)
+        return NS(st_mode=st.st_mode, st_uid=uid, st_gid=gid, st_nlink=st.st_nlink, st_size=st.st_size,
+                  st_dev=st.st_dev, st_ino=st.st_ino)
     def geteuid(self): return 0
 
 h['os'] = ProjectedOS()
@@ -150,6 +151,8 @@ def run(argv, **kw):
 
 h.update(subprocess=NS(run=run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired),
          preflight=lambda machine: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
+         observe_ppp_preparation=lambda: dict(missing=[], persist=False, builtin=[], policy='fixture'),
+         require_network_observers=lambda: None,
          boot=lambda: 'fixture-boot', vpn_empty=lambda **kw: True, sock_rows=lambda: [], nft_tables=lambda: [],
          xray_users=lambda *args: [['tcp','127.0.0.1',8080]])
 # The signed settings tree is exercised by rebuildRelayDirectSwanFiles.py;

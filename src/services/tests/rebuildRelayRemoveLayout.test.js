@@ -93,6 +93,8 @@ put(MAIN, f['main'], (65534,65534))
 if f['bridge'] is not None: put(BRIDGE, f['bridge'], (0,65534))
 for k in ('lns','starter','secrets','chap'): put(P[k], '# stock\n')
 put(P['starter'], '# stock\nconfig setup\ninclude /etc/ipsec.d/*.conf\n')
+put(h['PPP_PATH'], h['raw'](h['ppp_config']()))
+backing(h['PPP_PATH']).chmod(0o644)
 for path in (SYSTEM, str(Path(P['ike']).parent), str(Path(h['VAULT']).parent)):
     backing(path).mkdir(parents=True, exist_ok=True)
 
@@ -153,6 +155,8 @@ removing = False
 
 def proc(path, mode='r'):
     facts = {'/etc/machine-id': f['machineId']+'\n', '/proc/devices':'Character devices:\n108 ppp\nBlock devices:\n',
+             '/proc/cmdline':'root=fixture\n', '/proc/modules':''.join(f'{n} 4096 0 - Live 0x0\n' for n in
+                ('ppp_generic','l2tp_ppp','inet_diag','tcp_diag','udp_diag','nfnetlink','nf_tables','xfrm_user')),
              '/proc/sys/kernel/random/boot_id':'fixture-boot\n', '/proc/net/dev':'header\nheader\n eth0: 0\n',
              '/proc/201/cgroup':'0::'+units[IKE]['ControlGroup']+'\n'}
     for n, cfg in [(X,MAIN),(B,BRIDGE)]:
@@ -170,12 +174,18 @@ def run(argv, **kw):
     def reply(value=b'', code=0):
         return NS(returncode=code, stdout=value if isinstance(value,bytes) else value.encode(), stderr=b'')
     def js(value): return reply(h['encode'](value))
+    if exe == h['MODPROBE']:
+        if a == ['--showconfig']: return reply()
+        assert a[:3] == ['--show-depends','--use-blacklist','--'] and a[3:] in (['ppp_generic'], ['l2tp_ppp']), a
+        return reply(f'insmod /lib/modules/fixture/{a[3]}.ko\n')
     if exe == '/usr/bin/systemctl':
         assert a.pop(0) == '--no-pager'
         op,*rest = a
         if op == 'show':
             assert len(rest) == 3 and rest[0] == '--all' and rest[1].startswith('--property=')
-            info = units[rest[2]]
+            info = (dict(LoadState='loaded', ActiveState='inactive', UnitFileState='static', NeedDaemonReload='no',
+                         FragmentPath='/usr/lib/systemd/system/systemd-modules-load.service')
+                    if rest[2] == 'systemd-modules-load.service' else units[rest[2]])
             rows = []
             for k in rest[1].split('=',1)[1].split(','):
                 value = info.get(k,'')

@@ -5,8 +5,8 @@ const { AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransac
 const fail = code => Object.assign(new Error(code), { code });
 const UNKNOWN = 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN';
 const ROLLBACK_UNKNOWN = 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN';
-const safe = (error, fallback) => fail(typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$/.test(error.code)
-    ? error.code : fallback);
+const safe = (error, fallback) => Object.assign(fail(typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$/.test(error.code)
+    ? error.code : fallback), error?.retryAllowed === false ? { retryAllowed: false } : {});
 
 async function runFreshRelayInstall(id, deps) {
     if (!deps.authorize()) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
@@ -41,7 +41,9 @@ async function runFreshRelayInstall(id, deps) {
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
                     throw fail('REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
                 }
-                if (host?.ppp !== true || host.masked !== false) throw fail('REBUILD_L2TP_HOST_NOT_READY');
+                if (host?.masked !== false || (host.ppp !== true && host.pppPreparation !== true)) {
+                    throw fail('REBUILD_L2TP_HOST_NOT_READY');
+                }
                 if (deps.verifyBinding) await checkAuthority();
                 checkAuthorization();
                 const plan = await deps.prepare(inventory, remote);
@@ -82,6 +84,12 @@ async function runFreshRelayInstall(id, deps) {
                     await guard();
                     installResult = await remote.install(plan, guard);
                 } catch (error) {
+                    if (error?.prerequisiteRefusal === true && typeof error.noHostChanges === 'boolean') {
+                        if (error.noHostChanges) await rollback(error.code, true);
+                        // A checked prerequisite failure may have left a module
+                        // loaded or the host receipt written. Keep the reservation.
+                        throw Object.assign(fail(error.code), { retryAllowed: false });
+                    }
                     // A thrown error is ambiguous unless the direct driver has
                     // explicit proof that all dispatched mutations have settled.
                     // Do not infer settlement from errno, timeout or SSH close.

@@ -18,6 +18,8 @@ const SESSION_COUNT_TIMEOUT = 12000;
 const PIN = /^[a-f0-9]{64}$/;
 const TOKEN = /^[a-f0-9]{32}$/;
 const CHAP_ACTIONS = ['check-chap', 'sync-chap', 'inspect-chap', 'read-chap-generation', 'fence-chap'];
+const PREREQUISITE_CODES = ['PPP_MODULES_REQUIRED', 'PPP_MODULES_PERSISTENCE_CONFLICT', 'PPP_MODULES_LOAD_FAILED',
+    'NETWORK_OBSERVATION_REQUIRED'];
 const fail = (suffix, uncertain = false) => Object.assign(new Error(`REBUILD_L2TP_${suffix}`), {
     code: `REBUILD_L2TP_${suffix}`, ...(uncertain && { remoteOutcomeUncertain: true }),
 });
@@ -175,12 +177,13 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     async function exec(action, params = {}, write = false, validate = () => true, verifyLock) {
         const count = action === 'session-count';
         const chap = CHAP_ACTIONS.includes(action);
+        const guarded = chap || action === 'install';
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         checkBinding();
         await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
         requireThat(!closed, 'DIRECT_CLOSED');
         checkBinding();
-        if (chap) requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
+        if (guarded) requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
         const stdin = JSON.stringify({ action, machineId, ...params });
         requireThat(Buffer.byteLength(stdin) <= 25 * 1024 * 1024, 'INSTALL_INPUT_INVALID');
         const verifyBeforeStdin = async () => {
@@ -197,7 +200,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         let result;
         try { result = await ssh.exec(directCommand(count ? '-k 1s 9s' : '-k 4s 125s'), {
             stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
-        }, ...(chap ? [verifyBeforeStdin] : [])); }
+        }, ...(guarded ? [verifyBeforeStdin] : [])); }
         catch { throw unknown(); }
         try { checkBinding(); }
         catch (error) { if (write) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
@@ -217,6 +220,17 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             if (count) codes.push('SESSION_COUNT_UNPROVED');
             if (ipsecBusy) codes.push('REMOVE_IPSEC_BUSY');
             if (chap) codes.push('CHAP_REFUSED');
+            const prerequisite = ['prepare', 'check', 'install'].includes(action) && PREREQUISITE_CODES.includes(raw);
+            if (prerequisite && result.code === 70 && result.stdout === '' && (!refusal?.[1] || action === 'install')) {
+                // After prerequisite dispatch the shared host may be partially
+                // prepared. The caller must keep its reservation, not roll back.
+                const error = fail(raw);
+                if (write) {
+                    error.noHostChanges = Boolean(refusal[1]);
+                    error.prerequisiteRefusal = true;
+                }
+                throw error;
+            }
             // Only the installed helper's closed refusal frame certifies a settled write.
             // A shell/transport exit alone is not authority to race a remote mutation.
             if (write && (result.code !== 70 || result.stdout !== '' || !codes.includes(raw))) throw unknown();
@@ -243,9 +257,11 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     };
     async function preflight() {
         const proof = await exec('preflight', {}, false, value => value && tokenMatches(TOKEN, value.machineId)
-            && ['ppp', 'masked', 'unitsLoaded'].every(key => typeof value[key] === 'boolean'));
+            && ['ppp', 'masked', 'unitsLoaded'].every(key => typeof value[key] === 'boolean')
+            && (!Object.hasOwn(value, 'pppPreparation') || value.pppPreparation === true));
         requireThat(proof.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
-        return { machineId, ppp: proof.ppp, masked: proof.masked, unitsLoaded: proof.unitsLoaded };
+        return { machineId, ppp: proof.ppp, masked: proof.masked, unitsLoaded: proof.unitsLoaded,
+            ...(proof.pppPreparation && { pppPreparation: true }) };
     }
     async function lock(check) {
         requireThat(typeof check === 'function', 'DIRECT_LOCK_REQUIRED');
@@ -340,7 +356,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             const d = makeDesired(input.desired);
             const controlPlaneAddresses = [...input.controlPlaneAddresses], carryDomain = input.carryDomain;
             const host = await preflight();
-            requireThat(host.ppp && !host.masked && host.unitsLoaded, 'HOST_NOT_READY');
+            requireThat((host.ppp || host.pppPreparation) && !host.masked && host.unitsLoaded, 'HOST_NOT_READY');
             const network = { clientCidr: d.clientCidr, tproxyPort: d.tproxyPort, fwmark: d.fwmark, routeTable: d.routeTable };
             const topology = input.transit === undefined ? {} : { transit: structuredClone(input.transit) };
             const snapshot = await exec('prepare', { network, ...topology }, false, v => v && tokenMatches(PIN, v.baseline));
@@ -361,7 +377,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             requireThat(!closed, 'DIRECT_CLOSED');
             held.phase = 'failed';
             held.start = performance.now();
-            try { await exec('install', held.params, true, exactAck(plan.backupId)); }
+            try { await exec('install', held.params, true, exactAck(plan.backupId), verifyLock); }
             catch (error) {
                 if (error.noHostChanges) held.phase = 'refused';
                 throw error;

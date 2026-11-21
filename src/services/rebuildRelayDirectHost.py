@@ -13,6 +13,7 @@ import os
 import pwd
 import re
 import select
+import shlex
 import signal
 import socket
 import stat
@@ -88,6 +89,17 @@ REMOVE_ENTERED = False
 CHAP_ENTERED = False
 NETWORK_UPGRADE_ENTERED = False
 NO_INSTALL_WRITES = False
+PPP_PREPARING = False
+PPP_MODULES = ('ppp_generic', 'l2tp_ppp')
+PPP_DIRS = ('/etc/modules-load.d', '/run/modules-load.d', '/usr/local/lib/modules-load.d',
+            '/usr/lib/modules-load.d', '/lib/modules-load.d')
+PPP_CONF = '70-celerity-rebuild-l2tp.conf'
+PPP_PATH = PPP_DIRS[0] + '/' + PPP_CONF
+PPP_REQUIRED = 'PPP_MODULES_REQUIRED'
+PPP_CONFLICT = 'PPP_MODULES_PERSISTENCE_CONFLICT'
+PPP_FAILED = 'PPP_MODULES_LOAD_FAILED'
+OBSERVATION_REQUIRED = 'NETWORK_OBSERVATION_REQUIRED'
+MODPROBE = '/usr/sbin/modprobe'
 
 
 class Refusal(Exception):
@@ -99,7 +111,7 @@ def need(condition, code):
         raise Refusal(code)
 
 
-def command(*args, data=None, wait=6, unit_show=False, quiet=False):
+def command(*args, data=None, wait=6, unit_show=False, quiet=False, negative=None, refusal=None):
     limit = min(wait, DEADLINE - time.monotonic())
     if limit <= 0:
         raise subprocess.TimeoutExpired([], 0)
@@ -107,11 +119,15 @@ def command(*args, data=None, wait=6, unit_show=False, quiet=False):
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE if quiet else subprocess.DEVNULL, timeout=limit,
                             env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}, cwd='/')
     need(result.returncode >= 0, 'IN_FLIGHT')
-    need(len(result.stdout) <= MAX_FILE, STAGE)
-    need(not quiet or not result.stderr, STAGE)
+    why = refusal or STAGE
+    need(len(result.stdout) <= MAX_FILE, why)
+    need(not quiet or not result.stderr, why)
     # Some systemd versions exit 1 for a structured not-found unit.
-    need(result.returncode == 0 or (unit_show and result.returncode == 1
-         and result.stdout.splitlines().count(b'LoadState=not-found') == 1), STAGE)
+    if negative is not None:
+        need(result.returncode == 1 and result.stdout == negative, why)
+    else:
+        need(result.returncode == 0 or (unit_show and result.returncode == 1
+             and result.stdout.splitlines().count(b'LoadState=not-found') == 1), why)
     return result.stdout
 
 
@@ -270,23 +286,207 @@ def no_jobs(units):
     need(not any(set(line.split()) & set(units) for line in jobs), 'IN_FLIGHT')
 
 
+def ppp_device():
+    try:
+        dev = os.lstat('/dev/ppp')
+        return stat.S_ISCHR(dev.st_mode) and os.major(dev.st_rdev) == 108 and os.minor(dev.st_rdev) == 0
+    except FileNotFoundError:
+        return None
+
+
+def ppp_registered():
+    # Opening the device (or a PPPoX socket) could trigger kernel autoload.
+    with open('/proc/devices', 'rb') as stream:
+        registered = stream.read(65536).partition(b'Block devices:')[0]
+    return re.search(rb'^\s*108\s+ppp\s*$', registered, re.M) is not None
+
+
 def preflight(machine):
     machine_id = open('/etc/machine-id', 'rb').read(34).strip().decode('ascii')
     need(re.fullmatch(r'[a-f0-9]{32}', machine_id) and machine_id == machine, 'IDENTITY')
-    ppp = False
-    try:
-        dev = os.lstat('/dev/ppp')
-        registered = open('/proc/devices', 'rb').read(65536).partition(b'Block devices:')[0]
-        ppp = (stat.S_ISCHR(dev.st_mode) and os.major(dev.st_rdev) == 108 and os.minor(dev.st_rdev) == 0
-               and re.search(rb'^\s*108\s+ppp\s*$', registered, re.M) is not None)
-    except FileNotFoundError:
-        pass
+    ppp = ppp_device() is True and ppp_registered()
     units = [unit(name)['LoadState'] for name in (XL, IKE)]
-    if ppp and units == ['loaded'] * 2:
+    if units == ['loaded'] * 2:
         for package in REQUIRED_PACKAGES:
             status = command('/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}', package)
             need(status.startswith(b'ii '), 'PREREQUISITE')
     return dict(machineId=machine_id, ppp=ppp, masked='masked' in units, unitsLoaded=units == ['loaded'] * 2)
+
+
+def ppp_config():
+    return entry(b'# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n', mode=0o644)
+
+
+def module_name(name):
+    return name.replace('-', '_')
+
+
+def ppp_boot_files(dependencies):
+    # A same-name override may intentionally suppress a vendor module request.
+    # Do not circumvent it by publishing our own file with a different name.
+    def modules(path):
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) and os.readlink(path) == '/dev/null':
+            return set()
+        value = read(path, 65536)
+        need(value is not None, PPP_CONFLICT)
+        return {module_name(line.partition('#')[0].strip()) for line in raw(value).decode().splitlines()}
+
+    try:
+        selected = {}
+        own = read(PPP_PATH, 4096)
+        need(own is None or own == ppp_config(), PPP_CONFLICT)
+        for parent in PPP_DIRS:
+            if parent.startswith('/lib/') and os.path.lexists('/lib') and stat.S_ISLNK(os.lstat('/lib').st_mode):
+                need(os.readlink('/lib') in ('usr/lib', '/usr/lib'), PPP_CONFLICT)
+                continue  # merged-/usr alias
+            try:
+                with directory(parent) as fd:
+                    names = [name for name in os.listdir(fd) if name.endswith('.conf')]
+            except FileNotFoundError:
+                continue
+            for name in names:
+                path = parent + '/' + name
+                if name == PPP_CONF:
+                    need(path == PPP_PATH and own is not None, PPP_CONFLICT)
+                elif name in selected:
+                    suppressed = modules(path) & dependencies
+                    need(not suppressed or suppressed <= modules(selected[name]), PPP_CONFLICT)
+                else:
+                    selected[name] = path
+        return own is None
+    except (OSError, UnicodeError, Refusal):
+        raise Refusal(PPP_CONFLICT) from None
+
+
+def ppp_policy():
+    try:
+        with open('/proc/cmdline') as stream:
+            cmdline = stream.read(65537)
+        need(len(cmdline) <= 65536, PPP_REQUIRED)
+        boot_args = [arg.partition('=') for arg in shlex.split(cmdline)]
+        blocked = {module_name(name) for key, _, value in boot_args
+                   if key in ('module_blacklist', 'modprobe.blacklist', 'rd.driver.blacklist')
+                   for name in value.split(',')}
+        boot_unit = 'systemd-modules-load.service'
+        need(not any(key in ('systemd.mask', 'rd.systemd.mask') and value == boot_unit for key, _, value in boot_args), PPP_CONFLICT)
+        try:
+            loader = unit(boot_unit)
+            need(loader['LoadState'] == 'loaded' and loader['UnitFileState'] == 'static'
+                 and loader.get('FragmentPath') in ('/lib/systemd/system/' + boot_unit, '/usr/lib/systemd/system/' + boot_unit)
+                 and not loader.get('DropInPaths') and loader.get('NeedDaemonReload') == 'no', PPP_CONFLICT)
+        except (OSError, Refusal):
+            raise Refusal(PPP_CONFLICT) from None
+        config = command(MODPROBE, '--showconfig', quiet=True, refusal=PPP_REQUIRED)
+        for line in config.decode().splitlines():
+            words = line.split()
+            if len(words) >= 2 and words[0] in ('blacklist', 'install'):
+                blocked.add(module_name(words[1]))
+        deps, builtin, listings = set(PPP_MODULES), set(), []
+        for name in PPP_MODULES:
+            # Read-only resolution, including soft dependencies; no install hooks run.
+            listing = command(MODPROBE, '--show-depends', '--use-blacklist', '--', name,
+                              quiet=True, refusal=PPP_REQUIRED).decode()
+            found = set()
+            for fields in map(str.split, listing.splitlines()):
+                if len(fields) == 2 and fields[0] == 'builtin':
+                    found.add(module_name(fields[1]))
+                    builtin.add(module_name(fields[1]))
+                    continue
+                need(len(fields) >= 2 and fields[0] == 'insmod', PPP_REQUIRED)
+                match = re.fullmatch(r'/(?:usr/)?lib/modules/[^\s]+/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|zst|gz))?', fields[1])
+                need(match, PPP_REQUIRED)
+                found.add(module_name(cast(re.Match, match)[1]))
+            need(name in found, PPP_REQUIRED)
+            deps.update(found)
+            listings.append(listing)
+        need(not (deps & blocked), PPP_REQUIRED)
+        return deps, sorted(builtin), digest(encode(listings))
+    except (OSError, ValueError):
+        raise Refusal(PPP_REQUIRED) from None
+
+
+def live_modules(refusal):
+    with open('/proc/modules') as stream:
+        data = stream.read(262145)
+    need(len(data) <= 262144, refusal)
+    return {fields[0] for line in data.splitlines() if len(fields := line.split()) >= 6 and fields[4] == 'Live'}
+
+
+def ppp_loaded(builtin):
+    return dict(ppp_generic=ppp_registered(), l2tp_ppp='l2tp_ppp' in live_modules(PPP_REQUIRED) or 'l2tp_ppp' in builtin)
+
+
+def require_network_observers():
+    # Even read-only netlink requests can autoload protocol/subsystem modules.
+    # Insist on available providers before ss, nft or ip xfrm, without loading
+    # them as a side effect of preparing a PPP/install plan.
+    try:
+        active = live_modules(OBSERVATION_REQUIRED)
+        for name in ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user'):
+            if name not in active:
+                proof = command(MODPROBE, '--show-depends', '--use-blacklist', '--', name,
+                                quiet=True, refusal=OBSERVATION_REQUIRED)
+                need(b'builtin ' + name.encode() in proof.splitlines(), OBSERVATION_REQUIRED)
+    except (OSError, ValueError):
+        raise Refusal(OBSERVATION_REQUIRED) from None
+
+
+def ppp_host_scope():
+    detect = '/usr/bin/systemd-detect-virt'
+    # A full VM owns its kernel; a shared-kernel container does not. Require
+    # the detector's documented negative result, not an arbitrary failed probe.
+    need(command(detect, '--container', quiet=True, negative=b'none\n', refusal=PPP_REQUIRED) == b'none\n', PPP_REQUIRED)
+    need(command(detect, '--chroot', quiet=True, negative=b'', refusal=PPP_REQUIRED) == b'', PPP_REQUIRED)
+    # Linux reserves PROC_USER_INIT_INO for the initial user namespace. A
+    # child namespace with a full UID map must not pass this check.
+    need(os.readlink('/proc/self/ns/user') == 'user:[4026531837]', PPP_REQUIRED)
+    with open('/proc/self/status') as stream:
+        caps = re.search(r'^CapEff:\s*([0-9a-f]+)$', stream.read(65536), re.M)
+    need(caps is not None and int(caps[1], 16) & (1 << 16), PPP_REQUIRED)  # CAP_SYS_MODULE
+
+
+def observe_ppp_preparation():
+    """Read-only prerequisite projection included in the fresh Install baseline."""
+    try:
+        deps, builtin, policy = ppp_policy()
+        loaded, device = ppp_loaded(builtin), ppp_device()
+        need(device is not False and (not loaded['ppp_generic'] or device is True), PPP_REQUIRED)
+        persist = ppp_boot_files(deps)
+        missing = [name for name in PPP_MODULES if not loaded[name]]
+        if missing or persist:
+            ppp_host_scope()
+            with open('/proc/sys/kernel/modules_disabled') as stream:
+                need(stream.read(8).strip() == '0', PPP_REQUIRED)
+        return dict(missing=missing, persist=persist, builtin=builtin, policy=policy)
+    except (OSError, ValueError):
+        raise Refusal(PPP_REQUIRED) from None
+
+
+def apply_ppp_preparation(expected):
+    """Reserved Install only, under the same host flock and durable applying receipt."""
+    need(observe_ppp_preparation() == expected, 'BASELINE_CHANGED')
+    for name in expected['missing']:
+        if not ppp_loaded(expected['builtin'])[name]:
+            # Use ordinary kmod policy, never --ignore-install/force/insmod.
+            command(MODPROBE, '--use-blacklist', '--', name, wait=10, quiet=True, refusal=PPP_FAILED)
+            need(ppp_loaded(expected['builtin'])[name], PPP_FAILED)
+    if 'ppp_generic' in expected['missing']:
+        # Give the kernel/devtmpfs/udev time to expose the node; never mknod.
+        ready_by = min(DEADLINE, time.monotonic() + 2)
+        while ppp_device() is None and time.monotonic() < ready_by:
+            time.sleep(0.05)
+    need(all(ppp_loaded(expected['builtin']).values()) and ppp_device() is True, PPP_FAILED)
+    if expected['persist']:
+        deps, _, policy = ppp_policy()
+        need(policy == expected['policy'] and ppp_boot_files(deps), PPP_CONFLICT)
+        try:
+            mkdir(PPP_DIRS[0], 0o755, exist_ok=True)
+            write(PPP_PATH, None, ppp_config())  # fsynced and never replaces a file
+        except (FileExistsError, PermissionError):
+            raise Refusal(PPP_CONFLICT) from None
+    ready = observe_ppp_preparation()
+    need(not ready['missing'] and not ready['persist'] and ready['policy'] == expected['policy'], PPP_FAILED)
 
 
 def sock_rows():
@@ -697,7 +897,7 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
     ready = preflight(machine)
-    need(ready['ppp'] and ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
+    need(ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
     no_jobs(UNITS)
     units = {name: unit(name) for name in UNITS}
     for name in (XL, IKE):
@@ -863,10 +1063,6 @@ def validate_profiles(after):
         command(*as_user, XRAY, 'run', '-test', '-format', 'json', '-config', 'stdin:', data=raw(after[key]), wait=8)
 
 
-def validate_candidate(after):
-    validate_profiles(after)
-    command('/usr/sbin/nft', '-c', '-f', '-', data=raw(after['nft']))
-
 
 def manifest_path(token):
     return VAULT + '/' + token + '/manifest.json'
@@ -1013,8 +1209,8 @@ def swan_started_units(before):
     return births
 
 
-def install(request, before, after):
-    global STAGE
+def install(request, before, after, lock_fd=None):
+    global STAGE, PPP_PREPARING
     STAGE = 'COMMAND_FAILED'
     token, d = request['backupId'], request['network']
     backup: dict[str, Any] = dict(machineId=request['machineId'], backupId=token, before=before, network=d,
@@ -1026,6 +1222,18 @@ def install(request, before, after):
     path = manifest_path(token)
     old_manifest = entry(payload)
     write(path, None, old_manifest)
+    modules = before.get('pppModules')
+    if modules is not None:
+        # This shared host prerequisite has no automatic inverse. Any later
+        # ordinary rollback deals only with the VPN-owned files and services.
+        PPP_PREPARING = True
+        need(lock_fd is not None and install_lock_identity(lock_fd) == before['installLock']
+             and boot() == before['boot'] and preflight(request['machineId'])['masked'] is False, 'BASELINE_CHANGED')
+        apply_ppp_preparation(modules)
+        # Even check-only nft can autoload expression modules. Run it only
+        # after the durable host intent and under the reserved host lock.
+        command('/usr/sbin/nft', '-c', '-f', '-', data=raw(after['nft']))
+        PPP_PREPARING = False
     if 'swan' in after:
         old_manifest = write_swan_profile(path, old_manifest, backup, after)
     mkdir(NFT_DIR, 0o755)
@@ -3356,6 +3564,24 @@ def read_session_count(request):
         return relay_session_census(request)
 
 
+def install_lock_identity(lock_fd):
+    st = os.fstat(lock_fd)
+    lock_id = [st.st_dev, st.st_ino]
+    with directory(SYSTEM) as current:
+        live = os.fstat(current)
+        need(lock_id == [live.st_dev, live.st_ino], 'BASELINE_CHANGED')
+    return lock_id
+
+
+def observe_install(machine, network, transit, lock_fd):
+    lock_id = install_lock_identity(lock_fd)
+    modules = observe_ppp_preparation()
+    require_network_observers()
+    before = observe(machine, network, transit)
+    need(install_lock_identity(lock_fd) == lock_id, 'BASELINE_CHANGED')
+    return {**before, 'pppModules': modules, 'installLock': lock_id}
+
+
 def dispatch(request: dict[str, Any]):
     global STAGE, NO_INSTALL_WRITES
     need(os.geteuid() == 0 and type(request) is dict, 'PREREQUISITE')
@@ -3368,7 +3594,7 @@ def dispatch(request: dict[str, Any]):
     NO_INSTALL_WRITES = action == 'install'
     ready = preflight(machine)
     if action == 'preflight':
-        return ready
+        return {**ready, 'pppPreparation': True}
     d = routing(request['network'])
     # Lock a stable system directory without creating a lock file in prepare.
     # This only serializes DIRECT invocations; the caller must exclude other
@@ -3428,7 +3654,7 @@ def dispatch(request: dict[str, Any]):
         transit = request.get('transit')
         need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
         if action == 'prepare':
-            before = observe(machine, d, transit)
+            before = observe_install(machine, d, transit, fd)
             main = raw(before['files']['main'])
             bridge = raw(before['bridge']) if before['bridge'] is not None else None
             return {**ready, 'baseline': digest(encode(before)), 'main': main.decode(), 'mainSha256': digest(main),
@@ -3436,18 +3662,21 @@ def dispatch(request: dict[str, Any]):
         token = request['backupId']
         need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{64}', request['baseline']), 'CANDIDATE_INVALID')
         if action in ('check', 'install'):
-            before = observe(machine, d, transit)
+            before = observe_install(machine, d, transit, fd)
             need(digest(encode(before)) == request['baseline'], 'BASELINE_CHANGED')
             after = candidate(request, before)
-            validate_candidate(after)
+            validate_profiles(after)
             if action == 'install':
-                need(observe(machine, d, transit) == before, 'BASELINE_CHANGED')
+                need(observe_install(machine, d, transit, fd) == before, 'BASELINE_CHANGED')
                 NO_INSTALL_WRITES = False
-                install(request, before, after)
+                install(request, before, after, fd)
         else:
             path, record, backup = bound_manifest(request)
             if action == 'verify':
                 need(installed_phase(backup['phase']), 'RUNTIME_UNPROVED')
+                if 'pppModules' in backup['before']:
+                    modules = observe_ppp_preparation()
+                    need(not modules['missing'] and not modules['persist'], 'RUNTIME_UNPROVED')
                 files = load_after(backup, require_all=True)
                 need(installed_runtime(d, token, backup['before'], files) == backup['runtime'], 'RUNTIME_UNPROVED')
             else:
@@ -3469,6 +3698,8 @@ def main():
     except Refusal as error:
         if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or str(error) == 'IN_FLIGHT':
             return 75
+        if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED):
+            return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
               'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
               'REMOVE_REFUSED' if action == 'remove' else
@@ -3477,7 +3708,7 @@ def main():
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
-        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED:
+        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or PPP_PREPARING:
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else

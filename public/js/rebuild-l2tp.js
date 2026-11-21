@@ -183,6 +183,7 @@
             } else if (revocation && data?.error?.retryAllowed === false) {
                 note = closureNote(data.error, data.error.confirmedSessionsTerminated);
             }
+            if (action === 'install' && typeof data?.error?.operatorAction === 'string') note = ` ${data.error.operatorAction}`;
         } catch { /* A lost response is not proof that the mutation failed. */ }
         if (result === 'uncertain') {
             requireRefresh = true;

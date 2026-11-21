@@ -96,7 +96,7 @@ if scenario.startswith('chap-unterminated-'):
     Path(P['chap']).write_bytes(b'# original comment with opaque byte \xff')
 
 def stat(value):
-    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size')})
+    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size','st_dev','st_ino')})
 class FixtureOS:
     def __getattr__(self, name): return getattr(os, name)
     def lstat(self, path):
@@ -131,6 +131,10 @@ def preflight(machine):
     h['need'](machine == f['machineId'], 'IDENTITY')
     return dict(machineId=machine, ppp=True, masked=False, unitsLoaded=True)
 h['preflight'] = preflight
+# Already-prepared PPP; the joined fixture exercises actual preparation.
+h['observe_ppp_preparation'] = lambda: dict(missing=[], persist=False, builtin=[], policy='fixture')
+h['apply_ppp_preparation'] = lambda expected: h['need'](expected == h['observe_ppp_preparation'](), 'BASELINE_CHANGED')
+h['require_network_observers'] = lambda: None
 h['boot'] = lambda: 'fixture-boot'
 h['ppp_empty'] = lambda: not (testing and scenario == 'active-ppp')
 h['in_cgroup'] = lambda pid, info: pid == info['MainPID']
@@ -399,8 +403,8 @@ if scenario == 'chap-inspect-active':
                     'require authentication = yes\npppoptfile = /etc/ppp/options.xl2tpd\nlength bit = yes\n')
     files['options'] = ('auth\nrefuse-pap\nrefuse-chap\nrefuse-mschap\nrequire-mschap-v2\nrefuse-eap\nname l2tpd\n'
                         'mtu 1400\nmru 1400\nnoipv6\nnodefaultroute\nms-dns 192.0.2.53\n')
-assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()},
-    baseline=h['digest'](h['encode'](before))))['ok']
+baseline = h['dispatch'](dict(req, action='prepare'))['baseline']
+assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()}, baseline=baseline))['ok']
 manifest = Path(h['manifest_path'](token))
 manifest_saved = manifest.read_bytes(), manifest.stat().st_ino
 intent = manifest.with_name('remove-attempt.json')
