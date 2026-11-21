@@ -1752,7 +1752,7 @@ def applying_vpn_ownership(rows, units):
     vpn_stop_checks(rows, units, require_xl_listener=False)
 
 
-def vpn_stop_checks(rows, units, *, require_xl_listener):
+def vpn_listener_ownership(rows, units, *, require_xl_listener):
     xl, ike = units[XL], units[IKE]
     lns_active, ike_active = (info['ActiveState'] == 'active' for info in (xl, ike))
     lns_rows = [(p, owners) for p, _, n, owners in rows if n == 1701]
@@ -1762,6 +1762,11 @@ def vpn_stop_checks(rows, units, *, require_xl_listener):
          and {n for _, n, _ in ike_rows} == ({500, 4500} if ike_active else set())
          and all(p == 'udp' and owners and all(in_cgroup(pid, ike) for pid in owners) for p, _, owners in ike_rows),
          'RUNTIME_UNPROVED')
+
+
+def vpn_stop_checks(rows, units, *, require_xl_listener):
+    vpn_listener_ownership(rows, units, require_xl_listener=require_xl_listener)
+    ike_active = units[IKE]['ActiveState'] == 'active'
     need(vpn_empty(allow_socket_policies=ike_active), 'ROLLBACK_DRIFT')
     if ike_active:
         # Don't stop a foreign connection or an in-flight negotiation.
@@ -2080,7 +2085,10 @@ def observe_removal(request, *, quiescent=False):
     need(policy == {'nft': runtime['nft'], 'rule': True, 'route': True} and policy['nft'] is not None, bad)
     rows = sock_rows()
     if quiescent:
-        removal_vpn_runtime(rows, units)
+        # PPP absence does not require IKE/XFRM to be idle. Keep listener
+        # ownership and the PPP guard; Remove still requires full VPN idleness.
+        vpn_listener_ownership(rows, units, require_xl_listener=True)
+        need(ppp_empty(), bad)
     else:
         removal_idle(request, rows, units)
     reserved = removal_sockets(rows, units, d, handoff, handoff_unit)

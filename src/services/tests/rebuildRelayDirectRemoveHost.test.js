@@ -50,11 +50,15 @@ os.umask(0o077)
 h = {'__name__': 'fixture'}
 mock_faults = []
 def no_host_dispatch(event, _):
-    if event in {'subprocess.Popen','os.system','os.posix_spawn','os.exec','os.fork'} or event.startswith('socket.'):
+    if event in {'subprocess.Popen','os.system','os.posix_spawn','os.exec','os.fork','os.kill','os.killpg'} or event.startswith('socket.'):
         mock_faults.append(event)
         raise AssertionError('non-modeled host dispatch')
 sys.addaudithook(no_host_dispatch)
 exec(compile(Path(source).read_bytes(), source, 'exec'), h)
+def forbidden_signal(*args):
+    mock_faults.append('unexpected pidfd signal')
+    raise AssertionError('unexpected pidfd signal')
+h['signal'] = types.SimpleNamespace(pidfd_send_signal=forbidden_signal, SIGTERM=15)
 for k in ('MAIN', 'BRIDGE', 'XRAY', 'SYSTEM', 'NET', 'DROP_DIR', 'DROP', 'NFT_DIR', 'NFT_FILE', 'VAULT'):
     h[k] = str(root) + h[k]
 h['NAMES'] = {k: str(root) + v for k, v in h['NAMES'].items()}
@@ -76,6 +80,10 @@ def stat(value):
     return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size')})
 class FixtureOS:
     def __getattr__(self, name): return getattr(os, name)
+    def lstat(self, path):
+        return os.lstat(root / path.lstrip('/') if path.startswith('/run/') else path)
+    def listdir(self, path):
+        return os.listdir(root / 'run' if path == '/run' else path)
     def fstat(self, fd): return stat(os.fstat(fd))
     def stat(self, path, *args, **kw):
         if path.startswith('/proc/'):
@@ -85,6 +93,7 @@ class FixtureOS:
         assert uid == gid == 0 and os.readlink('/proc/self/fd/' + str(fd)).startswith(tmp + '/')
     def geteuid(self): return 0
 h['os'] = FixtureOS()
+(root / 'run').mkdir(exist_ok=True)
 @contextlib.contextmanager
 def directory(path, private=False):
     assert Path(path).is_relative_to(root)
@@ -208,7 +217,7 @@ def command(*a, data=None):
         if a == ('/usr/bin/head','-c','1024','/sys/fs/cgroup/system.slice/xl2tpd.service/cgroup.events'):
             return b'populated 1\nfrozen 0\n' if group_populated else b'populated 0\nfrozen 0\n'
         if a == ('/usr/bin/ps','-ww','-e','-o','pid=','-o','comm='):
-            return b'    1 systemd\n   40 ps\n'
+            return b'    1 systemd\n   40 ps\n' + (b'  999 pppd\n' if stray_pppd else b'')
         if a == ('/usr/bin/ss','-H','-aun','sport = :1701'):
             return b''
         if a == ('/usr/sbin/ip','-j','-details','link','show'):
@@ -234,6 +243,7 @@ def command(*a, data=None):
         for name, ports in [(XL,[1701]), (IKE,[500,4500])]:
             if units[name]['ActiveState'] == 'active':
                 rows.extend(('udp','0.0.0.0',port,units[name]['MainPID']) for port in ports)
+        if foreign_l2tp_listener: rows.append(('udp','0.0.0.0',1701,'999'))
         if testing and scenario == 'foreign-listener': rows.append(('tcp','0.0.0.0',network['tproxyPort'],'999'))
         if testing and scenario == 'lingering-listener' and ('restart', X) in changes:
             rows.append(('tcp','0.0.0.0',network['tproxyPort'],'999'))
@@ -308,9 +318,11 @@ def run(a, input=None, **kw):
     return types.SimpleNamespace(stdout=stdout, stderr=b'', returncode=status)
 subprocess = h['subprocess']
 h['subprocess'] = types.SimpleNamespace(run=run, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired)
+stray_pppd = foreign_l2tp_listener = False
 before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stock_units, bridge=None,
               globalFiles={}, installBoot=False, ikeSockets=[],
               sockets=h['owned_sockets'](h['sock_rows'](), units[X]['MainPID']))
+if scenario == 'apply-quiescent-dependent': before['transit'] = []
 h['observe'] = lambda m,d,transit: before
 req = {k: f[k] for k in ('network','backupId','machineId')}
 nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
@@ -348,7 +360,6 @@ if scenario.endswith('-suffix') or scenario == 'chap-unterminated-separated':
         req['currentUsers'] = [dict(login='alice', password='test-old', ipAddress='10.255.1.10', enabled=True)]
     else:
         Path(P['chap']).write_bytes(Path(P['chap']).read_bytes() + suffix)
-if scenario == 'apply-quiescent-dependent': req['transit'] = []
 if scenario == 'foreign-drop': Path(h['DROP_DIR'], 'foreign.conf').write_text('untouched')
 if scenario == 'foreign-dep': units[X]['RequiredBy'] += ' ' + B
 if scenario in ('vpn-generation', 'chap-legacy-replaced'):
@@ -600,9 +611,43 @@ else:
         assert count['activeSessions'] == count['activeIpsec'] == 0 and len(expected) == 64
         assert snapshot() == recheck and not changes and not intent.exists()
         assert l2tp_reads == 2
+        # Use the same live SA for the read-only census and both Remove guards.
+        checked_vpn_empty = h['vpn_empty']
+        vpn_empty_calls = []
+        def record_vpn_empty(**kwargs):
+            result = checked_vpn_empty(**kwargs)
+            vpn_empty_calls.append(result)
+            return result
+        h['vpn_empty'] = record_vpn_empty
+        ipsec_live = True
+        code, stdout, stderr = wire('session-count')
+        assert (code, stderr) == (0, ''), (code, stderr)
+        busy = json.loads(stdout)
+        assert busy['activeSessions'] == 0 and busy['activeIpsec'] == 1 and len(busy['census']) == 64, busy
+        assert busy['census'] != expected and not vpn_empty_calls
+        assert wire('prepare-remove') == (70, '', 'DIRECT_REMOVE_IPSEC_BUSY\n') and vpn_empty_calls == [False]
+        assert wire('remove', baseline=proof['baseline'], expectedCensus=busy['census']) == (
+            70, '', 'DIRECT_REMOVE_IPSEC_BUSY\n') and vpn_empty_calls == [False, False]
+        foreign_l2tp_listener = True
+        code, stdout, stderr = wire('session-count')
+        assert (code, json.loads(stdout), stderr) == (0, {'activeSessions': None, 'activeIpsec': 1, 'census': None}, '')
+        foreign_l2tp_listener = False
+
+        revoke = dict(currentUsers=new_users, desiredUsers=new_users, revokedLogin='disabled')
+        for stray_pppd in (False, True):
+            code, stdout, stderr = wire('sync-chap', **revoke)
+            assert (code, stderr) == (0, ''), (code, stderr)
+            assert json.loads(stdout) == dict(ok=True, backupId=token, changed=False, sessionsTerminated=0,
+                                              complete=not stray_pppd)
+        stray_pppd = False
+        assert vpn_empty_calls == [False, False] and snapshot() == recheck and not changes and not intent.exists()
+        h['vpn_empty'] = checked_vpn_empty
+        ipsec_live = False
+        clean_reads = l2tp_reads
         group_populated = True
         code, stdout, stderr = wire('session-count')
-        assert (code, json.loads(stdout), stderr) == (0, {'activeSessions': None, 'activeIpsec': 0, 'census': None}, '') and l2tp_reads == 2
+        assert (code, json.loads(stdout), stderr) == (0, {'activeSessions': None, 'activeIpsec': 0, 'census': None}, '')
+        assert l2tp_reads == clean_reads
         group_populated = False
         lingering_from = l2tp_reads + 1
         code, stdout, stderr = wire('session-count')
