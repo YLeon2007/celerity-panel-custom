@@ -338,7 +338,7 @@
     "rebuildCountUnavailable": "unconfirmed",
     "rebuildRemoveOpen": "Review L2TP removal",
     "rebuildRemoveConfirmSummary": "L2TP removal preview. {counts}",
-    "rebuildRemoveWarning": "This removes the L2TP installation and its managed account from this relay. The preview is valid for up to two minutes.",
+    "rebuildRemoveWarning": "This removes L2TP and its local account copies from this relay only. Shared accounts are kept, even when removing the last relay. The preview is valid for up to two minutes.",
     "rebuildRemoveConfirm": "Confirm L2TP removal",
     "rebuildRemoveBusy": "Removal is blocked while sessions are active. No sessions are forcibly disconnected.",
     "rebuildRemoveIpsecBusy": "Removal is blocked by active IPsec connections, which can remain after PPP disconnects. Disconnect IPsec on the client or wait for the connection to expire, then review the counts again. There is no force option.",

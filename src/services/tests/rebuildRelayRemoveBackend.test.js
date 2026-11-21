@@ -11,6 +11,7 @@ const User = require('../../modules/relay-l2tp/models/l2tpUserModel');
 const Node = require('../../models/hyNodeModel');
 const Link = require('../../models/cascadeLinkModel');
 const { encrypt, decrypt } = require('../../modules/relay-l2tp/services/secretBoxService');
+const { bindDirectory } = require('./helpers/rebuildRelayDirectoryFixture');
 
 const id = 'a'.repeat(24), machineId = 'b'.repeat(32), backupId = 'c'.repeat(32);
 const oid = value => new Types.ObjectId(value);
@@ -80,6 +81,7 @@ function deferred() {
     return { promise, done };
 }
 function fixture(t) {
+    bindDirectory(t, User.db);
     const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: id,
         C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, ENCRYPTION_KEY: 'test-only-credential-key-'.repeat(2), PANEL_DOMAIN: 'fixture.invalid' };
     const nodes = [{ _id: oid(id), ip: '192.0.2.4', domain: 'relay.fixture.invalid', type: 'xray', active: true,
@@ -257,6 +259,7 @@ function modelTransactions(t, { states, users, nodes }) {
             const apply = () => {
                 if (reserving) states[0] = next;
                 else for (const rows of [states, users]) rows.splice(0, rows.length, ...session.rows.get(rows));
+                session.commitDirectory?.();
                 return { ok: 1 };
             };
             const commit = reserving ? dbHooks.reserve : dbHooks.settle;

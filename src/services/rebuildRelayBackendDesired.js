@@ -54,9 +54,9 @@ function makeDesired(nodeId, occupied, controlPlaneAddresses, key, { inherited, 
         try {
             accounts = inherited.map(account => {
                 const password = decrypt(account.passwordEncrypted, key);
-                // The DIRECT serializer owns quoting and format checks. Keep
-                // failure secret-free and never fall back to a new password.
-                if (!password || /[\r\n\0]/.test(password)) throw new Error();
+                // Same credential alphabet as DIRECT Install. Refuse an
+                // unusable retained credential before opening the target.
+                if (!/^[A-Za-z0-9_-]{1,256}(?![\s\S])/.test(password)) throw new Error();
                 return { ...account, password };
             });
         } catch { throw fail('REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID'); }

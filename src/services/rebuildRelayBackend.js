@@ -94,20 +94,20 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, cr
                 const topology = await readTopology(Node, Link, node, env.PANEL_DOMAIN);
                 const sourceSnapshot = await store.sourceRows(id);
                 const key = env.ENCRYPTION_KEY;
-                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env, key,
+                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env, key, machineId,
                     readNode: getNode, listMode: fence.listMode });
                 const payload = makeDesired(id, sourceInventory.occupied, topology.controlPlaneAddresses, key, sourceInventory);
                 if (sourceInventory.inherited && payload.desired.users[0].ipAddress !== payload.desired.poolStart) {
                     throw fail('REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID');
                 }
-                return { ...snapshot, ...topology, ...payload, sourceSnapshot, replicated: !!sourceInventory.inherited,
+                return { ...snapshot, ...topology, ...payload, sourceSnapshot, inherited: sourceInventory.inherited,
                     sources: sourceInventory.prechecks, key, node, eligible: true, nodeId: id };
             },
             verifyBinding: fence.listMode ? async inventory => {
                 const current = await getNode();
                 if (!eligible(current, id, true)) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
                 fence.check(current);
-                if (inventory?.replicated && env.ENCRYPTION_KEY !== inventory.key) throw fail('REBUILD_L2TP_CREDENTIAL_KEY_INVALID');
+                if (inventory?.key !== undefined && env.ENCRYPTION_KEY !== inventory.key) throw fail('REBUILD_L2TP_CREDENTIAL_KEY_INVALID');
                 for (const source of inventory?.sources ?? []) await source.verifyBinding();
             } : undefined,
             precheckSources: async ({ sources }, checkAuthority) => {

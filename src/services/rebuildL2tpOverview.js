@@ -4,6 +4,7 @@ const { isIP, isIPv4 } = require('node:net');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { resolveRelayBinding: defaultResolveBinding } = require('./rebuildRelayAuthorization');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
+const { readDirectory, sameAccounts } = require('./rebuildRelayDirectory');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 
@@ -184,7 +185,10 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         const cohort = list ? ownedCohort(states.filter(row => row.status !== 'not_installed' || row.desiredState !== 'absent'), owned, list)
             : owned.size === 1 ? owned : null;
         const accountRows = list ? rows : rows.filter(row => owned.has(String(row.relayNode)));
-        const inventoryOk = clear && inventoryMatches(rows.filter(row => owned.has(String(row.relayNode))), cohort, list);
+        const directory = await readDirectory(L2tpUser.db, undefined, true);
+        const inventoryOk = clear && inventoryMatches(rows.filter(row => owned.has(String(row.relayNode))), cohort, list)
+            && (!directory || [...cohort.keys()].every(id => sameAccounts(directory.accounts,
+                rows.filter(row => String(row.relayNode) === id), false)));
         const grouped = new Map();
         for (const row of accountRows) {
             if (!matches(loginPattern, row.login)) continue;
@@ -205,6 +209,12 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 consistent, canRevealPassword: consistent && hasKey(),
                 addresses: visible.filter(row => isIPv4(row.ip)).map(row => ({ id: String(row.relayNode), ip: row.ip }))
                     .sort((a, b) => compare(a.id, b.id)) });
+        }
+        if (directory && !rows.length && states.every(row => row.status === absentState.status && row.desiredState === absentState.desiredState)
+            && (list || (directory.accounts.length === 1 && matches(idPattern, env.C3_REBUILD_L2TP_RELAY_ID)))) {
+            for (const { login, enabled } of directory.accounts) {
+                accounts.push({ login, enabled, consistent: clear, canRevealPassword: clear && hasKey(), addresses: [] });
+            }
         }
         accounts.sort((a, b) => compare(a.login, b.login));
         return { relays, accounts, canManageAccounts: list && hasKey() && inventoryOk && accounts.every(row => row.consistent) };
@@ -228,7 +238,15 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             if (!list && (!matches(idPattern, singleton) || login !== bootstrap)) return null;
             const filter = list ? { $nor: [absentState] } : { node: singleton };
             const states = await read(State.find(filter).sort('_id'), stateFields);
-            if (!states.length || states.some(row => !matches(idPattern, String(row.node)))) return null;
+            if (states.some(row => !matches(idPattern, String(row.node)))) return null;
+            const directory = await readDirectory(L2tpUser.db);
+            if (states.length === 0 || (!list && states.length === 1 && states[0].status === absentState.status
+                && states[0].desiredState === absentState.desiredState)) {
+                if (!directory || (!list && directory.accounts.length !== 1)) return null;
+                if ((!list && await read(State.findOne({ $nor: [absentState] }), '_id'))
+                    || await read(L2tpUser.findOne({}), '_id')) return null;
+                return { list, dormant: true, directory, states };
+            }
             const nodes = await findNodes({ _id: { $in: states.map(row => row.node) } });
             const cohort = passwordCohort(states, nodes, list);
             if (!cohort) return null;
@@ -236,13 +254,19 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             const inventoryScope = list ? { $or: [{ relayNode: { $in: states.map(row => row.node) } }, { login }] } : scope;
             const inventory = await read(L2tpUser.find(inventoryScope).sort('_id'), userFields);
             if (!inventoryMatches(inventory, cohort, list)) return null;
+            if (directory && ![...cohort.keys()].every(id => sameAccounts(directory.accounts,
+                inventory.filter(row => String(row.relayNode) === id), false))) return null;
             // An unexpected same-login replica invalidates the account; don't
             // filter down to a good-looking subset of the installed cohort.
             const copies = await read(L2tpUser.find({ ...scope, login }).sort('_id'), `${userFields} passwordEncrypted`);
             if (!equal(inventory.filter(row => row.login === login), copies.map(({ passwordEncrypted: _, ...row }) => row))) return null;
-            return { list, nodes, states, inventory, copies };
-        }, ({ list, states, nodes, copies }) => {
-            if (list !== listMode() || !replicasAgree(copies, passwordCohort(states, nodes, list), list, true)) return null;
+            return { list, nodes, states, inventory, copies, directory };
+        }, ({ list, dormant, states, nodes, copies, directory }) => {
+            if (list !== listMode()) return null;
+            const account = directory?.accounts.find(row => row.login === login);
+            if (dormant) return account?.passwordEncrypted;
+            if (!replicasAgree(copies, passwordCohort(states, nodes, list), list, true)) return null;
+            if (directory && (!account || account.enabled !== copies[0].enabled || account.passwordEncrypted !== copies[0].passwordEncrypted)) return null;
             return copies[0].passwordEncrypted;
         });
     }

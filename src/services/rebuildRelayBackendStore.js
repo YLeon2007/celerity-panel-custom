@@ -5,6 +5,7 @@ const { isDeepStrictEqual: equal } = require('node:util');
 const { Types } = require('mongoose');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { transactOnce } = require('./rebuildRelayInstallTransaction');
+const { readDirectory, checkDirectory, writeDirectory, logicalAccount } = require('./rebuildRelayDirectory');
 
 const fail = code => Object.assign(new Error(code), { code });
 const STATE_CHANGED = 'REBUILD_L2TP_RESERVATION_CHANGED';
@@ -45,16 +46,16 @@ function createStore(State, User, listMode) {
         return { prior, pristine };
     }
     async function sourceRows(id, session) {
-        const states = await read(State.find({ node: { $ne: id } }).select(privateStateFields), session);
+        const states = await read(State.find(id == null ? {} : { node: { $ne: id } }).select(privateStateFields), session);
         const users = await read(User.find({}).select('+passwordEncrypted'), session);
-        return { states: states.sort(byId), users: users.sort(byId) };
+        return { states: states.sort(byId), users: users.sort(byId), directory: await readDirectory(User.db, session) };
     }
 
     // List enrollment joins state and accounts even for the first relay, with
     // no source and only one login. Only legacy no-list supports standalone.
     const mutate = work => listMode ? transactOnce(State, User, work) : work();
 
-    async function reserve({ nodeId, prior, machineId, backupId, state, accounts, sourceSnapshot }, verifyLock) {
+    async function reserve({ nodeId, prior, machineId, backupId, state, accounts, sourceSnapshot, inherited }, verifyLock) {
         if (!Array.isArray(accounts) || accounts.length === 0 || (!listMode && accounts.length !== 1)) throw fail(STATE_CHANGED);
         const now = new Date();
         const stateId = prior?._id ?? nodeId;
@@ -67,7 +68,7 @@ function createStore(State, User, listMode) {
         const fence = { ...key, ...exact({ ...prior, ...fields }, [...Object.keys(fields), ...zeroFields, ...emptyFields]) };
         const replicas = accounts.map(account => ({ _id: new Types.ObjectId(), relayNode: new Types.ObjectId(nodeId),
             ...account, appliedRevision: 0, syncStatus: 'pending', createdAt: now, updatedAt: now }));
-        const reservation = { nodeId, fence, fields, prior, replicas };
+        const reservation = { nodeId, fence, fields, prior, replicas, directory: sourceSnapshot.directory, inherited };
         return mutate(async session => {
             // Prepare can take time. Recheck the source and absence of target
             // accounts before making any row durable.
@@ -92,7 +93,8 @@ function createStore(State, User, listMode) {
         });
     }
 
-    async function verifyReservation({ nodeId, fence, replicas }, session) {
+    async function verifyReservation({ nodeId, fence, replicas, directory }, session) {
+        await checkDirectory(User.db, directory, session);
         if (!(await read(State.findOne(fence).select('_id'), session))) throw fail(STATE_CHANGED);
         const rows = await read(User.find({ relayNode: nodeId }).select('+passwordEncrypted').limit(replicas.length + 1), session);
         const byRowId = new Map(rows.map(row => [String(row._id), row]));
@@ -110,6 +112,9 @@ function createStore(State, User, listMode) {
             for (const row of reservation.replicas) {
                 requireOne(await updateOnce(User, exact(row, accountKeys), { $set: { appliedRevision: row.desiredRevision,
                     syncStatus: 'synced', updatedAt: now, lastSyncedAt: now } }, options), 'matchedCount');
+            }
+            if (listMode && !reservation.directory) {
+                await writeDirectory(User.db, null, reservation.inherited ?? reservation.replicas.map(logicalAccount), session);
             }
             await verifyLock();
             requireOne(await updateOnce(State, reservation.fence, { $set: { status: 'installed', installedAt: now,

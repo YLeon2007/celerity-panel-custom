@@ -8,6 +8,7 @@ const { validateRebuildMode } = require('./rebuildMode');
 const { encrypt, decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { accountError: fail, RelayAccountsError, createRebuildRelayAccountsStore } = require('./rebuildRelayAccountsStore');
+const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
 const machinePattern = /^[a-f0-9]{32}(?![\s\S])/;
@@ -182,7 +183,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             await authority();
                             const states = (await store.states(session)).sort(by('node'));
                             if (!equal(states.map(s => String(s.node)), ids)) throw fail('CHANGED');
-                            const { nodes, users } = await store.inventory(ids, login, session);
+                            const { nodes, users, directory } = await store.inventory(ids, login, session);
                             nodes.sort(by('_id')); users.sort(by('_id'));
                             if (!equal(nodes.map(n => String(n._id)), ids)) throw fail('BINDING_MISMATCH');
                             const bindings = [];
@@ -193,11 +194,16 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                 bindings.push(binding);
                             }
                             await authority();
-                            return { states, nodes, bindings, users };
+                            return { states, nodes, bindings, users, directory };
                         };
                         const baseline = await load();
                         const plans = makePlans(baseline, action, login, password, key);
                         const revokedLogin = action === 'create' ? undefined : login;
+                        const firstRelay = baseline.users.filter(row => String(row.relayNode) === ids[0]);
+                        const directory = baseline.directory;
+                        if (directory && !sameAccounts(directory.accounts, firstRelay)) throw fail('ACCOUNT_CONFLICT');
+                        const directoryBase = directory?.accounts ?? firstRelay.map(logicalAccount);
+
                         // Legacy Remove only owns the exact bootstrap row. Do
                         // not introduce account changes under that contract.
                         if (!listMode) throw fail('OPERATOR_LIST_REQUIRED');
@@ -287,7 +293,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             const changes = plans.map(({ before, after }) => ({ before, after: after && {
                                 ...after, lastSyncedAt: now, updatedAt: now, ...(action === 'create' && { createdAt: now }),
                             } }));
-                            await store.publish({ intentId: id, action, changes, recheck, verifyAuthority });
+                            await store.publish({ intentId, action, changes, recheck, verifyAuthority, directory, directoryBase, login });
                             completed = true;
                             return { ...result, relayCount: ids.length, ...(revokedLogin && { sessionsTerminated }) };
                         } catch (error) {

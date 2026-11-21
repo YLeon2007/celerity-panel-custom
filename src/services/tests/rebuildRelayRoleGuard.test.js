@@ -60,13 +60,20 @@ test('mounted role guard and Remove use one estimate, require a current session-
         async findOne({ _id, token }) { return held?._id === _id && held.token === token ? held : null; },
         async deleteMany(filter) { assert.deepEqual(filter, { _id: 'apply', token: held.token }); held = null; return { acknowledged: true, deletedCount: 1 }; },
     };
-    let pendingAccounts = false;
+    let pendingAccounts = false, directory = null;
     t.mock.method(mongoose.connection, 'collection', name => {
         if (name === 'c3_rebuild_relay_accounts') return { async findOne(filter, options) {
             assert.ok(held);
+            if (filter._id === 'directory') return directory;
             assert.deepEqual(filter, { _id: 'pending' });
             assert.equal(options.readConcern.level, 'majority');
             return pendingAccounts ? filter : null;
+        }, async updateMany(filter, update, options) {
+            assert.ok(held && !directory);
+            assert.equal(filter._id, 'directory');
+            assert.deepEqual(options, { writeConcern: { w: 'majority' }, upsert: true });
+            directory = update.$setOnInsert;
+            return { acknowledged: true, upsertedCount: 1 };
         } };
         assert.equal(name, 'c3_rebuild_locks');
         return lockStore;

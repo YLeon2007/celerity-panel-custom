@@ -534,7 +534,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const beforeInheritance = [receipt(a), fingerprint(a, chapPath), a.records().effects];
         const n = frames.length;
         await install(b);
-        assert.deepEqual(frames.slice(n), [[a.id, 'check-chap'], ...installedActions.map(op => [b.id, op])]);
+        assert.deepEqual(frames.slice(n), installedActions.map(op => [b.id, op]), 'published directory needs no source host');
         assert.deepEqual([receipt(a), fingerprint(a, chapPath), a.records().effects], beforeInheritance);
         proveChap(b, inherited);
         replicas();

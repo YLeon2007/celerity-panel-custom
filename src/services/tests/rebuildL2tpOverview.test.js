@@ -85,6 +85,7 @@ function fixture(t, { legacy = false } = {}) {
     t.mock.method(db, 'collection', name => {
         assert.equal(name, 'c3_rebuild_relay_accounts');
         return { async findOne(filter, options) {
+            if (filter._id === 'directory') return null;
             assert.deepEqual(filter, { _id: 'pending' });
             assert.deepEqual(options.projection, { _id: 1 });
             assert.equal(options.readConcern.level, 'majority');

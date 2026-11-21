@@ -4,8 +4,9 @@ const { isIP } = require('node:net');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
 const { captureRelayBinding, sameRelayBinding } = require('./rebuildRelayAuthorization');
-const { read } = require('./rebuildRelayBackendStore');
-const { projectRelayChap } = require('./rebuildRelayAccountInventory');
+const { read, createStore } = require('./rebuildRelayBackendStore');
+const { projectRelayChap, inspectAccountSources } = require('./rebuildRelayAccountInventory');
+const { readDirectory, writeDirectory, checkDirectory, logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 const { transactOnce, AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
 const { readAccountCount, readSessionCensus } = require('./rebuildRelayCounts');
 const { readAppliedTransit } = require('./rebuildAppliedLink');
@@ -96,7 +97,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
         let fence;
         try { fence = captureRelayBinding(env, id); } catch { throw fail(DISABLED); }
         const { machineId } = fence.binding;
-        const chapKey = fence.listMode ? env.ENCRYPTION_KEY : undefined;
+        const chapKey = env.ENCRYPTION_KEY;
         const authorize = node => {
             try { fence.check(node); } catch (error) {
                 if (error.code === 'REBUILD_L2TP_INSTALL_DISABLED') throw fail(DISABLED);
@@ -199,6 +200,26 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             expires: performance.now() + PREVIEW_TTL_MS });
                         return snapshot;
                     }
+                    const directorySnapshot = async session => {
+                        const directory = await readDirectory(User.db, session);
+                        if (directory) {
+                            if (!sameAccounts(directory.accounts, accounts)) throw fail(NOT_OWNED);
+                            return { directory };
+                        }
+                        // Backfill only from an unambiguous legacy cohort. No
+                        // peer connection or live relay owner is needed.
+                        if (!fence.listMode) return { directory, legacy: accounts.map(logicalAccount) };
+                        const rows = await createStore(State, User, true).sourceRows(null, session);
+                        const { legacy } = inspectAccountSources({ rows, listMode: true });
+                        if (rows.directory || !legacy || !sameAccounts(legacy, accounts)) throw fail(CHANGED);
+                        return { directory, legacy, rows };
+                    };
+                    const baselineDirectory = await directorySnapshot();
+                    let retainedDirectory = baselineDirectory.directory;
+                    const preserveDirectory = async session => {
+                        if (!equal(await directorySnapshot(session), baselineDirectory) || env.ENCRYPTION_KEY !== chapKey) throw fail(CHANGED);
+                        if (!retainedDirectory) retainedDirectory = await writeDirectory(User.db, null, baselineDirectory.legacy, session);
+                    };
                     // Only a confirmed Apply receipt can classify the physical
                     // MAIN listener as transport. A PUT can change draft fields.
                     if (Link) input.transit = await readAppliedTransit(Link, id);
@@ -249,6 +270,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             await transactOnce(State, User, async session => {
                                 await checkInventory(state, accounts, session);
                                 checkPreview();
+                                await preserveDirectory(session);
                                 const result = await State.updateMany(exactDocument(state, 'node'), { $set: transition },
                                     { session, timestamps: false });
                                 if (result?.acknowledged !== true) throw fail(RESERVATION_FAILED);
@@ -271,12 +293,20 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         catch { throw fail(RESERVATION_UNKNOWN); }
                         if (result?.acknowledged !== true) throw fail(RESERVATION_UNKNOWN);
                         if (result.matchedCount !== 1) throw fail(CHANGED);
+                        // Historical standalone Mongo: make the logical copy
+                        // durable before any host removal or projection delete.
+                        try { await preserveDirectory(); }
+                        catch { throw fail(RESERVATION_UNKNOWN); }
                     }
 
                     let revoked;
                     const guard = async () => {
                         if (revoked) throw revoked;
-                        try { await checkInventory(reservation, accounts); }
+                        try {
+                            await checkInventory(reservation, accounts);
+                            await checkDirectory(User.db, retainedDirectory);
+                            await authority();
+                        }
                         catch (error) { revoked = safe(error); throw revoked; }
                     };
                     await guard();
@@ -305,6 +335,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         await guard();
                         const settle = async session => {
                             if (session) await checkInventory(reservation, accounts, session);
+                            await checkDirectory(User.db, retainedDirectory, session);
                             const options = session ? { session, timestamps: false } : write;
                             for (const row of accounts) {
                                 // Match the entire list-mode row: enumerating known

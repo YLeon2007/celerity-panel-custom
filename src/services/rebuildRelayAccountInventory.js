@@ -5,6 +5,7 @@ const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2
 const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 const { ipv4, occupiedRange, validLogin } = require('./rebuildRelayBackendDesired');
 const { captureRelayBinding } = require('./rebuildRelayAuthorization');
+const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 
 const fail = code => Object.assign(new Error(`REBUILD_L2TP_${code}`), { code: `REBUILD_L2TP_${code}` });
 const inventoryInvalid = () => fail('ACCOUNT_INVENTORY_INVALID');
@@ -93,7 +94,7 @@ function projectRelayChap(state, rows, key) {
 // Login is the logical key. Source IP and the per-row sync revision are local
 // to each relay. Agreement is on the actual envelope and enablement, not on
 // decrypted passwords (independent historical bootstraps must not be merged).
-async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMode }) {
+function inspectAccountSources({ nodeId, rows, listMode }) {
     const sources = new Map();
     const stateIds = new Set(), machineIds = new Set();
     const occupied = [], allocations = [];
@@ -127,7 +128,7 @@ async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMod
         if (!source && !listMode && sources.size === 0 && String(row.relayNode) !== nodeId) continue;
         if (!source) throw inventoryInvalid();
         validateAccount(row, source.pool, source.accounts, assigned);
-        source.accounts.set(row.login, { login: row.login, enabled: row.enabled, passwordEncrypted: row.passwordEncrypted, ip: row.ip });
+        source.accounts.set(row.login, { ...logicalAccount(row), ip: row.ip });
         assigned.add(row.ip);
         allocations.push(row.ip);
     }
@@ -141,8 +142,18 @@ async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMod
         }))) throw fail('ACCOUNT_SOURCE_CONFLICT');
         canonical ??= source.accounts;
     }
+    const legacy = canonical && [...canonical.values()].map(({ ip: _, ...account }) => account);
+    return { sources, occupied, allocations, legacy, machineIds };
+}
+
+async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMode, machineId }) {
+    const { sources, occupied, allocations, legacy, machineIds } = inspectAccountSources({ nodeId, rows, listMode });
+    if (machineIds.has(machineId)) throw inventoryInvalid();
+    const catalog = rows.directory?.accounts;
+    if (catalog && legacy && !sameAccounts(catalog, legacy)) throw fail('ACCOUNT_SOURCE_CONFLICT');
+    if (catalog && !listMode && (catalog.length !== 1 || sources.size)) throw inventoryInvalid();
     const prechecks = [];
-    for (const [id, { state, accounts }] of sources) {
+    for (const [id, { state, accounts }] of catalog ? [] : sources) {
         const enrollment = await enrollSource(env, id, state, readNode);
         const { backupId, clientCidr, tproxyPort, fwmark, routeTable } = state;
         const installation = { nodeId: id, backupId, network: { clientCidr, tproxyPort, fwmark, routeTable } };
@@ -157,12 +168,10 @@ async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMod
     }
     // Allocate bootstrap first: account lifecycle requires it at poolStart on
     // each relay, regardless of where its login sorts among inherited accounts.
-    const inherited = canonical && [bootstrap, ...[...canonical.keys()].filter(login => login !== bootstrap).sort()]
-        .map(login => {
-            const { enabled, passwordEncrypted } = canonical.get(login);
-            return { login, enabled, passwordEncrypted };
-        });
+    const shared = catalog ?? legacy;
+    const inherited = shared && [...shared].sort((a, b) => a.login === bootstrap ? -1 : b.login === bootstrap ? 1
+        : (a.login > b.login) - (a.login < b.login));
     return { occupied, allocations, inherited, prechecks };
 }
 
-module.exports = { resolveAccountSources, projectRelayChap };
+module.exports = { resolveAccountSources, inspectAccountSources, projectRelayChap };

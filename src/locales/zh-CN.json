@@ -337,7 +337,7 @@
     "rebuildCountUnavailable": "未确认",
     "rebuildRemoveOpen": "查看 L2TP 移除预览",
     "rebuildRemoveConfirmSummary": "L2TP 移除预览。{counts}",
-    "rebuildRemoveWarning": "此操作将从该中继移除 L2TP 及其受管理的账户。预览最多两分钟内有效。",
+    "rebuildRemoveWarning": "此操作仅移除此中继上的 L2TP 和本地账户副本。即使移除最后一个中继，共享账户也会保留。预览最多两分钟内有效。",
     "rebuildRemoveConfirm": "确认移除 L2TP",
     "rebuildRemoveBusy": "存在活跃会话时无法移除。不会强行断开任何会话。",
     "rebuildRemoveIpsecBusy": "存在活跃 IPsec 连接，无法移除。PPP 断开后 IPsec 连接仍可能存在。请在客户端断开 IPsec 或等待连接过期，然后重新查看计数。无法强制移除。",

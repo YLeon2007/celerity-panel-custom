@@ -13,6 +13,7 @@ const User = require('../../modules/relay-l2tp/models/l2tpUserModel');
 const Node = require('../../models/hyNodeModel');
 const Link = require('../../models/cascadeLinkModel');
 const joined = require('./helpers/rebuildRelayInstallJoined');
+const { bindDirectory } = require('./helpers/rebuildRelayDirectoryFixture');
 
 const id = 'a'.repeat(24), machineId = 'b'.repeat(32), backupId = 'rebuild-unique-backup';
 const oid = value => new Types.ObjectId(value);
@@ -96,6 +97,7 @@ function deferred() {
     return { promise, done };
 }
 function fixture(t, planBackupId = backupId) {
+    const directory = bindDirectory(t, User.db);
     const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: id,
         C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, ENCRYPTION_KEY: 'test-only-credential-key-'.repeat(2), PANEL_DOMAIN: 'fixture.invalid' };
     const nodes = [{ _id: oid(id), ip: '192.0.2.4', domain: 'relay.fixture.invalid', type: 'xray', active: true,
@@ -167,7 +169,7 @@ function fixture(t, planBackupId = backupId) {
         env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(rows);
         return create().installRelay;
     };
-    return { env, events, create, enroll, enrollment, nodes, links, states, users, hooks, stateHooks, userHooks,
+    return { env, events, create, enroll, enrollment, nodes, links, states, users, hooks, stateHooks, userHooks, directory,
         get prepared() { return prepared; },
         get lockHeld() { return !!lock; },
         loseLock: () => { lock = undefined; } };
@@ -230,6 +232,7 @@ function sessionFixture(t, f) {
     function commit(session) {
         for (const rows of [f.states, f.users]) rows.splice(0, rows.length, ...session.rows.get(rows));
         session.commitAccountIntent?.();
+        session.commitDirectory?.();
         return { ok: 1 };
     }
     t.mock.method(State.db, 'startSession', async () => new Session());
@@ -666,11 +669,14 @@ function accountIntentFixture(t, f) {
         assert.equal(name, 'c3_rebuild_relay_accounts');
         assert.ok(f.lockHeld);
         return {
-            async findOne(where) {
+            async findOne(where, options) {
+                if (where._id === 'directory') return f.directory.findOne(where, options);
                 assert.equal(where._id, 'pending');
                 return pending && matches(pending, where) ? { _id: pending._id } : null;
             },
-            async updateMany(where, { $setOnInsert }, options) {
+            async updateMany(where, update, options) {
+                if (where._id === 'directory') return f.directory.updateMany(where, update, options);
+                const { $setOnInsert } = update;
                 assert.deepEqual(where, { _id: 'pending', intentId: $setOnInsert.intentId });
                 assert.ok(options.session?.inTransaction());
                 assert.equal(options.upsert, true);

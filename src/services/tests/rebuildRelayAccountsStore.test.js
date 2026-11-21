@@ -9,7 +9,7 @@ const intent = { intentId: 'original', action: 'create', login: 'fixture-account
 const item = { _id: 'user-on-a', syncOperationId: null, ip: '10.255.16.11' };
 
 function fixture() {
-    let pending, users = [];
+    let pending, users = [], directory;
     const events = [], hooks = {};
     class Session {
         transaction = { transition: state => { assert.equal(state, 'TRANSACTION_COMMITTED'); this.active = false; } };
@@ -37,6 +37,12 @@ function fixture() {
         async updateMany(filter, update, { session, ...options }) {
             inTxn(session);
             assert.deepEqual(options, { upsert: true });
+            if (filter._id === 'directory') {
+                assert.equal(filter.generation, update.$setOnInsert.generation);
+                session.directory = structuredClone(update.$setOnInsert);
+                events.push('directory');
+                return { acknowledged: true, upsertedCount: 1 };
+            }
             assert.deepEqual(filter, { _id: 'pending', intentId: update.$setOnInsert.intentId });
             events.push('intent');
             if (session.pending) throw Object.assign(new Error('duplicate'), { code: 11000 });
@@ -62,13 +68,18 @@ function fixture() {
                 assert.equal(command.commitTransaction, 1);
                 assert.equal(command.writeConcern.w, 'majority');
                 events.push('commit');
-                const land = () => { pending = session.pending; users = session.users; return { ok: 1 }; };
+                const land = () => { pending = session.pending; users = session.users; directory = session.directory; return { ok: 1 }; };
                 return hooks.commit ? hooks.commit(land) : land();
             } };
         } }),
     };
     const User = { db,
-        async insertMany(rows, { session }) { inTxn(session); events.push('insert'); session.users.push(...rows); return rows; },
+        async insertMany(rows, { session }) {
+            inTxn(session); events.push('insert');
+            const inserted = rows.map(row => ({ ...row, _id: 'a'.repeat(24) }));
+            session.users.push(...inserted);
+            return inserted;
+        },
         async updateMany(filter, update, options) {
             assert.deepEqual(filter, { _id: { $eq: item._id }, ip: { $eq: item.ip },
                 syncOperationId: { $eq: null, $exists: true } });
@@ -87,11 +98,16 @@ function fixture() {
     };
     const store = createRebuildRelayAccountsStore({ Node: { db }, State: { db }, L2tpUser: User });
     const publish = (action, intentId = intent.intentId, changed = true) => store.publish({ action, intentId,
-        changes: [{ before: item, after: changed ? { enabled: false } : undefined }],
+        login: intent.login,
+        directoryBase: [{ id: 'b'.repeat(24), login: 'relay-bootstrap', enabled: true, passwordEncrypted: 'fixture-envelope' },
+            ...(action !== 'create' ? [{ id: 'a'.repeat(24), login: intent.login, enabled: changed, passwordEncrypted: 'fixture-envelope' }] : [])],
+        changes: [{ before: item, after: !changed ? undefined : action === 'create'
+             ? { login: intent.login, enabled: true, passwordEncrypted: 'fixture-envelope' } : { enabled: false } }],
         async recheck(session) { inTxn(session); events.push('snapshot'); },
         async verifyAuthority() { await store.verifyIntent(intentId); events.push('guard'); },
     });
-    return { db, collection, store, publish, events, hooks, get pending() { return pending; }, get users() { return users; } };
+    return { db, collection, store, publish, events, hooks, get pending() { return pending; }, get users() { return users; },
+        get directory() { return directory; } };
 }
 
 test('transaction commits the actual majority intent; another owner cannot overwrite or settle it', async () => {
@@ -105,7 +121,8 @@ test('transaction commits the actual majority intent; another owner cannot overw
     assert.deepEqual(f.events.splice(0), ['start', 'intent', 'abort', 'end']);
     await assert.rejects(f.store.verifyIntent('different'), code('CHANGED'));
     await assert.rejects(f.publish('create', 'different'), code('CHANGED'));
-    assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'settle', 'abort', 'end']);
+    assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'directory', 'settle', 'abort', 'end']);
+    assert.equal(f.directory, undefined);
     assert.deepEqual(f.users, []);
     await assert.rejects(assertNoPendingRelayAccounts(f.db), { ...code('BLOCKED'), retryAllowed: false });
     await f.store.verifyIntent(intent.intentId);
@@ -133,7 +150,9 @@ for (const [action, write] of [['create', 'insert'], ['disable', 'update'], ['de
         f.events.length = 0;
         f.hooks.commit = land => { assert.deepEqual(f.pending, intent); return land(); };
         await f.publish(action);
-        assert.deepEqual(f.events, ['start', 'snapshot', write, 'settle', 'guard', 'commit', 'end']);
+        assert.deepEqual(f.events, ['start', 'snapshot', write, 'directory', 'settle', 'guard', 'commit', 'end']);
+        const account = f.directory.accounts.find(row => row.login === intent.login);
+        assert.equal(account?.enabled, { create: true, disable: false, delete: undefined }[action]);
         await assertNoPendingRelayAccounts(f.db);
     });
 }
@@ -154,7 +173,8 @@ test('lost publish acknowledgement does not retry or abort; an uncommitted attem
     f.events.length = 0;
     f.hooks.commit = () => { throw lost; };
     await assert.rejects(f.publish('create'), err => err === lost);
-    assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'settle', 'guard', 'commit', 'end']);
+    assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'directory', 'settle', 'guard', 'commit', 'end']);
+    assert.equal(f.directory, undefined);
     assert.deepEqual(f.users, []);
     await f.store.verifyIntent(intent.intentId);
 });
