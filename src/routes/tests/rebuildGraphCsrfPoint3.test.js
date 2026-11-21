@@ -73,7 +73,7 @@ function response(url, body, status = 200, options = {}) {
 
 // Render the complete templates; only the DOM/Cytoscape APIs and Fetch are
 // modelled. Missing rendered IDs are not filled in by the harness.
-function mount(view, lang, csrfToken, rebuild, send) {
+function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () => true } = {}) {
     let html;
     render({ locals: { t: key => t(key, lang), lang, csrfToken, c3Rebuild: rebuild },
         render(layout, data) { assert.equal(layout, 'layout'); html = data.content; },
@@ -81,7 +81,7 @@ function mount(view, lang, csrfToken, rebuild, send) {
         nodes: [], groups: [], nodesCount: 0, linksCount: 0, ipProtocolCount: {},
         panelDomain: hostname, loadBalancingEnabled: false,
     });
-    const tags = new Map(), resources = [], requests = [], confirmations = [];
+    const tags = new Map(), resources = [], requests = [], confirmations = [], alerts = [];
     let runAsset;
     function element() {
         const children = [], classes = new Set();
@@ -99,6 +99,11 @@ function mount(view, lang, csrfToken, rebuild, send) {
         };
     }
     for (const [, id] of html.matchAll(/\bid="([\w-]+)"/g)) tags.set(id, element());
+    const dialog = tags.get('rebuildPreview');
+    if (dialog && onDialog) {
+        dialog.showModal = () => { dialog.open = true; onDialog(dialog); };
+        dialog.close = () => { dialog.open = false; dialog.onclose?.(); };
+    }
     const document = {
         readyState: 'complete', body: element(), createElement: element,
         getElementById: id => tags.get(id) ?? null,
@@ -115,11 +120,13 @@ function mount(view, lang, csrfToken, rebuild, send) {
         on(event, query, cb) { handlers[event + query] = cb; },
         edges: () => emptyEdge, nodes: () => [], getElementById: () => emptyEdge,
         elements: () => ({ remove() {}, unselect() {} }),
+        add() {}, fit() {},
     });
     const context = vm.createContext({ document, URL, AbortController, setTimeout() {}, clearTimeout() {}, setInterval() {},
         MutationObserver: class { observe() {} },
         location: { origin }, sessionStorage: { getItem: () => 'network', removeItem() {} }, cytoscape,
-        confirm: message => { confirmations.push(message); return true; },
+        confirm: message => { confirmations.push(message); return confirm(message); },
+        alert: message => { alerts.push(message); },
         fetch: async (url, init = {}) => {
             const target = new URL(url, origin);
             const call = { url: target.href, pathname: target.pathname, ...init };
@@ -136,10 +143,11 @@ function mount(view, lang, csrfToken, rebuild, send) {
     };
     for (const [, src, code] of html.matchAll(/<script(?: src="([^"]+)"[^>]*)?>([\s\S]*?)<\/script>/g)) {
         if (src) runAsset(src);
-        else if (code.includes('_networkCsrfToken')) vm.runInContext(code, context);
+        else if (code.includes('_networkCsrfToken') || code.includes('_networkRebuildPreviewI18n')) vm.runInContext(code, context);
     }
     const openEdge = () => handlers.tapedge({ target: { data: () => ({ linkId, label: 'Graph fixture' }) } });
-    return { context, document, requests, resources, openEdge, confirmations,
+    return { context, document, requests, resources, openEdge, confirmations, alerts, html,
+        refresh: () => document.getElementById('btnRefresh').listeners.click(),
         toast: () => document.getElementById('toast')?.textContent };
 }
 
@@ -200,6 +208,7 @@ for (const [view, lang, actionCopy] of [['network', 'ru', /Повторите д
         const ui = mount(view, lang, 'fixture', false, () => assert.fail('unexpected fetch'));
         assert.ok(ui.resources.includes('/js/network.min.js?v=8c1440573d630ba3'));
         assert.ok(!ui.resources.some(src => src.startsWith('/js/network.js?')));
+        assert.equal(ui.document.getElementById('rebuildPreview'), null);
     });
 }
 
@@ -357,5 +366,177 @@ test('delete refusal after preview never resends DELETE or marks it accepted', a
     assert.match(ui.toast(), /Повторите действие вручную.*\(CSRF_TOKEN_INVALID\)/);
     assert.deepEqual(ui.requests.map(call => call.pathname), [previewPath, '/api/cascade/links/' + linkId, refreshPath]);
     assert.deepEqual(app.calls.map(call => [call.preview, call.remove]), [[true, true]]);
-    assert.equal(ui.confirmations.length, 2);
+    assert.equal(ui.confirmations.length, 1);
+});
+
+const portalId = 'c'.repeat(24), gatewayId = 'd'.repeat(24), relayId = 'e'.repeat(24), unknownId = 'f'.repeat(24);
+const portalLabel = 'North <b>Harbor</b>\n$& {name}', cleanPortalLabel = 'North <b>Harbor</b> $& {name}';
+const removePath = '/api/cascade/links/' + linkId;
+const profile = (profile, sections, options = {}) => ({ profile, change: sections.length ? 'replace' : 'unchanged',
+    sections, protectedChanged: false, ...options });
+
+async function mountPreview(view, lang, { exitImpact, protectedChanged = false, native = true, approve = true,
+    reportId = previewId } = {}) {
+    const opened = Promise.withResolvers();
+    const nodes = [
+        { nodeId: portalId, role: 'portal', exitImpact, profiles: [profile('main', ['inbounds', 'routing'], { protectedChanged }),
+            profile('bridge', ['inbounds'], { tunnelMigration: 'legacy-to-vless-reverse' })] },
+        // Reports from older servers can omit role; the topology still knows it.
+        { nodeId: gatewayId, profiles: [profile('main', []), profile('bridge', ['outbounds'])] },
+        { nodeId: relayId, profiles: [profile('main', []), profile('bridge', [])] },
+        { nodeId: unknownId, profiles: [profile('main', ['routing', 'reverse', 'dns']), profile('bridge', [])] },
+    ];
+    const ui = mount(view, lang, 'fixture', true, ({ pathname, url, method }) => {
+        if (pathname === '/api/cascade/topology') return response(url, { edges: [], nodes: [
+            [portalId, portalLabel, 'portal'], [gatewayId, 'West Exit', 'bridge'], [relayId, 'Middle', 'relay'],
+        ].map(([id, label, cascadeRole]) => ({ data: { id, label, cascadeRole }, position: { x: 0, y: 0 } })) });
+        if (pathname === '/api/cascade/links' && !method) return response(url, { links: [], topologyRevision: 7, deployedRevision: 6 });
+        if (pathname === previewPath) return response(url, { allowed: !protectedChanged, nodes, previewId: reportId });
+        assert.ok(pathname === removePath && method === 'DELETE' || pathname === deployPath && method === 'POST');
+        return response(url, { executionMode: 'rebuild', deleted: linkId, status: 'succeeded' });
+    }, { onDialog: native ? opened.resolve : undefined, confirm: () => approve });
+    assert.equal(await ui.refresh(), true);
+    const get = suffix => ui.document.getElementById('rebuildPreview' + suffix);
+    return { ...ui, opened: opened.promise, get, writes: () => ui.requests.filter(call => call.method) };
+}
+
+const copy = {
+    ru: {
+        lost: `после удаления у портала ${cleanPortalLabel} не останется выхода — клиенты этого портала потеряют интернет`,
+        partial: `После удаления у портала ${cleanPortalLabel} пропадёт выход по умолчанию — геомаршруты сохранятся.`,
+        blocked: `После удаления у портала ${cleanPortalLabel} не будет выхода — у клиентов этого портала не будет интернета.`,
+        portal: 'портал: меняется вход и маршруты', gateway: 'шлюз: меняется выход', unchanged: 'ретранслятор: без изменений',
+        unknown: 'Узел №4 — узел: меняются маршруты, обратные туннели и DNS', settings: 'Параметры подключения клиентов не изменятся.',
+        protected: 'Параметры подключения клиентов изменились бы.', refused: 'Применение запрещено. Конфигурация нод не изменена.',
+    },
+    en: {
+        lost: `After removal, portal ${cleanPortalLabel} will have no exit — clients of this portal will lose internet access.`,
+        partial: `After removal, portal ${cleanPortalLabel} will lose its default exit — geo routes will remain.`,
+        blocked: `After removal, portal ${cleanPortalLabel} will have no exit — its clients will have no internet access.`,
+        portal: 'portal: inbound and routing will change', gateway: 'gateway: outbound will change', unchanged: 'relay: no changes',
+        unknown: 'Node #4 — node: routing, reverse tunnels, and DNS will change', settings: 'Client connection settings will not change.',
+        protected: 'Client connection settings would change.', refused: 'Apply refused. Node configurations were not changed.',
+    },
+};
+
+function assertSummary(text, expected, protectedChanged = false) {
+    for (const label of [cleanPortalLabel, 'West Exit', 'Middle', expected.portal, expected.gateway, expected.unchanged,
+        expected.unknown, expected.settings, 'VLESS Reverse Proxy']) assert.ok(text.includes(label), `Missing: ${label}\n${text}`);
+    assert.equal(text.includes(expected.protected), protectedChanged);
+    for (const value of [portalId, gatewayId, relayId, unknownId, 'main replace', 'inbounds', 'outbounds', 'bridge unchanged']) {
+        assert.ok(!text.includes(value), `Raw preview data: ${value}`);
+    }
+}
+
+async function openedBy(ui, action) {
+    return Promise.race([ui.opened, action.then(() => assert.fail(
+        'No rendered Preview dialog. Native prompts: ' + JSON.stringify(ui.confirmations)))]);
+}
+
+for (const view of ['nodes', 'network']) for (const [lang, expected] of Object.entries(copy)) {
+    test(`${view} (${lang}): Remove highlights total exit loss before named, deduplicated details; Cancel never deletes`, async () => {
+        const ui = await mountPreview(view, lang, { exitImpact: 'lost' });
+        const action = ui.context._cascadeDelete(linkId);
+        const dialog = await openedBy(ui, action);
+        const currentAsset = require('node:crypto').createHash('sha256').update(readFileSync(path.join(root, 'public/js/network.js'))).digest('hex').slice(0, 16);
+        assert.deepEqual(ui.resources.filter(src => src.startsWith('/js/network')), ['/js/network.js?v=' + currentAsset]);
+        assert.ok(dialog.open);
+        assert.match(ui.html, /<dialog[^>]*id="rebuildPreview"[^>]*aria-labelledby="rebuildPreviewTitle"[^>]*>/);
+        assert.match(ui.html, /id="rebuildPreviewWarning"[\s\S]*id="rebuildPreviewDetails"[\s\S]*id="rebuildPreviewCancel"[^>]*autofocus/);
+        assert.equal(ui.get('Warning').hidden, false);
+        assert.equal(ui.get('Warning').textContent, expected.lost);
+        assert.equal(ui.get('Warning').innerHTML, undefined);
+        assertSummary(ui.get('Details').textContent, expected);
+        assert.equal(ui.get('Details').innerHTML, undefined);
+        assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+        assert.equal(JSON.parse(ui.writes()[0].body).remove, true);
+        ui.get('Cancel').onclick();
+        await action;
+        assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+        assert.equal(dialog.open, false);
+        assert.equal(ui.toast(), lang === 'ru' ? 'Применение отменено.' : 'Apply cancelled.');
+    });
+
+    test(`${view} (${lang}): Remove with a healthy alternative has no warning and sends the exact preview once`, async () => {
+        const ui = await mountPreview(view, lang);
+        const action = ui.context._cascadeDelete(linkId);
+        await openedBy(ui, action);
+        assert.equal(ui.get('Warning').hidden, true);
+        assert.equal(ui.get('Warning').textContent, '');
+        assertSummary(ui.get('Details').textContent, expected);
+        assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+        ui.get('Apply').onclick();
+        await action;
+        assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath, removePath]);
+        assert.deepEqual(JSON.parse(ui.writes()[1].body), { expectedTopologyRevision: 7, expectedPreview: previewId });
+    });
+}
+
+for (const [lang, expected] of Object.entries(copy)) {
+    test(`Remove (${lang}): partial and blocked exit impacts use distinct copy`, async () => {
+        for (const [exitImpact, text] of [['default-lost', expected.partial], ['blocked', expected.blocked]]) {
+            const ui = await mountPreview('network', lang, { exitImpact });
+            const action = ui.context._cascadeDelete(linkId);
+            const dialog = await openedBy(ui, action);
+            assert.equal(ui.get('Warning').textContent, text);
+            dialog.close(); // Like the native Escape action: close without approval.
+            await action;
+            assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+        }
+    });
+
+    test(`Deploy (${lang}): protected settings refuse Apply; exit warning is Remove-only`, async () => {
+        const ui = await mountPreview('nodes', lang, { exitImpact: 'lost', protectedChanged: true });
+        const action = ui.context._cascadeDeploy(linkId);
+        await openedBy(ui, action);
+        assert.equal(ui.get('Title').textContent, expected.refused);
+        assert.equal(ui.get('Warning').hidden, true);
+        assert.equal(ui.get('Apply').hidden, true);
+        assertSummary(ui.get('Details').textContent, expected, true);
+        ui.get('Apply').onclick(); // Even activation of the hidden control cannot send a write.
+        assert.equal(ui.get('').open, true);
+        ui.get('Cancel').onclick();
+        await action;
+        assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+    });
+
+    test(`Remove (${lang}): text-only fallback puts the warning first and respects Cancel`, async () => {
+        const ui = await mountPreview('nodes', lang, { exitImpact: 'lost', native: false, approve: false });
+        await ui.context._cascadeDelete(linkId);
+        assert.equal(ui.confirmations.length, 1);
+        assert.ok(ui.confirmations[0].startsWith(expected.lost + '\n'), ui.confirmations[0]);
+        assertSummary(ui.confirmations[0], expected);
+        assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+    });
+}
+
+test('a missing Preview ID cannot be approved or sent', async () => {
+    const ui = await mountPreview('nodes', 'en', { native: false, reportId: null });
+    await ui.context._cascadeDelete(linkId);
+    assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+    assert.equal(ui.confirmations.length, 0);
+});
+
+test('a concurrent preview cannot replace the warning or send a second write', async () => {
+    const reportId = 'd'.repeat(128);
+    const ui = await mountPreview('network', 'en', { exitImpact: 'lost', reportId });
+    const removing = ui.context._cascadeDelete(linkId);
+    await openedBy(ui, removing);
+    await ui.context._cascadeDeploy(linkId);
+    assert.equal(ui.get('Warning').textContent, copy.en.lost);
+    assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath, previewPath]);
+    ui.get('Apply').onclick();
+    await removing;
+    assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath, previewPath, removePath]);
+    assert.equal(JSON.parse(ui.writes()[2].body).expectedPreview, reportId);
+});
+
+test('a refused preview without native dialog can be read but never approved', async () => {
+    const ui = await mountPreview('network', 'en', { native: false, protectedChanged: true });
+    await ui.context._cascadeDeploy(linkId);
+    assert.equal(ui.confirmations.length, 0);
+    assert.equal(ui.alerts.length, 1);
+    assert.ok(ui.alerts[0].startsWith(copy.en.refused));
+    assertSummary(ui.alerts[0], copy.en, true);
+    assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
 });

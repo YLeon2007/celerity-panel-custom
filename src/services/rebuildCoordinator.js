@@ -2,6 +2,7 @@
 const { isDeepStrictEqual: equal } = require('node:util');
 const {createHmac,randomBytes}=require('node:crypto');
 const {linkSnapshotBytes}=require('./rebuildLinkSnapshot');
+const {addRemoveExitImpacts}=require('./rebuildPreviewExitImpact');
 // The preview fingerprint is opaque and expires when the panel restarts.
 const previewKey=randomBytes(32);
 const fail = code => Object.assign(new Error(code), {code});
@@ -85,7 +86,7 @@ async function runRebuild(d, req) {
             const desired=links.filter(row=>!removed.includes(row)&&row.active!==false);
             const candidates=await d.build(nodes,desired);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
-            const pairs=new Map(), report=[], fingerprint=createHmac('sha256',previewKey);
+            const pairs=new Map(), report=[], observedMain=req.remove&&d.nodeRole?new Map():null, fingerprint=createHmac('sha256',previewKey);
             fingerprint.update(JSON.stringify([linkVersion,req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()]));
             for(const nodeId of nodes){
                 const pair=candidates.filter(p=>p.nodeId===nodeId); pairs.set(nodeId,pair);
@@ -93,6 +94,7 @@ async function runRebuild(d, req) {
                 const profiles=[];
                 for(const p of pair){
                     const before=await d.read(nodeId,p.profile);
+                    if(observedMain&&p.profile==='main')observedMain.set(nodeId,before);
                     const diff=profilePreview(before,p.config,p.profile);
                     if(p.publishedKeyMismatch)diff.protectedChanged=true;
                     profiles.push(diff);
@@ -101,9 +103,11 @@ async function runRebuild(d, req) {
                 report.push({nodeId,profiles});
             }
             const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
+            const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;
+            if(observedMain&&(req.preview||!result.allowed||stale))addRemoveExitImpacts(report,links,observedMain,candidates,d.nodeRole);
             if(req.preview) return result;
             if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);
-            if(req.expectedPreview!==undefined && req.expectedPreview!==result.previewId)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
+            if(stale)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();
             await d.checkActivation?.(nodes);
             if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }

@@ -895,6 +895,9 @@ function nodeMetaFor(node) {
 .ranking-num { font-size: 11px; color: var(--text-muted); margin-right: 2px; }
 </style>
 
+<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+<%- include('partials/rebuild-preview') %>
+<% } %>
 <script>
 const i18n = {
     confirmDelete: <%- JSON.stringify(t("nodes.confirmDelete")) %>,
@@ -1330,7 +1333,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=rebuild3' : '/js/network.min.js?v=8c1440573d630ba3'
+        window._c3Rebuild ? '/js/network.js?v=a58cbe4c8d87339b' : '/js/network.min.js?v=8c1440573d630ba3'
     ];
 
     let idx = 0;

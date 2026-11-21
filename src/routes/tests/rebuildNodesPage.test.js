@@ -2,6 +2,8 @@
 
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const { readFileSync } = require('node:fs');
+const { createHash } = require('node:crypto');
 const vm = require('node:vm');
 const { test, after } = require('node:test');
 const express = require('express');
@@ -48,7 +50,7 @@ for (const rebuild of [true, false]) test(`GET /panel/nodes selects the ${rebuil
     } });
     assert.equal(window._c3Rebuild, rebuild);
     assert.deepEqual(selected.filter(url => url.startsWith('/js/network')), [
-        rebuild ? '/js/network.js?v=rebuild3' : '/js/network.min.js?v=8c1440573d630ba3',
+        rebuild ? '/js/network.js?v=' + createHash('sha256').update(readFileSync(path.join(__dirname, '../../../public/js/network.js'))).digest('hex').slice(0, 16) : '/js/network.min.js?v=8c1440573d630ba3',
     ]);
     if (rebuild) {
         const token = JSON.parse(inline.match(/window\._networkCsrfToken\s*=\s*("[A-Za-z0-9_-]+")/)[1]);

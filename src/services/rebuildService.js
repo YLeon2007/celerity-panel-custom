@@ -122,7 +122,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         }));
     }
     async function execute(req,alreadyHeld){
-        gate();const transports=new Map(), bindings=new Map();let prepared,states,verifyLock;
+        gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock;
         const verifyApply=async()=>{
             await verifyLock();
             // Recheck all captured grants before the coordinator effects,
@@ -137,6 +137,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             async build(ids,links){
                 const nodes=await Node.find({_id:{$in:ids}}).select('+xray.manualKey').lean();
                 if(nodes.length!==ids.length||nodes.some(n=>n.type!=='xray'||!n.active||n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
+                if(req.remove)for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
                 states=await installedStates(ids);
                 await openTransports(nodes,states,transports,bindings,verifyLock);
                 const followRelayStates=[...states.values()].map(row=>({...row,routingMode:'follow-relay',routingVersion:1}));
@@ -161,6 +162,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
                 return candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p);
             },
+            nodeRole:id=>roles.get(id),
             async read(id,p){const current=await transports.get(id).read(p);if(p==='main'){
                 const installed=states.get(id);const ingress=(current?.inbounds||[]).filter(i=>i.tag?.startsWith('relay-l2tp-'));
                 if(ingress.length || installed){if(ingress.length!==1 || !installed || ingress[0].port!==installed.tproxyPort || ingress[0].tag!==`relay-l2tp-${installed.routeGroup||id}` || ingress[0].protocol!=='dokodemo-door' || ingress[0].settings?.followRedirect!==true || ingress[0].streamSettings?.sockopt?.tproxy!=='tproxy')throw fail('REBUILD_L2TP_BASELINE_MISMATCH');}

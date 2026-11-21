@@ -225,4 +225,4 @@ function composeRebuildProfiles({ nodes, links, usersByNode = {}, bridgesWithCli
     return profiles;
 }
 
-module.exports = { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX };
+module.exports = { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX, egressTag };

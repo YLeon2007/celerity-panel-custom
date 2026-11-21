@@ -1,0 +1,61 @@
+<%
+const previewKeys = [
+    'deployTitle', 'removeTitle', 'apply', 'remove', 'refused', 'unavailable', 'cancelled', 'unknownNode',
+    'portal', 'bridge', 'relay', 'standalone', 'changes', 'changesPlural', 'otherChanges', 'unchanged',
+    'inbounds', 'outbounds', 'routing', 'reverse', 'log', 'api', 'stats', 'policy', 'dns', 'observatory',
+    'migration', 'settingsUnchanged', 'settingsChanged', 'exitLost', 'defaultExitLost', 'exitBlocked',
+];
+const previewLabels = Object.fromEntries(previewKeys.map(key => [key, t('network.rebuildPreview.' + key)]));
+previewLabels.lang = typeof lang === 'string' ? lang : 'en';
+previewLabels.cancel = t('common.cancel');
+previewLabels.close = t('common.close');
+%>
+<style>
+    #rebuildPreview:not([open]), #rebuildPreview [hidden] { display: none; }
+    #rebuildPreview {
+        position: fixed;
+        inset: 0;
+        margin: auto;
+        height: fit-content;
+        width: min(44rem, calc(100% - 2rem));
+        max-height: calc(100% - 2rem);
+        box-sizing: border-box;
+        padding: 1.25rem;
+        border: 1px solid #64748b;
+        border-radius: .75rem;
+        background: #111827;
+        color: #f8fafc;
+        overflow-wrap: anywhere;
+    }
+    #rebuildPreview::backdrop { background: rgb(0 0 0 / 70%); }
+    #rebuildPreviewTitle { font-size: 1.25rem; margin: 0 0 .75rem; }
+    #rebuildPreviewBody { max-height: 55vh; overflow: auto; }
+    #rebuildPreviewWarning {
+        background: #7f1d1d;
+        color: #fff;
+        border: 2px solid #fca5a5;
+        border-radius: .5rem;
+        padding: .75rem;
+        margin: 0 0 1rem;
+        font-size: 1.25rem;
+        font-weight: 700;
+        line-height: 1.4;
+    }
+    #rebuildPreviewWarning, #rebuildPreviewDetails { white-space: pre-wrap; }
+    .rebuild-preview-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: .5rem; margin-top: 1rem; }
+    .rebuild-preview-actions button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+</style>
+<dialog id="rebuildPreview" aria-labelledby="rebuildPreviewTitle" aria-describedby="rebuildPreviewWarning">
+    <h2 id="rebuildPreviewTitle"></h2>
+    <div id="rebuildPreviewBody" tabindex="0" role="region" aria-labelledby="rebuildPreviewTitle">
+        <p id="rebuildPreviewWarning" hidden></p>
+        <div id="rebuildPreviewDetails"></div>
+    </div>
+    <div class="rebuild-preview-actions">
+        <button type="button" class="btn btn-outline" id="rebuildPreviewCancel" autofocus></button>
+        <button type="button" class="btn btn-primary" id="rebuildPreviewApply" hidden></button>
+    </div>
+</dialog>
+<script>
+window._networkRebuildPreviewI18n = <%- JSON.stringify(previewLabels).replace(/</g, '\\u003c') %>;
+</script>
