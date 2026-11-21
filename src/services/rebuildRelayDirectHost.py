@@ -2950,7 +2950,8 @@ def ipsec_status_inventory(status):
         return []
     inventory, children, parent, last_child = {}, set(), None, None
     for line in body.split(b'\n')[:-1]:
-        row = re.fullmatch(rb'[ \t]+celerity-l2tp(?:\[([1-9][0-9]{0,9})\]|\{([1-9][0-9]{0,9})\}):[ \t]+([^\x00-\x1f]+)', line)
+        # stroke uses %12s, a minimum width; celerity-l2tp needs no padding.
+        row = re.fullmatch(rb'[ \t]*celerity-l2tp(?:\[([1-9][0-9]{0,9})\]|\{([1-9][0-9]{0,9})\}):[ \t]+([^\x00-\x1f]+)', line)
         if row is None:
             raise Refusal(SESSION_UNKNOWN)
         ike, child, detail = row.groups()
@@ -2970,8 +2971,9 @@ def ipsec_status_inventory(status):
         else:
             child = int(child)
             session_need(parent is not None)
-            sa = re.fullmatch(rb'(?:INSTALLED|REKEYING|REKEYED|DELETING), TRANSPORT, reqid [0-9]+, '
-                              rb'ESP(?: in UDP)? SPIs: [a-f0-9]{8}_i [a-f0-9]{8}_o', detail)
+            sa = re.fullmatch(rb'(?:INSTALLED, TRANSPORT, reqid [0-9]+, ESP(?: in UDP)? SPIs: [a-f0-9]{8}_i [a-f0-9]{8}_o'
+                              rb'|(?:REKEYING|REKEYED), TRANSPORT, reqid [0-9]+, expires in [0-9]+ (?:second|minute|hour|day)s?'
+                              rb'|DELETING, TRANSPORT, reqid [0-9]+)', detail)
             if sa:
                 session_need(child not in children)
                 children.add(child)

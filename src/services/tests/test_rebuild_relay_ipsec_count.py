@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 
 HOST = Path(__file__).resolve().parents[1] / 'rebuildRelayDirectHost.py'
-CONNECTION = b'Connections:\n  celerity-l2tp:  %any...%any  IKEv1\n  celerity-l2tp:   child:  dynamic[udp/l2f] === dynamic[udp] TRANSPORT\n'
+CONNECTION = b'Connections:\ncelerity-l2tp:  %any...%any  IKEv1\ncelerity-l2tp:   child:  dynamic[udp/l2f] === dynamic[udp] TRANSPORT\n'
 
 
 def status(up, connecting, body):
@@ -14,15 +14,18 @@ def status(up, connecting, body):
 
 
 def ike(uid=1):
-    return (f'  celerity-l2tp[{uid}]: ESTABLISHED 3 seconds ago, 192.0.2.1[192.0.2.1]...198.51.100.1[198.51.100.1]\n'
-            f'  celerity-l2tp[{uid}]: IKEv1 SPIs: 88776655443322{uid:02x}_i 0011223344556677_r*\n'
-            f'  celerity-l2tp[{uid}]: IKE proposal: AES_CBC_256/HMAC_SHA1_96/PRF_HMAC_SHA1/MODP_2048\n').encode()
+    return (f'celerity-l2tp[{uid}]: ESTABLISHED 3 seconds ago, 192.0.2.1[192.0.2.1]...198.51.100.1[198.51.100.1]\n'
+            f'celerity-l2tp[{uid}]: IKEv1 SPIs: 88776655443322{uid:02x}_i 0011223344556677_r*\n'
+            f'celerity-l2tp[{uid}]: IKE proposal: AES_CBC_256/HMAC_SHA1_96/PRF_HMAC_SHA1/MODP_2048\n').encode()
 
 
 def child(uid=1, state='INSTALLED', spi=1):
-    return (f'  celerity-l2tp{{{uid}}}:  {state}, TRANSPORT, reqid 1, ESP in UDP SPIs: abcdef{spi:02x}_i fedcba{spi:02x}_o\n'
-            f'  celerity-l2tp{{{uid}}}:  AES_CBC_256/HMAC_SHA1_96, 100 bytes_i, 0 bytes_o\n'
-            f'  celerity-l2tp{{{uid}}}:   192.0.2.1/32[udp/l2f] === 198.51.100.1/32[udp/1701]\n').encode()
+    if state in ('REKEYING', 'REKEYED'):
+        return (f'celerity-l2tp{{{uid}}}:  {state}, TRANSPORT, reqid 1, expires in {spi} seconds\n'
+                f'celerity-l2tp{{{uid}}}:   192.0.2.1/32[udp/l2f] === 198.51.100.1/32[udp/1701]\n').encode()
+    return (f'celerity-l2tp{{{uid}}}:  {state}, TRANSPORT, reqid 1, ESP in UDP SPIs: abcdef{spi:02x}_i fedcba{spi:02x}_o\n'
+            f'celerity-l2tp{{{uid}}}:  AES_CBC_256/HMAC_SHA1_96, 100 bytes_i, 0 bytes_o\n'
+            f'celerity-l2tp{{{uid}}}:   192.0.2.1/32[udp/l2f] === 198.51.100.1/32[udp/1701]\n').encode()
 
 
 class IpsecCount(unittest.TestCase):
@@ -43,7 +46,7 @@ class IpsecCount(unittest.TestCase):
 
     def test_unknown_is_not_an_empty_inventory(self):
         count = self.g['ipsec_status_inventory']
-        for data in (b'', status(1, 0, b''), status(0, 1, b'  celerity-l2tp[1]: CONNECTING\n'),
+        for data in (b'', status(1, 0, b''), status(0, 1, b'celerity-l2tp[1]: CONNECTING\n'),
                      status(2, 0, ike() + child()), status(1, 0, ike() + child() + child()),
                      status(1, 0, child() + ike()), status(1, 0, ike() + child()).replace(b'TRANSPORT', b'TUNNEL'),
                      status(1, 0, ike().replace(b'celerity-l2tp', b'foreign')),

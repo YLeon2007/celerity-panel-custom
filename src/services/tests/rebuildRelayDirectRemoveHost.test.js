@@ -259,10 +259,10 @@ def command(*a, data=None):
         connection = '   celerity-l2tp: transport\n' if units[IKE]['ActiveState'] == 'active' else ''
         if ipsec_live:
             return (b'Status:\nConnections:\n   celerity-l2tp: transport\nSecurity Associations (1 up, 0 connecting):\n'
-                    b'  celerity-l2tp[9]: ESTABLISHED 3 seconds ago, 192.0.2.1[192.0.2.1]...203.0.113.99[203.0.113.99]\n'
-                    b'  celerity-l2tp[9]: IKEv1 SPIs: 8877665544332211_i 0011223344556677_r*\n'
-                    b'  celerity-l2tp{4}:  INSTALLED, TRANSPORT, reqid 1, ESP in UDP SPIs: abcdef11_i fedcba11_o\n'
-                    b'  celerity-l2tp{5}:  REKEYED, TRANSPORT, reqid 1, ESP in UDP SPIs: abcdef22_i fedcba22_o\n')
+                    b'celerity-l2tp[9]: ESTABLISHED 3 seconds ago, 192.0.2.1[192.0.2.1]...203.0.113.99[203.0.113.99]\n'
+                    b'celerity-l2tp[9]: IKEv1 SPIs: 8877665544332211_i 0011223344556677_r*\n'
+                    b'celerity-l2tp{4}:  INSTALLED, TRANSPORT, reqid 1, ESP in UDP SPIs: abcdef11_i fedcba11_o\n'
+                    b'celerity-l2tp{5}:  REKEYED, TRANSPORT, reqid 1, expires in 12 seconds\n')
         if ipsec_appears_at_recount:
             ipsec_appears_at_recount = False
             ipsec_live = True  # Initial Remove observation was still idle.

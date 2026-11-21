@@ -50,10 +50,11 @@ async function fixture(t) {
                 },
                 verify: async ({ desired }) => { check(desired.users); return true; },
                 checkChap: async (_, current, desired, guard) => { await guard(); check(current); return { changed: !same(current, desired) }; },
-                syncChap: async (_, current, desired, guard) => {
-                    await guard(); check(current); hosts.set(nodeId, rendered(desired)); return { changed: !same(current, desired) };
+                syncChap: async (_, current, desired, guard, revokedLogin) => {
+                    await guard(); check(current); hosts.set(nodeId, rendered(desired));
+                    return { changed: !same(current, desired), ...(revokedLogin && { sessionsTerminated: 0, complete: true }) };
                 },
-                readSessionCount: async () => ({ activeSessions: 0, census: 'a'.repeat(64) }),
+                readSessionCount: async () => ({ activeSessions: 0, activeIpsec: 0, census: 'a'.repeat(64) }),
                 prepareRemove: async ({ currentUsers }) => { if (currentUsers) check(currentUsers); return {}; },
                 remove: async (_, guard) => {
                     await guard(); hosts.delete(nodeId); return true;
