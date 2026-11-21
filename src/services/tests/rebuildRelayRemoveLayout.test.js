@@ -241,7 +241,14 @@ def run(argv, **kw):
         if removing and scenario == 'foreign-handoff': rows.append(('udp','127.0.0.1',f['sharedPort'],'999'))
         return reply(''.join(f'{p} LISTEN 0 0 {a}:{n} *:* users:(("fixture",pid={pid},fd=3))\n' for p,a,n,pid in rows))
     if exe == '/usr/sbin/ipsec' and a == ['statusall']:
-        return reply('Status:\nConnections:\n   celerity-l2tp: transport\nSecurity Associations (0 up, 0 connecting):\n')
+        assert units[IKE]['ActiveState'] == 'active'
+        # Native stroke prints an explicit 'none' row for an idle SA inventory.
+        # The older residual guard tolerates its absence; the census does not.
+        empty = '' if scenario == 'missing-ipsec-idle-witness' else '  none\n'
+        return reply('Status of IKE charon daemon:\nConnections:\n'
+                     'celerity-l2tp:  %any...%any  IKEv1\n'
+                     'celerity-l2tp:   child:  dynamic[udp/l2f] === dynamic[udp] TRANSPORT\n'
+                     'Security Associations (0 up, 0 connecting):\n' + empty)
     if exe == '/usr/sbin/ip':
         if a in (['xfrm','policy','list'],['xfrm','policy','list','nosock'],['xfrm','state','list','nokeys']): return reply()
         if a == ['-j','-N','-4','addr','show']: return js([])
@@ -359,8 +366,12 @@ else:
     a = wire('remove',baseline=proof)
     if scenario == 'apply-stale-bridge':
         assert a == (70,'','DIRECT_REMOVE_REFUSED\n') and snapshots() == now and not changes and not intent.exists(), a
+    elif scenario == 'missing-ipsec-idle-witness':
+        assert a == (70,'','DIRECT_REMOVE_REFUSED\n') and snapshots() == before and not changes and not intent.exists(), a
+        assert all(policy.values())
     elif scenario in ('post-bridge-udp','post-user'):
         assert a == (75,'','') and intent.exists() and all(policy.values()), a
+        assert ('restart',X) in changes and ('restart',B) in changes
     else:
         assert a[0] == 0 and json.loads(a[1]) == dict(ok=True,backupId=token,removed=True), a
         assert ('restart',X) in changes and not any(policy.values()) and intent.exists()
@@ -384,7 +395,8 @@ print('ok')
 
 for (const scenario of ['split', 'apply', 'apply-nobody-main', 'apply-empty-bridge', 'local', 'replace-main', 'replace-bridge', 'restart-bridge', 'restart-main',
     'changed-split', 'foreign-dependency', 'wrong-node', 'foreign-handoff', 'split-missing-udp', 'local-missing-udp',
-    'dynamic-user', 'bridge-exe', 'apply-mixed', 'non-invertible-receipt', 'apply-stale-bridge', 'post-bridge-udp', 'post-user']) {
+    'dynamic-user', 'bridge-exe', 'apply-mixed', 'non-invertible-receipt', 'apply-stale-bridge', 'missing-ipsec-idle-witness',
+    'post-bridge-udp', 'post-user']) {
     test(`DIRECT remove layout: ${scenario}`, () => {
         const split = !scenario.startsWith('local');
         const originals = { main: stringify(split ? main : localMain), bridge: split ? stringify(bridge) : null };
