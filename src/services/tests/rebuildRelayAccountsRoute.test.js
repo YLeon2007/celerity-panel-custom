@@ -25,7 +25,7 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
     t.after(() => { if (old === undefined) delete process.env.C3_REBUILD_ENABLED; else process.env.C3_REBUILD_ENABLED = old; });
     const Settings = require('../../models/settingsModel');
     const serviceModule = require('../rebuildService');
-    let completed = false, failure, invalidReceipt = false;
+    let completed = false, failure, invalidReceipt = false, recovery, scopedError = false;
     const calls = [];
     t.mock.method(Settings, 'get', async () => ({ deployment: { completed } }));
     t.mock.method(serviceModule, 'createRebuildService', () => Object.fromEntries(actions.map(([action, method, status]) => [method, async input => {
@@ -34,11 +34,12 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
         assert.equal(input.login, login);
         if (action === 'create') assert.ok(input.password === password, 'must pass the supplied password only to Create');
         if (failure) throw Object.assign(new Error(`${password} ${privateDetail}`), { code: failure, password, privateDetail,
-            ...(failure.endsWith('OUTCOME_UNKNOWN') && { confirmedSessionsTerminated: 2 }) });
+            ...(failure.endsWith('OUTCOME_UNKNOWN') && { confirmedSessionsTerminated: 2 }),
+            ...(scopedError && { sessionsTerminatedScope: 'request' }) });
         // Even extra internal success metadata must not cross the HTTP boundary.
         return { executionMode: 'rebuild', status, login, relayCount: 2,
             ...(action !== 'create' && { sessionsTerminated: invalidReceipt ? privateDetail : 3 }),
-            internal: { password, privateDetail } };
+            internal: { password, privateDetail }, ...recovery };
     }])));
 
     const panel = require('../../routes/panel');
@@ -139,4 +140,32 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
     const install = await request(app, `/panel/rebuild/relays/${'a'.repeat(24)}/l2tp/install`, authorized);
     assert.equal(install.status, 429);
     assert.deepEqual(calls, ['create', 'disable', 'delete', 'create', 'create', 'disable', 'disable', 'delete', 'delete', ...Array(7).fill('disable')]);
+
+    const recoveryPeer = { ...authorized, ip: '192.0.2.14' };
+    for (const [action, , status, httpStatus] of actions) {
+        const count = sessionsTerminated => action === 'create' ? {} : { sessionsTerminated, sessionsTerminatedScope: 'request' };
+        recovery = { recovered: true, ...(action === 'delete' && { sessionsTerminated: 0 }) };
+        const success = await send(action, recoveryPeer);
+        assert.equal(success.status, httpStatus);
+        assert.deepEqual(JSON.parse(success.body), { executionMode: 'rebuild', status, login, relayCount: 2,
+            recovered: true, ...count(action === 'delete' ? 0 : 3) });
+
+        recovery = { recovered: true, status: 'canceled', ...(action !== 'create' && { sessionsTerminated: 0 }) };
+        const canceled = await send(action, recoveryPeer);
+        assert.equal(canceled.status, 200);
+        assert.deepEqual(JSON.parse(canceled.body), { executionMode: 'rebuild', status: 'canceled', login, relayCount: 2,
+            recovered: true, ...count(0) });
+    }
+    for (const overrides of [{ recovered: false }, { login: 'other-account' }, { sessionsTerminated: 1 }]) {
+        recovery = { recovered: true, status: 'canceled', sessionsTerminated: 0, ...overrides };
+        const denied = await send('delete', recoveryPeer);
+        assert.equal(denied.status, 409);
+        assert.deepEqual(JSON.parse(denied.body), { error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false } });
+    }
+    failure = 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN';
+    scopedError = true;
+    const partial = await send('delete', recoveryPeer);
+    assert.equal(partial.status, 409);
+    assert.deepEqual(JSON.parse(partial.body), { error: { code: failure, retryAllowed: false,
+        confirmedSessionsTerminated: 2, sessionsTerminatedScope: 'request' } });
 });

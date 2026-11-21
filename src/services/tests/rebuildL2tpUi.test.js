@@ -3,6 +3,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
+const { runInNewContext } = require('node:vm');
 const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
@@ -17,7 +19,9 @@ const id = 'a'.repeat(24), otherId = 'b'.repeat(24), csrf = 'test-"<&-csrf';
 const hostile = '\"><img src=x onerror=alert(1)>&';
 const bindingRu = 'Нет привязки SSH/machine-id, добавьте релей в настройки оператора';
 const statuses = State.schema.path('status').enumValues;
-const scriptTag = '<script src="/js/rebuild-l2tp.js" defer></script>';
+const rebuildL2tpScriptVersion = createHash('sha256')
+    .update(readFileSync(join(root, 'public/js/rebuild-l2tp.js'))).digest('hex').slice(0, 16);
+const scriptTag = `<script src="/js/rebuild-l2tp.js?v=${rebuildL2tpScriptVersion}" defer></script>`;
 
 const installed = { id, name: hostile, ip: '192.0.2.42', status: 'installed', bound: true, canInstall: false,
     canRemove: true, canRevealPsk: true, psk: 'SERVER-ONLY-PSK', pskEncrypted: 'SERVER-ONLY-ENCRYPTED' };
@@ -30,7 +34,7 @@ const unsafeAccount = { login: hostile, enabled: false, consistent: false, addre
 async function render(lang, overrides) {
     const translate = key => t(key, lang);
     const data = { page: 'l2tp', title: translate('rebuildL2tp.title'), csrfToken: csrf, t: translate, lang,
-        relays: [installed, fresh], accounts: [account, unsafeAccount], canManageAccounts: true, ...overrides };
+        relays: [installed, fresh], accounts: [account, unsafeAccount], canManageAccounts: true, rebuildL2tpScriptVersion, ...overrides };
     const content = await ejs.renderFile(join(root, 'views/rebuild-l2tp.ejs'), data);
     const layout = await ejs.renderFile(join(root, 'views/layout.ejs'), { ...data, content });
     return { content, layout };
@@ -55,6 +59,68 @@ test('a read-only singleton exposes password reveal but no account mutation cont
     const { content } = await render('en', { canManageAccounts: false, accounts: [{ ...account, login: 'relay-bootstrap' }] });
     assert.ok(content.includes(`${route}/l2tp/accounts/reveal`));
     assert.doesNotMatch(content, /data-create|data-account-action|SERVER-ONLY-PASSWORD/);
+});
+
+test('pending supersedes generic conflict/unavailable text and hides mutation and reveal controls in RU and EN', async () => {
+    for (const [lang, message] of [['ru', 'Незавершённая операция, выполняется сверка'], ['en', 'Unfinished operation, reconciliation in progress']]) {
+        const { content } = await render(lang, { accountsPending: true, canReconcileAccounts: true });
+        assert.match(content, new RegExp(`>${message}<`));
+        assert.ok(content.includes(`data-reconcile-url="${route}/l2tp/accounts/reconcile"`));
+        for (const key of ['inconsistent', 'accountsReadOnly', 'loadError']) assert.ok(!content.includes(t(`rebuildL2tp.${key}`, lang)));
+        assert.doesNotMatch(content, /data-create|data-account-action|data-secret-url|data-install-url|#rebuild-l2tp-remove|SERVER-ONLY-/);
+    }
+    const singleton = await render('ru', { accountsPending: true, canReconcileAccounts: false });
+    assert.doesNotMatch(singleton.content, /data-reconcile-url|data-secret-url/);
+    const clear = await render('ru');
+    assert.doesNotMatch(clear.content, /data-reconcile-url/);
+});
+
+test('opening a pending section POSTs once, then shows settled, pending or unconfirmed without retry/reload', async () => {
+    const script = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
+    for (const [outcome, responseStatus, receipt, messageKey, count] of [
+        ['settled', 200, { executionMode: 'rebuild', status: 'settled' }, 'reconcileSettled'],
+        ['settled with closures', 200, { executionMode: 'rebuild', status: 'settled', sessionsTerminated: 2,
+            sessionsTerminatedScope: 'request' }, 'reconcileSettled', 2],
+        ['unscoped', 200, { executionMode: 'rebuild', status: 'settled', sessionsTerminated: 2 }, 'reconcileSettled'],
+        ['pending', 200, { executionMode: 'rebuild', status: 'pending', sessionsTerminated: 2,
+            sessionsTerminatedScope: 'request' }, 'reconcileStillPending'],
+        ['refused', 503, { error: { message: 'PRIVATE_FIXTURE' } }, 'reconcileUnconfirmed'],
+        ['unexpected', 200, { executionMode: 'classic', status: 'settled' }, 'reconcileUnconfirmed'],
+        ['lost', null, null, 'reconcileUnconfirmed'],
+        ['disabled', null, null, null],
+    ]) {
+        const url = `${route}/l2tp/accounts/reconcile`;
+        const words = require('../../locales/ru.json').rebuildL2tp;
+        const status = { textContent: words.accountsPending }, refresh = { hidden: true };
+        const page = {
+            dataset: { csrf, messages: JSON.stringify(words.messages), ...(messageKey && { reconcileUrl: url }) },
+            querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh })[key] ?? null,
+            querySelectorAll: () => [],
+        };
+        const calls = [];
+        runInNewContext(script, {
+            document: { getElementById: () => page },
+            window: { addEventListener() {}, location: { reload: () => calls.push('reload') } },
+            async fetch(path, options) {
+                calls.push({ path, options });
+                if (responseStatus === null) throw new Error('PRIVATE_FIXTURE');
+                return { ok: responseStatus === 200, status: responseStatus, json: async () => receipt };
+            },
+        });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(calls.length, messageKey ? 1 : 0, outcome);
+        assert.equal(refresh.hidden, !messageKey, outcome);
+        const message = messageKey ? words.messages[messageKey] : words.accountsPending;
+        assert.equal(status.textContent, count === undefined ? message : `${message} Подтверждено завершение сеансов этим запросом: ${count}.`, outcome);
+        if (messageKey) {
+            assert.equal(calls[0].path, url);
+            const { method, headers, credentials, mode, body, redirect, cache } = calls[0].options;
+            assert.deepEqual({ method, credentials, mode, body, redirect, cache, ...headers }, {
+                method: 'POST', credentials: 'same-origin', mode: 'same-origin', body: '{}', redirect: 'error', cache: 'no-store',
+                'x-csrf-token': csrf, 'Content-Type': 'application/json',
+            });
+        }
+    }
 });
 
 test('renders EN, RU and English fallback for every relay status and fails closed for missing binding and load error', async () => {
@@ -214,23 +280,47 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
     await flush();
     check(fetchCalls.length === beforeFailure && status.textContent === words.messages.cryptoUnavailable, 'weak fallback used or missing localized crypto error');
     window.crypto.getRandomValues = rng;
+    let expectedMessage = words.messages.uncertain;
     if (terminal === 'uncertainInstall') {
         respond = async () => response({ error: { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' } }, 409);
         install.click();
         await flush();
         params(`${route}/${otherId}/l2tp/install`, {});
+    } else if (terminal === 'recoveredDisable' || terminal === 'recoveredPartial') {
+        const partial = terminal === 'recoveredPartial';
+        respond = async () => partial
+            ? response({ error: { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', retryAllowed: false,
+                confirmedSessionsTerminated: 2, sessionsTerminatedScope: 'request' } }, 409)
+            : response({ executionMode: 'rebuild', status: 'disabled', login: 'alice.test', relayCount: 2,
+                recovered: true, sessionsTerminated: 0, sessionsTerminatedScope: 'request' });
+        disable.click();
+        await flush();
+        params(`${route}/l2tp/accounts/disable`, { login: 'alice.test' });
+        expectedMessage = partial ? `${words.messages.uncertain} Session closures confirmed by this request: 2.`
+            : `${words.messages.disabled} Session closures confirmed by this request: 0.`;
     } else {
-        respond = async () => terminal === 'created'
-            ? response({ executionMode: 'rebuild', status: 'created', login: 'new.user', relayCount: 1 }, 201)
-            : response({ error: { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', retryAllowed: false } }, 409);
+        const canceled = terminal === 'canceled' || terminal === 'wrongLogin';
+        respond = async () => terminal === 'uncertainAccount'
+            ? response({ error: { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', retryAllowed: false } }, 409)
+            : response({ executionMode: 'rebuild', status: canceled ? 'canceled' : 'created',
+                login: terminal === 'wrongLogin' ? 'other.user' : 'new.user', relayCount: 1, ...(canceled && { recovered: true }) },
+            canceled ? 200 : 201);
         submit.click();
         await flush();
         const second = params(`${route}/l2tp/accounts/create`, { login: 'new.user' }, ['login', 'password']).password;
         check(second !== first, 'password reused between submissions');
-        if (terminal === 'created') check(login.value === '', 'successful form was not cleared');
+        if (terminal === 'created') {
+            check(login.value === '', 'successful form was not cleared');
+            expectedMessage = words.messages.created;
+        }
+        if (terminal === 'canceled') {
+            check(login.value === 'new.user', 'canceled request was treated as a creation');
+            expectedMessage = 'The requested account change was canceled and not applied. Reload L2TP data to see the current state.';
+        }
     }
-    check(status.textContent === words.messages[terminal === 'created' ? 'created' : 'uncertain'] &&
-        submit.disabled && install.disabled && !$('[data-refresh]').hidden, 'terminal action did not require a fresh view');
+    check(status.textContent === expectedMessage, 'wrong terminal message: ' + status.textContent);
+    check(submit.disabled && install.disabled && disable.disabled && !$('[data-refresh]').hidden,
+        'terminal action did not require a fresh view');
     const count = fetchCalls.length;
     submit.click();
     install.click();
@@ -242,7 +332,8 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
 const firefox = process.env.REBUILD_L2TP_FIREFOX || 'firefox';
 const browserAvailable = spawnSync(firefox, ['--version'], { timeout: 3000 }).status === 0;
 
-for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainInstall'], ['en', 'created']]) {
+for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainInstall'], ['en', 'created'],
+    ...['canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial'].map(terminal => ['en', terminal])]) {
     test(`Firefox: clicks, secret lifecycle and account/relay requests (${lang}, ${terminal})`, {
         skip: browserAvailable ? false : 'requires local Firefox (or REBUILD_L2TP_FIREFOX)',
     }, async () => {

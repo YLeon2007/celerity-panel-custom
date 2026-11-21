@@ -129,11 +129,11 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             return resolveRelayBinding(env, String(_id), { _id, name, ip, cascadeRole, ssh: { port: ssh?.port, username: ssh?.username } });
         } catch { return null; }
     }
-    async function noPending() {
+    async function hasPendingAccounts() {
         if (Node.db !== State.db || Node.db !== L2tpUser.db) throw new Error('Rebuild L2TP persistence unavailable');
-        try { await assertNoPendingRelayAccounts(L2tpUser.db); return true; }
+        try { await assertNoPendingRelayAccounts(L2tpUser.db); return false; }
         catch (error) {
-            if (error.code === 'REBUILD_L2TP_ACCOUNTS_BLOCKED') return false;
+            if (error.code === 'REBUILD_L2TP_ACCOUNTS_BLOCKED') return true;
             throw error;
         }
     }
@@ -145,14 +145,14 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
     }
     async function stableReveal(load, envelopeFor) {
         const key = env.ENCRYPTION_KEY;
-        if (!hasKey() || !await noPending()) return null;
+        if (!hasKey() || await hasPendingAccounts()) return null;
         const before = await load();
-        if (!before || !nonempty(envelopeFor(before)) || !await noPending()) return null;
+        if (!before || !nonempty(envelopeFor(before)) || await hasPendingAccounts()) return null;
         // Read-only recheck: a Remove reservation can leave the account rows
         // untouched, and an account publication can clear its intent. Recheck
         // both witnesses without taking a writer lock or requiring a replica set.
         const after = await load();
-        if (!equal(before, after) || !await noPending() || env.ENCRYPTION_KEY !== key) return null;
+        if (!equal(before, after) || await hasPendingAccounts() || env.ENCRYPTION_KEY !== key) return null;
         const value = envelopeFor(after);
         if (!nonempty(value)) return null;
         try { return decrypt(value, key) || null; } catch { return null; }
@@ -171,7 +171,8 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         const maybePristine = states.filter(row => row.status === 'not_installed' && row.desiredState === 'absent');
         const pristineIds = new Set(maybePristine.length ? (await read(State.find({ ...pristineFilter,
             _id: { $in: maybePristine.map(row => row._id) } }), '_id')).map(row => String(row._id)) : []);
-        const clear = await noPending(), list = listMode(), owned = new Map();
+        const accountsPending = await hasPendingAccounts();
+        const clear = !accountsPending, list = listMode(), owned = new Map();
         const withUsers = new Set(rows.map(row => String(row.relayNode)));
         const relays = nodes.sort((a, b) => compare(String(a._id), String(b._id))).map(row => {
             const id = String(row._id), state = byNode.get(id), binding = bindingFor(row);
@@ -185,7 +186,9 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         const cohort = list ? ownedCohort(states.filter(row => row.status !== 'not_installed' || row.desiredState !== 'absent'), owned, list)
             : owned.size === 1 ? owned : null;
         const accountRows = list ? rows : rows.filter(row => owned.has(String(row.relayNode)));
-        const directory = await readDirectory(L2tpUser.db, undefined, true);
+        // An unfinished operation can leave this inventory unsettled. Do not
+        // require a consistent directory to report the persisted fence.
+        const directory = clear ? await readDirectory(L2tpUser.db, undefined, true) : null;
         const inventoryOk = clear && inventoryMatches(rows.filter(row => owned.has(String(row.relayNode))), cohort, list)
             && (!directory || [...cohort.keys()].every(id => sameAccounts(directory.accounts,
                 rows.filter(row => String(row.relayNode) === id), false)));
@@ -217,7 +220,8 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             }
         }
         accounts.sort((a, b) => compare(a.login, b.login));
-        return { relays, accounts, canManageAccounts: list && hasKey() && inventoryOk && accounts.every(row => row.consistent) };
+        return { relays, accounts, accountsPending, canReconcileAccounts: accountsPending && list,
+            canManageAccounts: list && hasKey() && inventoryOk && accounts.every(row => row.consistent) };
     }
 
     function passwordCohort(states, nodes, list) {
@@ -281,7 +285,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             return { list, node, state };
         }, ({ list, node, state }) => list === listMode() && ownedState(state, bindingFor(node)) ? state.pskEncrypted : null);
     }
-    return Object.freeze({ overview, revealPassword, revealPsk });
+    return Object.freeze({ overview, revealPassword, revealPsk, hasPendingAccounts });
 }
 
 module.exports = { createRebuildL2tpOverview };

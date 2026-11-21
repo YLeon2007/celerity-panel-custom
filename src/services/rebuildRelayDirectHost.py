@@ -1046,7 +1046,8 @@ def after_match(record, expected):
     return record is not None and {**record, 'data': digest(raw(record))} == expected
 
 
-CHAP_ACTIONS = ('check-chap', 'sync-chap')
+CHAP_ACTIONS = ('check-chap', 'sync-chap', 'inspect-chap', 'read-chap-generation', 'fence-chap')
+CHAP_GENERATION_PREFIX = 'installed-chap-v2:'
 APPLY_NETWORK_ACTIONS = ('check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network')
 CHAP_BEGIN = b'# BEGIN CELERITY MANAGED L2TP USERS'
 CHAP_END = b'# END CELERITY MANAGED L2TP USERS'
@@ -1054,6 +1055,17 @@ CHAP_LOGIN = rb'[A-Za-z0-9._@-]{1,64}'
 CHAP_QUOTED_BYTE = rb'(?:[ !#-\[\]-~]|\\["\\])'
 CHAP_ROW = re.compile(rb'"(' + CHAP_LOGIN + rb')" l2tpd "(' + CHAP_QUOTED_BYTE + rb'{1,255}|[A-Za-z0-9_-]{256})" ([0-9.]{7,15})')
 CHAP_FOREIGN_TOKEN = re.compile(rb'(?:"' + CHAP_QUOTED_BYTE + rb'''*"|'[ -&(-\[\]-~]*'|[!$-&(-\[\]-~]+)''')
+
+
+def chap_generation(phase):
+    match = re.fullmatch(CHAP_GENERATION_PREFIX + r'([a-f0-9]{32})', phase) if type(phase) is str else None
+    return match[1] if match else None
+
+
+def installed_phase(phase):
+    # Keep the real phase in the parsed backup. In particular, when Apply
+    # rewrites its receipt it must not publish the legacy 'installed' again.
+    return phase == 'installed' or chap_generation(phase) is not None
 
 
 def chap_pool(lns, cidr):
@@ -1215,12 +1227,12 @@ def rollback(request, path, old_manifest, backup):
     global STAGE
     STAGE = 'COMMAND_FAILED'
     before, d, token = backup['before'], request['network'], request['backupId']
-    need(backup['phase'] in ('applying', 'installed'), 'ROLLBACK_DRIFT')
-    was_installed = backup['phase'] == 'installed'
+    was_installed = installed_phase(backup['phase'])
+    need(backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
     no_jobs(UNITS)
     sidecar = 'bridge' in backup['after']
     neighbors(before, sidecar)
-    current = load_after(backup, require_all=backup['phase'] == 'installed')
+    current = load_after(backup, require_all=was_installed)
     need(ike_include_matches(current['starter'], [os.path.basename(NAMES['ike'])] if current['ike'] is not None else []),
          'ROLLBACK_DRIFT')
     boot_enrollment = boot_link() if before.get('installBoot') else None
@@ -1883,7 +1895,7 @@ def owned_installation(request):
     bad = 'ROLLBACK_DRIFT'
     token = request['backupId']
     path, manifest, backup = read_manifest(token)
-    need(backup['phase'] == 'installed' and backup['machineId'] == request['machineId']
+    need(installed_phase(backup['phase']) and backup['machineId'] == request['machineId']
          and backup['backupId'] == token and encode(backup['network']) == encode(request['network'])
          and backup['before']['boot'] == boot(), bad)
     intent = os.path.join(os.path.dirname(path), 'remove-attempt.json')
@@ -1984,8 +1996,7 @@ def apply_network(request, action):
     return {'ok': True, 'backupId': token, 'proof': proof}
 
 
-def sync_chap(request, *, write_changes):
-    global CHAP_ENTERED
+def chap_preconditions(request):
     bad = 'ROLLBACK_DRIFT'
     path, manifest, backup, intent = owned_installation(request)
     before, runtime = backup['before'], backup['runtime']
@@ -2017,9 +2028,20 @@ def sync_chap(request, *, write_changes):
          and removal_native(xl, XL, before, installed=True)
          and ((working(xl) and xl['InvocationID'] == runtime['invocations'][1])
               or rollback_quiescent(xl) or (xl['ActiveState'], xl['SubState'], xl['MainPID']) == ('failed', 'failed', '0')), bad)
+    return path, manifest, backup, intent, xl, current_rows, desired_rows, current_logins | desired_logins
+
+
+def sync_chap(request, *, write_changes):
+    global CHAP_ENTERED
+    bad = 'ROLLBACK_DRIFT'
+    path, manifest, backup, intent, xl, current_rows, desired_rows, logins = chap_preconditions(request)
+    generation = chap_generation(backup['phase'])
+    # Omission belongs only to a genuinely unfenced install. In particular a
+    # previously valid CHAP preimage does not authorize an obsolete command.
+    need(not write_changes or request.get('generation') == generation, bad)
     target = NAMES['chap']
     record = read(target)
-    prefix, suffix, rows = owned_chap(record, backup, (current_rows, current_logins | desired_logins))
+    prefix, suffix, rows = owned_chap(record, backup, (current_rows, logins))
     need(record is not None, bad)
     after = record
     if rows != desired_rows:
@@ -2034,10 +2056,98 @@ def sync_chap(request, *, write_changes):
         CHAP_ENTERED = True
         write(target, record, after)
     reply = {'ok': True, 'backupId': request['backupId'], 'changed': changed}
-    if write_changes and revoked is not None:
+    if not write_changes and generation is not None:
+        reply['generation'] = generation
+    if write_changes and 'revokedLogin' in request:
         # Even a previously disabled row can have surviving authenticated calls.
         CHAP_ENTERED = True
         reply.update(revoke_ppp(request, {**request, 'currentUsers': request['desiredUsers']}, after, path, manifest, xl))
+    return reply
+
+
+def chap_projection(record, current_rows, desired_rows, logins):
+    prefix, _, suffix, rows = chap_parts(record)
+    original, desired = rows == current_rows, rows == desired_rows
+    need(original or desired, 'ROLLBACK_DRIFT')
+    check_chap_neighbors(prefix, logins)
+    check_chap_neighbors(suffix, logins)
+    return original, desired
+
+
+def fence_chap(request):
+    global CHAP_ENTERED
+    bad = 'ROLLBACK_DRIFT'
+    path, manifest, backup, intent, xl, current_rows, desired_rows, logins = chap_preconditions(request)
+    predecessor = chap_generation(backup['phase'])
+    need(request['generation'] == predecessor, bad)
+    target = NAMES['chap']
+    generation = remove_generation(target)
+    record = read(target)
+    chap_projection(record, current_rows, desired_rows, logins)
+    no_jobs(UNITS)
+    need(unit(XL) == xl and directory_absent(intent) and generation is not None
+         and read(target) == record and remove_generation(target) == generation, bad)
+    # The exclusive SYSTEM flock spans the preimage and exact manifest CAS.
+    # Old in-flight helpers accept only 'installed'; neither this action nor
+    # a late replay of it can re-publish the predecessor phase.
+    successor = uuid.uuid4().hex
+    need(successor != predecessor, bad)
+    session_need(time.monotonic() < DEADLINE)
+    updated = entry(encode({**backup, 'phase': CHAP_GENERATION_PREFIX + successor}))
+    CHAP_ENTERED = True
+    write(path, manifest, updated)
+    session_need(time.monotonic() < DEADLINE)
+    return {'ok': True, 'backupId': request['backupId'], 'fenced': True}
+
+
+def inspect_chap(request):
+    bad = 'ROLLBACK_DRIFT'
+    target = NAMES['chap']
+    manifest_generation = remove_generation(manifest_path(request['backupId']))
+    path, manifest, backup, intent, xl, current_rows, desired_rows, logins = chap_preconditions(request)
+    # A failed daemon does not establish that its sessions are gone.
+    need(xl['ActiveState'] != 'failed', bad)
+    generation = remove_generation(target)
+    record = read(target)
+    original, desired = chap_projection(record, current_rows, desired_rows, logins)
+
+    def unchanged():
+        no_jobs(UNITS)
+        need(unit(XL) == xl and directory_absent(intent) and read(path, 2 * MAX_FILE) == manifest
+             and manifest_generation is not None and remove_generation(path) == manifest_generation
+             and read(target) == record and generation is not None and remove_generation(target) == generation, bad)
+        session_need(time.monotonic() < DEADLINE)
+
+    revoked = request.get('revokedLogin')
+    count = 0  # No target on a non-revoke; this does not assert PPP idleness.
+    with contextlib.ExitStack() as stack:
+        watch = None
+        if revoked is not None:
+            session_need(os.uname().machine == 'x86_64')
+            # The owner reads the live CHAP projection. Authenticated sessions
+            # are joined to the original users, including the removed login.
+            observed = {**request, 'currentUsers': request['currentUsers' if original else 'desiredUsers']}
+            if rollback_quiescent(xl):
+                quiet = quiescent_session_sample(observed)
+                session_need(quiet == quiescent_session_sample(observed))
+            else:
+                owner = session_owner(observed)
+                session_need((owner[1], str(owner[2])) == (xl['InvocationID'], xl['MainPID']))
+                users = {u['login']: u['ipAddress'] for u in request['currentUsers']}
+                sample, _, watch = stack.enter_context(revoke_ppp_view(owner))
+                before = sample()
+                peers = revoke_peer_logins(before[1], users)
+                session_need(owner == session_owner(observed) and before == sample()
+                             and peers == revoke_peer_logins(before[1], users) and before == sample())
+                count = sum(login == revoked for login in peers.values())
+        unchanged()
+        if watch is not None:
+            watch()
+    session_need(time.monotonic() < DEADLINE)
+    projection = 'both' if original and desired else 'original' if original else 'desired'
+    reply = {'ok': True, 'backupId': request['backupId'], 'projection': projection, 'activeTargetSessions': count}
+    if (epoch := chap_generation(backup['phase'])) is not None:
+        reply['generation'] = epoch
     return reply
 
 
@@ -2468,7 +2578,7 @@ def session_owner(request):
     session_need(identity is not None and raw(identity) in (machine.encode('ascii'), (machine + '\n').encode('ascii')))
     path, manifest, backup = read_manifest(token)
     before, runtime = backup['before'], backup['runtime']
-    session_need(backup['phase'] == 'installed' and backup['backupId'] == token and backup['machineId'] == machine
+    session_need(installed_phase(backup['phase']) and backup['backupId'] == token and backup['machineId'] == machine
                  and encode(backup['network']) == encode(network) and before['boot'] == boot()
                  and directory_absent(os.path.dirname(path) + '/remove-attempt.json'))
     no_jobs((XL, NET_UNIT, IKE))
@@ -3212,7 +3322,7 @@ def dispatch(request: dict[str, Any]):
     # This only serializes DIRECT invocations; the caller must exclude other
     # administrative writers. No locks from the old runners are consulted.
     with directory(SYSTEM) as fd:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, (fcntl.LOCK_SH if action in ('inspect-chap', 'read-chap-generation') else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         if action in APPLY_NETWORK_ACTIONS:
             keys = {'action', 'machineId', 'backupId', 'network'}
             if action in ('verify-apply-network', 'restart-apply-network'):
@@ -3223,10 +3333,28 @@ def dispatch(request: dict[str, Any]):
             return apply_network(request, action)
         if action in CHAP_ACTIONS:
             token = request['backupId']
-            keys = {'action', 'machineId', 'backupId', 'network', 'nodeId', 'currentUsers', 'desiredUsers'}
-            need(keys <= set(request) <= keys | {'revokedLogin'}
-                 and re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId']), 'CANDIDATE_INVALID')
+            keys = {'action', 'machineId', 'backupId', 'network', 'nodeId'}
+            need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId']), 'CANDIDATE_INVALID')
             need(ready['ppp'] and ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
+            if action == 'read-chap-generation':
+                need(set(request) == keys, 'CANDIDATE_INVALID')
+                _, _, backup, _ = owned_installation(request)
+                return {'ok': True, 'backupId': token, 'generation': chap_generation(backup['phase'])}
+            keys |= {'currentUsers', 'desiredUsers'}
+            optional = {'revokedLogin'}
+            if action == 'fence-chap':
+                keys.add('generation')
+            if action == 'sync-chap':
+                optional.add('generation')
+            need(keys <= set(request) <= keys | optional, 'CANDIDATE_INVALID')
+            if 'generation' in request:
+                generation = request['generation']
+                need((action == 'fence-chap' and generation is None)
+                     or (type(generation) is str and re.fullmatch(r'[a-f0-9]{32}', generation)), 'CANDIDATE_INVALID')
+            if action == 'fence-chap':
+                return fence_chap(request)
+            if action == 'inspect-chap':
+                return inspect_chap(request)
             return sync_chap(request, write_changes=action == 'sync-chap')
         if action in ('prepare-remove', 'remove'):
             token = request['backupId']
@@ -3267,7 +3395,7 @@ def dispatch(request: dict[str, Any]):
         else:
             path, record, backup = bound_manifest(request)
             if action == 'verify':
-                need(backup['phase'] == 'installed', 'RUNTIME_UNPROVED')
+                need(installed_phase(backup['phase']), 'RUNTIME_UNPROVED')
                 files = load_after(backup, require_all=True)
                 need(installed_runtime(d, token, backup['before'], files) == backup['runtime'], 'RUNTIME_UNPROVED')
             else:

@@ -1,6 +1,9 @@
 <%
 const l = key => t(`rebuildL2tp.${key}`);
 const available = typeof loadError === 'undefined' || !loadError;
+const pending = available && typeof accountsPending !== 'undefined' && accountsPending === true;
+const actionableOverview = available && !pending;
+const reconcile = pending && typeof canReconcileAccounts !== 'undefined' && canReconcileAccounts === true;
 const relayStatuses = new Set(['not_installed', 'queued', 'preflight', 'installing', 'installed',
     'degraded', 'drifted', 'removing', 'error', 'role_lost']);
 const validId = id => typeof id === 'string' && /^[a-f0-9]{24}(?![\s\S])/.test(id);
@@ -9,7 +12,8 @@ const relayNames = new Map(relays.map(({ id, name }) => [id, name]));
 const relayPath = id => `/panel/rebuild/relays/${id}/l2tp`;
 const accountPath = '/panel/rebuild/relays/l2tp/accounts';
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
-    'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted'];
+    'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
+    'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed'];
 function secretControl(kind, url, index, login) {
     const valueId = `rebuild-l2tp-${kind}-${index}`;
 %>
@@ -34,11 +38,12 @@ function secretControl(kind, url, index, login) {
     #rebuild-l2tp [data-action-status]:not(:empty) { margin-bottom: .75rem; }
 </style>
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
+     <% if (reconcile) { %>data-reconcile-url="<%= accountPath %>/reconcile"<% } %>
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
     <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
     <div class="card">
         <div class="card-body">
-            <p data-action-status role="status"></p>
+            <p data-action-status role="status"><%= pending ? l(reconcile ? 'accountsPending' : 'accountsPendingListRequired') : '' %></p>
             <a href="/panel/l2tp" data-refresh hidden><%= l('refresh') %></a>
         </div>
         <section aria-labelledby="rebuild-l2tp-relays">
@@ -55,7 +60,7 @@ function secretControl(kind, url, index, login) {
                         </tr></thead>
                         <tbody>
                         <% relays.forEach((relay, index) => {
-                            const actionable = available && relay.bound === true && validId(relay.id);
+                            const actionable = actionableOverview && relay.bound === true && validId(relay.id);
                             const status = relayStatuses.has(relay.status) ? relay.status : 'unknown';
                         %>
                             <tr>
@@ -87,7 +92,7 @@ function secretControl(kind, url, index, login) {
     </div>
     <section class="card" aria-labelledby="rebuild-l2tp-accounts">
         <div class="card-header"><h2 id="rebuild-l2tp-accounts"><i class="ti ti-users" aria-hidden="true"></i> <%= l('accounts') %></h2></div>
-        <% if (available && canManageAccounts === true) { %>
+        <% if (actionableOverview && canManageAccounts === true) { %>
             <div class="card-body">
                 <form method="post" autocomplete="off" data-create>
                     <div class="form-group">
@@ -98,7 +103,7 @@ function secretControl(kind, url, index, login) {
                     <button type="submit" class="btn btn-primary" disabled><i class="ti ti-plus" aria-hidden="true"></i> <%= l('create') %></button>
                 </form>
             </div>
-        <% } else if (available) { %>
+        <% } else if (actionableOverview) { %>
             <p class="card-body text-muted"><%= l('accountsReadOnly') %></p>
         <% } %>
         <% if (accounts.length) { %>
@@ -113,7 +118,7 @@ function secretControl(kind, url, index, login) {
                     </tr></thead>
                     <tbody>
                     <% accounts.forEach((account, index) => {
-                        const valid = available && account.consistent === true && validLogin(account.login);
+                        const valid = actionableOverview && account.consistent === true && validLogin(account.login);
                         const actionable = valid && canManageAccounts === true;
                     %>
                         <tr>
@@ -127,7 +132,7 @@ function secretControl(kind, url, index, login) {
                             </td>
                             <td>
                                 <span class="badge <%= account.enabled ? 'badge-success' : 'badge-secondary' %>"><%= l(account.enabled ? 'enabled' : 'disabled') %></span>
-                                <% if (!account.consistent) { %><div class="text-muted"><%= l('inconsistent') %></div><% } %>
+                                <% if (!pending && !account.consistent) { %><div class="text-muted"><%= l('inconsistent') %></div><% } %>
                             </td>
                             <td><% if (valid && account.canRevealPassword === true) { secretControl('password', `${accountPath}/reveal`, index, account.login); } %></td>
                             <td>
@@ -144,9 +149,9 @@ function secretControl(kind, url, index, login) {
                     </tbody>
                 </table>
             </div>
-        <% } else if (available) { %>
+        <% } else if (actionableOverview) { %>
             <p class="card-body text-muted"><%= l('noAccounts') %></p>
         <% } %>
     </section>
 </div>
-<script src="/js/rebuild-l2tp.js" defer></script>
+<script src="/js/rebuild-l2tp.js?v=<%= rebuildL2tpScriptVersion %>" defer></script>

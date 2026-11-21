@@ -192,9 +192,9 @@ app.use(compression({
 }));
 
 if (rebuildEnabled) {
-    // Secret reveal requests get a bounded parser and no-store before the
+    // Rebuild L2TP reveal/reconcile requests get a bounded parser and no-store before the
     // CORS preflight or general body parser can complete the response.
-    app.use(require('./src/routes/panel/rebuildL2tp').revealIngress);
+    app.use(require('./src/routes/panel/rebuildL2tp').rebuildL2tpIngress);
 }
 
 app.use(cors({

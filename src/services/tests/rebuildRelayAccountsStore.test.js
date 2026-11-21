@@ -26,13 +26,21 @@ function fixture() {
         endSession() { assert.equal(this.active, false); events.push('end'); }
     }
     const inTxn = session => assert.ok(session instanceof Session && session.inTransaction());
+    const matchesOwner = (filter, row) => {
+        if (!row || (filter.intentId && row.intentId !== filter.intentId)) return false;
+        if (!filter.$expr) return true;
+        const { $eq } = filter.$expr;
+        assert.equal($eq[0], '$$ROOT');
+        return JSON.stringify($eq[1].$literal) === JSON.stringify({ _id: 'pending', ...row });
+    };
     const collection = {
         async findOne(filter, options) {
             assert.equal(filter._id, 'pending');
             assert.equal(options.readPreference, 'primary');
             assert.equal(options.readConcern.level, 'majority');
-            assert.deepEqual(options.projection, { _id: 1 });
-            return pending && (!filter.intentId || pending.intentId === filter.intentId) ? { _id: 'pending' } : null;
+            if (options.projection) assert.deepEqual(options.projection, { _id: 1 });
+            return matchesOwner(filter, pending) ? options.projection ? { _id: 'pending' }
+                : { _id: 'pending', ...structuredClone(pending) } : null;
         },
         async updateMany(filter, update, { session, ...options }) {
             inTxn(session);
@@ -54,7 +62,7 @@ function fixture() {
             assert.deepEqual(options, {});
             assert.equal(filter._id, 'pending');
             events.push('settle');
-            if (!session.pending || session.pending.intentId !== filter.intentId) return { acknowledged: true, deletedCount: 0 };
+            if (!matchesOwner(filter, session.pending)) return { acknowledged: true, deletedCount: 0 };
             session.pending = undefined;
             return { acknowledged: true, deletedCount: 1 };
         },
@@ -97,16 +105,20 @@ function fixture() {
         },
     };
     const store = createRebuildRelayAccountsStore({ Node: { db }, State: { db }, L2tpUser: User });
-    const publish = (action, intentId = intent.intentId, changed = true) => store.publish({ action, intentId,
+    const publish = (action, intentId, changed, expected) => store.publish({ action, intentId, intent: expected,
         login: intent.login,
         directoryBase: [{ id: 'b'.repeat(24), login: 'relay-bootstrap', enabled: true, passwordEncrypted: 'fixture-envelope' },
             ...(action !== 'create' ? [{ id: 'a'.repeat(24), login: intent.login, enabled: changed, passwordEncrypted: 'fixture-envelope' }] : [])],
         changes: [{ before: item, after: !changed ? undefined : action === 'create'
              ? { login: intent.login, enabled: true, passwordEncrypted: 'fixture-envelope' } : { enabled: false } }],
         async recheck(session) { inTxn(session); events.push('snapshot'); },
-        async verifyAuthority() { await store.verifyIntent(intentId); events.push('guard'); },
+        async verifyAuthority() { await store.verifyIntent(intentId, expected); events.push('guard'); },
     });
-    return { db, collection, store, publish, events, hooks, get pending() { return pending; }, get users() { return users; },
+    const cancel = expected => store.cancel({ intent: expected,
+        async recheck(session) { inTxn(session); events.push('snapshot'); },
+        async verifyAuthority() { await store.verifyIntent(expected.intentId, expected); events.push('guard'); },
+    });
+    return { db, collection, store, publish, cancel, events, hooks, get pending() { return pending; }, get users() { return users; },
         get directory() { return directory; } };
 }
 
@@ -119,13 +131,28 @@ test('transaction commits the actual majority intent; another owner cannot overw
     assert.deepEqual(f.events.splice(0), ['start', 'intent', 'commit', 'end']);
     await assert.rejects(f.store.begin({ intentId: 'different' }), { code: 11000 });
     assert.deepEqual(f.events.splice(0), ['start', 'intent', 'abort', 'end']);
-    await assert.rejects(f.store.verifyIntent('different'), code('CHANGED'));
-    await assert.rejects(f.publish('create', 'different'), code('CHANGED'));
+    const foreign = { ...await f.store.pending(), intentId: 'different' };
+    await assert.rejects(f.store.verifyIntent('different', foreign), code('CHANGED'));
+    await assert.rejects(f.publish('create', 'different', true, foreign), code('CHANGED'));
     assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'directory', 'settle', 'abort', 'end']);
     assert.equal(f.directory, undefined);
     assert.deepEqual(f.users, []);
     await assert.rejects(assertNoPendingRelayAccounts(f.db), { ...code('BLOCKED'), retryAllowed: false });
-    await f.store.verifyIntent(intent.intentId);
+    await f.store.verifyIntent(intent.intentId, await f.store.pending());
+});
+
+test('authority and settlement never fall back to UUID-only when a full row is missing', async () => {
+    const f = fixture();
+    await f.store.begin(intent);
+    const row = await f.store.pending();
+    f.events.length = 0;
+    for (const invalid of [undefined, { ...row, intentId: 'different' }, { ...row, _id: 'directory' }]) {
+        await assert.rejects(f.store.verifyIntent(intent.intentId, invalid), code('CHANGED'));
+        await assert.rejects(f.publish('create', intent.intentId, true, invalid), code('CHANGED'));
+    }
+    await assert.rejects(f.cancel(undefined), code('CHANGED'));
+    assert.deepEqual(f.events, []);
+    assert.deepEqual(await f.store.pending(), row);
 });
 
 test('committed intent with lost majority acknowledgement stays visible, without retry or abort', async () => {
@@ -149,7 +176,7 @@ for (const [action, write] of [['create', 'insert'], ['disable', 'update'], ['de
         await f.store.begin(intent);
         f.events.length = 0;
         f.hooks.commit = land => { assert.deepEqual(f.pending, intent); return land(); };
-        await f.publish(action);
+        await f.publish(action, intent.intentId, true, await f.store.pending());
         assert.deepEqual(f.events, ['start', 'snapshot', write, 'directory', 'settle', 'guard', 'commit', 'end']);
         const account = f.directory.accounts.find(row => row.login === intent.login);
         assert.equal(account?.enabled, { create: true, disable: false, delete: undefined }[action]);
@@ -161,7 +188,7 @@ test('already-disabled settlement closes the intent transaction without writing 
     const f = fixture();
     await f.store.begin(intent);
     f.events.length = 0;
-    await f.publish('disable', intent.intentId, false);
+    await f.publish('disable', intent.intentId, false, await f.store.pending());
     assert.deepEqual(f.events, ['start', 'snapshot', 'directory', 'settle', 'guard', 'commit', 'end']);
     await assertNoPendingRelayAccounts(f.db);
 });
@@ -172,9 +199,51 @@ test('lost publish acknowledgement does not retry or abort; an uncommitted attem
     const lost = new Error('lost commit acknowledgement');
     f.events.length = 0;
     f.hooks.commit = () => { throw lost; };
-    await assert.rejects(f.publish('create'), err => err === lost);
+    const observed = await f.store.pending();
+    await assert.rejects(f.publish('create', intent.intentId, true, observed), err => err === lost);
     assert.deepEqual(f.events, ['start', 'snapshot', 'insert', 'directory', 'settle', 'guard', 'commit', 'end']);
     assert.equal(f.directory, undefined);
     assert.deepEqual(f.users, []);
-    await f.store.verifyIntent(intent.intentId);
+    await f.store.verifyIntent(intent.intentId, observed);
+});
+
+test('read the full majority pending row and cancel only that row in one transaction', async () => {
+    const f = fixture();
+    assert.equal(await f.store.pending(), null);
+    await f.store.begin(intent);
+    const observed = await f.store.pending();
+    assert.deepEqual(observed, { _id: 'pending', ...intent });
+    f.events.length = 0;
+    await f.cancel(observed);
+    assert.deepEqual(f.events, ['start', 'snapshot', 'settle', 'guard', 'commit', 'end']);
+    assert.deepEqual(f.users, []);
+    assert.equal(f.directory, undefined);
+    assert.equal(await f.store.pending(), null);
+});
+
+for (const settlement of ['cancel', 'publish']) {
+    test(`${settlement} cannot consume a modified raw row even with the same UUID`, async () => {
+        const f = fixture();
+        await f.store.begin(intent);
+        const observed = await f.store.pending();
+        f.pending.extra = true;
+        await assert.rejects(f.store.verifyIntent(intent.intentId, observed), code('CHANGED'));
+        f.events.length = 0;
+        await assert.rejects(settlement === 'cancel' ? f.cancel(observed) : f.publish('create', intent.intentId, true, observed), code('CHANGED'));
+        assert.deepEqual(f.events, ['start', 'snapshot', ...(settlement === 'publish' ? ['insert', 'directory'] : []),
+            'settle', 'abort', 'end']);
+        assert.deepEqual(f.users, []);
+        assert.equal(f.directory, undefined);
+        assert.equal(f.pending.extra, true);
+    });
+}
+
+test('unknown cancellation commit is not automatically retried or aborted', async () => {
+    const f = fixture();
+    await f.store.begin(intent);
+    f.events.length = 0;
+    f.hooks.commit = () => { throw Error('unknown cancel'); };
+    await assert.rejects(f.cancel(await f.store.pending()), /unknown cancel/);
+    assert.deepEqual(f.events, ['start', 'snapshot', 'settle', 'guard', 'commit', 'end']);
+    await assert.rejects(f.store.assertNoPending(), code('BLOCKED'));
 });

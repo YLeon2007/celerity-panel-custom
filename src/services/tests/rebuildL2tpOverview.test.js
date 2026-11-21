@@ -85,7 +85,10 @@ function fixture(t, { legacy = false } = {}) {
     t.mock.method(db, 'collection', name => {
         assert.equal(name, 'c3_rebuild_relay_accounts');
         return { async findOne(filter, options) {
-            if (filter._id === 'directory') return null;
+            if (filter._id === 'directory') {
+                if (f.directoryError) throw new Error('fixture-private-directory-error');
+                return null;
+            }
             assert.deepEqual(filter, { _id: 'pending' });
             assert.deepEqual(options.projection, { _id: 1 });
             assert.equal(options.readConcern.level, 'majority');
@@ -116,6 +119,8 @@ test('overview uses real model projections, showing only safe relay and per-rela
             relay(idC, 3, 'not_installed', true, false, false)],
         accounts: [{ login, enabled: true, consistent: true, canRevealPassword: true, addresses: [{ id: idA, ip: '10.66.0.11' }, { id: idB, ip: '10.66.1.11' }] }],
         canManageAccounts: true,
+        accountsPending: false,
+        canReconcileAccounts: false,
     });
     assert.equal(f.decipher.mock.callCount(), 0);
     for (const { fields } of f.queries) {
@@ -273,10 +278,14 @@ test('a pending intent, including one observed during the read, fences all secre
     f.pending = true;
     assert.equal(await f.service.revealPassword(login), null);
     assert.equal(await f.service.revealPsk(idA), null);
+    f.directoryError = true;
     const result = await f.service.overview();
+    assert.equal(result.accountsPending, true);
+    assert.equal(result.canReconcileAccounts, true);
     assert.equal(result.canManageAccounts, false);
     assert.ok(result.relays.every(r => !r.canInstall && !r.canRemove && !r.canRevealPsk));
     assert.ok(result.accounts.every(row => !row.consistent));
+    f.directoryError = false;
     for (const [reveal, field] of [[() => f.service.revealPassword(login), 'passwordEncrypted'],
         [() => f.service.revealPsk(idA), 'pskEncrypted']]) {
         f.pending = false;
@@ -286,6 +295,17 @@ test('a pending intent, including one observed during the read, fences all secre
         assert.ok(f.fenceReads >= before + 2);
     }
     assert.equal(f.decipher.mock.callCount(), 0);
+});
+
+test('a known pending fence is not a read error, and singleton mode cannot trigger reconciliation', async t => {
+    const f = fixture(t, { legacy: true });
+    f.pending = true;
+    const result = await f.service.overview();
+    assert.equal(result.accountsPending, true);
+    assert.equal(result.canReconcileAccounts, false);
+    assert.equal(result.canManageAccounts, false);
+    f.fenceError = true;
+    await assert.rejects(f.service.overview(), { code: 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE' });
 });
 
 test('password reveal refuses a Remove reservation that appears while loading replicas', async t => {

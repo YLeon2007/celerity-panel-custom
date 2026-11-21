@@ -1,19 +1,27 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
+const { readFileSync } = require('node:fs');
+const { resolve } = require('node:path');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { requireAuth, render } = require('./helpers');
 const { requirePanelCsrf } = require('./csrf');
+const { isRebuildEnabled } = require('../../services/rebuildMode');
 
 const pagePath = /^\/l2tp$/;
 const accountPath = /^\/rebuild\/relays\/l2tp\/accounts\/reveal$/;
+const reconcilePath = /^\/rebuild\/relays\/l2tp\/accounts\/reconcile$/;
 // No Express parameter capture: validate the raw segment, without URL decoding.
 const pskPath = /^\/rebuild\/relays\/[^/]+\/l2tp\/psk\/reveal$/;
 const loginPattern = /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/;
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
 const jsonString = String.raw`"(?:[^"\\]|\\.)*"`;
 const accountJson = new RegExp(String.raw`^\s*\{\s*${jsonString}\s*:\s*${jsonString}\s*\}\s*$`);
-const pskJson = /^\s*\{\s*\}\s*$/;
+const emptyJson = /^\s*\{\s*\}\s*$/;
+const reconcileInvalid = 'REBUILD_L2TP_RECONCILE_INVALID_REQUEST';
+const reconcileUnavailable = res => revealError(res, 503, 'REBUILD_L2TP_RECONCILE_UNAVAILABLE');
+let rebuildL2tpScriptVersion;
 
 function noStore(_req, res, next) {
     res.set('Cache-Control', 'no-store');
@@ -34,31 +42,37 @@ function invalidRequest(res) {
 
 // Mount at app level before CORS and the general parsers. The panel router
 // cannot mark or sanitize requests that those earlier middlewares terminate.
-const parseRevealJson = express.json({
+const parseScopedJson = express.json({
     limit: '1kb',
     inflate: false,
     verify(req, _res, bytes) {
         // Verify the wire shape before JSON.parse can discard duplicate keys.
-        const pattern = accountPath.test(req.path.slice('/panel'.length)) ? accountJson : pskJson;
-        if (!pattern.test(bytes.toString('utf8'))) throw new Error('Invalid reveal request');
+        const pattern = accountPath.test(req.path.slice('/panel'.length)) ? accountJson : emptyJson;
+        if (!pattern.test(bytes.toString('utf8'))) throw new Error('Invalid rebuild L2TP request');
     },
 });
 
-function revealIngress(req, res, next) {
+function rebuildL2tpIngress(req, res, next) {
     if (!/^\/panel\//i.test(req.path)) return next();
     const path = req.path.slice('/panel'.length);
     if (req.method === 'GET' && pagePath.test(path)) return noStore(req, res, next);
-    if (!accountPath.test(path) && !pskPath.test(path)) return next();
+    const reconcile = reconcilePath.test(path);
+    if (!reconcile && !accountPath.test(path) && !pskPath.test(path)) return next();
     res.set('Cache-Control', 'no-store');
     if (req.method !== 'POST') return next();
-    if (req.url.includes('?') || !req.is('application/json') || req.get('content-length') === '0') return invalidRequest(res);
-    return parseRevealJson(req, res, err => err ? invalidRequest(res) : next());
+    const reject = () => reconcile ? revealError(res, 400, reconcileInvalid) : invalidRequest(res);
+    if (req.url.includes('?') || !req.is('application/json') || req.get('content-length') === '0') return reject();
+    return parseScopedJson(req, res, err => err ? reject() : next());
 }
 
 function renderPage(res, model) {
     const t = res.locals.t;
     const title = t?.('rebuildL2tp.title');
-    return render(res, 'rebuild-l2tp', { title: title && title !== 'rebuildL2tp.title' ? title : 'L2TP', page: 'l2tp', ...model });
+    // Hash the packaged script on first use; there is no version to bump by hand.
+    rebuildL2tpScriptVersion ??= createHash('sha256')
+        .update(readFileSync(resolve(__dirname, '../../../public/js/rebuild-l2tp.js'))).digest('hex').slice(0, 16);
+    return render(res, 'rebuild-l2tp', { title: title && title !== 'rebuildL2tp.title' ? title : 'L2TP', page: 'l2tp',
+        ...model, rebuildL2tpScriptVersion });
 }
 
 function sendLoadError(res) {
@@ -119,7 +133,7 @@ function revealInput(isAccount) {
 }
 
 function mountNoStore(router) {
-    router.all([accountPath, pskPath], noStore);
+    router.all([accountPath, pskPath, reconcilePath], noStore);
     router.get(pagePath, (req, res, next) => req.method === 'GET' ? noStore(req, res, next) : next());
 }
 
@@ -163,14 +177,52 @@ function mountReveals(router, getOverview) {
     }
 }
 
+function mountReconcile(router, getOverview, reconcile, limiter) {
+    router.post(reconcilePath, requireAuth, requireSessionId, checkCsrf, (req, res, next) => {
+        const body = req.body;
+        if (req.url.includes('?') || !req.is('application/json') || req.get('content-length') === '0'
+            || !body || Object.getPrototypeOf(body) !== Object.prototype || Object.keys(body).length !== 0) {
+            return revealError(res, 400, reconcileInvalid);
+        }
+        if (!isRebuildEnabled() || !Object.hasOwn(process.env, 'C3_REBUILD_L2TP_RELAYS_JSON')) {
+            return revealError(res, 409, 'REBUILD_L2TP_RECONCILE_DISABLED');
+        }
+        next();
+    }, requireCompletedOnboarding(reconcileUnavailable), limiter, async (_req, res) => {
+        const receipt = (status, count) => res.json({ executionMode: 'rebuild', status,
+            ...(count !== undefined && { sessionsTerminated: count, sessionsTerminatedScope: 'request' }) });
+        try {
+            const { hasPendingAccounts } = getOverview();
+            // This is a scoped recovery request, not a request to mutate a
+            // specific account or host. The writer rechecks under its lock.
+            if (!await hasPendingAccounts()) return receipt('settled');
+            let result, failed = false;
+            try { result = await reconcile(); } catch { failed = true; }
+            // A busy/refused writer is still pending if the fence can be observed; a failed read is not.
+            if (await hasPendingAccounts()) return receipt('pending');
+            if (failed) return reconcileUnavailable(res);
+            // Publish only acknowledged closures from this settled revocation, never its account or relay metadata.
+            const count = result?.sessionsTerminated;
+            const proved = result?.executionMode === 'rebuild' && result.recovered === true
+                && (result.status === 'disabled' || result.status === 'deleted') && Number.isSafeInteger(count) && count >= 0;
+            return receipt('settled', proved ? count : undefined);
+        } catch {
+            return reconcileUnavailable(res);
+        }
+    });
+    router.all(reconcilePath, (_req, res) => revealError(res.set('Allow', 'POST'), 405, 'METHOD_NOT_ALLOWED'));
+}
+
 function createRoutes(service) {
-    // No service import, construction or query at startup or on a refused request.
+    // No service construction or query at startup or on a refused request.
     const getOverview = () => service ??= require('../../services/rebuildL2tpOverview').createRebuildL2tpOverview();
+    const reconcile = () => require('../../services/rebuildService').createRebuildService().reconcileRelayAccounts();
     return {
         mountNoStore,
         mountOverview: (router, exposePanelCsrfToken) => mountOverview(router, getOverview, exposePanelCsrfToken),
+        mountReconcile: (router, limiter) => mountReconcile(router, getOverview, reconcile, limiter),
         mountReveals: router => mountReveals(router, getOverview),
     };
 }
 
-module.exports = { createRoutes, revealIngress };
+module.exports = { createRoutes, rebuildL2tpIngress };

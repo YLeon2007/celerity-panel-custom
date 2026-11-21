@@ -194,6 +194,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     return {execute,verifyDraftTls,locks:guardedLocks,installRelay,...relayRemoval,
         createRelayAccount: input=>relayAccounts().create(input),
         disableRelayAccount: input=>relayAccounts().disable(input),
-        deleteRelayAccount: input=>relayAccounts().delete(input)};
+        deleteRelayAccount: input=>relayAccounts().delete(input),
+        // Reconciliation must acquire the account writer's lock itself; the
+        // general mutation guard intentionally refuses a pending account fence.
+        reconcileRelayAccounts: ()=>relayAccounts().reconcile()};
 }
 module.exports={createRebuildService};

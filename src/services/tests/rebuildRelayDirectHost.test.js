@@ -190,6 +190,20 @@ except R as e:
     assert scenario == 'known-failure' and str(e) == 'COMMAND_FAILED'
 assert h['read'](names['main']) != before['files']['main']
 assert os.stat(h['manifest_path'](token)).st_mode & 0o777 == 0o600
+if scenario == 'fenced-restore':
+    path, original, backup = h['read_manifest'](token)
+    epoch = 'installed-chap-v2:' + 'e'*32
+    for malformed in (epoch + '\n', epoch.upper(), epoch[:-1]):
+        replacement = h['entry'](h['encode'](dict(backup, phase=malformed)))
+        h['write'](path, original, replacement)
+        for action in ('verify', 'rollback'):
+            count = len(commands)
+            try: h['dispatch'](dict(req, action=action))
+            except R as error: assert str(error) in ('ROLLBACK_DRIFT', 'RUNTIME_UNPROVED')
+            else: raise AssertionError('malformed installed phase accepted')
+            assert len(commands) == count and h['read'](path) == replacement
+        original = replacement
+    h['write'](path, original, h['entry'](h['encode'](dict(backup, phase=epoch))))
 if scenario != 'known-failure':
     assert h['dispatch'](dict(req, action='verify')) == {'ok': True, 'backupId': token}
 if scenario in ('same-bytes-drift', 'changed-file'):
@@ -222,7 +236,7 @@ else:
 print('ok')
 `;
 
-for (const scenario of ['install-and-restore', 'known-failure', 'same-bytes-drift', 'changed-file']) {
+for (const scenario of ['install-and-restore', 'fenced-restore', 'known-failure', 'same-bytes-drift', 'changed-file']) {
     test(`host payload: ${scenario} (real files, modeled systemd/nft/PPP)`, () => {
         const dir = mkdtempSync(join(process.cwd(), '.direct-local-fixture-'));
         try {

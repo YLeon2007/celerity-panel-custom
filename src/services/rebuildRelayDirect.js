@@ -17,6 +17,7 @@ const TIMEOUT = 145000;
 const SESSION_COUNT_TIMEOUT = 12000;
 const PIN = /^[a-f0-9]{64}$/;
 const TOKEN = /^[a-f0-9]{32}$/;
+const CHAP_ACTIONS = ['check-chap', 'sync-chap', 'inspect-chap', 'read-chap-generation', 'fence-chap'];
 const fail = (suffix, uncertain = false) => Object.assign(new Error(`REBUILD_L2TP_${suffix}`), {
     code: `REBUILD_L2TP_${suffix}`, ...(uncertain && { remoteOutcomeUncertain: true }),
 });
@@ -143,7 +144,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     });
     ssh.usePool = false;
     let connected = false, closed = false, busy = false, poisoned = false;
-    let held;
+    let held, chapObservation;
     const disconnect = () => { try { ssh.disconnect(); } catch { /* cleanup cannot replace outcome */ } };
     function checkBinding() {
         try {
@@ -171,16 +172,24 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         } finally { clearTimeout(timer); }
     }
 
-    async function exec(action, params = {}, write = false, validate = () => true) {
+    async function exec(action, params = {}, write = false, validate = () => true, verifyLock) {
         const count = action === 'session-count';
-        const chap = action === 'check-chap' || action === 'sync-chap';
+        const chap = CHAP_ACTIONS.includes(action);
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         checkBinding();
         await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
         requireThat(!closed, 'DIRECT_CLOSED');
         checkBinding();
+        if (chap) requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
         const stdin = JSON.stringify({ action, machineId, ...params });
         requireThat(Buffer.byteLength(stdin) <= 25 * 1024 * 1024, 'INSTALL_INPUT_INVALID');
+        const verifyBeforeStdin = async () => {
+            requireThat(busy && !closed && !poisoned, 'DIRECT_UNAVAILABLE');
+            checkBinding();
+            await lock(verifyLock);
+            requireThat(busy && !closed && !poisoned, 'DIRECT_UNAVAILABLE');
+            checkBinding();
+        };
         const unknown = () => {
             if (write) { poisoned = true; disconnect(); }
             return fail('DIRECT_OUTCOME_UNKNOWN', write);
@@ -188,7 +197,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         let result;
         try { result = await ssh.exec(directCommand(count ? '-k 1s 9s' : '-k 4s 125s'), {
             stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
-        }); }
+        }, ...(chap ? [verifyBeforeStdin] : [])); }
         catch { throw unknown(); }
         try { checkBinding(); }
         catch (error) { if (write) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
@@ -218,7 +227,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             throw error;
         }
         try {
-            const replyLimit = (count || chap) ? 160 : 46 * 1024 * 1024;
+            const replyLimit = action === 'inspect-chap' ? 170 : (count || chap) ? 160 : 46 * 1024 * 1024;
             if (result.stderr !== '' || Buffer.byteLength(result.stdout) > replyLimit) throw Error();
             const reply = JSON.parse(result.stdout);
             if ((count || chap) && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
@@ -243,9 +252,12 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         requireThat(await check() !== false, 'DIRECT_LOCK_REQUIRED');
     }
     const exactAck = backupId => value => value?.ok === true && value.backupId === backupId;
+    const validGeneration = value => value?.length === 32 && tokenMatches(TOKEN, value);
 
     const chapOperation = (action, installation, currentUsers, desiredUsers, verifyLock, revokedLogin) => serial(async () => {
-        const invalid = 'CHAP_INPUT_INVALID', write = action === 'sync-chap';
+        const invalid = 'CHAP_INPUT_INVALID', sync = action === 'sync-chap';
+        const inspect = action === 'inspect-chap', retire = action === 'fence-chap', write = sync || retire;
+        if (!sync) chapObservation = undefined;
         requireThat(!held && installation?.nodeId === nodeId && Object.keys(installation).length === 3
             && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(installation, key))
             && installation.backupId?.length === 32 && tokenMatches(TOKEN, installation.backupId), invalid);
@@ -253,17 +265,39 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         const revoke = revokedLogin !== undefined;
         requireThat(!revoke || (tokenMatches(/^[A-Za-z0-9._@-]{1,64}(?![\s\S])/, revokedLogin)
             && revokedLogin !== 'relay-bootstrap'), invalid);
-        const params = { nodeId, backupId, network: removeNetwork(installation.network, invalid),
+        const binding = { nodeId, backupId, network: removeNetwork(installation.network, invalid) };
+        const installKey = JSON.stringify(binding);
+        const params = { ...binding,
             currentUsers: chapUsers(currentUsers, invalid), desiredUsers: chapUsers(desiredUsers, invalid),
             ...(revoke && { revokedLogin }) };
         requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
+        if (sync) {
+            requireThat(chapObservation?.installKey === installKey, 'DIRECT_CHAP_CHECK_REQUIRED');
+            if (chapObservation.generation !== undefined) params.generation = chapObservation.generation;
+        }
         await connect(CONNECT_TIMEOUT_MS);
         await lock(verifyLock);
-        const draining = revoke && write;
-        const { changed, sessionsTerminated, complete } = await exec(action, params, write, reply => exactAck(backupId)(reply)
-            && typeof reply.changed === 'boolean' && (draining ? Object.keys(reply).length === 5
-                && integer(reply.sessionsTerminated, 0, Number.MAX_SAFE_INTEGER) && typeof reply.complete === 'boolean'
-                : Object.keys(reply).length === 3));
+        if (retire) {
+            // Read only the CAS preimage, not the CHAP/PPP projection. The
+            // coordinator must inspect again after the retirement is durable.
+            const preimage = await exec('read-chap-generation', binding, false, value => exactAck(backupId)(value)
+                && Object.keys(value).length === 3 && (value.generation === null || validGeneration(value.generation)), verifyLock);
+            await lock(verifyLock);
+            params.generation = preimage.generation;
+        }
+        const draining = revoke && sync;
+        const reply = await exec(action, params, write, value => {
+            if (!exactAck(backupId)(value)) return false;
+            if (retire) return Object.keys(value).length === 3 && value.fenced === true;
+            const versioned = Object.hasOwn(value, 'generation');
+            if (versioned && (sync || !validGeneration(value.generation))) return false;
+            const keys = Object.keys(value).length - Number(versioned);
+            if (inspect) return keys === 4 && ['original', 'desired', 'both'].includes(value.projection)
+                && integer(value.activeTargetSessions, 0, revoke ? Number.MAX_SAFE_INTEGER : 0);
+            return typeof value.changed === 'boolean' && (draining ? keys === 5
+                && integer(value.sessionsTerminated, 0, Number.MAX_SAFE_INTEGER) && typeof value.complete === 'boolean'
+                : keys === 3);
+        }, verifyLock);
         try {
             await lock(verifyLock);
             requireThat(!closed, 'DIRECT_CLOSED');
@@ -273,6 +307,10 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             disconnect();
             throw fail('DIRECT_OUTCOME_UNKNOWN', true);
         }
+        if (retire) return { fenced: true };
+        if (!sync) chapObservation = { installKey, generation: reply.generation };
+        if (inspect) return { projection: reply.projection, activeTargetSessions: reply.activeTargetSessions };
+        const { changed, sessionsTerminated, complete } = reply;
         return draining ? { changed, sessionsTerminated, complete } : { changed };
     });
 
@@ -280,6 +318,8 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         preflight: () => serial(preflight),
         checkChap: (...args) => chapOperation('check-chap', ...args),
         syncChap: (...args) => chapOperation('sync-chap', ...args),
+        inspectChap: (...args) => chapOperation('inspect-chap', ...args),
+        fenceChap: (...args) => chapOperation('fence-chap', ...args),
         readSessionCount: input => serial(async () => {
             const invalid = 'SESSION_COUNT_INPUT_INVALID';
             requireThat(input?.nodeId === nodeId

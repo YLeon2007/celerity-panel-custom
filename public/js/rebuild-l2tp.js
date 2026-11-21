@@ -131,31 +131,64 @@
         refresh.hidden = !requireRefresh;
     }
 
+    function closureNote(data, count) {
+        return data?.sessionsTerminatedScope === 'request' && Number.isSafeInteger(count) && count >= 0
+            ? ` ${words.requestClosures.replace('{count}', String(count))}` : '';
+    }
+
+    async function reconcileOnOpen() {
+        busy = true;
+        updateMutations();
+        let message = 'reconcileUnconfirmed', note = '';
+        try {
+            const { response, data } = await post(page.dataset.reconcileUrl, {});
+            if (response.ok && data?.executionMode === 'rebuild') {
+                if (data.status === 'settled') {
+                    message = 'reconcileSettled';
+                    note = closureNote(data, data.sessionsTerminated);
+                }
+                if (data.status === 'pending') message = 'reconcileStillPending';
+            }
+        } catch { /* A lost response does not establish whether the fence cleared. */ }
+        status.textContent = words[message] + note;
+        busy = false;
+        // Never unlock controls against this stale overview or reload into
+        // another automatic POST. Any refresh is an explicit operator action.
+        requireRefresh = true;
+        updateMutations();
+    }
+
     async function mutate(action, url, body, match) {
         if (busy || requireRefresh) return;
         busy = true;
         updateMutations();
         status.textContent = words.working;
-        let result = 'uncertain';
+        let result = 'uncertain', note = '';
+        const revocation = action === 'disable' || action === 'delete';
         try {
             const { response, data } = await post(url, body);
             if (response.ok) {
-                if (data?.executionMode === 'rebuild' && data.status === expected[action] && match(data)) {
+                const canceled = action !== 'install' && data?.status === 'canceled' && data.recovered === true
+                    && (!revocation || (data.sessionsTerminated === 0 && data.sessionsTerminatedScope === 'request'));
+                if (data?.executionMode === 'rebuild' && (data.status === expected[action] || canceled) && match(data)) {
                     result = data.status;
                     requireRefresh = true;
-                    if (action === 'create') form.reset();
+                    if (result === 'created') form.reset();
+                    if (revocation && data.recovered === true) note = closureNote(data, data.sessionsTerminated);
                     clearSecrets();
                 }
             } else if (data?.retryAllowed !== false && data?.error?.retryAllowed !== false
                 && !uncertainInstallCodes.has(data?.error?.code) && response.status !== 408 && response.status < 500) {
                 result = response.status === 429 ? 'rateLimited' : 'requestFailed';
+            } else if (revocation && data?.error?.retryAllowed === false) {
+                note = closureNote(data.error, data.error.confirmedSessionsTerminated);
             }
         } catch { /* A lost response is not proof that the mutation failed. */ }
         if (result === 'uncertain') {
             requireRefresh = true;
             clearSecrets();
         }
-        status.textContent = words[result];
+        status.textContent = words[result] + note;
         busy = false;
         updateMutations();
     }
@@ -199,5 +232,6 @@
         }
         accountAction('create', login, password);
     });
-    updateMutations();
+    if (page.dataset.reconcileUrl) void reconcileOnOpen();
+    else updateMutations();
 })();

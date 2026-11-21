@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const { performance } = require('node:perf_hooks');
 const test = require('node:test');
 
 const NodeSSH = require('../nodeSSH');
@@ -31,6 +32,162 @@ function createDirectNodeSSH(execImplementation) {
     nodeSSH.usePool = false;
     nodeSSH.directClient = { exec: execImplementation };
     return nodeSSH;
+}
+
+async function createGuardedChannel() {
+    const node = { ip: '192.0.2.10', ssh: { port: 22, username: 'test' } };
+    const direct = new NodeSSH(node, {
+        expectedEndpoint: { ip: node.ip, ...node.ssh }, expectedHostKeySha256: 'a'.repeat(64),
+    });
+    direct.usePool = false;
+    const client = new EventEmitter();
+    client.on('error', () => {});
+    const calls = [], writes = [];
+    let callback, ends = 0, disposed = 0;
+    client.exec = (...args) => { calls.push(args); callback = args[1]; };
+    client.end = () => {}; // Explicit disconnect must not depend on a peer event.
+    direct._openDirectClient = async () => client;
+    await direct.connectDirectOnce(1000);
+    const stream = createExecStream({ onWrite: chunk => writes.push(chunk.toString()), onEnd: () => ends++ });
+    stream.destroy = () => { disposed++; stream.emit('close'); };
+    return { direct, client, node, calls, writes, stream, open: () => callback(null, stream),
+        counts: () => ({ ends, disposed }) };
+}
+
+const guardedOptions = { stdin: 'fixture-payload', timeout: 5000 };
+const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+const stdinFailure = error => {
+    assert.equal(error.message, SANITIZED_STDIN_ERROR);
+    assert.equal(error.cause, undefined);
+    assert.doesNotMatch(error.stack, /private-fixture|fixture-payload/);
+    return true;
+};
+
+test('guarded direct exec waits for the late channel and the local guard before writing', async () => {
+    const fixture = await createGuardedChannel();
+    const permission = Promise.withResolvers();
+    let checked = 0;
+    const done = fixture.direct.exec('/fixed/receiver', guardedOptions, (...args) => {
+        assert.deepEqual(args, []);
+        checked++;
+        return permission.promise;
+    });
+    assert.equal(checked, 0);
+    assert.equal(fixture.calls.length, 1);
+    assert.deepEqual(fixture.calls[0], ['/fixed/receiver', fixture.calls[0][1]]);
+    fixture.open();
+    await nextTurn();
+    assert.equal(checked, 1);
+    assert.deepEqual(fixture.writes, []);
+    assert.deepEqual(fixture.counts(), { ends: 0, disposed: 0 });
+    permission.resolve();
+    assert.deepEqual(await done, { code: 0, stdout: '', stderr: '' });
+    assert.deepEqual(fixture.writes, ['fixture-payload']);
+    assert.deepEqual(fixture.counts(), { ends: 1, disposed: 0 });
+    for (const event of ['end', 'close', 'error']) assert.equal(fixture.client.listenerCount(event), event === 'error' ? 1 : 0);
+});
+
+test('guarded direct exec sanitizes a busy lock or a rejected or throwing guard', async () => {
+    for (const guard of [() => false, async () => { throw Error('private-fixture'); }, () => { throw Error('private-fixture'); }]) {
+        const fixture = await createGuardedChannel();
+        const rejected = assert.rejects(fixture.direct.exec('/fixed/receiver', guardedOptions, guard), stdinFailure);
+        fixture.open();
+        await rejected;
+        assert.deepEqual(fixture.writes, []);
+        assert.deepEqual(fixture.counts(), { ends: 0, disposed: 1 });
+        assert.equal(fixture.calls.length, 1);
+    }
+});
+
+test('guarded direct exec rejects a changed endpoint or client while awaiting the guard', async () => {
+    for (const lose of [f => { f.node.ip = '192.0.2.20'; }, f => { f.node.ssh.port = 2222; },
+        f => { f.node.ssh.username = 'private-fixture'; }, f => { f.direct.usePool = true; },
+        f => { f.direct.directClient = new EventEmitter(); }]) {
+        const fixture = await createGuardedChannel();
+        const permission = Promise.withResolvers();
+        let checked = false;
+        const rejected = assert.rejects(fixture.direct.exec('/fixed/receiver', guardedOptions, () => {
+            checked = true;
+            return permission.promise;
+        }), stdinFailure);
+        fixture.open();
+        await nextTurn();
+        assert.equal(checked, true);
+        lose(fixture);
+        permission.resolve(true);
+        await rejected;
+        assert.deepEqual(fixture.writes, []);
+        assert.deepEqual(fixture.counts(), { ends: 0, disposed: 1 });
+    }
+});
+
+test('a newly pinned client does not authorize stdin on the original channel', async () => {
+    const fixture = await createGuardedChannel();
+    const replacement = new EventEmitter();
+    const ready = Promise.withResolvers();
+    let attempts = 0;
+    fixture.direct._openDirectClient = () => ++attempts === 1 ? fixture.client : ready.promise;
+    // Start both dials before a client is published, then delay the second ready event.
+    const first = fixture.direct.connectDirect();
+    const second = fixture.direct.connectDirect();
+    await first;
+    const permission = Promise.withResolvers();
+    const rejected = assert.rejects(fixture.direct.exec('/fixed/receiver', guardedOptions, () => permission.promise), stdinFailure);
+    fixture.open();
+    ready.resolve(replacement);
+    await second;
+    assert.equal(fixture.direct.directClient, replacement);
+    permission.resolve(true);
+    await rejected;
+    assert.deepEqual(fixture.writes, []);
+    assert.deepEqual(fixture.counts(), { ends: 0, disposed: 1 });
+});
+
+test('guarded stdin refuses a late authorization even when the timeout callback has not run', async t => {
+    const fixture = await createGuardedChannel();
+    let now = 0;
+    t.mock.method(performance, 'now', () => now);
+    const permission = Promise.withResolvers();
+    const rejected = assert.rejects(fixture.direct.exec('/fixed/receiver', guardedOptions, () => permission.promise), stdinFailure);
+    fixture.open();
+    now = guardedOptions.timeout;
+    permission.resolve(true);
+    await rejected;
+    assert.deepEqual(fixture.writes, []);
+    assert.deepEqual(fixture.counts(), { ends: 0, disposed: 1 });
+});
+
+for (const reason of ['timeout before callback', 'timeout', 'disconnect', 'peer end', 'client error', 'channel close']) {
+    test(`guarded direct exec cancels stdin on ${reason} even if authorization arrives later`, async t => {
+        const fixture = await createGuardedChannel();
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const permission = Promise.withResolvers();
+        let checked = 0;
+        const rejected = assert.rejects(fixture.direct.exec('/fixed/receiver', guardedOptions, () => {
+            checked++;
+            return permission.promise;
+        }), stdinFailure);
+        const lateChannel = reason === 'timeout before callback';
+        if (!lateChannel) {
+            fixture.open();
+            await nextTurn();
+        }
+        if (reason.startsWith('timeout')) t.mock.timers.tick(guardedOptions.timeout);
+        if (reason === 'disconnect') fixture.direct.disconnect();
+        if (reason === 'peer end') fixture.client.emit('end');
+        if (reason === 'client error') fixture.client.emit('error', Error('private-fixture'));
+        if (reason === 'channel close') fixture.stream.emit('close');
+        await rejected; // Cancellation must not wait for authorization to return.
+        if (lateChannel) fixture.open();
+        if (reason === 'client error') permission.reject(Error('private-fixture'));
+        else permission.resolve(true);
+        await nextTurn();
+        assert.equal(checked, lateChannel ? 0 : 1);
+        assert.deepEqual(fixture.writes, []);
+        assert.equal(fixture.counts().ends, 0);
+        assert.equal(fixture.counts().disposed, reason === 'channel close' ? 0 : 1);
+        assert.equal(fixture.calls.length, 1);
+    });
 }
 
 async function withPooledExec(execImplementation, callback) {
@@ -100,7 +257,9 @@ test('NodeSSH forwards stdin options through pooled execution', async () => {
         const node = { id: 'node-stdin', name: 'node-stdin' };
         const nodeSSH = new NodeSSH(node);
         const secret = 'pool-stdin-secret';
-        const result = await nodeSSH.exec('/fixed/receiver', { stdin: secret });
+        let checked = false;
+        const result = await nodeSSH.exec('/fixed/receiver', { stdin: secret }, () => { checked = true; });
+        assert.equal(checked, false);
 
         assert.deepEqual(result, { code: 0, stdout: '', stderr: '' });
         assert.deepEqual(calls, [{

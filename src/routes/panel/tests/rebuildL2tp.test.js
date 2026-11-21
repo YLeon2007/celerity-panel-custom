@@ -18,6 +18,8 @@ const { createPanelRouter } = panelRouter;
 
 const page = '/panel/l2tp';
 const accounts = '/panel/rebuild/relays/l2tp/accounts/reveal';
+const reconcile = '/panel/rebuild/relays/l2tp/accounts/reconcile';
+const listKey = 'C3_REBUILD_L2TP_RELAYS_JSON';
 const id = 'abcdef0123456789abcdef01';
 const pskPath = relay => `/panel/rebuild/relays/${relay}/l2tp/psk/reveal`;
 const psk = pskPath(id);
@@ -28,12 +30,15 @@ const sharedKey = `${marker}_PSK`;
 
 test.after(() => require('../../../services/sshPoolService').closeAll());
 
-async function mount(t, { rebuild = true, ingress = false } = {}) {
+async function mount(t, { rebuild = true, ingress = false, realView = false } = {}) {
     const originalMode = process.env.C3_REBUILD_ENABLED;
+    const originalList = process.env[listKey];
     process.env.C3_REBUILD_ENABLED = String(rebuild);
     t.after(() => {
         if (originalMode === undefined) delete process.env.C3_REBUILD_ENABLED;
         else process.env.C3_REBUILD_ENABLED = originalMode;
+        if (originalList === undefined) delete process.env[listKey];
+        else process.env[listKey] = originalList;
         helpers.invalidateOnboardingCache();
     });
     const config = require('../../../../config');
@@ -57,7 +62,7 @@ async function mount(t, { rebuild = true, ingress = false } = {}) {
 
     const view = path.resolve(__dirname, '../../../../views/rebuild-l2tp.ejs');
     const read = fs.readFileSync;
-    t.mock.method(fs, 'readFileSync', (filename, ...args) => filename === view
+    if (!realView) t.mock.method(fs, 'readFileSync', (filename, ...args) => filename === view
         ? '<main id="fixture-rebuild-l2tp"><%= page %>:<%= accounts.map(account => account.login).join(",") %>'
             + '<% if (typeof loadError !== "undefined" && loadError) { %><%= t("dashboard.loadError") %><% } %></main>'
         : read(filename, ...args));
@@ -65,7 +70,14 @@ async function mount(t, { rebuild = true, ingress = false } = {}) {
         async overview() {
             state.calls.push(['overview']);
             if (state.overviewFailure) throw new Error(marker);
+            if (realView) return { relays: [], accounts: [], canManageAccounts: false, accountsPending: state.pending === true,
+                canReconcileAccounts: state.pending === true && Object.hasOwn(process.env, listKey) };
             return { relays: [], accounts: [{ login }] };
+        },
+        async hasPendingAccounts() {
+            state.calls.push(['read fence']);
+            if (state.fenceFailure) throw new Error(marker);
+            return state.pending === true;
         },
         async revealPassword(value) {
             state.calls.push(['password', value]);
@@ -82,7 +94,7 @@ async function mount(t, { rebuild = true, ingress = false } = {}) {
     app.set('view engine', 'ejs');
     app.set('views', path.dirname(view));
     if (ingress) {
-        app.use(require('../rebuildL2tp').revealIngress);
+        app.use(require('../rebuildL2tp').rebuildL2tpIngress);
         app.use(cors({ origin: 'http://fixture.invalid', credentials: true }));
     }
     app.use(express.json());
@@ -99,6 +111,15 @@ async function mount(t, { rebuild = true, ingress = false } = {}) {
         if (req.get('x-fixture-no-session-id')) delete req.sessionID;
         next();
     });
+    state.rebuildService = t.mock.method(require('../../../services/rebuildService'), 'createRebuildService', () => ({
+        async reconcileRelayAccounts(...args) {
+            state.calls.push(['reconcile', ...args]);
+            if (state.settles) state.pending = false;
+            if (state.loseReadback) state.fenceFailure = true;
+            if (state.reconcileFailure) throw new Error(marker);
+            return state.recoveryReceipt ?? { secret: marker };
+        },
+    }));
     app.use('/panel', rebuild ? createPanelRouter({ rebuildL2tpOverview: service }) : panelRouter);
     app.use((req, res) => res.status(404).send('Not found'));
     app.use((err, req, res, next) => res.status(500).send('Unexpected fixture error'));
@@ -178,6 +199,97 @@ test('only exact authenticated, onboarded GET /panel/l2tp renders the rebuild ov
     assert.match(response.text, /fixture-rebuild-l2tp">l2tp:Ошибка загрузки/);
     assert.doesNotMatch(response.text, /Fixture\.Account@local/);
     assert.deepEqual(state.calls, [['overview'], ['overview']]);
+});
+
+test('pending GET renders recovery metadata without invoking the writer; unknown GET has no trigger', async t => {
+    const { request, signIn, state } = await mount(t, { realView: true });
+    process.env[listKey] = '[]';
+    const auth = await signIn();
+    state.pending = true;
+    const pending = await request(`${page}?lang=ru`, { auth });
+    safe(pending, 200);
+    assert.match(pending.text, /Незавершённая операция, выполняется сверка/);
+    assert.ok(pending.text.includes(`data-reconcile-url="${reconcile}"`));
+    assert.deepEqual(state.calls, [['overview']]);
+    state.overviewFailure = true;
+    const unknown = await request(`${page}?lang=ru`, { auth });
+    safe(unknown, 503);
+    assert.doesNotMatch(unknown.text, /data-reconcile-url|Незавершённая операция, выполняется сверка/);
+    assert.deepEqual(state.calls, [['overview'], ['overview']]);
+    assert.equal(state.rebuildService.mock.callCount(), 0);
+});
+
+test('reconciliation requires a guarded POST and returns only the observed public fence status', async t => {
+    const { request, postRaw, signIn, state } = await mount(t, { ingress: true });
+    process.env[listKey] = '[]';
+    const auth = await signIn();
+    const post = (options = {}) => request(reconcile, { method: 'POST', auth, json: {}, ...options });
+    state.pending = true;
+    safe(await request(reconcile, { auth }), 405);
+    safe(await post({ auth: undefined, headers: { Authorization: 'Bearer fixture-api-key' } }), 302);
+    safe(await post({ headers: { 'X-Forwarded-For': '192.0.2.1' } }), 403);
+    safe(await post({ headers: { 'X-Fixture-No-Session-ID': '1' } }), 403);
+    safe(await post({ headers: { 'X-CSRF-Token': '' } }), 403);
+    safe(await post({ headers: { Origin: 'http://foreign.invalid' } }), 403);
+    safe(await postRaw(`${reconcile}?`, auth, '{}'), 400);
+    safe(await postRaw(reconcile, auth, `{"scope":"${marker}"}`), 400);
+    safe(await postRaw(reconcile, auth, '{'), 400);
+    state.onboarded = false;
+    safe(await post(), 302);
+    state.onboarded = true;
+    state.onboardingFailure = true;
+    safe(await post(), 503);
+    state.onboardingFailure = false;
+    delete process.env[listKey];
+    safe(await post(), 409);
+    assert.deepEqual(state.calls, []);
+    assert.equal(state.rebuildService.mock.callCount(), 0);
+
+    process.env[listKey] = '[]';
+    const receipt = async (statusValue) => {
+        const response = await post();
+        safe(response, 200);
+        assert.deepEqual(JSON.parse(response.text), { executionMode: 'rebuild', status: statusValue });
+    };
+    state.fenceFailure = true;
+    safe(await post(), 503);
+    assert.deepEqual(state.calls.splice(0), [['read fence']]);
+    state.fenceFailure = false;
+    state.reconcileFailure = true;
+    await receipt('pending');
+    assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+    state.reconcileFailure = false;
+    state.loseReadback = true;
+    safe(await post(), 503);
+    assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+    state.loseReadback = state.fenceFailure = false;
+    state.settles = true;
+    await receipt('settled');
+    assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+    await receipt('settled');
+    assert.deepEqual(state.calls, [['read fence']]);
+});
+
+test('settled reconcile projects only closures proved by this POST, never a prior account identity', async t => {
+    // The stock L2TP limiter is shared across router instances on this peer.
+    panelRouter.l2tpRateLimiter.resetKey('127.0.0.1');
+    const { request, signIn, state } = await mount(t, { ingress: true });
+    process.env[listKey] = '[]';
+    const auth = await signIn();
+    const revocation = { executionMode: 'rebuild', status: 'deleted', recovered: true, sessionsTerminated: 2,
+        login: marker, relayCount: 2, privateDetail: marker };
+    for (const [overrides, settles, count] of [[{}, true, 2], [{ status: 'disabled', sessionsTerminated: 0 }, true, 0],
+        [{}, false], [{ status: 'canceled', sessionsTerminated: 0 }, true], [{ status: 'idle' }, true],
+        [{ recovered: false }, true], [{ sessionsTerminated: '2' }, true], [{ sessionsTerminated: -1 }, true]]) {
+        state.pending = true;
+        state.settles = settles;
+        state.recoveryReceipt = { ...revocation, ...overrides };
+        const response = await request(reconcile, { method: 'POST', auth, json: {} });
+        safe(response, 200);
+        assert.deepEqual(JSON.parse(response.text), { executionMode: 'rebuild', status: settles ? 'settled' : 'pending',
+            ...(count !== undefined && { sessionsTerminated: count, sessionsTerminatedScope: 'request' }) });
+        assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+    }
 });
 
 test('both reveal POSTs enforce session, onboarding, existing same-origin CSRF and allowlist, always no-store', async t => {
@@ -302,7 +414,7 @@ test('classic does not mount rebuild handlers or load the injected overview on s
     const stockStatus = await request(`/panel/nodes/${id}/l2tp/status`, { auth });
     assert.equal(stockStatus.status, 200);
     assert.equal(JSON.parse(stockStatus.text).status, 'installed');
-    for (const url of [accounts, psk]) {
+    for (const url of [accounts, psk, reconcile]) {
         assert.equal((await request(url, { method: 'POST', auth, json: {} })).status, 404);
     }
     assert.deepEqual(state.calls, []);

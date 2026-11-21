@@ -4,8 +4,10 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { mkdtempSync, rmSync } = require('node:fs');
+const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
 const { join } = require('node:path');
+const { gunzipSync } = require('node:zlib');
+const { createRelayDirect } = require('../rebuildRelayDirect');
 const { composeRebuildRelayPair } = require('../rebuildRelayInstallSteps');
 const composeRebuildRelayMain = (...args) => composeRebuildRelayPair(...args).main;
 const { composeRebuildProfiles, syntheticTunnelSettings } = require('../../modules/relay-l2tp/tests/helpers/rebuildComposerFixture');
@@ -22,6 +24,18 @@ const compose = (nodes, links, users, installed) => composeRebuildProfiles({ nod
     }] : [],
 }).find(p => p.nodeId === nodeId && p.profile === 'main').config;
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+
+function loadChapEpochLegacySource() {
+    // Frozen test data, not a runtime module. See tests/fixtures/README.md.
+    const path = join(__dirname, '../../../tests/fixtures/rebuildRelayDirectHost-chap-epoch.py.gz');
+    const size = 173197;
+    const bytes = gunzipSync(readFileSync(path), { maxOutputLength: size });
+    assert.equal(bytes.length, size, 'chap-epoch legacy fixture byte length mismatch');
+    assert.equal(sha(bytes), '687c355fe82a73c388c50aff66ba6435f34e48d2281f6a707de30ddf799cc7d0',
+        'chap-epoch legacy fixture SHA-256 mismatch');
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+}
+
 const old = JSON.stringify(compose([relay], [], [], false));
 const installed = composeRebuildRelayMain({ main: old, bridge: null }, {
     nodeId, controlPlaneAddresses: controls, carryDomain: false, tproxyPort: network.tproxyPort,
@@ -41,7 +55,7 @@ const expected = compose(...laterArgs, false);
 // Actual helper, file IO, flock, manifest, parser, and mutation sequence.
 // No subprocess can run a real systemctl, ip, nft, Xray, ss or IPsec command.
 const fixture = String.raw`
-import contextlib, copy, io, json, os, pathlib, sys, types
+import contextlib, copy, io, json, os, pathlib, shlex, sys, types
 from pathlib import Path
 source, tmp, scenario = sys.argv[1:]
 f = json.load(sys.stdin)
@@ -54,7 +68,12 @@ def no_host_dispatch(event, _):
         mock_faults.append(event)
         raise AssertionError('non-modeled host dispatch')
 sys.addaudithook(no_host_dispatch)
-exec(compile(Path(source).read_bytes(), source, 'exec'), h)
+if 'command' in f:
+    argv = shlex.split(f['command'])
+    assert argv[:-1] == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c']
+    exec(compile(argv[-1], '<DIRECT command>', 'exec'), h)
+else:
+    exec(compile(Path(source).read_bytes(), source, 'exec'), h)
 def forbidden_signal(*args):
     mock_faults.append('unexpected pidfd signal')
     raise AssertionError('unexpected pidfd signal')
@@ -130,6 +149,26 @@ for n in (X, B, XL, IKE, NET):
         RequiredBy='', BoundBy='', ConsistsOf='', PropagatesStopTo='', Conflicts='shutdown.target', ConflictedBy='',
         Wants='', BindsTo='', Upholds='', Type='simple', EnvironmentFiles='', ExecStopPost='')
 units[XL]['ExecStart'] = '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }'
+if scenario == 'chap-inspect-active':
+    fragment = Path(h['SYSTEM'], XL)
+    fragment.write_bytes(b'modeled native unit')
+    fragment.chmod(0o644)
+    h['NATIVE_XL_SHA'] = h['digest'](fragment.read_bytes())
+    units[XL].update(FragmentPath=str(fragment), ControlGroup=h['SESSION_GROUP'])
+    h['SESSION_GLOBAL'] = {}
+    h['session_binary'] = lambda path: (path, 'modeled stock binary generation')
+    h['pwd'] = types.SimpleNamespace(getpwnam=h['pwd'].getpwnam, getpwuid=lambda uid: types.SimpleNamespace(pw_dir='/root'))
+    for leaf in ('ip-pre-up.d', 'ip-up.d', 'ip-down.d'):
+        folder = root / 'etc/ppp' / leaf
+        folder.mkdir()
+        if leaf != 'ip-pre-up.d': (folder / '0000usepeerdns').touch()
+    (root / 'root').mkdir()
+    @contextlib.contextmanager
+    def session_directory(path, private=False):
+        projected = path in ('/etc/ppp', '/root') or path.startswith('/etc/ppp/')
+        with directory(str(root) + path if projected else path, private) as fd:
+            yield fd
+    h['directory'] = session_directory
 units[IKE]['ExecStart'] = '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }'
 units[X].update(ActiveState='active', SubState='running', MainPID='10', InvocationID='old-main')
 stock_units = copy.deepcopy(units)
@@ -167,7 +206,8 @@ def sc(*args):
             units[X]['RequiredBy'] = ''
     elif cmd == 'start' and rest == [XL]:
         for n, pid, sub in [(XL,'11','running'), (IKE,'12','running'), (NET,'0','exited')]:
-            units[n].update(ActiveState='active', SubState=sub, MainPID=pid, InvocationID=n + '-installed')
+            units[n].update(ActiveState='active', SubState=sub, MainPID=pid,
+                            InvocationID='1'*32 if n == XL and scenario == 'chap-inspect-active' else n + '-installed')
         policy.update(nft=True, rule=True, route=True)
     elif args == ('restart', X):
         units[X].update(MainPID=str(40 + len(changes)), InvocationID='main-' + str(len(changes)))
@@ -333,6 +373,11 @@ new_row = b'"bob" l2tpd "test-new" 10.255.1.11\n'
 foreign = b'elsewhere other "foreign # value" *\r\n# opaque \xff'
 files = dict(main=f['installed'], nft=nft, chap=(begin + old_row + end).decode(),
              lns='ip range = 10.255.1.10-10.255.1.19\n', **{k: 'secret-fixture-only' for k in ('ike','options','secrets')})
+if scenario == 'chap-inspect-active':
+    files['lns'] = ('[global]\nport = 1701\n\n[lns default]\n' + files['lns'] + 'local ip = 10.255.1.1\n'
+                    'require authentication = yes\npppoptfile = /etc/ppp/options.xl2tpd\nlength bit = yes\n')
+    files['options'] = ('auth\nrefuse-pap\nrefuse-chap\nrefuse-mschap\nrequire-mschap-v2\nrefuse-eap\nname l2tpd\n'
+                        'mtu 1400\nmru 1400\nnoipv6\nnodefaultroute\nms-dns 192.0.2.53\n')
 assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()},
     baseline=h['digest'](h['encode'](before))))['ok']
 manifest = Path(h['manifest_path'](token))
@@ -389,16 +434,17 @@ if scenario == 'wrong-machine': req['machineId'] = 'f'*32
 if scenario == 'wrong-node': req['nodeId'] = 'f'*24
 if scenario == 'missing-manifest': req['backupId'] = 'f'*32
 
-def wire(action, **kw):
+def wire(action, *, stdin=None, helper=h, **kw):
     global wire_action
     wire_action = action
     stdout, stderr = io.StringIO(), io.StringIO()
     saved = sys.stdin
     try:
-        h['CHAP_ENTERED'] = False  # one invocation per process on the host
-        sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(h['encode'](dict(req, action=action, **kw))))
+        helper['CHAP_ENTERED'] = False  # one invocation per process on the host
+        sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(
+            stdin.encode() if stdin is not None else h['encode'](dict(req, action=action, **kw))))
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = h['main']()
+            code = helper['main']()
     finally: sys.stdin = saved
     assert not mock_faults, mock_faults
     assert all(marker not in stdout.getvalue() + stderr.getvalue() for marker in (
@@ -410,6 +456,153 @@ def snapshot():
                    p.read_bytes() if p.is_file() else None) for p in root.rglob('*'))
 
 initial = snapshot()
+if scenario == 'chap-epoch':
+    # Run the exact historical helper with the same modeled system and real
+    # flock/files as the current helper. Its dispatch, manifest and CHAP code
+    # are not replaced. Verify it can write before testing its late refusal.
+    legacy = {'__name__': 'legacy_fixture'}
+    exec(compile(f['legacySource'], '<a406947 DIRECT host>', 'exec'), legacy)
+    legacy.update({k: h[k] for k in ('MAIN', 'BRIDGE', 'XRAY', 'SYSTEM', 'NET', 'DROP_DIR', 'DROP', 'NFT_DIR',
+                                     'NFT_FILE', 'VAULT', 'NAMES', 'os', 'directory', 'preflight', 'boot',
+                                     'signal', 'subprocess')})
+    params = dict(currentUsers=old_users, desiredUsers=[], revokedLogin='alice')
+    refusal = (70, '', 'DIRECT_CHAP_REFUSED\n')
+    drains = []
+    def drain(*_):
+        drains.append(True)
+        return dict(sessionsTerminated=0, complete=True)
+    h['revoke_ppp'] = legacy['revoke_ppp'] = drain
+    def ack(action, **kw):
+        code, out, err = wire(action, **kw)
+        assert (code, err) == (0, ''), (action, code, err)
+        return json.loads(out)
+    ok = dict(ok=True, backupId=token)
+    assert ack('check-chap', helper=legacy, **params) == dict(ok, changed=True)
+    assert ack('sync-chap', helper=legacy, currentUsers=old_users, desiredUsers=[]) == dict(ok, changed=True)
+    assert ack('sync-chap', currentUsers=[], desiredUsers=old_users) == dict(ok, changed=True)
+    initial = snapshot()
+    original_manifest = json.loads(manifest.read_bytes())
+    assert ack('read-chap-generation') == dict(ok, generation=None)
+    saved_legacy_sync = h['encode'](dict(req, action='sync-chap', **params)).decode()
+    saved_first_fence = h['encode'](dict(req, action='fence-chap', **params, generation=None)).decode()
+    assert wire('fence-chap', currentUsers=new_users, desiredUsers=[], generation=None) == refusal
+    assert wire('fence-chap', **params) == refusal  # no CAS preimage
+    with directory(h['SYSTEM']) as contender:
+        h['fcntl'].flock(contender, h['fcntl'].LOCK_SH | h['fcntl'].LOCK_NB)
+        assert wire('fence-chap', stdin=saved_first_fence) == (75, '', '')
+    assert snapshot() == initial and not changes and not drains
+    manifest_name = str(manifest.relative_to(root))
+    file_rows = lambda: [row for row in snapshot() if row[-1] is not None and row[0] != manifest_name]
+    untouched = file_rows()
+    assert ack('fence-chap', stdin=saved_first_fence) == dict(ok, fenced=True)
+    first = ack('check-chap', **params)['generation']
+    assert len(first) == 32
+    assert json.loads(manifest.read_bytes()) == dict(original_manifest, phase='installed-chap-v2:' + first)
+    retired = snapshot()
+    # Recovery sees the original CHAP and can cancel. The older encoded
+    # helper with a still-valid CHAP preimage cannot write or reach PPP.
+    assert ack('inspect-chap', currentUsers=old_users, desiredUsers=[]) == dict(
+        ok, projection='original', activeTargetSessions=0, generation=first)
+    assert wire('sync-chap', helper=legacy, stdin=saved_legacy_sync) == refusal
+    assert wire('sync-chap', stdin=saved_legacy_sync) == refusal
+    assert wire('fence-chap', stdin=saved_first_fence) == refusal
+    assert snapshot() == retired and file_rows() == untouched and not changes and not drains
+    stale_sync = h['encode'](dict(req, action='sync-chap', **params, generation=first)).decode()
+    second_fence = h['encode'](dict(req, action='fence-chap', **params, generation=first)).decode()
+    assert ack('fence-chap', stdin=second_fence) == dict(ok, fenced=True)
+    second = ack('read-chap-generation')['generation']
+    assert len(second) == 32 and first != second
+    assert json.loads(manifest.read_bytes()) == dict(original_manifest, phase='installed-chap-v2:' + second)
+    retired = snapshot()
+    assert wire('sync-chap', stdin=stale_sync) == refusal
+    assert wire('fence-chap', stdin=second_fence) == refusal
+    assert snapshot() == retired and file_rows() == untouched and not changes and not drains
+    assert ack('sync-chap', **params, generation=ack('check-chap', **params)['generation']) == dict(
+        ok, changed=True, sessionsTerminated=0, complete=True)
+    assert drains == [True] and not changes
+    # The managed block is now desired; a new fence still rotates without
+    # changing CHAP. The prior epoch cannot drain even on a no-op.
+    untouched = file_rows()
+    assert ack('fence-chap', **params, generation=second) == dict(ok, fenced=True)
+    post_fence = snapshot()
+    blocked = [dict(old_users[0], enabled=False)]
+    assert wire('sync-chap', **{**params, 'currentUsers': blocked}, generation=second) == refusal
+    assert snapshot() == post_fence and file_rows() == untouched and drains == [True]
+    apply = {k: req[k] for k in ('machineId', 'backupId', 'network')}
+    def apply_ack(action, **kw):
+        return ack(action, stdin=h['encode'](dict(apply, action=action, **kw)).decode())
+    proof = apply_ack('check-apply-network')['proof']
+    assert apply_ack('prepare-apply-network')['proof'] == proof
+    assert apply_ack('verify-apply-network', proof=proof)['proof'] == proof
+    req['currentUsers'] = []
+    h['collect_session_census'] = lambda _: dict(activeSessions=0, census='e'*64)
+    count = ack('session-count')
+    assert count['activeSessions'] == count['activeIpsec'] == 0 and len(count['census']) == 64
+    manifest_saved = manifest.read_bytes(), manifest.stat().st_ino
+    initial = snapshot()
+if scenario == 'chap-inspect-active':
+    observation = f['observation']
+    if observation != 'create':
+        target_row = old_row if observation not in ('desired', 'desired-idle') else b''
+        neighbor = new_row.replace(b'test-new', b'wrong-password') if observation == 'mixed' else new_row
+        chap.write_bytes(stock_chap + begin + target_row + neighbor + end + foreign)
+    if observation == 'failed':
+        units[XL].update(ActiveState='failed', SubState='failed', MainPID='0')
+    if observation == 'fenced-original':
+        params = {k: v for k, v in json.loads(f['stdin']).items() if k in ('currentUsers', 'desiredUsers', 'revokedLogin')}
+        code, stdout, stderr = wire('fence-chap', generation=None, **params)
+        assert (code, json.loads(stdout), stderr) == (0, dict(ok=True, backupId=token, fenced=True), '')
+    before_inspect = snapshot()
+    samples = identity_reads = 0
+    calls = {pid: ((1, pid, 2, pid), '10.255.1.1', peer, pid, pid + 10, pid + 20, pid + 30, [1,pid,2])
+             for pid, peer in [(501, '10.255.1.10'), (502, '10.255.1.11'), (503, '10.255.1.10')]}
+
+    # Model native PPP objects and pppd state only at the reader seams.
+    @contextlib.contextmanager
+    def view(owner):
+        assert observation not in ('create', 'failed', 'mixed', 'exclusive-held')
+        assert owner[1:3] == ('1'*32, 11)
+        def sample():
+            global samples
+            samples += 1
+            pids = (502,) if observation == 'desired-idle' else (501, 502, 503)
+            start = 100 if observation != 'session-drift' or samples == 1 else 101
+            return start, [calls[pid] for pid in pids]
+        def watch():
+            if observation == 'watch-drift':
+                raise Refusal(h['SESSION_UNKNOWN'])
+        yield sample, forbidden_signal, watch
+
+    def peer_logins(rows, users):
+        global identity_reads, before_inspect
+        assert users == {'alice': '10.255.1.10', 'bob': '10.255.1.11'}
+        identity_reads += 1
+        if observation == 'identity-drift' and identity_reads == 2:
+            raise Refusal(h['SESSION_UNKNOWN'])
+        if (observation, identity_reads) in (('file-drift', 1), ('manifest-drift', 2)):
+            # External same-byte inode replacement during the observation.
+            assert snapshot() == before_inspect
+            victim = chap if observation == 'file-drift' else manifest
+            replacement = victim.with_suffix('.replacement')
+            replacement.write_bytes(victim.read_bytes())
+            replacement.replace(victim)
+            before_inspect = snapshot()
+        return {call[3]: 'bob' if call[3] == 502 else 'alice' for call in rows}
+
+    h.update(revoke_ppp_view=view, revoke_peer_logins=peer_logins)
+    with directory(h['SYSTEM']) as contender:
+        h['fcntl'].flock(contender, (h['fcntl'].LOCK_EX if observation == 'exclusive-held' else h['fcntl'].LOCK_SH)
+                         | h['fcntl'].LOCK_NB)
+        result = wire('inspect-chap', stdin=f['stdin'])
+    assert snapshot() == before_inspect and not changes and not intent.exists()
+    if observation in ('original', 'fenced-original', 'desired', 'desired-idle', 'identity-drift', 'file-drift', 'manifest-drift', 'watch-drift'):
+        assert samples >= 2 and identity_reads >= 2, 'did not sample PPP identities under the host frame'
+    elif observation == 'session-drift':
+        assert samples >= 2 and identity_reads >= 1, 'did not reach the changing session observations'
+    else:
+        assert not samples and not identity_reads
+    print(json.dumps(result))
+    sys.exit(0)
 if scenario.startswith('chap-sync-'):
     chap.write_bytes(stock_chap + begin + old_row + end + foreign)
     params = dict(currentUsers=old_users, desiredUsers=new_users)
@@ -420,11 +613,14 @@ if scenario.startswith('chap-sync-'):
         assert code == 0 and not stderr and json.loads(stdout) == payload, (code, stderr)
     initial = snapshot()
     expect('check-chap', changed, **params)
+    expect('inspect-chap', dict(ok=True, backupId=token, projection='original', activeTargetSessions=0), **params)
     assert snapshot() == initial and not changes
     if scenario == 'chap-sync-drift':
         # A file looking exactly like DESIRED does not authorize replay.
         chap.write_bytes(stock_chap + begin + new_row + end + foreign)
         pre = snapshot()
+        expect('inspect-chap', dict(ok=True, backupId=token, projection='desired', activeTargetSessions=0), **params)
+        assert wire('check-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n')
         assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n')
         assert snapshot() == pre and not changes
     elif scenario == 'chap-sync-guards':
@@ -448,6 +644,7 @@ if scenario.startswith('chap-sync-'):
             pre = snapshot()
             assert wire('check-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
             assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
+            assert wire('inspect-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
             assert snapshot() == pre and not changes, label
         chap.write_bytes(stock_chap + begin + old_row + end + foreign)
         chap.chmod(0o644)
@@ -521,6 +718,7 @@ if scenario.startswith('chap-sync-'):
         assert other_files() == other_before
         # New no-op cannot toggle disabled rows on disk or replace the inode.
         initial = snapshot()
+        expect('inspect-chap', dict(ok=True, backupId=token, projection='desired', activeTargetSessions=0), **params)
         expect('sync-chap', no_change, currentUsers=new_users, desiredUsers=new_users[:1])
         assert snapshot() == initial
         assert wire('prepare-remove') == (70, '', 'DIRECT_ROLLBACK_DRIFT\n')  # changed block, no DB projection
@@ -635,6 +833,12 @@ else:
 
         revoke = dict(currentUsers=new_users, desiredUsers=new_users, revokedLogin='disabled')
         for stray_pppd in (False, True):
+            code, stdout, stderr = wire('inspect-chap', **revoke)
+            if stray_pppd:
+                assert (code, stdout, stderr) == (70, '', 'DIRECT_CHAP_REFUSED\n')
+            else:
+                assert (code, stderr) == (0, ''), (code, stderr)
+                assert json.loads(stdout) == dict(ok=True, backupId=token, projection='both', activeTargetSessions=0)
             code, stdout, stderr = wire('sync-chap', **revoke)
             assert (code, stderr) == (0, ''), (code, stderr)
             assert json.loads(stdout) == dict(ok=True, backupId=token, changed=False, sessionsTerminated=0,
@@ -705,7 +909,7 @@ else:
 print('ok')
 `;
 
-for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation',
+for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation', 'chap-epoch',
     'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown', 'chap-sync-revoke',
     'chap-unterminated-clean', 'chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix', 'chap-unterminated-separated',
     'chap-terminated-suffix',
@@ -734,10 +938,76 @@ for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-m
                 nodeId, controlPlaneAddresses: controls, carryDomain: false, tproxyPort: network.tproxyPort,
                 mainSha256: sha(main), bridgeSha256: null,
             });
+            const legacySource = scenario === 'chap-epoch' ? loadChapEpochLegacySource() : undefined;
             const result = spawnSync('python3', ['-I', '-B', '-c', fixture, join(__dirname, '../rebuildRelayDirectHost.py'), dir, scenario],
-                { input: JSON.stringify({ old: main, installed: withUdp, applied, expected, network, backupId, nodeId, machineId }), encoding: 'utf8', timeout: 10000 });
+                { input: JSON.stringify({ old: main, installed: withUdp, applied, expected, network, backupId, nodeId, machineId, legacySource }), encoding: 'utf8', timeout: 10000 });
             assert.equal(result.status, 0, result.stderr || result.error?.message);
             assert.equal(result.stdout, 'ok\n');
         } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 }
+
+test('inspectChap uses a full pinned transport and host frame without writes or signals', async t => {
+    const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: nodeId,
+        C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, C3_REBUILD_L2TP_SSH_SHA256: 'd'.repeat(64) };
+    const node = { _id: nodeId, ip: relay.ip, ssh: { port: 22, username: 'root' } };
+    const alice = { login: 'alice', password: 'test-old', ipAddress: '10.255.1.10', enabled: true };
+    const bob = { login: 'bob', password: 'test-new', ipAddress: '10.255.1.11', enabled: true };
+    const installation = { nodeId, backupId, network };
+    for (const [observation, projection, activeTargetSessions] of [
+        ['original', 'original', 2], ['fenced-original', 'original', 2], ['desired', 'desired', 2],
+        ['desired-idle', 'desired', 0], ['create', 'original', 0],
+        ['failed'], ['mixed'], ['session-drift'], ['identity-drift'], ['file-drift'], ['manifest-drift'], ['watch-drift'],
+        ['exclusive-held'],
+    ]) {
+        await t.test(observation, async () => {
+            const create = observation === 'create';
+            const currentUsers = create ? [alice] : [alice, bob], desiredUsers = create ? [alice, bob] : [bob];
+            const revokedLogin = create ? undefined : 'alice';
+            const guards = [];
+            let calls = 0;
+            let fixtureFailure;
+            class SSH {
+                constructor(selected, options) {
+                    assert.equal(selected, node);
+                    assert.deepEqual(options, { expectedEndpoint: { ip: node.ip, ...node.ssh }, expectedHostKeySha256: 'd'.repeat(64) });
+                }
+                connect() { assert.equal(this.usePool, false); }
+                disconnect() {}
+                exec(command, { stdin }) {
+                    ++calls;
+                    const dir = mkdtempSync(join(process.cwd(), '.direct-inspect-fixture-'));
+                    try {
+                        assert.ok(!command.includes(alice.password) && !command.includes(bob.password));
+                        assert.deepEqual(JSON.parse(stdin), { action: 'inspect-chap', machineId, ...installation,
+                            currentUsers, desiredUsers, ...(revokedLogin && { revokedLogin }) });
+                        const result = spawnSync('/usr/bin/python3', ['-I', '-B', '-c', fixture,
+                            join(__dirname, '../rebuildRelayDirectHost.py'), dir, 'chap-inspect-active'], {
+                            input: JSON.stringify({ old, installed, network, backupId, nodeId, machineId, observation, command, stdin }),
+                            encoding: 'utf8', timeout: 10000, env: {},
+                        });
+                        assert.equal(result.status, 0, result.stderr || result.error?.message);
+                        const [code, stdout, stderr] = JSON.parse(result.stdout);
+                        return { code, stdout, stderr };
+                    } catch (error) { fixtureFailure = error; throw error; }
+                    finally { rmSync(dir, { recursive: true, force: true }); }
+                }
+            }
+            const remote = createRelayDirect({ node, env, SSH });
+            try {
+                const result = remote.inspectChap(installation, currentUsers, desiredUsers, () => { guards.push(calls); }, revokedLogin);
+                if (projection) {
+                    assert.deepEqual(await result, { projection, activeTargetSessions });
+                    assert.deepEqual(guards, [0, 1]);
+                } else {
+                    await assert.rejects(result, { code: observation === 'exclusive-held'
+                        ? 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_DIRECT_CHAP_REFUSED' });
+                }
+                assert.equal(calls, 1);
+            } finally {
+                await remote.close();
+                if (fixtureFailure) throw fixtureFailure;
+            }
+        });
+    }
+});

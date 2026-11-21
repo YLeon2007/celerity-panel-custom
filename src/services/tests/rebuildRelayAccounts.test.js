@@ -19,6 +19,9 @@ const neighborCipher = encrypt('fixture-neighbor', key);
 const ip = (i, end) => `10.255.${16 + i}.${end}`;
 const code = suffix => ({ code: `REBUILD_L2TP_ACCOUNTS_${suffix}` });
 const order = rows => [...rows].sort((a, b) => a.login.localeCompare(b.login));
+const sameStoredRow = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const reads = [`inspect:${A}`, `inspect:${B}`];
+const fencePass = [...reads, `fence:${A}`, `fence:${B}`, ...reads];
 
 function fixture({ shared = false, single = false, legacy = false, disabled = false, other = false, fault = () => {} } = {}) {
     const ids = single ? [A] : [A, B];
@@ -48,30 +51,56 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
         C3_REBUILD_L2TP_SSH_SHA256: operatorList[0].sshHostKeySha256,
         ...(!legacy && { C3_REBUILD_L2TP_RELAYS_JSON: JSON.stringify(operatorList) }) };
     const events = [];
-    let pending, held = false;
+    let pending, held = false, inTransaction = false, directory;
     const sessions = Object.fromEntries(ids.map((id, i) => [id, [bootstrap, ...(other ? [neighbor] : []),
         ...(shared ? Array(i + 1).fill(credentials.login) : [])]]));
-    const f = { rows, users, hosts, sessions, events, env, get pending() { return pending; } };
-    const step = (name, id) => { assert.equal(held, true); events.push(id ? `${name}:${id}` : name); return fault(name, id, f); };
+    const f = { rows, users, hosts, sessions, events, env, get pending() { return pending; },
+        set pending(value) { pending = value; }, get directory() { return directory; }, set directory(value) { directory = value; } };
+    const step = (name, id) => {
+        assert.equal(held, true);
+        if (id) assert.equal(inTransaction, false, 'no resolver or DIRECT I/O in the transaction');
+        events.push(id ? `${name}:${id}` : name);
+        return fault(name, id, f);
+    };
+    const compareInTransaction = async check => {
+        inTransaction = true;
+        try { await check({}); } finally { inTransaction = false; }
+    };
     const store = {
         async assertNoPending() { step('gate'); if (pending) throw accountError('BLOCKED'); },
+        async pending() { await step('pending'); return pending === undefined ? null : structuredClone(pending); },
         async states() { step('inventory'); return structuredClone(rows.map(r => r.state).reverse()); },
         async inventory(ids, login) {
             step('read');
             return structuredClone({ nodes: rows.map(r => r.node),
-                users: users.filter(u => ids.includes(u.relayNode) || u.login === login) });
+                users: users.filter(u => ids.includes(u.relayNode) || u.login === login), directory });
         },
-        async begin(intent) { step('intent'); assert.equal(pending, undefined); pending = structuredClone(intent); await step('intent-ack'); },
-        async verifyIntent(intentId) { step('own'); assert.equal(intentId, pending.intentId); },
-        async publish({ intentId, action, changes, recheck, verifyAuthority }) {
-            step('publish'); await recheck();
+        async begin(intent) { step('intent'); assert.equal(pending, undefined);
+            pending = { _id: 'pending', ...structuredClone(intent) }; await step('intent-ack'); },
+        async verifyIntent(intentId, expected) {
+            step('own');
+            if (intentId !== pending?.intentId || (expected && !sameStoredRow(expected, pending))) throw accountError('CHANGED');
+        },
+        async cancel({ intent, recheck, verifyAuthority }) {
+            step('cancel'); await compareInTransaction(recheck); await verifyAuthority();
+            if (!sameStoredRow(intent, pending)) throw accountError('CHANGED');
+            pending = undefined;
+            step('cancel-ack');
+        },
+        async publish({ intentId, intent, action, changes, recheck, verifyAuthority }) {
+            step('publish'); await compareInTransaction(recheck);
             assert.equal(intentId, pending.intentId);
             await verifyAuthority();
             step('settle');
+            if (intent && !sameStoredRow(intent, pending)) throw accountError('CHANGED');
             for (const { before, after } of changes) {
                 if (action === 'create') users.push({ _id: `${after.relayNode}:${after.login}`, ...after });
                 else if (action === 'delete') users.splice(users.findIndex(u => u._id === before._id), 1);
                 else Object.assign(users.find(u => u._id === before._id), after);
+            }
+            if (directory) {
+                directory.accounts = users.filter(u => u.relayNode === A).map(u => ({ id: u._id, login: u.login,
+                    enabled: u.enabled, passwordEncrypted: u.passwordEncrypted }));
             }
             pending = undefined;
             step('publish-ack');
@@ -94,27 +123,46 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
             const check = (install, current) => {
                 assert.equal(install.nodeId, id);
                 assert.deepEqual(Object.keys(install.network).sort(), ['clientCidr', 'fwmark', 'routeTable', 'tproxyPort']);
-                assert.deepEqual(order(current), order(hosts[id]));
+                assert.equal(changed(current, hosts[id]), false, 'must pass observed CHAP preimage');
             };
             return {
                 async checkChap(install, current, desired, verifyLock, revokedLogin) {
                     await verifyLock(); check(install, current);
                     assert.ok(Array.isArray(desired));
-                    if (revokedLogin !== undefined) assert.equal(revokedLogin, credentials.login);
+                    if (revokedLogin !== undefined) assert.ok(current.some(u => u.login === revokedLogin));
                     return step('check', id) ?? { changed: changed(current, desired) };
                 },
+                async inspectChap(install, current, desired, verifyLock, revokedLogin) {
+                    await verifyLock();
+                    assert.equal(install.nodeId, id);
+                    const override = step('inspect', id);
+                    const original = !changed(current, hosts[id]), target = !changed(desired, hosts[id]);
+                    if (!original && !target) throw Error('unclassified CHAP');
+                    if (sessions[id].some(login => !current.some(u => u.login === login)
+                        && !desired.some(u => u.login === login))) throw Error('unclassified session');
+                    return override ?? { projection: original && target ? 'both' : original ? 'original' : 'desired',
+                        activeTargetSessions: sessions[id].filter(login => login === revokedLogin).length };
+                },
                 async syncChap(install, current, desired, verifyLock, revokedLogin) {
+                    await step('before-sync-guard', id);
                     await verifyLock(); check(install, current);
                     assert.ok(pending);
+                    if (revokedLogin) assert.ok(current.find(u => u.login === revokedLogin)?.ipAddress, 'target IP must be known');
                     const result = step('sync', id);
                     if (result === undefined) hosts[id] = structuredClone(desired);
                     if (result !== undefined) return result;
-                    if (pending.action === 'create') return { changed: true };
-                    assert.equal(revokedLogin, credentials.login);
+                    if (pending.action === 'create') return { changed: changed(current, desired) };
                     assert.ok(!hosts[id].some(u => u.login === revokedLogin && u.enabled), 'block CHAP before terminating');
                     const sessionsTerminated = sessions[id].filter(login => login === revokedLogin).length;
                     sessions[id] = sessions[id].filter(login => login !== revokedLogin);
                     return { changed: changed(current, desired), sessionsTerminated, complete: true };
+                },
+                async fenceChap(install, current, desired, verifyLock, revokedLogin) {
+                    await verifyLock();
+                    assert.equal(install.nodeId, id);
+                    assert.ok(Array.isArray(current) && Array.isArray(desired));
+                    assert.equal(revokedLogin, pending.action === 'create' ? undefined : pending.login);
+                    return (await step('fence', id)) ?? { fenced: true };
                 },
                 async close() { step('close', id); },
             };
@@ -122,6 +170,7 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
     };
     f.service = createRebuildRelayAccounts(deps);
     f.restart = () => createRebuildRelayAccounts(deps);
+    f.deps = deps;
     return f;
 }
 
@@ -232,7 +281,7 @@ test('preflight refusal on B leaves both hosts and persistence unchanged', async
     assert.ok([A, B].every(id => f.events.includes(`close:${id}`)));
 });
 
-test('timeout on B after A: leaves durable intent, no DB publication or rollback, refuses fresh caller', async () => {
+test('timeout on B after A: no DB publication or rollback until a fresh observation can settle it', async () => {
     const f = fixture({ fault(step, id) {
         if (step === 'sync' && id === B) throw new Error('simulated lost acknowledgement');
         if (step === 'close' && id === A) throw new Error('simulated disposal error');
@@ -250,9 +299,9 @@ test('timeout on B after A: leaves durable intent, no DB publication or rollback
     assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`]);
     assert.ok(f.events.includes(`close:${B}`));
     const end = f.events.length;
-    await assert.rejects(f.restart().delete({ login: 'other' }), code('BLOCKED'));
-    assert.deepEqual(f.events.slice(end), ['lock', 'gate']);
-    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`]);
+    await assert.rejects(f.restart().delete({ login: 'other' }), { ...code('OUTCOME_UNKNOWN'), uncertainNodeId: B });
+    assert.deepEqual(recoveryEffects({ events: f.events.slice(end) }), [...fencePass, `sync:${B}`]);
+    assert.ok(f.pending);
 });
 
 test('missing installed relays refuses without write or DIRECT', async () => {
@@ -311,12 +360,14 @@ for (const mismatch of ['missing', 'duplicate', 'ciphertext', 'enabled']) {
     });
 }
 
-test('intent acknowledgement loss never dispatches, a committed intent still blocks', async () => {
+test('intent acknowledgement loss never dispatches, a later all-original observation can cancel it', async () => {
     const f = fixture({ fault(step) { if (step === 'intent-ack') throw Error('ack lost'); } });
     await assert.rejects(f.service.create(credentials), { ...code('INTENT_UNKNOWN'), retryAllowed: false });
     assert.ok(f.pending);
     assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent']);
-    await assert.rejects(f.restart().create(credentials), code('BLOCKED'));
+    assert.equal((await f.restart().create(credentials)).status, 'canceled');
+    assert.equal(f.pending, undefined);
+    assert.deepEqual(recoveryEffects(f), [`check:${A}`, `check:${B}`, 'intent', ...fencePass, 'cancel']);
 });
 
 test('visible intent is not permission to dispatch before its commit acknowledgement', async () => {
@@ -333,13 +384,61 @@ test('visible intent is not permission to dispatch before its commit acknowledge
     assert.deepEqual(effects(f).filter(e => e.startsWith('sync:')), [`sync:${A}`, `sync:${B}`]);
 });
 
+for (const [name, change] of [
+    ['missing row', f => { f.pending = undefined; }],
+    ['different owner', f => { f.pending.intentId = 'aaaaaaaa-bbbb-4ccc-8ddd-fffffffffffe'; }],
+    ['same-owner added field', f => { f.pending.extra = true; }],
+    ['nested change under the same owner', f => { f.pending.relays[1].network.routeTable++; }],
+    ['read failure', () => { throw Error('fixture pending readback unavailable'); }],
+]) {
+    test(`fresh intent readback refuses ${name} before sync or publication`, async () => {
+        const f = fixture({ fault(step, _, state) { if (step === 'pending' && state.pending) change(state); } });
+        const original = structuredClone(f.hosts);
+        await assert.rejects(f.service.create(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false, confirmedNodeIds: [] });
+        assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent']);
+        assert.deepEqual(f.hosts, original);
+    });
+}
+
+test('fresh intent accepts reordered content but uses the stored order for authority and settlement', async () => {
+    const reverseFields = row => Object.fromEntries(Object.entries(row).reverse());
+    const f = fixture({ fault(step, _, state) {
+        if (step === 'intent-ack') state.pending = reverseFields({ ...state.pending, relays: state.pending.relays.map(relay =>
+            reverseFields({ ...relay, network: reverseFields(relay.network) })) });
+    } });
+    assert.equal((await f.service.create(credentials)).status, 'created');
+    assert.deepEqual(f.events.filter(step => ['pending', 'intent', `sync:${A}`].includes(step)),
+        ['pending', 'intent', 'pending', `sync:${A}`]);
+});
+
+test('fresh authority rejects same-owner drift at B transport guard after A', async () => {
+    const f = fixture({ fault(step, id, state) {
+        if (step === 'before-sync-guard' && id === B) state.pending.createdAt = new Date(0);
+    } });
+    await assert.rejects(f.service.create(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false,
+        confirmedNodeIds: [A], uncertainNodeId: B });
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`]);
+    assert.equal(f.pending.createdAt.getTime(), 0);
+});
+
+test('fresh publication cannot settle same-owner drift after the last authority check', async () => {
+    const f = fixture({ fault(step, _, state) { if (step === 'settle') state.pending.extra = true; } });
+    const original = structuredClone(f.users);
+    await assert.rejects(f.service.create(credentials), { ...code('FINISH_UNKNOWN'), retryAllowed: false, confirmedNodeIds: [A, B] });
+    assert.equal(f.pending.extra, true);
+    assert.deepEqual(f.users, original);
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'settle']);
+});
+
 test('publication CAS loss retains the intent and never publishes or rolls back hosts', async () => {
     const f = fixture({ fault(step) { if (step === 'settle') throw Error('settlement conflict'); } });
     await assert.rejects(f.service.create(credentials), { ...code('FINISH_UNKNOWN'), retryAllowed: false, confirmedNodeIds: [A, B] });
     assert.ok(f.pending);
     assert.deepEqual(f.users.map(u => u.login), [bootstrap, bootstrap]);
-    await assert.rejects(f.restart().create(credentials), code('BLOCKED'));
-    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'settle']);
+    f.events.length = 0;
+    await assert.rejects(f.restart().create(credentials), code('FINISH_UNKNOWN'));
+    assert.deepEqual(recoveryEffects(f), [...fencePass, ...reads, 'publish']);
+    assert.ok(f.pending);
 });
 
 test('lost publication acknowledgement remains unknown after atomic settlement and never replays', async () => {
@@ -356,4 +455,323 @@ test('ordinary guard rejects strict flags before resolving any binding', async (
     f.env.L2TP_EXECUTION_ENABLED = 'true';
     await assert.rejects(f.service.create(credentials), code('DISABLED'));
     assert.deepEqual(f.events, []);
+});
+
+// The released intent had no progress journal, desired inventory, or count.
+function releasedIntent(f, action) {
+    return { _id: 'pending', intentId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', action, login: credentials.login,
+        createdAt: new Date(0), ...(action === 'create' && { passwordEncrypted: sharedCipher }),
+        relays: f.rows.map(({ node, state }, i) => ({
+            ...resolveRelayBinding(f.env, node._id, node), backupId: state.backupId,
+            network: { clientCidr: state.clientCidr, tproxyPort: state.tproxyPort, fwmark: state.fwmark, routeTable: state.routeTable },
+            ip: ip(i, 11), revision: action === 'create' ? 0 : 1,
+        })) };
+}
+
+const recoveryEffects = f => f.events.filter(x => /^(inspect:|fence:|check:|sync:|cancel$|intent$|publish$)/.test(x));
+
+test('no pending intent is a no-op, not an inventory or host sweep', async () => {
+    const f = fixture();
+    f.rows.length = 0;
+    assert.deepEqual(await f.service.reconcile(), { executionMode: 'rebuild', status: 'idle' });
+    assert.deepEqual(recoveryEffects(f), []);
+});
+
+test('all-original legacy revocation cancels just the intent, without signaling or touching the directory', async () => {
+    const f = fixture({ shared: true, other: true });
+    f.pending = releasedIntent(f, 'disable');
+    f.directory = { generation: 'original', accounts: f.users.filter(u => u.relayNode === A) };
+    const original = structuredClone([f.users, f.directory, f.hosts, f.sessions]);
+    const result = await f.service.disable(credentials);
+    assert.deepEqual(result, { executionMode: 'rebuild', status: 'canceled', login: credentials.login,
+        relayCount: 2, sessionsTerminated: 0, recovered: true });
+    assert.deepEqual([f.users, f.directory, f.hosts, f.sessions], original);
+    assert.equal(f.pending, undefined);
+    assert.deepEqual(recoveryEffects(f), [...fencePass, 'cancel']);
+});
+
+test('late B writer between first inspection and fence makes recovery converge instead of cancel', async () => {
+    const f = fixture({ shared: true, other: true, fault(step, id, state) {
+        if (step === 'fence' && id === B) {
+            // The old writer won the host lock before B rotated its fence;
+            // its CHAP change and PPP closures are not this caller's receipts.
+            blockedHost(state, B);
+            state.sessions[B] = [bootstrap, neighbor];
+        }
+    } });
+    f.pending = releasedIntent(f, 'delete');
+    assert.deepEqual(await f.service.reconcile(), { executionMode: 'rebuild', status: 'deleted', login: credentials.login,
+        relayCount: 2, sessionsTerminated: 1, recovered: true });
+    assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${A}`, ...reads, 'publish']);
+    assert.equal(f.pending, undefined);
+    assert.deepEqual(f.sessions, { [A]: [bootstrap, neighbor], [B]: [bootstrap, neighbor] });
+});
+
+for (const [name, response] of [
+    ['lost acknowledgement', () => { throw Error('fence reply lost'); }],
+    ['non-boolean acknowledgement', () => ({ fenced: 1 })],
+    ['augmented acknowledgement', () => ({ fenced: true, changed: false })],
+]) {
+    test(`B fence ${name} permits neither cancellation nor convergence`, async () => {
+        for (const mixed of [false, true]) {
+            const f = fixture({ shared: true, fault(step, id) { if (step === 'fence' && id === B) return response(); } });
+            f.pending = releasedIntent(f, 'delete');
+            if (mixed) blockedHost(f, A);
+            const before = structuredClone([f.pending, f.users, f.hosts, f.sessions]);
+            await assert.rejects(f.service.reconcile(), { ...code('BLOCKED'), retryAllowed: false, confirmedNodeIds: [],
+                confirmedSessionsTerminated: 0 });
+            assert.deepEqual(recoveryEffects(f), [...reads, `fence:${A}`, `fence:${B}`]);
+            assert.deepEqual([f.pending, f.users, f.hosts, f.sessions], before);
+            assert.ok([A, B].every(id => f.events.includes(`close:${id}`)));
+        }
+    });
+}
+
+test('unknown second classification retains the intent even when A needs convergence', async () => {
+    const f = fixture({ shared: true, fault(step, id, state) {
+        if (step === 'fence' && id === B) state.sessions[B] = ['unclassified'];
+    } });
+    f.pending = releasedIntent(f, 'delete');
+    blockedHost(f, A);
+    const before = structuredClone(f.pending);
+    await assert.rejects(f.service.reconcile(), { ...code('BLOCKED'), retryAllowed: false, confirmedSessionsTerminated: 0 });
+    assert.deepEqual(f.pending, before);
+    assert.deepEqual(recoveryEffects(f), fencePass);
+});
+
+test('mixed create after a crashed writer uses the exact escrow and mutates only the original relay', async () => {
+    let crash = true;
+    const f = fixture({ fault(step, id) {
+        if (step === 'sync' && id === B && crash) throw Error('lost reply');
+    } });
+    await assert.rejects(f.service.create(credentials), code('OUTCOME_UNKNOWN'));
+    const escrow = f.pending.passwordEncrypted;
+    crash = false;
+    f.events.length = 0;
+    assert.deepEqual(await f.restart().create(credentials), { executionMode: 'rebuild', status: 'created',
+        login: credentials.login, relayCount: 2, recovered: true });
+    assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${B}`, ...reads, 'publish']);
+    assert.ok(f.users.filter(u => u.login === credentials.login).every(u => u.passwordEncrypted === escrow));
+    assert.equal(f.pending, undefined);
+});
+
+test('desired delete drains surviving target PPP with the original IP, not known neighboring sessions', async () => {
+    const f = fixture({ shared: true, other: true });
+    f.pending = releasedIntent(f, 'delete');
+    for (const id of [A, B]) f.hosts[id] = f.hosts[id].filter(u => u.login !== credentials.login);
+    f.sessions[A] = [bootstrap, neighbor]; // historical closure was never acknowledged to this caller
+    assert.deepEqual(await f.service.reconcile(), { executionMode: 'rebuild', status: 'deleted',
+        login: credentials.login, relayCount: 2, sessionsTerminated: 2, recovered: true });
+    assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${B}`, ...reads, 'publish']);
+    assert.deepEqual(f.sessions, { [A]: [bootstrap, neighbor], [B]: [bootstrap, neighbor] });
+    assert.equal(f.users.some(u => u.login === credentials.login), false);
+});
+
+for (const action of ['disable', 'delete']) {
+    test(`both projections: ${action} of disabled account still settles live PPP`, async () => {
+        const f = fixture({ shared: true, disabled: true });
+        f.pending = releasedIntent(f, action);
+        assert.equal((await f.restart()[action](credentials)).sessionsTerminated, 3);
+        assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${A}`, `sync:${B}`, ...reads, 'publish']);
+        assert.deepEqual(f.sessions, { [A]: [bootstrap], [B]: [bootstrap] });
+        assert.deepEqual(f.users.filter(u => u.login === credentials.login).map(u => u.desiredRevision), action === 'disable' ? [1, 1] : []);
+    });
+}
+
+const blockedHost = (f, id) => {
+    f.hosts[id] = f.hosts[id].filter(u => u.login !== credentials.login);
+};
+
+test('foreign session alone on B blocks a mixed cohort before writing A', async () => {
+    const f = fixture({ shared: true });
+    f.pending = releasedIntent(f, 'delete');
+    blockedHost(f, B);
+    f.sessions[B] = ['unclassified'];
+    await assert.rejects(f.service.reconcile(), { ...code('BLOCKED'), retryAllowed: false });
+    assert.ok(f.pending);
+    assert.deepEqual(recoveryEffects(f), [`inspect:${A}`, `inspect:${B}`]);
+});
+
+test('fully desired revocation with only other managed sessions acknowledges zero closures', async () => {
+    const f = fixture({ shared: true, other: true });
+    f.pending = releasedIntent(f, 'delete');
+    for (const id of [A, B]) {
+        blockedHost(f, id);
+        f.sessions[id] = [neighbor];
+    }
+    assert.equal((await f.service.reconcile()).sessionsTerminated, 0);
+    assert.deepEqual(recoveryEffects(f), [...fencePass, ...reads, 'publish']);
+    assert.deepEqual(f.sessions, { [A]: [neighbor], [B]: [neighbor] });
+});
+
+test('mixed revocation checks the observed host preimage again at write time', async () => {
+    const f = fixture({ shared: true, fault(step, id, state) {
+        if (step === 'inspect' && id === B && state.events.includes(`fence:${B}`)) state.hosts[A] = [];
+    } });
+    f.pending = releasedIntent(f, 'delete');
+    blockedHost(f, B);
+    await assert.rejects(f.service.reconcile(), { ...code('OUTCOME_UNKNOWN'), uncertainNodeId: A, confirmedSessionsTerminated: 0 });
+    assert.deepEqual(recoveryEffects(f), fencePass);
+    assert.ok(f.pending);
+});
+
+test('checked partial remains pending, and a different classified relay can still settle', async () => {
+    const f = fixture({ shared: true, fault(step, id) {
+        if (step === 'sync' && id === A) return { changed: false, complete: false, sessionsTerminated: 0 };
+    } });
+    f.pending = releasedIntent(f, 'delete');
+    blockedHost(f, A);
+    await assert.rejects(f.service.reconcile(), { ...code('OUTCOME_UNKNOWN'), uncertainNodeId: A,
+        retryAllowed: false, confirmedSessionsTerminated: 2, confirmedNodeIds: [B] });
+    assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${A}`, `sync:${B}`]);
+    assert.ok(f.pending);
+    assert.deepEqual(f.sessions[B], [bootstrap]);
+});
+
+test('partial recovery closure counts are only attributed to a matching mutation', async () => {
+    for (const [action, login, matching] of [['delete', neighbor, false], ['disable', credentials.login, false],
+        ['delete', credentials.login, true]]) {
+        const f = fixture({ shared: true, other: true, fault(step, id) {
+            if (step === 'sync' && id === A) return { changed: false, complete: false, sessionsTerminated: 0 };
+        } });
+        f.pending = releasedIntent(f, 'delete');
+        blockedHost(f, A);
+        await assert.rejects(f.service[action]({ login }), error => {
+            assert.equal(error.code, code('OUTCOME_UNKNOWN').code);
+            assert.equal(error.retryAllowed, false);
+            if (matching) {
+                assert.equal(error.confirmedSessionsTerminated, 2);
+                assert.equal(error.sessionsTerminatedScope, 'request');
+            } else {
+                assert.equal(Object.hasOwn(error, 'confirmedSessionsTerminated'), false);
+                assert.equal(Object.hasOwn(error, 'sessionsTerminatedScope'), false);
+            }
+            return true;
+        });
+        assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${A}`, `sync:${B}`]);
+        assert.ok(f.pending);
+        assert.deepEqual(f.sessions[B], [bootstrap, neighbor]);
+    }
+});
+
+test('final readback showing a surviving target prevents publication even after checked sync', async () => {
+    const f = fixture({ shared: true, fault(step, id, state) {
+        if (step === 'inspect' && id === B && state.events.includes(`sync:${B}`)) state.sessions[B].push(credentials.login);
+    } });
+    f.pending = releasedIntent(f, 'delete');
+    blockedHost(f, A);
+    await assert.rejects(f.service.reconcile(), { ...code('OUTCOME_UNKNOWN'), uncertainNodeId: B,
+        retryAllowed: false, confirmedSessionsTerminated: 3, confirmedNodeIds: [A] });
+    assert.ok(f.pending);
+    assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${A}`, `sync:${B}`, ...reads]);
+});
+
+for (const [name, change] of [
+    ['different owner', f => { f.pending.intentId = 'aaaaaaaa-bbbb-4ccc-8ddd-fffffffffffe'; }],
+    ['changed record under the same owner', f => { f.pending.createdAt = new Date(1); }],
+    ['directory drift', f => { f.directory.generation = 'changed'; }],
+    ['account metadata drift', f => { f.users[0].comment = 'changed'; }],
+]) {
+    test(`${name} at the transactional snapshot prevents recovery publication`, async () => {
+        const f = fixture({ shared: true, fault(step, _, state) { if (step === 'publish') change(state); } });
+        f.pending = releasedIntent(f, 'delete');
+        f.directory = { generation: 'original', accounts: f.users.filter(u => u.relayNode === A) };
+        for (const id of [A, B]) { blockedHost(f, id); f.sessions[id] = []; }
+        await assert.rejects(f.service.reconcile(), { ...code('FINISH_UNKNOWN'), retryAllowed: false });
+        assert.ok(f.pending && f.users.filter(u => u.login === credentials.login).length === 2);
+        assert.ok(!f.events.includes('settle'));
+    });
+}
+
+for (const [name, change] of [
+    ['extra top-level field', f => { f.pending.extra = true; }],
+    ['extra network field', f => { f.pending.relays[0].network.extra = true; }],
+    ['unknown operation', f => { f.pending.action = 'constructor'; }],
+    ['missing cohort member', f => { f.pending.relays.pop(); }],
+    ['duplicate cohort member', f => { f.pending.relays[1] = f.pending.relays[0]; }],
+    ['wrong SSH pin', f => { f.pending.relays[0].sshHostKeySha256 = '5'.repeat(64); }],
+    ['wrong IP', f => { f.pending.relays[0].ip = ip(0, 12); }],
+    ['wrong revision', f => { f.pending.relays[0].revision = 1; }],
+    ['malformed escrow', f => { f.pending.passwordEncrypted = 'not-an-envelope'; }],
+    ['escrow cannot authenticate', f => { f.pending.passwordEncrypted = encrypt(credentials.password, 'wrong-fixture-key'); }],
+]) {
+    test(`${name} in an intent refuses before opening DIRECT`, async () => {
+        const f = fixture();
+        f.pending = releasedIntent(f, 'create');
+        change(f);
+        const before = structuredClone(f.pending);
+        await assert.rejects(f.service.reconcile(), { ...code('BLOCKED'), retryAllowed: false });
+        assert.equal(equal(f.pending, before), true);
+        assert.deepEqual(recoveryEffects(f), []);
+        assert.ok(!f.events.some(e => e.startsWith('connect:')));
+    });
+}
+
+for (const capability of ['inspectChap', 'fenceChap']) {
+    test(`missing ${capability} cannot fall back to ordinary check or clear pending`, async () => {
+        const f = fixture({ shared: true });
+        f.pending = releasedIntent(f, 'delete');
+        const factory = f.deps.createRelayDirect;
+        f.deps.createRelayDirect = params => {
+            const remote = factory(params);
+            delete remote[capability];
+            return remote;
+        };
+        await assert.rejects(f.restart().delete(credentials), code('BLOCKED'));
+        assert.deepEqual(recoveryEffects(f), []);
+        assert.ok(f.pending);
+    });
+}
+
+test('unexpected create session count or impossible both projection blocks recovery', async () => {
+    for (const receipt of [{ projection: 'original', activeTargetSessions: 1 }, { projection: 'both', activeTargetSessions: 0 }]) {
+        const f = fixture({ fault(step, id) { if (step === 'inspect' && id === B) return receipt; } });
+        f.pending = releasedIntent(f, 'create');
+        await assert.rejects(f.service.reconcile(), code('BLOCKED'));
+        assert.ok(f.pending);
+        assert.deepEqual(recoveryEffects(f), [`inspect:${A}`, `inspect:${B}`]);
+    }
+});
+
+test('unrelated mutation must check hosts anew after settling the prior intent', async () => {
+    const f = fixture({ shared: true, other: true, fault(step, id) { if (step === 'check' && id === B) return false; } });
+    f.pending = releasedIntent(f, 'delete');
+    for (const id of [A, B]) { blockedHost(f, id); f.sessions[id] = [bootstrap, neighbor]; }
+    await assert.rejects(f.service.disable({ login: neighbor }), code('PREFLIGHT_REFUSED'));
+    assert.equal(f.pending, undefined);
+    assert.deepEqual(recoveryEffects(f), [...fencePass, ...reads, 'publish', `check:${A}`, `check:${B}`]);
+    assert.ok(f.users.filter(u => u.login === neighbor).every(u => u.enabled));
+});
+
+test('create with the same login but a different password does not claim the recovered outcome', async () => {
+    const f = fixture();
+    f.pending = releasedIntent(f, 'create');
+    for (const [i, id] of [A, B].entries()) f.hosts[id].push({ ...credentials, ipAddress: ip(i, 11), enabled: true });
+    await assert.rejects(f.service.create({ ...credentials, password: 'different-fixture-only' }), code('ACCOUNT_CONFLICT'));
+    assert.equal(f.pending, undefined);
+    assert.ok(f.users.filter(u => u.login === credentials.login).every(u => u.passwordEncrypted === sharedCipher));
+    assert.deepEqual(recoveryEffects(f), [...fencePass, ...reads, 'publish']);
+});
+
+test('Apply ownership loss during the cohort inspection prevents any convergence', async () => {
+    let lost = false;
+    const f = fixture({ shared: true, fault(step, id) {
+        if (step === 'inspect' && id === B) lost = true;
+        if (step === 'lock' && lost) return false;
+    } });
+    f.pending = releasedIntent(f, 'delete');
+    blockedHost(f, B);
+    await assert.rejects(f.service.reconcile(), { ...code('BLOCKED'), retryAllowed: false });
+    assert.ok(f.pending);
+    assert.deepEqual(recoveryEffects(f), [`inspect:${A}`, `inspect:${B}`]);
+    assert.ok([A, B].every(id => f.events.includes(`close:${id}`)));
+});
+
+test('lost cancellation acknowledgement blocks the unrelated request even if cancellation landed', async () => {
+    const f = fixture({ shared: true, other: true, fault(step) { if (step === 'cancel-ack') throw Error('unknown cancel'); } });
+    f.pending = releasedIntent(f, 'delete');
+    await assert.rejects(f.service.disable({ login: neighbor }), { ...code('FINISH_UNKNOWN'), retryAllowed: false });
+    assert.deepEqual(recoveryEffects(f), [...fencePass, 'cancel']);
+    assert.ok([A, B].every(id => f.events.indexOf(`close:${id}`) < f.events.indexOf('cancel')));
+    assert.equal(f.pending, undefined);
 });

@@ -16,8 +16,10 @@ const pinPattern = /^[a-f0-9]{64}(?![\s\S])/;
 const installToken = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}(?![\s\S])/;
 const loginPattern = /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/;
 const passwordPattern = /^[A-Za-z0-9_-]{1,256}(?![\s\S])/;
+const escrowPattern = /^v1:[0-9a-f]{24}:[0-9a-f]{32}:(?:[0-9a-f]{2}){1,256}(?![\s\S])/;
 const bootstrap = 'relay-bootstrap';
 const operatorList = 'C3_REBUILD_L2TP_RELAYS_JSON';
+const statuses = Object.freeze({ create: 'created', disable: 'disabled', delete: 'deleted' });
 const matches = (re, value) => typeof value === 'string' && re.test(value);
 const int = (v, lo, hi) => Number.isSafeInteger(v) && v >= lo && v <= hi;
 const ipv4 = ip => isIPv4(ip) ? ip.split('.').reduce((n, s) => n * 256 + Number(s), 0) : NaN;
@@ -70,7 +72,7 @@ async function bindingFor(resolve, env, state, node) {
     return Object.freeze({ nodeId, host, port, username, machineId, sshHostKeySha256 });
 }
 
-function makePlans({ states, users, nodes, bindings }, action, login, password, key) {
+function makePlans({ states, users, nodes, bindings }, action, login, password, key, escrow) {
     const cohort = new Map(states.map(s => [String(s.node), []]));
     for (const user of users) {
         const group = cohort.get(String(user.relayNode));
@@ -78,7 +80,7 @@ function makePlans({ states, users, nodes, bindings }, action, login, password, 
         group.push(user);
     }
     const plans = [];
-    const passwordEncrypted = action === 'create' ? encrypt(password, key) : undefined;
+    const passwordEncrypted = action === 'create' ? (escrow ?? encrypt(password, key)) : undefined;
     let shared, logical;
     for (const [i, state] of states.entries()) {
         const binding = bindings[i];
@@ -138,15 +140,78 @@ function makePlans({ states, users, nodes, bindings }, action, login, password, 
     return plans;
 }
 
+const recordRelays = plans => plans.map(({ installation, binding, before, after }) => ({ ...installation, ...binding,
+    ip: before?.ip ?? after?.ip, revision: before?.desiredRevision ?? 0 }));
+const fields = (row, names) => row !== null && typeof row === 'object' && Object.getPrototypeOf(row) === Object.prototype
+    && Reflect.ownKeys(row).length === names.length && names.every(name => Object.hasOwn(row, name));
+
+function openIntent(intent, key) {
+    const create = intent?.action === 'create';
+    if (!fields(intent, ['_id', 'intentId', 'action', 'login', 'createdAt', 'relays', ...(create ? ['passwordEncrypted'] : [])])
+        || intent._id !== 'pending' || !matches(installToken, intent.intentId)
+        || typeof intent.action !== 'string' || !Object.hasOwn(statuses, intent.action)
+        || !matches(loginPattern, intent.login) || intent.login === bootstrap
+        || !(intent.createdAt instanceof Date) || !Number.isFinite(intent.createdAt.getTime())
+        || !Array.isArray(intent.relays) || intent.relays.length === 0
+        || (create && !matches(escrowPattern, intent.passwordEncrypted))) throw fail('BLOCKED', { retryAllowed: false });
+    if (create) {
+        let password;
+        try { password = decrypt(intent.passwordEncrypted, key); } catch { /* Not usable escrow. */ }
+        if (!matches(passwordPattern, password)) throw fail('BLOCKED', { retryAllowed: false });
+        return password;
+    }
+}
+
+function publication(store, plans, baseline, { intentId, intent, action, login, recheck, verifyAuthority }) {
+    const { directory } = baseline;
+    const firstRelay = baseline.users.filter(row => String(row.relayNode) === plans[0].binding.nodeId);
+    const directoryBase = directory?.accounts ?? firstRelay.map(logicalAccount);
+    const now = new Date();
+    const changes = plans.map(({ before, after }) => ({ before, after: after && {
+        ...after, lastSyncedAt: now, updatedAt: now, ...(action === 'create' && { createdAt: now }),
+    } }));
+    return store.publish({ intentId, intent, action, changes, recheck, verifyAuthority, directory, directoryBase, login });
+}
+
+function validateDirectory({ directory, users }, firstId) {
+    if (directory && !sameAccounts(directory.accounts, users.filter(row => String(row.relayNode) === firstId))) {
+        throw fail('ACCOUNT_CONFLICT');
+    }
+}
+
+async function withRemotes(work) {
+    const opened = new Set();
+    const track = (remote, ...methods) => {
+        if (opened.has(remote) || typeof remote?.close !== 'function') throw fail('UNAVAILABLE');
+        opened.add(remote);
+        if (methods.some(method => typeof remote[method] !== 'function') || typeof remote.syncChap !== 'function') throw fail('UNAVAILABLE');
+        return remote;
+    };
+    const closeAll = async () => {
+        const remotes = Array.from(opened);
+        opened.clear();
+        const results = await Promise.allSettled(remotes.map(async remote => remote.close()));
+        if (results.some(r => r.status === 'rejected')) throw fail('CLEANUP_FAILED');
+    };
+    try { return await work(track, closeAll); }
+    finally {
+        // Required close is done before settlement and while all locks are
+        // held. A secondary close failure cannot change the primary outcome.
+        try { await closeAll(); } catch { /* Preserve the primary outcome. */ }
+    }
+}
+
 // Parent supplies the one ordinary resolver and DIRECT factory. The factory
-// must bind the supplied endpoint, pin and machine identity. checkChap is
-// read-only. syncChap must call verifyLock at dispatch, attest the installation
-// and preimage under its host lock, and return a checked change receipt.
-const chapReceipt = result => result !== null && typeof result === 'object'
-    && Object.keys(result).length === 1 && typeof result.changed === 'boolean';
-const revokeReceipt = result => result !== null && typeof result === 'object'
-    && Object.keys(result).length === 3 && typeof result.changed === 'boolean'
+// must bind the supplied endpoint, pin and machine identity. checkChap and
+// inspectChap are read-only. fenceChap retires older commands without changing
+// CHAP or PPP. Each write must verify authority at dispatch and attest the
+// installation and preimage under the host lock before returning its receipt.
+const chapReceipt = result => fields(result, ['changed']) && typeof result.changed === 'boolean';
+const revokeReceipt = result => fields(result, ['changed', 'complete', 'sessionsTerminated']) && typeof result.changed === 'boolean'
     && typeof result.complete === 'boolean' && int(result.sessionsTerminated, 0, Number.MAX_SAFE_INTEGER);
+const inspectionReceipt = (result, revokedLogin, sameProjection) => fields(result, ['projection', 'activeTargetSessions'])
+    && (sameProjection ? result.projection === 'both' : ['original', 'desired'].includes(result.projection))
+    && int(result.activeTargetSessions, 0, revokedLogin ? Number.MAX_SAFE_INTEGER : 0);
 function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = process.env, resolveRelayBinding,
     createRelayDirect, store = createRebuildRelayAccountsStore({ Node, State, L2tpUser }) }) {
     const allow = () => {
@@ -154,17 +219,169 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
         try { enabled = validateRebuildMode(env); } catch { /* Strict/classic conflict. */ }
         if (enabled !== true) throw fail('DISABLED');
     };
+
+    function inventoryFor(ids, login, authority) {
+        const readDatabase = async session => {
+            const states = (await store.states(session)).sort(by('node'));
+            if (!equal(installedIds(states), ids)) throw fail('CHANGED');
+            const { nodes, users, directory } = await store.inventory(ids, login, session);
+            nodes.sort(by('_id')); users.sort(by('_id'));
+            if (!equal(nodes.map(n => String(n._id)), ids)) throw fail('BINDING_MISMATCH');
+            return { states, nodes, users, directory };
+        };
+        const load = async () => {
+            await authority();
+            const db = await readDatabase();
+            const bindings = [];
+            for (const [i, state] of db.states.entries()) {
+                const binding = await bindingFor(resolveRelayBinding, env, state, db.nodes[i]);
+                if (bindings.some(b => b.machineId === binding.machineId || b.sshHostKeySha256 === binding.sshHostKeySha256
+                    || (b.host === binding.host && b.port === binding.port))) throw fail('BINDING_MISMATCH', { nodeId: binding.nodeId });
+                bindings.push(binding);
+            }
+            await authority();
+            return { ...db, bindings };
+        };
+        return { load, async check(baseline, session) {
+            // All remote calls and binding resolver work are outside the
+            // transaction. Its snapshot must still match the frozen DB scope.
+            await authority();
+            const { bindings, ...db } = baseline;
+            if (!(session ? equal(await readDatabase(session), db) : equal(await load(), baseline))) throw fail('CHANGED');
+        } };
+    }
+
+    async function recover(intent, key, listMode, authority, requested) {
+        const password = openIntent(intent, key);
+        const { intentId, action, login } = intent;
+        const revokedLogin = action === 'create' ? undefined : login;
+        const matching = requested.action === action && requested.login === login
+            && (action !== 'create' || requested.password === password);
+        let phase = 'BLOCKED', uncertainNodeId;
+        let sessionsTerminated = 0;
+        const confirmedNodeIds = new Set();
+        const verifyAuthority = async () => {
+            await authority();
+            await store.verifyIntent(intentId, intent);
+            await authority();
+        };
+        try {
+            // The released format was only produced by the list-mode writer.
+            if (!listMode) throw fail('OPERATOR_LIST_REQUIRED');
+            await verifyAuthority();
+            const ids = installedIds(await store.states());
+            if (!equal(intent.relays.map(row => row?.nodeId), ids)) throw fail('CHANGED');
+            return await withNodes(ids, () => withRemotes(async (track, closeAll) => {
+                const inventory = inventoryFor(ids, login, authority);
+                const baseline = await inventory.load();
+                const plans = makePlans(baseline, action, login, password, key, intent.passwordEncrypted);
+                if (!equal(recordRelays(plans), intent.relays)) throw fail('CHANGED');
+                validateDirectory(baseline, ids[0]);
+                const recheck = async session => {
+                    await inventory.check(baseline, session);
+                    await verifyAuthority();
+                };
+                // For a disabled target, the two CHAP projections are identical
+                // even when the requested DB delta is a deletion.
+                const sameProjection = revokedLogin !== undefined && plans[0].before.enabled === false;
+                const inspect = async ({ installation, currentUsers, desiredUsers }, remote) => {
+                    await recheck();
+                    const receipt = await remote.inspectChap(installation, currentUsers, desiredUsers, recheck, revokedLogin);
+                    await recheck();
+                    if (!inspectionReceipt(receipt, revokedLogin, sameProjection)) throw fail('CHANGED');
+                    return receipt;
+                };
+                const calls = [];
+                for (const plan of plans) {
+                    await recheck();
+                    const { node, binding } = plan;
+                    const remote = track(await createRelayDirect({ node, env, binding }), 'inspectChap', 'fenceChap');
+                    await inspect(plan, remote);
+                    calls.push({ plan, remote });
+                }
+
+                // The first pass admits the whole cohort but is not settlement
+                // evidence: a previously dispatched command could still land.
+                // Retire those commands on every host before observing again.
+                for (const { plan, remote } of calls) {
+                    const { installation, currentUsers, desiredUsers } = plan;
+                    await recheck();
+                    const receipt = await remote.fenceChap(installation, currentUsers, desiredUsers, recheck, revokedLogin);
+                    await recheck();
+                    if (!fields(receipt, ['fenced']) || receipt.fenced !== true) throw fail('CHANGED');
+                }
+                const classified = [];
+                for (const call of calls) classified.push({ ...call, ...await inspect(call.plan, call.remote) });
+
+                const cancel = classified.every(call => call.projection === 'original');
+                if (!cancel) {
+                    let incompleteNodeId;
+                    for (const { plan, remote, projection, activeTargetSessions } of classified) {
+                        const changed = projection === 'original';
+                        if (!changed && activeTargetSessions === 0) continue;
+                        await recheck();
+                        const { installation, currentUsers, desiredUsers } = plan;
+                        // In the desired projection the target's row is already
+                        // blocked. Carry its original IP even on a delete, so
+                        // surviving sessions can still be attributed exactly.
+                        const observed = changed ? currentUsers : Object.freeze(currentUsers.map(user => user.login === revokedLogin
+                            ? Object.freeze({ ...user, enabled: false }) : user));
+                        phase = 'OUTCOME_UNKNOWN';
+                        uncertainNodeId = installation.nodeId;
+                        const synced = await remote.syncChap(installation, observed, desiredUsers, recheck, revokedLogin);
+                        if (!(revokedLogin ? revokeReceipt(synced) : chapReceipt(synced)) || synced.changed !== changed) throw fail(phase);
+                        if (revokedLogin) {
+                            const total = sessionsTerminated + synced.sessionsTerminated;
+                            if (!Number.isSafeInteger(total)) throw fail(phase);
+                            sessionsTerminated = total;
+                            if (!synced.complete) incompleteNodeId ??= uncertainNodeId;
+                        }
+                        if (!revokedLogin || synced.complete) confirmedNodeIds.add(uncertainNodeId);
+                        uncertainNodeId = undefined;
+                    }
+                    if (incompleteNodeId) {
+                        uncertainNodeId = incompleteNodeId;
+                        throw fail(phase);
+                    }
+                    for (const { plan, remote } of calls) {
+                        uncertainNodeId = plan.installation.nodeId;
+                        confirmedNodeIds.delete(uncertainNodeId);
+                        const proof = await inspect(plan, remote);
+                        if (proof.projection === 'original' || proof.activeTargetSessions !== 0) throw fail('CHANGED');
+                        confirmedNodeIds.add(uncertainNodeId);
+                        uncertainNodeId = undefined;
+                    }
+                }
+
+                phase = 'FINISH_UNKNOWN';
+                await closeAll();
+                await recheck();
+                if (cancel) await store.cancel({ intent, recheck, verifyAuthority });
+                else await publication(store, plans, baseline, { intentId, intent, action, login, recheck, verifyAuthority });
+                return { matching, result: { executionMode: 'rebuild', status: cancel ? 'canceled' : statuses[action], login,
+                    relayCount: ids.length, recovered: true, ...(revokedLogin && { sessionsTerminated }) } };
+            }));
+        } catch {
+            throw fail(phase, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds].sort(),
+                // Do not attribute closures from a different pending action to the requested mutation.
+                ...(revokedLogin && (!requested.action || matching) && { confirmedSessionsTerminated: sessionsTerminated,
+                    ...(matching && { sessionsTerminatedScope: 'request' }) }),
+                ...(uncertainNodeId && { uncertainNodeId }) });
+        }
+    }
+
     async function run(action, input) {
         allow();
         const listMode = Object.hasOwn(env, operatorList);
+        const list = env[operatorList], installEnabled = env.C3_REBUILD_L2TP_INSTALL_ENABLED;
         const { login, password } = input ?? {};
-        if (!matches(loginPattern, login) || login === bootstrap || (action === 'create' && !matches(passwordPattern, password))) {
+        if (action && (!matches(loginPattern, login) || login === bootstrap || (action === 'create' && !matches(passwordPattern, password)))) {
             throw fail('INVALID_REQUEST');
         }
         if (typeof resolveRelayBinding !== 'function' || typeof createRelayDirect !== 'function') throw fail('UNAVAILABLE');
         const key = env.ENCRYPTION_KEY;
         if (typeof key !== 'string' || key.length < 32) throw fail('CREDENTIAL_KEY_INVALID');
-        const result = { executionMode: 'rebuild', status: { create: 'created', disable: 'disabled', delete: 'deleted' }[action], login };
+        const result = { executionMode: 'rebuild', status: statuses[action], login };
         let primary, completed = false;
         try {
             return await locks.run(async verifyLock => {
@@ -173,56 +390,43 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                         allow();
                         if (await verifyLock() === false) throw Object.assign(new Error('REBUILD_LOCK_LOST'), { code: 'REBUILD_LOCK_LOST' });
                         allow();
-                        if (env.ENCRYPTION_KEY !== key || Object.hasOwn(env, operatorList) !== listMode) throw fail('CHANGED');
+                        if (env.ENCRYPTION_KEY !== key || Object.hasOwn(env, operatorList) !== listMode
+                            || env[operatorList] !== list || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== installEnabled) throw fail('CHANGED');
                     };
                     await authority();
+                    const pending = await store.pending();
+                    await authority();
+                    if (pending !== null) {
+                        const recovered = await recover(pending, key, listMode, authority, { action, login, password });
+                        completed = true;
+                        if (!action || recovered.matching) return recovered.result;
+                    }
+                    if (!action) return { executionMode: 'rebuild', status: 'idle' };
+                    // An unrelated request takes a fresh baseline after settlement;
+                    // it never inherits the recovered operation's host/DB proof.
                     await store.assertNoPending();
                     const ids = installedIds(await store.states());
-                    return await withNodes(ids, async () => {
-                        const load = async session => {
-                            await authority();
-                            const states = (await store.states(session)).sort(by('node'));
-                            if (!equal(states.map(s => String(s.node)), ids)) throw fail('CHANGED');
-                            const { nodes, users, directory } = await store.inventory(ids, login, session);
-                            nodes.sort(by('_id')); users.sort(by('_id'));
-                            if (!equal(nodes.map(n => String(n._id)), ids)) throw fail('BINDING_MISMATCH');
-                            const bindings = [];
-                            for (const [i, state] of states.entries()) {
-                                const binding = await bindingFor(resolveRelayBinding, env, state, nodes[i]);
-                                if (bindings.some(b => b.machineId === binding.machineId || b.sshHostKeySha256 === binding.sshHostKeySha256
-                                    || (b.host === binding.host && b.port === binding.port))) throw fail('BINDING_MISMATCH', { nodeId: binding.nodeId });
-                                bindings.push(binding);
-                            }
-                            await authority();
-                            return { states, nodes, bindings, users, directory };
-                        };
-                        const baseline = await load();
+                    return await withNodes(ids, () => withRemotes(async (track, closeAll) => {
+                        const inventory = inventoryFor(ids, login, authority);
+                        const baseline = await inventory.load();
                         const plans = makePlans(baseline, action, login, password, key);
                         const revokedLogin = action === 'create' ? undefined : login;
-                        const firstRelay = baseline.users.filter(row => String(row.relayNode) === ids[0]);
-                        const directory = baseline.directory;
-                        if (directory && !sameAccounts(directory.accounts, firstRelay)) throw fail('ACCOUNT_CONFLICT');
-                        const directoryBase = directory?.accounts ?? firstRelay.map(logicalAccount);
+                        validateDirectory(baseline, ids[0]);
 
                         // Legacy Remove only owns the exact bootstrap row. Do
                         // not introduce account changes under that contract.
                         if (!listMode) throw fail('OPERATOR_LIST_REQUIRED');
-                        let intentId, phase, uncertainNodeId;
+                        let intentId, intent, phase, uncertainNodeId;
                         let sessionsTerminated = 0;
                         const confirmedNodeIds = [];
                         const verifyAuthority = async () => {
                             await authority();
-                            if (intentId) await store.verifyIntent(intentId);
+                            if (intentId) await store.verifyIntent(intentId, intent);
                             await authority();
                         };
                         const recheck = async session => {
-                            if (!equal(await load(session), baseline)) throw fail('CHANGED');
+                            await inventory.check(baseline, session);
                             await verifyAuthority();
-                        };
-                        const remotes = [];
-                        const closeAll = async () => {
-                            const results = await Promise.allSettled(remotes.splice(0).map(async remote => remote.close()));
-                            if (results.some(r => r.status === 'rejected')) throw fail('CLEANUP_FAILED');
                         };
                         const outcome = suffix => fail(suffix, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds],
                             ...(revokedLogin && { confirmedSessionsTerminated: sessionsTerminated }),
@@ -231,12 +435,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             const calls = [];
                             for (const { node, binding, installation, currentUsers, desiredUsers } of plans) {
                                 await recheck();
-                                const remote = await createRelayDirect({ node, env, binding });
-                                if (remotes.includes(remote)) throw fail('UNAVAILABLE');
-                                if (typeof remote?.close === 'function') remotes.push(remote);
-                                if (typeof remote?.close !== 'function' || typeof remote.checkChap !== 'function' || typeof remote.syncChap !== 'function') {
-                                    throw fail('UNAVAILABLE');
-                                }
+                                const remote = track(await createRelayDirect({ node, env, binding }), 'checkChap');
                                 calls.push([remote, installation, currentUsers, desiredUsers]);
                             }
                             for (const call of calls) {
@@ -256,11 +455,16 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             intentId = id;
                             // Only the create delta needs escrow. The password is
                             // never stored in plaintext, logged, or echoed in errors.
-                            await store.begin({ intentId: id, action, login, createdAt: new Date(),
+                            const submitted = { intentId: id, action, login, createdAt: new Date(),
                                 ...(action === 'create' && { passwordEncrypted: plans[0].after.passwordEncrypted }),
-                                relays: plans.map(({ installation, binding, before, after }) => ({ ...installation, ...binding,
-                                    ip: before?.ip ?? after?.ip, revision: before?.desiredRevision ?? 0 })) });
+                                relays: recordRelays(plans) };
+                            await store.begin(submitted);
                             phase = 'OUTCOME_UNKNOWN';
+                            await authority();
+                            // Validate contents regardless of field order, then
+                            // retain the unmodified BSON read image for CAS.
+                            intent = await store.pending();
+                            if (!equal(intent, { _id: 'pending', ...submitted })) throw fail('CHANGED');
                             let incompleteNodeId;
                             for (const [remote, installation, currentUsers, desiredUsers, changed] of calls) {
                                 await recheck();
@@ -289,22 +493,14 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             phase = 'FINISH_UNKNOWN';
                             await closeAll();
                             await recheck();
-                            const now = new Date();
-                            const changes = plans.map(({ before, after }) => ({ before, after: after && {
-                                ...after, lastSyncedAt: now, updatedAt: now, ...(action === 'create' && { createdAt: now }),
-                            } }));
-                            await store.publish({ intentId, action, changes, recheck, verifyAuthority, directory, directoryBase, login });
+                            await publication(store, plans, baseline, { intentId, intent, action, login, recheck, verifyAuthority });
                             completed = true;
                             return { ...result, relayCount: ids.length, ...(revokedLogin && { sessionsTerminated }) };
                         } catch (error) {
                             if (phase) throw outcome(phase);
                             throw error;
-                        } finally {
-                            // Required close is done before publish; secondary
-                            // close failures cannot change an unknown outcome.
-                            try { await closeAll(); } catch { /* Preserve the primary outcome. */ }
                         }
-                    });
+                    }));
                 } catch (error) {
                     primary = safe(error);
                     throw primary;
@@ -314,7 +510,8 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
             throw primary ?? (completed ? fail('CLEANUP_FAILED', { retryAllowed: false }) : safe(error));
         }
     }
-    return Object.freeze({ create: input => run('create', input), disable: input => run('disable', input), delete: input => run('delete', input) });
+    return Object.freeze({ create: input => run('create', input), disable: input => run('disable', input),
+        delete: input => run('delete', input), reconcile: () => run() });
 }
 
 module.exports = { createRebuildRelayAccounts };

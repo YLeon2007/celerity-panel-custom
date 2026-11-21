@@ -62,6 +62,7 @@ function createPanelRouter({
     router.use(checkIpWhitelist);
 
     rebuildL2tp?.mountOverview(router, exposePanelCsrfToken);
+    rebuildL2tp?.mountReconcile(router, injectedL2tpRateLimiter);
     if (rebuildEnabled) router.use(['/l2tp', '/nodes/:id/l2tp'], rejectRebuildRoute);
 
     // Auth routes are public (login, setup, totp, logout)

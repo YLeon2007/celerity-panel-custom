@@ -157,7 +157,10 @@ async function verify(app) {
     assert.equal(overview.status, 200);
     assert.equal(overview.cacheControl, 'no-store');
     assert.ok(overview.body.includes('id="rebuild-l2tp"'));
-    assert.ok(overview.body.includes('/js/rebuild-l2tp.js'));
+    const assetPath = require('node:path').resolve(process.argv[1], '../public/js/rebuild-l2tp.js');
+    const assetVersion = require('node:crypto').createHash('sha256')
+        .update(require('node:fs').readFileSync(assetPath)).digest('hex').slice(0, 16);
+    assert.ok(overview.body.includes('<script src="/js/rebuild-l2tp.js?v=' + assetVersion + '" defer></script>'));
     assert.ok(overview.body.includes('/panel/nodes/' + relay + '#rebuild-l2tp-remove'));
     assert.ok(overview.body.includes('fixture.user') && overview.body.includes('10.66.0.8'));
     assert.ok(!overview.body.includes('reveal-fixture-only'));

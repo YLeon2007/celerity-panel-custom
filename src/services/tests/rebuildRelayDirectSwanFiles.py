@@ -59,6 +59,7 @@ class Files(unittest.TestCase):
 
         h.update(os=FixtureOS(), boot=lambda: 'fixture-boot')
         self.real('/etc').mkdir(mode=0o755)
+        self.real('/etc/machine-id').write_text(MACHINE + '\n', encoding='ascii')
         shutil.copy2(a.etc_archive / 'strongswan.conf', self.real('/etc/strongswan.conf'))
         shutil.copytree(a.etc_archive / 'strongswan.d', self.real('/etc/strongswan.d'))
         self.real(h['SYSTEM']).mkdir(mode=0o755, parents=True)
@@ -85,6 +86,7 @@ class Files(unittest.TestCase):
         self.policy: dict[str, Any] = dict(nft=None, rule=False, route=False)
         self.sock = [['tcp', '127.0.0.1', 8080]]
         self.units = {k: v.copy() for k, v in self.original_units.items()}
+        self.native_command = h['command']
         h.update(unit=lambda n: self.units[n].copy(), no_jobs=lambda *_: None, vpn_empty=lambda **kw: True,
                  preflight=lambda machine: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
                  sock_rows=lambda: [], ip=lambda *args: [], xray_users=lambda *args: self.sock,
@@ -104,6 +106,10 @@ class Files(unittest.TestCase):
             return b'[{"priority":0,"src":"all","table":"255"},{"priority":32766,"src":"all","table":"254"}]'
         if argv == ('/usr/sbin/ipsec', 'statusall'):
             return b'Connections:\n  celerity-l2tp: transport\nSecurity Associations (0 up, 0 connecting):\n  none\n'
+        if argv == ('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys'):
+            # A modeled idle daemon does not prove kernel emptiness. Read the
+            # real XFRM table in the private netns, with the normal error checks.
+            return self.native_command(*argv, **kwargs)
         if argv[:4] == ('/usr/sbin/ip', '-4', 'rule', 'del'):
             self.policy['rule'] = False
         elif argv[:4] == ('/usr/sbin/ip', '-4', 'route', 'del'):
@@ -133,7 +139,14 @@ class Files(unittest.TestCase):
         payload = {'main': h['encode']({'inbounds': [{'tag':'relay-l2tp-a','port':12345},
             {'tag':'rebuild-relay-ingress','listen':'127.0.0.1','port':23456}]}),
             'nft': ('create table inet ' + h['TABLE'] + ' {\n    comment "' + TOKEN + '"\n}').encode(),
-            **{k: b'# fixture\n' for k in ('ike','lns','options','chap','secrets')}}
+            'lns': (b'[global]\nport = 1701\n\n[lns default]\n'
+                    b'ip range = 10.255.1.10-10.255.1.19\nlocal ip = 10.255.1.1\n'
+                    b'require authentication = yes\npppoptfile = /etc/ppp/options.xl2tpd\nlength bit = yes\n'),
+            # candidate() appends the managed block to the stock CHAP preimage.
+            'chap': (b'# BEGIN CELERITY MANAGED L2TP USERS\n'
+                     b'"alice" l2tpd "local-fixture-only" 10.255.1.10\n'
+                     b'# END CELERITY MANAGED L2TP USERS\n'),
+            **{k: b'# fixture\n' for k in ('ike','options','secrets')}}
         after = h['candidate']({**self.req,'files':{k: h['b64'](v) for k,v in payload.items()}}, before)
         self.assertIsNone(before['files']['swan'])
         self.assertEqual(h['operation_files'](after)['swan'], FILE)
@@ -181,9 +194,16 @@ class Files(unittest.TestCase):
         self.units[self.X].update(InvocationID='main-installed', MainPID='10')
         self.units[self.XL].update(InvocationID='1' * 32, ActiveState='active', SubState='running', MainPID='11',
             DropInPaths=h['DROP'], Requires=self.N + ' ' + self.IKE, After=self.N + ' ' + self.IKE)
-        self.units[self.IKE].update(InvocationID='2' * 32, ActiveState='active', SubState='running', MainPID='12')
+        self.units[self.IKE].update(InvocationID='2' * 32, ActiveState='active', SubState='running', MainPID='12',
+            RequiredBy=self.XL)
+        # Project the generated unit as systemctl show would, without loading it.
+        net = dict(line.split('=', 1) for line in self.real(h['NET']).read_text().splitlines()
+                   if line.startswith(('Type=', 'Requires=', 'Wants=', 'After=', 'ExecStartPre=')))
+        pre = net['ExecStartPre']
         self.units[self.N].update(InvocationID='3' * 32, ActiveState='active', SubState='exited', LoadState='loaded',
-            FragmentPath=h['NET'], Type='oneshot', UnitFileState='static', Requires=self.X)
+            FragmentPath=h['NET'], Type=net['Type'], UnitFileState='static', RequiredBy=self.XL,
+            Requires=net.get('Requires', ''), Wants=net['Wants'], After=net['After'],
+            ExecStartPre=f'{{ path={pre.split()[0]} ; argv[]={pre} ; ignore_errors=no ; }}')
         self.real(h['XRAY']).parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         self.real(h['XRAY']).write_bytes(b'modeled binary identity\n')
         self.policy.update(nft={'marker': TOKEN}, rule=True, route=True)

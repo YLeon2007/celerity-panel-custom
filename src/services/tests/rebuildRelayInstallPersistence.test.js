@@ -672,7 +672,7 @@ function accountIntentFixture(t, f) {
             async findOne(where, options) {
                 if (where._id === 'directory') return f.directory.findOne(where, options);
                 assert.equal(where._id, 'pending');
-                return pending && matches(pending, where) ? { _id: pending._id } : null;
+                return project(pending && matches(pending, where) ? pending : null, options?.projection);
             },
             async updateMany(where, update, options) {
                 if (where._id === 'directory') return f.directory.updateMany(where, update, options);
@@ -689,7 +689,8 @@ function accountIntentFixture(t, f) {
             },
             async deleteMany(where, options) {
                 assert.ok(options.session?.inTransaction());
-                assert.deepEqual(where, { _id: 'pending', intentId: pending?.intentId });
+                assert.deepEqual(where, { _id: 'pending', intentId: pending?.intentId,
+                    $expr: { $eq: ['$$ROOT', { $literal: pending }] } });
                 options.session.commitAccountIntent = () => {
                     writes.push(`settle:${pending.action}`);
                     pending = undefined;

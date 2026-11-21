@@ -39,9 +39,20 @@ function createRebuildRelayAccountsStore({ Node, State, L2tpUser }) {
     const db = L2tpUser.db;
     if (Node.db !== db || State.db !== db) throw accountError('PERSISTENCE_UNAVAILABLE');
     const fence = () => db.collection(COLLECTION);
-    const owner = intentId => ({ ...singleton, intentId });
+    // A writer owns the exact BSON row it observed, not just a UUID. Use the
+    // raw read image, including fields/order as stored, as the CAS operand.
+    const owner = (intentId, intent) => {
+        if (typeof intentId !== 'string' || intent?._id !== singleton._id || intent.intentId !== intentId) {
+            throw accountError('CHANGED');
+        }
+        return { ...singleton, intentId, $expr: { $eq: ['$$ROOT', { $literal: intent }] } };
+    };
     return {
         assertNoPending: () => assertNoPendingRelayAccounts(db),
+        async pending() {
+            try { return await fence().findOne(singleton, readOptions); }
+            catch { throw accountError('PERSISTENCE_UNAVAILABLE'); }
+        },
         states: session => read(State.find({ $nor: [{ status: 'not_installed', desiredState: 'absent' }] })
             .select('+rebuildInstallToken +rebuildMachineId').sort({ node: 1, _id: 1 }), session),
         async inventory(ids, login, session) {
@@ -58,16 +69,25 @@ function createRebuildRelayAccountsStore({ Node, State, L2tpUser }) {
             // not permission to dispatch, even if the row later appears.
             await transactOnce(State, L2tpUser, async session => {
                 // A competing owner cannot match the unique singleton _id.
-                requireOne(await fence().updateMany(owner(intent.intentId), { $setOnInsert: intent },
+                requireOne(await fence().updateMany({ ...singleton, intentId: intent.intentId }, { $setOnInsert: intent },
                     { session, upsert: true }), 'upsertedCount');
             });
         },
-        async verifyIntent(intentId) {
-            if (!(await fence().findOne(owner(intentId), { ...readOptions, projection: { _id: 1 } }))) {
+        async verifyIntent(intentId, intent) {
+            if (!(await fence().findOne(owner(intentId, intent), { ...readOptions, projection: { _id: 1 } }))) {
                 throw accountError('CHANGED');
             }
         },
-        async publish({ intentId, action, changes, recheck, verifyAuthority, directory, directoryBase, login }) {
+        async cancel({ intent, recheck, verifyAuthority }) {
+            const filter = owner(intent?.intentId, intent);
+            await transactOnce(State, L2tpUser, async session => {
+                await recheck(session);
+                requireOne(await fence().deleteMany(filter, { session }), 'deletedCount');
+                await verifyAuthority();
+            });
+        },
+        async publish({ intentId, intent, action, changes, recheck, verifyAuthority, directory, directoryBase, login }) {
+            const filter = owner(intentId, intent);
             await transactOnce(State, L2tpUser, async session => {
                 // Re-read the whole original scope before the first account write.
                 await recheck(session);
@@ -91,7 +111,7 @@ function createRebuildRelayAccountsStore({ Node, State, L2tpUser }) {
                 await writeDirectory(db, directory, next, session);
                 // Settle the exact owner's intent with the account rows. A
                 // failed CAS cannot publish any of the account changes.
-                requireOne(await fence().deleteMany(owner(intentId), { session }), 'deletedCount');
+                requireOne(await fence().deleteMany(filter, { session }), 'deletedCount');
                 await verifyAuthority();
             });
         },

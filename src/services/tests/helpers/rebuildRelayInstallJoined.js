@@ -257,11 +257,13 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         t.mock.method(Client.prototype, 'end', function () { liveClients.delete(this); });
         t.mock.method(Client.prototype, 'exec', function (command, ready) {
             const peer = peers.get(this);
+            const direct = command.startsWith('/usr/bin/timeout -k ');
+            const expectsStdin = direct || command.includes('; cat > ');
             const stream = new EventEmitter(), chunks = [];
             stream.stderr = new EventEmitter();
             stream.write = chunk => { chunks.push(Buffer.from(chunk)); return true; };
             const execute = stdin => {
-                if (!command.startsWith('/usr/bin/timeout -k ')) {
+                if (!direct) {
                     const host = routes.get(peer.ip);
                     assert.equal(peer.pinned, Boolean(host));
                     if (command === '/usr/bin/head -c 34 /etc/machine-id') {
@@ -288,10 +290,20 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                     stream.emit('error', error);
                 }
             };
-            stream.end = done => { ended = true; done(); queueMicrotask(() => finish(Buffer.concat(chunks).toString('utf8'))); };
+            stream.end = done => {
+                if (ended) return;
+                ended = true;
+                done();
+                queueMicrotask(() => finish(Buffer.concat(chunks).toString('utf8')));
+            };
             ready(null, stream);
-            // Ordinary SSH execs without stdin never call channel.end().
-            queueMicrotask(() => { if (!ended) finish(undefined); });
+            // Stdin receivers wait for EOF, even if async authorization delays the first write.
+            // Control-only execs never call channel.end().
+            if (!expectsStdin) queueMicrotask(() => {
+                if (ended) return;
+                ended = true;
+                finish(undefined);
+            });
         });
         t.after(() => {
             assert.deepEqual(wireFaults, [], 'fixture wire must handle every dispatched frame');
@@ -299,6 +311,39 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         });
         return frames;
     }
+
+    test('joined DIRECT wire waits for stdin EOF and completes only once', async t => {
+        const command = '/usr/bin/timeout -k fixture';
+        const ip = '192.0.2.4', key = Buffer.from('fixture key');
+        const received = [], events = [];
+        const frames = wire(t, [{ id, relay: { ip }, key, applyHandlers: new Map(), execute(cmd, stdin) {
+            assert.equal(cmd, command);
+            received.push(stdin);
+            return { status: 0, stdout: 'ok', stderr: '' };
+        } }]);
+        const client = new Client();
+        client.connect({ host: ip, port: 22, username: 'root', hostVerifier: candidate => candidate.equals(key) });
+        try {
+            let stream;
+            client.exec(command, (error, channel) => {
+                assert.ifError(error);
+                stream = channel.on('error', error => events.push(error.name)).on('close', status => events.push(status));
+            });
+            await Promise.resolve(); // The receiver stays open while local authorization is pending.
+            assert.deepEqual(events, []);
+            stream.write('{"action":');
+            stream.write('"check-chap"}');
+            await Promise.resolve();
+            assert.deepEqual(frames, [], 'writes alone must not dispatch the request');
+            assert.deepEqual(events, []);
+            stream.end(() => {});
+            stream.end(() => {});
+            await Promise.resolve();
+            assert.deepEqual(received, ['{"action":"check-chap"}']);
+            assert.deepEqual(frames, [[id, 'check-chap']]);
+            assert.deepEqual(events, [0]);
+        } finally { client.end(); }
+    });
 
     function host(t, scenario, options) {
         const f = fixture(t);
