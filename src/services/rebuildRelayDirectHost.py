@@ -860,15 +860,18 @@ def swan_inputs(present, bad):
     return digest(encode(rows))
 
 
-def no_swan_rule():
-    # The existing IPv4 projector remains unchanged (including on Remove).
-    # Its removal mode allows unrelated rules; neither family may have 220/220
-    # before this operation starts or stops the managed IKE invocation.
+def swan_rule_dumps() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rules4 = ip('rule', 'show')
     rules6 = json.loads(command('/usr/sbin/ip', '-j', '-N', '-6', 'rule', 'show'))
     need(type(rules4) is list and type(rules6) is list and all(
-        isinstance(row, dict) and not (row.get('priority') == 220 and str(row.get('table')) == '220')
-        for row in (*rules4, *rules6)), 'NETWORK_CONFLICT')
+        isinstance(row, dict) for row in (*rules4, *rules6)), 'NETWORK_CONFLICT')
+    return cast(list[dict[str, Any]], rules4), cast(list[dict[str, Any]], rules6)
+
+
+def no_swan_rule():
+    # Keep the existing guard for owned startup, verification and teardown.
+    need(not any(row.get('priority') == 220 and str(row.get('table')) == '220'
+                 for rules in swan_rule_dumps() for row in rules), 'NETWORK_CONFLICT')
 
 
 def swan_default_environment(bad):
@@ -889,6 +892,36 @@ def idle_ike(info, rows):
     return sorted([p, a, n] for p, a, n, _ in sockets)
 
 
+def fresh_ike_guard(info):
+    # Diagnose before the generic IPv4 projector (and before rejecting loaded
+    # connection files). Even an exact lookalike predates our owned invocation.
+    # Charon's stop may delete an indistinguishable foreign rule. Neither the
+    # shape nor a native, idle socket owner gives us permission to stop it.
+    matches = [[row for row in rules if row.get('priority') in (220, '220') or row.get('table') in (220, '220')]
+               for rules in swan_rule_dumps()]
+    active = info['ActiveState'] == 'active'
+    if any(matches):
+        need(active and all(len(rows) <= 1 and all(
+            set(row) == {'priority', 'src', 'table'} and type(row['priority']) is int and row['priority'] == 220
+            and row['src'] == 'all' and type(row['table']) in (str, int) and row['table'] in ('220', 220)
+            for row in rows) for rows in matches), 'RULE_220_CONFLICT')
+        if (working(info) and info['SubState'] == 'running' and info['UnitFileState'] in ('enabled', 'disabled')
+                and not any(info.get(k) for k in ('DropInPaths', 'PassEnvironment', 'ExecCondition', 'SourcePath'))
+                and removal_native(info, IKE, {'units': {IKE: info}}, installed=False)):
+            try:
+                idle_ike(info, sock_rows())
+                idle = vpn_empty(allow_socket_policies=True)
+            except Refusal as error:
+                if str(error) == 'IN_FLIGHT':
+                    raise
+                idle = False
+            except OSError:
+                idle = False
+            if idle:
+                raise Refusal('IKE_ACTIVE_RULE_220')
+    need(not active, 'IKE_ACTIVE_UNMANAGED')
+
+
 def boot():
     return open('/proc/sys/kernel/random/boot_id').read(64).strip()
 
@@ -900,11 +933,11 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     need(ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
     no_jobs(UNITS)
     units = {name: unit(name) for name in UNITS}
+    fresh_ike_guard(units[IKE])
     for name in (XL, IKE):
         info = units[name]
         stopped = info['ActiveState'] == 'inactive' and info['SubState'] == 'dead' and info['MainPID'] == '0'
-        stock_idle_ike = name == IKE and working(info) and info['SubState'] == 'running'
-        need(native_vpn(info, name) and (stopped or stock_idle_ike) and not info.get('DropInPaths')
+        need(native_vpn(info, name) and stopped and not info.get('DropInPaths')
              and info['UnitFileState'] in ('enabled', 'disabled'), 'PREREQUISITE')
     # Enroll only the exact helper unit via its single WantedBy symlink.
     install_boot = units[XL]['UnitFileState'] == 'disabled'
@@ -933,7 +966,6 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     globals_before = {path: read(path, 262144) for path in global_paths}
     need(xl_defaults_admitted(globals_before[XL_DEFAULT], units[XL]), 'PREREQUISITE')
     rows = sock_rows()
-    ike_sockets = idle_ike(units[IKE], rows) if units[IKE]['ActiveState'] == 'active' else []
     net = ipaddress.IPv4Network(d['clientCidr'])
     for addr in ip('addr', 'show'):
         for item in addr.get('addr_info', []):
@@ -942,15 +974,12 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     for route in ip('route', 'show', 'table', 'all'):
         dst = route.get('dst', 'default')
         need(dst == 'default' or not net.overlaps(ipaddress.IPv4Network(dst)), 'NETWORK_CONFLICT')
-    reserved = (1701, d['tproxyPort']) if ike_sockets else (500, 4500, 1701, d['tproxyPort'])
+    reserved = (500, 4500, 1701, d['tproxyPort'])
     need(not any(n in reserved for _, _, n, _ in rows)
-         and vpn_empty(allow_socket_policies=bool(ike_sockets)) and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
+         and vpn_empty() and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
     need(not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
     no_swan_rule()
-    # Startup must be ours: do not replace or restart a previously running IKE
-    # instance. Retain the old network refusal above for stock 220 conflicts.
-    need(units[IKE]['ActiveState'] == 'inactive' and not units[IKE].get('PassEnvironment')
-         and STOCK_IKE_INCLUDE in starter, 'PREREQUISITE')
+    need(not units[IKE].get('PassEnvironment') and STOCK_IKE_INCLUDE in starter, 'PREREQUISITE')
     need(all(removal_native(units[n], n, {'units': units}, installed=False)
              and not units[n].get('ExecCondition') for n in (XL, IKE)), 'PREREQUISITE')
     removal_dependencies({n: units[n] for n in (XL, IKE)}, installed=False)
@@ -966,7 +995,7 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
                  ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID', 'FragmentPath', 'DropInPaths')}
                  for name in UNITS}
     return dict(boot=boot(), files=files, units=unit_pins, bridge=bridge, sockets=sockets, globalFiles=globals_before,
-                installBoot=install_boot, ikeSockets=ike_sockets, swanInputs=swan,
+                installBoot=install_boot, ikeSockets=[], swanInputs=swan,
                 **({'transit': transit} if transit is not None else {}))
 
 

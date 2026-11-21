@@ -206,7 +206,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         catch (error) { if (write) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
-            const refusal = typeof result.stderr === 'string' && /^DIRECT_(NO_WRITE_)?([A-Z_]+)\n$/.exec(result.stderr);
+            const refusal = typeof result.stderr === 'string' && /^DIRECT_(NO_WRITE_)?([A-Z0-9_]+)\n$/.exec(result.stderr);
             const raw = refusal?.[2];
             if (count && (result.code !== 70 || result.stdout !== ''
                 || result.stderr !== 'DIRECT_SESSION_COUNT_UNPROVED\n')) throw unknown();
@@ -217,6 +217,12 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 || result.stderr !== 'DIRECT_CHAP_REFUSED\n')) throw unknown();
             const codes = ['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
                 'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED', 'REMOVE_REFUSED'];
+            if (['IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED'].includes(raw)) {
+                // These reasons are only emitted by the pre-write admission gate.
+                if (!['prepare', 'check', 'install'].includes(action) || result.code !== 70 || result.stdout !== ''
+                    || result.stderr !== `DIRECT_${write ? 'NO_WRITE_' : ''}${raw}\n`) throw unknown();
+                codes.push(raw);
+            }
             if (count) codes.push('SESSION_COUNT_UNPROVED');
             if (ipsecBusy) codes.push('REMOVE_IPSEC_BUSY');
             if (chap) codes.push('CHAP_REFUSED');

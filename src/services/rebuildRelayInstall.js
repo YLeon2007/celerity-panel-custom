@@ -5,6 +5,8 @@ const { AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransac
 const fail = code => Object.assign(new Error(code), { code });
 const UNKNOWN = 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN';
 const ROLLBACK_UNKNOWN = 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN';
+const IKE_ADMISSION_CODES = ['REBUILD_L2TP_DIRECT_IKE_ACTIVE_RULE_220', 'REBUILD_L2TP_DIRECT_RULE_220_CONFLICT',
+    'REBUILD_L2TP_DIRECT_IKE_ACTIVE_UNMANAGED'];
 const safe = (error, fallback) => Object.assign(fail(typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$/.test(error.code)
     ? error.code : fallback), error?.retryAllowed === false ? { retryAllowed: false } : {});
 
@@ -93,7 +95,12 @@ async function runFreshRelayInstall(id, deps) {
                     // A thrown error is ambiguous unless the direct driver has
                     // explicit proof that all dispatched mutations have settled.
                     // Do not infer settlement from errno, timeout or SSH close.
-                    if (error?.commandSettled === true) await rollback('REBUILD_L2TP_INSTALL_FAILED', error.noHostChanges === true);
+                    if (error?.commandSettled === true) {
+                        const noHostChanges = error.noHostChanges === true;
+                        const code = noHostChanges && IKE_ADMISSION_CODES.includes(error.code)
+                            ? error.code : 'REBUILD_L2TP_INSTALL_FAILED';
+                        await rollback(code, noHostChanges);
+                    }
                     throw fail(UNKNOWN);
                 }
                 if (installResult === false) await rollback('REBUILD_L2TP_INSTALL_FAILED');

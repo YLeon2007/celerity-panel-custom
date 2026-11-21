@@ -7,6 +7,7 @@ const { spawnSync } = require('node:child_process');
 const { existsSync, readlinkSync } = require('node:fs');
 const { join } = require('node:path');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const { runFreshRelayInstall } = require('../rebuildRelayInstall');
 
 const nodeId = 'a'.repeat(24);
 const machineId = 'b'.repeat(32);
@@ -217,6 +218,36 @@ test('wire receipt for settled install refusal releases the coordinator to attem
     await assert.rejects(remote.install(plan, async () => {}), { code: 'REBUILD_L2TP_DIRECT_COMMAND_FAILED', commandSettled: true });
     assert.equal(await remote.rollback(plan, async () => {}), true);
     await remote.close();
+});
+
+test('IKE admission codes survive prepare, check and settled no-write install refusals', async () => {
+    for (const reason of ['IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED']) {
+        for (const action of ['prepare', 'check', 'install']) {
+            const stderr = `DIRECT_${action === 'install' ? 'NO_WRITE_' : ''}${reason}\n`;
+            const { remote, calls } = fixture(request => request.action === action ? { code: 70, stdout: '', stderr } : undefined);
+            const db = [];
+            await assert.rejects(runFreshRelayInstall(nodeId, {
+                authorize: () => true, machineId, lock: fn => fn(async () => true),
+                inventory: async () => ({ eligible: true, pristine: true }), connect: async () => remote,
+                prepare: async () => remote.prepare(args), verifyReservation: async () => {},
+                reserve: async () => db.push('reserve'), restore: async () => db.push('restore'),
+                finish: async () => assert.fail('must not finish a refused install'),
+            }), { code: `REBUILD_L2TP_DIRECT_${reason}` });
+            assert.deepEqual(db, action === 'install' ? ['reserve', 'restore'] : []);
+            assert.ok(!calls.includes('rollback') && !calls.includes('verify'));
+            assert.equal(calls.at(-2), action);
+        }
+    }
+});
+
+test('IKE refusal without the exact install no-write frame leaves the outcome unknown', async () => {
+    for (const stderr of ['DIRECT_IKE_ACTIVE_RULE_220\n', 'DIRECT_NO_WRITE_IKE_ACTIVE_RULE_220\n\n']) {
+        const { remote } = fixture(request => request.action === 'install' ? { code: 70, stdout: '', stderr } : undefined);
+        const plan = await remote.prepare(args);
+        await assert.rejects(remote.install(plan, async () => {}), { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', remoteOutcomeUncertain: true });
+        assert.equal(await remote.rollback(plan, async () => {}), false);
+        await remote.close();
+    }
 });
 
 test('definite nonzero permits exact rollback, but SSH failure, signal, timeout or lost receipt never do', async () => {

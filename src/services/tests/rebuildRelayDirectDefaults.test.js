@@ -300,6 +300,6 @@ test('DIRECT install refuses an unattributed rule 220 before any write', t => {
             rpdbNetns: readlinkSync('/proc/self/ns/net') }), timeout: 10000 });
         assert.equal(result.status, 0, result.stderr || result.error?.message);
         assert.equal(result.stdout, '');
-        assert.equal(result.stderr, 'DIRECT_NO_WRITE_NETWORK_CONFLICT\n');
+        assert.equal(result.stderr, 'DIRECT_NO_WRITE_RULE_220_CONFLICT\n');
     } finally { rmSync(dir, { recursive: true, force: true }); }
 });

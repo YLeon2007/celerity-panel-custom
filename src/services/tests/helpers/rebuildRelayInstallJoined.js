@@ -498,8 +498,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         test(`joined DIRECT + stock prerequisites: ${scenario}`, async t => {
             const f = host(t, scenario);
             const expected = { settled: 'REBUILD_L2TP_INSTALL_FAILED', 'sidecar-refusal': 'REBUILD_L2TP_INSTALL_FAILED',
-                'ike-active': 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
-                'foreign-rpdb6': 'REBUILD_L2TP_DIRECT_NETWORK_CONFLICT', 'manager-override': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'ike-active': 'REBUILD_L2TP_DIRECT_IKE_ACTIVE_UNMANAGED', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'foreign-rpdb6': 'REBUILD_L2TP_DIRECT_RULE_220_CONFLICT', 'manager-override': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
                 'unacknowledged-start': 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN',
                 prewrite: 'REBUILD_L2TP_INSTALL_FAILED', masked: 'REBUILD_L2TP_HOST_NOT_READY',
                 package: 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'user-rpc-error': 'REBUILD_L2TP_DIRECT_PROFILE_USERS',

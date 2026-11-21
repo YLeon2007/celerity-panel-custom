@@ -192,7 +192,8 @@ function host(t, scenario) {
     };
     const prepared = wire('prepare', { machineId, network });
     if (initialIdle || scenario === 'explicit-ike-include') {
-        assert.deepEqual([prepared.status, prepared.stdout, prepared.stderr], [70, '', 'DIRECT_PREREQUISITE\n']);
+        assert.deepEqual([prepared.status, prepared.stdout, prepared.stderr],
+            [70, '', initialIdle ? 'DIRECT_IKE_ACTIVE_UNMANAGED\n' : 'DIRECT_PREREQUISITE\n']);
         assert.deepEqual(report().effects, []);
         assert.deepEqual(report().units, original);
         assert.ok(!fs.existsSync(p(stockSwan.profile)) && !fs.existsSync(p('/var/lib/celerity-rebuild-l2tp-direct')));

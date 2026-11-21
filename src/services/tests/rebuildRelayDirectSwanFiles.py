@@ -428,13 +428,12 @@ class Files(unittest.TestCase):
 
     def test_ipv6_rule_conflicts_before_prepare_write(self):
         self.h['command'].side_effect = lambda *argv, **kw: b'[{"priority":220,"src":"all","table":"220"}]'
-        self.refusal_no_write(lambda: self.h['dispatch'](dict(self.req, action='prepare')), 'NETWORK_CONFLICT')
+        self.refusal_no_write(lambda: self.h['dispatch'](dict(self.req, action='prepare')), 'RULE_220_CONFLICT')
         self.assertFalse(self.path.exists())
 
     def test_already_running_idle_ike_is_not_restarted_or_adopted(self):
         self.units[self.IKE].update(ActiveState='active', SubState='running', MainPID='42', InvocationID='foreign')
-        self.h['idle_ike'] = lambda *_: [['udp','0.0.0.0',500], ['udp','0.0.0.0',4500]]
-        self.refusal_no_write(self.before, 'PREREQUISITE')
+        self.refusal_no_write(self.before, 'IKE_ACTIVE_UNMANAGED')
         self.assertFalse(self.path.exists())
 
     def test_applying_rollback_before_profile_creation_restores_absence(self):
@@ -648,7 +647,7 @@ class Files(unittest.TestCase):
             self.assertIn(dict(priority=220, src='all', table='220'), json.loads(rules(family)))
             for table in (177, 220):
                 request = {**self.req, 'action': 'prepare', 'network': {**NET, 'routeTable': table}}
-                self.refusal_no_write(lambda: h['dispatch'](request), 'NETWORK_CONFLICT')
+                self.refusal_no_write(lambda: h['dispatch'](request), 'RULE_220_CONFLICT')
                 self.assertEqual([rules(f) for f in ('-4', '-6')], snapshot)
                 self.assertFalse(self.real(h['VAULT']).exists())
             # Only the fixture's own rule in the disposable netns.
