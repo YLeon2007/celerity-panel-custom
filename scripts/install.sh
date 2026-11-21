@@ -493,19 +493,25 @@ prepare_mongo_keyfile() (
 )
 
 mongo_rs_eval() {
-  local deadline="$1" initiate="$2" budget
+  local deadline="$1" initiate="$2" now budget
+  now="$(date +%s)" || return 1
   budget=$((deadline - SECONDS))
   [ "$budget" -gt 0 ] || return 1
-  if [ "$budget" -gt 10 ]; then budget=10; fi
 
-  # Connect over the service network, not to the image entrypoint's temporary
-  # localhost-only standalone. Direct mode works before discovery of rs0.
-  # Credentials stay inside the Mongo container; never print raw shell output.
-  timeout --signal=KILL "${budget}s" docker compose -f "$COMPOSE_FILE" exec -T mongo sh -ec '
-    exec mongosh "mongodb://mongo:27017/admin?directConnection=true&serverSelectionTimeoutMS=2000&socketTimeoutMS=5000" \
+  # Wait for the stock entrypoint to exec the final mongod. The temporary
+  # bootstrap mongod is not PID 1. Connect directly over the service network.
+  # Bound the in-container process too: killing the Docker CLI does not reap
+  # its exec. Serialize with the Compose ping and keep HOME off the DB volume.
+  timeout --signal=KILL "${budget}s" docker compose -f "$COMPOSE_FILE" exec -T --user mongodb mongo sh -ec '
+    [ "$(cat /proc/1/comm)" = mongod ] || { echo BOOTSTRAPPING; exit 0; }
+    now=$(date +%s)
+    budget=$(($1 - now))
+    [ "$budget" -gt 0 ] || exit 1
+    exec timeout --signal=KILL "${budget}s" flock -F /tmp/c3-mongo-probe.lock env HOME=/tmp \
+      mongosh "mongodb://mongo:27017/admin?directConnection=true&serverSelectionTimeoutMS=2000&socketTimeoutMS=5000" \
       --quiet --norc --username "$MONGO_INITDB_ROOT_USERNAME" \
-      --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "$1"
-  ' sh "const initiate = $initiate;
+      --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "$2"
+  ' sh "$((now + budget))" "const initiate = $initiate;
     const admin = db.getSiblingDB('admin');
     let status;
     try { status = admin.runCommand({ replSetGetStatus: 1 }); }
@@ -535,7 +541,7 @@ wait_for_mongo_primary() {
     if result="$(mongo_rs_eval "$deadline" false)" && [ "$SECONDS" -lt "$deadline" ]; then
       case "$result" in
         PRIMARY) return 0 ;;
-        WAIT) ;;
+        WAIT|BOOTSTRAPPING) ;;
         NOT_INITIALIZED)
           if [ "$attempted" = 0 ]; then
             attempted=1
@@ -630,7 +636,7 @@ start_stack() {
   log "Starting stack"
   docker compose -f "$COMPOSE_FILE" up -d
 
-  local deadline=$((SECONDS + START_TIMEOUT))
+  local deadline=$((SECONDS + START_TIMEOUT)) healthy=0
   log "Waiting up to ${START_TIMEOUT}s for containers and health checks"
   while [ "$SECONDS" -lt "$deadline" ]; do
     if container_running hysteria-backend \
@@ -639,19 +645,15 @@ start_stack() {
       && container_healthy hysteria-mongo \
       && container_healthy hysteria-redis \
       && backend_health_ok \
-      && https_health_ok; then
+      && https_health_ok \
+      && [ "$SECONDS" -lt "$deadline" ]; then
+      healthy=1
       break
     fi
-    sleep 3
+    if [ "$SECONDS" -lt "$deadline" ]; then sleep 3; fi
   done
 
-  if ! container_running hysteria-backend \
-    || ! container_running hysteria-updater \
-    || ! container_running hysteria-caddy \
-    || ! container_healthy hysteria-mongo \
-    || ! container_healthy hysteria-redis \
-    || ! backend_health_ok \
-    || ! https_health_ok; then
+  if [ "$healthy" = 0 ]; then
     warn "Installation health gate failed; inspect container logs locally for details"
     docker compose -f "$COMPOSE_FILE" ps >&2 || true
     fail "Stack did not become healthy within ${START_TIMEOUT}s"

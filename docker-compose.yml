@@ -34,11 +34,18 @@ services:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-hysteria}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet"]
-      interval: 5s
-      timeout: 5s
+      test:
+        - CMD-SHELL
+        - >-
+          [ "$$(cat /proc/1/comm)" = mongod ] &&
+          exec gosu mongodb timeout --signal=KILL 45s
+          flock -n -F /tmp/c3-mongo-probe.lock env HOME=/tmp
+          mongosh 'mongodb://127.0.0.1:27017/admin?directConnection=true&serverSelectionTimeoutMS=2000'
+          --quiet --norc --eval 'quit(db.adminCommand("ping").ok === 1 ? 0 : 1)'
+      interval: 10s
+      timeout: 50s
       retries: 12
-      start_period: 20s
+      start_period: 120s
     networks:
       - hysteria-net
 
