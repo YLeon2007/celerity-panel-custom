@@ -25,6 +25,7 @@ import uuid
 from typing import Any, cast
 
 MAIN = '/usr/local/etc/xray/config.json'
+XRAY_CONFIG_WRITABLE = 'XRAY_CONFIG_WRITABLE'
 BRIDGE = '/usr/local/etc/xray-bridge/config.json'
 XRAY = '/usr/local/bin/xray'
 SYSTEM = '/etc/systemd/system'
@@ -171,15 +172,20 @@ def directory(path, private=False):
         os.close(fd)
 
 
-def read(path, maximum=MAX_FILE):
+def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False):
     parent, name = os.path.split(path)
     try:
         with directory(parent) as fd:
             with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), 'rb') as handle:
                 st = os.fstat(handle.fileno())
                 owner_ok = st.st_uid == 0 or (path in (MAIN, BRIDGE) and st.st_uid == pwd.getpwnam('nobody').pw_uid)
+                writable = bool(st.st_mode & 0o022)
+                diagnose_writable = diagnose_main_mode and path == MAIN
                 need(stat.S_ISREG(st.st_mode) and owner_ok and st.st_nlink == 1
-                     and not st.st_mode & 0o7022 and not os.listxattr(handle.fileno()), 'PREREQUISITE')
+                     and not st.st_mode & 0o7000 and (not writable or diagnose_writable)
+                     and not os.listxattr(handle.fileno()), 'PREREQUISITE')
+                # Only install observation distinguishes this mode; do not read the payload.
+                need(not writable, XRAY_CONFIG_WRITABLE)
                 data = handle.read(maximum + 1)
                 need(len(data) <= maximum and len(data) == st.st_size, 'PREREQUISITE')
                 return entry(data, stat.S_IMODE(st.st_mode), st.st_gid, st.st_uid)
@@ -949,7 +955,8 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
         need(directory_absent(path), 'PREREQUISITE')
     need(not any(os.path.lexists(p) for p in ('/etc/nftables.d/celerity-l2tp.nft', '/etc/ipsec.d/celerity-l2tp.conf')),
          'PREREQUISITE')
-    files = {key: read(path) for key, path in NAMES.items()}
+    files = {key: read(path, diagnose_main_mode=True) if key == 'main' else read(path)
+             for key, path in NAMES.items()}
     need(all(files[k] is None for k in ('ike', 'options', 'nft', 'net', 'drop'))
          and all(files[k] is not None for k in ('main', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
     starter = uncomment(raw(files['starter']))

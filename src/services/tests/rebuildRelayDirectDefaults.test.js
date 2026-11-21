@@ -26,7 +26,7 @@ DAEMON_OPTS=""
 // a private scratch tree; each modeled observation is read-only. No systemd,
 // dpkg, sockets, /dev/ppp or host configuration are accessed by this test.
 const harness = String.raw`
-import io, json, os, runpy, subprocess, sys
+import contextlib, io, json, os, runpy, subprocess, sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -86,6 +86,38 @@ elif lns_case:
         assert lns_case == 'missing'
 if opts.get('missingChap'):
     backing(h['NAMES']['chap']).unlink()
+
+def file_pin(p):
+    if not os.path.lexists(p):
+        return None
+    st = p.lstat()
+    return st.st_ino, st.st_mode, st.st_mtime_ns, st.st_ctime_ns
+
+config = opts.get('config')
+if config is not None:
+    config_path = {'bridge': h['BRIDGE'], **h['NAMES']}[config.get('file', 'main')]
+    config_mode = config.get('mode', 0o666)
+    target = put(config_path, b'{}', config_mode)
+    kind = config.get('kind')
+    if kind == 'hardlink':
+        os.link(target, target.with_suffix('.alias'))
+    elif kind in ('symlink', 'dangling', 'directory', 'fifo', 'missing'):
+        target.unlink()
+        if kind == 'symlink':
+            other = put(config_path + '.foreign', b'{}', config_mode)
+            target.symlink_to(other.name)
+        elif kind == 'dangling':
+            target.symlink_to('absent.json')
+        elif kind == 'directory':
+            target.mkdir()
+            target.chmod(config_mode)
+        elif kind == 'fifo':
+            os.mkfifo(target)
+            target.chmod(config_mode)
+    elif kind == 'writable-parent':
+        target.parent.chmod(0o777)
+    before_target = file_pin(target)
+    forbidden_payload = (target.stat().st_ino if target.is_file() and not opts['accept'] else None)
 backing('/etc/ipsec.d').mkdir()
 backing(h['NFT_DIR']).parent.mkdir(exist_ok=True)
 backing(path).parent.mkdir()
@@ -99,12 +131,15 @@ if opts['defaults'] is not None:
 
 owners = {backing(p).stat().st_ino: owner for p, owner in (
     (path, (opts.get('uid', 0), opts.get('gid', 0))), (local_xl, (0, opts.get('unitGid', 0)))) if backing(p).is_file()}
+if config is not None and config.get('owner') is not None:
+    owners[target.stat().st_ino] = (config['owner'], 0)
+payload_reads = []
 
 class ProjectedOS:
     path = NS(split=os.path.split, basename=os.path.basename, lexists=lambda p: os.path.lexists(backing(p)))
     def __getattr__(self, name):
         # Only the read side and existing FD traversal are allowed.
-        assert name in ('O_RDONLY','O_DIRECTORY','O_NOFOLLOW','O_NONBLOCK','close','fdopen','listxattr','listdir','umask')
+        assert name in ('O_RDONLY','O_DIRECTORY','O_NOFOLLOW','O_NONBLOCK','close','listdir','umask')
         return getattr(os, name)
     def open(self, part, flags, *, dir_fd=None):
         assert not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT)
@@ -121,9 +156,25 @@ class ProjectedOS:
         uid,gid = owners.get(st.st_ino, (0,0))
         return NS(st_mode=st.st_mode, st_uid=uid, st_gid=gid, st_nlink=st.st_nlink, st_size=st.st_size,
                   st_dev=st.st_dev, st_ino=st.st_ino)
+    @contextlib.contextmanager
+    def fdopen(self, fd, mode):
+        with os.fdopen(fd, mode) as handle:
+            if config is not None and os.fstat(fd).st_ino == forbidden_payload:
+                def reject_payload(*args):
+                    payload_reads.append(fd)
+                    raise AssertionError('refused config payload was read')
+                yield NS(fileno=handle.fileno, read=reject_payload)
+            else:
+                yield handle
+    def listxattr(self, fd):
+        if config is not None and config.get('xattr') and os.fstat(fd).st_ino == forbidden_payload:
+            return ['user.foreign']
+        return os.listxattr(fd)
+
     def geteuid(self): return 0
 
 h['os'] = ProjectedOS()
+h['pwd'] = NS(getpwnam=lambda name: NS(pw_uid={'nobody': 65534}[name]))
 units = {n: dict(LoadState='loaded', ActiveState='inactive', SubState='dead', MainPID='0', InvocationID='',
                 UnitFileState='enabled', NeedDaemonReload='no', FragmentPath='/usr/lib/systemd/system/'+n,
                 DropInPaths='', PrivateNetwork='no', User='', KillMode='control-group') for n in (XL,IKE,X,B,NET)}
@@ -202,6 +253,17 @@ assert status == (0 if opts['accept'] else 70), status
 assert not backing(h['VAULT']).exists()
 assert not backing(h['DROP_DIR']).exists()
 assert backing(boot).is_symlink() == bool(opts.get('enabled'))
+assert not payload_reads
+if config is not None:
+    assert before_target == file_pin(target)
+    if config.get('unscoped'):
+        try:
+            h['read'](config_path)
+        except h['Refusal'] as error:
+            assert str(error) == 'PREREQUISITE'
+        else:
+            raise AssertionError('ordinary guarded reader admitted writable MAIN')
+        assert not payload_reads
 if rpdb:
     assert h['NO_INSTALL_WRITES'] and list(ip_show) in commands
     assert subprocess.check_output(ip_show, timeout=4) == with_foreign_rule
@@ -316,6 +378,24 @@ runCases('DIRECT xl2tpd conffile', [
         .map(lns => [`${lns} remains a generic refusal`, { lns }]),
     ['missing CHAP file is not a missing xl2tpd conffile', { missingChap: true }],
     ['missing CHAP and LNS files remain a generic refusal', { lns: 'missing', missingChap: true }],
+]);
+
+runCases('DIRECT Xray main config', [
+    ['regular mode 0600 passes prepare', { accept: true, config: { mode: 0o600 } }],
+    ...['prepare', 'check', 'install'].map(action => [
+        `mode 0666 is diagnosed on ${action}`, { action, config: { unscoped: true }, code: 'XRAY_CONFIG_WRITABLE' },
+    ]),
+    ...[0o664, 0o646].map(mode => [
+        `either write bit is diagnosed (${mode.toString(8)})`, { config: { mode }, code: 'XRAY_CONFIG_WRITABLE' },
+    ]),
+    ['writable main owned by the supported Xray user', { config: { owner: 65534 }, code: 'XRAY_CONFIG_WRITABLE' }],
+    ...['missing', 'symlink', 'dangling', 'directory', 'fifo', 'hardlink', 'writable-parent']
+        .map(kind => [`${kind} remains a generic refusal`, { config: { kind } }]),
+    ['writable main with foreign owner', { config: { owner: 12345 } }],
+    ['writable main with special bits', { config: { mode: 0o4666 } }],
+    ['writable main with extended attributes', { config: { xattr: true } }],
+    ['writable bridge is not writable MAIN', { config: { file: 'bridge' } }],
+    ['writable LNS is not writable MAIN', { config: { file: 'lns' } }],
 ]);
 
 test('DIRECT install refuses an unattributed rule 220 before any write', t => {
