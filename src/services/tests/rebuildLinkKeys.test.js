@@ -140,6 +140,19 @@ test('TLS, REALITY and forward VMess need no key; eligible unprepared link canno
     })));
 });
 
+test('explicit none skips key preparation and envelope writes, with or without an old envelope', async () => {
+    const rows = [row(1, { mode: 'forward', tunnelSecurity: 'none', tunnelEncryption: 'none' }),
+        row(2, { mode: 'reverse', tunnelEncryption: 'none' })];
+    const db = storage([rows[0], { ...rows[1], [FIELD]: 'unused-legacy-envelope' }]);
+    const prepared = await preview(db, rows, { env: {} });
+    await apply(db, prepared, { env: {} });
+    assert.ok(prepared.every(link => !Object.hasOwn(link, '_rebuildVless') && tunnelSettings(link) === null));
+    assert.equal(db.calls.transactions, 0);
+    assert.equal(db.calls.writes, 0);
+    assert.equal(Object.hasOwn(db.get(rows[0]._id), FIELD), false);
+    assert.equal(db.get(rows[1]._id)[FIELD], 'unused-legacy-envelope');
+});
+
 test('rejects bad roots, malformed ciphertext, tampering, and copying a valid envelope from another link', async () => {
     const rows = [row(1), row(2)];
     const db = storage(rows);

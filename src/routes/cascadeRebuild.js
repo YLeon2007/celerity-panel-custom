@@ -7,7 +7,7 @@ const {componentFor,previewForError}=require('../services/rebuildCoordinator');
 const fail=code=>Object.assign(new Error(code),{code});
 const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
 const objectId=id=>typeof id==='string'&&/^[a-f\d]{24}$/i.test(id);
-const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelTransport tunnelDomain tcpFastOpen tcpKeepAlive tcpNoDelay wsPath wsHost grpcServiceName xhttpPath xhttpHost xhttpMode muxEnabled muxConcurrency geoRouting priority autoDeploy realityDest realitySni realityShortIds realityFingerprint').split(' ');
+const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelEncryption tunnelTransport tunnelDomain tcpFastOpen tcpKeepAlive tcpNoDelay wsPath wsHost grpcServiceName xhttpPath xhttpHost xhttpMode muxEnabled muxConcurrency geoRouting priority autoDeploy realityDest realitySni realityShortIds realityFingerprint').split(' ');
 // Mounted ONLY in rebuild, behind regular requireAuth. API key credentials are
 // scope checked; session writes also need the panel's actual CSRF token.
 function routerForRebuild({service=createRebuildService(),Link=require('../models/cascadeLinkModel'),Node=require('../models/hyNodeModel')}={}){
@@ -38,7 +38,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
  router.delete('/links/:id',...write,wrap(async req=>({executionMode:'rebuild',deleted:req.params.id,...(await run(req,false,true))})));
  const save=(editing)=>async (req,outcome)=>service.locks.run(async verify=>{
     const b=req.body||{};if(editing&&!objectId(req.params.id))throw fail('REBUILD_INVALID_REQUEST');
-    const link=editing?await Link.findById(req.params.id):new Link({tunnelUuid:crypto.randomUUID(),rebuildApplied:null});
+    const link=editing?await Link.findById(req.params.id):new Link({tunnelUuid:crypto.randomUUID(),rebuildApplied:null,tunnelEncryption:'vless-enc'});
     if(!link)throw fail('REBUILD_LINK_NOT_FOUND');if(link.rebuildDelete||link.lifecycle)throw fail('REBUILD_DELETION_PENDING');
     const old=editing?[String(link.portalNode),String(link.bridgeNode)]:[];
     const source=b.portalNodeId??old[0],target=b.bridgeNodeId??old[1];
@@ -48,6 +48,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     const from=inventory.find(n=>String(n._id)===source),to=inventory.find(n=>String(n._id)===target);
     if(!from||!to||!['portal','relay'].includes(from.cascadeRole)||!['relay','bridge'].includes(to.cascadeRole))throw fail('REBUILD_INVALID_EDGE_ROLE');
     if(Object.hasOwn(b,'tunnelSecurity')&&!['none','tls','reality'].includes(b.tunnelSecurity))throw fail('REBUILD_INVALID_REQUEST');
+    if(Object.hasOwn(b,'tunnelEncryption')&&!['vless-enc','none'].includes(b.tunnelEncryption))throw fail('REBUILD_INVALID_REQUEST');
     if(!editing&&!Object.hasOwn(b,'tunnelSecurity'))link.tunnelSecurity='reality';
     for(const field of fields){
         if(!Object.hasOwn(b,field))continue;
@@ -62,6 +63,11 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
             continue;
         }
         link.set(field,value);
+    }
+    if(link.tunnelEncryption==='none'&&(link.tunnelSecurity!=='none'||(link.mode==='forward'&&link.tunnelProtocol!=='vless'))){
+        if(b.tunnelEncryption==='none')throw fail('REBUILD_INVALID_REQUEST');
+        // Leaving the applicable mode cancels the opt-out; a later edit must opt out again.
+        link.tunnelEncryption='vless-enc';
     }
     if(link.tunnelSecurity==='tls'&&Object.hasOwn(b,'tlsServerName')){
         if(typeof b.tlsServerName!=='string')throw fail('REBUILD_TLS_SERVER_NAME_REQUIRED');

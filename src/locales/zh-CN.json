@@ -1434,6 +1434,8 @@
     "tunnelProtocol": "协议",
     "tunnelTransport": "传输",
     "tunnelSecurity": "安全",
+    "tunnelEncryption": "VLESS 隧道加密",
+    "tunnelEncryptionHint": "如果服务商限制或阻断节点之间的加密流量，请关闭此选项。",
     "deploy": "部署",
     "status": "状态",
     "selectPortal": "— 选择入口 —",

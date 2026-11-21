@@ -403,6 +403,8 @@
             if (rs) rs.style.display = this.value === 'reality' ? '' : 'none';
             updateLinkFormWarnings();
         });
+        if (rebuild) document.querySelector('#addLinkForm [name="tunnelProtocol"]')
+            ?.addEventListener('change', updateLinkFormWarnings);
 
         // Transport change -> disable REALITY for ws + refresh warnings
         var transSel = document.getElementById('selectTransport');
@@ -1220,6 +1222,7 @@
         if (rebuild && !editing) {
             form.tunnelTransport.value = 'tcp';
             form.tunnelSecurity.value = 'reality';
+            if (form.tunnelEncryption) form.tunnelEncryption.checked = true;
         }
         const realitySection = document.getElementById('realitySection');
         if (realitySection) realitySection.style.display = form.tunnelSecurity.value === 'reality' ? '' : 'none';
@@ -1280,6 +1283,7 @@
         form.tunnelProtocol.value = link.tunnelProtocol || 'vless';
         form.tunnelTransport.value = link.tunnelTransport === 'splithttp' ? 'xhttp' : (link.tunnelTransport || 'tcp');
         form.tunnelSecurity.value = link.tunnelSecurity || 'none';
+        if (rebuild && form.tunnelEncryption) form.tunnelEncryption.checked = link.tunnelEncryption !== 'none';
         form.tunnelDomain.value = link.tunnelDomain || 'reverse.tunnel.internal';
         form.muxEnabled.checked = !!link.muxEnabled;
         form.muxConcurrency.value = link.muxConcurrency || 8;
@@ -1535,6 +1539,7 @@
             muxConcurrency: parseInt(form.muxConcurrency?.value) || 8,
             priority:       Number(form.priority?.value || 100),
         };
+        if (canSetTunnelEncryption(form)) data.tunnelEncryption = form.tunnelEncryption.checked ? 'vless-enc' : 'none';
 
         // Tunnel domain (reverse only)
         if (form.tunnelDomain?.value) {
@@ -1972,9 +1977,16 @@
         });
     }
 
+    function canSetTunnelEncryption(form) {
+        return rebuild && form.tunnelEncryption && form.tunnelSecurity.value === 'none'
+            && (form.mode?.value !== 'forward' || form.tunnelProtocol.value === 'vless');
+    }
+
     function updateLinkFormWarnings() {
         var form = document.getElementById('addLinkForm');
         if (!form) return;
+        const encryptionGroup = document.getElementById('tunnelEncryptionGroup');
+        if (encryptionGroup) encryptionGroup.hidden = !canSetTunnelEncryption(form);
         var mode = (document.getElementById('linkModeInput') || {}).value || 'reverse';
         var isForward = mode === 'forward';
 

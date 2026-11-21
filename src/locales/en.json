@@ -1435,6 +1435,8 @@
     "tunnelProtocol": "Protocol",
     "tunnelTransport": "Transport",
     "tunnelSecurity": "Security",
+    "tunnelEncryption": "VLESS tunnel encryption",
+    "tunnelEncryptionHint": "Turn this off if your provider throttles or blocks encrypted traffic between nodes.",
     "deploy": "Deploy",
     "status": "Status",
     "selectPortal": "— Select Portal —",

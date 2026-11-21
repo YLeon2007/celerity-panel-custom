@@ -1435,6 +1435,8 @@
     "tunnelProtocol": "Протокол",
     "tunnelTransport": "Транспорт",
     "tunnelSecurity": "Безопасность",
+    "tunnelEncryption": "Шифрование туннеля VLESS",
+    "tunnelEncryptionHint": "Выключайте, если провайдер режет зашифрованный трафик между нодами.",
     "deploy": "Деплой",
     "status": "Статус",
     "selectPortal": "— Выберите Portal —",

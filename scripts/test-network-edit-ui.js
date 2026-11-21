@@ -11,7 +11,7 @@ const PORTAL_ID = '507f1f77bcf86cd799439055';
 const BRIDGE_ID = '507f1f77bcf86cd799439066';
 const snapshot = (extra = {}) => ({ topologyRevision: 7, deployedRevision: 6, links: [], ...extra });
 
-function browserHarness({ persistedAutoDeploy = true, operation = null, job = null,
+function browserHarness({ persistedAutoDeploy = true, operation = null, job = null, savedLink = {},
     links = [], deployResponse = null, confirmResult = true, autoDeployError = null,
     livePorts = false, locale = 'en', rebuild = false } = {}) {
     const requests = [];
@@ -70,6 +70,10 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
     })) form[name] = { value };
     form.autoDeploy = { checked: true };
     form.muxEnabled = { checked: false };
+    if (rebuild) {
+        form.tunnelEncryption = { checked: true };
+        element('tunnelEncryptionGroup').hidden = true;
+    }
     const submit = { disabled: false, innerHTML: '' };
     form.querySelector = selector => selector === '[type="submit"]' ? submit : null;
     form.reset = () => { form.autoDeploy.checked = true; };
@@ -134,7 +138,7 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
         if (url === '/api/cascade/links' && !options) return json(snapshot({ links }));
         if (url === '/api/cascade/links/' + LINK_ID && !options) return json({
             name: 'Existing link', portalNode: livePorts ? PORTAL_ID : 'portal',
-            bridgeNode: livePorts ? BRIDGE_ID : 'bridge', autoDeploy: persistedAutoDeploy,
+            bridgeNode: livePorts ? BRIDGE_ID : 'bridge', autoDeploy: persistedAutoDeploy, ...savedLink,
         });
         if (url === '/api/cascade/topology/deploy' && deployResponse) return {
             ok: false, status: deployResponse.status, async json() { return deployResponse.body; },
@@ -226,6 +230,47 @@ test('only rebuild new-link forms default to REALITY; edits and explicit none ar
     assert.equal(h.form.tunnelSecurity.value, 'reality');
     assert.equal(h.requests.filter(r => r.method === 'POST').length, 0);
     assert.match(h.toasts.at(-1)[0], /REALITY.*WebSocket/);
+});
+
+test('rebuild edit loads, toggles and submits VLESS encryption only when applicable', async () => {
+    for (const [saved, checked] of [[undefined, true], ['none', false], ['vless-enc', true]]) {
+        const h = browserHarness({ rebuild: true, savedLink: { mode: 'forward', tunnelEncryption: saved } });
+        await h.ui.openEditLinkModal(LINK_ID);
+        assert.equal(h.elements.tunnelEncryptionGroup.hidden, false);
+        assert.equal(h.form.tunnelEncryption.checked, checked);
+        h.form.tunnelEncryption.checked = !checked;
+        const request = await save(h);
+        assert.equal(request.method, 'PUT');
+        assert.equal(request.body.tunnelEncryption, checked ? 'none' : 'vless-enc');
+        await h.ui.openAddLinkModal();
+        assert.equal(h.form.tunnelEncryption.checked, true);
+        assert.equal(h.elements.tunnelEncryptionGroup.hidden, true, 'REALITY default does not expose toggle');
+    }
+    for (const savedLink of [{ tunnelSecurity: 'tls' }, { mode: 'forward', tunnelProtocol: 'vmess' }]) {
+        const h = browserHarness({ rebuild: true, savedLink });
+        await h.ui.openEditLinkModal(LINK_ID);
+        assert.equal(h.elements.tunnelEncryptionGroup.hidden, true);
+        assert.equal(Object.hasOwn((await save(h)).body, 'tunnelEncryption'), false);
+    }
+    const classic = browserHarness();
+    await classic.ui.openEditLinkModal(LINK_ID);
+    assert.equal(Object.hasOwn((await save(classic)).body, 'tunnelEncryption'), false);
+});
+
+test('the real link form renders an accessible localized checkbox only in rebuild mode', () => {
+    const view = fs.readFileSync(path.join(__dirname, '..', 'views/nodes.ejs'), 'utf8');
+    const start = view.indexOf('<form id="addLinkForm"');
+    const template = view.slice(start, view.indexOf('</form>', start) + 7);
+    const ejs = require('ejs');
+    assert.doesNotMatch(ejs.render(template, { t: k => k }), /name="tunnelEncryption"/);
+    for (const locale of ['ru', 'en', 'zh-CN']) {
+        const labels = require('../src/locales/' + locale + '.json').network;
+        const t = key => labels[key.split('.')[1]] ?? key;
+        const html = ejs.render(template, { t, c3Rebuild: true });
+        assert.match(html, /<input type="checkbox" name="tunnelEncryption" aria-describedby="tunnelEncryptionHint" checked>/);
+        assert.ok(labels.tunnelEncryption && html.includes(labels.tunnelEncryption));
+        assert.ok(labels.tunnelEncryptionHint && html.includes(labels.tunnelEncryptionHint));
+    }
 });
 
 test('main form warns about a source-config-only listener absent from cached DB links', async () => {

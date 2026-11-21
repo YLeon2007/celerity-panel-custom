@@ -23,6 +23,33 @@ const route = (config, inbound, dest = '') => config.routing.rules.find(rule => 
 ))?.outboundTag ?? config.outbounds[0].tag;
 const byNode = (profiles, nodeId, profile = 'main') => profiles.find(p => p.nodeId === nodeId && p.profile === profile).config;
 
+test('explicit none composes a forward VLESS hop without keys or a protected client diff', () => {
+    const { profilePreview } = require('../../../services/rebuildCoordinator');
+    const nodes = [node('p', 'portal', 1), node('r', 'relay', 2), node('b', 'bridge', 3)];
+    const forward = edge('forward', 'p', 'r', 1, { mode: 'forward', tunnelSecurity: 'none' });
+    const exit = edge('exit', 'r', 'b', 2, { mode: 'forward' });
+    const compose = choice => composeRebuildProfiles({ nodes, links: [choice, exit],
+        usersByNode: { p: [{ userId: 'reader', xrayUuid: id(100) }] } });
+    const encrypted = compose(forward);
+    const plain = { ...forward, tunnelEncryption: 'none' };
+    delete plain._rebuildVless;
+    const clear = compose(plain);
+    const dial = byNode(clear, 'p').outbounds.find(o => o.tag === 'fwd-forward');
+    const listen = byNode(clear, 'r').inbounds.find(i => i.tag === 'fwd-hop-forward');
+    assert.equal(dial.settings.vnext[0].users[0].encryption, 'none');
+    assert.equal(listen.settings.decryption, 'none');
+    assert.equal(dial.streamSettings.security, 'none');
+    assert.equal(listen.settings.clients[0].id, forward.tunnelUuid);
+    for (const [from, to] of [[encrypted, clear], [clear, encrypted]]) {
+        for (const endpoint of ['p', 'r']) {
+            const preview = profilePreview(byNode(from, endpoint), byNode(to, endpoint), 'main');
+            assert.equal(preview.change, 'replace');
+            assert.equal(preview.protectedChanged, false);
+        }
+    }
+    assert.throws(() => compose({ ...forward, tunnelEncryption: 'invalid' }), { code: 'REBUILD_INVALID_TUNNEL' });
+});
+
 test('actual profiles route a reverse split/merge with priorities and share relay policy with local ingress', () => {
     const nodes = [node('p', 'portal', 1), node('r', 'relay', 2), node('s', 'relay', 3), node('m', 'relay', 4),
         node('a', 'bridge', 5), node('b', 'bridge', 6), node('c', 'bridge', 7)];

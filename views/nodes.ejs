@@ -508,6 +508,16 @@ function nodeMetaFor(node) {
                     </div>
                 </div>
 
+                <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+                <div class="form-group" id="tunnelEncryptionGroup" hidden>
+                    <label class="checkbox-label">
+                        <input type="checkbox" name="tunnelEncryption" aria-describedby="tunnelEncryptionHint" checked>
+                        <span><%= t('network.tunnelEncryption') %></span>
+                    </label>
+                    <div class="form-hint" id="tunnelEncryptionHint"><%= t('network.tunnelEncryptionHint') %></div>
+                </div>
+                <% } %>
+
                 <!-- REALITY Settings (hidden by default) -->
                 <div class="form-section" id="realitySection" style="display:none">
                     <div class="form-section-title"><i class="ti ti-shield-lock"></i> REALITY</div>
@@ -1313,7 +1323,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=rebuild2' : '/js/network.min.js?v=8c1440573d630ba3'
+        window._c3Rebuild ? '/js/network.js?v=rebuild3' : '/js/network.min.js?v=8c1440573d630ba3'
     ];
 
     let idx = 0;

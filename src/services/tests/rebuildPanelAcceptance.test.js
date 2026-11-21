@@ -45,6 +45,9 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
     const nodes={}, nodeIds={}, roles={p:'portal',u:'relay',r:'relay',a:'bridge',b:'bridge',c:'bridge',x:'portal',y:'bridge'};
     for (const [i,[n,role]] of Object.entries(roles).entries()) {
         const node={_id:id(),name:n,cascadeRole:role,type:'xray',active:true,ip:`192.0.2.${i+1}`,port:22000+i,xray:{inboundTag:'client',apiPort:31000+i,transport:'tcp',security:'none'}};
+        // The forward plaintext fixture uses a private peer; newer Xray
+        // rejects a literal public destination before installing the profile.
+        if(n==='y') node.ip='10.123.45.67';
         if(n==='r') Object.assign(node,{_id:relayId,ssh:{port:22,username:'root',password:'fixture-ssh-auth'}});
         if(n==='p') Object.assign(node.xray,{security:'reality',realitySni:['site.invalid'],realityDest:'site.invalid:443',realityPrivateKey:keys.privateKey,realityPublicKey:keys.publicKey,realityShortIds:['0123abcd']});
         await Node.collection.insertOne(node); nodes[n]=node; nodeIds[n]=String(node._id);
@@ -154,6 +157,10 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
     assert.ok(!events().some(e=>[nodeIds.x,nodeIds.y].includes(e.split(':')[1])));
     await t.test('first Apply migrates a classic reverse pair without changing the portal client or rolling tunnel keys on repeat',async()=>{
         const classic=require('../configGenerator');
+        assert.equal(Object.hasOwn(new Link().toObject(),'tunnelEncryption'),false,'Classic should not get a persisted default');
+        const xyId=new mongoose.Types.ObjectId(links.xy);
+        assert.equal((await Link.collection.findOne({_id:xyId})).tunnelEncryption,'vless-enc');
+        await Link.collection.updateOne({_id:xyId},{$unset:{tunnelEncryption:1}});
         const old=await Link.findById(links.xy).lean();
         const subscriber={_id:id(),userId:'migration-fixture',subscriptionToken:randomUUID(),enabled:true,nodes:[nodes.x._id],xrayUuid:randomUUID()};
         await User.collection.insertOne(subscriber);
@@ -185,5 +192,92 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
         assert.ok(identity(config('x'))===before,'client changed');
         const digest=digests();await apply(links.xy);
         assert.ok((await raw()).rebuildVlessKeyEnvelope===envelope); assert.deepEqual(digests(),digest);
+    });
+    await t.test('forward VLESS encryption switches both endpoints after Preview, without a protected diff',async()=>{
+        await remove('xy');
+        const before=events().length;
+        const created=await call('POST','/links',{name:'forward encryption fixture',mode:'forward',
+            portalNodeId:nodeIds.x,bridgeNodeId:nodeIds.y,tunnelPort:41005,tunnelSecurity:'none',tunnelEncryption:'none'});
+        const linkId=created.linkId, url=`/links/${linkId}`, suffix=linkId.slice(-8);
+        const raw=()=>Link.collection.findOne({_id:new mongoose.Types.ObjectId(linkId)});
+        const assertSaved=async value=>{
+            assert.equal((await raw()).tunnelEncryption,value);
+            const saved=await call('GET',url);
+            assert.equal(saved.tunnelEncryption,value);
+            assert.equal(Object.hasOwn(saved,'rebuildVlessKeyEnvelope'),false);
+        };
+        const previewHop=async()=>{
+            const report=await preview(linkId);
+            assert.equal(report.allowed,true);
+            assert.ok(report.nodes.flatMap(n=>n.profiles).every(p=>p.protectedChanged===false));
+            return report;
+        };
+        const pair=()=>{
+            const dial=config('x').outbounds.find(o=>o.tag===`fwd-${suffix}`);
+            const listener=config('y','bridge').inbounds.find(i=>i.tag===`fwd-hop-${suffix}`);
+            assert.equal(dial.settings.vnext[0].users[0].id,listener.settings.clients[0].id);
+            assert.equal(dial.streamSettings.security,'none');
+            assert.equal(listener.streamSettings.security,'none');
+            return [dial.settings.vnext[0].users[0].encryption,listener.settings.decryption];
+        };
+        await assertSaved('none');
+        const denied=await call('PUT',url,{tunnelEncryption:null},400);
+        assert.equal(denied.error.code,'REBUILD_INVALID_REQUEST');
+        for(const other of [{tunnelSecurity:'reality'},{tunnelProtocol:'vmess'}]) {
+            const denied=await call('PUT',url,{...other,tunnelEncryption:'none'},400);
+            assert.equal(denied.error.code,'REBUILD_INVALID_REQUEST');
+            await assertSaved('none');
+        }
+        await call('PUT',url,{name:'renamed without changing encryption'});
+        await assertSaved('none');
+        const clearPreview=await previewHop();
+        assert.equal(events().length,before);
+        await apply(linkId,clearPreview);
+        assert.deepEqual(pair(),['none','none']);
+        assert.equal(Object.hasOwn(await raw(),'rebuildVlessKeyEnvelope'),false);
+
+        const beforeRefusal=digests(), stageCount=events().length;
+        await Node.collection.updateOne({_id:nodes.y._id},{$set:{ip:'192.0.2.8'}});
+        try {
+            const unsupported=await previewHop();
+            const response=await call('POST','/topology/deploy',{linkId,expectedPreview:unsupported.previewId},409);
+            assert.equal(response.error.code,'REBUILD_PARSER_FAILED');
+            assert.ok(events().slice(stageCount).some(event=>event.startsWith('stage:')));
+            assert.ok(events().slice(stageCount).every(event=>!event.startsWith('put:')&&!event.startsWith('written:')));
+            assert.deepEqual(digests(),beforeRefusal);
+            assert.equal(Object.hasOwn(await raw(),'rebuildVlessKeyEnvelope'),false);
+        } finally {
+            await Node.collection.updateOne({_id:nodes.y._id},{$set:{ip:nodes.y.ip}});
+        }
+
+        let envelope, encrypted;
+        for(const value of ['vless-enc','none','vless-enc']) {
+            const count=events().length;
+            const stale=await previewHop();
+            await call('PUT',url,{tunnelEncryption:value});
+            await assertSaved(value);
+            const fresh=await previewHop();
+            assert.notEqual(fresh.previewId,stale.previewId);
+            assert.equal((await call('POST','/topology/deploy',{linkId,expectedPreview:stale.previewId},409)).error.code,
+                'REBUILD_PREVIEW_CHANGED');
+            assert.equal(events().length,count);
+            assert.ok((await raw()).rebuildVlessKeyEnvelope===envelope,'edit or preview changed the sealed key');
+            await apply(linkId,fresh);
+            if(value==='none') assert.deepEqual(pair(),['none','none']);
+            else {
+                const next=pair();
+                assert.ok(next[0].startsWith('mlkem768x25519plus.native.0rtt.') && next[1].startsWith('mlkem768x25519plus.native.600s.'));
+                if(encrypted) assert.ok(next.every((key,i)=>key===encrypted[i]),'re-enable changed the tunnel keys');
+                else encrypted=next;
+                envelope??=(await raw()).rebuildVlessKeyEnvelope;
+                assert.ok(typeof envelope==='string','encrypted Apply did not seal a key');
+            }
+            assert.ok((await raw()).rebuildVlessKeyEnvelope===envelope,'Apply changed an existing envelope');
+        }
+        await call('PUT',url,{tunnelEncryption:'none'});
+        await call('PUT',url,{tunnelProtocol:'vmess'});
+        await assertSaved('vless-enc');
+        await call('PUT',url,{tunnelProtocol:'vless'});
+        await assertSaved('vless-enc');
     });
 });

@@ -17,7 +17,8 @@ class LinkKeyError extends Error {
     constructor(code) { super(code); this.code = code; }
 }
 const fail = code => new LinkKeyError(code);
-const needsKey = link => (link?.mode !== 'forward' || (link.tunnelProtocol ?? 'vless') === 'vless') && (link?.tunnelSecurity ?? 'none') === 'none';
+const needsKey = link => (link.mode !== 'forward' || (link.tunnelProtocol ?? 'vless') === 'vless')
+    && (link.tunnelSecurity ?? 'none') === 'none' && link.tunnelEncryption !== 'none';
 
 function subkeys(env) {
     // Do not import config/cryptoService: no dotenv side effect, shared passphrase

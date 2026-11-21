@@ -22,12 +22,14 @@ function projectLinks(graph, options) {
         const reverse = entry.mode === 'reverse';
         const server = graph.byNodeId.get(reverse ? entry.source : entry.target).node;
         const security = link.tunnelSecurity ?? 'none';
+        const { tunnelEncryption = 'vless-enc' } = link;
         const port = link.tunnelPort;
         const id = link.tunnelUuid;
         const wire = security === 'tls' ? { ...link, tlsServerName: tunnelName(link) } : link;
         requireRebuild(address(server), 'REBUILD_INVALID_NODE_ADDRESS');
         requireRebuild(validPort(port) && typeof id === 'string' && /^\S+$/.test(id)
             && ['none', 'tls', 'reality'].includes(security)
+            && ['vless-enc', 'none'].includes(tunnelEncryption)
             && ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'].includes(link.tunnelTransport ?? 'tcp'), 'REBUILD_INVALID_TUNNEL');
         if (security === 'reality') {
             requireRebuild(typeof link.realityPrivateKey === 'string' && link.realityPrivateKey.length > 0
@@ -38,7 +40,7 @@ function projectLinks(graph, options) {
 
         let decryption = 'none';
         let encryption = 'none';
-        if (protocol === 'vless' && security === 'none') {
+        if (protocol === 'vless' && security === 'none' && tunnelEncryption === 'vless-enc') {
             const keys = tunnelSettings(link);
             decryption = keys?.decryption;
             encryption = keys?.encryption;
