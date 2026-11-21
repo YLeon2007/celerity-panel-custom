@@ -45,7 +45,8 @@ async function fixture(t, relayCount = 3) {
             if (hostFactory) return hostFactory(nodeId, binding);
             function check(users) { assert.ok(same(rendered(users), hosts.get(nodeId)), 'selected CHAP preimage'); }
             return {
-                preflight: async () => ({ ppp: true, masked: false, machineId: enrollment.find(x => x.nodeId === nodeId).machineId }),
+                preflight: async () => ({ ppp: true, masked: false, unitsLoaded: true,
+                    machineId: enrollment.find(x => x.nodeId === nodeId).machineId }),
                 prepare: async ({ desired }) => ({ desired, backupId: randomBytes(16).toString('hex') }),
                 install: async ({ desired }, guard) => {
                     await guard(); assert.equal(hosts.has(nodeId), false); hosts.set(nodeId, rendered(desired.users)); return true;

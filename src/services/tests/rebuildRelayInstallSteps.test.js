@@ -180,7 +180,7 @@ test('stock install refuses in runFreshRelayInstall before reserve; direct insta
     const mustNot = name => () => { calls.push(name); assert.fail(name); };
     const f = fixture();
     const remote = {
-        preflight: async () => ({ ppp: true, masked: false }), close: async () => calls.push('close'),
+        preflight: async () => ({ ppp: true, masked: false, unitsLoaded: true }), close: async () => calls.push('close'),
         uploadRootFile: mustNot('upload'), runArtifactCommand: mustNot('dispatch'), exec: mustNot('exec'),
     };
     await assert.rejects(() => runFreshRelayInstall(nodeId, {

@@ -48,7 +48,6 @@ function fixture(handler = () => {}) {
             if (result !== undefined) return result;
             if (input.action === 'preflight') return ok(ready);
             if (input.action === 'prepare') return ok(observation);
-            if (input.action === 'check') return ok({ ok: true });
             return ok({ ok: true, backupId: input.backupId });
         }
     }
@@ -104,6 +103,51 @@ test('prepare and validate before mutation, bind private desired and lock, then 
     assert.equal(await remote.verify(plan), true);
     await remote.close();
     assert.deepEqual(calls.slice(5), ['lock', 'install', 'verify', 'close']);
+});
+
+test('install checks require exact frames; the check alone never permits cleanup', async () => {
+    const partial = 'DIRECT_PPP_MODULES_LOAD_FAILED\n';
+    const noWrite = 'DIRECT_NO_WRITE_PPP_MODULES_LOAD_FAILED\n';
+    const frame = (stderr, stdout = '', code = 70) => ({ code, stdout, stderr });
+    for (const [result, trusted, unchanged, retained = false] of [
+        [frame(partial), true, false, true], [frame(noWrite), true, true],
+        [frame('DIRECT_PREREQUISITE\n'), true, false],
+        [frame(noWrite + '\n'), false, false], [frame(noWrite.trimEnd()), false, false],
+        [frame(noWrite.replace('\n', '\r\n')), false, false], [frame(noWrite, 'fixture-private'), false, false],
+        [frame(noWrite, '', 1), false, false], [frame('DIRECT_NO_WRITE_FUTURE_CHECK\n'), false, false],
+        [frame('DIRECT_NO_WRITE_PPP_MODULES_LOAD_FAILED fixture-private\n'), false, false],
+        [frame('DIRECT_IKE_ACTIVE_RULE_220\n'), false, false], [frame('', '', 75), false, false],
+    ]) {
+        const { remote, calls } = fixture(({ action }) => action === 'install' ? result : undefined);
+        const plan = await remote.prepare(args);
+        await assert.rejects(remote.install(plan, () => true), error => {
+            assert.equal(error.commandSettled === true, trusted && !retained);
+            assert.equal(error.prerequisitePartial === true, retained);
+            assert.equal(error.noHostChanges === true, unchanged);
+            assert.equal(error.remoteOutcomeUncertain === true, !trusted);
+            assert.equal(error.check, !trusted ? undefined
+                : result.stderr === 'DIRECT_PREREQUISITE\n' ? 'HOST_INSTALL' : 'PPP_MODULES_LOAD_FAILED');
+            assert.doesNotMatch(JSON.stringify(error) + error.message, /fixture-private|FUTURE_CHECK/);
+            return true;
+        });
+        assert.equal(await remote.rollback(plan, () => true), trusted && !unchanged && !retained);
+        assert.equal(calls.includes('rollback'), trusted && !unchanged && !retained);
+        await remote.close();
+    }
+});
+
+test('invalid read-only framing cannot produce an install check or prepare a write', async () => {
+    for (const result of [
+        { code: 70, stdout: '', stderr: 'DIRECT_NO_WRITE_XRAY_DROPIN_UNSUPPORTED\n' },
+        { code: 70, stdout: 'fixture-private', stderr: 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n' },
+        { code: 70, stdout: '', stderr: 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n\n' },
+        { code: 0, stdout: '{"ok":false,"ok":true}\n', stderr: '' },
+    ]) {
+        const { remote, calls } = fixture(({ action }) => action === 'check' ? result : undefined);
+        await assert.rejects(remote.prepare(args), { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' });
+        assert.deepEqual(calls, ['connect', 'preflight', 'prepare', 'check']);
+        await remote.close();
+    }
 });
 
 const nftMarkerProbe = String.raw`
@@ -232,7 +276,8 @@ test('IKE admission codes survive prepare, check and settled no-write install re
                 prepare: async () => remote.prepare(args), verifyReservation: async () => {},
                 reserve: async () => db.push('reserve'), restore: async () => db.push('restore'),
                 finish: async () => assert.fail('must not finish a refused install'),
-            }), { code: `REBUILD_L2TP_DIRECT_${reason}` });
+            }), { code: action === 'install' ? 'REBUILD_L2TP_INSTALL_FAILED' : 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                check: reason, outcome: 'refused' });
             assert.deepEqual(db, action === 'install' ? ['reserve', 'restore'] : []);
             assert.ok(!calls.includes('rollback') && !calls.includes('verify'));
             assert.equal(calls.at(-2), action);

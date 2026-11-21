@@ -384,24 +384,24 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         ['ppp-persist', 'installed', []],
         ['ppp-ready', 'installed', []],
         ['ppp-container-ready', 'installed', []],
-        ['ppp-container', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-child-userns', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-device-missing', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-blacklist', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-dependency-blacklist', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-install-hook', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-boot-blacklist', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-disabled', 'REBUILD_L2TP_PPP_MODULES_REQUIRED', []],
-        ['ppp-conflict', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
-        ['ppp-mask', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
-        ['ppp-shadow-mask', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
-        ['ppp-service-mask', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', []],
-        ['ppp-network-observers', 'REBUILD_L2TP_NETWORK_OBSERVATION_REQUIRED', []],
-        ['ppp-publish-race', 'REBUILD_L2TP_PPP_MODULES_PERSISTENCE_CONFLICT', [], true],
-        ['ppp-load-failure', 'REBUILD_L2TP_PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
-        ['ppp-no-readback', 'REBUILD_L2TP_PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
-        ['ppp-load-timeout', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', ['l2tp_ppp'], true],
-        ['ppp-lost-ack', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', ['l2tp_ppp'], true],
+        ['ppp-container', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-child-userns', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-device-missing', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-blacklist', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-dependency-blacklist', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-install-hook', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-boot-blacklist', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-disabled', 'PPP_MODULES_REQUIRED', []],
+        ['ppp-conflict', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-shadow-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-service-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-network-observers', 'NETWORK_OBSERVATION_REQUIRED', []],
+        ['ppp-publish-race', 'PPP_MODULES_PERSISTENCE_CONFLICT', [], true],
+        ['ppp-load-failure', 'PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
+        ['ppp-no-readback', 'PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
+        ['ppp-load-timeout', undefined, ['l2tp_ppp'], true],
+        ['ppp-lost-ack', undefined, ['l2tp_ppp'], true],
     ]) {
         test(`joined Install PPP prerequisite: ${scenario}`, async t => {
             const f = host(t, scenario);
@@ -410,12 +410,13 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             let status = 200, result;
             const res = { status(value) { status = value; return this; }, json(value) { result = value; } };
             await installHandler(f.create)({ params: { id }, body: {} }, res);
-            assert.equal(result.error?.code ?? result.status, expected, diagnostic(f));
             assert.equal(status, expected === 'installed' ? 200 : 409);
-            if (expected.includes('PPP_MODULES') || expected.includes('NETWORK_OBSERVATION')) {
-                assert.match(result.error.operatorAction, /^Have the /);
-                assert.equal(result.error.retryAllowed, retained ? false : undefined);
-            }
+            if (expected === 'installed') assert.equal(result.status, 'installed', diagnostic(f));
+            else assert.deepEqual(result.error, {
+                code: retained ? 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                outcome: retained ? 'unknown' : 'refused', ...(expected && { check: expected }),
+                ...(retained && expected && { retryAllowed: false }),
+            }, diagnostic(f));
             const { moduleLoads = [], effects } = f.records();
             assert.deepEqual(moduleLoads, loads);
             assert.equal(fs.readFileSync(join(f.root, '/etc/modules-load.d/10-unrelated.conf'), 'utf8'), '# operator-owned\nloop\n');
@@ -498,14 +499,18 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         test(`joined DIRECT + stock prerequisites: ${scenario}`, async t => {
             const f = host(t, scenario);
             const expected = { settled: 'REBUILD_L2TP_INSTALL_FAILED', 'sidecar-refusal': 'REBUILD_L2TP_INSTALL_FAILED',
-                'ike-active': 'REBUILD_L2TP_DIRECT_IKE_ACTIVE_UNMANAGED', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
-                'foreign-rpdb6': 'REBUILD_L2TP_DIRECT_RULE_220_CONFLICT', 'manager-override': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'ike-active': 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'foreign-rpdb6': 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'manager-override': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
                 'unacknowledged-start': 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN',
                 prewrite: 'REBUILD_L2TP_INSTALL_FAILED', masked: 'REBUILD_L2TP_HOST_NOT_READY',
                 package: 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'user-rpc-error': 'REBUILD_L2TP_DIRECT_PROFILE_USERS',
                 'sidecar-unsafe': 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' }[scenario];
             const outcome = await f.create().installRelay(id).catch(error => error);
             assert.equal(outcome.code ?? outcome.status, expected ?? 'installed', diagnostic(f));
+            if (scenario === 'ike-active' || scenario === 'foreign-rpdb6') {
+                assert.equal(outcome.check, scenario === 'ike-active' ? 'IKE_ACTIVE_UNMANAGED' : 'RULE_220_CONFLICT');
+                assert.equal(outcome.outcome, 'refused');
+            }
             if (!expected) {
                 assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
                 assert.ok(fs.lstatSync(join(f.root, f.bootLink)).isSymbolicLink());

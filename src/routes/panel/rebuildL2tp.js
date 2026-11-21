@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const { requireAuth, render } = require('./helpers');
 const { requirePanelCsrf } = require('./csrf');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
+const { installCheckIds } = require('../../services/rebuildRelayInstallDiagnostics');
 
 const pagePath = /^\/l2tp$/;
 const accountPath = /^\/rebuild\/relays\/l2tp\/accounts\/reveal$/;
@@ -71,8 +72,9 @@ function renderPage(res, model) {
     // Hash the packaged script on first use; there is no version to bump by hand.
     rebuildL2tpScriptVersion ??= createHash('sha256')
         .update(readFileSync(resolve(__dirname, '../../../public/js/rebuild-l2tp.js'))).digest('hex').slice(0, 16);
+    const installChecks = Object.fromEntries(installCheckIds.map(check => [check, t?.(`rebuildL2tp.installChecks.${check}`)]));
     return render(res, 'rebuild-l2tp', { title: title && title !== 'rebuildL2tp.title' ? title : 'L2TP', page: 'l2tp',
-        ...model, rebuildL2tpScriptVersion });
+        ...model, installChecks, rebuildL2tpScriptVersion });
 }
 
 function sendLoadError(res) {

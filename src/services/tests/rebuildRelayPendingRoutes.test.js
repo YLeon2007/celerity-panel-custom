@@ -157,6 +157,7 @@ test('pending relay-account intent fences public Install, confirmed Remove, Appl
         assert.equal(response.status, status, name);
         const body = JSON.parse(response.body);
         if (name === 'role') assert.equal(body.code, code);
+        else if (name === 'Install') assert.deepEqual(body, { error: { code, outcome: code === blocked ? 'busy' : 'unknown' } }, name);
         else assert.deepEqual(body, { error: { code } }, name);
         assert.deepEqual(lockEvents, ['acquire', 'verify', 'intent', 'release'], name);
         assert.deepEqual(effects, [], name);

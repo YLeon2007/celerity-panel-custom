@@ -87,7 +87,7 @@ test('DIRECT uses only operator endpoint and pin, plus allowlisted card credenti
             exec(_, { stdin }) {
                 const frame = JSON.parse(stdin);
                 calls.push(frame);
-                return { code: 0, stderr: '', stdout: JSON.stringify({ machineId: row.machineId, ppp: true, masked: false, unitsLoaded: true }) };
+                return { code: 0, stderr: '', stdout: `${JSON.stringify({ machineId: row.machineId, ppp: true, masked: false, unitsLoaded: true })}\n` };
             }
         }
         const remote = createRelayDirect({ env: list(a, b), node, SSH });

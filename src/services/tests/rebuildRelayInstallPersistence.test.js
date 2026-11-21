@@ -123,7 +123,7 @@ function fixture(t, planBackupId = backupId) {
     const plan = { backupId: planBackupId };
     let prepared;
     const hooks = {
-        preflight: async () => ({ ppp: true, masked: false, machineId }),
+        preflight: async () => ({ ppp: true, masked: false, unitsLoaded: true, machineId }),
         prepare: async () => plan,
         install: async guard => { await guard(); return true; },
         verify: async () => true,
@@ -719,7 +719,7 @@ test('operator list installs two relays under Apply exclusion and records their 
             async preflight() {
                 assert.equal(f.lockHeld, true);
                 preflight.push(selected.nodeId);
-                return { machineId: selected.machineId, ppp: true, masked: false };
+                return { machineId: selected.machineId, ppp: true, masked: false, unitsLoaded: true };
             },
             async prepare({ nodeId }) { assert.equal(nodeId, selected.nodeId); return { backupId: selected.machineId }; },
             async checkChap(installation, current, desired, guard) {

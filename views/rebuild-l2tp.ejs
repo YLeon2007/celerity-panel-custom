@@ -13,7 +13,8 @@ const relayPath = id => `/panel/rebuild/relays/${id}/l2tp`;
 const accountPath = '/panel/rebuild/relays/l2tp/accounts';
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
     'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
-    'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed'];
+    'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed',
+    'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed'];
 function secretControl(kind, url, index, login) {
     const valueId = `rebuild-l2tp-${kind}-${index}`;
 %>
@@ -39,6 +40,7 @@ function secretControl(kind, url, index, login) {
 </style>
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
      <% if (reconcile) { %>data-reconcile-url="<%= accountPath %>/reconcile"<% } %>
+     data-install-checks="<%= JSON.stringify(typeof installChecks === 'undefined' ? {} : installChecks) %>"
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
     <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
     <div class="card">
