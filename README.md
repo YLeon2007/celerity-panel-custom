@@ -132,6 +132,20 @@ UPDATER_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 
 
 This section applies to `feature/c3-rebuild`, not the `main` quick start above.
 Rebuild is a separate startup mode that uses Preview → Apply for cascade topology.
+
+To install this branch, download its installer into a fresh working directory and check its syntax:
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/refs/heads/feature/c3-rebuild/scripts/install.sh' -o ./install.sh &&
+  bash -n ./install.sh
+```
+
+If the check passes, review `./install.sh` before running it as root. Pass `BRANCH` explicitly so the installer checks out the same branch:
+
+```bash
+sudo BRANCH=feature/c3-rebuild bash ./install.sh
+```
+
 On a fresh install, the branch installer defaults to `C3_REBUILD_ENABLED=true` in `.env`.
 For manual setup, set it explicitly: the backend treats an unset flag or `false` as off.
 Leave strict/classic execution flags unset or `false`, and leave `C3_SETTINGS`

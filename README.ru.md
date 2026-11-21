@@ -130,6 +130,20 @@ UPDATER_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 
 
 Этот раздел относится к `feature/c3-rebuild`, а не к быстрому старту из `main` выше.
 Rebuild — отдельный режим запуска панели с предпросмотром перед применением изменений топологии (Preview → Apply).
+
+Чтобы установить эту ветку, скачайте её установщик в пустой рабочий каталог и проверьте синтаксис:
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/refs/heads/feature/c3-rebuild/scripts/install.sh' -o ./install.sh &&
+  bash -n ./install.sh
+```
+
+Если проверка прошла, просмотрите `./install.sh` перед запуском от root. Передайте `BRANCH` явно, чтобы установщик выбрал ту же ветку:
+
+```bash
+sudo BRANCH=feature/c3-rebuild bash ./install.sh
+```
+
 При новой установке установщик этой ветки по умолчанию записывает `C3_REBUILD_ENABLED=true` в `.env`.
 При ручной настройке задайте флаг явно: без него или при `false` backend не включает rebuild.
 Флаги выполнения strict/classic оставьте незаданными или равными `false`, а
