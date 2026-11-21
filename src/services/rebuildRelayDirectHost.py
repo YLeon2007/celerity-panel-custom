@@ -2720,49 +2720,109 @@ def session_sample(libc, proc, group, owner, held, watch, *, revoke=False):
     return main_start, result
 
 
-def revoke_peer_logins(rows, owner, users):
+REVOKE_DB_NAME = 'pppd2.tdb'
+# Built-in TDB in Debian trixie amd64 ppp 2.5.2-1+1 (SESSION_STOCK),
+# pppd/tdb.h and tdb.c: little-endian default header, 131 hash buckets.
+REVOKE_DB_BUCKETS = 131
+REVOKE_DB_HEADER = struct.pack('<32sII', b'TDB file\n', 0x2601196d, REVOKE_DB_BUCKETS) + bytes(128)
+REVOKE_DB_DATA = len(REVOKE_DB_HEADER) + 4 * (1 + REVOKE_DB_BUCKETS)
+REVOKE_ENV = re.compile(rb'ORIG_UID=0;PPPLOGNAME=(?:' + CHAP_LOGIN + rb'|\(unknown\));'
+                        rb'PPPD_PID=([1-9][0-9]{0,9});IFNAME=(ppp(?P<unit>0|[1-9][0-9]{0,9}));'
+                        rb'UNIT=(?P=unit);PEERNAME=(' + CHAP_LOGIN + rb');'
+                        rb'IPLOCAL=([0-9.]{7,15});IPREMOTE=([0-9.]{7,15});')
+
+
+def revoke_db_fetch(fd, size, key):
+    def at(offset, count):
+        data = os.pread(fd, count, offset)
+        session_need(len(data) == count)
+        return data
+
+    hsize = len(REVOKE_DB_HEADER)
+    value = 0x238f13af * len(key) + sum(byte << (i * 5 % 24) for i, byte in enumerate(key))
+    full_hash = (1103515243 * value + 12345) & 0xffffffff
+    bucket = full_hash % REVOKE_DB_BUCKETS
+    offset, = struct.unpack('<I', at(hsize + 4 * (1 + bucket), 4))
+    seen, found = set(), None
+    while offset:
+        session_need(REVOKE_DB_DATA <= offset <= size - 24 and offset % 4 == 0 and offset not in seen
+                     and len(seen) < 4096 and time.monotonic() < DEADLINE)
+        seen.add(offset)
+        following, length, klen, vlen, hashed, magic = struct.unpack('<6I', at(offset, 24))
+        end = offset + 24 + length
+        session_need(klen + vlen + 4 <= length and end <= size and length % 4 == 0
+                     and hashed % REVOKE_DB_BUCKETS == bucket and magic in (0x26011999, 0xfee1dead)
+                     and struct.unpack('<I', at(end - 4, 4))[0] == 24 + length)
+        if magic == 0x26011999 and full_hash == hashed and klen == len(key) and at(offset + 24, klen) == key:
+            session_need(found is None and 0 < vlen <= 4096)
+            found = at(offset + 24 + klen, vlen)
+        offset = following
+    if found is None:
+        raise Refusal(SESSION_UNKNOWN)
+    return found
+
+
+def revoke_db_writer(proc, pid, identity):
+    # Match the inode already opened by the attested child. No process env,
+    # memory, fd contents or journal are read, and no writer FD is duplicated.
+    fd = os.open(f'{pid}/fd', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=proc)
+    try:
+        fds = os.listdir(fd)
+        session_need(len(fds) <= 128 and all(re.fullmatch(r'[0-9]{1,10}', leaf) for leaf in fds))
+        matches = 0
+        for leaf in fds:
+            if os.readlink(leaf, dir_fd=fd).rsplit('/', 1)[-1] == REVOKE_DB_NAME:
+                st = os.stat(leaf, dir_fd=fd)
+                matches += (st.st_dev, st.st_ino) == identity
+        session_need(matches == 1)
+    finally:
+        os.close(fd)
+
+
+def revoke_db_identity(st):
+    session_need(stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1
+                 and not st.st_mode & 0o7022)
+    return st.st_dev, st.st_ino
+
+
+def revoke_peer_logins(rows, users):
     if not rows:
         return {}
-    # Stock pppd 2.5.2 auth_peer_success() emits a server-side notice, not
-    # the peer-supplied L2TP name or the CHAP client's success text.
-    matches = {'_BOOT_ID': owner[0].replace('-', ''), '_SYSTEMD_INVOCATION_ID': owner[1],
-               '_SYSTEMD_UNIT': XL, '_SYSTEMD_CGROUP': SESSION_GROUP, '_UID': '0', '_EXE': SESSION_PPP,
-               '_TRANSPORT': 'syslog', 'PRIORITY': '5'}
-    known = {str(row[3]): (row[4], row[2]) for row in rows}
-    hz = os.sysconf('SC_CLK_TCK')
-    # Also require syslog's kernel-source realtime stamp to clear the task
-    # birth tick. A receive stamp alone can be late for queued old datagrams.
-    def epoch():
-        return time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
-    first = epoch()
-    data = command('/usr/bin/journalctl', '--local', '--system', '--no-pager', '--quiet', '--output=json', '--lines=4097',
-                   '--output-fields=' + ','.join((*matches, '_PID', '_SOURCE_REALTIME_TIMESTAMP', 'MESSAGE')),
-                   '--grep=^Peer .* authenticated with ', *(k + '=' + v for k, v in matches.items()),
-                   *('_PID=' + p for p in known), quiet=True)
-    last = epoch()
-    session_need(hz > 0 and abs(first - last) < 1000000 and data.count(b'\n') < 4097)
     observed = {}
-    for line in data.splitlines():
-        decoded = json.loads(line)
-        session_need(type(decoded) is dict)
-        event = cast(dict[str, Any], decoded)
-        pid = event['_PID']
-        session_need(type(pid) is str and pid in known and type(event.get('MESSAGE')) is str
-                     and all(event.get(k) == v for k, v in matches.items()))
-        stamp, source = (event[k] for k in ('__MONOTONIC_TIMESTAMP', '_SOURCE_REALTIME_TIMESTAMP'))
-        session_need(all(type(s) is str and re.fullmatch(r'[0-9]{1,20}', s) for s in (stamp, source)))
-        start, peer = known[pid]
-        birth = ((start + 1) * 10**9 + hz - 1) // hz
-        if int(stamp) * 1000 < birth or int(source) * 1000 < max(first, last) + birth:
-            continue  # not evidence from this generation; still require a fresh notice
-        match = re.fullmatch(rb'Peer (' + CHAP_LOGIN + rb') authenticated with CHAP', event['MESSAGE'].encode('ascii'))
-        if match is None:
-            raise Refusal(SESSION_UNKNOWN)
-        login = match[1].decode('ascii')
-        # The authenticated login and live IPCP address must agree with the
-        # fenced account projection. IP alone could belong to a past account.
-        session_need(users.get(login) == peer and observed.setdefault(int(pid), login) == login)
-    session_need(len(observed) == len(rows))
+    with directory('/run') as run, directory('/proc') as proc:
+        fd = os.open(REVOKE_DB_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=run)
+        try:
+            # Stock tdb_open(O_RDONLY) disables locking. Instead take a
+            # nonblocking POSIX read lock covering init/alloc/hash-chain locks.
+            identity = revoke_db_identity(os.fstat(fd))
+            fcntl.lockf(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            size = os.fstat(fd).st_size
+            header = REVOKE_DB_HEADER
+            session_need(REVOKE_DB_DATA <= size <= MAX_FILE and os.pread(fd, len(header), 0) == header)
+            for _, local, peer, pid, _, _, _, stamp in rows:
+                revoke_db_writer(proc, pid, identity)
+                pid_bytes = str(pid).encode('ascii')
+                key = b'pppd' + pid_bytes
+                # main.c writes this process' script_env under pppd<PID> at
+                # startup and on updates. auth_peer_success() sets PEERNAME;
+                # ipcp_up() sets IPLOCAL/IPREMOTE before kernel activation.
+                # Require exact field order: values are not escaped, so a
+                # permissive split(';') could truncate a foreign peer name.
+                env = REVOKE_ENV.fullmatch(revoke_db_fetch(fd, size, key))
+                if env is None:
+                    raise Refusal(SESSION_UNKNOWN)
+                db_pid, name, number, login, db_local, db_peer = env.groups()
+                login = login.decode('ascii')
+                session_need(pid not in observed and db_pid == pid_bytes
+                             and (db_local, db_peer) == (local.encode('ascii'), peer.encode('ascii'))
+                             and users.get(login) == peer and session_pid_stamp(name.decode('ascii'), pid) == stamp)
+                # IPREMOTE is not a unique alias (two calls can share it).
+                for alias in (b'PPPD_PID=' + pid_bytes, b'IFNAME=' + name, b'UNIT=' + number):
+                    session_need(revoke_db_fetch(fd, size, alias) == key)
+                observed[pid] = login
+            session_need(revoke_db_identity(os.stat(REVOKE_DB_NAME, dir_fd=run, follow_symlinks=False)) == identity)
+        finally:
+            os.close(fd)  # releases the read lock before any signal/wait
     return observed
 
 
@@ -2838,8 +2898,8 @@ def revoke_ppp(request, blocked, chap, path, manifest, xl):
                     session_need(all(row[0] != key and row[6] != index for row in before[1]))
                     count += 1
                     closed_call = None
-                logins = revoke_peer_logins(before[1], owner, users)
-                session_need(before == sample())
+                logins = revoke_peer_logins(before[1], users)
+                session_need(before == sample() and logins == revoke_peer_logins(before[1], users))
                 unchanged()
                 selected = next((row for row in before[1] if logins[row[3]] == request['revokedLogin']), None)
                 watch()
@@ -2865,7 +2925,7 @@ def revoke_ppp(request, blocked, chap, path, manifest, xl):
                 closed_call = key, index
     except (Refusal, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
         # A checked partial reply is not authority to publish or replay. Never
-        # return log contents, PID, address or guessed count over the wire.
+        # return state contents, PID, address or guessed count over the wire.
         completed = False
     finally:
         DEADLINE = outer_deadline
