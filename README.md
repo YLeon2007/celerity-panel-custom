@@ -128,6 +128,41 @@ MONGO_PASSWORD=0123456789abcdef                 # openssl rand -hex 16
 UPDATER_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  # openssl rand -hex 32
 ```
 
+### Rebuild mode (`feature/c3-rebuild`)
+
+This section applies to `feature/c3-rebuild`, not the `main` quick start above.
+Rebuild is a separate startup mode that uses Preview → Apply for cascade topology.
+On a fresh install, the branch installer defaults to `C3_REBUILD_ENABLED=true` in `.env`.
+For manual setup, set it explicitly: the backend treats an unset flag or `false` as off.
+Leave strict/classic execution flags unset or `false`, and leave `C3_SETTINGS`
+and `TOPOLOGY_TEST_STARTUP_MODE` unset. See the [rebuild guide](docs/rebuild-mode.md).
+Compose passes `.env` to the `backend` service; recreate that container after changing the file.
+
+#### L2TP relay allowlist
+
+For rebuild L2TP Install and Remove, also set `C3_REBUILD_L2TP_INSTALL_ENABLED=true`.
+Put the relay allowlist on one line in `.env`: a JSON array with one object per
+relay and exactly these six fields. This is a template, not a usable enrollment:
+
+```env
+C3_REBUILD_L2TP_RELAYS_JSON='[{"nodeId":"<NODE_ID>","host":"relay.example.invalid","port":22,"username":"root","machineId":"<MACHINE_ID>","sshHostKeySha256":"<HOST_KEY_SHA256_HEX>"}]'
+```
+
+- `nodeId`: the panel node ID (24 lowercase hex characters). `host`: SSH IP or
+  DNS name; `port`: integer 1–65535; `username`: SSH login with root privileges
+  for DIRECT. These four fields must match the node card. SSH credentials stay
+  on the card, not in the JSON.
+- `machineId`: 32 lowercase hex characters from `/etc/machine-id`.
+  `sshHostKeySha256`: 64 lowercase hex characters of SHA-256 over the SSH host
+  public-key blob, not the OpenSSH `SHA256:…` display format. Use the trusted
+  machine ID and host key from the original enrollment record (B2), not values
+  learned from a first connection or a fresh scan of the target.
+- The list fails closed: a blank or invalid value, duplicate fields, or duplicate
+  node IDs, machine IDs, host-key pins or host/port pairs invalidate the entire
+  list. `[]` authorizes no relays; a relay missing from the list or with a
+  mismatched identity is denied. There is no fallback to the legacy single-relay
+  settings unless `C3_REBUILD_L2TP_RELAYS_JSON` is entirely unset.
+
 ---
 
 ## 🐳 Dokploy / Traefik (optional, not the primary path)
