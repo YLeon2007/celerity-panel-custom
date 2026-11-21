@@ -595,8 +595,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         assert.notEqual(afterMain.inode, beforeMain.inode);
         assert.deepEqual([afterMain.owner, afterMain.mode], [beforeMain.owner, beforeMain.mode]);
         assert.notEqual(f.records().units[f.x].InvocationID, originalInvocation);
-        assert.equal(f.records().units[f.net].ActiveState, 'failed');
-        assert.equal(f.records().units[f.xl].ActiveState, 'inactive');
+        assert.equal(f.records().units[f.net].ActiveState, 'active');
+        assert.equal(f.records().units[f.xl].ActiveState, 'active');
         assert.ok(f.records().rule && f.records().route && f.records().nft, 'Apply retains the installed kernel policy');
         const main = readJson(f.mpath);
         assert.ok(main.routing.rules.some(rule => rule.domain?.includes('full:new-deny.invalid')
@@ -604,11 +604,89 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         assert.ok(main.inbounds.some(row => row.tag === `relay-l2tp-${id}` && row.port === f.states[0].tproxyPort));
     }
 
-    test('joined DIRECT: later Apply preserves install ownership and recomposes policy', async t => {
+    const applyActions = ['check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network', 'verify-apply-network'];
+    for (const legacy of [false, true]) test(`joined DIRECT: switching the default tunnel keeps PPP (${legacy ? 'published unit' : 'new install'})`, async t => {
+        const f = host(t, 'sidecar', { lifecycle: true });
+        if (legacy) f.writeRecords({ ...f.records(), legacyNetwork: true });
+        const service = f.create(applyOptions(t, f));
+        assert.equal((await service.installRelay(id)).status, 'installed');
+        const before = f.records();
+        const manifestPath = `/var/lib/celerity-rebuild-l2tp-direct/${f.states[0].backupId}/manifest.json`;
+        const manifest = () => readJson(join(f.root, manifestPath));
+        const originalReceipt = manifest();
+        assert.equal(before.units[f.net].Requires.includes(f.x), legacy);
+        const ppp = { interface: 'ppp0', pid: 710, start: 810, l2tpId: 7 };
+        f.writeRecords({ ...before, ppp });
+        const [link] = f.links;
+        const defaultPort = () => {
+            const main = f.records().running[f.x];
+            const route = main.routing.rules.find(row => row.ruleTag === 'rebuild-policy-default');
+            return main.outbounds.find(row => row.tag === route.outboundTag).settings.vnext[0].port;
+        };
+        link.tunnelPort++;
+        const preview = await service.execute({ nodeId: id, preview: true });
+        assert.equal(preview.allowed, true);
+        assert.deepEqual(f.records(), { ...before, ppp }, 'Preview did not touch the relay');
+        assert.equal((await service.execute({ nodeId: id, expectedPreview: preview.previewId })).allowed, true);
+        const after = f.records();
+        assert.deepEqual(f.actions, [...installedActions, ...applyActions]);
+        assert.notEqual(after.units[f.x].InvocationID, before.units[f.x].InvocationID);
+        assert.equal(defaultPort(), link.tunnelPort, 'the new tunnel is selected by the live MAIN model');
+        assert.deepEqual(after.ppp, ppp, 'PPP did not survive MAIN restart');
+        for (const name of [f.xl, f.ike, f.net]) {
+            assert.equal(after.units[name].ActiveState, 'active');
+            assert.equal(after.units[name].MainPID, before.units[name].MainPID);
+            assert.equal(after.units[name].InvocationID, before.units[name].InvocationID);
+        }
+        for (const key of ['nft', 'rule', 'route']) assert.deepEqual(after[key], before[key]);
+        assert.equal(after.units[f.net].Requires.includes(f.x), false);
+        assert.equal(after.units[f.net].Wants.includes(f.x), true);
+        const settled = manifest();
+        if (legacy) {
+            assert.notDeepEqual(settled.after.net, originalReceipt.after.net);
+            assert.notDeepEqual(settled.runtime.files.net, originalReceipt.runtime.files.net);
+            originalReceipt.after.net = settled.after.net;
+            originalReceipt.runtime.files.net = settled.runtime.files.net;
+        }
+        assert.deepEqual(settled, originalReceipt, 'no changes outside the exact owned unit receipt');
+        f.writeRecords(Object.fromEntries(Object.entries(after).filter(([key]) => key !== 'ppp')));
+        assert.equal((await service.removeRelay(id)).status, 'not_installed');
+    });
+
+    test('joined DIRECT: interrupted unit transition is fenced before DELETE or MAIN restart', async t => {
+        const f = host(t, 'sidecar', { lifecycle: true });
+        f.writeRecords({ ...f.records(), legacyNetwork: true });
+        const service = f.create(applyOptions(t, f));
+        assert.equal((await service.installRelay(id)).status, 'installed');
+        const before = f.records();
+        const ppp = { interface: 'ppp0', pid: 710, start: 810 };
+        f.writeRecords({ ...before, failApplyReload: true, ppp });
+        const linkBefore = structuredClone(f.links[0]);
+        const linkId = String(f.links[0]._id);
+        const preview = await service.execute({ linkId, preview: true, remove: true });
+        await assert.rejects(service.execute({ linkId, remove: true, expectedPreview: preview.previewId }),
+            { code: 'REBUILD_L2TP_APPLY_NETWORK_OUTCOME_UNKNOWN', remoteOutcomeUncertain: true });
+        const manifest = `/var/lib/celerity-rebuild-l2tp-direct/${f.states[0].backupId}/manifest.json`;
+        assert.equal(readJson(join(f.root, manifest)).phase, 'network-upgrading');
+        assert.equal(f.links[0].rebuildDelete, linkBefore.rebuildDelete);
+        assert.equal(f.records().units[f.x].InvocationID, before.units[f.x].InvocationID);
+        assert.deepEqual(f.records().ppp, ppp);
+        await assert.rejects(service.execute({ linkId }), { code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED' });
+        assert.deepEqual(f.actions, [...installedActions, ...applyActions.slice(0, 2), 'check-apply-network']);
+    });
+
+    test('joined DIRECT: reload-induced stop propagation refuses at the native restart boundary', async t => {
         const f = host(t, 'sidecar', { lifecycle: true });
         const service = f.create(applyOptions(t, f));
         assert.equal((await service.installRelay(id)).status, 'installed');
-        await laterApply(f, service);
+        const before = f.records();
+        const ppp = { interface: 'ppp0', pid: 710, start: 810 };
+        f.writeRecords({ ...before, driftOnApplyEnable: true, ppp });
+        f.links[0].tunnelPort++;
+        await assert.rejects(service.execute({ nodeId: id }), { code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED' });
+        assert.equal(f.records().units[f.x].InvocationID, before.units[f.x].InvocationID);
+        assert.deepEqual(f.records().ppp, ppp);
+        assert.deepEqual(f.actions, [...installedActions, ...applyActions.slice(0, 4)]);
     });
 
     test('joined DIRECT: Remove uses the applied port despite a pending edit and ignores an unapplied draft', async t => {
@@ -759,7 +837,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         }
         assert.equal(status(outcome), 'not_installed', diagnostic(f));
         assert.deepEqual(outcome, { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
-        assert.deepEqual(f.actions, [...installedActions, 'prepare-remove', 'remove']);
+        assert.deepEqual(f.actions, [...installedActions, ...(apply ? applyActions : []), 'prepare-remove', 'remove']);
 
         const current = f.records();
         assert.deepEqual([current.rule, current.route, current.nft, current.ikeConnection], [null, null, null, false]);

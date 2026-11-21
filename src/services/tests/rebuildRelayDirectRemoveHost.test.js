@@ -139,10 +139,15 @@ def sc(*args):
     changes.append(args)
     if args == ('daemon-reload',):
         if Path(h['NET']).exists():
+            lines = Path(h['NET']).read_text().splitlines()
+            pre = next((line.split('=', 1)[1] for line in lines if line.startswith('ExecStartPre=')), '')
+            legacy = f'Requires={X}' in lines
             units[NET].update(LoadState='loaded', FragmentPath=h['NET'], UnitFileState='static',
-                              Type='oneshot', Requires=X, RequiredBy=XL)
+                              Type='oneshot', Requires=X if legacy else '', Wants='' if legacy else X, RequiredBy=XL,
+                              After=next(line.split('=', 1)[1] for line in lines if line.startswith('After=')),
+                              ExecStartPre=f'{{ path=/usr/bin/systemctl ; argv[]={pre} ; ignore_errors=no ; }}' if pre else '')
             units[XL].update(DropInPaths=h['DROP'], Requires=f'{NET} {IKE}', After=f'{NET} {IKE}')
-            units[X]['RequiredBy'], units[IKE]['RequiredBy'] = NET, XL
+            units[X]['RequiredBy'], units[IKE]['RequiredBy'] = (NET if legacy else ''), XL
         else:
             for n in (NET, XL, IKE): units[n] = dict(stock_units[n])
             units[X]['RequiredBy'] = ''

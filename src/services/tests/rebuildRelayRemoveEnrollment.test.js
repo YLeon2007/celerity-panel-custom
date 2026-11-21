@@ -50,9 +50,7 @@ def reloaded():
     _stock_reload()
     u = s['units']
     if backing(h['NET']).exists():
-        u[NET].update(Type='oneshot', Requires=X + ' sysinit.target system.slice', RequiredBy=XL)
-        u[NET]['After'] = X + ' nftables.service'
-        u[X]['RequiredBy'], u[IKE]['RequiredBy'] = NET, XL
+        u[NET]['Requires'] = (u[NET]['Requires'] + ' sysinit.target system.slice').strip()
     else:
         u[X]['RequiredBy'] = B if case == 'foreign-post-reload' and request['action'] == 'remove' else ''
         u[IKE]['RequiredBy'] = ''

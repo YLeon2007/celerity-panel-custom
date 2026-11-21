@@ -89,9 +89,12 @@ async function runRebuild(d, req) {
             if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);
             if(req.expectedPreview!==undefined && req.expectedPreview!==result.previewId)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();
+            await d.checkActivation?.(nodes);
+            if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }
+            await d.prepareActivation?.(nodes);
+            await verify();
             await d.persistKeys?.(verify);
             if(req.remove && !anchor?.rebuildDelete) await d.markDelete?.(req.linkId);
-            if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }
             // A connection loss is reported as failure even if only a restart
             // was missed. Never skip an unchanged profile pair on a retry.
             for(const [nodeId,pair] of pairs) { await verify(); await d.putPair(nodeId,pair); }

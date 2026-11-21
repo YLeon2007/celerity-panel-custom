@@ -63,9 +63,10 @@ module.exports = ({ root, records, writeRecords, mainPath, bridgePath }) => {
                 // A restart of a required unit can stop xl2tpd and leave its
                 // oneshot failed on the existing kernel objects. They remain
                 // quiescent; the live IKE and resident firewall are not erased.
-                if (unit === x && units[net]?.ActiveState === 'active') {
+                if (unit === x && units[net]?.ActiveState === 'active' && units[net].Requires.split().includes(x)) {
                     Object.assign(units[xl], inactive);
                     Object.assign(units[net], inactive, { ActiveState: 'failed', SubState: 'failed', InvocationID: 'apply-net-' + pid });
+                    delete manager.ppp;
                 }
                 return change('restart', unit);
             }
@@ -80,6 +81,11 @@ module.exports = ({ root, records, writeRecords, mainPath, bridgePath }) => {
             assert.equal(units[b].ActiveState, 'inactive');
             units[b].UnitFileState = 'disabled';
             return change('disable', b);
+        }
+        if (stdin === undefined && command === 'systemctl enable ' + x) {
+            units[x].UnitFileState = 'enabled';
+            if (manager.driftOnApplyEnable) units[x].ConsistsOf = xl;
+            return change('enable', x);
         }
         if (command === `set -eu; test ! -e ${unitFile}; test ! -L ${unitFile}; (umask 022; set -C; cat > ${unitFile}); systemctl daemon-reload`) {
             assert.equal(stdin, generateBridgeSystemdService());

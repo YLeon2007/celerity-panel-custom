@@ -58,7 +58,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const panelTLS=()=>{const cert=require('./configGenerator').buildPanelInlineCertificate();return {...cert,serverName:cert?.domain||env.PANEL_DOMAIN};};
     async function installedStates(ids){
         const states=new Map(), seen=new Set();
-        const records=await State.find({node:{$in:ids}}).select('node status desiredState routingMode routingVersion routeGroup activePathKey tproxyPort secretRevision +rebuildMachineId').lean();
+        const records=await State.find({node:{$in:ids}}).select('node status desiredState routingMode routingVersion routeGroup activePathKey clientCidr tproxyPort fwmark routeTable backupId secretRevision +rebuildMachineId +rebuildInstallToken').lean();
         for(const row of records){
             const id=String(row.node);
             if(seen.has(id))throw fail('REBUILD_L2TP_STATE_TRANSITION');
@@ -89,7 +89,11 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             if(!binding)continue;
             // The general-purpose connector is only for ordinary Xray nodes;
             // it cannot supply or replace a bound relay's attested writer.
-            const transport=createBoundRelayTransport(node,binding,verifyLock);
+            const state=states.get(id);
+            // Old route-group rows without a DIRECT receipt are not eligible
+            // for the owned-unit transition. Keep their existing Apply path.
+            const direct=state?.rebuildInstallToken!=null || state?.rebuildMachineId!=null;
+            const transport=createBoundRelayTransport(node,binding,verifyLock,direct?state:undefined);
             transports.set(id,transport);
             await transport.attest();
         }
@@ -162,6 +166,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             }return current;},
             persistKeys:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
             markDelete:async id=>{if(bindings.size)await verifyApply();const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
+            async checkActivation(ids){for(const id of ids)await transports.get(id).checkActivation?.();},
+            async prepareActivation(ids){for(const id of ids)await transports.get(id).prepareActivation?.();},
             stagePair:(id,pair)=>transports.get(id).stagePair(pair),putPair:(id,pair)=>transports.get(id).putPair(pair),
             async finish({desired,removed}){
                 // Not a recovery journal. A single Mongo transaction publishes the

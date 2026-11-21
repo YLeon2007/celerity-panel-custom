@@ -34,6 +34,11 @@ def no_host_dispatch(event, _):
 
 sys.addaudithook(no_host_dispatch)
 exec(compile(command_line[-1], '<DIRECT command>', 'exec'), h)
+# Seed pre-fix Install through the existing fixture, not by adopting the live
+# generation under test. Apply/Remove run the candidate without this override.
+if s.get('legacyNetwork') and request['action'] in ('prepare', 'check', 'install', 'verify') and 'network_unit' in h:
+    render = h['network_unit']
+    h['network_unit'] = lambda d, sidecar, *, legacy=False: render(d, sidecar, legacy=True)
 XL, IKE, X, B, NET = (h[k] for k in ('XL', 'IKE', 'X', 'B', 'NET_UNIT'))
 MAIN, BRIDGE, SYSTEM = (h[k] for k in ('MAIN', 'BRIDGE', 'SYSTEM'))
 STOCK_UID = 65534
@@ -132,14 +137,18 @@ def reloaded():
     units = s['units']
     if backing(h['NET']).exists():
         net = backing(h['NET']).read_text()
-        assert f'Requires={X}\n' in net and 'Type=oneshot\n' in net
+        legacy = f'Requires={X}\n' in net
+        assert legacy != (f'Wants={X}\n' in net) and 'Type=oneshot\n' in net
         commands = [line.removeprefix('ExecStart=') for line in net.splitlines() if line.startswith('ExecStart=')]
         # systemctl show emits one property row per command on the real relay.
         records = [f'{{ path={cmd.split()[0]} ; argv[]={cmd} ; ignore_errors=no ; '
                    'start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0 }' for cmd in commands]
+        pre = next((line.removeprefix('ExecStartPre=') for line in net.splitlines() if line.startswith('ExecStartPre=')), '')
         units[NET].update(LoadState='loaded', FragmentPath=h['NET'], UnitFileState='static',
-                          Type='oneshot', Requires=X, RequiredBy=XL, ExecStart=records)
-        units[X]['RequiredBy'] = NET
+                          Type='oneshot', Requires=X if legacy else '', Wants='' if legacy else X,
+                          After=next(line.removeprefix('After=') for line in net.splitlines() if line.startswith('After=')),
+                          RequiredBy=XL, ExecStart=records, ExecStartPre=f'{{ path={pre.split()[0]} ; argv[]={pre} ; ignore_errors=no ; }}' if pre else '')
+        units[X]['RequiredBy'] = NET if legacy else ''
         units[IKE]['RequiredBy'] = XL
     else:
         units[NET] = dict(s['original'][NET])
@@ -215,8 +224,14 @@ def run(argv, **kwargs):
             return reply(s['managerEnvironment'])
         s['effects'].append(v)
         if v == ['daemon-reload']:
+            if request['action'] == 'prepare-apply-network' and s.get('failApplyReload'):
+                return reply(code=1)
             reloaded()
         elif action == 'restart' and len(rest) == 1 and rest[0] in (X, B, IKE):
+            if rest == [X] and s['units'][NET]['ActiveState'] == 'active' and X in s['units'][NET]['Requires'].split():
+                stop(XL)
+                stop(NET)
+                s.pop('ppp', None)
             start(rest[0])
         elif action == 'start' and rest == [XL]:
             assert s['units'][NET]['LoadState'] == 'loaded' and s['units'][X]['ActiveState'] == 'active'

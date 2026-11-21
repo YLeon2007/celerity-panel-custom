@@ -83,6 +83,7 @@ DEADLINE = time.monotonic() + 115
 STAGE = 'PREREQUISITE'
 REMOVE_ENTERED = False
 CHAP_ENTERED = False
+NETWORK_UPGRADE_ENTERED = False
 NO_INSTALL_WRITES = False
 
 
@@ -755,21 +756,6 @@ def candidate(request, before):
              for _, a, _, owners in listeners), 'NETWORK_CONFLICT')
     else:
         need(not any(n == handoff[0]['port'] for _, _, n, _ in rows), 'NETWORK_CONFLICT')
-    prerequisite = X + (' ' + B if sidecar else '')
-    net_unit = f'''[Unit]
-Description=Celerity rebuild L2TP TPROXY policy
-Before={XL}
-Requires={X}
-After={prerequisite} nftables.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-TimeoutStartSec=20s
-ExecStart=/usr/sbin/nft -f {NFT_FILE}
-ExecStart=/usr/sbin/ip -4 route add local 0.0.0.0/0 dev lo table {d['routeTable']}
-ExecStart=/usr/sbin/ip -4 rule add priority {PRIORITY} from {d['clientCidr']} fwmark {d['fwmark']} table {d['routeTable']}
-'''.encode()
     drop = f'[Unit]\nRequires={NET_UNIT} {IKE}\nAfter={NET_UNIT} {IKE}\n'.encode()
     original = before['files']
     after = {key: entry(data, 0o644 if key in ('lns', 'ike', 'nft') else 0o600) for key, data in bytes_.items()}
@@ -780,11 +766,37 @@ ExecStart=/usr/sbin/ip -4 rule add priority {PRIORITY} from {d['clientCidr']} fw
         raw(original['starter']) + b'\ninclude ' + NAMES['ike'].encode() + b'\n', original['starter']['mode'], original['starter']['gid'])
     for k in ('chap', 'secrets'):
         after[k] = entry(raw(original[k]) + b'\n' + bytes_[k])
-    after['net'], after['drop'] = entry(net_unit, 0o644), entry(drop, 0o644)
+    after['net'], after['drop'] = entry(network_unit(d, sidecar), 0o644), entry(drop, 0o644)
     if 'swan' in original:
         after['swan'] = entry(SWAN_SETTINGS, 0o644)
     need(nft_marker(bytes_['nft'], token), 'CANDIDATE_INVALID')
     return after
+
+
+NETWORK_START_CHECK = '/usr/bin/systemctl is-active --quiet ' + X
+
+
+def network_unit(d, sidecar, *, legacy=False):
+    prerequisite = X + (' ' + B if sidecar else '')
+    dependency = 'Requires' if legacy else 'Wants'
+    # Xray is needed to bring the network up, but a routine restart must not
+    # stop the resident policy or the LNS. PPP can't fall back to forwarding:
+    # that is denied by the resident nft table even with no Xray listener.
+    startup = '' if legacy else f'ExecStartPre={NETWORK_START_CHECK}\n'
+    return f'''[Unit]
+Description=Celerity rebuild L2TP TPROXY policy
+Before={XL}
+{dependency}={X}
+After={prerequisite} nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=20s
+{startup}ExecStart=/usr/sbin/nft -f {NFT_FILE}
+ExecStart=/usr/sbin/ip -4 route add local 0.0.0.0/0 dev lo table {d['routeTable']}
+ExecStart=/usr/sbin/ip -4 rule add priority {PRIORITY} from {d['clientCidr']} fwmark {d['fwmark']} table {d['routeTable']}
+'''.encode()
 
 
 def nft_marker(data, token):
@@ -882,6 +894,7 @@ def installed_runtime(d, token, before, after):
     sidecar = 'bridge' in after
     neighbors(before, sidecar)
     x, lns, ike, net_unit = (unit(name) for name in (X, XL, IKE, NET_UNIT))
+    need(network_unit_loaded(net_unit, legacy_network(after['net'], d, sidecar)), 'RUNTIME_UNPROVED')
     need(native_vpn(lns, XL) and native_vpn(ike, IKE) and working(lns) and working(ike)
          and lns['UnitFileState'] == 'enabled'
          and ike['UnitFileState'] == before['units'][IKE]['UnitFileState']
@@ -1033,6 +1046,7 @@ def after_match(record, expected):
 
 
 CHAP_ACTIONS = ('check-chap', 'sync-chap')
+APPLY_NETWORK_ACTIONS = ('check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network')
 CHAP_BEGIN = b'# BEGIN CELERITY MANAGED L2TP USERS'
 CHAP_END = b'# END CELERITY MANAGED L2TP USERS'
 CHAP_LOGIN = rb'[A-Za-z0-9._@-]{1,64}'
@@ -1659,15 +1673,32 @@ def removal_profiles(main, side, node_id, tproxy, backup, units, main_generation
             'bridge': {**side, 'data': original['bridge']['data']}}, port, B
 
 
-def removal_units(units, before, runtime, restart_bridge):
+def legacy_network(record, d, sidecar):
+    need(record in (entry(network_unit(d, sidecar), 0o644),
+                    entry(network_unit(d, sidecar, legacy=True), 0o644)), 'ROLLBACK_DRIFT')
+    return raw(record) == network_unit(d, sidecar, legacy=True)
+
+
+def network_unit_loaded(net, legacy):
+    pre = net.get('ExecStartPre', '')
+    return (net['LoadState'] == 'loaded' and net['FragmentPath'] == NET and not net['DropInPaths']
+            and net['UnitFileState'] == 'static' and net['NeedDaemonReload'] == 'no'
+            and no_hooks({**net, 'ExecStartPre': ''})
+            and not any(net.get(k) for k in ('Environment', 'EnvironmentFiles', 'ExecCondition', 'ExecReload'))
+            and net.get('User') in ('', 'root') and net.get('Group') in ('', 'root') and net.get('Type') == 'oneshot'
+            and net['MainPID'] == '0' and X in net['After'].split()
+            and (X in net['Requires'].split()) == legacy and (X in net['Wants'].split()) != legacy
+            and not any(net.get(k) for k in ('BindsTo', 'PartOf', 'Upholds'))
+            and (not pre if legacy else re.fullmatch(
+                r'\{ path=/usr/bin/systemctl ; argv\[\]=' + re.escape(NETWORK_START_CHECK)
+                + r' ; ignore_errors=no ;[^{}]*\}', pre)))
+
+
+def removal_units(units, before, runtime, restart_bridge, legacy):
     bad = 'ROLLBACK_DRIFT'
     x, xl, ike, net = (units[name] for name in (X, XL, IKE, NET_UNIT))
     need(x['FragmentPath'] == before['units'][X]['FragmentPath'] and working(x), bad)
-    need(net['LoadState'] == 'loaded' and net['FragmentPath'] == NET and not net['DropInPaths']
-         and net['UnitFileState'] == 'static' and net['NeedDaemonReload'] == 'no' and no_hooks(net)
-         and not any(net.get(k) for k in ('Environment', 'EnvironmentFiles'))
-         and net.get('User') in ('', 'root') and net.get('Type') == 'oneshot'
-         and X in net['Requires'].split() and net['MainPID'] == '0', bad)
+    need(network_unit_loaded(net, legacy), bad)
     for name, info, invocation, sub in zip((XL, IKE, NET_UNIT), (xl, ike, net), runtime['invocations'][1:],
                                           ('running', 'running', 'exited')):
         if name != NET_UNIT:
@@ -1854,6 +1885,99 @@ def owned_installation(request):
     return path, manifest, backup, intent
 
 
+def apply_network_snapshot(d, token, backup, record, generation, *, listeners_required=True):
+    bad = 'ROLLBACK_DRIFT'
+    before, runtime = backup['before'], backup['runtime']
+    legacy = legacy_network(record, d, 'bridge' in backup['after'])
+    need(read(NET, 65536) == record and remove_generation(NET) == generation, bad)
+    for key in ('drop', 'nft'):
+        p = NAMES[key]
+        need(after_match(read(p), backup['after'][key]) and remove_generation(p) == runtime['files'][key], bad)
+    removal_boot(before, backup, runtime)
+    no_jobs(UNITS)
+    units = {n: unit(n) for n in UNITS}
+    removal_units(units, before, runtime, False, legacy)
+    xpid = xray_argv(units[X])
+    # A sidecar may be stopped by putPair even if its replacement will be
+    # empty. Neither it nor MAIN may propagate stop outside the old exact edge.
+    for name in (X, B):
+        info = units[name]
+        if name == B and info['LoadState'] == 'not-found':
+            continue
+        need(info['LoadState'] == 'loaded' and info['NeedDaemonReload'] == 'no' and no_hooks(info)
+             and not any(info.get(k) for k in ('ExecCondition', 'ExecReload', 'DropInPaths'))
+             and set(info['RequiredBy'].split()) == ({NET_UNIT} if name == X and legacy else set())
+             and not any(info[k] for k in ('BoundBy', 'ConsistsOf', 'PropagatesStopTo'))
+             and all(set(info[k].split()) <= {'shutdown.target'} for k in ('Conflicts', 'ConflictedBy')), bad)
+    need(set(units[NET_UNIT]['RequiredBy'].split()) == {XL}
+         and not any(units[n][k] for n in (NET_UNIT, XL, IKE) for k in ('BindsTo', 'PartOf', 'PropagatesStopTo')), bad)
+    # Unlike Remove, a negotiated IPsec SA and a live PPP session are allowed.
+    # Check their supervisor generations and listener ownership, not emptiness.
+    vpn = (XL, IKE, NET_UNIT)
+    need(all(units[n]['ActiveState'] == 'active' for n in vpn), bad)
+    rows = sock_rows()
+    lns = [owners for proto, _, port, owners in rows if proto == 'udp' and port == 1701]
+    need(lns and all(owners == [units[XL]['MainPID']] for owners in lns), bad)
+    listeners = [(proto, addr, owners) for proto, addr, port, owners in rows if port == d['tproxyPort']]
+    need(all(addr in ('0.0.0.0', '*', '[::]') and owners == [xpid] for _, addr, owners in listeners), bad)
+    ready = {proto for proto, _, _ in listeners} == {'tcp', 'udp'}
+    need(ready or not listeners_required, 'RUNTIME_UNPROVED')
+    policy = network_projection(d, token, removing=True)
+    need(policy == {'nft': runtime['nft'], 'rule': True, 'route': True} and policy['nft'] is not None, bad)
+    no_jobs(UNITS)
+    return legacy, [[units[n][key] for key in ('InvocationID', 'MainPID', 'ControlGroup')] for n in vpn], units[X]['InvocationID'], ready
+
+
+def apply_network(request, action):
+    global NETWORK_UPGRADE_ENTERED
+    token, d = request['backupId'], request['network']
+    path, manifest, backup, _ = owned_installation(request)
+    record, generation = read(NET, 65536), remove_generation(NET)
+    need(after_match(record, backup['after']['net']) and generation == backup['runtime']['files']['net'], 'ROLLBACK_DRIFT')
+    legacy, stable, main_invocation, _ = apply_network_snapshot(d, token, backup, record, generation)
+    if legacy and action == 'prepare-apply-network':
+        replacement = entry(network_unit(d, 'bridge' in backup['after']), 0o644)
+        pin = digest(raw(replacement))
+        # Do not adopt a partial file/manager/receipt transition on replay.
+        # The intent retains the exact old receipt and the intended new bytes.
+        pending = entry(encode({**backup, 'phase': 'network-upgrading', 'networkUpgrade': pin}))
+        need(apply_network_snapshot(d, token, backup, record, generation)[:3]
+             == (True, stable, main_invocation), 'ROLLBACK_DRIFT')
+        NETWORK_UPGRADE_ENTERED = True
+        write(path, manifest, pending)
+        need(remove_generation(NET) == generation, 'ROLLBACK_DRIFT')
+        write(NET, record, replacement)
+        generation = remove_generation(NET)
+        sc('daemon-reload', wait=12)
+        need(apply_network_snapshot(d, token, backup, replacement, generation)[:3]
+             == (False, stable, main_invocation), 'ROLLBACK_DRIFT')
+        backup['after']['net'] = {**replacement, 'data': pin}
+        backup['runtime']['files']['net'] = generation
+        manifest = entry(encode(backup))
+        write(path, pending, manifest)
+        need(read(path, 2 * MAX_FILE) == manifest, 'ROLLBACK_DRIFT')
+        legacy = False
+    need(action != 'prepare-apply-network' or not legacy, 'RUNTIME_UNPROVED')
+    proof = digest(encode([digest(raw(manifest)), generation, stable]))
+    if action in ('verify-apply-network', 'restart-apply-network'):
+        need(not legacy and proof == request['proof'], 'RUNTIME_UNPROVED')
+    if action == 'restart-apply-network':
+        # Final effective-graph observation and the actual restart share the
+        # DIRECT flock; no manager reload or separate SSH channel intervenes.
+        NETWORK_UPGRADE_ENTERED = True
+        sc('restart', X, wait=45)
+        until = min(DEADLINE, time.monotonic() + 6)
+        while True:
+            new_legacy, new_stable, active_invocation, ready = apply_network_snapshot(
+                d, token, backup, record, generation, listeners_required=False)
+            need(not new_legacy and new_stable == stable and active_invocation != main_invocation, 'RUNTIME_UNPROVED')
+            need(time.monotonic() < until, 'RUNTIME_UNPROVED')
+            if ready:
+                break
+            time.sleep(0.2)
+    return {'ok': True, 'backupId': token, 'proof': proof}
+
+
 def sync_chap(request, *, write_changes):
     global CHAP_ENTERED
     bad = 'ROLLBACK_DRIFT'
@@ -1932,7 +2056,8 @@ def observe_removal(request, *, quiescent=False):
                                                        backup, units, generations['main'], side_generation)
     if b['ActiveState'] == 'active':
         xray_argv(b, BRIDGE)
-    removal_units(units, before, runtime, 'bridge' in profiles)
+    removal_units(units, before, runtime, 'bridge' in profiles,
+                  legacy_network(current['net'], d, 'bridge' in backup['after']))
     if quiescent:
         # An inactive unit alone does not prove the supported Apply layout.
         session_need(rollback_quiescent(units[XL])
@@ -2684,7 +2809,8 @@ def dispatch(request: dict[str, Any]):
     if action == 'session-count':
         return read_session_count(request)
     need(re.fullmatch(r'[a-f0-9]{32}', machine) and action in
-         ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove') + CHAP_ACTIONS, 'PREREQUISITE')
+         ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove')
+         + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
     NO_INSTALL_WRITES = action == 'install'
     ready = preflight(machine)
     if action == 'preflight':
@@ -2695,6 +2821,14 @@ def dispatch(request: dict[str, Any]):
     # administrative writers. No locks from the old runners are consulted.
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if action in APPLY_NETWORK_ACTIONS:
+            keys = {'action', 'machineId', 'backupId', 'network'}
+            if action in ('verify-apply-network', 'restart-apply-network'):
+                keys.add('proof')
+                need(re.fullmatch(r'[a-f0-9]{64}', request['proof']), 'CANDIDATE_INVALID')
+            need(set(request) == keys and re.fullmatch(r'[a-f0-9]{32}', request['backupId']), 'CANDIDATE_INVALID')
+            need(ready['ppp'] and ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
+            return apply_network(request, action)
         if action in CHAP_ACTIONS:
             token = request['backupId']
             need(set(request) == {'action', 'machineId', 'backupId', 'network', 'nodeId', 'currentUsers', 'desiredUsers'}
@@ -2760,7 +2894,7 @@ def main():
     except (subprocess.TimeoutExpired, BlockingIOError):
         return 75
     except Refusal as error:
-        if REMOVE_ENTERED or CHAP_ENTERED or str(error) == 'IN_FLIGHT':
+        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or str(error) == 'IN_FLIGHT':
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
@@ -2768,7 +2902,7 @@ def main():
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
-        if REMOVE_ENTERED or CHAP_ENTERED:
+        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED:
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else

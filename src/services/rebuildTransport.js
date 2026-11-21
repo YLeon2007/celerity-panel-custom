@@ -75,8 +75,18 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             staged.set(profile,{active,state});
         }
     }
+    let networkProof;
+    const relayNetwork=(action,proof)=>require('./rebuildRelayDirect').applyRelayNetwork(
+        run,authority.machineId,authority.installation,action,proof);
+    async function prepareActivation(){
+        networkProof=await relayNetwork('prepare-apply-network');
+    }
     async function putPair(){
         if(staged.size!==2)throw fail('REBUILD_PAIR_NOT_STAGED');
+        if(authority?.installation){
+            if(!networkProof)throw fail('REBUILD_L2TP_APPLY_NETWORK_REFUSED');
+            await relayNetwork('verify-apply-network',networkProof);
+        }
         // Release the previous socket owner before moving any listener between
         // services; enable both effective profiles for a normal unattended boot.
         const side=staged.get('bridge');
@@ -91,9 +101,13 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             const unit='/etc/systemd/system/xray-bridge.service';
             await check(`set -eu; test ! -e ${unit}; test ! -L ${unit}; (umask 022; set -C; cat > ${unit}); systemctl daemon-reload`,generateBridgeSystemdService());
         }
-        await check('systemctl enable xray.service && systemctl restart xray.service && systemctl is-active --quiet xray.service');
+        if(authority?.installation){
+            await check('systemctl enable xray.service');
+            await relayNetwork('restart-apply-network',networkProof);
+        }else await check('systemctl enable xray.service && systemctl restart xray.service && systemctl is-active --quiet xray.service');
         if(side.active)await check('systemctl enable xray-bridge.service && systemctl restart xray-bridge.service && systemctl is-active --quiet xray-bridge.service');
         else if(side.state==='loaded') await check('systemctl disable xray-bridge.service');
+        if(authority?.installation)await relayNetwork('verify-apply-network',networkProof);
     }
     async function close(){
         if(closed)return;
@@ -102,15 +116,16 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
     }
     return {read,requireSupportedCore,stagePair,putPair,close,
         ...(authority&&{attest}),
+        ...(authority?.installation&&{checkActivation:()=>relayNetwork('check-apply-network'),prepareActivation}),
         readTunnelCertificate:()=>check(READ_CHAIN),verifyTunnelCertificate:input=>check(VERIFY_CHAIN,input)};
 }
 
-function createBoundRelayTransport(node,fence,verifyLock){
+function createBoundRelayTransport(node,fence,verifyLock,installation){
     const {nodeId,host:ip,port,username,sshHostKeySha256,machineId}=fence.binding;
     // Same binding as DIRECT. In list mode, use the operator endpoint and
     // take only authentication material from the corroborating card.
     const target={_id:nodeId,name:nodeId,ip,ssh:{port,username,password:node.ssh.password,privateKey:node.ssh.privateKey}};
-    return createTransport(target,undefined,{machineId,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
+    return createTransport(target,undefined,{machineId,installation,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
         expectedEndpoint:{ip,port,username}},async verify(){await verifyLock();fence.check();}});
 }
 module.exports={createTransport,createBoundRelayTransport};

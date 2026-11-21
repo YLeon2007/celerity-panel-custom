@@ -696,6 +696,7 @@ test('a later Apply preserves the ownership receipt and normal Apply works after
         controlPlaneAddresses: [f.env.PANEL_DOMAIN, f.nodes[0].ip, f.nodes[0].domain] });
     f.hooks.verify = async () => { writeProfiles(profiles([{ ...f.states[0], status: 'installed' }])); return true; };
     const connect = () => ({ requireSupportedCore: async () => {}, close: async () => {}, stagePair: async () => {},
+        relayNetwork: async () => '2'.repeat(64),
         read: async profile => structuredClone(files.get(profile)), putPair: async pair => writeProfiles(pair) });
     const service = f.create({ sync: { _getUsersForNode: async () => [] }, cache: { invalidateAllSubscriptions: async () => {} }, connect });
     await service.installRelay(id);

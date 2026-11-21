@@ -31,6 +31,11 @@ function bindProfileWire(replace, endpoint, machineId, createFixture) {
             const ok = (stdout = '') => { stream.emit('data', stdout); stream.emit('close', 0); };
             try {
                 if (command === '/usr/bin/head -c 34 /etc/machine-id') return ok(machineId + '\n');
+                if (command.startsWith('/usr/bin/timeout -k ') && fixture.relayNetwork) {
+                    const request = JSON.parse(stdin);
+                    assert.equal(request.machineId, machineId);
+                    return ok(JSON.stringify({ ok: true, backupId: request.backupId, proof: await fixture.relayNetwork(request) }) + '\n');
+                }
                 if (command === '/usr/local/bin/xray version') {
                     try { await fixture.requireSupportedCore(); }
                     catch (error) { if (error.code === 'REBUILD_XRAY_VERSION_TOO_OLD') return ok('Xray 25.0.0'); throw error; }

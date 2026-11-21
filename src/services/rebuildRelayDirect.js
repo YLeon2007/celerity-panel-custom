@@ -118,6 +118,15 @@ function buildFiles(d, profiles, backupId) {
     }).map(([name, value]) => [name, Buffer.from(value).toString('base64')]));
 }
 
+let directSource;
+function directCommand(limits) {
+    // Compress the static helper to fit the remote shell's per-argument limit.
+    // Only local source enters shell argv; all request data travels via stdin.
+    directSource ??= deflateSync(readFileSync(join(__dirname, 'rebuildRelayDirectHost.py'))).toString('base64');
+    const script = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("${directSource}")),"<DIRECT host>","exec"))`;
+    return `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script}'`;
+}
+
 function createRelayDirect({ node, env = process.env, SSH } = {}) {
     const nodeId = String(node?._id ?? node?.id ?? '');
     const fence = captureRelayBinding(env, nodeId, node);
@@ -127,12 +136,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     const transportNode = fence.listMode ? Object.freeze({ _id: nodeId, name: nodeId, ip,
         ssh: Object.freeze({ port, username, password: node.ssh.password, privateKey: node.ssh.privateKey }),
     }) : node;
-    // Keep the static helper below Linux's per-argument limit, including the
-    // remote login shell's -c argument. Only local source enters this envelope;
-    // the entire request, including secrets, still travels in stdin.
-    const source = deflateSync(readFileSync(join(__dirname, 'rebuildRelayDirectHost.py'))).toString('base64');
-    const script = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("${source}")),"<DIRECT host>","exec"))`;
-    const command = limits => `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script}'`;
+
     const ssh = new (SSH || require('./nodeSSH'))(transportNode, {
         expectedHostKeySha256: sshHostKeySha256, expectedEndpoint: { ip, port, username },
     });
@@ -181,7 +185,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             return fail('DIRECT_OUTCOME_UNKNOWN', write);
         };
         let result;
-        try { result = await ssh.exec(command(count ? '-k 1s 9s' : '-k 4s 125s'), {
+        try { result = await ssh.exec(directCommand(count ? '-k 1s 9s' : '-k 4s 125s'), {
             stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
         }); }
         catch { throw unknown(); }
@@ -381,4 +385,29 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     });
 }
 
-module.exports = { createRelayDirect };
+async function applyRelayNetwork(run, machineId, state, action, proof) {
+    const invalid = 'APPLY_NETWORK_NOT_OWNED';
+    const { backupId, rebuildMachineId, clientCidr, tproxyPort, fwmark, routeTable } = state;
+    requireThat(rebuildMachineId === machineId && backupId?.length === 32 && tokenMatches(TOKEN, backupId)
+        && typeof state.rebuildInstallToken === 'string' && state.rebuildInstallToken.length === 36
+        && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(state.rebuildInstallToken), invalid);
+    const network = removeNetwork({ clientCidr, tproxyPort, fwmark, routeTable }, invalid);
+    const unknown = () => fail('APPLY_NETWORK_OUTCOME_UNKNOWN', ['prepare-apply-network', 'restart-apply-network'].includes(action));
+    let result;
+    try {
+        result = await run(directCommand('-k 4s 125s'), { timeout: TIMEOUT,
+            stdin: JSON.stringify({ action, machineId, backupId, network, ...(proof !== undefined && { proof }) }) });
+    } catch { throw unknown(); }
+    if (result?.code === 70 && result.stdout === '' && /^DIRECT_(?:ROLLBACK_DRIFT|IDENTITY|PREREQUISITE|RUNTIME_UNPROVED|CANDIDATE_INVALID|COMMAND_FAILED)\n$(?![\s\S])/.test(result.stderr)) {
+        throw fail('APPLY_NETWORK_REFUSED');
+    }
+    if (result?.code !== 0 || result.stderr !== '' || typeof result.stdout !== 'string' || result.stdout.length > 140) throw unknown();
+    let reply;
+    try { reply = JSON.parse(result.stdout); } catch { throw unknown(); }
+    if (reply?.ok !== true || reply.backupId !== backupId || reply.proof?.length !== 64 || !tokenMatches(PIN, reply.proof)
+        || result.stdout !== `${JSON.stringify({ ok: true, backupId, proof: reply.proof })}\n`
+        || (proof !== undefined && proof !== reply.proof)) throw unknown();
+    return reply.proof;
+}
+
+module.exports = { createRelayDirect, applyRelayNetwork };

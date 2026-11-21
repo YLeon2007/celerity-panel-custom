@@ -190,11 +190,17 @@ def run(argv, **kw):
         changes.append(tuple(a))
         if op == 'daemon-reload':
             if backing(P['net']).exists():
-                commands = [l.removeprefix('ExecStart=') for l in backing(P['net']).read_text().splitlines() if l.startswith('ExecStart=')]
+                lines = backing(P['net']).read_text().splitlines()
+                commands = [l.removeprefix('ExecStart=') for l in lines if l.startswith('ExecStart=')]
                 records = [f'{{ path={cmd.split()[0]} ; argv[]={cmd} ; ignore_errors=no ; }}' for cmd in commands]
-                units[NET].update(LoadState='loaded',FragmentPath=P['net'],UnitFileState='static',Type='oneshot',Requires=X,RequiredBy=XL,ExecStart=records)
+                pre = next((l.removeprefix('ExecStartPre=') for l in lines if l.startswith('ExecStartPre=')), '')
+                legacy = f'Requires={X}' in lines
+                units[NET].update(LoadState='loaded', FragmentPath=P['net'], UnitFileState='static', Type='oneshot',
+                                  Requires=X if legacy else '', Wants='' if legacy else X, RequiredBy=XL, ExecStart=records,
+                                  After=next(l.removeprefix('After=') for l in lines if l.startswith('After=')),
+                                  ExecStartPre=f'{{ path=/usr/bin/systemctl ; argv[]={pre} ; ignore_errors=no ; }}' if pre else '')
                 units[XL].update(DropInPaths=h['DROP'],Requires=NET+' '+IKE,After=NET+' '+IKE)
-                units[X]['RequiredBy'], units[IKE]['RequiredBy'] = NET, XL
+                units[X]['RequiredBy'], units[IKE]['RequiredBy'] = (NET if legacy else ''), XL
             else:
                 for n in (XL,IKE,NET): units[n] = dict(stock[n])
                 units[X]['RequiredBy'] = ''

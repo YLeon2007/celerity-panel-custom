@@ -95,7 +95,7 @@ function deferred() {
     const promise = new Promise(resolve => { done = resolve; });
     return { promise, done };
 }
-function fixture(t) {
+function fixture(t, planBackupId = backupId) {
     const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: id,
         C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, ENCRYPTION_KEY: 'test-only-credential-key-'.repeat(2), PANEL_DOMAIN: 'fixture.invalid' };
     const nodes = [{ _id: oid(id), ip: '192.0.2.4', domain: 'relay.fixture.invalid', type: 'xray', active: true,
@@ -118,7 +118,7 @@ function fixture(t) {
             return { acknowledged: true, deletedCount: Number(matched) };
         },
     };
-    const plan = { backupId };
+    const plan = { backupId: planBackupId };
     let prepared;
     const hooks = {
         preflight: async () => ({ ppp: true, masked: false, machineId }),
@@ -826,7 +826,7 @@ test('verified bootstrap rollback restores exact existing row', async t => {
 
 test('later Apply retains ownership and adds the new policy to the live follow-relay profile', async t => {
     t.after(() => require.cache[require.resolve('../sshPoolService')]?.exports.closeAll());
-    const f = fixture(t);
+    const f = fixture(t, '1'.repeat(32));
     const { composeRebuildProfiles } = require('../../modules/relay-l2tp/services/rebuildTopologyComposer');
     t.mock.method(require('../configGenerator'), 'buildPanelInlineCertificate', () => null);
     t.mock.method(Link.db, 'transaction', async fn => fn({}));
@@ -860,6 +860,7 @@ test('later Apply retains ownership and adds the new policy to the live follow-r
     f.env.C3_REBUILD_L2TP_SSH_SHA256 = pin;
     f.nodes[0].ssh.password = 'fixture-ssh-auth';
     bindProfileWire(t.mock.method.bind(t.mock), f.nodes[0].ip, machineId, () => ({
+        relayNetwork: async () => '2'.repeat(64),
         requireSupportedCore: async () => {}, read: async name => structuredClone(files[name]),
         close: async () => {}, stagePair: async () => {}, putPair: async pair => {
             for (const { profile, config } of pair) files[profile] = structuredClone(config);
