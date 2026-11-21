@@ -1,6 +1,7 @@
 'use strict';
 const { isDeepStrictEqual: equal } = require('node:util');
 const {createHmac,randomBytes}=require('node:crypto');
+const {linkSnapshotBytes}=require('./rebuildLinkSnapshot');
 // The preview fingerprint is opaque and expires when the panel restarts.
 const previewKey=randomBytes(32);
 const fail = code => Object.assign(new Error(code), {code});
@@ -14,6 +15,14 @@ function previewRefusal(code, preview) {
 const previewForError = error => publicPreviews.get(error);
 const id = obj => String(obj?._id ?? obj);
 const ends = row => [id(row.portalNode), id(row.bridgeNode)];
+function fingerprintLinks(links) {
+    const digest=createHmac('sha256',previewKey).update('rebuild-link-rows\0');
+    for(const row of [...links].sort((a,b)=>id(a).localeCompare(id(b)))) {
+        const bytes=linkSnapshotBytes(row);
+        digest.update(String(bytes.length)).update(':').update(bytes);
+    }
+    return digest.digest('hex');
+}
 function componentFor(links, seeds) {
     const seen = new Set(seeds.map(id)), todo = [...seen], adjacent = new Map();
     for (const row of links) {
@@ -60,17 +69,24 @@ function profilePreview(before, after, profile) {
 async function runRebuild(d, req) {
     return d.global(async(verify = async()=>{})=>{
         const inventory=await d.links(), anchor=inventory.find(row=>id(row)===req.linkId);
-        if (!anchor && !req.nodeId) throw fail('REBUILD_LINK_NOT_FOUND');
+        const confirmedLinks=!req.preview && req.expectedPreview?.length===128;
+        if (!anchor && !req.nodeId) throw fail(confirmedLinks?'REBUILD_LINK_CHANGED':'REBUILD_LINK_NOT_FOUND');
         const nodes=componentFor(inventory,anchor?ends(anchor):[req.nodeId]);
         return d.withNodes(nodes,async()=>{
             const scope=new Set(nodes), links=inventory.filter(row=>ends(row).every(n=>scope.has(n)));
+            // Bind both the working rows and the profiles to the opaque token.
+            // Separate digests let Apply identify row drift before composing.
+            const linkVersion=fingerprintLinks(links);
+            if(confirmedLinks && !req.expectedPreview.startsWith(linkVersion)) {
+                throw fail('REBUILD_LINK_CHANGED');
+            }
             if(links.some(row=>row.lifecycle)) throw fail('REBUILD_CONFLICTING_LINK_LIFECYCLE');
             const removed=links.filter(row=>row.rebuildDelete===true || req.remove && id(row)===req.linkId);
             const desired=links.filter(row=>!removed.includes(row)&&row.active!==false);
             const candidates=await d.build(nodes,desired);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
             const pairs=new Map(), report=[], fingerprint=createHmac('sha256',previewKey);
-            fingerprint.update(JSON.stringify([req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()]));
+            fingerprint.update(JSON.stringify([linkVersion,req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()]));
             for(const nodeId of nodes){
                 const pair=candidates.filter(p=>p.nodeId===nodeId); pairs.set(nodeId,pair);
                 if(pair.length!==2||new Set(pair.map(p=>p.profile)).size!==2||!pair.every(p=>['main','bridge'].includes(p.profile)))throw fail('REBUILD_INCOMPLETE_PROFILES');
@@ -84,7 +100,7 @@ async function runRebuild(d, req) {
                 }
                 report.push({nodeId,profiles});
             }
-            const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:fingerprint.digest('hex')};
+            const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
             if(req.preview) return result;
             if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);
             if(req.expectedPreview!==undefined && req.expectedPreview!==result.previewId)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);

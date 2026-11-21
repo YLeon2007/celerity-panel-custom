@@ -98,7 +98,9 @@ test('actual TLS chain gates Preview, fresh Apply and draft before persistence',
             link.rebuildTlsServerName=bad==='wrong-name'?'other.example.invalid':name;
             const code=bad==='wrong-name'?'REBUILD_TLS_NAME_MISMATCH':'REBUILD_TLS_TRUST_UNVERIFIED';
             await assert.rejects(service.verifyDraftTls(link),{code});
-            await assert.rejects(service.execute({linkId:link._id,expectedPreview:preview.previewId}),{code});
+            await assert.rejects(service.execute({linkId:link._id,expectedPreview:preview.previewId}),
+                {code:bad==='wrong-name'?'REBUILD_LINK_CHANGED':code});
+            if(bad==='wrong-name') await assert.rejects(service.execute({linkId:link._id,preview:true}),{code});
             assert.equal(writes,0);
         }
     }

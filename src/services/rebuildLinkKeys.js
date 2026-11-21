@@ -5,7 +5,7 @@ const {
 } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
 
-const FIELD = 'rebuildVlessKeyEnvelope';
+const { linkSnapshot, keyEnvelopeField: FIELD, fullLinkRead } = require('./rebuildLinkSnapshot');
 const DOMAIN = 'celerity/rebuild/link-vless/v1';
 const SERVER = 'mlkem768x25519plus.native.600s.';
 const CLIENT = 'mlkem768x25519plus.native.0rtt.';
@@ -92,13 +92,14 @@ function tunnelSettings(link) {
     return { decryption: keys.decryption, encryption: keys.encryption };
 }
 
-async function readRows(Link, links, session) {
+async function readRows(Link, links, session, privateInventory = false) {
     if (!links.length) return [];
     const ids = links.map(link => String(link?._id));
     if (new Set(ids).size !== links.length || ids.some(id => !/^[a-f0-9]{24}$/.test(id))) throw fail('REBUILD_LINK_CHANGED');
     let rows;
     try {
-        const query = Link.find({ _id: { $in: ids } }).select(`+${FIELD}`).read('primary');
+        const filter = { _id: { $in: ids } };
+        const query = (privateInventory ? Link.find(filter, null, fullLinkRead) : Link.find(filter).select(`+${FIELD}`)).read('primary');
         rows = await (session ? query.session(session) : query.readConcern('majority')).lean();
     } catch {
         throw fail('REBUILD_LINK_KEY_READ_FAILED');
@@ -108,10 +109,17 @@ async function readRows(Link, links, session) {
     return links.map((link, i) => {
         const row = byId.get(ids[i]);
         if (!row) throw fail('REBUILD_LINK_CHANGED');
-        const { [FIELD]: envelope, ...draft } = row;
-        if (!isDeepStrictEqual(draft, link)) throw fail('REBUILD_LINK_CHANGED');
+        const draft = linkSnapshot(row), expected = linkSnapshot(link);
+        const envelope = Object.hasOwn(draft, FIELD) ? draft[FIELD] : missing;
+        if (!privateInventory) {
+            delete draft[FIELD];
+            delete expected[FIELD];
+        }
+        if (!isDeepStrictEqual(draft, expected)) {
+            throw fail('REBUILD_LINK_CHANGED');
+        }
         // Null, empty, malformed or undecryptable are never legacy absence.
-        return { id: ids[i], envelope: Object.hasOwn(row, FIELD) ? envelope : missing };
+        return { id: ids[i], envelope };
     });
 }
 
@@ -120,36 +128,40 @@ async function checkGuard(verify) {
 }
 
 /**
- * Read phase: pass the freshly read, full, unpopulated lean desired rows (no
- * private projection). Use the returned copies to compose candidates and to
- * compute the opaque preview ID. No key writes occur in this phase.
+ * Read phase: pass the freshly read, unpopulated lean desired rows. Set
+ * privateInventory when the inventory included fields hidden by the schema;
+ * verify them too, but never return them with the prepared links. Use the
+ * returned copies to compose candidates. No key writes occur in this phase.
  *
  * Apply phase: after version/capability, client-change and preview-ID checks,
  * pass that SAME returned array with { persist: true, verify, env }, under
- * the held rebuild lock and before staging. Keep verify checks at subsequent
- * dispatch boundaries. Use the already-composed candidates; do not rebuild.
+ * the held rebuild lock and before activating profiles. Keep verify checks at
+ * subsequent dispatch boundaries. Use the already-composed candidates.
  *
  * Keep these copies in the rebuild process. The non-enumerable _rebuildVless
  * is intentionally omitted by serialization and spreads; a composer that
  * projects links must explicitly carry it to the internal tunnel helpers.
  */
-async function prepareLinks(Link, links, { persist = false, verify, env = process.env } = {}) {
+async function prepareLinks(Link, links, { persist = false, verify, env = process.env, privateInventory = false } = {}) {
     let keys;
     try {
         keys = links.some(needsKey) ? subkeys(env) : null;
         if (!persist) {
-            const rows = await readRows(Link, links);
+            const rows = await readRows(Link, links, undefined, privateInventory);
             const prepared = links.map((link, i) => {
                 const copy = { ...link };
+                delete copy[FIELD];
+                delete copy.rebuildApplied;
+                delete copy.classicLifecycleGrant;
                 if (needsKey(link)) {
-                    const { id, envelope } = rows[i];
-                    const seed = keyFor(keys, id, envelope);
+                    const { id, envelope: stored } = rows[i];
+                    const seed = keyFor(keys, id, stored);
                     try { Object.defineProperty(copy, '_rebuildVless', { value: xraySettings(seed) }); }
                     finally { seed.fill(0); }
                 }
                 return Object.freeze(copy);
             });
-            batches.set(prepared, { Link, rows });
+            batches.set(prepared, { Link, rows, privateRows: privateInventory ? links.map(linkSnapshot) : null });
             return Object.freeze(prepared);
         }
 
@@ -159,13 +171,14 @@ async function prepareLinks(Link, links, { persist = false, verify, env = proces
         await checkGuard(verify);
         const hasMissing = batch.rows.some((row, i) => needsKey(links[i]) && row.envelope === missing);
         const confirm = async session => {
-            const latest = await readRows(Link, links, session);
+            const latest = await readRows(Link, batch.privateRows ?? links, session, batch.privateRows !== null);
             const writes = [];
             for (const [i, { id, envelope }] of latest.entries()) {
+                if (envelope !== batch.rows[i].envelope) throw fail('REBUILD_LINK_CHANGED');
                 if (!needsKey(links[i])) continue;
                 const seed = keyFor(keys, id, envelope);
                 try {
-                    if (envelope !== batch.rows[i].envelope || !isDeepStrictEqual(xraySettings(seed), tunnelSettings(links[i]))) {
+                    if (!isDeepStrictEqual(xraySettings(seed), tunnelSettings(links[i]))) {
                         throw fail('REBUILD_LINK_CHANGED');
                     }
                     if (envelope === missing) writes.push([id, seal(keys.wrap, id, seed)]);
@@ -173,8 +186,8 @@ async function prepareLinks(Link, links, { persist = false, verify, env = proces
             }
             for (const [id, envelope] of writes) {
                 await checkGuard(verify);
-                // Exact draft equality was checked inside the transaction. A
-                // concurrent row mutation conflicts with this write, and the
+                // Working-field equality was checked inside the transaction.
+                // A concurrent row mutation conflicts with this write, and the
                 // existence CAS separately forbids overwriting any envelope.
                 const result = await Link.updateOne({ _id: id, [FIELD]: { $exists: false } },
                     { $set: { [FIELD]: envelope } }, { session, timestamps: false, runValidators: true });

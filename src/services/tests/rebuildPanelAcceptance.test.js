@@ -108,6 +108,51 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
         appliedNodes(await apply(links.pu),['p','u','r','a','b']); assertGraph();
     });
     const stable=checkPPP();
+    await t.test('health telemetry preserves an HTTP confirmation; working link edits expire it',async()=>{
+        // Mutate a non-anchor member of the same connected component.
+        const dbId=new mongoose.Types.ObjectId(links.ra);
+        await Link.collection.updateOne({_id:dbId},{$set:{updatedAt:new Date(1000)}});
+        const report=await preview(links.ur);assert.ok(report.allowed);
+        const health={status:'offline',lastHealthCheck:new Date(),latencyMs:987,lastError:'fixture health error'};
+        const old=await Link.collection.findOne({_id:dbId});
+        assert.equal((await Link.updateOne({_id:dbId},{$set:health})).matchedCount,1);
+        const observed=await Link.collection.findOne({_id:dbId});
+        assert.ok(observed.updatedAt>old.updatedAt);
+        for(const [field,value] of Object.entries(health)) assert.deepEqual(observed[field],value);
+        assert.equal((await preview(links.ur)).previewId,report.previewId);
+        appliedNodes(await apply(links.ur,report),['p','u','r','a','b']);
+        assert.equal(checkPPP(),stable);
+
+        const other=cryptoService.generateX25519KeysLocal();
+        for(const patch of [{tunnelPort:old.tunnelPort+10},{mode:'forward'},
+            {realityPrivateKey:other.privateKey,realityPublicKey:other.publicKey},
+            {rebuildVlessKeyEnvelope:'changed-private-envelope'}, {name:'metadata edit, not health'},
+            {rebuildApplied:null}, {classicLifecycleGrant:'f'.repeat(64)}]) {
+            const prior=await preview(links.ur);assert.ok(prior.allowed);
+            const previous=digests(),count=events().length;
+            const baseline=await Link.collection.findOne({_id:dbId});
+            assert.equal((await Link.collection.updateOne({_id:dbId},{$set:patch})).matchedCount,1);
+            try {
+                const response=await call('POST','/topology/deploy',{linkId:links.ur,expectedPreview:prior.previewId},409);
+                assert.equal(response.error.code,'REBUILD_LINK_CHANGED');
+                assert.equal(events().length,count,'no staging or activation for stale links');
+                assert.deepEqual(digests(),previous);
+            } finally {
+                const restore={$set:{},$unset:{}};
+                for(const key of Object.keys(patch)) Object.hasOwn(baseline,key)?restore.$set[key]=baseline[key]:restore.$unset[key]='';
+                await Link.collection.updateOne({_id:dbId},restore);
+            }
+        }
+        const anchorId=new mongoose.Types.ObjectId(links.ur);
+        const prior=await preview(links.ur);assert.ok(prior.allowed);
+        const previous=digests(),count=events().length;
+        await Link.collection.updateOne({_id:anchorId},{$set:{active:false}});
+        try {
+            assert.equal((await call('POST','/topology/deploy',{linkId:links.ur,expectedPreview:prior.previewId},409)).error.code,'REBUILD_LINK_CHANGED');
+            assert.equal(events().length,count);
+            assert.deepEqual(digests(),previous);
+        } finally {await Link.collection.updateOne({_id:anchorId},{$set:{active:true}});}
+    });
     await t.test('3: replacing the default bridge moves ordinary and PPP policy and cleans the removed bridge',async()=>{
         await create('rc'); assertGraph('rc'); appliedNodes(await remove('ra'),['p','u','r','a','b','c']);
         assertGraph('rc'); assert.equal(checkPPP(),stable); assert.ok(!config('a','bridge').reverse); assert.equal(config('a','bridge').outbounds[0].protocol,'blackhole');
@@ -259,7 +304,7 @@ test('rebuild acceptance through the actual index.js HTTP mounts', {timeout:2400
             const fresh=await previewHop();
             assert.notEqual(fresh.previewId,stale.previewId);
             assert.equal((await call('POST','/topology/deploy',{linkId,expectedPreview:stale.previewId},409)).error.code,
-                'REBUILD_PREVIEW_CHANGED');
+                'REBUILD_LINK_CHANGED');
             assert.equal(events().length,count);
             assert.ok((await raw()).rebuildVlessKeyEnvelope===envelope,'edit or preview changed the sealed key');
             await apply(linkId,fresh);

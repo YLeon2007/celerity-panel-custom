@@ -14,3 +14,28 @@ test('one changed or removed portal credential vetoes ALL writes before dispatch
  for(const prop of ['port','users','sni','drop']){let after=structuredClone(client);if(prop==='port')after.port++;if(prop==='users')after.settings.clients=[];if(prop==='sni')after.streamSettings.realitySettings.serverNames=[];const row=profilePreview({inbounds:[client]}, {inbounds:prop==='drop'?[]:[after]},'main');assert.ok(row.protectedChanged);}
 });
 test('readback mismatch is not success; next apply writes every node afresh',async()=>{const {d,trace,store}=fixture();const put=d.putPair;d.putPair=async(id,p)=>{await put(id,p);store.get(id)[0].config.routing.rules.push({tag:'drift'})};await assert.rejects(runRebuild(d,{linkId:'m'}),{code:'REBUILD_READBACK_MISMATCH'});assert.ok(!trace.includes('finish'));d.putPair=put;await runRebuild(d,{linkId:'m'});assert.ok(trace.includes('finish'));});
+
+test('a confirmed snapshot distinguishes null, undefined and absence in nested working fields',async()=>{
+    const {d,trace}=fixture();
+    const inventory=structuredClone(links);
+    d.links=async()=>inventory;
+    inventory[1].extra={nested:[{status:undefined}]};
+    const ticket=await runRebuild(d,{linkId:'m',preview:true});
+    trace.length=0;
+    inventory[1].extra.nested[0].status=null;
+    await assert.rejects(runRebuild(d,{linkId:'m',expectedPreview:ticket.previewId}),{code:'REBUILD_LINK_CHANGED'});
+    delete inventory[1].extra.nested[0].status;
+    await assert.rejects(runRebuild(d,{linkId:'m',expectedPreview:ticket.previewId}),{code:'REBUILD_LINK_CHANGED'});
+    assert.deepEqual(trace,[]);
+});
+
+test('the link fingerprint depends on values, not array layout or object identity',()=>{
+    const {linkSnapshotBytes}=require('../rebuildLinkSnapshot');
+    const packed=['x','y','z'];
+    const holey=Array(3);
+    for(let i=0;i<packed.length;i++)holey[i]=packed[i];
+    const sample=Buffer.from([1,2]);
+    const a={items:packed,binary:[sample,sample]}, b={binary:[Buffer.from(sample),Buffer.from(sample)],items:holey};
+    assert.deepEqual(a,b);
+    assert.ok(linkSnapshotBytes(a).equals(linkSnapshotBytes(b)));
+});

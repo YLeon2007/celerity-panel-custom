@@ -26,7 +26,8 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
   if(linkId!==undefined&&!objectId(linkId))throw fail('REBUILD_INVALID_REQUEST');
   const expectedPreview=req.body?.expectedPreview;
   if(!preview && expectedPreview===undefined)throw fail('REBUILD_PREVIEW_REQUIRED');
-  if(expectedPreview!==undefined && (typeof expectedPreview!=='string'||!/^[a-f0-9]{64}$/.test(expectedPreview)))throw fail('REBUILD_INVALID_REQUEST');
+  // Accept the previous format only so a pre-restart token gets a stale-preview conflict.
+  if(expectedPreview!==undefined && (typeof expectedPreview!=='string'||!/^(?:[a-f0-9]{64}|[a-f0-9]{128})$/.test(expectedPreview)))throw fail('REBUILD_INVALID_REQUEST');
   if(linkId)return service.execute({linkId,preview,remove,expectedPreview});
   // Unscoped Apply is only unambiguous if the DB contains one component.
   if(remove)throw fail('REBUILD_INVALID_REQUEST');

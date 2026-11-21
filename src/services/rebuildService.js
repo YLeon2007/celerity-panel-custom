@@ -6,6 +6,7 @@ const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTo
 const {createTransport,createBoundRelayTransport}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {prepareLinks}=require('./rebuildLinkKeys');
+const {fullLinkRead}=require('./rebuildLinkSnapshot');
 const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
 const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
 const {createRebuildRelayAccounts}=require('./rebuildRelayAccounts');
@@ -132,7 +133,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             verifyLock=verify;
             return fn(verifyApply);
         }),withNodes:(ids,fn)=>withNodes(ids,()=>usingTransports(transports,fn)),
-            links:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]}).lean(),
+            links:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]},null,fullLinkRead).lean(),
             async build(ids,links){
                 const nodes=await Node.find({_id:{$in:ids}}).select('+xray.manualKey').lean();
                 if(nodes.length!==ids.length||nodes.some(n=>n.type!=='xray'||!n.active||n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
@@ -145,7 +146,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 }
                 const controlPlaneAddresses=[...new Set([env.PANEL_DOMAIN,...nodes.flatMap(n=>[n.ip,n.domain])].filter(Boolean))];
                 for(const id of ids)await transports.get(id).requireSupportedCore();
-                prepared=await prepareLinks(Link,links,{env});
+                prepared=await prepareLinks(Link,links,{env,privateInventory:true});
                 // A bridge can still serve its managed client interface with no assigned users.
                 // Pass only its presence to the generator, never observed MAIN parameters.
                 const bridgesWithClientInbound=new Set();

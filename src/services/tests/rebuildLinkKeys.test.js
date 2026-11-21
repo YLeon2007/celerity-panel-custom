@@ -191,6 +191,58 @@ test('Apply refuses unguarded, detached or stale prepared candidates without wri
     assert.equal(db.calls.writes, 0);
 });
 
+test('health updates do not invalidate a link snapshot or undo the key CAS', async () => {
+    const draft = row(1, { status: 'deployed', lastError: '', latencyMs: null });
+    const db = storage([draft]);
+    const telemetry = { status: 'offline', lastHealthCheck: new Date(200), latencyMs: 5,
+        lastError: 'fixture health check', updatedAt: new Date(201) };
+    // First update between the inventory read and the private-key read.
+    Object.assign(db.get(draft._id), telemetry);
+    const prepared = await preview(db, [draft]);
+    assert.equal(db.calls.writes, 0);
+    // A second update between preparation and the transactional key recheck.
+    Object.assign(telemetry, { status: 'online', lastHealthCheck: new Date(300),
+        latencyMs: 6, lastError: '', updatedAt: new Date(301) });
+    Object.assign(db.get(draft._id), telemetry);
+    await apply(db, prepared);
+    assert.equal(db.calls.writes, 1);
+    assert.deepEqual(Object.fromEntries(Object.keys(telemetry).map(k => [k, db.get(draft._id)[k]])), telemetry);
+    // Same result on the majority-read path with the envelope already present.
+    const stored = await preview(db, [draft]);
+    db.get(draft._id).status = 'offline';
+    await apply(db, stored);
+    assert.equal(db.calls.writes, 1);
+});
+
+test('strict key recheck still refuses each working-field edit even with health drift', async () => {
+    for (const change of [{ tunnelPort: 41001 }, { mode: 'forward' }, { realityPrivateKey: 'synthetic' },
+        { active: false }, { rebuildDelete: true }, { geoRouting: { status: 'nested working field' } }]) {
+        const draft = row(1, { mode: 'reverse', tunnelPort: 41000 });
+        const db = storage([draft]);
+        const prepared = await preview(db, [draft]);
+        Object.assign(db.get(draft._id), change, { status: 'online', updatedAt: new Date(200) });
+        await refuses('REBUILD_LINK_CHANGED', () => apply(db, prepared));
+        assert.equal(db.calls.writes, 0);
+    }
+});
+
+test('private inventory verifies hidden link fields without returning them to the composer', async () => {
+    const draft = row(1, { tunnelSecurity: 'reality', [FIELD]: 'unused-fixture-envelope',
+        rebuildApplied: { port: 8443 }, classicLifecycleGrant: 'fixture-grant' });
+    const db = storage([draft]);
+    const prepared = await preview(db, [draft], { privateInventory: true });
+    for (const field of [FIELD, 'rebuildApplied', 'classicLifecycleGrant']) {
+        assert.equal(Object.hasOwn(prepared[0], field), false);
+    }
+    db.get(draft._id).rebuildApplied = { port: 8444 };
+    await refuses('REBUILD_LINK_CHANGED', () => apply(db, prepared));
+    db.get(draft._id).rebuildApplied = draft.rebuildApplied;
+    db.get(draft._id)[FIELD] = 'changed-fixture-envelope';
+    await refuses('REBUILD_LINK_CHANGED', () => preview(db, [draft], { privateInventory: true }));
+    await refuses('REBUILD_LINK_CHANGED', () => apply(db, prepared));
+    assert.equal(db.calls.writes, 0);
+});
+
 test('CAS drift, ambiguous result and commit errors refuse Apply; no partial batch persists in the transaction model', async () => {
     for (const opts of [{ cas: 2 }, { noModify: 2 }, { commit: env.ENCRYPTION_KEY }]) {
         const rows = [row(1), row(2)];
