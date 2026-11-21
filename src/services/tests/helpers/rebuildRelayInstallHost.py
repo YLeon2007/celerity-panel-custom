@@ -368,10 +368,21 @@ def modeled_session_collection(query):
     xl = h['unit'](XL)
     assert xl['ActiveState'] == 'active' and xl['InvocationID'] == backup['runtime']['invocations'][1]
     count = s.get('activeSessions', 0)
-    return {'activeSessions': count, 'census': h['digest'](h['encode']([
+    ipsec = h['ipsec_session_sample'](query)
+    return {'activeSessions': count, 'activeIpsec': ipsec[0], 'census': h['digest'](h['encode']([
         'fixture-only-session-collection', query['nodeId'], query['machineId'], query['backupId'],
-        h['digest'](h['raw'](manifest)), h['chap_rows_digest'](rows), xl['InvocationID'], count,
+        h['digest'](h['raw'](manifest)), h['chap_rows_digest'](rows), xl['InvocationID'], count, ipsec,
     ]))}
+
+
+def modeled_empty_revoke(request, blocked, chap, path, manifest, xl):
+    # This two-root harness has no PPP kernel/pppd. Target selection and the
+    # pidfd path are exercised independently by test_rebuild_relay_revoke.py.
+    assert request['action'] == 'sync-chap' and not s.get('activeSessions')
+    assert request['revokedLogin'] not in [u['login'] for u in blocked['currentUsers'] if u['enabled']]
+    assert chap == h['read'](h['NAMES']['chap']) and manifest == h['read'](path, 2 * h['MAX_FILE'])
+    assert h['unit'](XL) == xl
+    return {'sessionsTerminated': 0, 'complete': True}
 
 
 h.update(os=LocalOS(), open=modeled_open,
@@ -380,6 +391,7 @@ if s.get('cohort'):
     assert h['pwd'].getpwnam('nobody').pw_uid == h['grp'].getgrnam('nogroup').gr_gid == STOCK_UID
     assert h['pwd'].getpwuid(0).pw_dir == '/root'
     h['collect_session_census'] = modeled_session_collection
+    h['revoke_ppp'] = modeled_empty_revoke
 else:
     h.update(pwd=SimpleNamespace(getpwnam=lambda name: SimpleNamespace(pw_uid=STOCK_UID, pw_gid=STOCK_UID)),
              grp=SimpleNamespace(getgrnam=lambda name: SimpleNamespace(gr_gid=STOCK_UID)))
