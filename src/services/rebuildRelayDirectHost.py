@@ -22,7 +22,12 @@ import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any, cast
+
+# Injected by the DIRECT payload, not loaded from the remote disk.
+C3_STOCK_RUNTIME: dict[str, Any]
+C3_STOCK_ENSURE: dict[str, Any]
 
 MAIN = '/usr/local/etc/xray/config.json'
 XRAY_CONFIG_WRITABLE = 'XRAY_CONFIG_WRITABLE'
@@ -52,6 +57,9 @@ REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'x
 PACKAGE_AUTOSTART_UNSAFE = 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
 NATIVE_UNIT_REQUIRED = 'RUNTIME_NATIVE_UNIT_REQUIRED'
 STOCK_IKE_INCLUDE = b'include /etc/ipsec.d/*.conf'
+# Original Debian strongswan-starter 6.0.1-6+deb13u7 conffile, before
+# install-runtime.sh adds its wildcard. DIRECT adds only the owned include.
+STOCK_IKE_STARTER_SHA = '6a54e39267b981ca3239cd93579f26b5699983021a0d636408fdd5c70f3024d1'
 SWAN_CONF = '/etc/strongswan.conf'
 SWAN_DIR = '/etc/strongswan.d'
 SWAN_PROFILE = SWAN_DIR + '/celerity-rebuild-l2tp.conf'
@@ -94,6 +102,7 @@ CHAP_ENTERED = False
 NETWORK_UPGRADE_ENTERED = False
 NO_INSTALL_WRITES = False
 PPP_PREPARING = False
+NATIVE_PREPARING = False
 PPP_MODULES = ('ppp_generic', 'l2tp_ppp')
 PPP_DIRS = ('/etc/modules-load.d', '/run/modules-load.d', '/usr/local/lib/modules-load.d',
             '/usr/lib/modules-load.d', '/lib/modules-load.d')
@@ -329,17 +338,55 @@ def preflight(machine, *, fresh=False):
     units = [xl['LoadState'], ike['LoadState']]
     if not fresh and units == ['loaded'] * 2:
         require_runtime_packages('PREREQUISITE')
-    if fresh and (xl['LoadState'] == 'not-found' or (
-            xl.get('UnitFileState') == 'generated' and xl.get('FragmentPath') == '/run/systemd/generator.late/' + XL
-            and xl.get('SourcePath') == '/etc/init.d/xl2tpd')):
-        # Diagnosis, not preparation authority: a generated unit need not be
-        # stock. Keep the native unit gate unchanged; never promote this layout.
-        inactive = all((u['ActiveState'], u['SubState'], u.get('MainPID'), u.get('Job')) == ('inactive', 'dead', '0', '')
-                       and u.get('NeedDaemonReload') == 'no' and not u.get('DropInPaths') for u in (xl, ike))
-        if inactive and ike.get('UnitFileState') in ('enabled', 'disabled') and not ike.get('ExecCondition') and (
-                removal_native(ike, IKE, {'units': {IKE: ike}}, installed=False)):
-            raise Refusal(NATIVE_UNIT_REQUIRED)
     return dict(machineId=machine_id, ppp=ppp, masked='masked' in units, unitsLoaded=units == ['loaded'] * 2)
+
+
+def stock_runtime_root():
+    return Path('/')
+
+
+def stock_runtime_command(*argv):
+    left = DEADLINE - time.monotonic()
+    if left <= 0:
+        raise subprocess.TimeoutExpired(argv, 0)
+    return C3_STOCK_RUNTIME['command'](*argv, timeout=min(12, left))
+
+
+def pending_xl(info):
+    if info['LoadState'] == 'not-found':
+        return 'missing'
+    if (info.get('UnitFileState') == 'generated' or info.get('SourcePath')
+            or info.get('FragmentPath', '').startswith('/run/systemd/generator')):
+        return 'generated'
+    return None
+
+
+def stock_runtime_observation(expected):
+    runtime = globals().get('C3_STOCK_RUNTIME')
+    helper = globals().get('C3_STOCK_ENSURE')
+    if runtime is None or helper is None or digest(helper['UNIT']) != NATIVE_XL_SHA:
+        raise Refusal(NATIVE_UNIT_REQUIRED)
+    try:
+        observed = runtime['observe'](stock_runtime_root(), stock_runtime_command, helper)
+    except (runtime['Refusal'], OSError, ValueError):
+        raise Refusal(NATIVE_UNIT_REQUIRED) from None
+    need(observed['state'] == expected, NATIVE_UNIT_REQUIRED)
+    return observed
+
+
+def pending_native(xl, ike, state):
+    # Independent live DIRECT sample must agree with the strict stock view.
+    for info in (xl, ike):
+        need((info['ActiveState'], info['SubState'], info.get('MainPID'), info.get('Job'),
+              info.get('NeedDaemonReload'), info.get('DropInPaths')) == ('inactive', 'dead', '0', '', 'no', ''),
+             NATIVE_UNIT_REQUIRED)
+    need(ike['UnitFileState'] in ('enabled', 'disabled') and not ike.get('ExecCondition')
+         and not ike.get('PassEnvironment') and removal_native(ike, IKE, {'units': {IKE: ike}}, installed=False),
+         NATIVE_UNIT_REQUIRED)
+    if state == 'generated':
+        need((xl['LoadState'], xl.get('UnitFileState'), xl.get('FragmentPath'), xl.get('SourcePath')) == (
+            'loaded', 'generated', '/run/systemd/generator.late/' + XL, '/etc/init.d/xl2tpd'), NATIVE_UNIT_REQUIRED)
+    return stock_runtime_observation(state)
 
 
 def ppp_config():
@@ -847,8 +894,8 @@ def enroll_boot(target, expected=None):
         os.fsync(fd)
 
 
-def ike_include_matches(starter, expected):
-    if STOCK_IKE_INCLUDE in uncomment(raw(starter)):
+def ike_include_matches(starter, expected, *, check_tree=False):
+    if check_tree or STOCK_IKE_INCLUDE in uncomment(raw(starter)):
         # A wildcard must never enroll or reload an unmanaged connection.
         with directory('/etc/ipsec.d') as fd:
             return sorted(name for name in os.listdir(fd) if not name.startswith('.') and name.endswith('.conf')) == expected
@@ -959,11 +1006,17 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
     ready = preflight(machine)
-    need(ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
+    need(not ready['masked'], 'PREREQUISITE')
     no_jobs(UNITS)
     units = {name: unit(name) for name in UNITS}
     fresh_ike_guard(units[IKE])
-    for name in (XL, IKE):
+    pending = pending_xl(units[XL])
+    if pending == 'missing':
+        require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
+    preparation = pending_native(units[XL], units[IKE], pending) if pending else None
+    need(preparation is not None or ready['unitsLoaded'], 'PREREQUISITE')
+    vpn = (IKE,) if preparation is not None else (XL, IKE)
+    for name in vpn:
         info = units[name]
         stopped = info['ActiveState'] == 'inactive' and info['SubState'] == 'dead' and info['MainPID'] == '0'
         need(native_vpn(info, name) and stopped and not info.get('DropInPaths')
@@ -971,6 +1024,7 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     # Enroll only the exact helper unit via its single WantedBy symlink.
     install_boot = units[XL]['UnitFileState'] == 'disabled'
     need(not install_boot or (units[XL]['FragmentPath'] == SYSTEM + '/' + XL and boot_link() is None), 'PREREQUISITE')
+    need(preparation is None or boot_link() is None, 'PREREQUISITE')
     need(units[NET_UNIT]['LoadState'] == 'not-found'
          and units[B]['ActiveState'] in ('active', 'inactive'), 'PREREQUISITE')
     for path in (NFT_DIR, DROP_DIR):
@@ -992,7 +1046,9 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
             raise Refusal(XL2TPD_CONFIG_MISSING)
         raise Refusal('PREREQUISITE')
     need(is_stock_lns(files['lns']), 'PREREQUISITE')
-    need(ike_include_matches(files['starter'], []), 'PREREQUISITE')
+    stock_starter = digest(raw(files['starter'])) == STOCK_IKE_STARTER_SHA
+    need(ike_include_matches(files['starter'], [], check_tree=True) if stock_starter
+         else ike_include_matches(files['starter'], []), 'PREREQUISITE')
     bridge = read(BRIDGE)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
     global_paths = ('/etc/ppp/options', SWAN_CONF, XL_DEFAULT)
@@ -1001,7 +1057,14 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
         if os.path.lexists(path):
             need(read(path, 262144) is not None, 'PREREQUISITE')
     globals_before = {path: read(path, 262144) for path in global_paths}
-    need(xl_defaults_admitted(globals_before[XL_DEFAULT], units[XL]), 'PREREQUISITE')
+    if preparation is None:
+        need(xl_defaults_admitted(globals_before[XL_DEFAULT], units[XL]), 'PREREQUISITE')
+    else:
+        # The strict package proof admitted exactly these SysV defaults. Only
+        # the verified native postimage may use the ordinary native predicate.
+        default = globals_before[XL_DEFAULT]
+        need(default is not None and default['mode'] == 0o644 and default['gid'] == 0
+             and default.get('uid', 0) == 0 and digest(raw(default)) == STOCK_XL_DEFAULT_SHA, 'PREREQUISITE')
     rows = sock_rows()
     net = ipaddress.IPv4Network(d['clientCidr'])
     for addr in ip('addr', 'show'):
@@ -1016,10 +1079,10 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
          and vpn_empty() and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
     need(not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
     no_swan_rule()
-    need(not units[IKE].get('PassEnvironment') and STOCK_IKE_INCLUDE in starter, 'PREREQUISITE')
+    need(not units[IKE].get('PassEnvironment') and (STOCK_IKE_INCLUDE in starter or stock_starter), 'PREREQUISITE')
     need(all(removal_native(units[n], n, {'units': units}, installed=False)
-             and not units[n].get('ExecCondition') for n in (XL, IKE)), 'PREREQUISITE')
-    removal_dependencies({n: units[n] for n in (XL, IKE)}, installed=False)
+             and not units[n].get('ExecCondition') for n in vpn), 'PREREQUISITE')
+    removal_dependencies({n: units[n] for n in vpn}, installed=False)
     swan_default_environment('PREREQUISITE')
     files['swan'] = read(SWAN_PROFILE, 8192)
     need(files['swan'] is None, 'PREREQUISITE')
@@ -1033,6 +1096,7 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
                  for name in UNITS}
     return dict(boot=boot(), files=files, units=unit_pins, bridge=bridge, sockets=sockets, globalFiles=globals_before,
                 installBoot=install_boot, ikeSockets=[], swanInputs=swan,
+                **({'nativePreparation': preparation} if preparation is not None else {}),
                 **({'transit': transit} if transit is not None else {}))
 
 
@@ -1151,6 +1215,23 @@ def bound_manifest(request):
     return path, record, value
 
 
+def runtime_before(backup):
+    before = backup['before']
+    prepared = backup.get('nativePrepared')
+    if prepared is None:
+        need('nativePreparation' not in before, 'ROLLBACK_DRIFT')
+        return before
+    # Keep the true checked baseline immutable for bound_manifest(). Existing
+    # teardown restores the proven *native* prerequisite, not the SysV view.
+    return {**before, 'units': {**before['units'], XL: prepared['unit']},
+            'installBoot': True, 'nativeGeneration': prepared['generation']}
+
+
+def check_prepared_native(before):
+    if 'nativeGeneration' in before:
+        need(remove_generation(SYSTEM + '/' + XL) == before['nativeGeneration'], 'ROLLBACK_DRIFT')
+
+
 def operation_files(records):
     return {**NAMES, **({'swan': SWAN_PROFILE} if 'swan' in records else {}),
             **({'bridge': BRIDGE} if 'bridge' in records else {})}
@@ -1165,6 +1246,7 @@ def original_files(before, records):
 
 
 def neighbors(before, sidecar=False):
+    check_prepared_native(before)
     b = unit(B)
     # Verify/rollback (and owned removal below) pin the admitted bytes and
     # metadata, rather than rerunning the pristine-unit defaults admission.
@@ -1275,19 +1357,50 @@ def swan_started_units(before):
     return births
 
 
+def prepare_native_install(request, before, after, lock_fd):
+    created = C3_STOCK_RUNTIME['create_native'](stock_runtime_root(), stock_runtime_command, C3_STOCK_ENSURE)
+    strict = stock_runtime_observation('native')
+    old = before['nativePreparation']
+    need(strict['inputs'] == old['inputs'] and strict['unitPath'] == old['unitPath']
+         and strict['layout'] == {SYSTEM + '/' + XL: created}, 'BASELINE_CHANGED')
+    # Fresh full observation on the very same flock. Only the XL fragment,
+    # physical load/file state and eligibility for the owned boot link change.
+    live = observe_install(request['machineId'], routing(request['network']), before.get('transit'), lock_fd)
+    expected = dict(before)
+    del expected['nativePreparation']
+    native = {**before['units'][XL], 'LoadState': 'loaded', 'UnitFileState': 'disabled', 'FragmentPath': SYSTEM + '/' + XL}
+    expected.update(units={**before['units'], XL: native}, installBoot=True)
+    need(live == expected and candidate(request, live) == after
+         and stock_runtime_observation('native') == strict, 'BASELINE_CHANGED')
+    return dict(unit=live['units'][XL], generation=created)
+
+
 def install(request, before, after, lock_fd=None):
-    global STAGE, PPP_PREPARING
+    global STAGE, PPP_PREPARING, NATIVE_PREPARING
     STAGE = 'COMMAND_FAILED'
     token, d = request['backupId'], request['network']
+    pending = 'nativePreparation' in before
     backup: dict[str, Any] = dict(machineId=request['machineId'], backupId=token, before=before, network=d,
-                  after={k: {**r, 'data': digest(raw(r))} for k, r in after.items()}, phase='applying')
+                  after={k: {**r, 'data': digest(raw(r))} for k, r in after.items()},
+                  phase='preparing-native' if pending else 'applying')
     payload = encode(backup)
     need(len(payload) <= 2 * MAX_FILE, 'CANDIDATE_INVALID')
     mkdir(VAULT, 0o700, exist_ok=True)
     mkdir(VAULT + '/' + token, 0o700)
     path = manifest_path(token)
     old_manifest = entry(payload)
+    NATIVE_PREPARING = pending
     write(path, None, old_manifest)
+    if pending:
+        need(lock_fd is not None and observe_install(request['machineId'], routing(d), before.get('transit'), lock_fd) == before,
+             'BASELINE_CHANGED')
+        backup['nativePrepared'] = prepare_native_install(request, before, after, lock_fd)
+        confirmed = entry(encode({**backup, 'phase': 'applying'}))
+        write(path, old_manifest, confirmed)
+        old_manifest = confirmed
+        backup['phase'] = 'applying'
+        before = runtime_before(backup)
+        NATIVE_PREPARING = False
     modules = before.get('pppModules')
     if modules is not None:
         # This shared host prerequisite has no automatic inverse. Any later
@@ -1547,9 +1660,9 @@ def load_after(backup, require_all=False):
 def rollback(request, path, old_manifest, backup):
     global STAGE
     STAGE = 'COMMAND_FAILED'
-    before, d, token = backup['before'], request['network'], request['backupId']
     was_installed = installed_phase(backup['phase'])
     need(backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
+    before, d, token = runtime_before(backup), request['network'], request['backupId']
     no_jobs(UNITS)
     sidecar = 'bridge' in backup['after']
     neighbors(before, sidecar)
@@ -2061,6 +2174,7 @@ def removal_units(units, before, runtime, restart_bridge, legacy):
 
 
 def removal_boot(before, backup, runtime):
+    check_prepared_native(before)
     receipt = backup.get('bootEnrollment')
     if before['units'][XL]['UnitFileState'] == 'disabled':
         target = before['units'][XL]['FragmentPath']
@@ -2230,7 +2344,7 @@ def owned_installation(request):
 
 def apply_network_snapshot(d, token, backup, record, generation, *, listeners_required=True):
     bad = 'ROLLBACK_DRIFT'
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     legacy = legacy_network(record, d, 'bridge' in backup['after'])
     need(read(NET, 65536) == record and remove_generation(NET) == generation, bad)
     for key in ('drop', 'nft'):
@@ -2325,7 +2439,7 @@ def apply_network(request, action):
 def chap_preconditions(request):
     bad = 'ROLLBACK_DRIFT'
     path, manifest, backup, intent = owned_installation(request)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     no_jobs(UNITS)
     removal_boot(before, backup, runtime)
     records = {}
@@ -2507,7 +2621,7 @@ def observe_removal(request, *, quiescent=False):
     bad = 'ROLLBACK_DRIFT'
     token, d = request['backupId'], request['network']
     path, manifest, backup, intent = owned_installation(request)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     no_jobs(UNITS)
     boot_enrollment = removal_boot(before, backup, runtime)
     original_ike = before.get('ikeSockets', [])
@@ -2583,6 +2697,7 @@ def removal_owned_dirs():
 
 
 def removal_neighbors(state):
+    check_prepared_native(state['before'])
     # BRIDGE is checked separately against the selected layout and invocation.
     need(all(read(p, 262144) == r for p, r in state['before']['globalFiles'].items())
          and read(state['path'], 2 * MAX_FILE) == state['manifest']
@@ -2929,7 +3044,7 @@ def session_owner(request):
     identity = read('/etc/machine-id', 34)
     session_need(identity is not None and raw(identity) in (machine.encode('ascii'), (machine + '\n').encode('ascii')))
     path, manifest, backup = read_manifest(token)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     session_need(installed_phase(backup['phase']) and backup['backupId'] == token and backup['machineId'] == machine
                  and encode(backup['network']) == encode(network) and before['boot'] == boot()
                  and directory_absent(os.path.dirname(path) + '/remove-attempt.json'))
@@ -3522,7 +3637,7 @@ def ipsec_session_sample(request):
     identity = read('/etc/machine-id', 34)
     session_need(identity is not None and raw(identity).strip() == request['machineId'].encode('ascii'))
     path, manifest, backup, _ = owned_installation(request)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     # Match installed configuration and starter include, not just a connection
     # name. No IPsec secrets are needed in the census.
     generations = []
@@ -3688,6 +3803,12 @@ def dispatch(request: dict[str, Any]):
     NO_INSTALL_WRITES = action == 'install'
     ready = preflight(machine, fresh=True) if action in ('preflight', 'prepare', 'check', 'install') else preflight(machine)
     if action == 'preflight':
+        xl = unit(XL)
+        pending = pending_xl(xl)
+        if pending:
+            need(not ready['masked'], NATIVE_UNIT_REQUIRED)
+            pending_native(xl, unit(IKE), pending)
+            return {**ready, 'unitsLoaded': False, 'pppPreparation': True, 'nativePreparation': True}
         return {**ready, 'pppPreparation': True}
     d = routing(request['network'])
     # Lock a stable system directory without creating a lock file in prepare.
@@ -3749,6 +3870,8 @@ def dispatch(request: dict[str, Any]):
         need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
         if action == 'prepare':
             before = observe_install(machine, d, transit, fd)
+            if 'nativePreparation' in before:
+                ready = {**ready, 'unitsLoaded': False}
             main = raw(before['files']['main'])
             bridge = raw(before['bridge']) if before['bridge'] is not None else None
             return {**ready, 'baseline': digest(encode(before)), 'main': main.decode(), 'mainSha256': digest(main),
@@ -3772,8 +3895,9 @@ def dispatch(request: dict[str, Any]):
                     modules = observe_ppp_preparation()
                     need(not modules['missing'] and not modules['persist'], 'RUNTIME_UNPROVED')
                 files = load_after(backup, require_all=True)
-                need(installed_runtime(d, token, backup['before'], files) == backup['runtime'], 'RUNTIME_UNPROVED')
+                need(installed_runtime(d, token, runtime_before(backup), files) == backup['runtime'], 'RUNTIME_UNPROVED')
             else:
+                need(backup['phase'] != 'preparing-native', 'IN_FLIGHT')
                 rollback(request, path, record, backup)
         return {'ok': True, 'backupId': token}
 
@@ -3790,7 +3914,7 @@ def main():
     except (subprocess.TimeoutExpired, BlockingIOError):
         return 75
     except Refusal as error:
-        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or str(error) == 'IN_FLIGHT':
+        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or NATIVE_PREPARING or str(error) == 'IN_FLIGHT':
             return 75
         if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED):
             return 75
@@ -3804,7 +3928,7 @@ def main():
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
-        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or PPP_PREPARING:
+        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or PPP_PREPARING or NATIVE_PREPARING:
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else

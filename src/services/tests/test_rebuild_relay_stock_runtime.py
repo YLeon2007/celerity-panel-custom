@@ -266,6 +266,27 @@ class StockRuntimeTest(unittest.TestCase):
         self.put(GENERATED, ENABLED_WRAPPER, 0o664)
         self.refused('UNIT_FILES')
 
+    def test_direct_binds_only_the_stock_effective_generator(self):
+        generator = self.entry['generator_input']
+        vendor = '/usr/lib/systemd/system-generators/systemd-sysv-generator'
+        local = '/etc/systemd/system-generators/systemd-sysv-generator'
+        data = b'fixture generator, never executed'
+        self.put(vendor, data, 0o755)
+        with patch.dict(generator.__globals__, ROOT_OWNER=(os.getuid(), os.getgid())):
+            with self.assertRaisesRegex(self.entry['Refusal'], 'UNIT_FILES'):
+                generator(self.root, missing=False, strict=True)
+            with patch.dict(generator.__globals__, SYSV_GENERATOR_SHA=hashlib.sha256(data).hexdigest()):
+                witness = generator(self.root, missing=False, strict=True)
+                self.assertEqual(witness[:2], [vendor, hashlib.sha256(data).hexdigest()])
+                with self.assertRaisesRegex(self.entry['Refusal'], 'UNIT_STATE'):
+                    generator(self.root, missing=True, strict=True)
+                self.put(local, data, 0o755)
+                with self.assertRaisesRegex(self.entry['Refusal'], 'UNIT_STATE'):
+                    generator(self.root, missing=False, strict=True)
+                self.path(local).unlink()
+                self.path(local).symlink_to('/dev/null')
+                self.assertEqual(generator(self.root, missing=True, strict=True)[:2], [local, 'masked'])
+
     def test_package_facts_are_separately_required(self):
         original = self.package
         self.package = original.replace('1.3.18-1+b1', '1.3.18-1+b2')

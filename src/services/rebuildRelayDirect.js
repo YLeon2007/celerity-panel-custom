@@ -10,7 +10,7 @@ const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { validCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
-const { isInstallStage, specificHostRefusal, prerequisiteCheck, requireInstallHostReady,
+const { isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, requireInstallHostReady,
     withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
@@ -131,13 +131,33 @@ function buildFiles(d, profiles, backupId) {
     }).map(([name, value]) => [name, Buffer.from(value).toString('base64')]));
 }
 
-let directSource;
+let directScript;
+function bundleDirectScript() {
+    const pack = path => deflateSync(readFileSync(join(__dirname, path))).toString('base64');
+    const load = (key, path, name, filename) =>
+        `${key}={"__name__":"${name}","__file__":"${filename}"};exec(_c3_compile("${pack(path)}","${filename}"),${key})`;
+    // These are fixed repository sources, not imports from the remote working
+    // directory. Non-main namespaces keep their standalone entrypoints inert.
+    return [
+        'import base64,zlib',
+        '_c3_compile=lambda data,filename:compile(zlib.decompress(base64.b64decode(data)),filename,"exec")',
+        // Runtime's standalone path calculation needs an absolute __file__
+        // with parents; the direct host gets the ensure code as a separate dict.
+        load('C3_STOCK_RUNTIME', 'rebuildRelayStockRuntime.py', 'c3_stock_runtime',
+            '/__c3_direct__/services/rebuildRelayStockRuntime.py'),
+        load('C3_STOCK_ENSURE', '../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'c3_stock_ensure',
+            '/__c3_direct__/modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'),
+        `exec(_c3_compile("${pack('rebuildRelayDirectHost.py')}","<DIRECT host>"))`,
+    ].join(';');
+}
+
 function directCommand(limits) {
-    // Compress the static helper to fit the remote shell's per-argument limit.
-    // Only local source enters shell argv; all request data travels via stdin.
-    directSource ??= deflateSync(readFileSync(join(__dirname, 'rebuildRelayDirectHost.py'))).toString('base64');
-    const script = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("${directSource}")),"<DIRECT host>","exec"))`;
-    return `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script}'`;
+    // Only static local source enters shell argv; all request data uses stdin.
+    directScript ??= bundleDirectScript();
+    const command = `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${directScript}'`;
+    // The whole command is also an argument to the remote shell. Count its NUL.
+    requireThat(Buffer.byteLength(command) + 1 <= 128 * 1024, 'DIRECT_COMMAND_TOO_LARGE');
+    return command;
 }
 
 function createRelayDirect({ node, env = process.env, SSH } = {}) {
@@ -268,7 +288,8 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         && ['ppp', 'masked', 'unitsLoaded'].every(key => typeof value[key] === 'boolean');
     async function preflight() {
         const proof = await exec('preflight', {}, false, value => (exactKeys(value, readinessKeys)
-            || (exactKeys(value, preparationKeys) && value.pppPreparation === true)) && validReadiness(value));
+            || (exactKeys(value, preparationKeys) && value.pppPreparation === true)
+            || hasNativePreparation(value)) && validReadiness(value));
         requireThat(proof.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
         return proof;
     }
@@ -373,8 +394,9 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 [...readinessKeys, 'baseline', 'main', 'mainSha256', 'bridge', 'bridgeSha256'])
                 && validReadiness(v) && tokenMatches(PIN, v.baseline) && v.baseline.length === 64);
             requireThat(snapshot.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
-            // Prepare has no capability field. Use only the same-peer preflight proof.
-            requireInstallHostReady(snapshot, host.pppPreparation === true);
+            // Prepare has no capability fields. Use only the fresh preflight
+            // proof from this serial exchange on the same pinned connection.
+            requireInstallHostReady(snapshot, host);
             const profiles = composeRebuildRelayPair(snapshot, { nodeId, tproxyPort: d.tproxyPort, controlPlaneAddresses,
                 carryDomain, mainSha256: snapshot.mainSha256, bridgeSha256: snapshot.bridgeSha256 });
             const backupId = randomBytes(16).toString('hex');

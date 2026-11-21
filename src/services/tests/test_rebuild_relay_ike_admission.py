@@ -70,7 +70,7 @@ class IkeAdmission(unittest.TestCase):
                                     path=SimpleNamespace(lexists=lambda _: False)),
                  directory=lambda _: contextlib.nullcontext(17), fcntl=SimpleNamespace(flock=lambda *_: None,
                             LOCK_EX=1, LOCK_NB=2), directory_absent=lambda _: True, read=lambda p, *_, **__: files.get(p),
-                 preflight=lambda machine: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
+                 preflight=lambda machine, *, fresh=False: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
                  observe_ppp_preparation=lambda: dict(missing=[], persist=False, builtin=[], policy='fixture'),
                  require_network_observers=lambda: None,
                  ike_include_matches=lambda *_: True, xray_users=lambda *_: [['tcp', '127.0.0.1', 8080]],

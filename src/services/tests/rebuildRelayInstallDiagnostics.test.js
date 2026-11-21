@@ -23,6 +23,7 @@ const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true
     C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, C3_REBUILD_L2TP_SSH_SHA256: 'c'.repeat(64) };
 const node = { _id: nodeId, ip: '192.0.2.19', ssh: { username: 'root', port: 22 } };
 const ready = { machineId, ppp: true, masked: false, unitsLoaded: true };
+const nativePending = { ...ready, ppp: false, unitsLoaded: false, pppPreparation: true, nativePreparation: true };
 const desired = { psk: marker, users: [], clientCidr: '10.255.1.0/24', localAddress: '10.255.1.1', poolStart: '10.255.1.10',
     poolEnd: '10.255.1.50', mtu: 1380, mru: 1370, dnsServers: ['192.0.2.53'], routeTable: 177, fwmark: 77, tproxyPort: 12345 };
 const main = JSON.stringify({ inbounds: [{ tag: 'fwd-hop-a', protocol: 'vless', port: 443 }],
@@ -36,11 +37,18 @@ const root = join(__dirname, '../../..');
 // no manager/kernel/network command is allowed to run. The exception includes a
 // private filename so the producer's exception path is exercised, not fabricated.
 const hostPreflight = String.raw`
-import base64, io, json, re, stat, sys, types, zlib
+import io, json, re, shlex, stat, sys, types
 command, request = json.load(sys.stdin)
-packed = re.search(r'base64\.b64decode\("([a-zA-Z0-9+/=]+)"\)', command)[1]
+argv = shlex.split(command)
+assert argv[:-1] == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c']
+faults = []
+def no_host_dispatch(event, _):
+    if event in {'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.exec', 'os.fork'} or event.startswith('socket.'):
+        faults.append(event)
+        raise AssertionError('non-modeled host dispatch')
+sys.addaudithook(no_host_dispatch)
 host = {'__name__': 'fixture_host'}
-exec(compile(zlib.decompress(base64.b64decode(packed)), '<DIRECT host>', 'exec'), host)
+exec(compile(argv[-1], '<DIRECT command>', 'exec'), host)
 assert json.loads(request)['action'] == 'preflight'
 assert re.fullmatch(r'[a-f0-9]{32}', json.loads(request)['machineId'])
 host['os'].geteuid = lambda: 0
@@ -48,12 +56,17 @@ host['os'].lstat = lambda path: types.SimpleNamespace(st_mode=stat.S_IFCHR, st_r
 host['open'] = lambda path, mode: io.BytesIO({ '/etc/machine-id': json.loads(request)['machineId'].encode() + b'\n',
     '/proc/devices': b'Character devices:\n108 ppp\nBlock devices:\n' }[path])
 host['unit'] = lambda name: {'LoadState': 'loaded'}
+package_calls = []
 def read_package(*args, **kwargs):
     assert args[0] == '/usr/bin/dpkg-query'
+    package_calls.append(args[0])
     raise FileNotFoundError('/fixture/FIXTURE_PRIVATE_VALUE')
 host['command'] = read_package
 sys.stdin = io.TextIOWrapper(io.BytesIO(request.encode()))
-sys.exit(host['main']())
+status = host['main']()
+assert not faults, faults
+assert package_calls == ['/usr/bin/dpkg-query']
+sys.exit(status)
 `;
 
 function localizedFrontend(html, response, headers, app) {
@@ -141,6 +154,7 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
                 if (scenario === 'missing-ppp') return ok({ ...ready, ppp: false });
                 if (scenario === 'pending-ppp-bad-capability') return ok({ ...ready, ppp: false, pppPreparation: 1 });
                 if (scenario === 'pending-ppp-missing-units') return ok({ ...ready, ppp: false, pppPreparation: true, unitsLoaded: false });
+                if (scenario === 'native-post-intent-unknown') return ok(nativePending);
                 if (scenario === 'pending-ppp' || scenario.startsWith('snapshot-')) {
                     return ok({ ...ready, ppp: false, pppPreparation: true });
                 }
@@ -156,10 +170,13 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
                 if (scenario === 'snapshot-forged-capability') snapshot.pppPreparation = true;
                 if (scenario === 'snapshot-missing-units') delete snapshot.unitsLoaded;
                 if (scenario === 'snapshot-unloaded') snapshot.unitsLoaded = false;
+                if (scenario === 'native-post-intent-unknown') Object.assign(snapshot, { ppp: false, unitsLoaded: false });
                 return ok(snapshot);
             }
             if (action === 'check' && ['candidate', 'pending-ppp'].includes(scenario)) return refusal('DIRECT_PREREQUISITE\n');
             if (action === 'install') {
+                // Consumer fixture for the host's post-intent unknown (e.g. lost reload acknowledgement).
+                if (scenario === 'native-post-intent-unknown') return { code: 75, stdout: '', stderr: '' };
                 if (scenario === 'install-prerequisite') return refusal('DIRECT_NO_WRITE_PREREQUISITE\n');
                 if (scenario === 'no-write' || scenario === 'lost-no-write-restore') return refusal('DIRECT_NO_WRITE_PPP_MODULES_LOAD_FAILED\n');
                 if (scenario === 'write' || scenario === 'lost-rollback') return refusal('DIRECT_XRAY_CONFIG_WRITABLE\n');
@@ -236,6 +253,7 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
         ['no-write', 'REBUILD_L2TP_INSTALL_FAILED', 'refused', 'PPP_MODULES_LOAD_FAILED', 'installRefused', [...apply, 'restore']],
         ['lost-no-write-restore', 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN', 'unknown', 'PPP_MODULES_LOAD_FAILED', 'uncertain', [...apply, 'restore']],
         ['partial-ppp', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'unknown', 'PPP_MODULES_LOAD_FAILED', 'uncertain', apply, false],
+        ['native-post-intent-unknown', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'unknown', undefined, 'uncertain', apply],
         ['write', 'REBUILD_L2TP_INSTALL_FAILED', 'rolled_back', 'XRAY_CONFIG_WRITABLE', 'installRolledBack', [...apply, 'rollback', 'restore']],
         ['lost-rollback', 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN', 'unknown', 'XRAY_CONFIG_WRITABLE', 'uncertain', [...apply, 'rollback']],
         ['unknown-frame', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'unknown', undefined, 'uncertain', apply],

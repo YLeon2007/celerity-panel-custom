@@ -40,11 +40,21 @@ function specificHostRefusal(action, suffix, noWrite) {
 }
 const prerequisiteCheck = action => stages.get(action);
 
-function requireInstallHostReady(host, canPreparePpp = host?.pppPreparation === true) {
-    if (host?.masked === false && host.unitsLoaded === true
-        && (host.ppp === true || (host.ppp === false && canPreparePpp === true))) return;
+const nativePreparationKeys = ['machineId', 'ppp', 'masked', 'unitsLoaded', 'pppPreparation', 'nativePreparation'];
+function hasNativePreparation(host) {
+    return host?.nativePreparation === true && host.pppPreparation === true && host.unitsLoaded === false
+        && host.masked === false && typeof host.ppp === 'boolean'
+        && Object.keys(host).length === nativePreparationKeys.length
+        && nativePreparationKeys.every(key => Object.hasOwn(host, key));
+}
+
+function requireInstallHostReady(host, preflight = host) {
+    if (host?.masked === false && host.unitsLoaded === preflight?.unitsLoaded
+        && (hasNativePreparation(preflight) || (host.unitsLoaded === true && !Object.hasOwn(preflight, 'nativePreparation')))
+        && (host.ppp === true || (host.ppp === false && preflight.pppPreparation === true))) return;
     const code = 'REBUILD_L2TP_HOST_NOT_READY';
     const check = host?.masked === true ? 'VPN_UNITS_MASKED' : host?.unitsLoaded === false ? 'VPN_UNITS_NOT_LOADED'
+        : host?.unitsLoaded !== preflight?.unitsLoaded ? 'HOST_BASELINE'
         : host?.ppp === false ? 'PPP_MODULES_REQUIRED' : 'HOST_PREFLIGHT';
     throw withInstallCheck(Object.assign(new Error(code), { code }), check);
 }
@@ -111,5 +121,5 @@ function publicInstallFailure(error) {
     return { code, outcome, ...(check !== undefined && { check }), ...(retryAllowed === false && { retryAllowed }) };
 }
 
-module.exports = { installCheckIds, isInstallStage, specificHostRefusal, prerequisiteCheck, requireInstallHostReady,
+module.exports = { installCheckIds, isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, requireInstallHostReady,
     withInstallCheck, checkedInstallId, installFailure, classifyInstallFailure, publicInstallFailure };
