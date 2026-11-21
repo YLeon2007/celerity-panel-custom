@@ -1205,6 +1205,13 @@ window._networkI18n = {
     reconnectSuccess: <%- JSON.stringify(t('network.reconnectSuccess')) %>,
     reconnectFailed: <%- JSON.stringify(t('network.reconnectFailed')) %>,
     deployFailed: <%- JSON.stringify(t('network.deployFailed')) %>,
+    <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+    csrfTokenInvalid: <%- JSON.stringify(t('network.csrfTokenInvalid')) %>,
+    csrfTokenRefreshed: <%- JSON.stringify(t('network.csrfTokenRefreshed')) %>,
+    csrfAuthRequired: <%- JSON.stringify(t('network.csrfAuthRequired')) %>,
+    csrfOriginInvalid: <%- JSON.stringify(t('network.csrfOriginInvalid')) %>,
+    csrfSavedDraft: <%- JSON.stringify(t('network.csrfSavedDraft')) %>,
+    <% } %>
     deployQueued: <%- JSON.stringify(t('network.deployQueued')) %>,
     deployInProgress: <%- JSON.stringify(t('network.deployInProgress')) %>,
     operationApplied: <%- JSON.stringify(t('network.operationApplied')) %>,

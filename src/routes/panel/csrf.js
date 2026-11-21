@@ -80,5 +80,6 @@ function requirePanelCsrf(req, res, next) {
 
 module.exports = {
     issuePanelCsrfToken,
+    originMatchesHost,
     requirePanelCsrf,
 };

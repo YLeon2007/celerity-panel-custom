@@ -1,7 +1,7 @@
 'use strict';
 const express=require('express'),crypto=require('node:crypto');
 const {requireScope}=require('../middleware/auth');
-const {requirePanelCsrf}=require('./panel/csrf');
+const {issuePanelCsrfToken, originMatchesHost, requirePanelCsrf}=require('./panel/csrf');
 const {createRebuildService}=require('../services/rebuildService');
 const {componentFor,previewForError}=require('../services/rebuildCoordinator');
 const fail=code=>Object.assign(new Error(code),{code});
@@ -32,6 +32,16 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
   // Unscoped Apply is only unambiguous if the DB contains one component.
   if(remove)throw fail('REBUILD_INVALID_REQUEST');
   return service.locks.run(async verify=>{const all=await Link.find({active:true}).select('_id portalNode bridgeNode').sort({_id:1}).lean();if(!all.length)throw fail('REBUILD_LINK_NOT_FOUND');const seen=new Set(componentFor(all,[String(all[0].portalNode)]));if(all.some(l=>!seen.has(String(l.portalNode))))throw fail('REBUILD_SELECT_COMPONENT');return service.execute({linkId:String(all[0]._id),preview,remove,expectedPreview},verify);});};
+ // The transfer-drafts token route is disabled in rebuild. Reread the same
+ // panel-session token used by the page and write guard, never an API-key token.
+ router.get('/rebuild/csrf-token',read,(req,res)=>{
+    res.set('Cache-Control','no-store');
+    res.removeHeader('Access-Control-Allow-Origin');
+    if(req.apiKey || !req.session?.authenticated) return res.sendStatus(403);
+    const site=req.get('Sec-Fetch-Site');
+    if((site && site!=='same-origin') || !originMatchesHost(req)) return res.sendStatus(403);
+    return res.json({csrfRequired:true,csrfToken:issuePanelCsrfToken(req)});
+ });
  router.get('/rebuild/lock',requireScope('nodes:write'),wrap(()=>service.locks.status()));
  router.post('/rebuild/unlock',...write,wrap(req=>service.locks.unlock(req.body?.token)));
  router.post('/rebuild/preview',...write,wrap(req=>run(req,true,req.body?.remove===true)));

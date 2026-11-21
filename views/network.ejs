@@ -41,6 +41,18 @@
         </div>
     </div>
 
+    <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+    <div class="modal-overlay" id="nodeInfoModal">
+        <div class="modal-card modal-card-sm">
+            <div class="modal-header">
+                <h3 id="nodeInfoTitleText"></h3>
+                <button type="button" class="modal-close" id="nodeInfoClose" aria-label="<%= t('common.close') %>"><i class="ti ti-x"></i></button>
+            </div>
+            <div class="modal-body" id="nodeInfoBody"></div>
+        </div>
+    </div>
+    <% } %>
+
     <!-- Add Link Modal -->
     <div class="modal-overlay" id="addLinkModal">
         <div class="modal-card">
@@ -49,6 +61,7 @@
                 <button class="modal-close" id="modalClose"><i class="ti ti-x"></i></button>
             </div>
             <form id="addLinkForm" class="modal-body">
+                <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %><input type="hidden" name="mode" value="reverse"><% } %>
                 <div class="form-group">
                     <label><%= t('network.linkName') %></label>
                     <input type="text" name="name" class="form-input" required placeholder="e.g. YandexCloud → France">
@@ -113,4 +126,17 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js" crossorigin="anonymous"></script>
-<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %><script>window._c3Rebuild=true;window._networkCsrfToken=<%- JSON.stringify(typeof csrfToken==='string'?csrfToken:'') %>;</script><script src="/js/network.js?v=rebuild2"></script><% } else { %><script src="/js/network.min.js?v=8c1440573d630ba3"></script><% } %>
+<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+<script>
+window._c3Rebuild = true;
+window._networkCsrfToken = <%- JSON.stringify(typeof csrfToken === 'string' ? csrfToken : '') %>;
+window._networkI18n = {
+    csrfTokenInvalid: <%- JSON.stringify(t('network.csrfTokenInvalid')) %>,
+    csrfTokenRefreshed: <%- JSON.stringify(t('network.csrfTokenRefreshed')) %>,
+    csrfAuthRequired: <%- JSON.stringify(t('network.csrfAuthRequired')) %>,
+    csrfOriginInvalid: <%- JSON.stringify(t('network.csrfOriginInvalid')) %>,
+    csrfSavedDraft: <%- JSON.stringify(t('network.csrfSavedDraft')) %>,
+};
+</script>
+<script src="/js/network.js?v=rebuild2"></script>
+<% } else { %><script src="/js/network.min.js?v=8c1440573d630ba3"></script><% } %>

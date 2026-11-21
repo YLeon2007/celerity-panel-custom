@@ -195,12 +195,77 @@
     }
 
     const i18n = window._networkI18n || {};
-    const csrfToken = window._networkCsrfToken || '';
+    let csrfToken = window._networkCsrfToken || '';
     const rebuild = window._c3Rebuild === true;
-    async function rebuildPreview(payload, report) {
+    const csrfMessages = new Map([
+        ['CSRF_TOKEN_INVALID', i18n.csrfTokenInvalid || 'Reload the topology page, sign in again if needed, then retry manually.'],
+        ['CSRF_AUTH_REQUIRED', i18n.csrfAuthRequired || 'Sign in to the panel again, reopen the topology, then retry manually.'],
+        ['CSRF_ORIGIN_INVALID', i18n.csrfOriginInvalid || 'Open the topology at the panel’s configured address before retrying. If this persists, check the proxy scheme and host.'],
+    ]);
+    let csrfRead;
+
+    class TopologyCsrfRejection extends Error {}
+
+    async function fetchInPanel(path, options) {
+        const url = new URL(path, window.location.origin);
+        if (url.origin !== window.location.origin || url.username || url.password) throw new Error('Invalid panel URL');
+        const response = await fetch(url.href, { ...options, mode: 'same-origin', credentials: 'same-origin', redirect: 'error' });
+        if (response.redirected || response.url !== url.href) throw new Error('Unexpected panel response URL');
+        return response;
+    }
+
+    function isJson(response) {
+        return /^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') || '');
+    }
+
+    async function rereadCsrfToken(rejectedToken) {
+        // Share a pending read across concurrent refusals. A late refusal of
+        // the old token must not overwrite a refresh that already succeeded.
+        if (csrfToken !== rejectedToken) return true;
+        if (!csrfRead) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            csrfRead = (async () => {
+                const response = await fetchInPanel('/api/cascade/rebuild/csrf-token', {
+                    method: 'GET', cache: 'no-store', signal: controller.signal,
+                });
+                if (response.status !== 200 || !isJson(response)) return false;
+                const data = await response.json();
+                const token = data?.csrfToken;
+                if (data?.csrfRequired !== true || typeof token !== 'string' || token.length !== 43
+                    || !/^[A-Za-z0-9_-]+$/.test(token) || token === rejectedToken) return false;
+                csrfToken = token;
+                return true;
+            })().catch(() => false).finally(() => {
+                clearTimeout(timeout);
+                csrfRead = undefined;
+            });
+        }
+        return csrfRead;
+    }
+
+    async function fetchTopologyWrite(path, options, sentToken = csrfToken) {
+        if (!rebuild) return fetch(path, options);
+        const response = await fetchInPanel(path, { ...options, headers: { ...options.headers, 'x-csrf-token': sentToken } });
+        if (response.status !== 403 || !isJson(response)) return response;
+        const payload = await response.clone().json().catch(() => null);
+        // requirePanelCsrf rejects before the handler with a top-level code;
+        // nested operation errors and other 403s don't prove a CSRF refusal.
+        if (payload?.error !== 'CSRF validation failed' || Object.keys(payload).length !== 2
+            || !csrfMessages.has(payload.code)) return response;
+        const refreshed = payload.code === 'CSRF_TOKEN_INVALID' && await rereadCsrfToken(sentToken);
+        const message = refreshed
+            ? (i18n.csrfTokenRefreshed || 'The session token was refreshed. Review the topology. Retry the action manually.')
+            : csrfMessages.get(payload.code);
+        // Never resend a submitted action, even with a new token: the current
+        // session may have changed and a prior step may already have saved data.
+        throw new TopologyCsrfRejection(message + ' (' + payload.code + ')');
+    }
+
+    async function rebuildPreview(payload, report, sessionToken) {
         if (!report) {
-            const response = await fetch('/api/cascade/rebuild/preview', { method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify(payload) });
+            const response = await fetchTopologyWrite('/api/cascade/rebuild/preview', { method: 'POST',
+                headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }, sessionToken);
             report = await response.json();
             if (!response.ok) throw new Error(report.error?.code || 'Предпросмотр недоступен');
         }
@@ -357,10 +422,11 @@
             const parent = document.getElementById('btnAddLink')?.parentElement;
             if (parent) { const unlock = document.createElement('button'); unlock.type='button'; unlock.className='btn btn-sm btn-outline';
                 unlock.textContent='Блокировка Apply'; parent.appendChild(unlock); unlock.onclick=async()=>{try{
-                    const r=await fetch('/api/cascade/rebuild/lock');const s=await r.json(); if(!r.ok)throw Error('Статус блокировки недоступен');
+                    const sessionToken = csrfToken;
+                    const r=await fetchInPanel('/api/cascade/rebuild/lock');const s=await r.json(); if(!r.ok)throw Error('Статус блокировки недоступен');
                     if(!s.stale){ showToast(s.locked?'Apply занят':'Свободно');return; }
                     if(!confirm('Предыдущий исполнитель и его команды на нодах остановлены? Снять именно эту устаревшую блокировку?'))return;
-                    const u=await fetch('/api/cascade/rebuild/unlock',{method:'POST',headers:{'Content-Type':'application/json','x-csrf-token':csrfToken},body:JSON.stringify({token:s.token})});
+                    const u=await fetchTopologyWrite('/api/cascade/rebuild/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:s.token})}, sessionToken);
                     if(!u.ok)throw Error('Блокировка не снята');showToast('Устаревшая блокировка снята');
                 }catch(e){showToast(e.message,'error');}}; }
         }
@@ -1065,8 +1131,9 @@
                 : '') +
             '</div>' +
             '<div class="info-actions">' +
-            '<button class="btn btn-sm btn-outline" id="btnEdit" onclick="window._cascadeEdit(\'' + lid + '\')">' +
-            '<i class="ti ti-edit"></i> ' + (i18n.edit || 'Edit') + '</button>' +
+            (!rebuild || document.getElementById('linkIdInput')
+                ? '<button class="btn btn-sm btn-outline" id="btnEdit" onclick="window._cascadeEdit(\'' + lid + '\')">' +
+                    '<i class="ti ti-edit"></i> ' + (i18n.edit || 'Edit') + '</button>' : '') +
             '<button class="btn btn-sm btn-success" id="btnDeploy" onclick="window._cascadeDeploy(\'' + lid + '\')">' +
             '<i class="ti ti-upload"></i> ' + (i18n.deploy || 'Deploy') + '</button>' +
             '<button class="btn btn-sm btn-primary" id="btnDeployChain" onclick="window._cascadeDeployChain(\'' + lid + '\')">' +
@@ -1446,10 +1513,17 @@
         return message + ' ' + job.jobId;
     }
 
-    async function handleLinkAutoDeploy(snapshot, optedIn) {
+    async function handleLinkAutoDeploy(snapshot, optedIn, sessionToken) {
         if (rebuild && snapshot?.executionMode === 'rebuild') {
             if (snapshot.status==='awaiting_preview') {
-                await deployTopology(snapshot.linkId, undefined, snapshot.preview); await loadTopology(); showToast('Схема пересобрана, файлы сверены');return;
+                try {
+                    await deployTopology(snapshot.linkId, undefined, snapshot.preview, sessionToken);
+                } catch (error) {
+                    if (!(error instanceof TopologyCsrfRejection)) throw error;
+                    showToast((i18n.csrfSavedDraft || 'The link was saved. Use Deploy on that link instead of saving it again.') + ' ' + error.message, 'error');
+                    return;
+                }
+                await loadTopology(); showToast('Схема пересобрана, файлы сверены');return;
             }
             showToast(snapshot.status==='succeeded'?'Схема пересобрана, файлы сверены':'Сохранено без применения'); return;
         }
@@ -1494,7 +1568,7 @@
 
     function createRequestHeaders(data, formKind) {
         const headers = { 'Content-Type': 'application/json' };
-        if (rebuild) return { ...headers, 'x-csrf-token': csrfToken };
+        if (rebuild) return headers;
         if (data.autoDeploy === true) {
             // Revision refresh is not a new logical create. Keep each form's
             // identity through rejected/unknown deliveries; retire on acceptance.
@@ -1586,17 +1660,18 @@
             const requestScope = linkId ? 'edit:' + linkId : 'main';
             if(rebuild && data.autoDeploy===true)data.interactivePreview=true;
             const headers = createRequestHeaders(data, requestScope);
-            const res = await fetch(linkId ? ('/api/cascade/links/' + linkId) : '/api/cascade/links', {
+            const sessionToken = csrfToken;
+            const res = await fetchTopologyWrite(linkId ? ('/api/cascade/links/' + linkId) : '/api/cascade/links', {
                 method: linkId ? 'PUT' : 'POST',
                 headers,
                 body: JSON.stringify(data),
-            });
+            }, sessionToken);
             const savedSnapshot = await handleDraftMutationResponse(res, linkId ? 'link.apply' : 'link.create', linkId || undefined);
             if (!savedSnapshot) return;
             pendingCreateRequests[requestScope] = null;
             closeModal();
             await loadTopology();
-            await handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true);
+            await handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true, sessionToken);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
@@ -1632,19 +1707,21 @@
         if (el) el.remove();
     }
 
-    async function deployTopology(linkId, domainLinkId, report) {
+    async function deployTopology(linkId, domainLinkId, report, sessionToken = csrfToken) {
         const payload = { expectedTopologyRevision: topologyRevision };
         if (linkId) payload.linkId = linkId;
         if (domainLinkId) payload.domainLinkId = domainLinkId;
-        if (rebuild) payload.expectedPreview = await rebuildPreview(payload, report);
+        // A concurrent reread applies to a new action, not to a workflow that
+        // has already started under an older session token.
+        if (rebuild) payload.expectedPreview = await rebuildPreview(payload, report, sessionToken);
         const scope = 'apply:' + linkId;
         const headers = linkId ? createRequestHeaders({ ...payload, autoDeploy: true,
             desiredVersion: _allLinks.find(link => link._id === linkId)?.desiredVersion }, scope) : { 'Content-Type': 'application/json' };
-        const res = await fetch('/api/cascade/topology/deploy', {
+        const res = await fetchTopologyWrite('/api/cascade/topology/deploy', {
             method: 'POST',
-            headers: { ...headers, 'x-csrf-token': csrfToken },
+            headers: rebuild ? headers : { ...headers, 'x-csrf-token': csrfToken },
             body: JSON.stringify(payload),
-        });
+        }, sessionToken);
         const data = await res.json().catch(() => ({}));
         if (res.status === 409) {
             await loadTopology();
@@ -1861,12 +1938,13 @@
         let response;
         try {
             const scope = 'delete:' + linkId;
-            const expectedPreview = rebuild ? await rebuildPreview({linkId,remove:true}) : undefined;
-            response = await fetch('/api/cascade/links/' + linkId, {
+            const sessionToken = csrfToken;
+            const expectedPreview = rebuild ? await rebuildPreview({linkId,remove:true}, undefined, sessionToken) : undefined;
+            response = await fetchTopologyWrite('/api/cascade/links/' + linkId, {
                 method: 'DELETE',
                 headers: createRequestHeaders({ autoDeploy: true, linkId }, scope),
                 body: JSON.stringify({ expectedTopologyRevision: topologyRevision, expectedPreview }),
-            });
+            }, sessionToken);
             const result = await handleDraftMutationResponse(response, 'link.delete', linkId);
             if (!result) return;
             if(rebuild && result.executionMode==='rebuild' && result.deleted===linkId){showToast('Связь удалена, обе части пересобраны');await loadTopology();closeInfoModal();return;}
@@ -1889,7 +1967,7 @@
             await loadTopology();
             closeInfoModal();
         } catch (err) {
-            if (!response || response.ok || response.status >= 500) {
+            if (!(err instanceof TopologyCsrfRejection) && (!response || response.ok || response.status >= 500)) {
                 // A lost/malformed acceptance is not proof of no accepted job.
                 // Retain the segment, but do not invent a server job or marker.
                 retainDeletion(link, null);
@@ -2203,17 +2281,18 @@
         if (btn) { btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>'; }
         try {
             if(rebuild && data.autoDeploy===true)data.interactivePreview=true;
-            var res = await fetch('/api/cascade/links', {
+            const sessionToken = csrfToken;
+            var res = await fetchTopologyWrite('/api/cascade/links', {
                 method: 'POST',
                 headers: createRequestHeaders(data, 'quick'),
                 body: JSON.stringify(data),
-            });
+            }, sessionToken);
             const createdSnapshot = await handleDraftMutationResponse(res, 'link.create');
             if (!createdSnapshot) return;
             pendingCreateRequests.quick = null;
             closeQuickModal();
             await loadTopology();
-            await handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
+            await handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true, sessionToken);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
