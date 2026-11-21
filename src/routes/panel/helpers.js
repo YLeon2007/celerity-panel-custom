@@ -924,6 +924,7 @@ const render = (res, template, data = {}) => {
         dateLocale: res.locals.dateLocale,
         locales: res.locals.locales,
         csrfToken: res.locals.csrfToken || '',
+        c3Rebuild: res.locals.c3Rebuild === true,
     };
 
     const content = compiledTemplate({
