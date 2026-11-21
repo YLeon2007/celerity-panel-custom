@@ -138,6 +138,7 @@ def modeled_xray_argv(info, path=None):
     expected_unit = B if path == h['BRIDGE'] else X
     h['need'](info['MainPID'] == units[expected_unit]['MainPID'] and h['working'](info), 'RUNTIME_UNPROVED')
     return info['MainPID']
+original_xray_argv = h['xray_argv']
 h['xray_argv'] = modeled_xray_argv
 units = {}
 for n in (X, B, XL, IKE, NET):
@@ -171,6 +172,26 @@ if scenario == 'chap-inspect-active':
     h['directory'] = session_directory
 units[IKE]['ExecStart'] = '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }'
 units[X].update(ActiveState='active', SubState='running', MainPID='10', InvocationID='old-main')
+if scenario.startswith('xtls-'):
+    start = f"{h['XRAY']} run -config {h['MAIN']}"
+    xtls = Path(h['SYSTEM'], 'xray.service.d', '10-donot_touch_single_conf.conf')
+    xtls.parent.mkdir()
+    xtls_bytes = f'# Do not edit; create a separate override instead.\n\n[Service]\nExecStart=\nExecStart={start}\n'.encode()
+    xtls.write_bytes(xtls_bytes)
+    xtls.chmod(0o644)
+    xtls_inode = xtls.stat().st_ino
+    units[X].update(DropInPaths=str(xtls), ExecStart=f"{{ path={h['XRAY']} ; argv[]={start} ; ignore_errors=no ; "
+                                                   'start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
+    def proc_cmdline(path, mode):
+        assert (path, mode) == ('/proc/' + units[X]['MainPID'] + '/cmdline', 'rb')
+        return io.BytesIO(b'\0'.join(arg.encode() for arg in (h['XRAY'], 'run', '-config', h['MAIN'], '')))
+    def realpath(path):
+        assert path == '/proc/' + units[X]['MainPID'] + '/exe'
+        return h['XRAY']
+    class XtlsOS(FixtureOS):
+        path = types.SimpleNamespace(realpath=realpath, **{k: getattr(os.path, k) for k in
+                                     ('split', 'basename', 'lexists', 'join', 'dirname')})
+    h.update(xray_argv=lambda info, path=h['MAIN']: original_xray_argv(info, path), os=XtlsOS(), open=proc_cmdline)
 stock_units = copy.deepcopy(units)
 stock_rules = [{'priority': n, 'src': 'all', 'table': t} for n, t in [(0, 255), (32766, 254), (32767, 253)]]
 foreign_rule = dict(priority=10078, src='198.51.100.0/24', table=201)
@@ -441,6 +462,7 @@ def wire(action, *, stdin=None, helper=h, **kw):
     saved = sys.stdin
     try:
         helper['CHAP_ENTERED'] = False  # one invocation per process on the host
+        helper['NETWORK_UPGRADE_ENTERED'] = False
         sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(
             stdin.encode() if stdin is not None else h['encode'](dict(req, action=action, **kw))))
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -455,6 +477,39 @@ def snapshot():
     return sorted((str(p.relative_to(root)), p.lstat().st_ino, p.lstat().st_ctime_ns,
                    p.read_bytes() if p.is_file() else None) for p in root.rglob('*'))
 
+if scenario.startswith('xtls-'):
+    def xtls_wire(action, **extra):
+        return wire(action, stdin=h['encode'](dict(
+            {k: req[k] for k in ('machineId', 'network', 'backupId')}, action=action, **extra)).decode())
+    install_baseline = h['digest'](h['encode'](before))
+    testing = False  # No foreign policy during the install-bound phases.
+    a = xtls_wire('verify', baseline=install_baseline)
+    assert a[0] == 0, a
+    units[X]['DropInPaths'] = ''
+    assert xtls_wire('verify', baseline=install_baseline) == (70, '', 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n')
+    units[X]['DropInPaths'] = str(xtls)
+    if scenario == 'xtls-rollback':
+        a = xtls_wire('rollback', baseline=install_baseline)
+        assert a[0] == 0 and json.loads(manifest.read_bytes())['phase'] == 'rolled-back', a
+        assert R(P['main']) == before['files']['main'] and not any(policy.values())
+        assert xtls.read_bytes() == xtls_bytes and xtls.stat().st_ino == xtls_inode
+        print('ok')
+        sys.exit(0)
+    testing = True
+    a = xtls_wire('check-apply-network')
+    assert a[0] == 0, a
+    apply_proof = json.loads(a[1])['proof']
+    assert xtls_wire('prepare-apply-network') == a
+    assert xtls_wire('verify-apply-network', proof=apply_proof) == a
+    xtls.write_bytes(xtls_bytes + b'Environment=FOREIGN=1\n')
+    drifted = snapshot()
+    assert xtls_wire('restart-apply-network', proof=apply_proof) == (70, '', 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n')
+    assert not changes and snapshot() == drifted
+    xtls.write_bytes(xtls_bytes)
+    assert xtls_wire('restart-apply-network', proof=apply_proof) == a
+    assert xtls_wire('verify-apply-network', proof=apply_proof) == a
+    assert changes == [('restart', X)]
+    changes.clear()
 initial = snapshot()
 if scenario == 'chap-epoch':
     # Run the exact historical helper with the same modeled system and real
@@ -904,12 +959,15 @@ else:
         assert not any(policy.values()) and intent.is_file() and wire('prepare-remove')[0] != 0
         assert not Path(h['DROP_DIR']).exists() and not Path(h['NFT_DIR']).exists()
         assert all(B not in cmd for cmd in changes) and ('restart',X) in changes
+        if scenario == 'xtls-apply-remove':
+            assert xtls.read_bytes() == xtls_bytes and xtls.stat().st_ino == xtls_inode
         assert h['ip']('rule','show')[-1] == foreign_rule and h['ip']('route','show','table','all') == [foreign_route]
     if scenario != 'stale-manifest': assert (manifest.read_bytes(), manifest.stat().st_ino) == manifest_saved
 print('ok')
 `;
 
-for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation', 'chap-epoch',
+for (const scenario of ['normal', 'xtls-apply-remove', 'xtls-rollback', 'apply', 'apply-quiescent-dependent',
+    'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation', 'chap-epoch',
     'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown', 'chap-sync-revoke',
     'chap-unterminated-clean', 'chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix', 'chap-unterminated-separated',
     'chap-terminated-suffix',

@@ -35,6 +35,8 @@ NFT_DIR = '/etc/celerity-rebuild-l2tp'
 NFT_FILE = NFT_DIR + '/ingress.nft'
 VAULT = '/var/lib/celerity-rebuild-l2tp-direct'
 XL, IKE, X, B = 'xl2tpd.service', 'strongswan-starter.service', 'xray.service', 'xray-bridge.service'
+XRAY_DROPIN_NAME = '10-donot_touch_single_conf.conf'
+XRAY_DROPIN_UNSUPPORTED = 'XRAY_DROPIN_UNSUPPORTED'
 # Exact native unit emitted by the stock prerequisite installer.
 NATIVE_XL_SHA = '20e9c67838fa8072a5378839fc729a1123d1580879fbf20f9121d558fd0fe0df'
 XL_BOOT = SYSTEM + '/multi-user.target.wants/' + XL
@@ -253,7 +255,9 @@ def unit(name):
             pairs = [(key, value) for key, value in pairs if key != 'ExecStart']
             pairs.append(('ExecStart', ' '.join(starts)))
     info = dict(pairs)
-    need(len(pairs) == len(info), 'PREREQUISITE')
+    if len(pairs) != len(info):
+        raise Refusal(XRAY_DROPIN_UNSUPPORTED if name == X and
+                      any(key == 'DropInPaths' and value for key, value in pairs) else 'PREREQUISITE')
     need(info.get('LoadState') in ('loaded', 'masked', 'not-found') and
          info.get('ActiveState') in ('active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading'), 'PREREQUISITE')
     return info
@@ -311,11 +315,52 @@ def no_hooks(info):
                                          'RootDirectory', 'RootImage')) and info.get('PrivateNetwork') == 'no'
 
 
+def xray_dropin(info, path, argv):
+    loaded = info.get('DropInPaths')
+    if not loaded:
+        return
+    bad = XRAY_DROPIN_UNSUPPORTED
+    folder = SYSTEM + '/' + X + '.d'
+    stock = folder + '/' + XRAY_DROPIN_NAME
+    need(path == MAIN and loaded == stock and info.get('LoadState') == 'loaded'
+         and info.get('NeedDaemonReload') == 'no', bad)
+    # An exact systemctl command record, not a prefix or the first of several.
+    prefix = '{ path=' + XRAY + ' ; argv[]=' + ' '.join(argv) + ' ; '
+    need(re.fullmatch(re.escape(prefix) + r'ignore_errors=no ; start_time=\[[^\[\]{};\r\n]+\] ; '
+                      r'stop_time=\[[^\[\]{};\r\n]+\] ; pid=[0-9]+ ; code=[^ ;{}\r\n]+ ; status=[^ ;{}\r\n]+ \}',
+                      info.get('ExecStart', '')) is not None and no_hooks(info)
+         and not any(info.get(k) for k in ('ExecCondition', 'ExecReload', 'Environment', 'EnvironmentFiles',
+                                           'PassEnvironment', 'UnsetEnvironment'))
+         and info.get('WorkingDirectory') in ('', '/') and info.get('KillMode') == 'control-group', bad)
+    try:
+        with directory(folder) as fd:
+            need([n for n in os.listdir(fd) if n.endswith('.conf')] == [XRAY_DROPIN_NAME], bad)
+        record = read(stock, 16384)
+    except (OSError, Refusal):
+        raise Refusal(bad) from None
+    need(record is not None and record['mode'] == 0o644 and record['gid'] == 0, bad)
+    lines = [line.removesuffix(b'\r').strip(b' \t') for line in raw(record).split(b'\n')]
+    need(all(not any(c in line for c in (b'\0', b'\r')) and not line.endswith(b'\\') for line in lines)
+         and [line for line in lines if line and not line.startswith((b'#', b';'))]
+             == [b'[Service]', b'ExecStart=', b'ExecStart=' + ' '.join(argv).encode()], bad)
+
+
+def same_xray_dropin(info, original):
+    # This operation never owns, writes or changes the MAIN drop-in selection.
+    need((info.get('DropInPaths') or '') == (original.get('DropInPaths') or ''), XRAY_DROPIN_UNSUPPORTED)
+
+
+def retained_xray_dropin(info, original):
+    same_xray_dropin(info, original)
+    xray_dropin(info, MAIN, (XRAY, 'run', '-config', MAIN))
+
+
 def xray_argv(info, path=MAIN):
     argv = [XRAY, 'run', '-config', path]
+    xray_dropin(info, path, argv)
     prefix = '{ path=' + XRAY + ' ; argv[]=' + ' '.join(argv) + ' ;'
     need(working(info) and info.get('ExecStart', '').startswith(prefix) and no_hooks(info)
-         and not info.get('Environment') and not info.get('EnvironmentFiles') and not info.get('DropInPaths')
+         and not info.get('Environment') and not info.get('EnvironmentFiles')
          and info.get('WorkingDirectory') in ('', '/') and info.get('KillMode') == 'control-group', 'PREREQUISITE')
     pid = info['MainPID']
     with open('/proc/' + pid + '/cmdline', 'rb') as handle:
@@ -904,6 +949,7 @@ def installed_runtime(d, token, before, after):
          'RUNTIME_UNPROVED')
     rows = sock_rows()
     pid = xray_argv(x)
+    same_xray_dropin(x, before['units'][X])
     sockets = xray_users(after['main'], x, rows, before.get('transit'))
     need(set(tuple(s) for s in before['sockets']) <= set(tuple(s) for s in sockets)
          and x['InvocationID'] != before['units'][X]['InvocationID'], 'RUNTIME_UNPROVED')
@@ -1000,6 +1046,7 @@ def install(request, before, after):
     sc('daemon-reload', wait=12)
     if 'bridge' in after:
         sc('restart', B, wait=22)
+    retained_xray_dropin(unit(X), before['units'][X])
     sc('restart', X, wait=22)
     if before.get('ikeSockets'):
         sc('restart', IKE, wait=22)
@@ -1281,7 +1328,8 @@ def rollback(request, path, old_manifest, backup):
         if n == NET_UNIT:
             need(info['LoadState'] == 'not-found' or info.get('FragmentPath') == NET, 'ROLLBACK_DRIFT')
         if n == X:
-            need(info['FragmentPath'] == before['units'][n]['FragmentPath'] and not info.get('DropInPaths'), 'ROLLBACK_DRIFT')
+            need(info['FragmentPath'] == before['units'][n]['FragmentPath'], 'ROLLBACK_DRIFT')
+            retained_xray_dropin(info, before['units'][n])
             if working(info):
                 original_invocation = info['InvocationID'] == before['units'][n]['InvocationID']
                 xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows(), before.get('transit'))
@@ -1365,6 +1413,7 @@ def rollback(request, path, old_manifest, backup):
     if sidecar and (current['bridge'] != originals['bridge'] or not working(unit(B))):
         sc('restart', B, wait=22)
     x = unit(X)
+    retained_xray_dropin(x, before['units'][X])
     if current['main'] != before['files']['main'] or not working(x):
         sc('restart', X, wait=22)
     if before.get('ikeSockets'):
@@ -1392,7 +1441,9 @@ def rollback(request, path, old_manifest, backup):
     if restored_ike:
         need(idle_ike(unit(IKE), rows) == restored_ike, 'RUNTIME_UNPROVED')
     reserved = (1701, d['tproxyPort']) if restored_ike else (500, 4500, 1701, d['tproxyPort'])
-    need(xray_users(before['files']['main'], unit(X), rows, before.get('transit')) == before['sockets'] and
+    x = unit(X)
+    same_xray_dropin(x, before['units'][X])
+    need(xray_users(before['files']['main'], x, rows, before.get('transit')) == before['sockets'] and
          not any(port in reserved for p, a, port, owners in rows), 'RUNTIME_UNPROVED')
     backup['phase'] = 'rolled-back'
     write(path, rolling, entry(encode(backup)))
@@ -1923,7 +1974,8 @@ def apply_network_snapshot(d, token, backup, record, generation, *, listeners_re
         if name == B and info['LoadState'] == 'not-found':
             continue
         need(info['LoadState'] == 'loaded' and info['NeedDaemonReload'] == 'no' and no_hooks(info)
-             and not any(info.get(k) for k in ('ExecCondition', 'ExecReload', 'DropInPaths'))
+             and not any(info.get(k) for k in ('ExecCondition', 'ExecReload'))
+             and (name == X or not info.get('DropInPaths'))
              and set(info['RequiredBy'].split()) == ({NET_UNIT} if name == X and legacy else set())
              and not any(info[k] for k in ('BoundBy', 'ConsistsOf', 'PropagatesStopTo'))
              and all(set(info[k].split()) <= {'shutdown.target'} for k in ('Conflicts', 'ConflictedBy')), bad)
