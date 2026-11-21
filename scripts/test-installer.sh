@@ -62,11 +62,11 @@ expect_failure() {
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || {
-    printf 'expected failure but command succeeded: %s\n' "$*" >&2
+    printf 'expected failure but command succeeded\n' >&2
     return 1
   }
   printf '%s\n' "$output" | grep -Fq "$expected" || {
-    printf 'missing expected failure %q in output:\n%s\n' "$expected" "$output" >&2
+    printf 'missing expected failure %q (output withheld)\n' "$expected" >&2
     return 1
   }
 }
@@ -108,27 +108,23 @@ set -e
 
 # Updating an existing checkout to a previously unseen branch must create the
 # remote-tracking ref explicitly and move only by fast-forward.
-git init -q --bare "$ROOT/source.git"
 git init -q -b main "$ROOT/source-work"
 git -C "$ROOT/source-work" config user.email test@example.com
 git -C "$ROOT/source-work" config user.name installer-test
 printf 'main\n' >"$ROOT/source-work/version.txt"
 git -C "$ROOT/source-work" add version.txt
 git -C "$ROOT/source-work" commit -qm main
-git -C "$ROOT/source-work" remote add origin "file://$ROOT/source.git"
-git -C "$ROOT/source-work" push -q -u origin main
 git -C "$ROOT/source-work" switch -qc feature/installer-test
 printf 'feature\n' >"$ROOT/source-work/version.txt"
 git -C "$ROOT/source-work" commit -qam feature
-git -C "$ROOT/source-work" push -q -u origin feature/installer-test
-git clone -q --branch main "file://$ROOT/source.git" "$ROOT/update"
+git clone -q --branch main "file://$ROOT/source-work" "$ROOT/update"
 (
   export CELERITY_INSTALLER_LIBRARY=1 INSTALL_DIR="$ROOT/update" BACKUP_ROOT="$ROOT/update-backups"
   export INSTALL_USER="$(id -un)" PANEL_DOMAIN=x.example.com ACME_EMAIL=x@example.com
   export BRANCH=feature/installer-test REPO=owner/repo
   source "$REPO_ROOT/scripts/install.sh"
   INSTALL_GROUP="$(id -gn "$INSTALL_USER")"
-  REPO_URL="file://$ROOT/source.git"
+  REPO_URL="file://$ROOT/source-work"
   clone_or_update_repo
 )
 [ "$(git -C "$ROOT/update" branch --show-current)" = feature/installer-test ]

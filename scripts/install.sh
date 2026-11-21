@@ -35,6 +35,7 @@ NO_START="${NO_START:-0}"
 START_TIMEOUT="${START_TIMEOUT:-240}"
 SKIP_HTTPS_CHECK="${SKIP_HTTPS_CHECK:-0}"
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
+env_file=.env
 
 log() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -77,13 +78,13 @@ install_docker_if_needed() {
 
 install_base_tools() {
   local missing="" cmd
-  for cmd in git curl openssl tar awk grep realpath; do
+  for cmd in git curl openssl tar awk grep realpath stat timeout runuser; do
     command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
   done
   if [ -n "$missing" ]; then
     log "Installing base tools:$missing"
     apt-get update
-    apt-get install -y git curl openssl tar gawk grep coreutils ca-certificates
+    apt-get install -y git curl openssl tar gawk grep coreutils util-linux ca-certificates
   fi
 }
 
@@ -138,15 +139,27 @@ valid_hostname() {
   done
 }
 
+check_secret_file() {
+  local path="$1"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ ! -L "$path" ] && [ -f "$path" ] && [ "$(stat -c %h -- "$path")" = 1 ] \
+      || fail "Unsafe ${path##*/}: expected a regular file with one link"
+  fi
+}
+
+check_runtime_paths() {
+  check_secret_file "$INSTALL_DIR/.env"
+  check_secret_file "$INSTALL_DIR/mongo-keyfile"
+  local dir
+  for dir in logs greenlock.d backups data; do
+    local path="$INSTALL_DIR/$dir"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      [ ! -L "$path" ] && [ -d "$path" ] || fail "Unsafe $dir: expected a directory"
+    fi
+  done
+}
+
 validate_inputs() {
-  prompt_for_missing_inputs
-
-  [ -n "$PANEL_DOMAIN" ] || fail "PANEL_DOMAIN is required, e.g. PANEL_DOMAIN=panel.example.com"
-  [ -n "$ACME_EMAIL" ] || fail "ACME_EMAIL is required, e.g. ACME_EMAIL=admin@example.com"
-  valid_hostname "$PANEL_DOMAIN" || fail "PANEL_DOMAIN must be a valid hostname without scheme/path"
-  printf '%s' "$ACME_EMAIL" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$' \
-    || fail "ACME_EMAIL must look like an email address, e.g. admin@example.com"
-
   case "$INSTALL_DIR" in
     /*) ;;
     *) fail "INSTALL_DIR must be an absolute path" ;;
@@ -160,6 +173,7 @@ validate_inputs() {
   [ ! -L "$INSTALL_DIR" ] || fail "INSTALL_DIR must not be a symlink: $INSTALL_DIR"
   [ "$(realpath -m -- "$INSTALL_DIR")" = "$INSTALL_DIR" ] \
     || fail "INSTALL_DIR must be normalized and must not traverse symlink parents"
+  [ ! -e "$INSTALL_DIR" ] || [ -d "$INSTALL_DIR" ] || fail "INSTALL_DIR must be a directory"
   case "$BACKUP_ROOT" in
     /*) ;;
     *) fail "BACKUP_ROOT must be an absolute path" ;;
@@ -171,6 +185,17 @@ validate_inputs() {
   [ ! -L "$BACKUP_ROOT" ] || fail "BACKUP_ROOT must not be a symlink: $BACKUP_ROOT"
   [ "$(realpath -m -- "$BACKUP_ROOT")" = "$BACKUP_ROOT" ] \
     || fail "BACKUP_ROOT must be normalized and must not traverse symlink parents"
+  case "$BACKUP_ROOT" in
+    "$INSTALL_DIR"|"$INSTALL_DIR"/*) fail "BACKUP_ROOT must be outside INSTALL_DIR" ;;
+  esac
+  check_runtime_paths
+  prompt_for_missing_inputs
+
+  [ -n "$PANEL_DOMAIN" ] || fail "PANEL_DOMAIN is required, e.g. PANEL_DOMAIN=panel.example.com"
+  [ -n "$ACME_EMAIL" ] || fail "ACME_EMAIL is required, e.g. ACME_EMAIL=admin@example.com"
+  valid_hostname "$PANEL_DOMAIN" || fail "PANEL_DOMAIN must be a valid hostname without scheme/path"
+  printf '%s' "$ACME_EMAIL" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$' \
+    || fail "ACME_EMAIL must look like an email address, e.g. admin@example.com"
   case "$COMPOSE_FILE" in
     ''|/*|*'..'*) fail "COMPOSE_FILE must be a relative filename inside INSTALL_DIR" ;;
   esac
@@ -183,6 +208,7 @@ validate_inputs() {
     ''|*[!0-9]*) fail "START_TIMEOUT must be an integer number of seconds" ;;
   esac
   [ "$START_TIMEOUT" -ge 30 ] || fail "START_TIMEOUT must be at least 30 seconds"
+  START_TIMEOUT=$((10#$START_TIMEOUT))
   printf '%s' "$MONGO_USER" | grep -Eq '^[A-Za-z0-9_.-]+$' || fail "Invalid MONGO_USER"
   printf '%s' "$LOG_LEVEL" | grep -Eq '^[A-Za-z]+$' || fail "Invalid LOG_LEVEL"
   printf '%s' "$SYNC_INTERVAL" | grep -Eq '^[0-9]+$' || fail "Invalid SYNC_INTERVAL"
@@ -231,9 +257,9 @@ make_backup_if_existing() {
     -czf "$backup" -C "$(dirname "$INSTALL_DIR")" "$(basename "$INSTALL_DIR")"
   chmod 600 "$backup"
 
-  if [ -d "$INSTALL_DIR/.git" ]; then
+  if [ -d "$INSTALL_DIR/.git" ] && [ ! -L "$INSTALL_DIR/.git" ]; then
     local sha
-    sha="$(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+    sha="$(git_as_install_user -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
     [ -z "$sha" ] || printf '%s\n' "$sha" >"$backup.git-sha"
   fi
 
@@ -243,75 +269,104 @@ make_backup_if_existing() {
 }
 
 clone_or_update_repo() {
-  mkdir -p "$(dirname "$INSTALL_DIR")"
+  # Newly created parents must be traversable by the owner running Git.
+  (umask 022; mkdir -p -- "$(dirname "$INSTALL_DIR")")
 
-  if [ -d "$INSTALL_DIR/.git" ]; then
+  if [ -d "$INSTALL_DIR/.git" ] && [ ! -L "$INSTALL_DIR/.git" ]; then
     log "Updating existing git checkout in $INSTALL_DIR"
-    if [ -n "$(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" status --porcelain=v1)" ]; then
+    local changes tracked_secrets branch_ref="refs/remotes/origin/$BRANCH"
+    local -a checkout=(-c "safe.directory=$INSTALL_DIR" -C "$INSTALL_DIR")
+    changes="$(git_as_install_user "${checkout[@]}" status --porcelain=v1 --untracked-files=no)"
+    if [ -n "$changes" ]; then
       fail "Existing checkout has local changes. Backup was created; clean or commit them before FORCE=1."
     fi
-    git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
-    run_git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" fetch origin \
-      "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-    if git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
-      git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" checkout "$BRANCH"
-      git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" merge --ff-only "refs/remotes/origin/$BRANCH"
+    tracked_secrets="$(git_as_install_user "${checkout[@]}" ls-files -- .env mongo-keyfile)"
+    [ -z "$tracked_secrets" ] || fail "Existing checkout must not track .env or mongo-keyfile"
+    git_as_install_user "${checkout[@]}" remote set-url origin "$REPO_URL"
+    run_git "${checkout[@]}" fetch origin "+refs/heads/$BRANCH:$branch_ref"
+    tracked_secrets="$(git_as_install_user "${checkout[@]}" ls-tree "$branch_ref" -- .env mongo-keyfile)"
+    [ -z "$tracked_secrets" ] || fail "Incoming checkout must not track .env or mongo-keyfile"
+    # Unrelated local files are allowed. Git must not overwrite collisions,
+    # even when a path (such as runtime data) is ignored by the old checkout.
+    if git_as_install_user "${checkout[@]}" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+      tracked_secrets="$(git_as_install_user "${checkout[@]}" ls-tree "refs/heads/$BRANCH" -- .env mongo-keyfile)"
+      [ -z "$tracked_secrets" ] || fail "Target branch must not track .env or mongo-keyfile"
+      git_as_install_user "${checkout[@]}" checkout --no-overwrite-ignore "$BRANCH"
+      git_as_install_user "${checkout[@]}" merge --ff-only --no-overwrite-ignore "$branch_ref"
     else
-      git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" checkout --track -b "$BRANCH" "refs/remotes/origin/$BRANCH"
+      git_as_install_user "${checkout[@]}" checkout --no-overwrite-ignore --track -b "$BRANCH" "$branch_ref"
     fi
   else
-    if [ -e "$INSTALL_DIR" ]; then
-      rm -rf -- "$INSTALL_DIR"
+    local entry=""
+    if [ -d "$INSTALL_DIR" ]; then
+      entry="$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)"
+      [ -z "$entry" ] || fail "Existing INSTALL_DIR is not a Git checkout; migrate it separately. No files were removed."
     fi
 
+    install -d -m 750 -o "$INSTALL_USER" -g "$INSTALL_GROUP" "$INSTALL_DIR"
     log "Cloning $REPO_URL ref $BRANCH into $INSTALL_DIR"
     run_git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$INSTALL_DIR"
+    entry="$(git_as_install_user -C "$INSTALL_DIR" ls-files -- .env mongo-keyfile)"
+    [ -z "$entry" ] || fail "Cloned checkout must not track .env or mongo-keyfile"
   fi
 
-  # Never persist a token in the checkout remote URL.
-  git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
-  chown -R "$INSTALL_USER:$INSTALL_GROUP" "$INSTALL_DIR"
+  # Git writes as the install owner, without a recursive chown of live data.
   unset GITHUB_TOKEN || true
+}
+
+git_as_install_user() {
+  local -a env_args=(-u GITHUB_TOKEN)
+  if [ -n "${git_auth_home:-}" ]; then
+    env_args+=("HOME=$git_auth_home")
+  fi
+  if [ "$(id -un)" = "$INSTALL_USER" ]; then
+    env "${env_args[@]}" git "$@"
+  else
+    runuser -u "$INSTALL_USER" -- env "${env_args[@]}" git "$@"
+  fi
 }
 
 run_git() {
   if [ -z "${GITHUB_TOKEN:-}" ]; then
-    git "$@"
+    git_as_install_user "$@"
     return
   fi
 
   (
-    local tmp_base tmp_home
+    local tmp_base git_auth_home
     tmp_base="${TMPDIR:-/tmp}"
     if [ "$(id -u)" -eq 0 ] && [ -d /run ]; then
       tmp_base=/run
     fi
-    tmp_home="$(mktemp -d "$tmp_base/celerity-installer-git.XXXXXX")"
-    chmod 700 "$tmp_home"
-    trap 'rm -rf -- "$tmp_home"' EXIT HUP INT TERM
-    cat >"$tmp_home/.netrc" <<EOF_NETRC
+    git_auth_home="$(mktemp -d "$tmp_base/celerity-installer-git.XXXXXX")"
+    trap 'rm -rf -- "$git_auth_home"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    cat >"$git_auth_home/.netrc" <<EOF_NETRC
 machine github.com
   login x-access-token
   password $GITHUB_TOKEN
 EOF_NETRC
-    chmod 600 "$tmp_home/.netrc"
-    env -u GITHUB_TOKEN HOME="$tmp_home" git "$@"
+    chown "$INSTALL_USER:$INSTALL_GROUP" "$git_auth_home/.netrc" "$git_auth_home"
+    git_as_install_user "$@"
   )
 }
 
 env_value() {
   local key="$1"
-  awk -v key="$key" 'index($0, key "=") == 1 { value=substr($0, length(key)+2) } END { print value }' .env
+  awk -v key="$key" 'index($0, key "=") == 1 { value=substr($0, length(key)+2) } END { print value }' "${env_file:-.env}"
 }
 
 ensure_env_value() {
-  local key="$1" value="$2" current tmp
+  local key="$1" value="$2" current tmp file="${env_file:-.env}"
   current="$(env_value "$key")"
   if [ -n "$current" ]; then
     return
   fi
 
-  if grep -q "^${key}=" .env; then
+  if grep -q "^${key}=" "$file"; then
+    [ -n "$value" ] || return 0
     tmp="$(mktemp "$INSTALL_DIR/.env.tmp.XXXXXX")"
     awk -v key="$key" -v value="$value" '
       BEGIN { written=0 }
@@ -321,31 +376,29 @@ ensure_env_value() {
       }
       { print }
       END { if (!written) print key "=" value }
-    ' .env >"$tmp"
+    ' "$file" >"$tmp"
     chmod 600 "$tmp"
-    mv -f "$tmp" .env
+    mv -Tf -- "$tmp" "$file"
   else
-    printf '%s=%s\n' "$key" "$value" >>.env
+    # Do not join a default to an operator's final unterminated line.
+    if [ -s "$file" ] && [ -n "$(tail -c 1 -- "$file")" ]; then
+      printf '\n' >>"$file"
+    fi
+    printf '%s=%s\n' "$key" "$value" >>"$file"
   fi
 }
 
-write_env_safely() {
-  cd "$INSTALL_DIR"
-  local had_env=0
-  if [ -f .env ]; then
-    had_env=1
-    local env_backup
-    install -d -m 700 "$BACKUP_ROOT"
-    env_backup="$(mktemp "$BACKUP_ROOT/.env-$(date +%Y%m%d-%H%M%S).XXXXXX.backup")"
-    cp -a .env "$env_backup"
-    chmod 600 "$env_backup"
-    chown "$INSTALL_USER:$INSTALL_GROUP" "$env_backup"
-    log "Preserving existing .env values; backup: $env_backup"
-  else
-    : >.env
+ensure_env_secret() {
+  local key="$1" bytes="$2" value="${!1:-}"
+  [ -z "$(env_value "$key")" ] || return 0
+  if [ -z "$value" ]; then
+    value="$(random_hex "$bytes")" || fail "Could not generate $key"
+    [ "${#value}" -eq "$((bytes * 2))" ] || fail "Could not generate $key"
   fi
-  chmod 600 .env
+  ensure_env_value "$key" "$value"
+}
 
+write_env_defaults() {
   # Existing non-empty values always win, including on FORCE=1. Missing/empty
   # values are added or repaired without rotating encryption/database secrets.
   ensure_env_value PANEL_DOMAIN "$PANEL_DOMAIN"
@@ -356,17 +409,40 @@ write_env_safely() {
   ensure_env_value DOKPLOY_PANEL_HOST "$PANEL_DOMAIN"
   ensure_env_value DOKPLOY_TRAEFIK_SERVICE_PORT 3000
   ensure_env_value ACME_EMAIL "$ACME_EMAIL"
-  ensure_env_value ENCRYPTION_KEY "${ENCRYPTION_KEY:-$(random_hex 16)}"
-  ensure_env_value SESSION_SECRET "${SESSION_SECRET:-$(random_hex 32)}"
+  ensure_env_secret ENCRYPTION_KEY 16
+  ensure_env_secret SESSION_SECRET 32
   ensure_env_value MONGO_USER "$MONGO_USER"
-  ensure_env_value MONGO_PASSWORD "${MONGO_PASSWORD:-$(random_hex 16)}"
-  ensure_env_value UPDATER_SECRET "${UPDATER_SECRET:-$(random_hex 32)}"
+  ensure_env_secret MONGO_PASSWORD 16
+  ensure_env_secret UPDATER_SECRET 32
   ensure_env_value USE_CADDY true
   ensure_env_value SESSION_COOKIE_SECURE true
   ensure_env_value PANEL_IP_WHITELIST "$PANEL_IP_WHITELIST"
   ensure_env_value SYNC_INTERVAL "$SYNC_INTERVAL"
   ensure_env_value LOG_LEVEL "$LOG_LEVEL"
+}
 
+write_env_safely() {
+  cd "$INSTALL_DIR"
+  local env_file=.env
+  check_secret_file .env
+  if [ -f .env ]; then
+    local env_backup
+    install -d -m 700 "$BACKUP_ROOT"
+    env_backup="$(mktemp "$BACKUP_ROOT/.env-$(date +%Y%m%d-%H%M%S).XXXXXX.backup")"
+    cp -- .env "$env_backup"
+    log "Preserving existing .env values; backup: $env_backup"
+    chmod 600 .env
+    write_env_defaults
+  else
+    (
+      env_file="$(mktemp .env.tmp.XXXXXX)"
+      trap 'rm -f -- "$env_file"' EXIT
+      write_env_defaults
+      ensure_env_value C3_REBUILD_ENABLED true
+      mv -Tf -- "$env_file" .env
+    )
+    log "Generated .env, including an HMAC UPDATER_SECRET"
+  fi
   chmod 600 .env
   chown "$INSTALL_USER:$INSTALL_GROUP" .env
   PANEL_DOMAIN="$(env_value PANEL_DOMAIN)"
@@ -374,11 +450,8 @@ write_env_safely() {
   MONGO_USER="$(env_value MONGO_USER)"
   export PANEL_DOMAIN ACME_EMAIL MONGO_USER
   validate_effective_env
-  if [ "$had_env" = 1 ]; then
-    log "Existing .env secrets were retained; only missing/empty keys were added"
-  else
-    log "Generated .env, including an HMAC UPDATER_SECRET"
-  fi
+  # Compose must use the preserved .env, not conflicting caller overrides.
+  unset MONGO_PASSWORD UPDATER_SECRET
 }
 
 validate_effective_env() {
@@ -395,8 +468,94 @@ validate_effective_env() {
 
 prepare_dirs() {
   cd "$INSTALL_DIR"
-  install -d -m 750 -o "$INSTALL_USER" -g "$INSTALL_GROUP" logs greenlock.d
-  install -d -m 700 -o "$INSTALL_USER" -g "$INSTALL_GROUP" backups data
+  check_runtime_paths
+  local dir mode
+  for dir in logs greenlock.d backups data; do
+    [ ! -d "$dir" ] || continue
+    case "$dir" in logs|greenlock.d) mode=750 ;; *) mode=700 ;; esac
+    install -d -m "$mode" -o "$INSTALL_USER" -g "$INSTALL_GROUP" "$dir"
+  done
+}
+
+prepare_mongo_keyfile() (
+  cd "$INSTALL_DIR"
+  check_secret_file mongo-keyfile
+  # Keep the inode and ownership of an existing bind-mounted key intact.
+  [ ! -s mongo-keyfile ] || return 0
+
+  local tmp
+  tmp="$(mktemp .mongo-keyfile.XXXXXX)"
+  trap 'rm -f -- "$tmp"' EXIT
+  openssl rand -base64 756 >"$tmp" && [ -s "$tmp" ] || fail "Could not generate Mongo keyfile"
+  chown 999 "$tmp" || fail "Could not set Mongo keyfile owner to uid 999"
+  chmod 0400 "$tmp" || fail "Could not set Mongo keyfile mode to 0400"
+  mv -Tf -- "$tmp" mongo-keyfile
+)
+
+mongo_rs_eval() {
+  local deadline="$1" initiate="$2" budget
+  budget=$((deadline - SECONDS))
+  [ "$budget" -gt 0 ] || return 1
+  if [ "$budget" -gt 10 ]; then budget=10; fi
+
+  # Connect over the service network, not to the image entrypoint's temporary
+  # localhost-only standalone. Direct mode works before discovery of rs0.
+  # Credentials stay inside the Mongo container; never print raw shell output.
+  timeout --signal=KILL "${budget}s" docker compose -f "$COMPOSE_FILE" exec -T mongo sh -ec '
+    exec mongosh "mongodb://mongo:27017/admin?directConnection=true&serverSelectionTimeoutMS=2000&socketTimeoutMS=5000" \
+      --quiet --norc --username "$MONGO_INITDB_ROOT_USERNAME" \
+      --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "$1"
+  ' sh "const initiate = $initiate;
+    const admin = db.getSiblingDB('admin');
+    let status;
+    try { status = admin.runCommand({ replSetGetStatus: 1 }); }
+    catch (error) { status = error; }
+    if (status.ok === 1) {
+      print(status.set !== 'rs0' ? 'STATUS_ERROR' : status.myState === 1 ? 'PRIMARY' : 'WAIT');
+    } else if (status.code === 94) {
+      if (!initiate) {
+        print('NOT_INITIALIZED');
+      } else {
+        let result;
+        try {
+          result = admin.runCommand({ replSetInitiate: { _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] } });
+        } catch (error) { result = error; }
+        // Code 23 means another initializer won; observe without reconfiguring.
+        print(result.ok === 1 || result.code === 23 ? 'WAIT' : 'INIT_ERROR');
+      }
+    } else {
+      print('STATUS_ERROR');
+    }" 2>/dev/null
+}
+
+wait_for_mongo_primary() {
+  local deadline=$((SECONDS + START_TIMEOUT)) result attempted=0
+  log "Waiting up to ${START_TIMEOUT}s for authenticated Mongo rs0 PRIMARY"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if result="$(mongo_rs_eval "$deadline" false)" && [ "$SECONDS" -lt "$deadline" ]; then
+      case "$result" in
+        PRIMARY) return 0 ;;
+        WAIT) ;;
+        NOT_INITIALIZED)
+          if [ "$attempted" = 0 ]; then
+            attempted=1
+            log "Initializing Mongo rs0"
+            result="$(mongo_rs_eval "$deadline" true)" || fail "Mongo replSetInitiate outcome unknown; not retrying"
+            [ "$SECONDS" -lt "$deadline" ] || break
+            case "$result" in
+              PRIMARY) return 0 ;;
+              WAIT) ;;
+              STATUS_ERROR) fail "Mongo replSetGetStatus failed or returned a different replica set" ;;
+              *) fail "Mongo replSetInitiate failed; not retrying" ;;
+            esac
+          fi ;;
+        STATUS_ERROR) fail "Mongo replSetGetStatus failed or returned a different replica set" ;;
+        *) fail "Unexpected Mongo replica-set probe response" ;;
+      esac
+    fi
+    if [ "$SECONDS" -lt "$deadline" ]; then sleep 1; fi
+  done
+  fail "Mongo rs0 did not reach PRIMARY within ${START_TIMEOUT}s; check the container and credentials"
 }
 
 container_running() {
@@ -458,13 +617,16 @@ start_stack() {
   [ -f "$COMPOSE_FILE" ] || fail "Compose file not found: $INSTALL_DIR/$COMPOSE_FILE"
 
   log "Validating Compose configuration"
-  docker compose -f "$COMPOSE_FILE" config >/dev/null
+  docker compose -f "$COMPOSE_FILE" config --quiet
   docker info >/dev/null 2>&1 || fail "Docker daemon is not running or not reachable"
 
   # Build before recreation: a build failure leaves the currently running stack
   # untouched during intentional FORCE=1 repair/update runs.
   log "Building backend and isolated updater sidecar"
   docker compose -f "$COMPOSE_FILE" build backend updater
+  log "Starting Mongo and Redis"
+  docker compose -f "$COMPOSE_FILE" up -d mongo redis
+  wait_for_mongo_primary
   log "Starting stack"
   docker compose -f "$COMPOSE_FILE" up -d
 
@@ -490,9 +652,8 @@ start_stack() {
     || ! container_healthy hysteria-redis \
     || ! backend_health_ok \
     || ! https_health_ok; then
-    warn "Installation health gate failed; current container state and bounded logs follow"
+    warn "Installation health gate failed; inspect container logs locally for details"
     docker compose -f "$COMPOSE_FILE" ps >&2 || true
-    docker compose -f "$COMPOSE_FILE" logs --tail=120 backend updater caddy mongo redis >&2 || true
     fail "Stack did not become healthy within ${START_TIMEOUT}s"
   fi
 
@@ -506,15 +667,16 @@ main() {
   need_root
   install_base_tools
   validate_inputs
-  install_docker_if_needed
   make_backup_if_existing
   clone_or_update_repo
-  write_env_safely
   prepare_dirs
+  prepare_mongo_keyfile
+  write_env_safely
 
   if [ "$NO_START" = 1 ]; then
-    log "NO_START=1 set; skipping docker compose build/up"
+    log "NO_START=1: files prepared; nothing started. Re-run with FORCE=1 and NO_START=0 to initialize Mongo and start the stack."
   else
+    install_docker_if_needed
     start_stack
   fi
 

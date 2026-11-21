@@ -44,6 +44,8 @@ Thumbs.db
 
 # Docker volumes (local dev)
 mongo_data/
+/mongo-keyfile
+/.mongo-keyfile.*
 
 # CC Agent binaries (large files, deploy separately)
 public/downloads/

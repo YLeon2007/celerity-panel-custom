@@ -5,6 +5,8 @@ npm-debug.log
 .env
 .env.*
 !.env.docker
+mongo-keyfile
+.mongo-keyfile.*
 logs/*
 !logs/.gitkeep
 greenlock.d/*
@@ -31,3 +33,5 @@ docs/
 **/evidence/
 **/functional-test-*/
 backups/
+data/
+mongo_data/
