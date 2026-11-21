@@ -169,6 +169,19 @@ class SessionCount(unittest.TestCase):
         selected, = [link for link in observed if link['ifname'] == 'ppp1']
         self.assertEqual((selected['link_type'], selected['addr_info'][0]['scope']), ('ppp', 'global'))
 
+    def test_revoke_uses_live_ipcp_peer_not_xl2tpd_offered_pool_slot(self):
+        # pppd changed the IPCP peer address after CHAP; both sessions now
+        # share one account address while keeping separate kernel identities.
+        self.links[2] = link('ppp2', 2, self.peers[501])
+        with self.assertRaises(self.refusal):
+            self.sample()
+        sample = self.sample_fn
+        self.sample_fn = lambda *args: sample(*args, revoke=True)
+        start, rows = self.sample()
+        self.assertEqual(start, 510)
+        self.assertEqual([(row[2], row[3], row[6]) for row in rows], [
+            (self.peers[501], 501, 1), (self.peers[501], 502, 2)])
+
     def test_zero_with_control_socket_and_foreign(self):
         self.pids = [500]
         self.data = self.g['SESSION_L2TP_HEADER'] + tunnel(1) + tunnel(2) + self.foreign

@@ -33,9 +33,11 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
         assert.deepEqual(Object.keys(input).sort(), action === 'create' ? ['login', 'password'] : ['login']);
         assert.equal(input.login, login);
         if (action === 'create') assert.ok(input.password === password, 'must pass the supplied password only to Create');
-        if (failure) throw Object.assign(new Error(`${password} ${privateDetail}`), { code: failure, password, privateDetail });
+        if (failure) throw Object.assign(new Error(`${password} ${privateDetail}`), { code: failure, password, privateDetail,
+            ...(failure.endsWith('OUTCOME_UNKNOWN') && { confirmedSessionsTerminated: 2 }) });
         // Even extra internal success metadata must not cross the HTTP boundary.
-        return { executionMode: 'rebuild', status, login, relayCount: invalidReceipt ? privateDetail : 2,
+        return { executionMode: 'rebuild', status, login, relayCount: 2,
+            ...(action !== 'create' && { sessionsTerminated: invalidReceipt ? privateDetail : 3 }),
             internal: { password, privateDetail } };
     }])));
 
@@ -92,7 +94,8 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
         assert.equal(success.status, httpStatus);
         assert.equal(success.headers['ratelimit-limit'], '10');
         assert.equal(success.headers['ratelimit-remaining'], String(9 - i));
-        assert.deepEqual(JSON.parse(success.body), { executionMode: 'rebuild', status, login, relayCount: 2 });
+        assert.deepEqual(JSON.parse(success.body), { executionMode: 'rebuild', status, login, relayCount: 2,
+            ...(action !== 'create' && { sessionsTerminated: 3 }) });
     }
     // Use a separate peer for input/error cases, leaving exactly three hits on
     // the main peer's shared bucket. The invalid selectors must never dispatch.
@@ -110,6 +113,8 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
         ['create', 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN', 409, { code: 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN', retryAllowed: false }],
         ['create', 'REBUILD_L2TP_ACCOUNTS_OPERATOR_LIST_REQUIRED', 409, { code: 'REBUILD_L2TP_ACCOUNTS_OPERATOR_LIST_REQUIRED' }],
         ['disable', 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE', 503, { code: 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE' }],
+        ['disable', 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', 409, { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', retryAllowed: false,
+            confirmedSessionsTerminated: 2 }],
         ['delete', privateDetail, 409, { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false }],
     ]) {
         failure = code;
@@ -120,7 +125,7 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
     }
     failure = undefined;
     invalidReceipt = true;
-    const malformed = await send('delete', alternate);
+    const malformed = await send('delete', { ...authorized, ip: '192.0.2.13' });
     assert.equal(malformed.status, 409);
     assert.deepEqual(JSON.parse(malformed.body), { error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false } });
     invalidReceipt = false;
@@ -133,5 +138,5 @@ test('stock rebuild account POSTs require panel auth, onboarding, CSRF and the s
     for (const [action] of actions) assert.equal((await send(action, authorized)).status, 429);
     const install = await request(app, `/panel/rebuild/relays/${'a'.repeat(24)}/l2tp/install`, authorized);
     assert.equal(install.status, 429);
-    assert.deepEqual(calls, ['create', 'disable', 'delete', 'create', 'create', 'disable', 'delete', 'delete', ...Array(7).fill('disable')]);
+    assert.deepEqual(calls, ['create', 'disable', 'delete', 'create', 'create', 'disable', 'disable', 'delete', 'delete', ...Array(7).fill('disable')]);
 });

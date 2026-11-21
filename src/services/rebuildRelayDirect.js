@@ -215,7 +215,8 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             throw error;
         }
         try {
-            if (result.stderr !== '' || Buffer.byteLength(result.stdout) > (count || chap ? 128 : 46 * 1024 * 1024)) throw Error();
+            const replyLimit = count ? 128 : chap ? 160 : 46 * 1024 * 1024;
+            if (result.stderr !== '' || Buffer.byteLength(result.stdout) > replyLimit) throw Error();
             const reply = JSON.parse(result.stdout);
             if ((count || chap) && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
             if (!validate(reply)) throw Error();
@@ -240,19 +241,26 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     }
     const exactAck = backupId => value => value?.ok === true && value.backupId === backupId;
 
-    const chapOperation = (action, installation, currentUsers, desiredUsers, verifyLock) => serial(async () => {
+    const chapOperation = (action, installation, currentUsers, desiredUsers, verifyLock, revokedLogin) => serial(async () => {
         const invalid = 'CHAP_INPUT_INVALID', write = action === 'sync-chap';
         requireThat(!held && installation?.nodeId === nodeId && Object.keys(installation).length === 3
             && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(installation, key))
             && installation.backupId?.length === 32 && tokenMatches(TOKEN, installation.backupId), invalid);
         const { backupId } = installation;
+        const revoke = revokedLogin !== undefined;
+        requireThat(!revoke || (tokenMatches(/^[A-Za-z0-9._@-]{1,64}(?![\s\S])/, revokedLogin)
+            && revokedLogin !== 'relay-bootstrap'), invalid);
         const params = { nodeId, backupId, network: removeNetwork(installation.network, invalid),
-            currentUsers: chapUsers(currentUsers, invalid), desiredUsers: chapUsers(desiredUsers, invalid) };
+            currentUsers: chapUsers(currentUsers, invalid), desiredUsers: chapUsers(desiredUsers, invalid),
+            ...(revoke && { revokedLogin }) };
         requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
         await connect(CONNECT_TIMEOUT_MS);
         await lock(verifyLock);
-        const { changed } = await exec(action, params, write, reply => exactAck(backupId)(reply)
-            && Object.keys(reply).length === 3 && typeof reply.changed === 'boolean');
+        const draining = revoke && write;
+        const { changed, sessionsTerminated, complete } = await exec(action, params, write, reply => exactAck(backupId)(reply)
+            && typeof reply.changed === 'boolean' && (draining ? Object.keys(reply).length === 5
+                && integer(reply.sessionsTerminated, 0, Number.MAX_SAFE_INTEGER) && typeof reply.complete === 'boolean'
+                : Object.keys(reply).length === 3));
         try {
             await lock(verifyLock);
             requireThat(!closed, 'DIRECT_CLOSED');
@@ -262,7 +270,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             disconnect();
             throw fail('DIRECT_OUTCOME_UNKNOWN', true);
         }
-        return { changed };
+        return draining ? { changed, sessionsTerminated, complete } : { changed };
     });
 
     return Object.freeze({

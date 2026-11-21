@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { isDeepStrictEqual: equal } = require('node:util');
 const { createRebuildRelayAccounts } = require('../rebuildRelayAccounts');
 const { resolveRelayBinding } = require('../rebuildRelayAuthorization');
 const { accountError } = require('../rebuildRelayAccountsStore');
@@ -13,10 +14,13 @@ const credentials = { login: 'shared', password: 'fixture-only' };
 const sharedCipher = encrypt(credentials.password, key);
 const bootstrap = 'relay-bootstrap';
 const bootstrapCipher = encrypt('fixture-bootstrap', key);
+const neighbor = 'other-account';
+const neighborCipher = encrypt('fixture-neighbor', key);
 const ip = (i, end) => `10.255.${16 + i}.${end}`;
 const code = suffix => ({ code: `REBUILD_L2TP_ACCOUNTS_${suffix}` });
+const order = rows => [...rows].sort((a, b) => a.login.localeCompare(b.login));
 
-function fixture({ shared = false, single = false, legacy = false, disabled = false, fault = () => {} } = {}) {
+function fixture({ shared = false, single = false, legacy = false, disabled = false, other = false, fault = () => {} } = {}) {
     const ids = single ? [A] : [A, B];
     const rows = ids.map((id, i) => ({
         node: { _id: id, ip: `192.0.2.${i + 1}`, ssh: { port: 22, username: 'root' },
@@ -32,6 +36,7 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
     const users = rows.flatMap(({ node: { _id: id } }, i) => [
         user(id, i, bootstrap, 10, bootstrapCipher),
         ...(shared ? [{ ...user(id, i, credentials.login, 11, sharedCipher), enabled: !disabled }] : []),
+        ...(other ? [user(id, i, neighbor, 12, neighborCipher)] : []),
     ]);
     const hosts = Object.fromEntries(ids.map(id => [id, users.filter(u => u.relayNode === id).map(u => ({
         login: u.login, password: decrypt(u.passwordEncrypted, key), ipAddress: u.ip, enabled: u.enabled,
@@ -44,7 +49,9 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
         ...(!legacy && { C3_REBUILD_L2TP_RELAYS_JSON: JSON.stringify(operatorList) }) };
     const events = [];
     let pending, held = false;
-    const f = { rows, users, hosts, events, env, get pending() { return pending; } };
+    const sessions = Object.fromEntries(ids.map((id, i) => [id, [bootstrap, ...(other ? [neighbor] : []),
+        ...(shared ? Array(i + 1).fill(credentials.login) : [])]]));
+    const f = { rows, users, hosts, sessions, events, env, get pending() { return pending; } };
     const step = (name, id) => { assert.equal(held, true); events.push(id ? `${name}:${id}` : name); return fault(name, id, f); };
     const store = {
         async assertNoPending() { step('gate'); if (pending) throw accountError('BLOCKED'); },
@@ -83,23 +90,31 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
         createRelayDirect({ node, binding }) {
             const id = node._id;
             step('connect', id); assert.equal(binding.nodeId, id);
+            const changed = (current, desired) => !equal(order(current.filter(u => u.enabled)), order(desired.filter(u => u.enabled)));
             const check = (install, current) => {
                 assert.equal(install.nodeId, id);
                 assert.deepEqual(Object.keys(install.network).sort(), ['clientCidr', 'fwmark', 'routeTable', 'tproxyPort']);
-                assert.deepEqual(current, hosts[id]);
+                assert.deepEqual(order(current), order(hosts[id]));
             };
             return {
-                async checkChap(install, current, desired, verifyLock) {
+                async checkChap(install, current, desired, verifyLock, revokedLogin) {
                     await verifyLock(); check(install, current);
                     assert.ok(Array.isArray(desired));
-                    return step('check', id) ?? { changed: !disabled };
+                    if (revokedLogin !== undefined) assert.equal(revokedLogin, credentials.login);
+                    return step('check', id) ?? { changed: changed(current, desired) };
                 },
-                async syncChap(install, current, desired, verifyLock) {
+                async syncChap(install, current, desired, verifyLock, revokedLogin) {
                     await verifyLock(); check(install, current);
                     assert.ok(pending);
                     const result = step('sync', id);
                     if (result === undefined) hosts[id] = structuredClone(desired);
-                    return result ?? { changed: true };
+                    if (result !== undefined) return result;
+                    if (pending.action === 'create') return { changed: true };
+                    assert.equal(revokedLogin, credentials.login);
+                    assert.ok(!hosts[id].some(u => u.login === revokedLogin && u.enabled), 'block CHAP before terminating');
+                    const sessionsTerminated = sessions[id].filter(login => login === revokedLogin).length;
+                    sessions[id] = sessions[id].filter(login => login !== revokedLogin);
+                    return { changed: changed(current, desired), sessionsTerminated, complete: true };
                 },
                 async close() { step('close', id); },
             };
@@ -122,11 +137,10 @@ for (const action of ['create', 'disable', 'delete']) {
     });
 }
 
-test('legacy singleton already-disabled account still allows a verified read-only no-op', async () => {
+test('legacy singleton already-disabled account cannot claim revocation without a supported writer', async () => {
     const f = fixture({ single: true, legacy: true, shared: true, disabled: true });
-    assert.deepEqual(await f.service.disable({ login: credentials.login }),
-        { executionMode: 'rebuild', status: 'disabled', login: credentials.login, relayCount: 1 });
-    assert.deepEqual(effects(f), [`check:${A}`]);
+    await assert.rejects(f.service.disable({ login: credentials.login }), code('OPERATOR_LIST_REQUIRED'));
+    noWrites(f);
 });
 
 test('losing operator list mode with an identical legacy binding revokes writes', async () => {
@@ -142,10 +156,12 @@ for (const [action, status] of [['create', 'created'], ['disable', 'disabled'], 
         const f = fixture({ shared: action !== 'create' });
         const before = structuredClone(f.users.filter(u => u.login === bootstrap));
         assert.deepEqual(await f.service[action](action === 'create' ? credentials : { login: credentials.login }),
-            { executionMode: 'rebuild', status, login: credentials.login, relayCount: 2 });
+            { executionMode: 'rebuild', status, login: credentials.login, relayCount: 2,
+                ...(action !== 'create' && { sessionsTerminated: 3 }) });
         assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'settle']);
         assert.equal(f.pending, undefined);
         assert.deepEqual(f.users.filter(u => u.login === bootstrap), before);
+        assert.deepEqual(f.sessions, { [A]: [bootstrap], [B]: [bootstrap] });
         const rows = f.users.filter(u => u.login === credentials.login);
         if (action === 'delete') {
             assert.deepEqual(rows, []);
@@ -164,6 +180,47 @@ for (const [action, status] of [['create', 'created'], ['disable', 'disabled'], 
         }
     });
 }
+
+test('already-disabled is checked and drained, without inventing a new account revision', async () => {
+    const f = fixture({ shared: true, disabled: true });
+    assert.equal((await f.service.disable(credentials)).sessionsTerminated, 3);
+    assert.deepEqual(f.users.filter(u => u.login === credentials.login).map(u => [u.enabled, u.desiredRevision]), [[false, 1], [false, 1]]);
+});
+
+test('disable and subsequent delete preserve a second ordinary account on both relays', async () => {
+    const f = fixture({ shared: true, other: true });
+    const neighbors = () => f.users.filter(u => u.login === neighbor || u.login === bootstrap);
+    const protectedRows = structuredClone(neighbors());
+    const protectedChap = Object.fromEntries([A, B].map(id => [id,
+        structuredClone(order(f.hosts[id].filter(u => u.login !== credentials.login)))]));
+    assert.equal((await f.service.disable(credentials)).sessionsTerminated, 3);
+    assert.deepEqual(f.sessions, { [A]: [bootstrap, neighbor], [B]: [bootstrap, neighbor] });
+    // A delete with unchanged CHAP bytes still has to prove zero sessions.
+    assert.equal((await f.service.delete(credentials)).sessionsTerminated, 0);
+    assert.deepEqual(f.sessions, { [A]: [bootstrap, neighbor], [B]: [bootstrap, neighbor] });
+    assert.deepEqual(neighbors(), protectedRows);
+    assert.deepEqual(f.hosts, protectedChap);
+});
+
+test('partial B settlement reports only confirmed closures, never publishes or retries', async () => {
+    const f = fixture({ shared: true, fault(step, id) {
+        if (step === 'sync' && id === B) return { changed: true, sessionsTerminated: 1, complete: false };
+    } });
+    await assert.rejects(f.service.delete(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false,
+        confirmedNodeIds: [A], uncertainNodeId: B, confirmedSessionsTerminated: 2 });
+    assert.ok(f.pending && f.users.filter(u => u.login === credentials.login).length === 2);
+    assert.ok(!f.events.includes('publish'));
+});
+
+test('a terminal partial A does not prevent revoking on pinned B', async () => {
+    const f = fixture({ shared: true, fault(step, id) {
+        if (step === 'sync' && id === A) return { changed: true, sessionsTerminated: 0, complete: false };
+    } });
+    await assert.rejects(f.service.disable(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false,
+        confirmedNodeIds: [B], uncertainNodeId: A, confirmedSessionsTerminated: 2 });
+    assert.deepEqual(f.sessions[B], [bootstrap]);
+    assert.ok(f.pending && !f.events.includes('publish'));
+});
 
 test('preflight refusal on B leaves both hosts and persistence unchanged', async () => {
     const f = fixture({ fault: (step, id) => step === 'check' && id === B ? false : undefined });

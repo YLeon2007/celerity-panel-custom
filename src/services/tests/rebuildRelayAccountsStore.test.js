@@ -86,8 +86,8 @@ function fixture() {
         },
     };
     const store = createRebuildRelayAccountsStore({ Node: { db }, State: { db }, L2tpUser: User });
-    const publish = (action, intentId = intent.intentId) => store.publish({ action, intentId,
-        changes: [{ before: item, after: { enabled: false } }],
+    const publish = (action, intentId = intent.intentId, changed = true) => store.publish({ action, intentId,
+        changes: [{ before: item, after: changed ? { enabled: false } : undefined }],
         async recheck(session) { inTxn(session); events.push('snapshot'); },
         async verifyAuthority() { await store.verifyIntent(intentId); events.push('guard'); },
     });
@@ -137,6 +137,15 @@ for (const [action, write] of [['create', 'insert'], ['disable', 'update'], ['de
         await assertNoPendingRelayAccounts(f.db);
     });
 }
+
+test('already-disabled settlement closes the intent transaction without writing an unchanged user', async () => {
+    const f = fixture();
+    await f.store.begin(intent);
+    f.events.length = 0;
+    await f.publish('disable', intent.intentId, false);
+    assert.deepEqual(f.events, ['start', 'snapshot', 'settle', 'guard', 'commit', 'end']);
+    await assertNoPendingRelayAccounts(f.db);
+});
 
 test('lost publish acknowledgement does not retry or abort; an uncommitted attempt preserves its intent', async () => {
     const f = fixture();

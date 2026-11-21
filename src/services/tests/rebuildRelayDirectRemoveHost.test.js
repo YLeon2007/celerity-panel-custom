@@ -452,6 +452,36 @@ if scenario.startswith('chap-sync-'):
         h['write'] = lost
         assert wire('sync-chap', **params) == (75, '', '')
         assert chap.read_bytes() == stock_chap + begin + new_row + end + foreign and not changes
+    elif scenario == 'chap-sync-revoke':
+        chap.write_bytes(stock_chap + begin + old_row + new_row + end + foreign)
+        current = old_users + new_users
+        desired = [dict(old_users[0], enabled=False)] + new_users
+        prior = snapshot()
+        expect('check-chap', changed, currentUsers=current, desiredUsers=desired, revokedLogin='alice')
+        assert snapshot() == prior and not changes
+        for substitute in (new_users[1:], [dict(desired[0], password='replaced')] + new_users):
+            assert wire('sync-chap', currentUsers=current, desiredUsers=substitute, revokedLogin='alice') == (70, '', 'DIRECT_CHAP_REFUSED\n')
+        assert snapshot() == prior
+        drain_calls = []
+        def drain(request, blocked, record, *rest):
+            assert request['revokedLogin'] == 'alice' and blocked['currentUsers'] == desired
+            assert h['raw'](record) == chap.read_bytes() == stock_chap + begin + new_row + end + foreign
+            with directory(h['SYSTEM']) as contender:
+                try:
+                    h['fcntl'].flock(contender, h['fcntl'].LOCK_SH | h['fcntl'].LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise AssertionError('lost DIRECT flock')
+            drain_calls.append(request['currentUsers'])
+            return {'sessionsTerminated': 2 if len(drain_calls) == 1 else 0, 'complete': len(drain_calls) == 1}
+        h['revoke_ppp'] = drain
+        expect('sync-chap', dict(changed, sessionsTerminated=2, complete=True),
+               currentUsers=current, desiredUsers=desired, revokedLogin='alice')
+        prior = snapshot()
+        expect('sync-chap', dict(no_change, sessionsTerminated=0, complete=False),
+               currentUsers=desired, desiredUsers=desired, revokedLogin='alice')
+        assert snapshot() == prior and len(drain_calls) == 2 and not changes
     else:
         def other_files():
             return [w for w in snapshot() if w[-1] is not None and w[0] != str(chap.relative_to(root))]
@@ -588,7 +618,7 @@ print('ok')
 `;
 
 for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation',
-    'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown',
+    'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown', 'chap-sync-revoke',
     'chap-unterminated-clean', 'chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix', 'chap-unterminated-separated',
     'chap-terminated-suffix',
     'foreign-drop', 'foreign-dep', 'foreign-ike', 'foreign-rule', 'foreign-listener', 'ambiguous', 'ambiguous-shared',

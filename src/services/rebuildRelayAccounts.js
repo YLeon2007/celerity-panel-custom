@@ -143,6 +143,9 @@ function makePlans({ states, users, nodes, bindings }, action, login, password, 
 // and preimage under its host lock, and return a checked change receipt.
 const chapReceipt = result => result !== null && typeof result === 'object'
     && Object.keys(result).length === 1 && typeof result.changed === 'boolean';
+const revokeReceipt = result => result !== null && typeof result === 'object'
+    && Object.keys(result).length === 3 && typeof result.changed === 'boolean'
+    && typeof result.complete === 'boolean' && int(result.sessionsTerminated, 0, Number.MAX_SAFE_INTEGER);
 function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = process.env, resolveRelayBinding,
     createRelayDirect, store = createRebuildRelayAccountsStore({ Node, State, L2tpUser }) }) {
     const allow = () => {
@@ -194,11 +197,12 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                         };
                         const baseline = await load();
                         const plans = makePlans(baseline, action, login, password, key);
-                        const noChange = action === 'disable' && !plans[0].after;
+                        const revokedLogin = action === 'create' ? undefined : login;
                         // Legacy Remove only owns the exact bootstrap row. Do
                         // not introduce account changes under that contract.
-                        if (!listMode && !noChange) throw fail('OPERATOR_LIST_REQUIRED');
+                        if (!listMode) throw fail('OPERATOR_LIST_REQUIRED');
                         let intentId, phase, uncertainNodeId;
+                        let sessionsTerminated = 0;
                         const confirmedNodeIds = [];
                         const verifyAuthority = async () => {
                             await authority();
@@ -215,6 +219,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             if (results.some(r => r.status === 'rejected')) throw fail('CLEANUP_FAILED');
                         };
                         const outcome = suffix => fail(suffix, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds],
+                            ...(revokedLogin && { confirmedSessionsTerminated: sessionsTerminated }),
                             ...(uncertainNodeId && { uncertainNodeId }) });
                         try {
                             const calls = [];
@@ -232,18 +237,14 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                 const [remote, installation, currentUsers, desiredUsers] = call;
                                 await recheck();
                                 let checked;
-                                try { checked = await remote.checkChap(installation, currentUsers, desiredUsers, () => recheck()); }
+                                try { checked = await remote.checkChap(installation, currentUsers, desiredUsers, () => recheck(), revokedLogin); }
                                 catch { throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId }); }
                                 if (!chapReceipt(checked)) throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId });
                                 call.push(checked.changed);
                             }
                             await store.assertNoPending();
                             await recheck();
-                            if (noChange) {
-                                if (calls.some(call => call[4] !== false)) throw fail('PREFLIGHT_REFUSED');
-                                await closeAll();
-                                return { ...result, relayCount: ids.length };
-                            }
+
                             const id = randomUUID();
                             phase = 'INTENT_UNKNOWN';
                             intentId = id;
@@ -254,13 +255,30 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                 relays: plans.map(({ installation, binding, before, after }) => ({ ...installation, ...binding,
                                     ip: before?.ip ?? after?.ip, revision: before?.desiredRevision ?? 0 })) });
                             phase = 'OUTCOME_UNKNOWN';
+                            let incompleteNodeId;
                             for (const [remote, installation, currentUsers, desiredUsers, changed] of calls) {
                                 await recheck();
                                 uncertainNodeId = installation.nodeId;
-                                const synced = await remote.syncChap(installation, currentUsers, desiredUsers, () => recheck());
-                                if (!chapReceipt(synced) || synced.changed !== changed) throw fail(phase);
+                                const synced = await remote.syncChap(installation, currentUsers, desiredUsers, () => recheck(), revokedLogin);
+                                if (!(revokedLogin ? revokeReceipt(synced) : chapReceipt(synced)) || synced.changed !== changed) throw fail(phase);
+                                if (revokedLogin) {
+                                    const total = sessionsTerminated + synced.sessionsTerminated;
+                                    if (!Number.isSafeInteger(total)) throw fail(phase);
+                                    sessionsTerminated = total;
+                                    if (!synced.complete) {
+                                        // The command reached a checked terminal frame, but this relay is not settled.
+                                        // Keep its intent and still revoke on the other independently pinned relays.
+                                        incompleteNodeId ??= uncertainNodeId;
+                                        uncertainNodeId = undefined;
+                                        continue;
+                                    }
+                                }
                                 confirmedNodeIds.push(uncertainNodeId);
                                 uncertainNodeId = undefined;
+                            }
+                            if (incompleteNodeId) {
+                                uncertainNodeId = incompleteNodeId;
+                                throw fail(phase);
                             }
                             phase = 'FINISH_UNKNOWN';
                             await closeAll();
@@ -271,7 +289,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             } }));
                             await store.publish({ intentId: id, action, changes, recheck, verifyAuthority });
                             completed = true;
-                            return { ...result, relayCount: ids.length };
+                            return { ...result, relayCount: ids.length, ...(revokedLogin && { sessionsTerminated }) };
                         } catch (error) {
                             if (phase) throw outcome(phase);
                             throw error;

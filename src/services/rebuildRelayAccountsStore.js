@@ -80,7 +80,7 @@ function createRebuildRelayAccountsStore({ Node, State, L2tpUser }) {
                         const options = { session, timestamps: false };
                         if (action === 'delete') {
                             requireOne(await L2tpUser.deleteMany(exact(before), options), 'deletedCount');
-                        } else {
+                        } else if (after) {
                             requireOne(await L2tpUser.updateMany(exact(before), { $set: after }, options), 'matchedCount');
                         }
                     }

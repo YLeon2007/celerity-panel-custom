@@ -25,18 +25,24 @@ function accountHandler(action, service = createRebuildService) {
         try {
             const { login } = body;
             const result = await service()[methods[action]]({ login, ...(action === 'create' && { password: body.password }) });
-            const status = statuses[action], relayCount = result?.relayCount;
+            const status = statuses[action], { relayCount, sessionsTerminated } = result ?? {};
             if (result?.executionMode !== 'rebuild' || result.status !== status || result.login !== login
-                || !Number.isSafeInteger(relayCount) || relayCount < 1) {
+                || !Number.isSafeInteger(relayCount) || relayCount < 1
+                || (action !== 'create' && (!Number.isSafeInteger(sessionsTerminated) || sessionsTerminated < 0))) {
                 return res.status(409).json({ error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false } });
             }
             // Only the public receipt crosses this boundary, even if the
             // service starts returning private inventory or transport metadata.
-            return res.status(action === 'create' ? 201 : 200).json({ executionMode: 'rebuild', status, login, relayCount });
+            return res.status(action === 'create' ? 201 : 200).json({ executionMode: 'rebuild', status, login, relayCount,
+                ...(action !== 'create' && { sessionsTerminated }) });
         } catch (error) {
             const { code } = error ?? {};
             if (code === invalid) return res.status(400).json({ error: { code } });
-            if (blocked.has(code)) return res.status(409).json({ error: { code, retryAllowed: false } });
+            if (blocked.has(code)) {
+                const count = error.confirmedSessionsTerminated;
+                return res.status(409).json({ error: { code, retryAllowed: false,
+                    ...(action !== 'create' && Number.isSafeInteger(count) && count >= 0 && { confirmedSessionsTerminated: count }) } });
+            }
             if (unavailable.has(code)) return res.status(503).json({ error: { code } });
             if (rejected.has(code)) return res.status(409).json({ error: { code } });
             return res.status(409).json({ error: { code: 'REBUILD_L2TP_ACCOUNTS_FAILED', retryAllowed: false } });

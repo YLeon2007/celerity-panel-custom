@@ -83,6 +83,23 @@ test('exact sync refusal is settled and certifies no write', async () => {
     });
 });
 
+test('revoke joins the selected login to the existing CHAP write and requires an exact drain receipt', async () => {
+    for (const [complete, sessionsTerminated] of [[true, 0], [true, 2], [false, Number.MAX_SAFE_INTEGER]]) {
+        const receipt = { changed: true, sessionsTerminated, complete };
+        const { remote, seen } = driver(action => action === 'check-chap' ? accepted : ack({ ok: true, backupId, ...receipt }));
+        assert.deepEqual(await remote.checkChap(installation, [row], [], () => true, 'alice'), { changed: true });
+        assert.deepEqual(await remote.syncChap(installation, [row], [], () => true, 'alice'), receipt);
+        assert.deepEqual(seen.map(wire => wire.revokedLogin), ['alice', 'alice']);
+        await remote.close();
+    }
+    for (const response of [accepted, ...[-1, 1.5, '2', null, Number.MAX_SAFE_INTEGER + 1].map(sessionsTerminated =>
+        ack({ ok: true, backupId, changed: true, complete: true, sessionsTerminated }))]) {
+        const { remote } = driver(() => response);
+        await assert.rejects(remote.syncChap(installation, [row], [], () => true, 'alice'), { remoteOutcomeUncertain: true });
+        await remote.close();
+    }
+});
+
 test('census and Remove receive private projection; Remove retains a copied inventory and confirmed token', async () => {
     const baseline = 'e'.repeat(64), census = 'f'.repeat(64);
     const { remote, seen } = driver(action => ({

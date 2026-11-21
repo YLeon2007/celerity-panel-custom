@@ -13,6 +13,7 @@ import os
 import pwd
 import re
 import select
+import signal
 import socket
 import stat
 import struct
@@ -1997,6 +1998,15 @@ def sync_chap(request, *, write_changes):
     pool = chap_pool(raw(records['lns']), request['network']['clientCidr'])
     current_rows, current_logins = chap_user_rows(request['currentUsers'], pool)
     desired_rows, desired_logins = chap_user_rows(request['desiredUsers'], pool)
+    revoked = request.get('revokedLogin')
+    if 'revokedLogin' in request:
+        need(type(revoked) is str and re.fullmatch(CHAP_LOGIN, revoked.encode('ascii'))
+             and revoked != 'relay-bootstrap', 'CANDIDATE_INVALID')
+        current = {u['login']: u for u in request['currentUsers']}
+        desired = {u['login']: u for u in request['desiredUsers']}
+        need(revoked in current and (revoked not in desired or desired[revoked] == {**current[revoked], 'enabled': False})
+             and {k: u for k, u in desired.items() if k != revoked} ==
+                 {k: u for k, u in current.items() if k != revoked}, 'CANDIDATE_INVALID')
     xl = unit(XL)
     need(all(read(p, 262144) == record for p, record in before['globalFiles'].items())
          and removal_native(xl, XL, before, installed=True)
@@ -2012,14 +2022,18 @@ def sync_chap(request, *, write_changes):
         need(len(data) <= MAX_FILE, bad)
         after = {**record, 'data': b64(data)}
     need(read(path, 2 * MAX_FILE) == manifest and directory_absent(intent) and read(target) == record, bad)
-    if after == record:
-        return False
-    if write_changes:
+    changed = after != record
+    if write_changes and changed:
         # The control-plane intent owns DB settlement. Do not accept the desired
         # projection in place of current, or attempt a physical retry/rollback.
         CHAP_ENTERED = True
         write(target, record, after)
-    return True
+    reply = {'ok': True, 'backupId': request['backupId'], 'changed': changed}
+    if write_changes and revoked is not None:
+        # Even a previously disabled row can have surviving authenticated calls.
+        CHAP_ENTERED = True
+        reply.update(revoke_ppp(request, {**request, 'currentUsers': request['desiredUsers']}, after, path, manifest, xl))
+    return reply
 
 
 def observe_removal(request, *, quiescent=False):
@@ -2634,8 +2648,10 @@ def session_links(rows, name, local, peer):
                  and type(link['ifindex']) is int and link['ifindex'] > 0
                  and len([row for row in rows if row['ifindex'] == link['ifindex']]) == 1)
     (addr,) = link['addr_info']
-    session_need(addr.get('family') == 'inet' and addr.get('local') == local and addr.get('address') == peer
+    session_need(addr.get('family') == 'inet' and addr.get('local') == local and (peer is None or addr.get('address') == peer)
                  and addr.get('prefixlen') == 32 and addr.get('scope') == 'global')
+    if peer is None:
+        return link['ifindex'], str(ipaddress.IPv4Address(addr['address']))
     return link['ifindex']
 
 
@@ -2648,7 +2664,7 @@ def session_pid_stamp(name, pid):
     return st
 
 
-def session_sample(libc, proc, group, owner, held, watch):
+def session_sample(libc, proc, group, owner, held, watch, *, revoke=False):
     _, _, main, _, _, _, binaries, pool = owner
     pids = session_cgroup(group)
     session_need(main in pids)
@@ -2676,15 +2692,173 @@ def session_sample(libc, proc, group, owner, held, watch):
         links = json.loads(command('/usr/sbin/ip', '-j', '-4', '-details', 'addr', 'show', quiet=True))
         seen_names, seen_peers, seen_inodes = set(), set(), set()
         for key, (pid, start, inode, name, local, peer, generation) in sample.items():
-            session_need(native[key] == name and name not in seen_names and peer not in seen_peers and inode not in seen_inodes)
+            session_need(native[key] == name and name not in seen_names and (revoke or peer not in seen_peers) and inode not in seen_inodes)
             seen_names.add(name)
             seen_peers.add(peer)
             seen_inodes.add(inode)
-            ifindex = session_links(links, name, local, peer)
+            if revoke:
+                # xl2tpd offers its next free pool slot. CHAP may replace it
+                # at IPCP; multiple calls from one login may share the latter.
+                ifindex, peer = session_links(links, name, local, None)
+                session_need(pool[1] <= ipaddress.IPv4Address(peer) <= pool[2])
+            else:
+                ifindex = session_links(links, name, local, peer)
             result.append((key, local, peer, pid, start, inode, ifindex, generation))
     session_need(pids == session_cgroup(group))
     watch()
     return main_start, result
+
+
+def revoke_peer_logins(rows, owner, users):
+    if not rows:
+        return {}
+    # Stock pppd 2.5.2 auth_peer_success() emits a server-side notice, not
+    # the peer-supplied L2TP name or the CHAP client's success text.
+    matches = {'_BOOT_ID': owner[0].replace('-', ''), '_SYSTEMD_INVOCATION_ID': owner[1],
+               '_SYSTEMD_UNIT': XL, '_SYSTEMD_CGROUP': SESSION_GROUP, '_UID': '0', '_EXE': SESSION_PPP,
+               '_TRANSPORT': 'syslog', 'PRIORITY': '5'}
+    known = {str(row[3]): (row[4], row[2]) for row in rows}
+    hz = os.sysconf('SC_CLK_TCK')
+    # Also require syslog's kernel-source realtime stamp to clear the task
+    # birth tick. A receive stamp alone can be late for queued old datagrams.
+    def epoch():
+        return time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    first = epoch()
+    data = command('/usr/bin/journalctl', '--local', '--system', '--no-pager', '--quiet', '--output=json', '--lines=4097',
+                   '--output-fields=' + ','.join((*matches, '_PID', '_SOURCE_REALTIME_TIMESTAMP', 'MESSAGE')),
+                   '--grep=^Peer .* authenticated with ', *(k + '=' + v for k, v in matches.items()),
+                   *('_PID=' + p for p in known), quiet=True)
+    last = epoch()
+    session_need(hz > 0 and abs(first - last) < 1000000 and data.count(b'\n') < 4097)
+    observed = {}
+    for line in data.splitlines():
+        decoded = json.loads(line)
+        session_need(type(decoded) is dict)
+        event = cast(dict[str, Any], decoded)
+        pid = event['_PID']
+        session_need(type(pid) is str and pid in known and type(event.get('MESSAGE')) is str
+                     and all(event.get(k) == v for k, v in matches.items()))
+        stamp, source = (event[k] for k in ('__MONOTONIC_TIMESTAMP', '_SOURCE_REALTIME_TIMESTAMP'))
+        session_need(all(type(s) is str and re.fullmatch(r'[0-9]{1,20}', s) for s in (stamp, source)))
+        start, peer = known[pid]
+        birth = ((start + 1) * 10**9 + hz - 1) // hz
+        if int(stamp) * 1000 < birth or int(source) * 1000 < max(first, last) + birth:
+            continue  # not evidence from this generation; still require a fresh notice
+        match = re.fullmatch(rb'Peer (' + CHAP_LOGIN + rb') authenticated with CHAP', event['MESSAGE'].encode('ascii'))
+        if match is None:
+            raise Refusal(SESSION_UNKNOWN)
+        login = match[1].decode('ascii')
+        # The authenticated login and live IPCP address must agree with the
+        # fenced account projection. IP alone could belong to a past account.
+        session_need(users.get(login) == peer and observed.setdefault(int(pid), login) == login)
+    session_need(len(observed) == len(rows))
+    return observed
+
+
+@contextlib.contextmanager
+def revoke_ppp_view(owner):
+    libc = ctypes.CDLL(None, use_errno=True)
+    path = '/sys/fs/cgroup' + SESSION_GROUP
+    with directory('/proc') as proc, directory(path) as group, contextlib.ExitStack() as stack:
+        session_fs(libc, proc, 0x9fa0)
+        session_fs(libc, group, 0x63677270)
+        route = stack.enter_context(socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK, 0))
+        route.bind((0, 1 | 16))
+        poll = select.poll()
+        poll.register(route, select.POLLIN)
+        pids = {}
+
+        def held(pid):
+            if pid not in pids:
+                fd = os.pidfd_open(pid)
+                stack.callback(os.close, fd)
+                poll.register(fd, select.POLLIN)
+                pids[pid] = fd
+            return pids[pid]
+
+        def watch():
+            session_need(not poll.poll(0) and time.monotonic() < DEADLINE)
+
+        def sample():
+            value = session_sample(libc, proc, group, owner, held, watch, revoke=True)
+            session_need(session_generation(os.fstat(group)) == session_generation(os.lstat(path)))
+            return value
+
+        yield sample, held, watch
+
+
+def revoke_ppp(request, blocked, chap, path, manifest, xl):
+    global DEADLINE
+    count, completed = 0, False
+    outer_deadline = DEADLINE
+    DEADLINE = min(outer_deadline, time.monotonic() + 25)
+    try:
+        session_need(os.uname().machine == 'x86_64' and hasattr(signal, 'pidfd_send_signal'))
+        chap_generation = remove_generation(NAMES['chap'])
+        manifest_generation = remove_generation(path)
+
+        def unchanged():
+            session_need(chap_generation is not None and manifest_generation is not None and read(NAMES['chap']) == chap
+                         and remove_generation(NAMES['chap']) == chap_generation and read(path, 2 * MAX_FILE) == manifest
+                         and remove_generation(path) == manifest_generation and time.monotonic() < DEADLINE)
+
+        unchanged()
+        if rollback_quiescent(xl):
+            quiet = quiescent_session_sample(blocked)
+            session_need(quiet == quiescent_session_sample(blocked) and unit(XL) == xl)
+            unchanged()
+            return {'sessionsTerminated': 0, 'complete': True}
+        owner = session_owner(blocked)
+        session_need((owner[1], str(owner[2])) == (xl['InvocationID'], xl['MainPID']))
+        users = {u['login']: u['ipAddress'] for u in request['currentUsers']}
+        closed_call = None
+        main_start = None
+        while True:
+            with revoke_ppp_view(owner) as (sample, held, watch):
+                before = sample()
+                if main_start is None:
+                    main_start = before[0]
+                session_need(main_start == before[0])
+                session_need(owner == session_owner(blocked) and before == sample())
+                unchanged()
+                watch()
+                if closed_call is not None:
+                    key, index = closed_call
+                    session_need(all(row[0] != key and row[6] != index for row in before[1]))
+                    count += 1
+                    closed_call = None
+                logins = revoke_peer_logins(before[1], owner, users)
+                session_need(before == sample())
+                unchanged()
+                selected = next((row for row in before[1] if logins[row[3]] == request['revokedLogin']), None)
+                watch()
+                if selected is None:
+                    completed = True
+                    break
+                key, _, _, pid, _, _, index, _ = selected
+                pfd = held(pid)
+                watch()
+                try:
+                    signal.pidfd_send_signal(pfd, signal.SIGTERM)
+                except ProcessLookupError:
+                    # Natural exit before delivery, not an operation closure.
+                    continue
+                exited = select.poll()
+                exited.register(pfd, select.POLLIN)
+                session_need(any(fd == pfd and flags & select.POLLIN for fd, flags in
+                                 exited.poll(max(0, int((DEADLINE - time.monotonic()) * 1000)))))
+                # A count requires an accepted signal to the pinned instance,
+                # its exit, and absence of both call and interface on readback.
+                # It does not distinguish a concurrent natural disconnect as
+                # the cause of that same targeted call's confirmed closure.
+                closed_call = key, index
+    except (Refusal, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        # A checked partial reply is not authority to publish or replay. Never
+        # return log contents, PID, address or guessed count over the wire.
+        completed = False
+    finally:
+        DEADLINE = outer_deadline
+    return {'sessionsTerminated': count, 'complete': completed}
 
 
 def session_census(request):
@@ -2831,10 +3005,11 @@ def dispatch(request: dict[str, Any]):
             return apply_network(request, action)
         if action in CHAP_ACTIONS:
             token = request['backupId']
-            need(set(request) == {'action', 'machineId', 'backupId', 'network', 'nodeId', 'currentUsers', 'desiredUsers'}
+            keys = {'action', 'machineId', 'backupId', 'network', 'nodeId', 'currentUsers', 'desiredUsers'}
+            need(keys <= set(request) <= keys | {'revokedLogin'}
                  and re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId']), 'CANDIDATE_INVALID')
             need(ready['ppp'] and ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
-            return {'ok': True, 'backupId': token, 'changed': sync_chap(request, write_changes=action == 'sync-chap')}
+            return sync_chap(request, write_changes=action == 'sync-chap')
         if action in ('prepare-remove', 'remove'):
             token = request['backupId']
             keys = {'action', 'machineId', 'backupId', 'network', 'nodeId'}
