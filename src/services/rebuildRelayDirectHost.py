@@ -2734,10 +2734,11 @@ REVOKE_DB_NAME = 'pppd2.tdb'
 REVOKE_DB_BUCKETS = 131
 REVOKE_DB_HEADER = struct.pack('<32sII', b'TDB file\n', 0x2601196d, REVOKE_DB_BUCKETS) + bytes(128)
 REVOKE_DB_DATA = len(REVOKE_DB_HEADER) + 4 * (1 + REVOKE_DB_BUCKETS)
+# pppd 2.5.2 update_db_entry stores a NUL terminator, not a trailing semicolon.
 REVOKE_ENV = re.compile(rb'ORIG_UID=0;PPPLOGNAME=(?:' + CHAP_LOGIN + rb'|\(unknown\));'
                         rb'PPPD_PID=([1-9][0-9]{0,9});IFNAME=(ppp(?P<unit>0|[1-9][0-9]{0,9}));'
                         rb'UNIT=(?P=unit);PEERNAME=(' + CHAP_LOGIN + rb');'
-                        rb'IPLOCAL=([0-9.]{7,15});IPREMOTE=([0-9.]{7,15});')
+                        rb'IPLOCAL=([0-9.]{7,15});IPREMOTE=([0-9.]{7,15})\x00')
 
 
 def revoke_db_fetch(fd, size, key):

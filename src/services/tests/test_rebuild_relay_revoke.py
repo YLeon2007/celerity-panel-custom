@@ -18,8 +18,10 @@ CHAP = '/etc/ppp/chap-secrets'
 MANIFEST = '/fixture/manifest'
 
 
-def call(pid: int, peer: int = 10) -> tuple[tuple[int, int, int, int], str, str, int, int, int, int, list[int]]:
-    return (1, pid, 2, pid), '10.20.0.1', f'10.20.0.{peer}', pid, 101, pid + 10, pid + 20, [1, pid, 2]
+def call(
+    pid: int, peer: int = 10, *, subnet: str = '10.20.0',
+) -> tuple[tuple[int, int, int, int], str, str, int, int, int, int, list[int]]:
+    return (1, pid, 2, pid), f'{subnet}.1', f'{subnet}.{peer}', pid, 101, pid + 10, pid + 20, [1, pid, 2]
 
 
 def tdb_bytes(records):
@@ -41,12 +43,13 @@ def tdb_bytes(records):
 
 def state(row, login, *, name=None, peer=None):
     _, local, live_peer, pid, *_ = row
-    name = name or f'ppp{pid - 500}'
+    name = name or f'ppp{pid - 501}'
     key = f'pppd{pid}'.encode()
     aliases = [f'PPPD_PID={pid}', f'IFNAME={name}', f'UNIT={name[3:]}']
     env = ['ORIG_UID=0', 'PPPLOGNAME=root', *aliases, f'PEERNAME={login}',
            f'IPLOCAL={local}', f'IPREMOTE={peer or live_peer}']
-    return [(key, (';'.join(env) + ';').encode()), *((a.encode(), key) for a in aliases)]
+    # pppd 2.5.2 update_db_entry stores semicolons between entries and a final NUL.
+    return [(key, ';'.join(env).encode() + b'\x00'), *((a.encode(), key) for a in aliases)]
 
 
 class Revoke(unittest.TestCase):
@@ -89,7 +92,7 @@ class Revoke(unittest.TestCase):
         self.db.chmod(0o644)
 
     def pid_stamp(self, name, pid):
-        return next((row[7] for row in self.rows if row[3] == pid and name == f'ppp{pid - 500}'), None)
+        return next((row[7] for row in self.rows if row[3] == pid and name == f'ppp{pid - 501}'), None)
 
     @contextlib.contextmanager
     def directory(self, path):
@@ -135,6 +138,49 @@ class Revoke(unittest.TestCase):
                         session_owner=lambda request: self.owner, remove_generation=lambda p: self.generation,
                         read=lambda p, *cap: self.read_chap if p == CHAP else 'manifest')):
             return self.g['revoke_ppp'](self.request, self.blocked, 'blocked', MANIFEST, 'manifest', self.xl)
+
+    def test_native_nul_terminated_value_revokes_only_target(self):
+        target = call(501, 11, subnet='10.255.191')
+        neighbor = call(502, 12, subnet='10.255.191')
+        self.rows = [target, neighbor]
+        self.request['currentUsers'] = [
+            {'login': 'alice', 'ipAddress': target[2]},
+            {'login': 'bob', 'ipAddress': neighbor[2]},
+        ]
+        self.blocked = {'currentUsers': self.request['currentUsers'][1:]}
+        # Pin the target's native bytes independently of the state() builder.
+        key = b'pppd501'
+        value = (b'ORIG_UID=0;PPPLOGNAME=root;PPPD_PID=501;IFNAME=ppp0;UNIT=0;'
+                 b'PEERNAME=alice;IPLOCAL=10.255.191.1;IPREMOTE=10.255.191.11\x00')
+        self.write_db(tdb_bytes([
+            (key, value), (b'PPPD_PID=501', key), (b'IFNAME=ppp0', key), (b'UNIT=0', key),
+            (b'IPREMOTE=10.255.191.11', key), *state(neighbor, 'bob'),
+            (b'IPREMOTE=10.255.191.12', b'pppd502'),
+        ]))
+        self.assertEqual(self.drain(write_db=False), dict(sessionsTerminated=1, complete=True))
+        self.assertEqual(self.sent, [501])
+        self.assertEqual(self.rows, [neighbor])
+        self.command.assert_not_called()
+
+    def test_malformed_value_separators_refuse_without_signaling(self):
+        target = call(501)
+        self.rows = [target]
+        (key, value), *aliases = self.records()
+        for label, malformed in (
+            ('missing NUL', value[:-1]),
+            ('semicolon before NUL', value[:-1] + b';\x00'),
+            ('double NUL', value + b'\x00'),
+            ('NUL between fields', value.replace(b';IPREMOTE=', b'\x00IPREMOTE=')),
+            ('semicolon instead of NUL', value[:-1] + b';'),
+        ):
+            with self.subTest(label=label):
+                self.rows = [target]
+                self.sent.clear()
+                self.write_db(tdb_bytes([(key, malformed), *aliases]))
+                self.assertEqual(self.drain(write_db=False), dict(sessionsTerminated=0, complete=False))
+                self.assertEqual(self.sent, [])
+                self.assertEqual(self.rows, [target])
+        self.command.assert_not_called()
 
     def test_rotated_journal_for_target_and_neighbor_leaves_only_neighbor(self):
         self.assertEqual(self.drain(), dict(sessionsTerminated=2, complete=True))
