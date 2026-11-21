@@ -42,6 +42,7 @@ XRAY_DROPIN_UNSUPPORTED = 'XRAY_DROPIN_UNSUPPORTED'
 NATIVE_XL_SHA = '20e9c67838fa8072a5378839fc729a1123d1580879fbf20f9121d558fd0fe0df'
 XL_BOOT = SYSTEM + '/multi-user.target.wants/' + XL
 XL_DEFAULT = '/etc/default/xl2tpd'
+XL2TPD_CONFIG_MISSING = 'XL2TPD_CONFIG_MISSING'
 # Extracted from signed Debian trixie/main xl2tpd_1.3.18-1+b1_amd64.deb
 # (archive SHA256 dd6fdf32b90f9f7d516f5251e1abdb65851156c80163a41aab60cf94dcff16da).
 STOCK_XL_DEFAULT_SHA = '37b5938f462ec60b4f8c179b34f70b548c09da4691c938e88ce111ce41268833'
@@ -950,11 +951,18 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
          'PREREQUISITE')
     files = {key: read(path) for key, path in NAMES.items()}
     need(all(files[k] is None for k in ('ike', 'options', 'nft', 'net', 'drop'))
-         and all(files[k] is not None for k in ('main', 'lns', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
+         and all(files[k] is not None for k in ('main', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
     starter = uncomment(raw(files['starter']))
     need(starter in ([], [b'config setup'], [STOCK_IKE_INCLUDE], [b'config setup', STOCK_IKE_INCLUDE])
          and not uncomment(raw(files['secrets']))
-         and not uncomment(raw(files['chap'])) and is_stock_lns(files['lns']), 'PREREQUISITE')
+         and not uncomment(raw(files['chap'])), 'PREREQUISITE')
+    if files['lns'] is None:
+        # read() also returns None for a missing parent. Diagnose only an absent
+        # leaf under the trusted directory, without following symlinks.
+        if directory_absent(NAMES['lns']):
+            raise Refusal(XL2TPD_CONFIG_MISSING)
+        raise Refusal('PREREQUISITE')
+    need(is_stock_lns(files['lns']), 'PREREQUISITE')
     need(ike_include_matches(files['starter'], []), 'PREREQUISITE')
     bridge = read(BRIDGE)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')

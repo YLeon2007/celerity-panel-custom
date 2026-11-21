@@ -61,6 +61,31 @@ if opts.get('enabled'):
     backing(boot).symlink_to(local_xl)
 for k in ('lns', 'chap', 'secrets', 'starter', 'main'):
     put(h['NAMES'][k], b'{}' if k == 'main' else (b'config setup\ninclude /etc/ipsec.d/*.conf\n' if k == 'starter' else b'# minimal\n'))
+lns = backing(h['NAMES']['lns'])
+lns_case = opts.get('lns')
+if lns_case == 'foreign':
+    lns.write_bytes(b'[lns foreign]\n')
+elif lns_case:
+    lns.unlink()
+    if lns_case == 'missing-parent':
+        lns.parent.rmdir()
+    elif lns_case == 'symlink-parent':
+        lns.parent.rename(lns.parent.with_name('foreign-l2tp'))
+        lns.parent.symlink_to('foreign-l2tp')
+    elif lns_case == 'writable-parent':
+        lns.parent.chmod(0o777)
+    elif lns_case == 'symlink':
+        lns.symlink_to(put('/etc/xl2tpd/foreign.conf', b'# not the conffile\n').name)
+    elif lns_case == 'dangling':
+        lns.symlink_to('missing.conf')
+    elif lns_case == 'directory':
+        lns.mkdir()
+    elif lns_case == 'fifo':
+        os.mkfifo(lns)
+    else:
+        assert lns_case == 'missing'
+if opts.get('missingChap'):
+    backing(h['NAMES']['chap']).unlink()
 backing('/etc/ipsec.d').mkdir()
 backing(h['NFT_DIR']).parent.mkdir(exist_ok=True)
 backing(path).parent.mkdir()
@@ -132,6 +157,8 @@ def run(argv, **kw):
         data = b'LANG=C\n'
     elif argv == ip6_show:
         data = b'[]'
+    elif argv == ('/usr/bin/dpkg-query', '-W', '-f=$'+'{Conffiles}', 'xl2tpd'):
+        data = b' /etc/xl2tpd/xl2tpd.conf 3c7f48565aff98751a9ef2d734b56405\n'
     elif argv == ('/usr/bin/dpkg-query', '-W', '-f=$'+'{Version}\\n$'+'{Architecture}\\n$'+'{Conffiles}', 'xl2tpd'):
         version = opts.get('version','1.3.18-1+b1')
         arch = opts.get('arch','amd64')
@@ -166,7 +193,7 @@ if not rpdb:
 
 machine = 'a'*32
 network = dict(clientCidr='10.255.1.0/24', tproxyPort=12345, fwmark=77, routeTable=177)
-req = dict(action='prepare' if opts['accept'] else 'install', machineId=machine, network=network,
+req = dict(action=opts.get('action', 'prepare' if opts['accept'] else 'install'), machineId=machine, network=network,
            backupId='b'*32, baseline='c'*64)
 sys.stdin = io.TextIOWrapper(io.BytesIO(json.dumps(req).encode()))
 status = h['main']()
@@ -258,8 +285,8 @@ const scenarios = [
     ['loaded helper with second start command is refused', { unit: { ExecStart: '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; } { path=/etc/init.d/xl2tpd ; argv[]=/etc/init.d/xl2tpd start ; }' } }],
 ];
 
-for (const [name, changes] of scenarios) {
-    test(`DIRECT xl2tpd defaults: ${name}`, () => {
+function runCases(prefix, cases) {
+    for (const [name, changes] of cases) test(`${prefix}: ${name}`, () => {
         const opts = { defaults, accept: false, ...changes };
         const dir = mkdtempSync(join(process.cwd(), '.direct-defaults-fixture-'));
         try {
@@ -268,7 +295,8 @@ for (const [name, changes] of scenarios) {
                 join(__dirname, '../../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'), dir],
             { encoding: 'utf8', input: JSON.stringify(opts), timeout: 10000 });
             assert.equal(result.status, 0, result.stderr || result.error?.message);
-            assert.equal(result.stderr, opts.accept ? '' : 'DIRECT_NO_WRITE_PREREQUISITE\n');
+            const frame = opts.action && opts.action !== 'install' ? 'DIRECT_' : 'DIRECT_NO_WRITE_';
+            assert.equal(result.stderr, opts.accept ? '' : `${frame}${opts.code ?? 'PREREQUISITE'}\n`);
             if (opts.accept) {
                 const prepared = JSON.parse(result.stdout);
                 assert.match(prepared.baseline, /^[0-9a-f]{64}$/);
@@ -277,6 +305,18 @@ for (const [name, changes] of scenarios) {
         } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 }
+
+runCases('DIRECT xl2tpd defaults', scenarios);
+runCases('DIRECT xl2tpd conffile', [
+    ['present regular inert file passes prepare', { accept: true }],
+    ...['prepare', 'check', 'install'].map(action => [
+        `missing leaf is diagnosed on ${action}`, { action, lns: 'missing', code: 'XL2TPD_CONFIG_MISSING' },
+    ]),
+    ...['foreign', 'symlink', 'dangling', 'directory', 'fifo', 'missing-parent', 'symlink-parent', 'writable-parent']
+        .map(lns => [`${lns} remains a generic refusal`, { lns }]),
+    ['missing CHAP file is not a missing xl2tpd conffile', { missingChap: true }],
+    ['missing CHAP and LNS files remain a generic refusal', { lns: 'missing', missingChap: true }],
+]);
 
 test('DIRECT install refuses an unattributed rule 220 before any write', t => {
     const unshare = '/usr/bin/unshare';
