@@ -55,7 +55,7 @@ const expected = compose(...laterArgs, false);
 // Actual helper, file IO, flock, manifest, parser, and mutation sequence.
 // No subprocess can run a real systemctl, ip, nft, Xray, ss or IPsec command.
 const fixture = String.raw`
-import contextlib, copy, io, json, os, pathlib, shlex, sys, types
+import contextlib, copy, ctypes, errno, io, json, os, pathlib, shlex, subprocess, sys, types
 from pathlib import Path
 source, tmp, scenario = sys.argv[1:]
 f = json.load(sys.stdin)
@@ -624,6 +624,18 @@ if scenario == 'chap-inspect-active':
         def sample():
             global samples
             samples += 1
+            if observation in ('getfd-eperm', 'getfd-esrch'):
+                def getfd(*args):
+                    ctypes.set_errno(errno.EPERM if observation == 'getfd-eperm' else errno.ESRCH)
+                    return -1
+                with h['session_dup'](types.SimpleNamespace(pidfd_getfd=getfd), 12, 13):
+                    raise AssertionError('failed pidfd_getfd yielded a descriptor')
+            if observation == 'other-eperm':
+                raise PermissionError(errno.EPERM, 'FIXTURE_PRIVATE_DETAIL')
+            if observation == 'timeout':
+                raise subprocess.TimeoutExpired(['FIXTURE_PRIVATE_DETAIL'], 0)
+            if observation == 'in-flight':
+                raise Refusal('IN_FLIGHT')
             pids = (502,) if observation == 'desired-idle' else (501, 502, 503)
             start = 100 if observation != 'session-drift' or samples == 1 else 101
             return start, [calls[pid] for pid in pids]
@@ -658,6 +670,8 @@ if scenario == 'chap-inspect-active':
         assert samples >= 2 and identity_reads >= 2, 'did not sample PPP identities under the host frame'
     elif observation == 'session-drift':
         assert samples >= 2 and identity_reads >= 1, 'did not reach the changing session observations'
+    elif observation in ('getfd-eperm', 'getfd-esrch', 'other-eperm', 'timeout', 'in-flight'):
+        assert samples == 1 and not identity_reads
     else:
         assert not samples and not identity_reads
     print(json.dumps(result))
@@ -703,7 +717,7 @@ if scenario.startswith('chap-sync-'):
             pre = snapshot()
             assert wire('check-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
             assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
-            assert wire('inspect-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
+            assert wire('inspect-chap', **params) == (70, '', 'DIRECT_INSPECT_CHAP_PROJECTION_UNPROVED\n'), label
             assert snapshot() == pre and not changes, label
         chap.write_bytes(stock_chap + begin + old_row + end + foreign)
         chap.chmod(0o644)
@@ -894,7 +908,7 @@ else:
         for stray_pppd in (False, True):
             code, stdout, stderr = wire('inspect-chap', **revoke)
             if stray_pppd:
-                assert (code, stdout, stderr) == (70, '', 'DIRECT_CHAP_REFUSED\n')
+                assert (code, stdout, stderr) == (70, '', 'DIRECT_INSPECT_PPP_UNPROVED\n')
             else:
                 assert (code, stderr) == (0, ''), (code, stderr)
                 assert json.loads(stdout) == dict(ok=True, backupId=token, projection='both', activeTargetSessions=0)
@@ -1016,11 +1030,13 @@ test('inspectChap uses a full pinned transport and host frame without writes or 
     const alice = { login: 'alice', password: 'test-old', ipAddress: '10.255.1.10', enabled: true };
     const bob = { login: 'bob', password: 'test-new', ipAddress: '10.255.1.11', enabled: true };
     const installation = { nodeId, backupId, network };
-    for (const [observation, projection, activeTargetSessions] of [
+    for (const [observation, projection, activeTargetSessions, inspectionReason] of [
         ['original', 'original', 2], ['fenced-original', 'original', 2], ['desired', 'desired', 2],
         ['desired-idle', 'desired', 0], ['create', 'original', 0],
-        ['failed'], ['mixed'], ['session-drift'], ['identity-drift'], ['file-drift'], ['manifest-drift'], ['watch-drift'],
-        ['exclusive-held'],
+        ...['failed', 'mixed'].map(mode => [mode, null, null, 'chap-projection-unproved']),
+        ...['session-drift', 'identity-drift', 'getfd-esrch', 'other-eperm'].map(mode => [mode, null, null, 'ppp-unproved']),
+        ...['file-drift', 'manifest-drift', 'watch-drift'].map(mode => [mode, null, null, 'inspect-readback-unproved']),
+        ['getfd-eperm', null, null, 'pidfd-getfd-eperm'], ['exclusive-held'], ['timeout'], ['in-flight'],
     ]) {
         await t.test(observation, async () => {
             const create = observation === 'create';
@@ -1062,8 +1078,13 @@ test('inspectChap uses a full pinned transport and host frame without writes or 
                     assert.deepEqual(await result, { projection, activeTargetSessions });
                     assert.deepEqual(guards, [0, 1]);
                 } else {
-                    await assert.rejects(result, { code: observation === 'exclusive-held'
-                        ? 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_DIRECT_CHAP_REFUSED' });
+                    await assert.rejects(result, error => {
+                        assert.equal(error.code, inspectionReason
+                            ? 'REBUILD_L2TP_DIRECT_INSPECT_UNPROVED' : 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN');
+                        assert.equal(error.inspectionReason, inspectionReason);
+                        assert.doesNotMatch(JSON.stringify(error), /FIXTURE_PRIVATE_DETAIL/);
+                        return true;
+                    });
                 }
                 assert.equal(calls, 1);
             } finally {

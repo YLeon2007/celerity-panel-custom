@@ -2426,16 +2426,40 @@ def fence_chap(request):
     return {'ok': True, 'backupId': request['backupId'], 'fenced': True}
 
 
+class InspectUnproved(Refusal):
+    pass
+
+
+class PidfdGetfdDenied(Refusal):
+    pass
+
+
+@contextlib.contextmanager
+def inspect_stage(stage):
+    try:
+        yield
+    except (InspectUnproved, subprocess.TimeoutExpired, BlockingIOError):
+        raise
+    except Exception as error:
+        if isinstance(error, Refusal) and str(error) == 'IN_FLIGHT':
+            raise
+        if time.monotonic() >= DEADLINE:
+            raise subprocess.TimeoutExpired([], 0) from None
+        # Only identify EPERM from this exact syscall, not a security policy.
+        raise InspectUnproved('PIDFD_GETFD_EPERM' if isinstance(error, PidfdGetfdDenied) else stage) from None
+
+
 def inspect_chap(request):
     bad = 'ROLLBACK_DRIFT'
     target = NAMES['chap']
-    manifest_generation = remove_generation(manifest_path(request['backupId']))
-    path, manifest, backup, intent, xl, current_rows, desired_rows, logins = chap_preconditions(request)
-    # A failed daemon does not establish that its sessions are gone.
-    need(xl['ActiveState'] != 'failed', bad)
-    generation = remove_generation(target)
-    record = read(target)
-    original, desired = chap_projection(record, current_rows, desired_rows, logins)
+    with inspect_stage('CHAP_PROJECTION_UNPROVED'):
+        manifest_generation = remove_generation(manifest_path(request['backupId']))
+        path, manifest, backup, intent, xl, current_rows, desired_rows, logins = chap_preconditions(request)
+        # A failed daemon does not establish that its sessions are gone.
+        need(xl['ActiveState'] != 'failed', bad)
+        generation = remove_generation(target)
+        record = read(target)
+        original, desired = chap_projection(record, current_rows, desired_rows, logins)
 
     def unchanged():
         no_jobs(UNITS)
@@ -2446,30 +2470,32 @@ def inspect_chap(request):
 
     revoked = request.get('revokedLogin')
     count = 0  # No target on a non-revoke; this does not assert PPP idleness.
-    with contextlib.ExitStack() as stack:
+    with inspect_stage('READBACK_UNPROVED'), contextlib.ExitStack() as stack:
         watch = None
         if revoked is not None:
-            session_need(os.uname().machine == 'x86_64')
-            # The owner reads the live CHAP projection. Authenticated sessions
-            # are joined to the original users, including the removed login.
-            observed = {**request, 'currentUsers': request['currentUsers' if original else 'desiredUsers']}
-            if rollback_quiescent(xl):
-                quiet = quiescent_session_sample(observed)
-                session_need(quiet == quiescent_session_sample(observed))
-            else:
-                owner = session_owner(observed)
-                session_need((owner[1], str(owner[2])) == (xl['InvocationID'], xl['MainPID']))
-                users = {u['login']: u['ipAddress'] for u in request['currentUsers']}
-                sample, _, watch = stack.enter_context(revoke_ppp_view(owner))
-                before = sample()
-                peers = revoke_peer_logins(before[1], users)
-                session_need(owner == session_owner(observed) and before == sample()
-                             and peers == revoke_peer_logins(before[1], users) and before == sample())
-                count = sum(login == revoked for login in peers.values())
+            with inspect_stage('PPP_UNPROVED'):
+                session_need(os.uname().machine == 'x86_64')
+                # The owner reads the live CHAP projection. Authenticated sessions
+                # are joined to the original users, including the removed login.
+                observed = {**request, 'currentUsers': request['currentUsers' if original else 'desiredUsers']}
+                if rollback_quiescent(xl):
+                    quiet = quiescent_session_sample(observed)
+                    session_need(quiet == quiescent_session_sample(observed))
+                else:
+                    owner = session_owner(observed)
+                    session_need((owner[1], str(owner[2])) == (xl['InvocationID'], xl['MainPID']))
+                    users = {u['login']: u['ipAddress'] for u in request['currentUsers']}
+                    sample, _, watch = stack.enter_context(revoke_ppp_view(owner))
+                    before = sample()
+                    peers = revoke_peer_logins(before[1], users)
+                    session_need(owner == session_owner(observed) and before == sample()
+                                 and peers == revoke_peer_logins(before[1], users) and before == sample())
+                    count = sum(login == revoked for login in peers.values())
         unchanged()
         if watch is not None:
             watch()
-    session_need(time.monotonic() < DEADLINE)
+    if time.monotonic() >= DEADLINE:
+        raise subprocess.TimeoutExpired([], 0)
     projection = 'both' if original and desired else 'original' if original else 'desired'
     reply = {'ok': True, 'backupId': request['backupId'], 'projection': projection, 'activeTargetSessions': count}
     if (epoch := chap_generation(backup['phase'])) is not None:
@@ -2999,6 +3025,8 @@ def session_ppp_argv(argv, pool):
 def session_dup(libc, pidfd, fd):
     # Getters only; never open /dev/ppp, attach a channel, or open the control FIFO.
     dup = libc.pidfd_getfd(pidfd, fd, 0)
+    if dup < 0 and ctypes.get_errno() == errno.EPERM:
+        raise PidfdGetfdDenied(SESSION_UNKNOWN)
     session_need(dup >= 0)
     try:
         yield dup
@@ -3769,6 +3797,8 @@ def main():
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
               'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
               'REMOVE_REFUSED' if action == 'remove' else
+              'INSPECT_' + str(error) if action == 'inspect-chap' and isinstance(error, InspectUnproved)
+              and str(error) in ('CHAP_PROJECTION_UNPROVED', 'PPP_UNPROVED', 'PIDFD_GETFD_EPERM', 'READBACK_UNPROVED') else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
               SESSION_UNKNOWN if action == 'session-count' else str(error)), file=sys.stderr)
         return 70

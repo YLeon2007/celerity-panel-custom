@@ -135,6 +135,14 @@
             ? ` ${words.requestClosures.replace('{count}', String(count))}` : '';
     }
 
+    const inspectionMessages = new Map([
+        ['host-inspection-unproved', 'reconcileHostInspection'],
+        ['chap-projection-unproved', 'reconcileChapProjection'],
+        ['ppp-unproved', 'reconcilePppInspection'],
+        ['pidfd-getfd-eperm', 'reconcilePidfdGetfdEperm'],
+        ['inspect-readback-unproved', 'reconcileInspectReadback'],
+    ]);
+
     async function reconcileOnOpen() {
         busy = true;
         updateMutations();
@@ -147,12 +155,17 @@
                     note = closureNote(data, data.sessionsTerminated);
                 }
                 if (data.status === 'pending') message = 'reconcileStillPending';
+                if (data.status === 'inspection-unproved' && data.retryAllowed === false) {
+                    message = 'reconcileInspectionUnproved';
+                    const detail = inspectionMessages.get(data.reason);
+                    if (detail) note = ` ${words[detail]}`;
+                }
             }
         } catch { /* A lost response does not establish whether the fence cleared. */ }
         status.textContent = words[message] + note;
         busy = false;
-        // Never unlock controls against this stale overview or reload into
-        // another automatic POST. Any refresh is an explicit operator action.
+        // Never unlock this stale overview. Its refresh link only reads the
+        // overview; it cannot cause another automatic recovery POST.
         requireRefresh = true;
         updateMutations();
     }

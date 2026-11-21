@@ -470,6 +470,108 @@ function releasedIntent(f, action) {
 
 const recoveryEffects = f => f.events.filter(x => /^(inspect:|fence:|check:|sync:|cancel$|intent$|publish$)/.test(x));
 
+test('mounted reconcile reports only a bounded DIRECT inspection refusal while its intent remains pending', async t => {
+    const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_RELAYS_JSON: '[]', PANEL_DOMAIN: 'panel.fixture.invalid',
+        ACME_EMAIL: 'test@fixture.invalid', ENCRYPTION_KEY: key, SESSION_SECRET: 'test-session-only' };
+    for (const [name, value] of Object.entries(env)) {
+        const previous = process.env[name];
+        process.env[name] = value;
+        t.after(() => { if (previous === undefined) delete process.env[name]; else process.env[name] = previous; });
+    }
+    const express = require('express');
+    const { request } = require('./helpers/rebuildPanelRequest');
+    const { createPanelRouter, l2tpRateLimiter } = require('../../routes/panel');
+    const Settings = require('../../models/settingsModel');
+    const { issuePanelCsrfToken } = require('../../routes/panel/csrf');
+    const { createRelayDirect } = require('../rebuildRelayDirect');
+    const service = require('../rebuildService');
+    const { i18nMiddleware } = require('../../middleware/i18n');
+    const peer = '192.0.2.10';
+    const config = require('../../../config');
+    t.mock.method(Settings, 'findById', () => ({ select: () => ({ lean: async () => ({ deployment: { completed: true } }) }) }));
+    t.after(() => require('../sshPoolService').closeAll());
+    const whitelist = config.PANEL_IP_WHITELIST;
+    config.PANEL_IP_WHITELIST = peer;
+    t.after(() => { config.PANEL_IP_WHITELIST = whitelist; });
+
+    const frame = 'DIRECT_INSPECT_PIDFD_GETFD_EPERM\n';
+    const exact = { code: 70, stdout: '', stderr: frame };
+    let f, loseReadback;
+    t.mock.method(service, 'createRebuildService', () => ({ reconcileRelayAccounts: f.service.reconcile }));
+    const app = express();
+    app.set('view engine', 'ejs');
+    app.set('views', require('node:path').join(__dirname, '../../../views'));
+    app.use(i18nMiddleware);
+    app.use('/panel', createPanelRouter({ rebuildL2tpOverview: {
+        async overview() {
+            return { relays: [], accounts: [], accountsPending: Boolean(f.pending), canReconcileAccounts: true, canManageAccounts: true };
+        },
+        async hasPendingAccounts() {
+            if (loseReadback && f.events.includes(`close:${A}`)) throw new Error('FIXTURE_PRIVATE_DETAIL');
+            return Boolean(f.pending);
+        },
+    } }));
+    const session = { authenticated: true }, sessionID = 'inspect-fixture';
+    const url = '/panel/rebuild/relays/l2tp/accounts/reconcile';
+    const post = () => request(app, url, { session, sessionID, ip: peer,
+        headers: { 'content-type': 'application/json', 'content-length': '2', 'x-csrf-token': issuePanelCsrfToken({ session }) } });
+    const receipt = status => ({ executionMode: 'rebuild', status });
+    const blocked = reason => ({ ...receipt('inspection-unproved'), reason, retryAllowed: false });
+    const pending = receipt('pending');
+    for (const [mode, wire, expected] of [
+        ['denied', exact, blocked('pidfd-getfd-eperm')],
+        ['legacy', { ...exact, stderr: 'DIRECT_CHAP_REFUSED\n' }, blocked('host-inspection-unproved')],
+        ['tainted', { ...exact, stderr: `${frame}FIXTURE_PRIVATE_DETAIL\n` }, pending],
+        ['busy host', { code: 75, stdout: '', stderr: '' }, pending],
+        ['busy Apply', undefined, pending],
+        ['lost Apply ownership', exact, pending],
+        ['stale readback', exact, { error: { code: 'REBUILD_L2TP_RECONCILE_UNAVAILABLE' } }],
+        ['proved', undefined, receipt('settled')],
+    ]) {
+        l2tpRateLimiter.resetKey(peer);
+        let lockLost = false;
+        f = fixture({ shared: true, other: true, fault(step) { if (step === 'lock' && lockLost) return false; } });
+        f.pending = releasedIntent(f, 'delete');
+        loseReadback = mode === 'stale readback';
+        const before = structuredClone([f.pending, f.users, f.hosts, f.sessions]);
+        const createMockRelay = f.deps.createRelayDirect;
+        const calls = [];
+        class SSH {
+            async connect() {}
+            disconnect() { calls.push('close'); }
+            async exec(_command, { stdin }, verifyBeforeStdin) {
+                await verifyBeforeStdin();
+                calls.push(JSON.parse(stdin).action);
+                lockLost = mode === 'lost Apply ownership';
+                return wire;
+            }
+        }
+        if (wire) f.deps.createRelayDirect = options => options.node._id === B
+            ? createRelayDirect({ ...options, SSH }) : createMockRelay(options);
+        if (mode === 'busy Apply') f.deps.locks.run = async () => { throw Object.assign(new Error(), { code: 'REBUILD_BUSY' }); };
+        f.service = f.restart();
+        const response = await post();
+        assert.equal(response.status, loseReadback ? 503 : 200, mode);
+        assert.equal(response.headers['cache-control'], 'no-store', mode);
+        assert.deepEqual(JSON.parse(response.body), expected, mode);
+        if (mode === 'denied') {
+            const refresh = await request(app, '/panel/l2tp?view=only', { method: 'GET', session, sessionID, ip: peer,
+                headers: { 'accept-language': 'en' } });
+            assert.equal(refresh.status, 200);
+            assert.match(refresh.body, /An unfinished operation is pending\. Controls are locked\./);
+            assert.doesNotMatch(refresh.body, /data-reconcile-url|data-create|data-secret-url/);
+        }
+        assert.deepEqual(calls, wire ? ['inspect-chap', 'close'] : [], mode);
+        if (mode === 'proved') {
+            assert.equal(f.pending, undefined);
+            assert.deepEqual(recoveryEffects(f), [...fencePass, 'cancel']);
+        } else {
+            assert.deepEqual([f.pending, f.users, f.hosts, f.sessions], before, mode);
+            assert.deepEqual(recoveryEffects(f), wire ? [`inspect:${A}`] : [], mode);
+        }
+    }
+});
+
 test('no pending intent is a no-op, not an inventory or host sweep', async () => {
     const f = fixture();
     f.rows.length = 0;

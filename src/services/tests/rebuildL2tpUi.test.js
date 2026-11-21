@@ -66,6 +66,7 @@ test('pending supersedes generic conflict/unavailable text and hides mutation an
         const { content } = await render(lang, { accountsPending: true, canReconcileAccounts: true });
         assert.match(content, new RegExp(`>${message}<`));
         assert.ok(content.includes(`data-reconcile-url="${route}/l2tp/accounts/reconcile"`));
+        assert.match(content, /href="\/panel\/l2tp\?view=only" data-refresh/);
         for (const key of ['inconsistent', 'accountsReadOnly', 'loadError']) assert.ok(!content.includes(t(`rebuildL2tp.${key}`, lang)));
         assert.doesNotMatch(content, /data-create|data-account-action|data-secret-url|data-install-url|#rebuild-l2tp-remove|SERVER-ONLY-/);
     }
@@ -73,6 +74,9 @@ test('pending supersedes generic conflict/unavailable text and hides mutation an
     assert.doesNotMatch(singleton.content, /data-reconcile-url|data-secret-url/);
     const clear = await render('ru');
     assert.doesNotMatch(clear.content, /data-reconcile-url/);
+    const refreshed = await render('en', { accountsPending: true, canReconcileAccounts: true, reconcileViewOnly: true });
+    assert.match(refreshed.content, />An unfinished operation is pending\. Controls are locked\.</);
+    assert.doesNotMatch(refreshed.content, /data-reconcile-url|data-install-url|data-secret-url|data-account-action|data-create/);
 });
 
 test('opening a pending section POSTs once, then shows settled, pending or unconfirmed without retry/reload', async () => {
@@ -119,6 +123,50 @@ test('opening a pending section POSTs once, then shows settled, pending or uncon
                 method: 'POST', credentials: 'same-origin', mode: 'same-origin', body: '{}', redirect: 'error', cache: 'no-store',
                 'x-csrf-token': csrf, 'Content-Type': 'application/json',
             });
+        }
+    }
+});
+
+test('unproved inspection replaces the working status with localized, allowlisted guidance and never unlocks', async () => {
+    const script = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
+    const chars = { '&#34;': '"', '&#39;': "'", '&amp;': '&', '&lt;': '<', '&gt;': '>' };
+    for (const [lang, guidance] of [
+        ['en', 'Do not retry blindly or edit the database.'],
+        ['ru', 'Не повторяйте операцию вслепую и не правьте базу данных.'],
+    ]) {
+        const { content } = await render(lang, { accountsPending: true, canReconcileAccounts: true });
+        const messages = /data-messages="([^"]+)"/.exec(content)[1].replace(/&#34;|&#39;|&amp;|&lt;|&gt;/g, match => chars[match]);
+        const text = JSON.parse(messages);
+        for (const [reason, key] of [
+            ['host-inspection-unproved', 'reconcileHostInspection'], ['chap-projection-unproved', 'reconcileChapProjection'],
+            ['ppp-unproved', 'reconcilePppInspection'], ['pidfd-getfd-eperm', 'reconcilePidfdGetfdEperm'],
+            ['inspect-readback-unproved', 'reconcileInspectReadback'], ['FIXTURE_PRIVATE_DETAIL', null], ['constructor', null],
+        ]) {
+            const status = { textContent: /data-action-status role="status">([^<]+)</.exec(content)[1] };
+            const refresh = { hidden: true }, staleControl = { disabled: false, addEventListener() {} };
+            const url = /data-reconcile-url="([^"]+)"/.exec(content)[1];
+            const page = { dataset: { csrf, messages, reconcileUrl: url },
+                querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh })[selector] ?? null,
+                querySelectorAll: selector => selector === '[data-install-url]' ? [staleControl] : [] };
+            const calls = [];
+            runInNewContext(script, {
+                document: { getElementById: () => page },
+                window: { addEventListener() {}, location: { reload: () => calls.push('reload') } },
+                async fetch(path) {
+                    calls.push(path);
+                    return { ok: true, json: async () => ({ executionMode: 'rebuild', status: 'inspection-unproved',
+                        reason, retryAllowed: false, message: 'FIXTURE_PRIVATE_DETAIL', sessionsTerminated: 2, sessionsTerminatedScope: 'request' }) };
+                },
+            });
+            assert.equal(staleControl.disabled, true);
+            await new Promise(resolve => setImmediate(resolve));
+            assert.deepEqual(calls, [url]);
+            assert.equal(refresh.hidden, false);
+            assert.equal(staleControl.disabled, true);
+            assert.equal(status.textContent, text.reconcileInspectionUnproved + (key ? ` ${text[key]}` : ''));
+            assert.ok(status.textContent.includes(guidance));
+            assert.doesNotMatch(status.textContent, /FIXTURE_PRIVATE_DETAIL|undefined|seccomp/i);
+            if (reason === 'pidfd-getfd-eperm') assert.match(status.textContent, /pidfd_getfd \(EPERM\)/);
         }
     }
 });

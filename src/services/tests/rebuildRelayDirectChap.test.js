@@ -110,6 +110,22 @@ test('inspectChap checks the caller guard before dispatch and again before retur
     assert.deepEqual(seen, Array(2).fill({ action: 'inspect-chap', ...installation, machineId, currentUsers: [], desiredUsers: [row] }));
 });
 
+test('an inspect refusal frame cannot certify a sync refusal or unlock the write channel', async () => {
+    const { remote, seen } = driver(action => action === 'check-chap' ? accepted
+        : { ...refused, stderr: 'DIRECT_INSPECT_PIDFD_GETFD_EPERM\n' });
+    const args = [installation, [], [row], () => true];
+    await remote.checkChap(...args);
+    await assert.rejects(remote.syncChap(...args), error => {
+        assert.equal(error.code, 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN');
+        assert.equal(error.remoteOutcomeUncertain, true);
+        assert.equal(error.noHostChanges, undefined);
+        assert.equal(error.inspectionReason, undefined);
+        return true;
+    });
+    await assert.rejects(remote.inspectChap(...args), { code: 'REBUILD_L2TP_DIRECT_UNAVAILABLE' });
+    assert.deepEqual(seen.map(frame => frame.action), ['check-chap', 'sync-chap']);
+});
+
 test('fenceChap CAS is private and requires a fresh check or inspection before sync', async () => {
     const generation = 'e'.repeat(32);
     const proof = { projection: 'original', activeTargetSessions: 0 };

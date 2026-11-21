@@ -14,6 +14,7 @@ const { isInstallStage, specificHostRefusal, prerequisiteCheck, requireInstallHo
     withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
+const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
 
 const TIMEOUT = 145000;
 const SESSION_COUNT_TIMEOUT = 12000;
@@ -214,6 +215,11 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         catch (error) { if (write) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
+            if (action === 'inspect-chap') {
+                const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
+                if (!reason) throw unknown();
+                throw Object.assign(fail('DIRECT_INSPECT_UNPROVED'), { inspectionReason: reason });
+            }
             const refusal = typeof result.stderr === 'string' && refusalFrame.exec(result.stderr);
             if (result.code !== 70 || result.stdout !== '' || !refusal) throw unknown();
             const [, noWrite, raw] = refusal;
