@@ -1138,8 +1138,9 @@
             '<i class="ti ti-upload"></i> ' + (i18n.deploy || 'Deploy') + '</button>' +
             '<button class="btn btn-sm btn-primary" id="btnDeployChain" onclick="window._cascadeDeployChain(\'' + lid + '\')">' +
             '<i class="ti ti-link"></i> ' + escHtml(syncDomainLabel) + '</button>' +
-            '<button class="btn btn-sm btn-outline" id="btnUndeploy" onclick="window._cascadeUndeploy(\'' + lid + '\')">' +
-            '<i class="ti ti-player-stop"></i> ' + (i18n.undeployLink || 'Undeploy') + '</button>' +
+            (rebuild ? '' :
+                '<button class="btn btn-sm btn-outline" id="btnUndeploy" onclick="window._cascadeUndeploy(\'' + lid + '\')">' +
+                '<i class="ti ti-player-stop"></i> ' + (i18n.undeployLink || 'Undeploy') + '</button>') +
             '<button class="btn btn-sm btn-danger" id="btnDelete" onclick="window._cascadeDelete(\'' + lid + '\')">' +
             '<i class="ti ti-trash"></i> ' + (i18n.delete || 'Delete') + '</button>' +
             '</div>';
@@ -1899,6 +1900,7 @@
     };
 
     window._cascadeUndeploy = async function (linkId) {
+        if (rebuild) return;
         if (!confirm(i18n.confirmUndeploy || 'Undeploy this cascade link?')) return;
         setActionLoading(i18n.undeploying || 'Undeploying...');
 

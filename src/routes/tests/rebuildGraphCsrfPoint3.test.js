@@ -151,6 +151,16 @@ function dispatch(app, call) {
             ...(call.method === 'POST' ? { origin } : {}) } });
 }
 
+test('rebuild nodes drawer keeps Delete but offers no strict Undeploy action', async () => {
+    const ui = mount('nodes', 'ru', '', true, () => assert.fail('unexpected strict request'));
+    ui.openEdge();
+    const drawer = ui.document.getElementById('nodeInfoBody').innerHTML;
+    assert.match(drawer, /id="btnDelete"/);
+    assert.doesNotMatch(drawer, /id="btnUndeploy"|_cascadeUndeploy\(/);
+    await ui.context._cascadeUndeploy(linkId);
+    assert.deepEqual(ui.requests, []);
+});
+
 for (const [view, lang, actionCopy] of [['network', 'ru', /Повторите действие вручную/], ['nodes', 'en', /Retry the action manually/]]) {
     test(`${view} (${lang}): stale session token is reread from real rebuild route, never replaying preview`, async () => {
         const app = makeApp();
