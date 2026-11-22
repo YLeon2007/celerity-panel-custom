@@ -95,7 +95,7 @@ function mongoFixture(t) {
             for (const name of this.modified) tables.set(name, this.view.get(name));
             return { ok: 1 };
         }
-        async commitTransaction() { this.commit('grant'); this.view = null; }
+        async commitTransaction() { this.commit(this.grantAction ?? 'grant'); this.view = null; }
         async abortTransaction() { this.view = null; }
         async endSession() { assert.equal(this.inTransaction(), false); }
     }
@@ -137,6 +137,18 @@ function mongoFixture(t) {
                     assert.ok(row._id === undefined || !data.some(other => equal(other._id, row._id)));
                     data.push(copy(row));
                     return { acknowledged: true };
+                }, options);
+            },
+            async updateOne(where, update, options) {
+                assert.equal(name, GRANTS);
+                assert.ok(options.session);
+                const [original] = tables.get(GRANTS);
+                assert.deepEqual(where, { nodeId: original.nodeId, generation: original.generation });
+                options.session.grantAction = 'reconfirm';
+                return write(data => {
+                    const row = data.find(candidate => match(candidate, where));
+                    if (row) Object.assign(row, copy(update.$set));
+                    return { acknowledged: true, matchedCount: Number(Boolean(row)) };
                 }, options);
             },
             async updateMany(where, update, options) {
@@ -188,8 +200,8 @@ function hostFixture(t, mongo) {
         ] } });
     const remote = { key, machineId, checks: [], effects: [] };
     let candidate, installedId;
-    const frames = bindWire(t, [{ id: nodeId, relay: { ip: host }, key, get machineId() { return remote.machineId; },
-        applyHandlers: new Map(), execute(command, stdin) {
+    const frames = bindWire(t, [{ id: nodeId, relay: { ip: host }, get key() { return remote.key; },
+        get machineId() { return remote.machineId; }, applyHandlers: new Map(), execute(command, stdin) {
         const req = JSON.parse(stdin);
         assert.equal(req.machineId, machineId);
         assert.equal(mongo.rows(LOCK).length, 1);
@@ -217,6 +229,15 @@ function hostFixture(t, mongo) {
             assert.equal(req.backupId, installedId);
             assert.equal(mongo.rows(STATES)[0].status, 'installing');
             break;
+        case 'check-apply-network': {
+            const [state] = mongo.rows(STATES);
+            assert.equal(state.status, 'installed');
+            assert.ok(installedId);
+            assert.deepEqual(req, { action: 'check-apply-network', machineId, backupId: installedId,
+                network: { clientCidr: state.clientCidr, tproxyPort: state.tproxyPort, fwmark: state.fwmark, routeTable: state.routeTable } });
+            return remote.ownerUnproved ? { status: 70, stdout: '', stderr: 'DIRECT_ROLLBACK_DRIFT\n' }
+                : ok({ ok: true, backupId: installedId, proof: 'e'.repeat(64) });
+        }
         default: assert.fail(`Unexpected DIRECT action: ${req.action}`);
         }
         return ok({ ok: true, backupId: req.backupId });
@@ -432,6 +453,40 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
     assert.deepEqual(f.remote.effects, ['install']);
     assert.deepEqual(f.remote.checks, checks);
     audit(f.mongo, [ok('probe'), ok('verify'), ok('grant'), ['confirm', 'denied', CHALLENGE], ['revoke', 'denied', CONFLICT]]);
+});
+
+test('installed pin rotation checks the original receipt, commits only grant and audit, and leaves host state alone', { timeout: 5000 }, async t => {
+    const f = joined(t);
+    const approve = async () => f.verify((await f.probe()).challenge);
+    await f.confirm((await approve()).challenge);
+    await f.send('install');
+    const before = [STATES, USERS, DIRECTORY].map(name => f.mongo.rows(name));
+    const [grant] = f.mongo.rows(GRANTS);
+    const frameStart = f.frames.length;
+    f.remote.key = Buffer.from('rotated synthetic host key');
+
+    const denied = await approve();
+    f.mongo.writes();
+    f.remote.ownerUnproved = true;
+    assert.deepEqual(await f.confirm(denied.challenge, 409), refused(CONFLICT));
+    assert.deepEqual(f.mongo.writes(), [LOCK, LOCK, AUDIT]);
+    assert.deepEqual(f.mongo.rows(GRANTS), [grant]);
+
+    f.remote.ownerUnproved = false;
+    const { challenge, ...proposal } = await approve();
+    f.mongo.writes();
+    assert.deepEqual(await f.confirm(challenge), proposal);
+    const [next] = f.mongo.rows(GRANTS);
+    assert.equal(next.sshHostKeySha256, hash(f.remote.key));
+    assert.notEqual(next.generation, grant.generation);
+    for (const field of ['nodeId', 'host', 'port', 'username', 'machineId']) assert.equal(next[field], grant[field]);
+    assert.deepEqual(f.mongo.writes(), [LOCK, GRANTS, AUDIT, LOCK]);
+    assert.deepEqual(f.mongo.commits.at(-1), ['reconfirm', GRANTS, AUDIT]);
+    assert.deepEqual(f.mongo.rows(AUDIT).slice(-4).map(row => [row.action, row.outcome, row.code]),
+        [['confirm', 'denied', CONFLICT], ok('probe'), ok('verify'), ok('reconfirm')]);
+    assert.deepEqual([STATES, USERS, DIRECTORY].map(name => f.mongo.rows(name)), before);
+    assert.deepEqual(f.frames.slice(frameStart), [[nodeId, 'check-apply-network'], [nodeId, 'check-apply-network']]);
+    assert.deepEqual(f.remote.effects, ['install']);
 });
 
 for (const mismatch of ['key', 'machineId', 'error']) {

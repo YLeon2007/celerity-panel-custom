@@ -11,7 +11,7 @@ const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { installCheckIds } = require('../../services/rebuildRelayInstallDiagnostics');
 const { isInspectionReason } = require('../../services/rebuildRelayInspection');
 const { mountAdmission, admissionPath, validAdmissionJson, reject: rejectAdmission,
-    validNodeId, grantEffectStatus } = require('./rebuildRelayAdmission');
+    validNodeId, grantEffectStatus, identityChanged } = require('./rebuildRelayAdmission');
 
 const pagePath = /^\/l2tp$/;
 const accountPath = /^\/rebuild\/relays\/l2tp\/accounts\/reveal$/;
@@ -26,6 +26,7 @@ const accountJson = new RegExp(String.raw`^\s*\{\s*${jsonString}\s*:\s*${jsonStr
 const emptyJson = /^\s*\{\s*\}\s*$/;
 const reconcileInvalid = 'REBUILD_L2TP_RECONCILE_INVALID_REQUEST';
 const reconcileUnavailable = res => revealError(res, 503, 'REBUILD_L2TP_RECONCILE_UNAVAILABLE');
+const reconcileBlocked = 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK';
 let rebuildL2tpScriptVersion;
 
 function noStore(_req, res, next) {
@@ -205,6 +206,7 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
     }, requireCompletedOnboarding(reconcileUnavailable), limiter, async (_req, res) => {
         const receipt = (status, count) => res.json({ executionMode: 'rebuild', status,
             ...(count !== undefined && { sessionsTerminated: count, sessionsTerminatedScope: 'request' }) });
+        const manualBlock = () => res.status(409).json({ error: { code: reconcileBlocked, retryAllowed: false } });
         try {
             const { hasPendingAccounts, overview } = getOverview();
             // This is a scoped recovery request, not a request to mutate a
@@ -213,6 +215,9 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
             // Let the current merged overview attest to multi-relay recovery.
             // The service independently rechecks authority under the writer lock.
             const authority = await overview();
+            if (authority.grantProblem === identityChanged) {
+                return await hasPendingAccounts() ? manualBlock() : receipt('settled');
+            }
             if (authority.grantProblem) {
                 const status = grantEffectStatus(authority.grantProblem);
                 return status ? revealError(res, status, authority.grantProblem) : reconcileUnavailable(res);
@@ -220,17 +225,20 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
             if (authority.canReconcileAccounts !== true) {
                 return await hasPendingAccounts() ? revealError(res, 409, 'REBUILD_L2TP_RECONCILE_DISABLED') : receipt('settled');
             }
-            let result, failed = false, reason, grantError;
+            let result, failed = false, reason, failureCode, identityBlocked = false;
             try { result = await reconcile(); } catch (error) {
                 failed = true;
                 const diagnostic = error?.retryAllowed === false && error.inspectionReason;
                 if (isInspectionReason(diagnostic)) reason = diagnostic;
-                if (grantEffectStatus(error?.code)) grantError = error.code;
+                failureCode = error?.code;
+                identityBlocked = error?.identityBlocked === true;
             }
             // A host refusal is diagnostic only while the pending fence still
             // exists. Busy, lost replies and unclassified outcomes stay pending.
             if (await hasPendingAccounts()) {
-                if (grantError) return revealError(res, grantEffectStatus(grantError), grantError);
+                if (identityBlocked || failureCode === reconcileBlocked || failureCode === identityChanged) return manualBlock();
+                const grantStatus = grantEffectStatus(failureCode);
+                if (grantStatus) return revealError(res, grantStatus, failureCode);
                 if (reason) return res.json({ executionMode: 'rebuild', status: 'inspection-unproved', reason, retryAllowed: false });
                 return receipt('pending');
             }

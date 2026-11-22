@@ -151,16 +151,19 @@ test('DB-only account reconciliation relies on the live service attestation, not
     eligible = true;
     for (const [code, status] of [['REBUILD_L2TP_GRANT_PERSISTENCE_UNAVAILABLE', 503],
         ['REBUILD_L2TP_GRANT_ENV_INVALID', 503], ['REBUILD_L2TP_GRANT_REGISTRY_INVALID', 503],
-        ['REBUILD_L2TP_GRANT_CONFLICT', 409], ['REBUILD_L2TP_GRANT_CHANGED', 409], ['REBUILD_L2TP_IDENTITY_CHANGED', 409]]) {
+        ['REBUILD_L2TP_GRANT_CONFLICT', 409], ['REBUILD_L2TP_GRANT_CHANGED', 409]]) {
         problem = code;
         assert.deepEqual(checked(await send(path), status), { error: { code } });
     }
+    const manualBlock = { error: { code: 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK', retryAllowed: false } };
+    problem = 'REBUILD_L2TP_IDENTITY_CHANGED';
+    assert.deepEqual(checked(await send(path), 409), manualBlock);
     problem = privateValue;
     assert.deepEqual(checked(await send(path), 503), { error: { code: 'REBUILD_L2TP_RECONCILE_UNAVAILABLE' } });
     assert.deepEqual(calls, []);
     problem = null;
-    fail = 'REBUILD_L2TP_IDENTITY_CHANGED';
-    assert.deepEqual(checked(await send(path), 409), { error: { code: fail } });
+    fail = 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK';
+    assert.deepEqual(checked(await send(path), 409), manualBlock);
     fail = null;
     const result = await send(path);
     assert.equal(result.status, 200);

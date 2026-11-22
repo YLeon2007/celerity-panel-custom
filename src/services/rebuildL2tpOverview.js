@@ -237,14 +237,15 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             ...nativeRead, projection: { intentId: 1, action: 1, login: 1, ...Object.fromEntries(keys.map(key => [`relays.${key}`, 1])) },
         });
         const { relays } = intent ?? {};
-        const ids = [...cohort.keys()].sort();
         if (!matches(receiptPattern, intent?.intentId) || !['create', 'disable', 'delete'].includes(intent.action)
             || !matches(loginPattern, intent.login) || intent.login === bootstrap
-            || !Array.isArray(relays) || !equal(relays.map(row => row?.nodeId), ids)) return false;
+            || !Array.isArray(relays) || !relays.length || relays.some(row => !matches(idPattern, row?.nodeId))) return false;
+        const ids = cohort && [...cohort.keys()].sort();
+        if (!ids || !equal(relays.map(row => row.nodeId), ids)) throw grantError(identityChanged);
         for (const row of relays) {
             if (!sameRelayBinding(bindings.get(row.nodeId), row)
-                || grants.get(row.nodeId)?.generation !== row.grantGeneration) throw grantError(identityChanged);
-            if (cohort.get(row.nodeId).backupId !== row.backupId) return false;
+                || grants.get(row.nodeId)?.generation !== row.grantGeneration
+                || cohort.get(row.nodeId).backupId !== row.backupId) throw grantError(identityChanged);
         }
         return true;
     }
@@ -394,7 +395,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             }
         }
         accounts.sort((a, b) => compare(a.login, b.login));
-        const canReconcileAccounts = accountsPending && list && enabled && hasKey() && !!cohort
+        const canReconcileAccounts = accountsPending && list && enabled && hasKey()
             && await recoveryAttestation(cohort, bindings, grants).catch(error => {
                 grantProblem = error.code === identityChanged ? identityChanged : grantUnavailable;
                 return false;

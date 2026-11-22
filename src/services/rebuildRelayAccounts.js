@@ -289,14 +289,16 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
         try {
             await verifyAuthority();
             const ids = installedIds(await store.states());
-            if (!equal(intent.relays.map(row => row?.nodeId), ids)) throw fail('CHANGED');
+            if (!equal(intent.relays.map(row => row?.nodeId), ids)) throw relayGrantStore ? identityChanged() : fail('CHANGED');
             return await withNodes(ids, () => withRemotes(async (track, closeAll) => {
                 const inventory = inventoryFor(ids, login, authority);
                 const baseline = await inventory.load();
                 if (!baseline.listMode) throw fail('OPERATOR_LIST_REQUIRED');
+                if (relayGrantStore && baseline.bindings.some((binding, i) => baseline.grants[i].generation !== intent.relays[i]?.grantGeneration
+                    || !sameRelayBinding(binding, intent.relays[i]) || baseline.states[i].backupId !== intent.relays[i].backupId)) {
+                    throw identityChanged();
+                }
                 const plans = makePlans(baseline, action, login, password, key, intent.passwordEncrypted);
-                if (relayGrantStore && plans.some(({ binding, grant }, i) => grant.generation !== intent.relays[i]?.grantGeneration
-                    || !sameRelayBinding(binding, intent.relays[i]))) throw identityChanged();
                 if (!equal(recordRelays(plans), intent.relays)) throw fail('CHANGED');
                 validateDirectory(baseline, ids[0]);
                 const recheck = async session => {
@@ -394,8 +396,16 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                     relayCount: ids.length, recovered: true, ...(revokedLogin && { sessionsTerminated }) } };
             }));
         } catch (error) {
-            if (isIdentityChanged(error)) throw Object.assign(identityChanged(), { retryAllowed: false });
+            // An original member's pin/endpoint/generation no longer joins the
+            // frozen intent. Do not reinterpret it under the current grant or
+            // direct the operator to reconfirm it while the intent is pending.
+            // Identity loss after an effect attempt must not mask its phase.
+            const identityBlocked = isIdentityChanged(error) || (relayGrantStore && phase === 'BLOCKED'
+                && error instanceof RelayAccountsError && ['REBUILD_L2TP_ACCOUNTS_NO_INSTALLED',
+                    'REBUILD_L2TP_ACCOUNTS_NOT_OWNED', 'REBUILD_L2TP_ACCOUNTS_BINDING_MISMATCH'].includes(error.code));
+            if (phase === 'BLOCKED' && identityBlocked) phase = 'MANUAL_BLOCK';
             throw fail(phase, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds].sort(),
+                ...(identityBlocked && { identityBlocked }),
                 ...(inspectionReason && { inspectionReason }),
                 // Do not attribute closures from a different pending action to the requested mutation.
                 ...(revokedLogin && (!requested.action || matching) && { confirmedSessionsTerminated: sessionsTerminated,
@@ -496,7 +506,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                 ...(action === 'create' && { passwordEncrypted: plans[0].after.passwordEncrypted }),
                                 relays: recordRelays(plans) };
                             await store.begin(submitted);
-                            phase = 'OUTCOME_UNKNOWN';
+                            phase = 'PRE_EFFECT_BLOCKED';
                             await authority();
                             // Validate contents regardless of field order, then
                             // retain the unmodified BSON read image for CAS.
@@ -506,6 +516,10 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             for (const [remote, installation, currentUsers, desiredUsers, changed] of calls) {
                                 await recheck();
                                 uncertainNodeId = installation.nodeId;
+                                // From this boundary a write may have landed,
+                                // including if DIRECT reports identity loss on
+                                // its post-dispatch check. Never downgrade it.
+                                phase = 'OUTCOME_UNKNOWN';
                                 const synced = await remote.syncChap(installation, currentUsers, desiredUsers, () => recheck(), revokedLogin);
                                 if (!(revokedLogin ? revokeReceipt(synced) : chapReceipt(synced)) || synced.changed !== changed) throw fail(phase);
                                 if (revokedLogin) {
@@ -534,7 +548,6 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             completed = true;
                             return { ...result, relayCount: ids.length, ...(revokedLogin && { sessionsTerminated }) };
                         } catch (error) {
-                            if (isIdentityChanged(error)) throw phase ? Object.assign(identityChanged(), { retryAllowed: false }) : error;
                             if (phase) throw outcome(phase);
                             throw error;
                         }

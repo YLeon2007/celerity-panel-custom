@@ -144,6 +144,10 @@
         ['REBUILD_L2TP_INSTALL_DISABLED', 'blocked'], ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'blocked'],
         ['REBUILD_BUSY', 'blocked'], ['REBUILD_LOCK_LOST', 'blocked'],
     ]);
+    const accountBlocks = new Map([
+        ['REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK', 'reconcileManualBlock'],
+        ['REBUILD_L2TP_ACCOUNTS_PRE_EFFECT_BLOCKED', 'accountPreEffectBlocked'],
+    ]);
     function conflictNote(conflict) {
         const { field, sources } = conflict ?? {};
         const labels = admissionWords.conflictFields;
@@ -339,9 +343,11 @@
                 message = 'rateLimited';
             } else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_RECONCILE_DISABLED') {
                 message = 'recoveryIneligible';
+            } else if (response.status === 409 && data?.error?.retryAllowed === false
+                && data.error.code === 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK') {
+                message = 'reconcileManualBlock';
             } else if (effectErrors.has(data?.error?.code)) {
-                message = effectErrors.get(data.error.code);
-                if (message === 'identityChanged') note = markIdentityReview(data.error.nodeId);
+                message = data.error.code === 'REBUILD_L2TP_IDENTITY_CHANGED' ? 'reconcileManualBlock' : effectErrors.get(data.error.code);
             }
         } catch { /* A lost response does not establish whether the fence cleared. */ }
         status.textContent = (words[message] ?? admissionWords[message]) + note;
@@ -370,6 +376,11 @@
                     if (revocation && data.recovered === true) note = closureNote(data, data.sessionsTerminated);
                     clearSecrets();
                 }
+            } else if (action !== 'install' && response.status === 409 && data?.error?.retryAllowed === false
+                && accountBlocks.has(data.error.code)) {
+                result = accountBlocks.get(data.error.code);
+                requireRefresh = true;
+                clearSecrets();
             } else if (effectErrors.has(data?.error?.code)) {
                 result = effectErrors.get(data.error.code);
                 requireRefresh = true;

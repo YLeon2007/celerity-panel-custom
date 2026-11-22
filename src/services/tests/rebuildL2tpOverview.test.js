@@ -382,11 +382,21 @@ test('pending recovery requires the merged installed cohort and its recorded gra
     const valid = await f.service.overview();
     assert.equal(valid.canReconcileAccounts, true);
     assert.ok(valid.relays.every(row => enabledActions(row).length === 0));
-    f.grants[0].generation = crypto.randomUUID();
-    const stale = await f.service.overview();
-    assert.equal(stale.accountsPending, true);
-    assert.equal(stale.canReconcileAccounts, false);
-    assert.equal(stale.grantProblem, 'REBUILD_L2TP_IDENTITY_CHANGED');
+    for (const [row, field, replacement] of [
+        [f.grants[0], 'generation', crypto.randomUUID()],
+        [f.cards[1], 'ip', 'replacement.example'],
+        [f.states[1], 'backupId', 'a'.repeat(32)],
+    ]) {
+        const original = row[field];
+        assert.notEqual(original, replacement);
+        row[field] = replacement;
+        const stale = await f.service.overview();
+        assert.equal(stale.accountsPending, true, field);
+        assert.equal(stale.canReconcileAccounts, false, field);
+        assert.equal(stale.grantProblem, 'REBUILD_L2TP_IDENTITY_CHANGED', field);
+        row[field] = original;
+    }
+    assert.equal((await f.service.overview()).canReconcileAccounts, true);
 });
 
 test('actual view renders a localized registry error and read-only inventory during conflict and outage', async t => {

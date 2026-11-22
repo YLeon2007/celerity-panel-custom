@@ -3,6 +3,7 @@ const l = key => t(`rebuildL2tp.${key}`);
 const available = typeof loadError === 'undefined' || !loadError;
 const pending = available && typeof accountsPending !== 'undefined' && accountsPending === true;
 const topProblem = typeof grantProblem !== 'undefined' && grantProblem;
+const manualBlock = pending && topProblem === 'REBUILD_L2TP_IDENTITY_CHANGED';
 const actionableOverview = available && !pending && !topProblem;
 const mismatch = typeof changedRelayId !== 'undefined' && changedRelayId;
 const eligible = pending && !topProblem && typeof canReconcileAccounts !== 'undefined' && canReconcileAccounts === true;
@@ -27,6 +28,7 @@ const problemText = problem => l(`admission.${problemKeys.get(problem) ?? 'grant
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
     'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
+    'reconcileManualBlock', 'accountPreEffectBlocked',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
     'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed'];
 function secretControl(kind, url, index, login) {
@@ -61,7 +63,7 @@ function secretControl(kind, url, index, login) {
          conflictFields: Object.fromEntries(conflictFields.map(key => [key, l(`admission.conflictFields.${key}`)])) }) %>"
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
     <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
-    <% if (available && topProblem) { %><p class="alert alert-error" role="alert"><%= problemText(topProblem) %></p><% } %>
+    <% if (available && topProblem) { %><p class="alert alert-error" role="alert"><%= manualBlock ? l('messages.reconcileManualBlock') : problemText(topProblem) %></p><% } %>
     <div class="card">
         <div class="card-body">
             <p data-action-status role="status"><%= pending ? l(eligible || topProblem ? 'accountsPendingLocked' : 'admission.recoveryIneligible') : mismatch ? l('admission.identityChanged') : '' %></p>

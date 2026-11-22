@@ -394,7 +394,7 @@ for (const [name, change] of [
     test(`fresh intent readback refuses ${name} before sync or publication`, async () => {
         const f = fixture({ fault(step, _, state) { if (step === 'pending' && state.pending) change(state); } });
         const original = structuredClone(f.hosts);
-        await assert.rejects(f.service.create(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false, confirmedNodeIds: [] });
+        await assert.rejects(f.service.create(credentials), { ...code('PRE_EFFECT_BLOCKED'), retryAllowed: false, confirmedNodeIds: [] });
         assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent']);
         assert.deepEqual(f.hosts, original);
     });
@@ -469,6 +469,72 @@ function releasedIntent(f, action) {
 }
 
 const recoveryEffects = f => f.events.filter(x => /^(inspect:|fence:|check:|sync:|cancel$|intent$|publish$)/.test(x));
+
+function withDbGrants(f) {
+    const list = JSON.parse(f.env.C3_REBUILD_L2TP_RELAYS_JSON);
+    const grants = list.map((binding, i) => ({ ...binding, generation: `generation-${i}` }));
+    f.deps.relayGrantStore = { async snapshot() {
+        return { env: { ...f.env, C3_REBUILD_L2TP_RELAYS_JSON: JSON.stringify(grants.map(({ generation, ...row }) => row)) },
+            grants: structuredClone(grants), sourceFor: () => 'db' };
+    } };
+    f.deps.resolveRelayBinding = resolveRelayBinding;
+    return grants;
+}
+
+test('identity loss after A blocks B, retains the exact intent and reports uncertainty; manual recovery only converges B', async () => {
+    let grants, originalIntent;
+    const f = fixture({ fault(step, id, state) {
+        if (step === 'sync' && id === A && !originalIntent) {
+            originalIntent = JSON.stringify(state.pending);
+            grants[1].sshHostKeySha256 = 'f'.repeat(64);
+        }
+    } });
+    grants = withDbGrants(f);
+    const originalPin = grants[1].sshHostKeySha256;
+    await assert.rejects(f.restart().create(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false,
+        confirmedNodeIds: [A] });
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`]);
+    assert.equal(JSON.stringify(f.pending), originalIntent);
+    f.events.length = 0;
+    await assert.rejects(f.restart().reconcile(), { ...code('MANUAL_BLOCK'), retryAllowed: false });
+    assert.ok(!f.events.some(event => event.startsWith('connect:')));
+    assert.deepEqual(recoveryEffects(f), []);
+    assert.equal(JSON.stringify(f.pending), originalIntent);
+
+    grants[1].sshHostKeySha256 = originalPin;
+    grants[1].generation = 'unrelated-successor';
+    await assert.rejects(f.restart().reconcile(), { ...code('MANUAL_BLOCK'), retryAllowed: false });
+    assert.deepEqual(recoveryEffects(f), []);
+    assert.equal(JSON.stringify(f.pending), originalIntent);
+
+    grants[1].generation = 'generation-1';
+    const { state: stateB } = f.rows.find(({ node }) => node._id === B);
+    const originalBackup = stateB.backupId;
+    stateB.backupId = 'e'.repeat(32);
+    await assert.rejects(f.restart().reconcile(), { ...code('MANUAL_BLOCK'), retryAllowed: false });
+    assert.deepEqual(recoveryEffects(f), []);
+    assert.equal(JSON.stringify(f.pending), originalIntent);
+    stateB.backupId = originalBackup;
+    const end = f.events.length;
+    assert.deepEqual(await f.restart().reconcile(), { executionMode: 'rebuild', status: 'created', login: credentials.login,
+        relayCount: 2, recovered: true });
+    assert.deepEqual(recoveryEffects({ events: f.events.slice(end) }), [...fencePass, `sync:${B}`, ...reads, 'publish']);
+    assert.equal(f.pending, undefined);
+});
+
+test('known pre-effect identity refusal stays distinct from a late cohort failure', async () => {
+    for (const afterIntent of [false, true]) {
+        let grants;
+        const f = fixture({ fault(step, id) {
+            if (afterIntent ? step === 'intent-ack' : step === 'check' && id === B) grants[1].sshHostKeySha256 = 'f'.repeat(64);
+        } });
+        grants = withDbGrants(f);
+        await assert.rejects(f.restart().create(credentials), afterIntent ? { ...code('PRE_EFFECT_BLOCKED'), retryAllowed: false }
+            : { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+        assert.equal(Boolean(f.pending), afterIntent);
+        assert.ok(!effects(f).some(e => e.startsWith('sync:') || e === 'publish'));
+    }
+});
 
 test('mounted reconcile reports only a bounded DIRECT inspection refusal while its intent remains pending', async t => {
     const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_RELAYS_JSON: '[]', PANEL_DOMAIN: 'panel.fixture.invalid',

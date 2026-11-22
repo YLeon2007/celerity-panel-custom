@@ -17,6 +17,10 @@ const binding = { ...endpoint, machineId: machine, sshHostKeySha256: pin };
 const card = { _id: nodeId, active: true, type: 'xray', cascadeRole: 'relay', ip: 'Relay.Example.',
     ssh: { port: 2222, username: 'root', password: 'fixture-only' }, privateValue: 'never public' };
 const clear = { states: [], accounts: null, operation: null, admission: null, operationLock: null };
+const installed = { _id: 'fixture-state', node: nodeId, status: 'installed', desiredState: 'installed',
+    routingMode: 'follow-relay', routingVersion: 1, secretRevision: 1, rebuildMachineId: machine,
+    rebuildInstallToken: '00000000-0000-4000-8000-000000000001', backupId: 'e'.repeat(32),
+    clientCidr: '10.255.16.0/24', tproxyPort: 12345, fwmark: 100, routeTable: 100 };
 
 function fixture(options = {}) {
     const f = { node: structuredClone(card), row: null, calls: [], writes: [], audits: [], now: 0 };
@@ -175,6 +179,67 @@ test('ENV is read only; DB reconfirm uses exact old generation without modifying
     await assert.rejects(f.perform('confirm', (await f.approve()).challenge), conflict);
     assert.equal(f.writes.length, 1);
     assert.equal(state.rebuildMachineId, machine);
+});
+
+test('explicit installed key rotation dispatches only the pinned read-only ownership check and CASes the old generation', async () => {
+    const newPin = 'd'.repeat(64);
+    const requests = [];
+    let closes = 0;
+    class SSH {
+        constructor(node, opts) {
+            assert.equal(node.ssh.password, 'fixture-only');
+            assert.deepEqual(opts, { expectedHostKeySha256: newPin,
+                expectedEndpoint: { ip: endpoint.host, port: endpoint.port, username: endpoint.username } });
+        }
+        async connectDirectOnce(ms) { assert.equal(ms, 5000); assert.equal(this.usePool, false); }
+        async exec(command, { stdin }) {
+            assert.match(command, /^\/usr\/bin\/timeout .* \/usr\/bin\/python3 -I -B -c /);
+            assert.ok(!command.includes(newPin) && !command.includes('fixture-only'));
+            const request = JSON.parse(stdin);
+            requests.push(request);
+            assert.equal(request.action, 'check-apply-network', 'no mutating host action');
+            return { code: 0, stderr: '', stdout: `${JSON.stringify({ ok: true, backupId: installed.backupId, proof: pin })}\n` };
+        }
+        disconnect() { closes++; }
+    }
+    const f = fixture({ SSH });
+    f.row = { ...binding, generation: 'previous' };
+    f.footprint = { ...clear, states: [structuredClone(installed)], accounts: { _id: 'account' } };
+    const before = structuredClone(f.footprint);
+    f.pin = newPin;
+    const { challenge } = await f.approve();
+    assert.deepEqual(requests, []);
+    assert.deepEqual(await f.perform('confirm', challenge), { ...binding, sshHostKeySha256: newPin, source: 'db' });
+    assert.deepEqual(requests, [{ action: 'check-apply-network', machineId: machine, backupId: installed.backupId,
+        network: { clientCidr: installed.clientCidr, tproxyPort: installed.tproxyPort, fwmark: installed.fwmark, routeTable: installed.routeTable } }]);
+    assert.equal(closes, 1);
+    assert.deepEqual(f.footprint, before);
+    assert.deepEqual(f.writes, [{ action: 'reconfirm', binding: { ...binding, sshHostKeySha256: newPin },
+        expectedGeneration: 'previous', actor: 'operator' }]);
+    await assert.rejects(f.perform('confirm', challenge), invalid);
+    assert.equal(requests.length, 1);
+});
+
+test('installed rotation refuses unproved receipt, changed footprint and pending intent without granting', async () => {
+    for (const reason of ['unproved', 'receipt-drift', 'grant-drift', 'candidate-machine', 'endpoint', 'missing-grant', 'fenced', 'pending']) {
+        let witnessed = 0;
+        const f = fixture({ witnessInstalled: async () => {
+            witnessed++;
+            if (reason === 'receipt-drift') f.footprint.states[0].backupId = 'a'.repeat(32);
+            if (reason === 'grant-drift') f.row.generation = 'successor';
+            return reason !== 'unproved';
+        } });
+        f.row = reason === 'missing-grant' ? null : { ...binding, generation: 'previous', ...(reason === 'endpoint' && { port: 22 }) };
+        f.footprint = { ...clear, states: [structuredClone(installed)] };
+        if (reason === 'fenced') f.footprint.states[0].replacementFence = 1;
+        f.pin = 'd'.repeat(64);
+        if (reason === 'candidate-machine') f.machine = 'a'.repeat(32);
+        const { challenge } = await f.approve();
+        f.pending = reason === 'pending';
+        await assert.rejects(f.perform('confirm', challenge), reason === 'pending' ? { code: 'REBUILD_L2TP_ACCOUNTS_BLOCKED' } : conflict, reason);
+        assert.equal(witnessed, ['unproved', 'receipt-drift', 'grant-drift'].includes(reason) ? 1 : 0, reason);
+        assert.deepEqual(f.writes, [], reason);
+    }
 });
 
 test('revoke requires a current strict host witness under Apply exclusion and pending fences survive', async () => {

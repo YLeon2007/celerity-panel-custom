@@ -41,12 +41,16 @@ test('all grant sources and permissions render in EN, RU and ZH; a registry fail
         assert.ok(!error.includes(`>${copy.none}<`));
         for (const [grantProblem, key] of [['REBUILD_L2TP_GRANT_CONFLICT', 'grantConflict'],
             ['REBUILD_L2TP_GRANT_CHANGED', 'grantConflict'], ['REBUILD_L2TP_INSTALL_DISABLED', 'disabled'],
-            ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged'], ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'blocked'],
+            ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'blocked'],
             ['<unknown grant problem>', 'grantUnavailable']]) {
             const blocked = await render(lang, { grantProblem, accountsPending: true, canReconcileAccounts: true });
             assert.ok(blocked.includes(`role="alert">${copy[key]}</p>`), `${lang}: ${grantProblem}`);
             assert.doesNotMatch(blocked, /data-install-url=|data-admission-action=|data-create|data-reconcile|<unknown grant problem>/);
         }
+        const manual = await render(lang, { grantProblem: 'REBUILD_L2TP_IDENTITY_CHANGED', accountsPending: true, canReconcileAccounts: true });
+        const manualCopy = require(`../../../locales/${lang}.json`).rebuildL2tp.messages.reconcileManualBlock;
+        assert.ok(manualCopy && manual.includes(`role="alert">${manualCopy}</p>`));
+        assert.doesNotMatch(manual, /data-install-url=|data-admission-action=|data-create|data-reconcile/);
     }
 });
 
@@ -178,6 +182,18 @@ test('even with a pending account operation, the page takes no action until the 
     assert.equal(f.status.textContent, words.messages.reconcileSettled);
     assert.equal(f.recover.disabled, true);
     f.recover.click(); await flush();
+    assert.deepEqual(f.calls.map(({ url }) => url), ['/accounts/reconcile']);
+});
+
+test('manual block after a reconcile click never presents reconfirmation or retry', async () => {
+    const f = launch('reconfirm', { pending: true });
+    f.replies.push({ status: 409, data: { error: { code: 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK', retryAllowed: false } } });
+    f.recover.click(); await flush();
+    assert.ok(words.messages.reconcileManualBlock);
+    assert.equal(f.status.textContent, words.messages.reconcileManualBlock);
+    assert.equal(f.recover.disabled, true);
+    assert.equal(f.review.hidden, true);
+    f.recover.click(); f.selected.click(); await flush();
     assert.deepEqual(f.calls.map(({ url }) => url), ['/accounts/reconcile']);
 });
 

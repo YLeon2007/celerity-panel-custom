@@ -250,6 +250,10 @@
     "logsDisconnected": "已断开"
   },
   "rebuildL2tp": {
+    "messages": {
+      "reconcileManualBlock": "当前中继身份不允许继续核对。未完成的记录已保留，供人工排查。请勿重试变更、重新确认授权或编辑该记录。",
+      "accountPreEffectBlocked": "此请求未在中继上启动写入。账户操作意图已记录；请重新加载 L2TP 数据核实其状态。请勿重新提交变更。"
+    },
     "admission": {
       "label": "L2TP 准入",
       "db": "面板（数据库）",

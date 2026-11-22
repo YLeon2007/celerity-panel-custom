@@ -6,6 +6,7 @@ const { makeLocks, withNode } = require('./rebuildLocks');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 const { validateRebuildMode } = require('./rebuildMode');
 const { normalizeRelayBinding } = require('./rebuildRelayAuthorization');
+const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
 const INVALID = 'REBUILD_L2TP_ADMISSION_INVALID_REQUEST';
 const CHALLENGE = 'REBUILD_L2TP_ADMISSION_CHALLENGE_INVALID';
@@ -26,7 +27,7 @@ const mappedCodes = new Map([
 ]);
 const details = new Set(['nodeId', 'machineId', 'sshHostKeySha256', 'endpoint', 'host', 'port', 'username',
     'env-read-only', 'no-db-grant', 'grant-changed', 'node-ineligible', 'node-changed',
-    'installation-not-absent', 'host-absence-unproved', 'ownership-conflict']);
+    'installation-not-absent', 'host-absence-unproved', 'installed-ownership-unproved', 'ownership-conflict']);
 const fail = (code, detail, outcome) => Object.assign(new Error(code), { code,
     ...(detail && { detail }), ...(outcome && { outcome }),
     ...(['unknown', 'applied'].includes(outcome) && { retryAllowed: false }) });
@@ -44,7 +45,7 @@ const installationFields = ['pskEncrypted', 'pskHint', 'backupId', 'managedVersi
     'lastSyncAt', 'appliedTopologyRevision', 'lastErrorCode', 'lastError', 'tproxyPort', 'fwmark', 'routeTable', 'poolStart', 'poolEnd'];
 const fences = ['pppDriftQueueFence', 'replacementFence'];
 const stateProjection = Object.fromEntries(['node', 'status', 'desiredState', 'routingMode', 'updatedAt', 'secretRevision',
-    ...installationFields, ...fences].map(key => [key, 1]));
+    'clientCidr', ...installationFields, ...fences].map(key => [key, 1]));
 const empty = value => value == null || value === '';
 const pristine = row => row?.status === 'not_installed' && row.desiredState === 'absent'
     && [undefined, null, 'route-group'].includes(row.routingMode)
@@ -204,8 +205,26 @@ async function witnessHost(node, binding, recordedAbsent, SSH) {
     return rec.stdout === `absent:${binding.machineId}\n`;
 }
 
+async function witnessInstalledHost(node, binding, state, SSH) {
+    const ssh = new SSH(node, { expectedHostKeySha256: binding.sshHostKeySha256,
+        expectedEndpoint: { ip: binding.host, port: binding.port, username: binding.username } });
+    ssh.usePool = false;
+    try {
+        await ssh.connectDirectOnce(5000);
+        // This exact DIRECT action checks the original manifest, owned files,
+        // boot and runtime under the host flock. Neither prepare (which can
+        // upgrade the receipt) nor any write-capable action belongs here.
+        await require('./rebuildRelayDirect').applyRelayNetwork((command, options) => ssh.exec(command, options),
+            binding.machineId, state, 'check-apply-network', undefined, true);
+        return true;
+    } catch (error) {
+        if (error?.code === CHANGED || error?.code === 'SSH_HOST_KEY_MISMATCH') throw fail(CHANGED);
+        return false;
+    } finally { ssh.disconnect(); }
+}
+
 function createRebuildRelayAdmission({ db = require('mongoose').connection, env = process.env,
-    store, probe, loadNode, readFootprint, assertNoPending, witnessAbsent, locks, SSH, normalizeBinding = normalizeRelayBinding,
+    store, probe, loadNode, readFootprint, assertNoPending, witnessAbsent, witnessInstalled, locks, SSH, normalizeBinding = normalizeRelayBinding,
     clock = () => performance.now(), ttlMs = 120_000, maxChallenges = 1024 } = {}) {
     store ??= require('./rebuildRelayGrantStore').createRelayGrantStore({ db, env });
     probe ??= require('./rebuildRelayIdentityProbe').createRelayIdentityProbe();
@@ -218,6 +237,7 @@ function createRebuildRelayAdmission({ db = require('mongoose').connection, env 
     readFootprint ??= (id, machines) => loadFootprint(db, id, machines);
     assertNoPending ??= () => assertNoPendingRelayAccounts(db);
     witnessAbsent ??= (node, binding, recordedAbsent) => witnessHost(node, binding, recordedAbsent, SSH ?? require('./nodeSSH'));
+    witnessInstalled ??= (node, binding, state) => witnessInstalledHost(node, binding, state, SSH ?? require('./nodeSSH'));
     if (!Number.isSafeInteger(ttlMs) || ttlMs < 1 || !Number.isSafeInteger(maxChallenges) || maxChallenges < 1) {
         throw new TypeError('Invalid relay admission challenge limits');
     }
@@ -290,15 +310,23 @@ function createRebuildRelayAdmission({ db = require('mongoose').connection, env 
         return view;
     };
     const isAbsent = ({ states, accounts }) => accounts === null && (states.length === 0 || pristine(states[0]));
-    const checkReconfirmOwnership = async (id, binding, old) => {
+    const checkReconfirmOwnership = async (id, transport, binding, old) => {
         const view = await footprint(id, binding, old);
         if (isAbsent(view)) return;
         const [state] = view.states;
-        // An installed owner's grant may be refreshed for the same exact
-        // binding only. No new grant or changed binding may adopt its files,
-        // machine ID, accounts or install receipt.
-        if (!old || !equal(binding, old) || state?.status !== 'installed' || state.desiredState !== 'installed'
+        // Only the SSH key may change on an installed owner's existing DB
+        // grant. Observing the same machine ID alone is not ownership proof.
+        if (!old || !sameEndpoint(binding, old) || binding.machineId !== old.machineId
+            || state?.status !== 'installed' || state.desiredState !== 'installed'
             || state.rebuildMachineId !== binding.machineId) throw fail(CONFLICT, 'ownership-conflict');
+        if (binding.sshHostKeySha256 === old.sshHostKeySha256) return;
+        if (state.routingMode !== FOLLOW_RELAY_MODE || state.routingVersion !== FOLLOW_RELAY_VERSION || state.secretRevision !== 1
+            || state.operationId != null || state.routeGroup != null || !empty(state.activePathKey)
+            || state.appliedTopologyRevision != null || fences.some(key => (state[key] ?? 0) !== 0) || !hex(state.backupId, 32)
+            || typeof state.rebuildInstallToken !== 'string'
+            || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}(?![\s\S])/.test(state.rebuildInstallToken)
+            || await witnessInstalled(transport, binding, state) !== true) throw fail(CONFLICT, 'installed-ownership-unproved');
+        if (!equal(await footprint(id, binding, old), view)) throw fail(CONFLICT, 'ownership-conflict');
     };
     async function perform(input) {
         const { action, nodeId, actor, sessionId, challenge } = input ?? {};
@@ -349,7 +377,7 @@ function createRebuildRelayAdmission({ db = require('mongoose').connection, env 
                     const { machineId, pin } = ticket.proof;
                     if (await pinnedMachine(transport, pin) !== machineId) throw fail(CHANGED);
                     binding = bindingFor({ ...endpoint, machineId, sshHostKeySha256: pin });
-                    await checkReconfirmOwnership(nodeId, binding, previous.binding);
+                    await checkReconfirmOwnership(nodeId, transport, binding, previous.binding);
                     mutation = previous.binding ? 'reconfirm' : 'grant';
                 } else {
                     binding = previous.binding;

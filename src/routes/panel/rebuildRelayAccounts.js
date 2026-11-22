@@ -6,7 +6,8 @@ const { identityChanged, grantEffectStatus, validNodeId } = require('./rebuildRe
 const methods = Object.freeze({ create: 'createRelayAccount', disable: 'disableRelayAccount', delete: 'deleteRelayAccount' });
 const statuses = Object.freeze({ create: 'created', disable: 'disabled', delete: 'deleted' });
 const blocked = new Set(['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN',
-    'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', 'REBUILD_L2TP_ACCOUNTS_FINISH_UNKNOWN',
+    'REBUILD_L2TP_ACCOUNTS_PRE_EFFECT_BLOCKED', 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN',
+    'REBUILD_L2TP_ACCOUNTS_FINISH_UNKNOWN', 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK',
     'REBUILD_L2TP_ACCOUNTS_CLEANUP_FAILED']);
 const unavailable = new Set(['REBUILD_L2TP_ACCOUNTS_UNAVAILABLE', 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE']);
 const rejected = new Set(['REBUILD_L2TP_ACCOUNTS_DISABLED', 'REBUILD_L2TP_ACCOUNTS_NO_INSTALLED',
