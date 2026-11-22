@@ -274,19 +274,6 @@ function hostFixture(t, mongo) {
             assert.equal(req.backupId, installedId);
             assert.equal(mongo.rows(STATES)[0].status, 'installing');
             break;
-        case 'session-count': return ok({ activeSessions: 0, activeIpsec: 0, census: 'd'.repeat(64) });
-        case 'prepare-remove': return ok({ ok: true, backupId: installedId, machineId, baseline: 'd'.repeat(64) });
-        case 'remove':
-            assert.equal(mongo.rows(STATES)[0].status, 'removing');
-            assert.equal(req.backupId, installedId);
-            remote.effects.push(req.action);
-            return remote.loseRemoveReply ? { status: 255, stdout: '', stderr: '' }
-                : ok({ ok: true, backupId: installedId, removed: true });
-        case 'check-chap': return ok({ ok: true, backupId: installedId, changed: true });
-        case 'sync-chap':
-            assert.ok(mongo.rows(DIRECTORY).some(row => row._id === 'pending'));
-            remote.effects.push(req.action);
-            return { status: 255, stdout: '', stderr: '' };
         case 'check-apply-network': {
             const [state] = mongo.rows(STATES);
             assert.equal(state.status, 'installed');
@@ -301,8 +288,10 @@ function hostFixture(t, mongo) {
             assert.equal(req.backupId, installedId);
             assert.deepEqual(logins(req.currentUsers), chapLogins);
             if (req.action === 'sync-chap') {
+                assert.ok(mongo.rows(DIRECTORY).some(row => row._id === 'pending'));
                 chapLogins = logins(req.desiredUsers);
                 remote.effects.push(req.action);
+                if (remote.loseChapReply) return { status: 255, stdout: '', stderr: '' };
             }
             return ok({ ok: true, backupId: installedId, changed: true });
         }
@@ -314,9 +303,11 @@ function hostFixture(t, mongo) {
             if (req.action === 'session-count') return ok({ activeSessions: 0, activeIpsec: 0, census });
             if (req.action === 'prepare-remove') return ok({ ok: true, backupId: installedId, machineId, baseline: '9'.repeat(64) });
             assert.equal(req.expectedCensus, census);
+            assert.equal(mongo.rows(STATES)[0].status, 'removing');
             remote.effects.push(req.action);
             installedId = undefined;
             chapLogins = undefined;
+            if (remote.loseRemoveReply) return { status: 255, stdout: '', stderr: '' };
             return ok({ ok: true, backupId: req.backupId, removed: true });
         }
         default: assert.fail(`Unexpected DIRECT action: ${req.action}`);
@@ -658,6 +649,7 @@ test('admitted account POSTs leave a prior uncertain intent untouched', { timeou
     await f.send('install');
     const path = '/panel/rebuild/relays/l2tp/accounts';
     const credentials = { login: 'fixture-new', password: 'fixture-password' };
+    f.remote.loseChapReply = true;
     assert.deepEqual(await f.send(`${path}/create`, credentials, { expected: 409 }), {
         error: { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', retryAllowed: false },
     });
