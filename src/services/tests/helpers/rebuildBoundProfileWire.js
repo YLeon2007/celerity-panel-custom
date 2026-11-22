@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const { createHash } = require('node:crypto');
 const { Client } = require('ssh2');
 const { MAIN, BRIDGE } = require('../../classicAppliedConfig');
+const { rebuildApplyMachineGuard } = require('./rebuildApplyMachineGuard');
 
 // Bridge the existing profile fixtures to the pinned NodeSSH transport; they
 // still own profile storage, parser checks and simulated activation failures.
@@ -21,7 +22,8 @@ function bindProfileWire(replace, endpoint, machineId, createFixture) {
         return this;
     });
     replace(Client.prototype, 'end', function () { clients.delete(this); });
-    replace(Client.prototype, 'exec', function (command, ready) {
+    replace(Client.prototype, 'exec', function (frame, ready) {
+        const { command, accepts } = rebuildApplyMachineGuard(frame);
         const { fixture, staged } = clients.get(this);
         const stream = new EventEmitter(), chunks = [];
         stream.stderr = new EventEmitter();
@@ -31,6 +33,7 @@ function bindProfileWire(replace, endpoint, machineId, createFixture) {
             const ok = (stdout = '') => { stream.emit('data', stdout); stream.emit('close', 0); };
             try {
                 if (command === '/usr/bin/head -c 34 /etc/machine-id') return ok(machineId + '\n');
+                if (accepts) assert.ok(accepts(machineId));
                 if (command.startsWith('/usr/bin/timeout -k ') && fixture.relayNetwork) {
                     const request = JSON.parse(stdin);
                     assert.equal(request.machineId, machineId);

@@ -78,10 +78,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     }
     async function openTransports(nodes,states,transports,bindings,verifyLock){
         await verifyLock();
-        // Resolve the complete affected set before opening any transport. An
-        // installed relay requires a binding; an explicit enrollment binds
-        // even before L2TP is installed.
-        const effectStore=states.size || env.C3_REBUILD_L2TP_INSTALL_ENABLED==='true' && nodes.some(node=>node.cascadeRole==='relay')
+        // Resolve the whole component before choosing a transport. The Install
+        // flag can deny use of a grant, but cannot prove a relay has no grant.
+        const effectStore=states.size || nodes.some(node=>node.cascadeRole==='relay')
             ? relayGrantStore : undefined;
         const snapshot=await readRelayAuthority(env,effectStore);
         for(const node of nodes){

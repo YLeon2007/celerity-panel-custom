@@ -12,6 +12,7 @@ const fs = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join, dirname } = require('node:path');
 const applyWire = require('./rebuildRelayApplyWire');
+const { rebuildApplyMachineGuard } = require('./rebuildApplyMachineGuard');
 const stockSwan = require('./rebuildRelayStockSwan');
 const { handler: installHandler } = require('../../../routes/panel/rebuildRelayInstall');
 
@@ -383,7 +384,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                         return { status: 0, stdout: `${host.machineId}\n`, stderr: '' };
                     }
                     assert.ok(applyHandlers.has(peer.ip));
-                    return applyHandlers.get(peer.ip)(command, stdin);
+                    const guarded = rebuildApplyMachineGuard(command);
+                    if (guarded.accepts) assert.ok(peer.pinned && guarded.accepts(host.machineId));
+                    return applyHandlers.get(peer.ip)(guarded.command, stdin);
                 }
                 const host = routes.get(peer.ip);
                 assert.ok(peer.pinned && host);

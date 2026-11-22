@@ -8,6 +8,14 @@ const {CONNECT_TIMEOUT_MS}=require('./rebuildSshLimits');
 const fail=code=>Object.assign(new Error(code),{code});
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
 const readMachineId='/usr/bin/head -c 34 /etc/machine-id';
+const guardExit=70, machineUnavailable='REBUILD_APPLY_MACHINE_ID_UNAVAILABLE', machineMismatch='REBUILD_APPLY_MACHINE_ID_MISMATCH';
+function guardMutation(machineId,command){
+    // Read at most one byte past the longest accepted value. Encoding bytes
+    // avoids shell command substitution silently dropping LF or NUL bytes.
+    const expected=Buffer.from(machineId).toString('hex').replace(/../g,' $&');
+    return `c3_machine_bytes=$(LC_ALL=C /usr/bin/od -An -v -N 34 -w34 -tx1 -- /etc/machine-id 2>/dev/null) || { printf '%s\\n' ${machineUnavailable} >&2; exit ${guardExit}; }; `+
+        `case "$c3_machine_bytes" in '${expected}'|'${expected} 0a') ;; *) printf '%s\\n' ${machineMismatch} >&2; exit ${guardExit};; esac; ${command}`;
+}
 // All shell strings are fixed or constructed from locally generated constants.
 // Profile contents (including REALITY private keys) are only passed via stdin.
 function createTransport(node, SSH=require('./nodeSSH'), authority) {
@@ -59,7 +67,13 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         return ssh.exec(command,options);
     }
     async function check(command,stdin,write=false) {
-        const result=await run(command,{timeout:60000,...(stdin===undefined?{}:{stdin})},write);
+        const guarded=authority&&write;
+        const result=await run(guarded?guardMutation(authority.machineId,command):command,{timeout:60000,...(stdin===undefined?{}:{stdin})},write);
+        // This refusal only describes this command, not earlier Apply effects.
+        if(guarded&&result?.code===guardExit&&result.stdout===''){
+            if(result.stderr===`${machineMismatch}\n`)throw authority.merged?identityChanged():fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');
+            if(result.stderr===`${machineUnavailable}\n`)throw fail(authority.merged?'REBUILD_L2TP_SSH_CONNECT_FAILED':'REBUILD_L2TP_MACHINE_ID_MISMATCH');
+        }
         if(result?.code!==0)throw fail('REBUILD_NODE_COMMAND_FAILED');return result.stdout;
     }
     async function read(profile){
@@ -100,6 +114,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         }
     }
     let networkProof;
+    // DIRECT checks the machine ID within its own command under its host flock.
     const relayNetwork=(action,proof)=>require('./rebuildRelayDirect').applyRelayNetwork(
         (cmd,options)=>run(cmd,options,['prepare-apply-network','restart-apply-network'].includes(action)),
         authority.machineId,authority.installation,action,proof,authority.merged);
