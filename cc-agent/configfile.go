@@ -32,6 +32,10 @@ type ConfigPersister struct {
 	stopErr   error
 	debounce  time.Duration
 	writeFile func(string, []byte) error // test seam at the real atomic write boundary
+
+	// Managed clients last published by this process before its first /sync.
+	// Guarded by store.startupMu, including checks from the user-file save path.
+	startupClients map[string]map[configClientKey]struct{}
 }
 
 func NewConfigPersister(path string, inbounds []InboundEntry, store *UserStore) *ConfigPersister {
@@ -114,9 +118,10 @@ var errPersisterStopped = errors.New("config persister stopped")
 
 // Flush reads the on-disk config, replaces the clients of every managed inbound
 // with the current user list, and atomically writes the file back. It returns
-// changed=true only when the managed client sets actually differed (so callers
-// can decide whether a one-shot xray restart is warranted). A missing config or
-// missing inbounds array is treated as a no-op (not an error).
+// changed=true only for a rewrite eligible for startup heal. Writes in the
+// empty-startup window only mirror deltas already applied to Xray; they must
+// not arm a heal that could run after a later reflush is blocked. A missing
+// config is treated as a no-op.
 func (p *ConfigPersister) Flush() (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -126,37 +131,107 @@ func (p *ConfigPersister) Flush() (bool, error) {
 	return p.flushLocked()
 }
 
-// flushLocked is also used by Stop for its final write after admission closes.
-func (p *ConfigPersister) flushLocked() (bool, error) {
+var errStartupConfigClients = errors.New("empty startup store conflicts with managed inbound clients")
+
+// Called by Load and by user-file saves with store.startupMu held.
+func (p *ConfigPersister) checkEmptyStore() error {
 	data, err := os.ReadFile(p.path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
+		return err
+	}
+	return p.checkStartupClients(data, p.managedFlows())
+}
+
+func (p *ConfigPersister) managedFlows() map[string]string {
+	managed := make(map[string]string, len(p.inbounds))
+	for _, ib := range p.inbounds {
+		managed[ib.Tag] = ib.Flow
+	}
+	return managed
+}
+
+// Scan all managed inbounds in the snapshot being written. Clients from our
+// own earlier delta flushes are not evidence of late external population.
+func (p *ConfigPersister) checkStartupClients(data []byte, managed map[string]string) error {
+	var cfg struct {
+		Inbounds []struct {
+			Tag      string
+			Settings json.RawMessage
 		}
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse %s: %w", p.path, err)
+	}
+	if cfg.Inbounds == nil {
+		return errors.New("missing inbounds in Xray config")
+	}
+	for _, ib := range cfg.Inbounds {
+		tag := ib.Tag
+		if _, ok := managed[tag]; !ok {
+			continue
+		}
+		var settings struct{ Clients []any }
+		if err := json.Unmarshal(ib.Settings, &settings); err != nil {
+			return fmt.Errorf("read clients for managed inbound %q: %w", tag, err)
+		}
+		clients := settings.Clients
+		known := p.startupClients[tag]
+		if len(clients) > len(known) {
+			return errStartupConfigClients
+		}
+		seen := make(map[configClientKey]struct{}, len(clients))
+		for _, client := range clients {
+			c, ok := client.(map[string]any)
+			key := clientKey(c)
+			_, owned := known[key]
+			_, duplicate := seen[key]
+			if !ok || !owned || duplicate {
+				return errStartupConfigClients
+			}
+			seen[key] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// flushLocked is also used by Stop for its final write after admission closes.
+func (p *ConfigPersister) flushLocked() (bool, error) {
+	snapshot, ok, check, done := p.store.persistenceSnapshot()
+	defer done()
+	if !ok {
+		return false, nil
+	}
+	guarded := check != nil
+	data, err := os.ReadFile(p.path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
 		return false, fmt.Errorf("read %s: %w", p.path, err)
 	}
-
+	managed := p.managedFlows()
+	if guarded {
+		if err := p.checkStartupClients(data, managed); err != nil {
+			return false, p.store.checkStartupConflict(err)
+		}
+	}
 	var root map[string]any
 	if err := json.Unmarshal(data, &root); err != nil {
 		// A hand-edited config with comments/trailing commas lands here. Keep the
 		// existing file untouched; the live gRPC state is unaffected.
 		return false, fmt.Errorf("parse %s: %w", p.path, err)
 	}
-
-	inboundsAny, ok := root["inbounds"].([]any)
+	inbounds, ok := root["inbounds"].([]any)
 	if !ok {
 		return false, nil
 	}
-
-	managed := make(map[string]string, len(p.inbounds))
-	for _, ib := range p.inbounds {
-		managed[ib.Tag] = ib.Flow
+	users := snapshot.Users
+	var nextClients map[string]map[configClientKey]struct{}
+	if guarded {
+		nextClients = make(map[string]map[configClientKey]struct{}, len(managed))
 	}
-
-	users := p.store.List()
-
 	changed := false
-	for _, ibAny := range inboundsAny {
+	for _, ibAny := range inbounds {
 		ib, ok := ibAny.(map[string]any)
 		if !ok {
 			continue
@@ -168,6 +243,13 @@ func (p *ConfigPersister) flushLocked() (bool, error) {
 		}
 
 		desired := buildConfigClients(users, flow)
+		if guarded {
+			keys := make(map[configClientKey]struct{}, len(users))
+			for _, u := range users {
+				keys[configClientKey{u.ID, u.Email, flow}] = struct{}{}
+			}
+			nextClients[tag] = keys
+		}
 
 		settings, ok := ib["settings"].(map[string]any)
 		if !ok {
@@ -194,8 +276,11 @@ func (p *ConfigPersister) flushLocked() (bool, error) {
 	if err := p.writeFile(p.path, out); err != nil {
 		return false, err
 	}
+	if guarded {
+		p.startupClients = nextClients
+	}
 	log.Printf("[config] Rewrote %s (%d users)", p.path, len(users))
-	return true, nil
+	return !guarded, nil
 }
 
 // buildConfigClients renders the VLESS clients array. Flow is added only when
@@ -224,7 +309,7 @@ func clientsEqual(existing, desired []any) bool {
 	if len(existing) != len(desired) {
 		return false
 	}
-	set := make(map[string]struct{}, len(existing))
+	set := make(map[configClientKey]struct{}, len(existing))
 	for _, c := range existing {
 		m, ok := c.(map[string]any)
 		if !ok {
@@ -244,19 +329,25 @@ func clientsEqual(existing, desired []any) bool {
 	return true
 }
 
-func clientKey(m map[string]any) string {
+type configClientKey struct{ id, email, flow string }
+
+func clientKey(m map[string]any) configClientKey {
 	id, _ := m["id"].(string)
 	email, _ := m["email"].(string)
 	flow, _ := m["flow"].(string)
-	return id + "\x00" + email + "\x00" + flow
+	return configClientKey{id, email, flow}
 }
 
 // atomicWriteFile writes data to a temp file in the same directory, fsyncs it,
 // then renames it over the target so a crash/power loss never leaves a partial
 // config.json.
 func atomicWriteFile(path string, data []byte) error {
+	return atomicWriteMode(path, data, 0644)
+}
+
+func atomicWriteMode(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".xray-config-*.tmp")
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp: %w", err)
 	}
@@ -267,6 +358,10 @@ func atomicWriteFile(path string, data []byte) error {
 		tmp.Close()
 		return fmt.Errorf("write temp: %w", err)
 	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return fmt.Errorf("sync temp: %w", err)
@@ -274,11 +369,13 @@ func atomicWriteFile(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
-	if err := os.Chmod(tmpName, 0644); err != nil {
-		return fmt.Errorf("chmod temp: %w", err)
-	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("rename temp -> %s: %w", path, err)
 	}
-	return nil
+	parent, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	return parent.Sync()
 }

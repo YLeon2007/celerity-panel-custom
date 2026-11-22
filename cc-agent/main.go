@@ -34,8 +34,10 @@ func main() {
 	}
 
 	userStore := NewUserStore(cfg)
-	if err := userStore.Load(); err != nil {
-		log.Printf("[main] Warning: could not load users from disk: %v", err)
+	persister := NewConfigPersister(xrayConfigPath, cfg.Inbounds, userStore)
+	loadErr := userStore.Load(persister.checkEmptyStore)
+	if loadErr != nil {
+		log.Printf("[main] Preserving Xray config and runtime; waiting for full panel /sync: %v", loadErr)
 	}
 
 	xrayClient, err := NewXrayClient(cfg)
@@ -45,7 +47,6 @@ func main() {
 
 	// ConfigPersister keeps /usr/local/etc/xray/config.json in sync with the
 	// authoritative user list so any Xray restart reloads the correct users.
-	persister := NewConfigPersister(xrayConfigPath, cfg.Inbounds, userStore)
 	go persister.run()
 
 	onlineTracker := NewOnlineTracker(defaultOnlineTimeout)
@@ -59,6 +60,7 @@ func main() {
 	// A panel full-push restarts cc-agent (reloadCcAgent) BEFORE it calls /sync,
 	// so the grace window avoids a redundant heal restart in that race.
 	startup := startStartupReconcile(startupReconcileDeps{
+		skipHeal: loadErr != nil, // An early recovery sync cannot turn an untrusted boot into a heal.
 		wait:     waitStartup,
 		flush:    persister.Flush,
 		lastSync: userStore.GetLastSync,
@@ -163,6 +165,7 @@ func main() {
 }
 
 type startupReconcileDeps struct {
+	skipHeal bool
 	wait     func(context.Context, time.Duration) bool
 	flush    func() (bool, error)
 	lastSync func() time.Time
@@ -251,7 +254,7 @@ func (r *startupReconciler) run(d startupReconcileDeps) {
 	}) {
 		return
 	}
-	if diskWasStale && !syncedDuringGrace {
+	if !d.skipHeal && diskWasStale && !syncedDuringGrace {
 		var restartOK bool
 		if !r.invoke(func() {
 			log.Printf("[main] Stale Xray config on startup, restarting xray once to heal runtime")
