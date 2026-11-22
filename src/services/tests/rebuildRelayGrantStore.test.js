@@ -22,7 +22,7 @@ const code = suffix => ({ code: `REBUILD_L2TP_GRANT_${suffix}` });
 // Model snapshot visibility, write-time unique-index checks, and the separate
 // server settlement and driver-local states of a raw commit.
 function fixture(env = { ...enabled }) {
-    let state = { [GRANTS]: [], [AUDIT]: [] };
+    let state = { [GRANTS]: [], [AUDIT]: [], relayl2tpstates: [], l2tpusers: [] };
     let indexes = [];
     const controls = {}, touches = [], lifecycle = [];
     let inventory;
@@ -44,6 +44,17 @@ function fixture(env = { ...enabled }) {
                 assert.deepEqual(options.projection, { _id: 1, ip: 1, 'ssh.port': 1, 'ssh.username': 1 });
                 assert.equal(String(filter._id), a.nodeId);
                 return inventory ?? null;
+            } };
+            if (name === 'relayl2tpstates' || name === 'l2tpusers') return { async findOne(filter, options) {
+                touches.push(name);
+                const rows = requireTransaction(options.session)[name];
+                assert.deepEqual(options.projection, { _id: 1 });
+                assert.equal(options.readConcern, undefined);
+                if (controls.footprintFailure) throw new Error('fixture private DB error');
+                const { $nor, ...keys } = filter;
+                const row = rows.find(candidate => Object.entries(keys).every(([key, value]) => candidate[key] === String(value))
+                    && !$nor?.some(term => match(candidate, term)));
+                return row ? { _id: row._id } : null;
             } };
             if (name === GRANTS) return {
                 async createIndexes(specs, options) {
@@ -157,6 +168,7 @@ function fixture(env = { ...enabled }) {
     const mutate = (binding, action = 'grant', expectedGeneration = null, session) =>
         store.mutate({ action, binding, expectedGeneration, actor, session });
     return { db, store, mutate, controls, touches, lifecycle, setCard: row => { inventory = row; },
+        setFootprint(name, ...rows) { state[name] = rows; },
         records: () => state[GRANTS], history: () => state[AUDIT], indexes: () => indexes };
 }
 
@@ -252,6 +264,40 @@ test('legacy mode is unchanged without DB records; any union requires the invent
     await assert.rejects(f.store.snapshot(), { ...code('CONFLICT'), field: 'endpoint', sources: ['env', 'db'] });
     f.setCard(null);
     await assert.rejects(f.store.snapshot(), code('ENV_INVALID'));
+});
+
+test('only a last-grant legacy downgrade checks singleton state and replicas in the grant transaction', async () => {
+    const env = { ...legacy }, c = binding('c');
+    const f = fixture(env);
+    f.setCard(card(a));
+    f.setFootprint('l2tpusers', { _id: 'replica', relayNode: a.nodeId });
+    const first = await f.mutate(b);
+    const second = await f.mutate(c);
+    f.touches.length = 0;
+    await f.mutate(c, 'revoke', second.generation);
+    assert.deepEqual(f.touches, ['hynodes'], 'another DB grant still supplies list mode');
+
+    f.touches.length = 0;
+    const history = f.history().length;
+    await assert.rejects(f.mutate(b, 'revoke', first.generation), code('LEGACY_SINGLETON_IN_USE'));
+    assert.deepEqual(f.touches, ['hynodes', 'relayl2tpstates', 'l2tpusers'], 'orphaned or retained projections also block');
+    assert.deepEqual(f.records(), [first]);
+    assert.equal(f.history().length, history);
+
+    f.setFootprint('l2tpusers');
+    f.setFootprint('relayl2tpstates', { _id: 'install', node: a.nodeId, status: 'installing', desiredState: 'installed' });
+    await assert.rejects(f.mutate(b, 'revoke', first.generation), code('LEGACY_SINGLETON_IN_USE'));
+    f.controls.footprintFailure = true;
+    await assert.rejects(f.mutate(b, 'revoke', first.generation), code('PERSISTENCE_UNAVAILABLE'));
+    assert.deepEqual(f.records(), [first]);
+    assert.equal(f.history().length, history);
+
+    env[LIST] = JSON.stringify([a]);
+    f.touches.length = 0;
+    await f.mutate(b, 'revoke', first.generation);
+    assert.deepEqual(f.touches, [], 'an explicit ENV list does not downgrade');
+    assert.deepEqual(f.records(), []);
+    assert.deepEqual(JSON.parse((await f.store.snapshot()).env[LIST]), [a]);
 });
 
 const collisions = [

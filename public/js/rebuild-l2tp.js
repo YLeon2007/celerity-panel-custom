@@ -141,6 +141,7 @@
     ]);
     const admissionErrors = new Map([...effectErrors,
         ['REBUILD_L2TP_ADMISSION_CHALLENGE_INVALID', 'challengeInvalid'],
+        ['REBUILD_L2TP_GRANT_LEGACY_SINGLETON_IN_USE', 'legacySingletonInUse'],
         ['REBUILD_L2TP_INSTALL_DISABLED', 'blocked'], ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'blocked'],
         ['REBUILD_BUSY', 'blocked'], ['REBUILD_LOCK_LOST', 'blocked'],
     ]);

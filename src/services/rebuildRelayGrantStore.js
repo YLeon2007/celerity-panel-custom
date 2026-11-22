@@ -19,6 +19,7 @@ const auditOutcomes = new Set(['success', 'denied', 'unknown']);
 const auditCodes = new Set(['OK', 'REBUILD_BUSY', 'REBUILD_LOCK_LOST', 'REBUILD_LOCK_RELEASE_UNCONFIRMED', ...[
     'INSTALL_DISABLED', 'BINDING_MISMATCH', 'SSH_PIN_INVALID', 'SSH_ENDPOINT_INVALID', 'GRANT_CONFLICT',
     'GRANT_CHANGED', 'GRANT_INVALID', 'GRANT_ENV_INVALID', 'GRANT_REGISTRY_INVALID', 'GRANT_PERSISTENCE_UNAVAILABLE',
+    'GRANT_LEGACY_SINGLETON_IN_USE',
     'GRANT_OUTCOME_UNKNOWN', 'ADMISSION_INVALID_REQUEST', 'ADMISSION_CHALLENGE_INVALID', 'ADMISSION_DISABLED',
     'ADMISSION_UNAVAILABLE', 'ACCOUNTS_BLOCKED', 'ACCOUNTS_PERSISTENCE_UNAVAILABLE', 'IDENTITY_CHANGED', 'IDENTITY_UNAVAILABLE',
 ].map(suffix => `REBUILD_L2TP_${suffix}`)]);
@@ -201,6 +202,21 @@ function createRelayGrantStore({ db, env = process.env }) {
         const collection = grantsCollection();
         let next = null;
         if (action === 'revoke') {
+            if (view.singleton && view.grants.length === 1) {
+                // Admission holds the global rebuild writer lock. Use the same
+                // transaction as the grant CAS: the last DB grant supplies list
+                // semantics for this ENV relay. Legacy Remove can only prove
+                // its original bootstrap, not an arbitrary CHAP projection.
+                const node = new ObjectId(view.singleton.nodeId);
+                const probe = { ...read(session), projection: { _id: 1 } };
+                if (await db.collection('relayl2tpstates').findOne({ node,
+                    $nor: [{ status: 'not_installed', desiredState: 'absent' }],
+                }, probe) || await db.collection('l2tpusers').findOne({ relayNode: node }, probe)) {
+                    throw error('LEGACY_SINGLETON_IN_USE');
+                }
+                // A directory without live projections intentionally survives
+                // Remove; it neither authorizes a cohort nor prevents revoke.
+            }
             const result = await collection.deleteOne(filter, options);
             if (result?.acknowledged !== true || result.deletedCount !== 1) throw error('CHANGED');
         } else {

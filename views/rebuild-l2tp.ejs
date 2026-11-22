@@ -17,7 +17,7 @@ const relayPath = id => `/panel/rebuild/relays/${id}/l2tp`;
 const accountPath = '/panel/rebuild/relays/l2tp/accounts';
 const admissionMessages = ['granted', 'revoked', 'checkUnavailable', 'recoveryIneligible',
     'challengeInvalid', 'identityChanged', 'envReadOnly', 'grantConflict', 'grantUnavailable', 'blocked',
-    'conflictField', 'conflictSources'];
+    'conflictField', 'conflictSources', 'legacySingletonInUse'];
 const conflictFields = ['nodeId', 'machineId', 'sshHostKeySha256', 'endpoint', 'host', 'port', 'username'];
 const problemKeys = new Map([
     ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged'], ['REBUILD_L2TP_INSTALL_DISABLED', 'disabled'],

@@ -1886,6 +1886,7 @@
       "identityChanged": "The server changed. Verify its identity again before continuing.",
       "reviewRelays": "Review relay identity",
       "grantConflict": "Relay admission was refused because it conflicts with an existing grant or installation state. Check the relay and operator settings.",
+      "legacySingletonInUse": "The last database grant was kept so accounts and L2TP removal on the legacy environment-configured relay remain manageable. Remove L2TP from that relay or configure an explicit relay list before retrying. Do not delete the saved account directory.",
       "conflictField": "Conflicting field: {field}.",
       "conflictSources": "Conflicting sources: {sources}.",
       "conflictFields": {

@@ -77,7 +77,7 @@ function widget(dataset = {}) {
         showModal() { this.open = true; }, close() { this.open = false; } };
 }
 
-function launch(action = 'grant', { target = id, pending = false } = {}) {
+function launch(action = 'grant', { target = id, pending = false, admissionWords = words.admission } = {}) {
     const replies = [], calls = [];
     const dialog = widget(), status = widget(), refresh = widget(), review = widget(), recover = widget();
     const install = widget({ nodeId: target, installUrl: '/install' });
@@ -94,7 +94,7 @@ function launch(action = 'grant', { target = id, pending = false } = {}) {
     dialog.querySelectorAll = selector => selector === '[data-admission-approve]' ? Object.values(approvals)
         : ['verify', 'confirm', 'revoke'].map(admissionStep => widget({ admissionStep }));
     const page = { dataset: { csrf: 'fixture', messages: JSON.stringify(words.messages),
-        accountUrl: '/accounts', admissionMessages: JSON.stringify(words.admission), ...(pending && { reconcileUrl: '/accounts/reconcile' }) },
+        accountUrl: '/accounts', admissionMessages: JSON.stringify(admissionWords), ...(pending && { reconcileUrl: '/accounts/reconcile' }) },
     querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh,
         '[data-review]': review, '[data-admission-dialog]': dialog, '[data-reconcile]': pending ? recover : null })[selector] ?? null,
     querySelectorAll: selector => ({ '[data-install-url]': [install], '[data-account-action]': [account],
@@ -168,6 +168,25 @@ test('revoke needs explicit approval, and a failed verification cannot advance o
     assert.equal(f.field('status').textContent, words.admission.checkUnavailable);
     f.approvals.verify.click(); await flush();
     assert.equal(f.calls.length, 2);
+});
+
+test('last-grant refusal shows localized recovery guidance and leaves account controls usable', async () => {
+    for (const lang of ['en', 'ru', 'zh-CN']) {
+        const admissionWords = require(`../../../locales/${lang}.json`).rebuildL2tp.admission;
+        const html = await render(lang);
+        assert.ok(html.match(/data-admission-messages="([^"]*)"/)?.[1]
+            .includes(ejs.escapeXML(JSON.stringify({ legacySingletonInUse: admissionWords.legacySingletonInUse }).slice(1, -1))));
+        const f = launch('revoke', { admissionWords });
+        f.replies.push({ status: 409, data: { error: { code: 'REBUILD_L2TP_GRANT_LEGACY_SINGLETON_IN_USE' } } });
+        f.selected.click();
+        f.approvals.revoke.click();
+        await flush();
+        assert.equal(f.field('status').textContent, admissionWords.legacySingletonInUse);
+        f.field('cancel').click();
+        assert.equal(f.dialog.open, false);
+        assert.equal(f.account.disabled, false);
+        assert.deepEqual(f.calls.map(({ url }) => url), [`${baseUrl(id)}/revoke`]);
+    }
 });
 
 test('even with a pending account operation, the page takes no action until the operator clicks reconcile', async () => {

@@ -286,6 +286,7 @@
       "identityChanged": "服务器身份已变更，请重新核验后再继续。",
       "reviewRelays": "查看中继身份",
       "grantConflict": "准入与现有授权或安装状态冲突，已拒绝。请检查中继和运维配置。",
+      "legacySingletonInUse": "已保留数据库中的最后一条授权，以便继续管理通过旧版环境变量配置的中继上的账户并卸载 L2TP。请先从该中继卸载 L2TP，或显式配置中继列表，再重试。请勿删除已保存的账户目录。",
       "conflictField": "冲突字段：{field}。",
       "conflictSources": "冲突来源：{sources}。",
       "conflictFields": {

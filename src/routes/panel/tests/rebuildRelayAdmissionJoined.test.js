@@ -19,10 +19,10 @@ const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const pin = hash(key);
 const sshPassword = 'joined-fixture-ssh-password', privateError = 'joined-fixture-private-error';
 const actor = 'admin.fixture', sessionID = 'joined-fixture-admin-session';
-const base = `/panel/rebuild/relays/${nodeId}/l2tp`;
+const unusedId = 'c'.repeat(24), unusedMachine = 'd'.repeat(32), unusedHost = '192.0.2.5';
+const unusedKey = Buffer.from('synthetic unused relay key');
 const GRANTS = 'c3_rebuild_l2tp_relay_grants', AUDIT = 'c3_rebuild_l2tp_relay_grant_audit';
 const STATES = 'relayl2tpstates', USERS = 'l2tpusers', LOCK = 'c3_rebuild_locks', DIRECTORY = 'c3_rebuild_relay_accounts';
-const oid = new mongoose.Types.ObjectId(nodeId);
 const copy = value => mongoose.mongo.BSON.deserialize(mongoose.mongo.BSON.serialize(value));
 
 // Model the driver API, not the workflow, grant store, Mongoose queries, or
@@ -32,8 +32,10 @@ function mongoFixture(t) {
     const password = require('../../../services/cryptoService').encrypt(sshPassword);
     const tables = new Map([
         ['settings', [{ _id: 'settings', deployment: { completed: true } }]],
-        ['hynodes', [{ _id: oid, name: 'Joined relay', ip: host, type: 'xray', active: true, cascadeRole: 'relay',
-            ssh: { port: 22, username: 'root', password } }]],
+        ['hynodes', [[nodeId, host], [unusedId, unusedHost]].map(([id, ip]) => ({
+            _id: new mongoose.Types.ObjectId(id), name: 'Joined relay', ip, type: 'xray', active: true, cascadeRole: 'relay',
+            ssh: { port: 22, username: 'root', password },
+        }))],
         ...[GRANTS, AUDIT, STATES, USERS, LOCK, DIRECTORY, 'l2tpoperations', 'remoteadmissions',
             'nodeoperationlocks', 'cascadelinks'].map(name => [name, []]),
     ]);
@@ -42,6 +44,11 @@ function mongoFixture(t) {
     const get = (row, key) => key.split('.').reduce((v, k) => v?.[k], row);
     const match = (row, where) => Object.entries(where).every(([key, value]) => {
         if (key === '$or') return value.some(part => match(row, part));
+        if (key === '$nor') return !value.some(part => match(row, part));
+        if (key === '$expr') {
+            assert.equal(value.$eq[0], '$$ROOT');
+            return equal(row, value.$eq[1].$literal);
+        }
         const current = get(row, key);
         if (value && Object.getPrototypeOf(value) === Object.prototype) {
             return Object.entries(value).every(([op, expected]) => {
@@ -122,11 +129,16 @@ function mongoFixture(t) {
                 return specs.map(spec => spec.name);
             },
             find(where, { projection, session, limit } = {}) {
-                return { limit(n) { limit = n; return this; },
+                // The joined consumers sort the resulting inventories themselves.
+                return { limit(n) { limit = n; return this; }, sort() { return this; },
                     async toArray() { return rows(session).filter(row => match(row, where)).slice(0, limit)
                         .map(row => project(row, projection)); } };
             },
             async findOne(where, { projection, session } = {}) {
+                if (name === STATES && where.$nor) {
+                    assert.ok(session?.inTransaction(), 'singleton downgrade check runs in the grant transaction');
+                    assert.equal(tables.get(LOCK).length, 1, 'singleton downgrade check holds the global writer lock');
+                }
                 const row = rows(session).find(candidate => match(candidate, where));
                 return row ? project(row, projection) : null;
             },
@@ -141,6 +153,13 @@ function mongoFixture(t) {
                     return { acknowledged: true };
                 }, options);
             },
+            async insertMany(documents, options) {
+                assert.equal(name, USERS);
+                assert.ok(options.session);
+                for (const row of documents) await this.insertOne(row, options);
+                return { acknowledged: true, insertedCount: documents.length };
+            },
+            async countDocuments(where) { return rows().filter(row => match(row, where)).length; },
             async updateOne(where, update, options) {
                 assert.equal(name, GRANTS);
                 assert.ok(options.session);
@@ -155,13 +174,20 @@ function mongoFixture(t) {
             },
             async updateMany(where, update, options) {
                 return write(data => {
-                    assert.ok(options.session);
                     const selected = data.filter(row => match(row, where));
                     assert.ok(selected.length <= 1);
-                    if (selected.length) Object.assign(selected[0], copy(update.$set));
-                    else if (options.upsert) data.push(copy(update.$setOnInsert));
+                    if (selected.length) {
+                        if (update.$set) Object.assign(selected[0], copy(update.$set));
+                        for (const key of Object.keys(update.$unset ?? {})) delete selected[0][key];
+                    } else if (options.upsert) data.push(copy({ ...where, ...update.$setOnInsert }));
                     return { acknowledged: true, matchedCount: selected.length, upsertedCount: Number(!selected.length && options.upsert) };
                 }, options);
+            },
+            async deleteOne(where, options) {
+                assert.equal(name, GRANTS);
+                assert.ok(options.session);
+                options.session.grantAction = 'revoke';
+                return this.deleteMany(where, options);
             },
             async deleteMany(where, options) {
                 return write(data => {
@@ -201,7 +227,9 @@ function hostFixture(t, mongo) {
             { type: 'field', ruleTag: 'rebuild-policy-default', inboundTag: ['fwd-hop-a'], outboundTag: 'block' },
         ] } });
     const remote = { key, machineId, checks: [], effects: [] };
-    let candidate, installedId;
+    let candidate, installedId, chapLogins;
+    const census = 'f'.repeat(64);
+    const logins = users => users.map(user => user.login).sort();
     const frames = bindWire(t, [{ id: nodeId, relay: { ip: host }, get key() { return remote.key; },
         get machineId() { return remote.machineId; }, applyHandlers: new Map(), execute(command, stdin) {
         const req = JSON.parse(stdin);
@@ -225,6 +253,7 @@ function hostFixture(t, mongo) {
             assert.deepEqual(mongo.rows(USERS).map(u => [u.login, u.syncStatus]), [['relay-bootstrap', 'pending']]);
             assert.equal(installedId, undefined);
             installedId = req.backupId;
+            chapLogins = ['relay-bootstrap'];
             remote.effects.push(req.action);
             break;
         case 'verify':
@@ -240,27 +269,55 @@ function hostFixture(t, mongo) {
             return remote.ownerUnproved ? { status: 70, stdout: '', stderr: 'DIRECT_ROLLBACK_DRIFT\n' }
                 : ok({ ok: true, backupId: installedId, proof: 'e'.repeat(64) });
         }
+        case 'check-chap':
+        case 'sync-chap': {
+            assert.equal(req.backupId, installedId);
+            assert.deepEqual(logins(req.currentUsers), chapLogins);
+            if (req.action === 'sync-chap') {
+                chapLogins = logins(req.desiredUsers);
+                remote.effects.push(req.action);
+            }
+            return ok({ ok: true, backupId: installedId, changed: true });
+        }
+        case 'session-count':
+        case 'prepare-remove':
+        case 'remove': {
+            assert.equal(req.backupId, installedId);
+            assert.deepEqual(logins(req.currentUsers), chapLogins);
+            if (req.action === 'session-count') return ok({ activeSessions: 0, activeIpsec: 0, census });
+            if (req.action === 'prepare-remove') return ok({ ok: true, backupId: installedId, machineId, baseline: '9'.repeat(64) });
+            assert.equal(req.expectedCensus, census);
+            remote.effects.push(req.action);
+            installedId = undefined;
+            chapLogins = undefined;
+            return ok({ ok: true, backupId: req.backupId, removed: true });
+        }
         default: assert.fail(`Unexpected DIRECT action: ${req.action}`);
         }
         return ok({ ok: true, backupId: req.backupId });
-    } }]);
+    } }, { id: unusedId, relay: { ip: unusedHost }, machineId: unusedMachine, key: unusedKey,
+        applyHandlers: new Map(), execute() { assert.fail('Unused relay received a DIRECT payload'); } }]);
     // The same synthetic host also provides the isolated discovery and pinned
     // machine-id channel; no real connect, shell or package command runs.
-    const sockets = new Set(), probes = new WeakSet();
+    const sockets = new Set(), probes = new WeakMap(), directHosts = new WeakMap(), absence = [];
     t.mock.method(Socket.prototype, 'connect', function (options) {
-        assert.deepEqual(options, { host, port: 22 });
+        assert.ok([host, unusedHost].includes(options.host));
+        assert.equal(options.port, 22);
         sockets.add(this);
         return this;
     });
     const connectInstall = Client.prototype.connect, execInstall = Client.prototype.exec;
     t.mock.method(Client.prototype, 'connect', function (options) {
-        if (!options.sock) return connectInstall.call(this, options);
+        if (!options.sock) {
+            directHosts.set(this, options.host);
+            return connectInstall.call(this, options);
+        }
         assert.ok(sockets.has(options.sock));
-        assert.equal(options.host, host);
+        const target = options.host === unusedHost ? { key: unusedKey, machineId: unusedMachine } : remote;
         assert.equal(options.username, 'root');
         assert.ok(!Object.hasOwn(options, 'password') && !Object.hasOwn(options, 'privateKey'));
-        probes.add(this);
-        const pinned = options.hostVerifier(remote.key);
+        probes.set(this, target);
+        const pinned = options.hostVerifier(target.key);
         remote.checks.push(pinned ? 'pinned' : 'key-only');
         if (pinned) {
             this.emit('handshake');
@@ -271,24 +328,33 @@ function hostFixture(t, mongo) {
         return this;
     });
     t.mock.method(Client.prototype, 'exec', function (command, callback) {
-        if (!probes.has(this)) return execInstall.call(this, command, callback);
-        assert.equal(command, '/usr/bin/head -c 34 /etc/machine-id');
+        const target = probes.get(this);
+        const absenceCheck = command.startsWith('/usr/bin/timeout -k 1s 15s /usr/bin/python3 -I -B -c ');
+        if (!target && !absenceCheck) return execInstall.call(this, command, callback);
+        if (absenceCheck) {
+            assert.equal(directHosts.get(this), unusedHost);
+            assert.ok(command.endsWith(' no-record'));
+            assert.equal(mongo.rows(LOCK).length, 1);
+            absence.push('observed');
+        } else assert.equal(command, '/usr/bin/head -c 34 /etc/machine-id');
         const channel = new EventEmitter();
         channel.stderr = new EventEmitter();
         channel.destroy = channel.stderr.destroy = () => {};
-        channel.end = () => queueMicrotask(() => {
-            remote.checks.push('machine');
-            if (remote.error) channel.emit('error', new Error(privateError));
+        const finish = () => queueMicrotask(() => {
+            if (!absenceCheck) remote.checks.push('machine');
+            if (target?.error) channel.emit('error', new Error(privateError));
             else {
-                channel.emit('data', Buffer.from(remote.machineId + '\n'));
+                channel.emit('data', Buffer.from(absenceCheck ? `absent:${unusedMachine}\n` : `${target.machineId}\n`));
                 channel.stderr.emit('end');
                 channel.emit('close', 0);
             }
         });
+        channel.end = finish;
         callback(null, channel);
+        if (absenceCheck) finish(); // The absence witness has no stdin.
     });
     t.after(() => assert.ok([...sockets].every(socket => socket.destroyed), 'all admission sockets closed'));
-    return { remote, frames };
+    return { remote, frames, absence };
 }
 
 function configure(t) {
@@ -322,12 +388,13 @@ function mount(panel, mongo) {
     app.use('/panel', panel.createPanelRouter());
     const session = { authenticated: true, adminUsername: actor };
     const csrf = issuePanelCsrfToken({ session });
-    const send = (action, body = {}, { csrfToken = csrf, expected = 200 } = {}) => new Promise((resolve, reject) => {
+    const send = (action, body = {}, { csrfToken = csrf, expected = 200, id = nodeId } = {}) => new Promise((resolve, reject) => {
         const payload = Buffer.from(JSON.stringify(body)), wire = [];
         const socket = new Duplex({ read() {}, write(chunk, _, done) { wire.push(chunk.toString()); done(); } });
         socket.remoteAddress = '192.0.2.10';
         const req = new IncomingMessage(socket);
-        Object.assign(req, { method: 'POST', url: `${base}/${action}`, session, sessionID, complete: true, headers: {
+        const path = action.startsWith('accounts/') ? 'l2tp' : `${id}/l2tp`;
+        Object.assign(req, { method: 'POST', url: `/panel/rebuild/relays/${path}/${action}`, session, sessionID, complete: true, headers: {
             host: 'panel.fixture.invalid', 'content-type': 'application/json', 'content-length': String(payload.length), 'x-csrf-token': csrfToken,
         } });
         req.push(payload);
@@ -348,7 +415,7 @@ function mount(panel, mongo) {
         });
         app(req, res);
     });
-    return { send, admission: (action, ...args) => send(`admission/${action}`, ...args) };
+    return { send, session, admission: (action, ...args) => send(`admission/${action}`, ...args) };
 }
 
 function audit(mongo, expected) {
@@ -512,5 +579,66 @@ for (const mismatch of ['key', 'machineId', 'error']) {
         audit(f.mongo, [ok('probe'), ok('verify'), ['confirm', 'denied', code], ['confirm', 'denied', CHALLENGE]]);
     });
 }
+
+test('last DB grant cannot strand a legacy singleton, but is revocable after Remove leaves only the directory', { timeout: 5000 }, async t => {
+    const f = joined(t);
+    const { createRebuildService } = require('../../../services/rebuildService');
+    const { createRelayGrantStore } = require('../../../services/rebuildRelayGrantStore');
+    const { issueRemovalTicket } = require('../rebuildRelayRemove');
+    const grants = createRelayGrantStore({ db: mongoose.connection });
+    const listKey = 'C3_REBUILD_L2TP_RELAYS_JSON';
+    Object.assign(process.env, { C3_REBUILD_L2TP_RELAY_ID: nodeId,
+        C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, C3_REBUILD_L2TP_SSH_SHA256: pin });
+    assert.equal(Object.hasOwn((await grants.snapshot()).env, listKey), false);
+    assert.deepEqual(await f.send('install'), { executionMode: 'rebuild', status: 'installed', nodeId });
+    assert.deepEqual(f.mongo.commits, [], 'legacy Install does not require a transaction');
+    assert.deepEqual(f.mongo.rows(DIRECTORY), []);
+
+    const other = { id: unusedId };
+    const { challenge: discovered } = await f.admission('probe', {}, other);
+    const { challenge: verified } = await f.admission('verify', { challenge: discovered }, other);
+    assert.equal((await f.admission('confirm', { challenge: verified }, other)).nodeId, unusedId);
+    assert.equal(f.mongo.rows(GRANTS).length, 1);
+    assert.equal(Object.hasOwn((await grants.snapshot()).env, listKey), true);
+    const login = 'fixture-shared';
+    assert.deepEqual(await f.send('accounts/create', { login, password: 'fixture-only' }, { expected: 201 }),
+        { executionMode: 'rebuild', status: 'created', login, relayCount: 1 });
+    assert.deepEqual(f.mongo.rows(USERS).map(row => [String(row.relayNode), row.login]).sort(),
+        [[nodeId, login], [nodeId, 'relay-bootstrap']]);
+    const before = [GRANTS, STATES, USERS, DIRECTORY].map(name => f.mongo.rows(name));
+    const commits = f.mongo.commits.length, frames = f.frames.length;
+    f.mongo.writes();
+    const blocked = 'REBUILD_L2TP_GRANT_LEGACY_SINGLETON_IN_USE';
+    assert.deepEqual(await f.admission('revoke', {}, { ...other, expected: 409 }), refused(blocked));
+    assert.deepEqual(f.absence, ['observed'], 'unused relay passed the ordinary host absence gate');
+    assert.ok(equal([GRANTS, STATES, USERS, DIRECTORY].map(name => f.mongo.rows(name)), before), 'business records are unchanged');
+    assert.equal(f.mongo.commits.length, commits);
+    assert.equal(f.frames.length, frames);
+    assert.deepEqual(f.mongo.writes(), [LOCK, LOCK, AUDIT]);
+    assert.deepEqual(f.mongo.rows(AUDIT).slice(-1).map(row => [row.nodeId, row.action, row.outcome, row.code]),
+        [[unusedId, 'revoke', 'denied', blocked]]);
+    assert.equal(Object.hasOwn((await grants.snapshot()).env, listKey), true);
+
+    const estimate = await createRebuildService().previewRemoveRelay(nodeId);
+    assert.deepEqual(estimate, { nodeId, accountCount: 2, activeSessions: 0, activeIpsec: 0, confirmable: true });
+    const ticket = issueRemovalTicket({ method: 'GET', session: f.session, sessionID, params: { id: nodeId }, headers: {} }, estimate);
+    assert.ok(ticket);
+    assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket }), { executionMode: 'rebuild', status: 'not_installed', nodeId });
+    assert.deepEqual(f.mongo.rows(USERS), []);
+    assert.deepEqual(f.mongo.rows(STATES).map(row => [row.status, row.desiredState]), [['not_installed', 'absent']]);
+    const directory = before[3];
+    assert.deepEqual(directory.map(row => row.accounts.map(account => account.login)), [[login, 'relay-bootstrap']]);
+    assert.ok(equal(f.mongo.rows(DIRECTORY), directory), 'Remove preserves the logical directory');
+
+    assert.deepEqual(await f.admission('revoke', {}, other), { nodeId: unusedId });
+    assert.deepEqual(f.mongo.rows(GRANTS), []);
+    assert.deepEqual(f.mongo.commits.at(-1), ['revoke', GRANTS, AUDIT]);
+    assert.ok(equal(f.mongo.rows(DIRECTORY), directory), 'safe revoke preserves the logical directory');
+    const snapshot = await grants.snapshot();
+    assert.equal(snapshot.sourceFor(nodeId), 'env');
+    assert.equal(Object.hasOwn(snapshot.env, listKey), false);
+    assert.deepEqual(f.remote.effects, ['install', 'sync-chap', 'remove']);
+    assert.deepEqual(f.mongo.rows(LOCK), []);
+});
 
 test.after(() => require('../../../services/sshPoolService').closeAll());
