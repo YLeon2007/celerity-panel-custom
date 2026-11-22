@@ -706,6 +706,220 @@ function accountIntentFixture(t, f) {
 
 joined({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt });
 
+// Reuse the joined wire, Python host and Debian model. This adapter only seeds
+// the companion Xray/manager state needed for an ordinary Install readback.
+function emptyIndexHost(t, f, scenario) {
+    const fs = require('node:fs');
+    const { join, dirname } = require('node:path');
+    const { tmpdir } = require('node:os');
+    const { createHash } = require('node:crypto');
+    const { spawnSync } = require('node:child_process');
+    const { generateXraySystemdService } = require('../configGenerator');
+    const { composeRebuildProfiles } = require('../../modules/relay-l2tp/services/rebuildTopologyComposer');
+    const root = fs.mkdtempSync(join(tmpdir(), '.relay-install-join-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const path = name => join(root, name);
+    const put = (name, data, mode = 0o644) => {
+        fs.mkdirSync(dirname(path(name)), { recursive: true });
+        fs.writeFileSync(path(name), data, { mode });
+        fs.chmodSync(path(name), mode);
+    };
+    const python = (file, input) => {
+        const result = spawnSync('/usr/bin/python3', ['-I', '-B', join(__dirname, 'helpers', file), root, scenario],
+            { input, env: {}, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
+        assert.ifError(result.error);
+        assert.ok([0, 70, 75].includes(result.status), `${file}: exit ${result.status}`);
+        return result;
+    };
+    const initialized = python('rebuildRelayInstallPackageModel.py');
+    assert.equal(initialized.status, 0, initialized.stderr);
+    const packageModel = JSON.parse(initialized.stdout);
+    const relay = f.nodes[0];
+    Object.assign(relay, { port: 21443, xray: { apiPort: 61001, security: 'none' },
+        aclRules: ['reject(denied.invalid)'], ssh: { ...relay.ssh, password: 'local-fixture-only' } });
+    const exit = { _id: oid('d'.repeat(24)), type: 'xray', active: true, ip: '192.0.2.99', cascadeRole: 'bridge', ssh: relay.ssh };
+    f.nodes.push(exit);
+    f.links.push({ _id: oid('e'.repeat(24)), portalNode: relay._id, bridgeNode: exit._id, mode: 'forward', active: true,
+        status: 'deployed', tunnelProtocol: 'vmess', tunnelPort: 20443, tunnelUuid: '7b159424-f38c-4869-bbf8-cb426fa00354' });
+    const profiles = composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode: { [id]: [] },
+        dialerVersions: new Map([[String(exit._id), '26.3.27']]) });
+    const main = profiles.find(row => row.nodeId === id && row.profile === 'main').config;
+    const mainPath = '/usr/local/etc/xray/config.json';
+    put(mainPath, JSON.stringify(main), 0o640);
+    put('/usr/local/etc/xray-bridge/config.json', JSON.stringify(profiles.find(row => row.nodeId === id && row.profile === 'bridge').config), 0o640);
+    put('/usr/local/bin/xray', 'synthetic executable; never run\n', 0o755);
+    put('/etc/systemd/system/xray.service', generateXraySystemdService());
+    put('/etc/machine-id', machineId + '\n');
+    put('/etc/ppp/chap-secrets', '# stock chap\n', 0o600);
+    put('/etc/ppp/options', '# stock options\n', 0o600);
+    fs.mkdirSync(path('/etc/ipsec.d'));
+    fs.mkdirSync(path('/etc/systemd/system/multi-user.target.wants'));
+    require('./helpers/rebuildRelayStockSwan').seed(root);
+
+    const absent = { LoadState: 'not-found', UnitFileState: '', ActiveState: 'inactive', SubState: 'dead', FragmentPath: '',
+        MainPID: '0', InvocationID: '', DropInPaths: '', NeedDaemonReload: 'no', PrivateNetwork: 'no', KillMode: 'control-group', User: '' };
+    const original = {
+        'xray.service': { ...absent, LoadState: 'loaded', UnitFileState: 'enabled', ActiveState: 'active',
+            SubState: 'running', FragmentPath: '/etc/systemd/system/xray.service', MainPID: '101', InvocationID: '0'.repeat(30) + '65',
+            ControlGroup: '/system.slice/xray.service', User: 'nobody',
+            ExecStart: `{ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${mainPath} ; }` },
+        'xray-bridge.service': absent, 'xl2tpd.service': absent, 'celerity-rebuild-l2tp-network.service': absent,
+        'strongswan-starter.service': { ...absent, ControlGroup: '/system.slice/strongswan-starter.service',
+            ExecStart: '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }' },
+    };
+    const packages = ['strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables'];
+    put('manager.json', JSON.stringify({ packages, packageModel, machine: machineId, address: relay.ip, cohort: true,
+        original, units: original, modules: ['ppp_generic', 'l2tp_ppp'], running: { 'xray.service': main }, nextPid: 300,
+        ikeConnection: false, effects: [], rule: null, route: null, nft: null, rules6: [],
+        stockRules: [[0, 255], [32766, 254], [32767, 253]].map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
+        foreign: { rules: [], routes: [], tables: [], sockets: [] }, managerEnvironment: 'LANG=C\n',
+        owners: { [fs.statSync(path(mainPath)).ino]: [65534, 65534] } }), 0o600);
+
+    const read = name => JSON.parse(fs.readFileSync(path(name), 'utf8'));
+    const key = Buffer.from('synthetic SSH wire key:' + id);
+    const sha256 = data => createHash('sha256').update(data).digest('hex');
+    const capture = name => {
+        const st = fs.lstatSync(path(name), { bigint: true });
+        return [name, st.ino, st.mode, st.ctimeNs, st.mtimeNs, st.isFile() ? sha256(fs.readFileSync(path(name))) : null];
+    };
+    const aptConfig = () => ['/etc/apt', ...fs.readdirSync(path('/etc/apt'), { recursive: true }).sort().map(name => join('/etc/apt', name)),
+        '/usr/share/keyrings/debian-archive-keyring.gpg'].map(capture);
+    const indexes = () => fs.readdirSync(path('/var/lib/apt/lists')).filter(name => !['lock', 'partial', 'auxfiles'].includes(name)).sort();
+    return { id, relay, key, pin: sha256(key), machineId, applyHandlers: new Map(), read, packages, aptConfig, indexes, capture,
+        exists: name => fs.existsSync(path(name)), execute: (command, stdin) => python('rebuildRelayInstallHost.py', `${JSON.stringify(command)}\n${stdin}`) };
+}
+
+for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered', 'foreign-source']) {
+    test(`joined empty-index Install with packed guard: ${outcome}`, async t => {
+        const f = fixture(t);
+        const { events } = sessionFixture(t, f);
+        const host = emptyIndexHost(t, f, `package-stock-empty-${outcome}`);
+        const config = host.aptConfig(), statusBefore = host.capture('/var/lib/dpkg/status');
+        const listsBefore = host.capture('/var/lib/apt/lists');
+        const initialPackages = host.read('manager.json').packageModel.installed;
+        const vault = '/var/lib/celerity-rebuild-l2tp-direct', pending = `${vault}/package-preparation.pending`;
+        const execute = host.execute, replies = [];
+        let reserved, proof;
+        assert.deepEqual(host.indexes(), []);
+        host.execute = (command, stdin) => {
+            assert.ok(f.lockHeld);
+            const request = JSON.parse(stdin);
+            if (!replies.length) assert.deepEqual([events, f.states, f.users], [[], [], []]);
+            else {
+                assert.deepEqual(events, ['commit']);
+                if (request.action === 'prepare-packages') {
+                    reserved = f.states[0]?.backupId;
+                    assert.match(reserved, /^[a-f0-9]{32}$/);
+                }
+                assert.deepEqual(f.states.map(row => [row.status, row.backupId]), [['installing', reserved]]);
+                assert.deepEqual(f.users.map(row => row.syncStatus), ['pending']);
+                if (request.backupId) assert.equal(request.backupId, reserved);
+            }
+            if (request.action === 'prepare-packages') {
+                assert.deepEqual(request, { action: 'prepare-packages', machineId, backupId: reserved, packagePreparation: proof });
+                assert.deepEqual(host.indexes(), []);
+            }
+            const result = execute(command, stdin);
+            const model = host.read('manager.json');
+            assert.deepEqual(model.faults ?? [], [], 'closed DIRECT command model');
+            assert.deepEqual(host.aptConfig(), config, 'APT source/config generations must not change');
+            if (!replies.length) {
+                assert.deepEqual(host.indexes(), []);
+                assert.deepEqual(host.capture('/var/lib/apt/lists'), listsBefore);
+                assert.deepEqual(host.capture('/var/lib/dpkg/status'), statusBefore);
+                assert.deepEqual([model.effects, model.packageModel.effects, model.packageModel.updates], [[], [], []]);
+                assert.deepEqual(model.packageModel.aptReads, {}, 'empty-cache preflight does not consult APT');
+                assert.equal(host.exists(vault), false);
+                if (outcome !== 'foreign-source') {
+                    assert.equal(result.status, 0, JSON.stringify(model.lastRefusal));
+                    const frame = JSON.parse(result.stdout);
+                    assert.match(frame.packagePreparation, /^[a-f0-9]{64}$/);
+                    proof = frame.packagePreparation;
+                    assert.deepEqual(frame, { machineId, packagePreparation: proof });
+                }
+            }
+            if (request.action === 'prepare-packages' && outcome === 'ok') {
+                assert.equal(result.status, 0, JSON.stringify(model.lastRefusal));
+                assert.deepEqual(JSON.parse(result.stdout), { ok: true, backupId: reserved, packagesReady: true });
+            }
+            replies.push({ status: result.status, hasOutput: Boolean(result.stdout) });
+            return result;
+        };
+        const bindWire = joined({ id, wireOnly: true });
+        const frames = bindWire(t, [host]);
+        delete f.env.C3_REBUILD_L2TP_RELAY_ID;
+        delete f.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
+        const grant = { nodeId: id, host: host.relay.ip, port: 22, username: 'root', machineId, sshHostKeySha256: host.pin,
+            generation: 'a1f2edc4-676c-4a6e-b111-a1239fbbcd1e', createdBy: 'fixture', confirmedBy: 'fixture',
+            createdAt: new Date(0), confirmedAt: new Date(0) };
+        const grantDb = { readyState: 1, collection(name) {
+            assert.equal(name, 'c3_rebuild_l2tp_relay_grants');
+            return { find(filter, options) {
+                assert.deepEqual(filter, {});
+                assert.deepEqual(options.readConcern, { level: 'majority' });
+                return { toArray: async () => [{ ...grant }] };
+            } };
+        } };
+        const service = f.create({ grantDb, createRelayDirect: undefined });
+        const { handler } = require('../../routes/panel/rebuildRelayInstall');
+        let status = 200;
+        const result = await handler(() => service)({ params: { id }, body: {} }, {
+            status(value) { status = value; return this; }, json(value) { return value; },
+        });
+        const manager = host.read('manager.json');
+        const model = manager.packageModel;
+        assert.deepEqual(manager.faults ?? [], []);
+        assert.deepEqual(host.aptConfig(), config);
+        if (outcome === 'foreign-source') {
+            assert.equal(status, 409);
+            assert.equal(result.error.check, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
+            assert.deepEqual(frames, [[id, 'preflight']]);
+            assert.deepEqual([events, f.states, f.users, model.updates], [[], [], [], []]);
+            assert.equal(host.exists(vault), false);
+            return;
+        }
+        const [update] = model.updates;
+        assert.equal(model.updates.length, 1);
+        assert.deepEqual([update.action, update.backupId, update.argv], ['prepare-packages', reserved, ['/usr/bin/apt-get', '--error-on=any', 'update']]);
+        assert.match(update.configDigest, /^[a-f0-9]{64}$/);
+        assert.deepEqual(host.indexes(), update.indexes);
+        const receipt = `${vault}/packages-${reserved}.json`;
+        if (outcome !== 'ok') {
+            assert.equal(status, 409);
+            assert.equal(result.error.outcome, 'unknown');
+            assert.equal(result.error.retryAllowed, false);
+            assert.deepEqual(frames, [[id, 'preflight'], [id, 'prepare-packages']]);
+            assert.ok(replies[1].status !== 0 && !replies[1].hasOutput);
+            assert.equal(update.status, ['incomplete', 'tampered'].includes(outcome) ? 0 : 100);
+            assert.equal(update.indexes.length, ({ untrusted: 0, tampered: 6 })[outcome] ?? 5);
+            assert.deepEqual([model.afterUpdate, model.quiet, model.aptWrites, model.installed], [[], {}, 0, initialPackages]);
+            assert.deepEqual(model.effects, ['enter', 'update']);
+            assert.deepEqual(host.capture('/var/lib/dpkg/status'), statusBefore);
+            assert.deepEqual([events, f.states.map(row => row.status), f.users.map(row => row.syncStatus)], [['commit'], ['installing'], ['pending']]);
+            assert.equal(f.lockHeld, true);
+            assert.equal(host.read(receipt).phase, 'preparing');
+            assert.deepEqual(host.read(pending), host.read(receipt));
+            assert.equal(host.exists(`${vault}/${reserved}`), false);
+            assert.deepEqual(manager.effects, []);
+            return;
+        }
+        assert.equal(status, 200, JSON.stringify({ error: result.error, refusal: manager.lastRefusal, frames }));
+        assert.deepEqual(result, { executionMode: 'rebuild', status: 'installed', nodeId: id });
+        assert.deepEqual(frames.map(([, action]) => action), ['preflight', 'prepare-packages', 'preflight', 'prepare', 'check', 'install', 'verify']);
+        assert.deepEqual([update.status, update.indexes.length, model.aptWrites], [0, 6, 1]);
+        assert.deepEqual(model.effects, ['enter', 'update', 'reload', 'apt', 'reload', 'reload']);
+        assert.deepEqual(model.afterUpdate.filter(step => step === 'install'), ['install']);
+        assert.ok(host.packages.every(name => Object.hasOwn(model.installed, name)));
+        assert.deepEqual(model.quiet, { 'xl2tpd.service': 'generated', 'strongswan-starter.service': 'disabled', 'nftables.service': 'disabled' });
+        assert.deepEqual([events, f.states.map(row => [row.status, row.backupId]), f.users.map(row => row.syncStatus)],
+            [['commit', 'commit'], [['installed', reserved]], ['synced']]);
+        assert.equal(f.lockHeld, false);
+        assert.equal(host.read(receipt).phase, 'ready');
+        assert.equal(host.read(`${vault}/${reserved}/manifest.json`).phase, 'installed');
+        assert.equal(host.exists(pending), false);
+    });
+}
+
 function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
     const { Client } = require('ssh2');
     const { EventEmitter } = require('node:events');

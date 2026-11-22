@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ CTL = ('/usr/bin/systemctl', '--system', '--no-pager', '--no-ask-password', '--f
 APT = ('/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL=C',
        'DEBIAN_FRONTEND=noninteractive', 'UCF_FORCE_CONFFOLD=1', f'APT_CONFIG=/proc/{os.getpid()}/fd/7',
        '/usr/bin/apt-get')
+APT_UPDATE = APT + ('--error-on=any', 'update')
 APT_INSTALL = APT + ('-y', '--no-install-recommends', '--no-install-suggests', '--no-remove', '--no-upgrade',
                      'install', 'xl2tpd=1')
 
@@ -306,6 +308,124 @@ class Adapter(unittest.TestCase):
         self.assertTrue((self.vault / self.h['PACKAGE_PENDING']).exists())
         self.assertEqual(len(self.effects), 1)
 
+    def test_protected_update_then_install_settles(self):
+        proof = self.offered()
+        calls = []
+
+        def child(argv, end, cap, *, may_write):
+            self.assertTrue(may_write)
+            self.assertTrue(time.monotonic() < end <= self.h['DEADLINE'])
+            self.assertEqual(cap, self.h['PACKAGE_MAX_OUTPUT'])
+            self.assertTrue((self.vault / self.h['PACKAGE_PENDING']).is_file())
+            calls.append(argv)
+            return 0, b'', b''
+
+        def prepare(root, run, expected, enter):
+            enter()
+            self.assertEqual(run(APT_UPDATE, 20), (0, b'', b''))
+            self.assertTrue(run.update_settled)
+            self.assertFalse(run.apt_dispatched or run.apt_settled)
+            self.assertEqual(run(APT_INSTALL, 78), (0, b'', b''))
+
+        self.h['bounded_status'] = child
+        self.h['C3_PACKAGE_GUARD']['prepare'] = prepare
+        self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof),
+                         (0, f'{{"ok":true,"backupId":"{TOKEN}","packagesReady":true}}\n', ''))
+        self.assertEqual(calls, [APT_UPDATE, APT_INSTALL])
+
+    def test_update_without_install_cannot_publish_ready(self):
+        proof = self.offered()
+        completed = []
+
+        def prepare(root, run, expected, enter):
+            enter()
+            completed.append(run(APT_UPDATE, 20))
+
+        self.h['bounded_status'] = lambda *a, **kw: (0, b'', b'')
+        self.h['C3_PACKAGE_GUARD']['prepare'] = prepare
+        self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', ''))
+        self.assertEqual(completed, [(0, b'', b'')])
+        self.assertTrue((self.vault / self.h['PACKAGE_PENDING']).is_file())
+
+    def test_update_consumes_the_same_absolute_deadline_as_install(self):
+        proof = self.offered()
+        deadline = self.h['DEADLINE']
+        now = deadline - 115 + 80  # Count elapsed receiver time; selection cannot restart the clock.
+        calls = []
+
+        def child(argv, end, cap, *, may_write):
+            nonlocal now
+            calls.append((argv, end - now, may_write))
+            now = now + 70 if argv == APT_UPDATE else end
+            return 0, b'', b''  # The install's zero status arrives at the clipped deadline.
+
+        def prepare(root, run, expected, enter):
+            enter()
+            run(APT_UPDATE, 78)
+            run(APT_INSTALL, 78)
+
+        self.h.update(time=SimpleNamespace(monotonic=lambda: now), bounded_status=child)
+        self.h['C3_PACKAGE_GUARD']['prepare'] = prepare
+        self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', ''))
+        self.assertEqual(calls, [(APT_UPDATE, 78, True), (APT_INSTALL, 60, True)])
+        self.assertEqual(self.h['DEADLINE'], deadline)
+        self.assertTrue((self.vault / self.h['PACKAGE_PENDING']).is_file())
+
+    def test_update_admission_rejects_wrong_shape_phase_and_replay(self):
+        malformed = (APT_UPDATE[7:], APT + ('update',), APT_UPDATE + ('-q',),
+                     (*APT_UPDATE[:6], 'APT_CONFIG=/etc/apt/apt.conf', *APT_UPDATE[7:]))
+        cases = ([(False, (), APT_UPDATE)] + [(True, (), argv) for argv in malformed] +
+                 [(True, (argv,), APT_UPDATE) for argv in (APT_UPDATE, APT_INSTALL)])
+        for entered, prior, attempt in cases:
+            with self.subTest(entered=entered, prior=prior, attempt=attempt):
+                calls = []
+                self.h['bounded_status'] = lambda argv, *a, **kw: (calls.append(argv) or 0, b'', b'')
+                run = self.h['PackageRunner']()
+                run.entered = entered
+                for argv in prior:
+                    self.assertEqual(run(argv, 20)[0], 0)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run(attempt, 20)
+                self.assertTrue(run.failed)
+                self.assertEqual(calls, list(prior))
+                self.assertEqual(run.remaining, self.h['PACKAGE_MAX_COMMANDS'] - len(prior))
+
+    def test_failed_update_blocks_install_and_publication_even_if_swallowed(self):
+        for status, second in ((100, APT_INSTALL), (100, APT_UPDATE), (0, APT_INSTALL), (-15, APT_INSTALL),
+                               (None, CTL + ('daemon-reload',))):
+            with self.subTest(status=status, second=second), tempfile.TemporaryDirectory(dir=self.root) as temp:
+                self.vault = Path(temp) / 'vault'
+                self.h['VAULT'] = str(self.vault)
+                proof = self.offered()
+                calls, outcomes = [], []
+
+                def child(argv, end, cap, *, may_write):
+                    self.assertTrue(may_write)
+                    calls.append(argv)
+                    if status is None:
+                        raise subprocess.TimeoutExpired(argv, 20, output=b'synthetic-private')
+                    return status, b'synthetic-private', b'synthetic-private'
+
+                def prepare(root, run, expected, enter):
+                    enter()
+                    try:
+                        code = run(APT_UPDATE, 20)[0]
+                    except subprocess.TimeoutExpired:
+                        code = None
+                    outcomes.append((code, run.failed, run.update_dispatched, run.update_settled))
+                    try:
+                        run(second, 20)
+                    except subprocess.TimeoutExpired:
+                        outcomes.append((run.failed, run.apt_dispatched, run.apt_settled))
+
+                self.h['bounded_status'] = child
+                self.h['C3_PACKAGE_GUARD']['prepare'] = prepare
+                self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', ''))
+                self.assertEqual(calls, [APT_UPDATE])
+                first = (status, False) if status in (0, 100) else (None, True)
+                self.assertEqual(outcomes, [(*first, True, False), (True, False, False)])
+                self.assertTrue((self.vault / self.h['PACKAGE_PENDING']).is_file())
+
     def test_observer_cannot_dispatch_and_budget_is_shared(self):
         calls = []
         self.h.update(bounded_status=lambda *args, **kwargs: (calls.append(args[0]) or 0, b'', b''),
@@ -316,13 +436,10 @@ class Adapter(unittest.TestCase):
             run(APT + ('-s', 'check'), 6)
             return self.plan
 
-        def mutate(root, run):
-            run(CTL + ('daemon-reload',), 12)
-            self.fail('observer could launch a manager writer')
-
-        guard['observe'] = mutate
-        self.assertEqual(self.wire('preflight'), (75, '', ''))
-        self.assertFalse(calls)
+        for writer in (CTL + ('daemon-reload',), APT_UPDATE):
+            guard['observe'] = lambda root, run: run(writer, 12)
+            self.assertEqual(self.wire('preflight'), (75, '', ''))
+            self.assertFalse(calls)
         guard['observe'] = observe
         proof = self.offered()
         calls.clear()
@@ -337,7 +454,9 @@ class Adapter(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertFalse(self.effects)
 
-    def prepare_with_real_guard(self, host, *, preflight_calls):
+    def prepare_with_real_guard(self, host, *, preflight_calls, empty_indexes=False):
+        if empty_indexes:
+            host.p('/var/lib/apt/lists/deb.debian.org_debian_dists_trixie_InRelease').unlink()
         self.system = host.p(SYSTEM)
         pending = self.vault / self.h['PACKAGE_PENDING']
         receipt = self.vault / f'packages-{TOKEN}.json'
@@ -353,9 +472,12 @@ class Adapter(unittest.TestCase):
 
         def child_status(argv, end, maximum, *, may_write):
             self.assertEqual(maximum, 256 * 1024)
-            self.assertTrue(time.monotonic() < end <= deadline)
+            selected = deadline if len(runners) == 1 else deadline - 115 + 210
+            self.assertEqual(self.h['DEADLINE'], selected)
+            self.assertTrue(time.monotonic() < end <= selected)
             apt = argv[7:9] == ('/usr/bin/apt-get', '-y')
-            self.assertEqual(may_write, apt or argv == CTL + ('daemon-reload',))
+            update = argv[7:] == APT_UPDATE[7:]
+            self.assertEqual(may_write, apt or update or argv == CTL + ('daemon-reload',))
             if may_write:
                 self.assertTrue(runners[-1].entered)
                 if not writes:
@@ -364,13 +486,15 @@ class Adapter(unittest.TestCase):
                     self.assertEqual((intent['phase'], intent['packagePreparation']), ('preparing', proof))
                     with self.h['directory'](str(self.system)) as fd, self.assertRaises(BlockingIOError):
                         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                    # The actual guard has already created its owned artifacts.
-                    # Record the verified grant for the command model's ordering assertions.
+                    # The first writer is the refresh on an empty cache, or the
+                    # reload with containment already in place otherwise.
                     host.effects.append('enter')
-                writes.append('apt' if apt else 'reload')
-            if apt:
+                writes.append('update' if update else 'apt' if apt else 'reload')
+            if apt or update:
                 self.assertTrue(77 < end - time.monotonic() <= 78)
-            return host.run(argv, 78 if apt else 6)
+            if apt:
+                self.assertEqual(runners[-1].update_settled, empty_indexes)
+            return host.run(argv, 78 if apt or update else 6)
 
         def child_run(argv, **_):
             self.assertEqual(argv[:3], ('/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}'))
@@ -392,16 +516,26 @@ class Adapter(unittest.TestCase):
             self.assertEqual(configured_limit - runners[0].remaining, preflight_calls)
             self.assertEqual(len(host.calls), preflight_calls)
             self.assertEqual(host.effects, [])
+            if empty_indexes:
+                self.assertFalse(any(argv[0] == '/usr/bin/env' for argv in host.calls))
             result = self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof)
         # The initial missing-package probes are outside both counters.
         self.assertEqual(probes, list(until_missing) * 2)
         self.assertEqual(len(runners), 2)
-        self.assertEqual(writes, ['reload', 'apt', 'reload', 'reload'])
+        self.assertEqual(writes, (['update'] if empty_indexes else []) + ['reload', 'apt', 'reload', 'reload'])
+        if empty_indexes:
+            prepared = host.calls[preflight_calls:]
+            first_apt = next(i for i, argv in enumerate(prepared) if argv[0] == '/usr/bin/env')
+            self.assertEqual(first_apt, 2 * preflight_calls)  # Two re-observations, neither with a solver.
+            apt_calls = [a[7:] for a in prepared if a[0] == '/usr/bin/env']
+            self.assertEqual(apt_calls[:2], [APT_UPDATE[7:], ('/usr/bin/apt-get', '-s', 'check')])
+            self.assertEqual(sum(a[0] == '/usr/bin/apt-cache' for a in apt_calls), 2 * len(host.candidates))
         self.assertEqual(host.effects, ['enter', *writes])
         self.assertEqual(host.apt_count, 1)
-        self.assertFalse(runners[0].failed)
+        self.assertFalse(runners[0].entered or runners[0].failed or runners[0].update_dispatched)
         run = runners[1]
         self.assertTrue(run.entered and run.apt_dispatched and run.apt_settled)
+        self.assertEqual((run.update_dispatched, run.update_settled), (empty_indexes, empty_indexes))
         self.assertEqual(configured_limit - run.remaining, len(host.calls) - preflight_calls)
         return result, run, receipt, pending
 
@@ -417,12 +551,19 @@ class Adapter(unittest.TestCase):
         self.assertFalse(any(self.root.rglob('.relay-package-*')))
 
     def test_real_guard_historical_clean_plan_fits_runner_budget(self):
+        self.assert_historical_clean_plan(empty_indexes=False, preflight_calls=46, prepare_calls=258)
+
+    def test_real_guard_empty_indexes_historical_plan_fits_runner_budget(self):
+        self.assert_historical_clean_plan(empty_indexes=True, preflight_calls=32, prepare_calls=277)
+
+    def assert_historical_clean_plan(self, *, empty_indexes, preflight_calls, prepare_calls):
         host = Host(self, self.root)
         host.stock_solver()
         self.assertEqual(len(host.candidates), 12)
         survivor = host.link(SYSTEM + '/multi-user.target.wants/operator.service', '/opt/operator.service')
         expected = host.installed | {n: (v, a) for n, (v, a, _) in host.candidates.items()}
-        self.assert_real_guard_ready(host, self.prepare_with_real_guard(host, preflight_calls=46), prepare_calls=258)
+        attempt = self.prepare_with_real_guard(host, preflight_calls=preflight_calls, empty_indexes=empty_indexes)
+        self.assert_real_guard_ready(host, attempt, prepare_calls=prepare_calls)
         self.assertEqual(host.installed, expected)
         self.assertEqual(survivor.readlink(), Path('/opt/operator.service'))
         for name in ('strongswan-starter.service', 'nftables.service'):
@@ -459,11 +600,24 @@ class Adapter(unittest.TestCase):
         self.assertEqual(attempt[1].remaining, 0)
 
     def test_real_guard_exhausted_budget_retains_pending(self):
+        self.assert_real_guard_one_short(empty_indexes=False, preflight_calls=86, prepare_calls=391)
+
+    def test_real_guard_empty_indexes_max_plan_fits_runner_budget(self):
         host = self.max_plan_host()
-        self.h['PACKAGE_MAX_COMMANDS'] -= 1  # Deny the very last readback in the same full path.
-        result, run, receipt, pending = self.prepare_with_real_guard(host, preflight_calls=86)
+        attempt = self.prepare_with_real_guard(host, preflight_calls=36, empty_indexes=True)
+        self.assert_real_guard_ready(host, attempt, prepare_calls=378)
+        self.assertEqual(attempt[1].remaining, 13)
+
+    def test_real_guard_empty_indexes_one_short_retains_pending(self):
+        self.assert_real_guard_one_short(empty_indexes=True, preflight_calls=36, prepare_calls=378)
+
+    def assert_real_guard_one_short(self, *, empty_indexes, preflight_calls, prepare_calls):
+        host = self.max_plan_host()
+        self.h['PACKAGE_MAX_COMMANDS'] = prepare_calls - 1  # Deny only the final readback of this path.
+        result, run, receipt, pending = self.prepare_with_real_guard(host, preflight_calls=preflight_calls,
+                                                                   empty_indexes=empty_indexes)
         self.assertEqual((result, run.remaining, run.failed), ((75, '', ''), 0, True))
-        self.assertEqual(len(host.calls) - 86, 390)
+        self.assertEqual(len(host.calls) - preflight_calls, prepare_calls - 1)
         self.assertEqual(host.calls[-1], ('/usr/bin/dpkg', '--audit'))
         self.assertEqual(receipt.read_bytes(), pending.read_bytes())
         intent = json.loads(pending.read_bytes())

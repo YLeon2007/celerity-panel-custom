@@ -6,10 +6,12 @@ Install. Synthetic init/defaults/generator bytes have test-only stock pins;
 manager properties, file generations, manifests and frame checks are not
 bypassed. The checked-in generated wrapper is used byte-for-byte.
 """
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 import unittest
@@ -23,6 +25,59 @@ INIT = '#!/bin/sh\nexit 0\n'
 GENERATOR = 'synthetic generator identity; never executed\n'
 GENERATOR_PATH = '/usr/lib/systemd/system-generators/systemd-sysv-generator'
 LNS = '; synthetic package conffile\n[global]\n'
+LISTS = '/var/lib/apt/lists'
+KEYRING = '/usr/share/keyrings/debian-archive-keyring.gpg'
+APT_UPDATE = ('/usr/bin/apt-get', '--error-on=any', 'update')
+REPOSITORIES = (('deb.debian.org/debian', 'trixie'), ('deb.debian.org/debian', 'trixie-updates'),
+                ('deb.debian.org/debian-security', 'trixie-security'))
+INDEXES = [f'{uri.replace("/", "_")}_dists_{suite}_{target}' for uri, suite in REPOSITORIES
+           for target in ('InRelease', 'main_binary-amd64_Packages')]
+
+
+def isolated_apt_config(argv, *, update):
+    # Read only this process's live memfds, never the host's APT files.
+    def sealed_text(path):
+        assert re.fullmatch(rf'/proc/{os.getpid()}/fd/[0-9]+', path), path
+        with Path(path).open() as stream:
+            seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+            assert fcntl.fcntl(stream, fcntl.F_GET_SEALS) & seals == seals
+            return stream.read()
+
+    assert argv[:6] == ('/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL=C',
+                         'DEBIAN_FRONTEND=noninteractive', 'UCF_FORCE_CONFFOLD=1')
+    assert argv[6].startswith('APT_CONFIG=')
+    config = sealed_text(argv[6].split('=', 1)[1])
+    expected = {
+        **dict.fromkeys(('Dir::Etc::Parts', 'Dir::Etc::Main', 'Dir::Etc::sourceparts', 'Dir::Etc::preferencesparts',
+                         'Dir::Etc::netrc', 'Dir::Etc::netrcparts', 'Dir::Etc::trustedparts'), '/dev/null'),
+        'Dir::Etc::trusted': KEYRING, 'Dir::State::lists': LISTS + '/',
+        'Dir::Cache::pkgcache': '', 'Dir::Cache::srcpkgcache': '', 'APT::Architecture': 'amd64',
+        'APT::Get::AllowUnauthenticated': 'false', 'Acquire::AllowInsecureRepositories': 'false',
+        'Acquire::AllowWeakRepositories': 'false', 'Acquire::AllowDowngradeToInsecureRepositories': 'false',
+        'Acquire::Check-Valid-Until': 'true', 'Acquire::Languages': 'none', 'KeepCompressed': 'false',
+        'Acquire::http::AllowRedirect': 'false', 'Acquire::https::AllowRedirect': 'false',
+    }
+
+    def option(key):
+        values = re.findall(rf'^\s*{re.escape(key)} "([^"\n]*)";$', config, re.M)
+        assert len(values) == 1, key
+        return values[0]
+
+    assert {key: option(key) for key in expected} == expected
+    assert '#clear APT::Update;\n' in config
+    source_path, prefs = option('Dir::Etc::sourcelist'), option('Dir::Etc::preferences')
+    sources = sealed_text(source_path)
+    if prefs != '/dev/null':
+        sealed_text(prefs)  # The stock plan model below may read only this validated carrier.
+    assert sources == ''.join(f'deb [signed-by={KEYRING} inrelease-path=InRelease] http://{uri} {suite} main\n'
+                              for uri, suite in REPOSITORIES)
+    no_dpkg = 'Dir::Bin::dpkg "/dev/null";\n'
+    assert config.count(no_dpkg) == int(update)
+    # Ignore only the live descriptor names, version pins and update's dpkg
+    # prohibition. All other settings plus the complete sources must match.
+    normalized = config.replace(no_dpkg, '').replace(source_path, '<sources>').replace(
+        f'Dir::Etc::preferences "{prefs}";', 'Dir::Etc::preferences "<pins>";')
+    return hashlib.sha256((normalized + sources).encode()).hexdigest(), prefs
 
 
 def sums(text):
@@ -31,6 +86,36 @@ def sums(text):
 
 
 class JoinedPackages(Host):
+    def listed_indexes(self):
+        return sorted(p.name for p in self.p(LISTS).iterdir() if p.name not in {'lock', 'partial', 'auxfiles'})
+
+    def update(self, scenario):
+        # Only the native child result and its index files are simulated.
+        # A failed mirror/missing index can leave other suites downloaded.
+        assert not self.listed_indexes()
+        assert not self.p(POLICY).exists()
+        self.effects.append('update')
+        if scenario == 'package-stock-empty-untrusted':
+            return 100, b'', b'E: The repository is not signed.\n'
+        for i, (_, suite) in enumerate(REPOSITORIES):
+            release, packages = INDEXES[2 * i:2 * i + 2]
+            payload = f'Package: fixture-{suite}\nVersion: 1\nArchitecture: amd64\n\n'
+            checksum = hashlib.sha256(payload.encode()).hexdigest()
+            self.put(f'{LISTS}/{release}', '-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nOrigin: Debian\n'
+                     f'Codename: {suite}\nArchitectures: amd64\nSHA256:\n'
+                     f' {checksum} {len(payload)} main/binary-amd64/Packages\n'
+                     '-----BEGIN PGP SIGNATURE-----\nmocked APT authentication\n-----END PGP SIGNATURE-----\n')
+            if suite != 'trixie-security' or scenario in ('package-stock-empty-ok', 'package-stock-empty-tampered'):
+                # KeepCompressed=false: unlike stock .lz4 lists, this is the
+                # exact uncompressed target named in the signed checksum.
+                if suite == 'trixie-security' and scenario == 'package-stock-empty-tampered':
+                    payload = payload.replace('fixture-', 'corrupt-')  # same byte length and target name
+                self.put(f'{LISTS}/{packages}', payload)
+        if scenario == 'package-stock-empty-acquisition':
+            return 100, b'', b'E: Failed to fetch trixie-security Packages\n'
+        assert scenario in ('package-stock-empty-ok', 'package-stock-empty-incomplete', 'package-stock-empty-tampered')
+        return 0, b'Reading package lists...\n', b''
+
     def native_exec(self, package):
         if package == 'strongswan-starter':
             return '/usr/sbin/ipsec start --nofork'
@@ -52,6 +137,7 @@ class JoinedPackages(Host):
 def attach(root, state, scenario, h, request, assert_host_lock):
     model = JoinedPackages(unittest.TestCase(), root, seed=False)
     ledger = state['packageModel']
+    empty = scenario.startswith('package-stock-empty-')
     model.installed = {n: tuple(v) for n, v in ledger['installed'].items()}
     model.apt_count = ledger['aptWrites']
     model.effects = ledger['effects']
@@ -84,15 +170,17 @@ def attach(root, state, scenario, h, request, assert_host_lock):
         try:
             assert maximum == h['PACKAGE_MAX_OUTPUT'] and time.monotonic() < end <= h['DEADLINE']
             assert request['action'] in ('preflight', 'prepare-packages')
-            if argv[0] == '/usr/bin/env':
-                _, mode = argv[7:9]
-                assert may_write == (mode == '-y')
+            suffix = argv[7:] if argv[0] == '/usr/bin/env' else ()
+            update = suffix == APT_UPDATE
+            mode = suffix[1] if suffix else ''
+            if suffix:
+                assert may_write == (update or mode == '-y')
                 if not may_write:
                     ledger['aptReads'][request['action']] = ledger['aptReads'].get(request['action'], 0) + 1
+            token = request.get('backupId')
             if may_write:
                 assert request['action'] == 'prepare-packages'
                 assert_host_lock()
-                token = request['backupId']
                 vault = root / h['VAULT'][1:]
                 pending = json.loads((vault / h['PACKAGE_PENDING']).read_bytes())
                 assert pending == json.loads((vault / f'packages-{token}.json').read_bytes())
@@ -102,14 +190,31 @@ def attach(root, state, scenario, h, request, assert_host_lock):
                 if not model.effects:
                     # The real PackageRunner allowed this writer only after
                     # its checked enter(), with both durable intents visible.
-                    assert argv[-1] == 'daemon-reload'
+                    assert (update if empty else argv[-1] == 'daemon-reload')
                     model.effects.append('enter')
+            if empty and suffix:
+                config, prefs = isolated_apt_config(argv, update=update)
+                if update:
+                    assert prefs == '/dev/null' and not ledger['updates']
+                    response = model.update(scenario)
+                    ledger['updates'].append({'action': request['action'], 'backupId': token, 'status': response[0],
+                                              'argv': suffix, 'configDigest': config, 'indexes': model.listed_indexes()})
+                    return response
+                assert len(ledger['updates']) == 1 and ledger['updates'][0]['status'] == 0
+                assert model.listed_indexes() == sorted(INDEXES), 'APT used incomplete indexes'
+                assert config == ledger['updates'][0]['configDigest'], 'APT configuration changed after update'
+                step = ('check' if suffix == ('/usr/bin/apt-get', '-s', 'check') else
+                        'metadata' if mode == 'show' else 'install' if mode == '-y' else 'simulate')
+                checks = ledger['afterUpdate']
+                if step == 'install':
+                    assert 'check' in checks and 'simulate' in checks and 'metadata' in checks
+                checks.append(step)
             response = model.run(argv, round(end - time.monotonic()))
             ledger['aptWrites'] = model.apt_count
             ledger['installed'] = model.installed
             return response
         except Exception as error:
-            state.setdefault('faults', []).append([type(error).__name__, list(argv)])
+            state.setdefault('faults', []).append([type(error).__name__, list(argv), str(error)])
             raise
 
     h['bounded_status'] = run
@@ -157,4 +262,15 @@ if __name__ == '__main__':
         model.p(SYSTEM + '/multi-user.target.wants/strongswan-starter.service').unlink()
     if scenario == 'package-stock-foreign':
         model.link('/run/systemd/system/strongswan-starter.service', '/opt/fixture-operator.service')
-    print(json.dumps(dict(installed=model.installed, aptReads={}, aptWrites=0, effects=[], quiet={})))
+    ledger = dict(installed=model.installed, aptReads={}, aptWrites=0, effects=[], quiet={})
+    if scenario.startswith('package-stock-empty-'):
+        for name in model.listed_indexes():
+            model.p(f'{LISTS}/{name}').unlink()
+        for name in ('partial', 'auxfiles'):
+            model.p(f'{LISTS}/{name}').mkdir(mode=0o700)
+        model.put('/etc/apt/apt.conf.d/99-operator', 'APT::Get::AllowUnauthenticated "true";\n')
+        model.put('/etc/apt/sources.list', '# operator comment, not an active source\n')
+        suffix = '.list' if scenario == 'package-stock-empty-foreign-source' else '.list.disabled'
+        model.put('/etc/apt/sources.list.d/operator' + suffix, 'deb https://fixture.invalid/vendor trixie main\n')
+        ledger.update(updates=[], afterUpdate=[])
+    print(json.dumps(ledger))

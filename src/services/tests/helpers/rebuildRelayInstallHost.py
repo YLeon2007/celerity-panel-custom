@@ -23,7 +23,7 @@ line = sys.stdin.buffer.readline()
 command_line = shlex.split(json.loads(line))
 wire = sys.stdin.buffer.read()
 request = json.loads(wire)
-timeout = ['1s', '9s'] if request['action'] == 'session-count' else ['4s', '125s']
+timeout = {'session-count': ['1s', '9s'], 'prepare-packages': ['4s', '220s']}.get(request['action'], ['4s', '125s'])
 assert command_line[:-1] == ['/usr/bin/timeout', '-k', *timeout, '/usr/bin/python3', '-I', '-B', '-c']
 state_path = root / 'manager.json'
 s = json.loads(state_path.read_text())
@@ -580,13 +580,42 @@ def modeled_empty_revoke(request, blocked, chap, path, manifest, xl):
     return {'sessionsTerminated': 0, 'complete': True}
 
 
+def model_package_timing(package_model):
+    # Advance only the two host/model clocks; the packed guard and runner
+    # still do their ordinary admission, writes, and readback.
+    started = h['DEADLINE'] - 115
+    now = started + 3
+    package_model.time = h['time'] = SimpleNamespace(monotonic=lambda: now)
+    child_status = h['bounded_status']
+    apt_calls = []
+
+    def timed_child(argv, end, maximum, *, may_write=False):
+        nonlocal now
+        suffix = argv[7:] if argv[0] == '/usr/bin/env' and may_write else ()
+        if suffix:
+            assert end - now == 78, 'APT child ceiling was clipped'
+            apt_calls.append(suffix[1])
+        result = child_status(argv, end, maximum, may_write=may_write)
+        now += 77.75 if suffix else 0.125
+        return result
+
+    def check():
+        assert apt_calls == ['--error-on=any', '-y'] and 2 * 78 < now - started < 210
+
+    h['bounded_status'] = timed_child
+    return check
+
 h.update(os=LocalOS(), open=modeled_open,
          subprocess=SimpleNamespace(run=modeled_run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired))
+check_package_timing = None
 if package_stock:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import rebuildRelayInstallPackageModel as package_model
     sys.path.pop(0)
     packages = package_model.attach(root, s, scenario, h, request, assert_host_lock)
+
+    if scenario == 'package-stock-empty-ok' and request['action'] == 'prepare-packages':
+        check_package_timing = model_package_timing(package_model)
 
     def package_stock_conffiles():
         assert 'xl2tpd' in packages.installed
@@ -625,6 +654,8 @@ try:
     sys.stdin = io.TextIOWrapper(io.BytesIO(wire))
     status = h['main']()
     if package_stock and status == 0 and request['action'] == 'prepare-packages':
+        if check_package_timing is not None:
+            check_package_timing()
         package_model.readback(packages, s)
 finally:
     s['sockets'] = sockets()

@@ -13,6 +13,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,8 @@ class Host:
         self.calls, self.effects = [], []
         self.apt_count = 0
         self.apt_mode = 'ok'
+        self.update_mode = 'ok'
+        self.after_update = lambda: None
         self.error_stage: str | None = None
         self.active = self.enabled = self.listener = self.job = self.process = self.bad_audit = False
         self.broken = False
@@ -242,12 +245,12 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         self.t.assertIn('APT::Get::AllowUnauthenticated "false";', config)
         self.t.assertIn('Acquire::AllowInsecureRepositories "false";', config)
         self.t.assertIn('Dir::Cache::pkgcache "";', config)
-        self.t.assertIn('Dir::Etc::Parts "";', config)
+        self.t.assertIn('Dir::Etc::Parts "/dev/null";', config)
         source_match = re.search(r'Dir::Etc::sourcelist "([^"]+)";', config)
         assert source_match is not None
         src = Path(source_match[1]).read_text()
-        self.t.assertIn('deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] '
-                        'http://deb.debian.org/debian trixie main\n', src)
+        self.t.assertRegex(src, r'deb \[signed-by=/usr/share/keyrings/debian-archive-keyring.gpg[^\n]*\] '
+                           r'http://deb\.debian\.org/debian trixie main\n')
         program, *args = argv[7:]
         if program == '/usr/bin/apt-cache':
             self.t.assertEqual(len(args), 2)
@@ -260,6 +263,8 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
                        f'SHA256: {hashlib.sha256(name.encode()).hexdigest()}\nDescription: fixture\n'
                        ' multiline comment\n\n').encode(), b''
         self.t.assertEqual(program, '/usr/bin/apt-get')
+        if args == ['--error-on=any', 'update']:
+            return self._update(config, src)
         if args == ['-s', 'check']:
             return (100, b'', b'Unmet dependencies') if self.broken else (0, b'Reading package lists...\n', b'')
         self.t.assertEqual(args[1:6], ['--no-install-recommends', '--no-install-suggests', '--no-remove',
@@ -291,7 +296,7 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         self.t.assertEqual(args[0], '-y')
         self.t.assertEqual(timeout, 78)
         self.t.assertNotEqual(prefs, '/dev/null')
-        self.t.assertEqual(self.effects[:2], ['enter', 'reload'])
+        self.t.assertEqual([effect for effect in self.effects if effect != 'update'][:2], ['enter', 'reload'])
         self.effects.append('apt')
         self.apt_count += 1
         self.containment()
@@ -303,6 +308,41 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
             return -15, b'', b''
         self._install()
         return 0, b'Setting up xl2tpd ...\n', b'invoke-rc.d: policy-rc.d denied execution of start.\n'
+
+    def _update(self, config, src):
+        self.t.assertEqual(self.effects, ['enter'])
+        self.effects.append('update')
+        self.t.assertFalse(self.p(POLICY).exists())
+        self.t.assertFalse(any(self.p(f'{SYSTEM}/{unit}').is_symlink() for unit in g.UNITS))
+        for setting in ('Dir::Etc::Main "/dev/null";', 'Dir::Etc::sourceparts "/dev/null";',
+                        'Acquire::http::AllowRedirect "false";', 'Acquire::https::AllowRedirect "false";',
+                        '#clear APT::Update;', 'Dir::State::lists "/var/lib/apt/lists/";'):
+            self.t.assertIn(setting, config)
+        self.t.assertIn('inrelease-path=InRelease', src)
+        if self.update_mode == 'timeout':
+            raise subprocess.TimeoutExpired((), 1)
+        self.p('/var/lib/apt/lists/auxfiles').mkdir(exist_ok=True)
+        self.p('/var/lib/apt/lists/auxfiles').chmod(0o755)
+        for uri, suite in re.findall(r'\] https?://([^ ]+) ([a-z-]+) main\n', src):
+            base = '/var/lib/apt/lists/' + uri.replace('/', '_') + '_dists_' + suite
+            payload = 'Package: fixture\nVersion: 1\nArchitecture: amd64\n\n'
+            checksum = hashlib.sha256(payload.encode()).hexdigest()
+            release = ('-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nOrigin: Debian\n'
+                       f'Codename: {suite}\nSHA256:\n {checksum} {len(payload)} main/binary-amd64/Packages\n'
+                       '-----BEGIN PGP SIGNATURE-----\nfixture\n-----END PGP SIGNATURE-----\n')
+            self.put(base + ('_Release' if self.update_mode == 'unsigned' else '_InRelease'), release)
+            if suite != 'trixie-security' or self.update_mode != 'partial':
+                contents = {'empty': '', 'tampered': payload.replace('fixture', 'corrupt')}.get(self.update_mode, payload)
+                self.put(base + '_main_binary-amd64_Packages', contents)
+        self.after_update()
+        if self.update_mode == 'bad-signature':
+            return 100, b'', b'The following signatures were invalid'
+        if self.update_mode == 'warning':
+            return 0, b'', b'W: failed to fetch'
+        if self.update_mode == 'staged':
+            self.put('/var/lib/apt/lists/partial/incomplete', 'staged fixture')
+            self.p('/var/lib/apt/lists/partial').chmod(0o700)
+        return 0, b'Reading package lists...\n', b''
 
     def run(self, argv, timeout):
         self.t.assertIs(type(argv), tuple)
@@ -367,6 +407,88 @@ class TestPackageGuard(unittest.TestCase):
     def no_apt(self):
         self.no_effects()
         self.assertFalse(any('/usr/bin/apt-get' in a or '/usr/bin/apt-cache' in a for a in self.h.calls))
+
+    def empty_indexes(self):
+        self.h.p('/var/lib/apt/lists/deb.debian.org_debian_dists_trixie_InRelease').unlink()
+
+    def test_empty_lists_only_update_after_enter_then_use_normal_plan_and_readback(self):
+        self.empty_indexes()
+        source = self.h.p('/etc/apt/sources.list.d/debian.sources')
+        before = source.read_bytes(), source.stat().st_mtime_ns
+        proof = self.observe()
+        self.assertEqual(proof['missing'], SIX)
+        self.no_apt()
+        self.assertEqual([p.name for p in self.h.p('/var/lib/apt/lists').iterdir()], ['lock'])
+        self.assertIsNone(self.prepare(proof))
+        self.assertEqual(self.h.effects, ['enter', 'update', 'reload', 'apt', 'reload', 'reload'])
+        apt = [a[7:] for a in self.h.calls if a[0] == '/usr/bin/env']
+        self.assertEqual(apt[0], ('/usr/bin/apt-get', '--error-on=any', 'update'))
+        self.assertEqual(apt[1], ('/usr/bin/apt-get', '-s', 'check'))
+        self.assertEqual(apt.count(apt[0]), 1)
+        self.assertEqual((source.read_bytes(), source.stat().st_mtime_ns), before)
+        self.assertFalse(self.h.p(POLICY).exists())
+        self.assertEqual(self.observe()['missing'], [])
+
+    def test_empty_lists_bootstrap_proof_binds_source_bytes_before_enter(self):
+        self.empty_indexes()
+        proof = self.observe()
+        source = self.h.p('/etc/apt/sources.list.d/debian.sources')
+        source.write_text(source.read_text() + '\n# another comment\n')
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_PLAN_CHANGED'):
+            self.prepare(proof)
+        self.no_apt()
+
+    def test_empty_lists_bad_or_incomplete_update_never_plans(self):
+        for mode in ('timeout', 'bad-signature', 'warning', 'unsigned', 'partial', 'empty', 'tampered', 'staged'):
+            with self.subTest(mode=mode):
+                self.h = Host(self, self.h.root / mode)
+                self.empty_indexes()
+                proof = self.observe()
+                self.h.update_mode = mode
+                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_APT_(UPDATE|INDEXES)'):
+                    self.prepare(proof)
+                self.assertEqual(self.h.effects, ['enter', 'update'])
+                self.assertEqual([a[-1] for a in self.h.calls if a[0] == '/usr/bin/env'], ['update'])
+
+    def test_empty_lists_with_staged_residue_refuse_without_enter(self):
+        self.empty_indexes()
+        self.h.put('/var/lib/apt/lists/partial/stale', 'stale fixture')
+        self.h.p('/var/lib/apt/lists/partial').chmod(0o700)
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_APT_INDEXES'):
+            self.observe()
+        self.no_apt()
+
+    def test_empty_lists_non_index_state_is_rechecked_before_solver(self):
+        for change, code in (('sources', 'PLAN_CHANGED'), ('keyring', 'PLAN_CHANGED'),
+                             ('active', 'UNIT_ACTIVE'), ('installed', 'PLAN_CHANGED')):
+            with self.subTest(change=change):
+                self.h = Host(self, self.h.root / change)
+                self.empty_indexes()
+                proof = self.observe()
+                def drift():
+                    if change == 'sources':
+                        source = self.h.p('/etc/apt/sources.list.d/debian.sources')
+                        source.write_text(source.read_text() + '\n# changed\n')
+                    elif change == 'keyring':
+                        self.h.put('/usr/share/keyrings/debian-archive-keyring.gpg', 'changed')
+                    elif change == 'installed':
+                        self.h.installed['libc6'] = ('2.0-1', 'amd64')
+                        self.h.status()
+                    else:
+                        self.h.active = True
+                self.h.after_update = drift
+                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_' + code):
+                    self.prepare(proof)
+                self.assertEqual(self.h.effects, ['enter', 'update'])
+                self.assertEqual([a[-1] for a in self.h.calls if a[0] == '/usr/bin/env'], ['update'])
+
+    def test_empty_lists_unauthorized_post_fetch_plan_never_installs(self):
+        self.empty_indexes()
+        proof = self.observe()
+        self.h.after_update = lambda: setattr(self.h, 'sim_extra', 'Remv libc6 [1.0-1]\n')
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_APT_PLAN'):
+            self.prepare(proof)
+        self.assertEqual(self.h.effects, ['enter', 'update'])
 
     def test_stock_shaped_success_disables_sysv_and_native_only_after_apt(self):
         proof = self.observe()
@@ -699,6 +821,139 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian
         self.assertFalse(self.h.p(POLICY).exists())
         self.assertEqual([f.name for f in self.h.p(SYSTEM).glob('*.service')], [mask.name])
         self.assertEqual(self.h.apt_count, 0)
+
+
+    def test_bootstrap_apt_config_and_sealed_source_readable_by_exec_child(self):
+        rows, _, _ = g._sources(self.h.root)
+        # Same credentials, separate exec, no inherited descriptors. This
+        # verifies the proc carrier, not APT parsing or privilege dropping.
+        reader = '''
+import fcntl, os, pathlib, re, stat
+def sealed(path):
+    assert stat.S_ISREG(os.stat(path).st_mode)
+    with open(path) as stream:
+        assert fcntl.fcntl(stream, fcntl.F_GET_SEALS) == 15
+        return stream.read()
+config = sealed(os.environ['APT_CONFIG'])
+for key in ('Parts', 'Main', 'sourceparts', 'preferencesparts', 'netrc', 'netrcparts', 'trustedparts'):
+    assert f'Dir::Etc::{key} "/dev/null";' in config
+assert not pathlib.Path('/dev/null').is_file() and not pathlib.Path('/dev/null').is_dir()
+assert 'KeepCompressed "false";' in config and '#clear Acquire::IndexTargets;' in config
+for key in ('sourcelist', 'preferences'):
+    print(sealed(re.search(rf'Dir::Etc::{key} "([^"]+)";', config)[1]), end='')
+'''
+        with g._apt(rows, {'ppp': ('2.5.2-1+1', 'amd64')}, bootstrap=True) as apt:
+            result = subprocess.run(apt + (sys.executable, '-I', '-B', '-c', reader),
+                                    check=True, capture_output=True, close_fds=True, timeout=5)
+        self.assertTrue(result.stdout.startswith(b''.join(
+            f'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg inrelease-path=InRelease] '
+            f'{uri} {suite} main\n'.encode() for uri, suite in rows)))
+        self.assertIn(b'Package: ppp\nPin: version 2.5.2-1+1\n', result.stdout)
+
+    def test_trixie_updates_solver_uses_signed_version_and_suite(self):
+        row = b'tzdata (2026f-0+deb13u1 Debian:13-updates/stable-updates [all])\n'
+        summary = b'0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.\n'
+        data = summary + b'Inst ' + row + b'Conf ' + row
+        self.assertEqual(g._simulation((), lambda *_: (0, data, b''), ['tzdata']),
+                         {'tzdata': ['2026f-0+deb13u1', 'all']})
+        bad = data.replace(b'/stable-updates', b'/stable')
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_APT_PLAN'):
+            g._simulation((), lambda *_: (0, bad, b''), ['tzdata'])
+
+    def test_stock_keyring_alias_binds_link_and_target(self):
+        alias = self.h.p('/usr/share/keyrings/debian-archive-keyring.gpg')
+        target = alias.with_suffix('.pgp')
+        alias.rename(target)
+        alias.symlink_to(target.name)
+        proof = self.observe()  # APT's packaged debian.sources still says .gpg.
+        alias.rename(alias.with_name('old-link'))
+        alias.symlink_to(target.name)
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_PLAN_CHANGED'):
+            self.prepare(proof)
+        proof = self.observe()
+        target.write_bytes(b'changed public keyring fixture')
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_PLAN_CHANGED'):
+            self.prepare(proof)
+        self.no_effects()
+
+    def test_keyring_refuses_other_aliases_and_unsafe_targets(self):
+        alias = self.h.p('/usr/share/keyrings/debian-archive-keyring.gpg')
+        target = alias.with_suffix('.pgp')
+        alias.rename(target)
+        for text in (str(target), './' + target.name, '../keyrings/' + target.name, 'operator.gpg'):
+            with self.subTest(text=text):
+                alias.symlink_to(text)
+                with self.assertRaises(g.Refusal):
+                    self.observe()
+                alias.unlink()
+        alias.symlink_to(target.name)
+        target.chmod(0o666)
+        with self.assertRaises(g.Refusal):
+            self.observe()
+        target.rename(target.with_name('other.pgp'))
+        target.symlink_to('other.pgp')
+        with self.assertRaises(g.Refusal):
+            self.observe()
+        self.no_apt()
+
+    def test_stock_empty_updates_and_security_targets(self):
+        # APT can omit a signed empty uncompressed Packages target even
+        # though its compressed representation is nonempty.
+        for empty in ('missing', 'present', 'wrong-digest', 'wrong-bytes', 'compressed', 'base-missing'):
+            with self.subTest(empty=empty):
+                self.h = Host(self, self.h.root / empty)
+                self.empty_indexes()
+                def stock_targets():
+                    for release in self.h.p('/var/lib/apt/lists').glob('*_InRelease'):
+                        suite = release.name.split('_dists_')[1].removesuffix('_InRelease')
+                        packages = release.with_name(release.name.replace('_InRelease', '_main_binary-amd64_Packages'))
+                        if suite == 'trixie':
+                            if empty == 'base-missing':
+                                packages.unlink()
+                            release.write_text(release.read_text().replace('SHA256:',
+                                'Architectures: all amd64 arm64\nNo-Support-for-Architecture-all: Packages\nSHA256:'))
+                            continue
+                        fields = ('Label: Debian-Security\nSuite: stable-security\n'
+                                  'Components: updates/main updates/non-free-firmware\nArchitectures: amd64 arm64\n'
+                                  if suite == 'trixie-security' else
+                                  'Label: Debian\nSuite: stable-updates\nVersion: 13-updates\n'
+                                  'Architectures: all amd64 arm64\nNo-Support-for-Architecture-all: Packages\n')
+                        digest = '1' * 64 if empty == 'wrong-digest' else hashlib.sha256(b'').hexdigest()
+                        release.write_text(re.sub(r'(?m)^SHA256:\n .*$', fields + 'SHA256:\n'
+                            f' {digest}        0 main/binary-amd64/Packages\n'
+                            ' 0040f94d11d0039505328a90b2ff48968db873e9e7967307631bf40ef5679275'
+                            '       32 main/binary-amd64/Packages.xz', release.read_text()))
+                        if empty == 'present':
+                            packages.write_bytes(b'')
+                        elif empty == 'compressed':
+                            packages.rename(packages.with_suffix('.lz4'))
+                        elif empty != 'wrong-bytes':
+                            packages.unlink()
+                self.h.after_update = stock_targets
+                proof = self.observe()
+                if empty in ('missing', 'present'):
+                    self.assertIsNone(self.prepare(proof))
+                    self.assertEqual(self.h.effects, ['enter', 'update', 'reload', 'apt', 'reload', 'reload'])
+                else:
+                    with self.assertRaisesRegex(g.Refusal, 'PACKAGE_APT_INDEXES'):
+                        self.prepare(proof)
+                    self.assertEqual(self.h.effects, ['enter', 'update'])
+
+    def test_trixie_security_package_main_pool_path(self):
+        # Archived trixie-security main/binary-amd64/Packages record fields.
+        filename = 'pool/updates/main/s/strongswan/strongswan_6.0.1-6+deb13u7_all.deb'
+        def records(leaf):
+            return (f'Package: strongswan\nVersion: 6.0.1-6+deb13u7\nArchitecture: all\n'
+                    f'Filename: {leaf}\nSize: 95460\n'
+                    'SHA256: 40c5a40bdb95f71dc412222aaa061d16cd943bc46b796aa0714e5732cfe1462a\n'
+                    'Depends: charon-systemd | strongswan-charon, strongswan-swanctl | strongswan-starter\n\n').encode()
+        plan = {'strongswan': ['6.0.1-6+deb13u7', 'all']}
+        self.assertEqual(g._metadata((), lambda *_: (0, records(filename), b''), plan, {}, plan)
+                         ['strongswan'][1], filename)
+        for leaf in (filename.replace('/main/', '/contrib/'), filename.replace('/main/', '/main/../'),
+                     filename.replace('/updates/', '/mirror/'), '/' + filename):
+            with self.subTest(leaf=leaf), self.assertRaisesRegex(g.Refusal, 'PACKAGE_DEPENDENCY'):
+                g._metadata((), lambda *_: (0, records(leaf), b''), plan, {}, plan)
 
 
 if __name__ == '__main__':

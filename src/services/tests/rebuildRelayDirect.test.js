@@ -146,6 +146,39 @@ assert len({scope['__name__'] for scope in scopes}) == len(scopes)
     assert.deepEqual(outcome, [0, '', '']);
 });
 
+test('DIRECT selects a longer exec ceiling only for the one-shot package receiver', async () => {
+    const backupId = '1'.repeat(32), packagePreparation = '2'.repeat(64), calls = [];
+    const fence = { merged: true, listMode: true, source: 'db', check() {},
+        binding: { host: node.ip, port: 22, username: 'root', machineId, sshHostKeySha256: pin } };
+    let guardChecks = 0;
+    class SSH {
+        connect() {}
+        disconnect() {}
+        async exec(command, { stdin, timeout, maxOutputBytes }, verify) {
+            const request = JSON.parse(stdin);
+            calls.push([request.action, timeout, maxOutputBytes, command.split(' ').slice(1, 4)]);
+            assert.ok(Buffer.byteLength(command) + 1 <= 128 * 1024);
+            await verify();
+            if (request.action === 'preflight') return ok({ machineId, packagePreparation });
+            assert.deepEqual(request, { action: 'prepare-packages', machineId, backupId, packagePreparation });
+            return ok({ ok: true, backupId, packagesReady: true });
+        }
+    }
+    const remote = createRelayDirect({ node, fence, SSH: attested(SSH, machineId) });
+    try {
+        await remote.preflight();
+        assert.equal(await remote.preparePackages(backupId, () => { guardChecks++; }), true);
+        await assert.rejects(remote.preparePackages(backupId, () => { guardChecks++; }), { code: 'REBUILD_L2TP_INSTALL_INPUT_INVALID' });
+        await remote.preflight();
+        assert.equal(guardChecks, 1);
+        assert.deepEqual(calls, [
+            ['preflight', 145000, undefined, ['-k', '4s', '125s']],
+            ['prepare-packages', 240000, 160, ['-k', '4s', '220s']],
+            ['preflight', 145000, undefined, ['-k', '4s', '125s']],
+        ]);
+    } finally { await remote.close(); }
+});
+
 test('prepare and validate before mutation, bind private desired and lock, then read back', async () => {
     const { remote, calls } = fixture(input => {
         if (input.action === 'check' || input.action === 'install') {

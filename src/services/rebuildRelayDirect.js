@@ -18,6 +18,9 @@ const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUse
 const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
 
 const TIMEOUT = 145000;
+// The package host has 210s from bootstrap; allow shell startup, kill grace,
+// and channel handoff/close without widening any other receiver.
+const PACKAGE_PREPARE_TIMEOUT = 240000;
 const SESSION_COUNT_TIMEOUT = 12000;
 const RETIREMENT_COUNT_TIMEOUT = 25000;
 const MACHINE_ID_COMMAND = '/usr/bin/head -c 34 /etc/machine-id';
@@ -258,9 +261,12 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             if (write) poison();
             return fail('DIRECT_OUTCOME_UNKNOWN', write);
         };
+        const shellLimits = retirementCount ? '-k 1s 22s' : count ? '-k 1s 9s' : packageWrite ? '-k 4s 220s' : '-k 4s 125s';
+        const timeout = retirementCount ? RETIREMENT_COUNT_TIMEOUT : count ? SESSION_COUNT_TIMEOUT
+            : packageWrite ? PACKAGE_PREPARE_TIMEOUT : TIMEOUT;
         let result;
-        try { result = await execPinned(directCommand(retirementCount ? '-k 1s 22s' : count ? '-k 1s 9s' : '-k 4s 125s'), {
-            stdin, timeout: retirementCount ? RETIREMENT_COUNT_TIMEOUT : count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
+        try { result = await execPinned(directCommand(shellLimits), {
+            stdin, timeout,
             ...(packageWrite && { maxOutputBytes: 160 }),
         }, verifyBeforeStdin); }
         catch { throw identityRefusal ?? unknown(); }

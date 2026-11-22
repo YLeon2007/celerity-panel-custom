@@ -64,12 +64,14 @@ REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'x
 PACKAGE_AUTOSTART_UNSAFE = 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
 PACKAGE_PENDING = 'package-preparation.pending'
 PACKAGE_MAX_OUTPUT = 256 * 1024  # per stream
-# Per runner; preflight has its own runner. Prepare uses three complete guard
-# observations, a pinned simulation, then containment/install/readback.
-# Each observation: 2 quiet sweeps (3 each), 4 dpkg, layout (1 + up to 4 SysV
-# conffiles), 21 unit shows, 2 APT simulations/checks and up to 48 metadata reads.
-# After the pinned simulation: 4 layouts/unit sweeps, 3 dpkg reads (4 each),
-# 4 quiet sweeps, 3 reloads and 1 install. Early cleanup replaces later phases.
+# Per runner; preflight has its own runner. A host observation takes up to 36
+# commands: 2 quiet sweeps (3 each), 4 dpkg, layout (1 + up to 4 SysV conffiles)
+# and 21 unit shows. A fully observed plan adds 2 APT checks/simulations and up
+# to 48 metadata reads. Prepare with populated indexes uses 3 full observations.
+# Starting empty instead uses 2 host-only observations, 1 update and 2 full
+# observations. Both paths also use 1 pinned simulation and 132 commands for
+# containment/install/readback (early cleanup replaces later phases).
+# Empty: 2*36 + 1 + 2*86 + 1 + 132 = 378; populated is still the maximum.
 PACKAGE_MAX_COMMANDS = 391      # 3*86 + 1 + 4*26 + 3*4 + 4*3 + 3 + 1
 NATIVE_MAX_OUTPUT = 128 * 1024
 NATIVE_UNIT_REQUIRED = 'RUNTIME_NATIVE_UNIT_REQUIRED'
@@ -112,7 +114,11 @@ NAMES = {
 ORDER = ('nft', 'net', 'drop', 'ike', 'starter', 'secrets', 'chap', 'options', 'lns', 'main')
 MAX_FILE = 16 * 1024 * 1024
 MAX_REQUEST = 25 * 1024 * 1024
-DEADLINE = time.monotonic() + 115
+HOST_STARTED = time.monotonic()
+DEADLINE = HOST_STARTED + 115
+# Two 78s APT children plus up to 54s total for stdin admission, observation,
+# planning, containment, cleanup and receipt readback. The shell is 220s.
+PACKAGE_PREPARE_DEADLINE = HOST_STARTED + 210
 STAGE = 'PREREQUISITE'
 REMOVE_ENTERED = False
 CHAP_ENTERED = False
@@ -4633,6 +4639,8 @@ class PackageRunner:
         self.remaining = PACKAGE_MAX_COMMANDS
         self.entered = False
         self.failed = False
+        self.update_dispatched = False
+        self.update_settled = False
         self.apt_dispatched = False
         self.apt_settled = False
 
@@ -4645,13 +4653,17 @@ class PackageRunner:
                 type(arg) is str and 0 < len(arg) <= 4096 and '\0' not in arg for arg in argv)
                  and type(timeout) is int and timeout > 0, 'IN_FLIGHT')
             end = min(DEADLINE, time.monotonic() + timeout)
+            already_updated = self.update_dispatched
             already_dispatched = self.apt_dispatched
             read_only = self.admit(argv)
             self.remaining -= 1
             status = bounded_status(argv, end, PACKAGE_MAX_OUTPUT, may_write=not read_only)
-            need(time.monotonic() < end, 'IN_FLIGHT')
+            need(time.monotonic() < end and type(status[0]) is int and status[0] >= 0, 'IN_FLIGHT')
+            if not already_updated and self.update_dispatched:
+                # Like the guard's strict update check, reject warnings even on zero.
+                self.update_settled = status[0] == 0 and status[2] == b''
             if not already_dispatched and self.apt_dispatched:
-                self.apt_settled = type(status[0]) is int and status[0] == 0
+                self.apt_settled = status[0] == 0
             return status
         except Exception:
             # An ordinary nonzero status is returned to the guard and may
@@ -4675,12 +4687,17 @@ class PackageRunner:
                 return True
             if binary == '/usr/bin/apt-get' and verb == '-s' and args == ['check']:
                 return True
+            if binary == '/usr/bin/apt-get' and verb == '--error-on=any' and args == ['update']:
+                need(self.entered and not self.update_dispatched and not self.apt_dispatched, 'IN_FLIGHT')
+                self.update_dispatched = True
+                return False
             need(binary == '/usr/bin/apt-get' and len(args) > 5 and
                  args[:5] == ['--no-install-recommends', '--no-install-suggests', '--no-remove', '--no-upgrade', 'install']
                  and all(re.fullmatch(spec, arg) for arg in args[5:]), 'IN_FLIGHT')
             if verb == '-s':
                 return True
-            need(verb == '-y' and self.entered and not self.apt_dispatched, 'IN_FLIGHT')
+            need(verb == '-y' and self.entered and not self.apt_dispatched
+                 and (not self.update_dispatched or self.update_settled), 'IN_FLIGHT')
             self.apt_dispatched = True
             return False
         if binary == '/usr/bin/systemctl':
@@ -4966,8 +4983,10 @@ def dispatch(request: dict[str, Any]):
 
 
 def main():
+    global DEADLINE
     os.umask(0o077)
     action = None
+    original_deadline = DEADLINE
     try:
         wire = sys.stdin.buffer.read(MAX_REQUEST + 1)
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
@@ -4982,6 +5001,8 @@ def main():
                 return value
 
             request = json.loads(wire, object_pairs_hook=unique_fields)
+            DEADLINE = PACKAGE_PREPARE_DEADLINE
+            need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
         result = dispatch(request)
         if action == 'prepare-packages' or action == 'preflight' and 'packagePreparation' in result:
             need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
@@ -5010,6 +5031,8 @@ def main():
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
               SESSION_UNKNOWN if action in ('session-count', 'retirement-count') else STAGE), file=sys.stderr)
         return 70
+    finally:
+        DEADLINE = original_deadline
     print(json.dumps(result, ensure_ascii=True, separators=(',', ':')), flush=True)
     return 0
 
