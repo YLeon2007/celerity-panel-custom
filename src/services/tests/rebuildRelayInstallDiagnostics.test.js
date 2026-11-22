@@ -57,6 +57,12 @@ host['os'].lstat = lambda path: types.SimpleNamespace(st_mode=stat.S_IFCHR, st_r
 host['open'] = lambda path, mode: io.BytesIO({ '/etc/machine-id': json.loads(request)['machineId'].encode() + b'\n',
     '/proc/devices': b'Character devices:\n108 ppp\nBlock devices:\n' }[path])
 host['unit'] = lambda name: {'LoadState': 'loaded'}
+vault_checks = []
+def absent_fixture_vault(path, private=False):
+    assert path == host['VAULT'] and private is True
+    vault_checks.append(path)
+    raise FileNotFoundError(path)
+host['directory'] = absent_fixture_vault
 package_calls = []
 def read_package(*args, **kwargs):
     assert args[0] == '/usr/bin/dpkg-query'
@@ -66,6 +72,7 @@ host['command'] = read_package
 sys.stdin = io.TextIOWrapper(io.BytesIO(request.encode()))
 status = host['main']()
 assert not faults, faults
+assert vault_checks == [host['VAULT']]
 assert package_calls == ['/usr/bin/dpkg-query']
 sys.exit(status)
 `;
