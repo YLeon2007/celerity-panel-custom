@@ -1274,7 +1274,12 @@ async function setupNode() {
         const res = await fetch('/panel/nodes/<%= node._id %>/setup', { method: 'POST' });
         const data = await res.json();
         if (data.logs) showLogs(data.logs);
-        if (data.success) {
+        if (res.ok && data.success && data.warning) {
+            const alert = document.createElement('div');
+            alert.className = 'alert alert-warning';
+            alert.textContent = data.warning;
+            document.getElementById('setupResult').replaceChildren(alert);
+        } else if (res.ok && data.success) {
             document.getElementById('setupResult').innerHTML = '<div class="alert alert-success"><i class="ti ti-check"></i> ' + data.message + '</div>';
         } else {
             document.getElementById('setupResult').innerHTML = '<div class="alert alert-error"><i class="ti ti-x"></i> ' + (data.error || i18n.error) + '</div>';
@@ -1308,7 +1313,7 @@ async function checkStatus() {
     try {
         const res = await fetch('/api/nodes/<%= node._id %>/status', { credentials: 'include' });
         const data = await res.json();
-        const statusColors = { online: 'alert-success', offline: 'alert-warning', error: 'alert-error' };
+        const statusColors = { online: 'alert-success', offline: 'alert-warning', unknown: 'alert-warning', error: 'alert-error' };
         const statusIcons = { online: '<i class="ti ti-check"></i>', offline: '<i class="ti ti-alert-triangle"></i>', error: '<i class="ti ti-x"></i>' };
         const color = statusColors[data.status] || '';
         const icon = statusIcons[data.status] || '<i class="ti ti-help"></i>';

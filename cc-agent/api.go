@@ -24,6 +24,7 @@ type API struct {
 
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", a.auth(a.handleHealth))
+	mux.HandleFunc("GET /xray-health", a.auth(xrayHealthHandler(a.probeXray)))
 	mux.HandleFunc("GET /info", a.auth(a.handleInfo))
 	mux.HandleFunc("POST /connect", a.auth(a.handleConnect))
 	mux.HandleFunc("POST /sync", a.auth(a.denyHTTPMutation(a.handleSync)))
@@ -68,6 +69,16 @@ func jsonErr(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// The existing /stats handler clears counters and masks gRPC failures with
+// zero traffic. Use the same local StatsService, without resetting counters.
+func (a *API) probeXray(ctx context.Context) error {
+	if a.xrayClient == nil {
+		return fmt.Errorf("Xray API client not configured")
+	}
+	_, err := a.xrayClient.QueryStats(ctx, "", false)
+	return err
 }
 
 // GET /health — simple liveness probe

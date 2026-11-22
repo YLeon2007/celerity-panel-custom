@@ -139,9 +139,17 @@ async function setNodeActive(req, res, active) {
             }
 
             await verify();
+            // Agent-backed Sync already persisted its proof. An SSH start of
+            // an agent-less Xray is not proof of its live API.
+            const fields = node.type !== 'xray'
+                ? { active: true, status: node.type === 'virtual' ? node.status : 'online', lastError: '' }
+                : node.xray?.agentToken ? { active: true } : {
+                    active: true, status: 'unknown', onlineUsers: 0, agentStatus: 'unknown',
+                    lastError: 'Xray health unknown: no agent token configured', healthFailures: 0,
+                };
             const enabledNode = await HyNode.findByIdAndUpdate(
                 req.params.id,
-                { $set: { active: true, status: node.type === 'virtual' ? node.status : 'online', lastError: '' } },
+                { $set: fields },
                 { new: true, ...options }
             );
 
@@ -521,10 +529,22 @@ router.get('/:id/status', requireScope('nodes:read'), async (req, res) => {
 });
 
 /**
- * POST /nodes/:id/reset-status - Сброс статуса ноды на online
+ * POST /nodes/:id/reset-status - Recheck Xray; legacy reset for other types
  */
 router.post('/:id/reset-status', requireScope('nodes:write'), async (req, res) => {
     try {
+        const current = await HyNode.findById(req.params.id);
+        if (!current) return res.status(404).json({ error: 'Node not found' });
+        if (current.type === 'xray') {
+            if (!current.active) return res.status(409).json({ error: 'Xray node is disabled' });
+            const health = await syncService.checkXrayAgentHealth(current, { requireProof: true });
+            if (!health.online) return res.status(409).json({
+                success: false, error: health.lastError || 'Xray health could not be saved', xray_status: health.xrayStatus,
+                xray_verification: health.xrayStatus === 'unknown' ? 'unavailable' : 'available',
+            });
+            const node = await HyNode.findById(current._id).select('name status lastError healthFailures');
+            return res.json({ success: true, message: 'Статус сброшен', node });
+        }
         const node = await HyNode.findByIdAndUpdate(
             req.params.id,
             { $set: { status: 'online', lastError: '', healthFailures: 0 } },
@@ -555,12 +575,16 @@ router.get('/:id/agent-info', requireScope('nodes:read'), async (req, res) => {
         if (!node) return res.status(404).json({ error: 'Node not found' });
         if (node.type !== 'xray') return res.status(400).json({ error: 'Not an Xray node' });
 
-        const syncService = require('../services/syncService');
-        const response = await syncService._agentRequest(node, 'GET', '/info');
-        res.json(response.data);
-    } catch (error) {
-        logger.error(`[Nodes API] agent-info error: ${error.message}`);
-        res.status(502).json({ error: error.message });
+        const health = await syncService.probeXrayHealth(node);
+        res.set('Cache-Control', 'no-store');
+        res.status(health.agentStatus === 'online' ? 200 : 502).json({
+            ...health.info,
+            agent_status: health.agentStatus,
+            xray_status: health.xrayStatus,
+            ...(health.lastError ? { xray_health_reason: health.lastError } : {}),
+        });
+    } catch (_) {
+        res.status(502).json({ error: 'Agent info unavailable' });
     }
 });
 
@@ -766,7 +790,7 @@ router.post('/:id/update-config', requireScope('nodes:write'), async (req, res) 
  *
  * Returns:
  *   200 { success: true,  logs: string[] }
- *   500 { success: false, error: string, logs: string[] }
+ *   500/502 { success: false, error: string, logs: string[] }
  */
 router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
     try {
@@ -808,10 +832,16 @@ router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
             }
 
             if (result.success) {
-                const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-                if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-                await verify();
-                await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields }, options);
+                if (node.type === 'xray') {
+                    const completion = await syncService.finishXraySetup(node, result.logs, { restartService, writeOptions: options, verify });
+                    await invalidateNodesCache();
+                    return reply(completion.success ? 200 : 502, completion);
+                } else {
+                    await verify();
+                    await HyNode.findByIdAndUpdate(req.params.id, { $set: {
+                        status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0, useTlsFiles: result.useTlsFiles,
+                    } }, options);
+                }
                 await invalidateNodesCache();
                 logger.info(`[Nodes API] Auto-setup completed for ${node.name} (${node.type})`);
                 return reply(200, { success: true, logs: result.logs });

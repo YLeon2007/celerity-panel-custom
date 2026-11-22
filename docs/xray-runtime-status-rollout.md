@@ -1,0 +1,11 @@
+# Xray runtime status: rollout note (unreleased)
+
+CC Agent **1.5.0** identifies the agent source that serves authenticated `GET /xray-health`. The endpoint does a bounded read of the local Xray StatsService without resetting counters. An idle Xray can be healthy; this is not a client-traffic test. `GET /health` remains **agent liveness**, not Xray readiness. The panel uses the probe response, not the version string, as evidence.
+
+1. Validate the panel and agent source locally. Deploying the panel from source does **not** build, publish, or update the GitHub Release binaries. The panel's agent installer still downloads the architecture-specific binaries from GitHub `releases/latest/download`.
+2. In a separately authorized release, build assets from the exact release tag containing CC Agent 1.5.0. Verify that the intended stable release is selected by `releases/latest` and that both Linux binaries (`cc-agent-linux-amd64`, `cc-agent-linux-arm64`) and `SHA256SUMS` are attached and verified before relying on the installer. A release with missing or stale assets is not ready for agent provisioning.
+3. Prefer verifying compatible agents on a pilot before rolling out the panel's readiness checks more broadly. Check `/info` for the running version and independently check authenticated `/xray-health`. Existing agents without the capability do not become compatible just because the panel is updated or a release is published.
+
+With mixed versions, missing or malformed proof yields persisted node status `unknown` and clears online-user counts; it is not an `offline` alert. Periodic agent transport failures still use the existing debounce. `hideOffline` continues to filter `offline` and `error`, not `unknown`; an unverified node can remain in subscriptions without being displayed as online.
+
+A normal Xray setup with a verified `offline` response fails at the final check; it does not undo installation, automatically retry, redeploy cascade links, or complete wizard onboarding. If proof is unavailable, installation can finish with an explicit warning; the panel skips automatic cascade redeploy. REST/MCP setup with `restartService: false` can complete with `xray_status: offline` because activation was not requested.

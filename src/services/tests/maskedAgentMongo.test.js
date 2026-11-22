@@ -1,6 +1,6 @@
 'use strict';
 // Disposable replica set and loopback-only HTTP. No SSH or installed agent.
-// The HTTP peer models the 1.4.0 wire responses until the listener is closed.
+// The HTTP peer models an agent with Xray health proof until its listener is closed.
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
 const http = require('node:http');
@@ -30,6 +30,7 @@ function agentReply(users, stats = {}) {
         const result = {
             '/online': { users: Object.fromEntries(users.map(id => [id, { online: true }])) },
             '/info': { agent_version: '1.4.0', xray_version: '26.3.27' },
+            '/xray-health': { xray_status: 'online' },
             '/stats': { users: {}, node: { tx: 0, rx: 0 }, ...stats },
         }[req.url];
         res.writeHead(result ? 200 : 404, { 'Content-Type': 'application/json' });
@@ -84,6 +85,7 @@ test('masked cc-agent leaves real Mongo state distinct from runtime/telemetry', 
         const baseline = await stats.collectSnapshot();
         assert.equal(baseline.online, 0);
         assert.equal(baseline.tx, 0);
+        await sync.healthCheck();
         await sync.collectAllStats();
         await sync.collectXrayAgentOnlineStates();
         assert.deepEqual(Object.keys(await cache.getXrayOnlineUsers()).sort(), ['masked-user', 'working-user']);

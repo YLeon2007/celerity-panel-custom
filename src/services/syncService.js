@@ -284,6 +284,7 @@ class SyncService {
                 'Content-Type': 'application/json',
             },
             timeout: 15000,
+            maxRedirects: 0,
             validateStatus: null, // handle errors manually
         };
 
@@ -300,67 +301,153 @@ class SyncService {
         if (response.status === 401) {
             const error = new Error(`[Agent] Unauthorized — check agentToken for node ${node.name}`);
             error.code = 'AGENT_HTTP_ERROR';
+            error.httpStatus = 401;
             throw error;
         }
         if (!Number.isInteger(response.status) || response.status < 200 || response.status >= 300) {
             // Never include the agent's response body: it may contain secrets.
             const error = new Error(`[Agent] HTTP ${Number.isInteger(response.status) ? response.status : 'unknown'} for node ${node.name}`);
             error.code = 'AGENT_HTTP_ERROR';
+            error.httpStatus = response.status;
             throw error;
         }
 
         return response;
     }
 
-    /**
-     * Check agent health and update node metadata (xrayVersion, agentVersion, agentStatus).
-     * Called by the periodic health check loop.
-     */
-    async checkXrayAgentHealth(node) {
-        try {
-            const response = await this._agentRequest(node, 'GET', '/info');
-            const data = response.data || {};
-
-            const prevNode = await HyNode.findOneAndUpdate(
-                { _id: node._id },
-                {
-                    $set: {
-                        xrayVersion: data.xray_version || '',
-                        agentVersion: data.agent_version || '',
-                        agentStatus: 'online',
-                        agentLastSeen: new Date(),
-                        status: 'online',
-                        healthFailures: 0,
-                    },
-                }
-            );
-
-            if (prevNode && prevNode.status !== 'online') {
-                await invalidateNodesCache();
-            }
-
-            return { online: true, xrayVersion: data.xray_version };
-        } catch (error) {
-            logger.warn(`[Agent] ${node.name} health check failed: ${error.message}`);
-
-            const prevNode = await HyNode.findOneAndUpdate(
-                { _id: node._id },
-                {
-                    $inc: { healthFailures: 1 },
-                    $set: { agentStatus: 'offline', lastError: `Agent: ${error.message}` },
-                }
-            );
-
-            const failures = (prevNode?.healthFailures || 0) + 1;
-
-            if (failures >= HEALTH_FAILURE_THRESHOLD && prevNode?.status === 'online') {
-                await HyNode.updateOne({ _id: node._id }, { $set: { status: 'offline', onlineUsers: 0 } });
-                await invalidateNodesCache();
-                webhook.emit(webhook.EVENTS.NODE_OFFLINE, { nodeId: node._id, name: node.name, lastError: error.message });
-                logger.warn(`[Agent] ${node.name}: marked offline after ${failures} consecutive failures`);
-            }
-            return { online: false };
+    // Read-only, safe to use from GET routes. Neither liveness nor legacy
+    // /stats (identical zero counters on success and failure) proves Xray.
+    async probeXrayHealth(node) {
+        const unknown = { online: false, xrayStatus: 'unknown', agentStatus: 'unknown', info: {} };
+        if (!node.xray?.agentToken) {
+            return { ...unknown, lastError: 'Xray health unknown: no agent token configured' };
         }
+        const [probe, metadata] = await Promise.allSettled([
+            this._agentRequest(node, 'GET', '/xray-health'),
+            this._agentRequest(node, 'GET', '/info'),
+        ]);
+        const info = {};
+        const data = metadata.value?.data;
+        if (metadata.value?.status === 200 && typeof data?.agent_version === 'string' && data.agent_version) {
+            for (const key of ['agent_version', 'xray_version', 'last_sync']) {
+                if (typeof data[key] === 'string' && data[key].length <= 256) info[key] = data[key];
+            }
+            for (const key of ['users_count', 'uptime_seconds']) {
+                if (Number.isSafeInteger(data[key]) && data[key] >= 0) info[key] = data[key];
+            }
+            if (typeof data.access_logs?.enabled === 'boolean') {
+                info.access_logs = { enabled: data.access_logs.enabled };
+                for (const key of ['spool_bytes', 'spool_batches', 'lag_bytes', 'dropped_events']) {
+                    if (Number.isSafeInteger(data.access_logs[key])) info.access_logs[key] = data.access_logs[key];
+                }
+            }
+        }
+
+        const xrayStatus = probe.value?.data?.xray_status;
+        if (probe.value?.status === 200 && (xrayStatus === 'online' || xrayStatus === 'offline')) {
+            return { online: xrayStatus === 'online', xrayStatus, agentStatus: 'online', info,
+                lastError: xrayStatus === 'online' ? '' : 'Xray runtime API unavailable' };
+        }
+
+        const agentStatus = (info.agent_version || probe.value?.status === 200) ? 'online' : 'offline';
+        const httpStatus = probe.reason?.httpStatus;
+        const transient = probe.status === 'rejected' && probe.reason?.code !== 'AGENT_HTTP_ERROR';
+        const transientCode = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED'].includes(probe.reason?.code)
+            ? ` (${probe.reason.code})` : '';
+        let detail = 'agent returned no Xray health proof';
+        if (transient) detail = `agent health request failed${transientCode}`;
+        else if (httpStatus === 404 || httpStatus === 405) detail = 'agent does not support Xray health checks';
+        else if (Number.isInteger(httpStatus)) detail = `agent health request returned HTTP ${httpStatus}`;
+        return { ...unknown, agentStatus, info, transient, lastError: `Xray health unknown: ${detail}` };
+    }
+
+    // Durable status writer shared by periodic refresh and explicit operations.
+    // Debounce panel-to-agent transport failures, not a local Xray failure or
+    // a legacy response that cannot establish health. Explicit checks require
+    // a fresh proof, so a transport failure there saves unknown, not offline.
+    async checkXrayAgentHealth(node, { requireProof = false, lastSync, writeOptions = {}, verify } = {}) {
+        const startedAt = new Date();
+        const health = await this.probeXrayHealth(node);
+        const filter = { _id: node._id, type: 'xray', ip: node.ip,
+            // An older in-flight response must not heal a node after a newer
+            // authenticated observation (or undo that observation's recovery).
+            $or: [{ agentLastSeen: null }, { agentLastSeen: { $lte: startedAt } }],
+        };
+        if (typeof node.active === 'boolean') filter.active = node.active;
+        filter['xray.agentToken'] = node.xray?.agentToken || { $in: [null, ''] };
+        const fields = { agentStatus: health.agentStatus, lastError: health.lastError };
+        if (lastSync) fields.lastSync = lastSync;
+        if (health.agentStatus === 'online') fields.agentLastSeen = startedAt;
+        if (health.info.xray_version) fields.xrayVersion = health.info.xray_version;
+        if (health.info.agent_version) fields.agentVersion = health.info.agent_version;
+        if (!health.transient || requireProof) {
+            fields.status = health.xrayStatus;
+            fields.healthFailures = 0;
+            if (!health.online) fields.onlineUsers = 0;
+        }
+
+        await verify?.();
+        let previous = await HyNode.findOneAndUpdate(filter,
+            health.transient && !requireProof ? { $set: fields, $inc: { healthFailures: 1 } } : { $set: fields },
+            { ...writeOptions, projection: { status: 1, healthFailures: 1, lastError: 1, onlineUsers: 1 } });
+        if (!previous) return { ...health, online: false, xrayStatus: 'unknown',
+            lastError: 'Xray health unknown: node changed during check' };
+        let status = fields.status;
+        if (health.transient && !requireProof && (previous.healthFailures || 0) + 1 >= HEALTH_FAILURE_THRESHOLD) {
+            // Don't overwrite a newer successful sample that reset the counter.
+            previous = await HyNode.findOneAndUpdate(
+                { ...filter, status: 'online', healthFailures: { $gte: HEALTH_FAILURE_THRESHOLD } },
+                { $set: { status: 'offline', onlineUsers: 0 } },
+                { ...writeOptions, projection: { status: 1, lastError: 1 } });
+            status = 'offline';
+        }
+        if (previous && (status === 'offline' || status === 'unknown')) {
+            const key = String(node._id);
+            this.xrayUserStatsSnapshots.delete(key);
+            this.xrayNodeUserLastActive.delete(key);
+            // Reject in-flight online samples taken before confirmed demotion.
+            this.xrayNodeOnlineUsers.set(key, { ids: [], observedAt: performance.now() });
+        }
+        if (previous && ((status && previous.status !== status) || previous.lastError !== fields.lastError ||
+            (fields.onlineUsers === 0 && previous.onlineUsers > 0))) {
+            await invalidateNodesCache();
+            if (status === 'online' && previous.status !== 'online') {
+                webhook.emit(webhook.EVENTS.NODE_ONLINE, { nodeId: node._id, name: node.name });
+            } else if (status === 'offline' && previous.status === 'online') {
+                webhook.emit(webhook.EVENTS.NODE_OFFLINE, { nodeId: node._id, name: node.name, lastError: health.lastError });
+            }
+        }
+        return health;
+    }
+
+    async refreshXraySetupHealth(node, { agentToken, writeOptions, verify } = {}) {
+        // setupXrayNodeWithAgent may have saved the token on another document.
+        const target = agentToken ? {
+            _id: node._id, active: node.active, ip: node.ip, name: node.name,
+            xray: { agentToken, agentTls: node.xray?.agentTls, agentPort: node.xray?.agentPort },
+        } : node;
+        return this.checkXrayAgentHealth(target, { requireProof: true, lastSync: new Date(), writeOptions, verify });
+    }
+
+    async finishXraySetup(node, logs = [], { restartService = true, ...options } = {}) {
+        const health = await this.refreshXraySetupHealth(node, options);
+        const result = { success: true, logs: [...logs], xray_status: health.xrayStatus,
+            xray_verification: health.xrayStatus === 'unknown' ? 'unavailable' : 'available' };
+
+        if (health.xrayStatus === 'offline' && restartService !== false) {
+            result.success = false;
+            result.error = health.lastError;
+            result.logs.push(`[FAIL] ${result.error}`);
+            logger.warn(`[Xray Setup] ${node.name}: ${result.error}`);
+        } else if (health.xrayStatus === 'unknown' || health.xrayStatus === 'offline') {
+            result.warning = health.xrayStatus === 'unknown' ? health.lastError
+                : `${health.lastError} (service restart was not requested)`;
+            result.logs.push(`[Warning] ${result.warning}`);
+            logger.warn(`[Xray Setup] ${node.name}: ${result.warning}`);
+        } else {
+            result.logs.push('[OK] Xray runtime API verified');
+        }
+        return result;
     }
 
     /**
@@ -838,21 +925,9 @@ class SyncService {
             }
         }
 
-        // Update node status
-        try {
-            const health = await this.checkXrayAgentHealth(node);
-            if (!health.online && hasAgent) {
-                await HyNode.updateOne({ _id: node._id }, { $set: { status: 'error', lastSync: new Date(), healthFailures: 0 } });
-                await invalidateNodesCache();
-                return false;
-            }
-        } catch (_) { if (fenced) return false; }
-
         if (completionFailed) return false;
-
-        await HyNode.updateOne({ _id: node._id }, {
-            $set: { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 },
-        });
+        const health = await this.checkXrayAgentHealth(node, { requireProof: true, lastSync: new Date() });
+        if (!health.online) return false;
         await invalidateNodesCache();
 
         logger.info(`[Xray Sync] Node ${node.name}: sync complete, ${users.length} users`);
@@ -867,11 +942,13 @@ class SyncService {
      * Xray), not from summing per-user counters.
      */
     async collectXrayTrafficStats(node) {
-        if (!(node.xray?.agentToken)) {
-            logger.debug(`[Agent Stats] ${node.name}: no agent token, skipping`);
-            return;
+        const nodeKey = node._id?.toString?.() || node.id || node.name;
+        // Keep billing counters independent of recorded service readiness;
+        // neither stats nor log-derived user activity can prove it.
+        if (!node.xray?.agentToken) {
+            return { onlineUserIds: [], nodeKey, ok: false };
         }
-
+        const observedAt = performance.now();
         try {
             const response = await this._agentRequest(node, 'GET', '/stats');
             const data = response.data || {};
@@ -880,20 +957,24 @@ class SyncService {
             const nodeTx = nodeTraffic.tx || 0;
             const nodeRx = nodeTraffic.rx || 0;
 
+            if (node.status !== 'online') {
+                // An old agent can still supply real counters. Drain them
+                // without treating its user activity as an online session.
+                await this.#storeXrayCounters(node, users, nodeTx, nodeRx, new Date());
+                return { onlineUserIds: [], nodeKey, ok: false };
+            }
+
             let agentOnlineUserIds = [];
             let agentOnlineAvailable = false;
             try {
                 const onlineResponse = await this._agentRequest(node, 'GET', '/online');
                 agentOnlineUserIds = extractAgentOnlineUserIds(onlineResponse.data || {});
                 agentOnlineAvailable = true;
-            } catch (onlineError) {
-                logger.debug(`[Agent Online] ${node.name}: /online unavailable (${onlineError.message}), falling back to traffic deltas`);
+            } catch (_) {
+                logger.debug(`[Agent Online] ${node.name}: /online unavailable, falling back to traffic deltas`);
             }
-
-            const userEntries = Object.entries(users);
-            const observedAt = performance.now();
             const now = new Date();
-            const snapshotKey = node._id?.toString?.() || node.id || node.name;
+            const snapshotKey = nodeKey;
             const previousUsers = this.xrayUserStatsSnapshots.get(snapshotKey) || {};
             const trafficActiveUserIds = extractXrayOnlineUserIds(users, {
                 previousUsersStats: previousUsers,
@@ -922,111 +1003,66 @@ class SyncService {
                 onlineWindowUserIds = [...nodeLastActive.keys()];
             }
 
-            const bulkOps = [];
-
-            for (const [email, traffic] of userEntries) {
-                const tx = traffic.tx || 0;
-                const rx = traffic.rx || 0;
-                if (tx === 0 && rx === 0) continue;
-
-                // email == userId (as set in configGenerator and agent)
-                bulkOps.push({
-                    updateOne: {
-                        filter: { userId: email },
-                        update: {
-                            $inc: { 'traffic.tx': tx, 'traffic.rx': rx },
-                            $set: { 'traffic.lastUpdate': now },
-                        },
-                    },
-                });
-            }
-
-            if (bulkOps.length > 0) {
-                const result = await HyUser.bulkWrite(bulkOps, { ordered: false });
-                logger.debug(`[Agent Stats] ${node.name}: updated ${result.modifiedCount}/${bulkOps.length} users`);
-                this.enforceTrafficLimit(userEntries.map(([email]) => email)).catch(() => {});
-            }
+            await this.#storeXrayCounters(node, users, nodeTx, nodeRx, now);
 
             // Online = users with explicit live/growing traffic observed recently.
             // cc-agent traffic events can be sparse/unstable between polls, so keep
             // a short per-node activity window to avoid flicker while still clearing
             // disconnected clients quickly.
             const activeUsers = onlineWindowUserIds.length;
-            const nodeUpdate = { $set: { onlineUsers: activeUsers } };
-            if (nodeTx > 0 || nodeRx > 0) {
-                nodeUpdate.$inc = { 'traffic.tx': nodeTx, 'traffic.rx': nodeRx };
-                nodeUpdate.$set['traffic.lastUpdate'] = now;
-            }
-            await HyNode.updateOne({ _id: node._id }, nodeUpdate);
+            const { matchedCount } = await HyNode.updateOne({ _id: node._id, active: true, status: 'online' }, {
+                $set: { onlineUsers: activeUsers },
+            });
+            if (!matchedCount) return { onlineUserIds: [], nodeKey, ok: false };
 
             if (nodeTx > 0 || nodeRx > 0 || activeUsers > 0) {
                 logger.info(`[Agent Stats] ${node.name}: ${activeUsers} online, node ↑${(nodeTx / 1024 / 1024).toFixed(1)}MB ↓${(nodeRx / 1024 / 1024).toFixed(1)}MB`);
             }
             return { onlineUserIds: onlineWindowUserIds, nodeKey: snapshotKey, observedAt, ok: true };
-        } catch (error) {
-            logger.error(`[Agent Stats] ${node.name} error: ${error.message}`);
-            const nodeKey = node._id?.toString?.() || node.id || node.name;
+        } catch (_) {
+            logger.error(`[Agent Stats] ${node.name} collection failed`);
             return { onlineUserIds: [], nodeKey, ok: false };
         }
     }
 
-    /**
-     * Health-check an Xray node via Agent GET /info and refresh metadata
-     * (xrayVersion, agentVersion, agentStatus, status). Does NOT touch
-     * `onlineUsers` — that counter is owned by collectXrayTrafficStats,
-     * which derives it from per-user traffic deltas over the poll interval.
-     */
-    async getXrayOnlineUsers(node) {
-        if (!(node.xray?.agentToken)) {
-            logger.debug(`[Agent] ${node.name}: no agent token, skipping health check`);
-            return 0;
-        }
+    async #storeXrayCounters(node, users, nodeTx, nodeRx, now) {
+        const userEntries = Object.entries(users);
+        const bulkOps = [];
 
-        try {
-            const response = await this._agentRequest(node, 'GET', '/info');
-            const data = response.data || {};
+        for (const [email, traffic] of userEntries) {
+            const tx = traffic.tx || 0;
+            const rx = traffic.rx || 0;
+            if (tx === 0 && rx === 0) continue;
 
-            const prevNode = await HyNode.findOneAndUpdate(
-                { _id: node._id },
-                {
-                    $set: {
-                        status: 'online',
-                        healthFailures: 0,
-                        xrayVersion: data.xray_version || '',
-                        agentVersion: data.agent_version || '',
-                        agentStatus: 'online',
-                        agentLastSeen: new Date(),
+            // email == userId (as set in configGenerator and agent)
+            bulkOps.push({
+                updateOne: {
+                    filter: { userId: email },
+                    update: {
+                        $inc: { 'traffic.tx': tx, 'traffic.rx': rx },
+                        $set: { 'traffic.lastUpdate': now },
                     },
-                }
-            );
-
-            if (prevNode && prevNode.status !== 'online') {
-                await invalidateNodesCache();
-                webhook.emit(webhook.EVENTS.NODE_ONLINE, { nodeId: node._id, name: node.name });
-            }
-
-            return 0;
-        } catch (error) {
-            logger.warn(`[Agent] ${node.name}: unavailable - ${error.message}`);
-
-            const prevNode = await HyNode.findOneAndUpdate(
-                { _id: node._id },
-                {
-                    $inc: { healthFailures: 1 },
-                    $set: { agentStatus: 'offline', lastError: `Agent: ${error.message}` },
-                }
-            );
-
-            const failures = (prevNode?.healthFailures || 0) + 1;
-
-            if (failures >= HEALTH_FAILURE_THRESHOLD && prevNode?.status === 'online') {
-                await HyNode.updateOne({ _id: node._id }, { $set: { status: 'offline', onlineUsers: 0 } });
-                await invalidateNodesCache();
-                webhook.emit(webhook.EVENTS.NODE_OFFLINE, { nodeId: node._id, name: node.name, lastError: error.message });
-                logger.warn(`[Agent] ${node.name}: marked offline after ${failures} consecutive failures`);
-            }
-            return 0;
+                },
+            });
         }
+
+        if (bulkOps.length > 0) {
+            const result = await HyUser.bulkWrite(bulkOps, { ordered: false });
+            logger.debug(`[Agent Stats] ${node.name}: updated ${result.modifiedCount}/${bulkOps.length} users`);
+            this.enforceTrafficLimit(userEntries.map(([email]) => email)).catch(() => {});
+        }
+
+        if (nodeTx > 0 || nodeRx > 0) {
+            await HyNode.updateOne({ _id: node._id }, {
+                $inc: { 'traffic.tx': nodeTx, 'traffic.rx': nodeRx }, $set: { 'traffic.lastUpdate': now },
+            });
+        }
+    }
+
+    // Xray health uses the API probe; user counts belong to traffic collection.
+    async getXrayOnlineUsers(node) {
+        await this.checkXrayAgentHealth(node);
+        return 0;
     }
 
     // ==================== HYSTERIA / COMMON METHODS ====================
@@ -1399,19 +1435,20 @@ class SyncService {
      * lamp is not delayed by slower node traffic polls or gRPC stats resets.
      */
     async collectXrayAgentOnlineStates() {
-        const nodes = await HyNode.find({ type: 'xray', active: true, 'xray.agentToken': { $exists: true, $ne: '' } });
+        const nodes = await HyNode.find({ type: 'xray', active: true, status: 'online', 'xray.agentToken': { $exists: true, $ne: '' } });
         const activeXrayNodeKeys = new Set(nodes.map(node => node._id?.toString?.() || node.id || node.name));
         const CONCURRENCY = 8;
 
         for (let i = 0; i < nodes.length; i += CONCURRENCY) {
             const batch = nodes.slice(i, i + CONCURRENCY);
             const results = await Promise.allSettled(batch.map(async (node) => {
+                const observedAt = performance.now();
                 const response = await this._agentRequest(node, 'GET', '/online');
                 return {
                     ok: true,
                     nodeKey: node._id?.toString?.() || node.id || node.name,
                     onlineUserIds: extractAgentOnlineUserIds(response.data || {}),
-                    observedAt: performance.now(),
+                    observedAt,
                 };
             }));
             this.#recordOnlineSamples(results);
@@ -1444,7 +1481,7 @@ class SyncService {
     async collectAllStats() {
         const nodes = await HyNode.find({ active: true });
         const activeXrayNodeKeys = new Set(nodes
-            .filter(node => node.type === 'xray')
+            .filter(node => node.type === 'xray' && node.status === 'online')
             .map(node => node._id?.toString?.() || node.id || node.name));
         
         // Parallel processing with concurrency limit
@@ -1454,7 +1491,7 @@ class SyncService {
             const results = await Promise.allSettled(
                 batch.flatMap(node => [
                     this.collectTrafficStats(node),
-                    this.getOnlineUsers(node)
+                    ...(node.type === 'xray' ? [] : [this.getOnlineUsers(node)])
                 ])
             );
             this.#recordOnlineSamples(results);

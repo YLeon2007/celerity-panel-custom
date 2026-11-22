@@ -433,10 +433,26 @@ async function _runBootstrap(taskId, nodeIds) {
                     for (const line of (result.logs || [])) { pushLog(line); }
 
                     if (result.success) {
-                        const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-                        if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-                        await verify();
-                        await HyNode.findByIdAndUpdate(nodeId, { $set: updateFields }, options);
+                        if (node.type === 'xray') {
+                            const completion = await require('../../services/syncService').finishXraySetup(node, [], {
+                                agentToken: result.agentToken, writeOptions: options, verify,
+                            });
+                            const { xray_status, xray_verification } = completion;
+                            task.xrayHealth = { xray_status, xray_verification };
+                            for (const line of completion.logs) pushLog(line);
+                            statusChanged = true;
+                            if (!completion.success) {
+                                allSuccess = false;
+                                task.starterSubscription = null;
+                                break;
+                            }
+                            if (completion.warning) continue;
+                        } else {
+                            await verify();
+                            await HyNode.findByIdAndUpdate(nodeId, { $set: {
+                                status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0, useTlsFiles: result.useTlsFiles,
+                            } }, options);
+                        }
                         statusChanged = true;
                         pushLog(`[OK] ${node.type.toUpperCase()} node setup completed`);
                     } else {
@@ -464,7 +480,9 @@ async function _runBootstrap(taskId, nodeIds) {
 
     if (allSuccess) {
         await completeOnboarding('self-host');
-        pushLog('\n[Done] All nodes set up successfully. Onboarding complete.');
+        pushLog(task.xrayHealth?.xray_verification === 'unavailable'
+            ? '[Warning] Onboarding finished without Xray runtime verification.'
+            : '\n[Done] All nodes set up successfully. Onboarding complete.');
     } else {
         pushLog('\n[Done] Setup finished with errors. Onboarding remains open until provisioning completes successfully.');
     }
@@ -534,6 +552,7 @@ router.get('/wizard/progress/:taskId/stream', (req, res) => {
         if (task.done) {
             send('done', {
                 success: task.success,
+                ...task.xrayHealth,
                 starterSubscription: task.starterSubscription,
             });
             clearInterval(intervalId);

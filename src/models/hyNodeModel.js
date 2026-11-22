@@ -345,7 +345,7 @@ const hyNodeSchema = new mongoose.Schema({
     aclRules: { type: [String], default: [] },
     
     active: { type: Boolean, default: true },
-    status: { type: String, enum: ['online', 'offline', 'error', 'syncing'], default: 'offline' },
+    status: { type: String, enum: ['online', 'offline', 'unknown', 'error', 'syncing'], default: 'offline' },
     lastError: { type: String, default: '' },
     lastSync: { type: Date, default: null },
 

@@ -100,14 +100,16 @@ for (const operation of ['add', 'remove']) {
     });
 }
 
-test('agent /info 423 marks health offline without setting node online', async t => {
+test('agent HTTP 423 leaves Xray health unknown without setting node online', async t => {
     const updates = [];
     t.mock.method(HyNode, 'findOneAndUpdate', async (_query, update) => {
         updates.push(update);
         return { healthFailures: 0, status: 'online' };
     });
     await withAgent(t, 423, async node => {
-        assert.deepEqual(await syncService.checkXrayAgentHealth(node), { online: false });
+        const health = await syncService.checkXrayAgentHealth(node);
+        assert.equal(health.online, false);
+        assert.equal(health.xrayStatus, 'unknown');
     });
     assert.equal(updates.length, 1);
     assert.equal(updates[0].$set.agentStatus, 'offline');

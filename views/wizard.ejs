@@ -736,12 +736,12 @@
                 const msg = data.message || '';
                 const line = document.createElement('span');
 
-                if (msg.startsWith('[OK]') || msg.includes('completed') || msg.includes('Done')) {
-                    line.className = 'log-ok';
-                } else if (msg.startsWith('[FAIL]') || msg.includes('[Error]') || msg.includes('ERROR')) {
+                if (msg.startsWith('[FAIL]') || msg.includes('[Error]') || msg.includes('ERROR')) {
                     line.className = 'log-fail';
-                } else if (msg.startsWith('---') || msg.startsWith('[Done]')) {
+                } else if (msg.startsWith('[Warning]') || msg.startsWith('---')) {
                     line.className = 'log-info';
+                } else if (msg.startsWith('[OK]') || msg.includes('completed') || msg.includes('Done')) {
+                    line.className = 'log-ok';
                 }
                 line.textContent = msg + '\n';
                 logEl.appendChild(line);
@@ -751,9 +751,13 @@
             if (data.type === 'done') {
                 es.close();
                 if (statusEl) {
-                    statusEl.innerHTML = data.success
-                        ? '<i class="ti ti-circle-check" style="color:var(--success);"></i> <%= typeof t !== "undefined" ? t("wizard.installSuccess") : "Installation complete!" %>'
-                        : '<i class="ti ti-alert-circle" style="color:var(--warning);"></i> <%= typeof t !== "undefined" ? t("wizard.installPartial") : "Finished with some errors. Check the log above." %>';
+                    if (!data.success) {
+                        statusEl.innerHTML = '<i class="ti ti-alert-circle" style="color:var(--warning);"></i> <%= typeof t !== "undefined" ? t("wizard.installPartial") : "Finished with some errors. Check the log above." %>';
+                    } else if (data.xray_verification === 'unavailable') {
+                        statusEl.innerHTML = '<i class="ti ti-alert-circle" style="color:var(--warning);"></i> <%= typeof t !== "undefined" ? t("wizard.installUnverified") : "Provisioned, but Xray could not be verified. Check the log above." %>';
+                    } else {
+                        statusEl.innerHTML = '<i class="ti ti-circle-check" style="color:var(--success);"></i> <%= typeof t !== "undefined" ? t("wizard.installSuccess") : "Installation complete!" %>';
+                    }
                 }
                 if (data.starterSubscription && credsCard && credsUser && credsUrl) {
                     credsUser.textContent = data.starterSubscription.userId || 'admin';

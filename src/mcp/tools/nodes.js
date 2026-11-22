@@ -35,7 +35,7 @@ const queryNodesSchema = z.object({
     filter: z.object({
         active: z.boolean().optional(),
         group: z.string().optional(),
-        status: z.enum(['online', 'offline', 'error', 'syncing']).optional(),
+        status: z.enum(['online', 'offline', 'unknown', 'error', 'syncing']).optional(),
     }).optional(),
     includeUsers: z.boolean().default(false).describe('Include users list for a single node'),
     includeConfig: z.boolean().default(false).describe('Include generated config for a single node'),
@@ -552,10 +552,18 @@ async function manageNodeAction(args, emit) {
                 }
 
                 if (result.success) {
-                    const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-                    if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-                    await verify();
-                    await HyNode.findByIdAndUpdate(id, { $set: updateFields }, options);
+                    if (node.type === 'xray') {
+                        const completion = await getSyncService().finishXraySetup(node, result.logs, {
+                            restartService: opts.restartService, writeOptions: options, verify,
+                        });
+                        await invalidateNodesCache();
+                        return completion.success ? completion : { ...completion, code: 502 };
+                    } else {
+                        await verify();
+                        await HyNode.findByIdAndUpdate(id, { $set: {
+                            status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0, useTlsFiles: result.useTlsFiles,
+                        } }, options);
+                    }
                     await invalidateNodesCache();
                     logger.info(`[MCP] Setup completed for ${node.name}`);
                     return { success: true, logs: result.logs };
@@ -569,6 +577,16 @@ async function manageNodeAction(args, emit) {
 
         case 'reset_status': {
             if (!id) throw new Error('id is required for reset_status');
+            const current = await HyNode.findById(id);
+            if (!current) return { error: `Node '${id}' not found`, code: 404 };
+            if (current.type === 'xray') {
+                if (!current.active) return { error: 'Xray node is disabled', code: 409 };
+                const health = await getSyncService().checkXrayAgentHealth(current, { requireProof: true });
+                return health.online
+                    ? { success: true, message: `Xray health verified for '${current.name}'` }
+                    : { success: false, error: health.lastError || 'Xray health could not be saved', code: 409,
+                        xray_status: health.xrayStatus, xray_verification: health.xrayStatus === 'unknown' ? 'unavailable' : 'available' };
+            }
             const node = await HyNode.findByIdAndUpdate(
                 id,
                 { $set: { status: 'online', lastError: '', healthFailures: 0 } },

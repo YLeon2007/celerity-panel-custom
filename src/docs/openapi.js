@@ -969,7 +969,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     domain:        { type: 'string', example: 'de.example.com' },
                     port:          { type: 'integer', example: 443 },
                     portRange:     { type: 'string', example: '20000-50000' },
-                    status:        { type: 'string', enum: ['online', 'offline', 'error', 'syncing'], example: 'online' },
+                    status:        { type: 'string', enum: ['online', 'offline', 'unknown', 'error', 'syncing'], example: 'online', description: 'Unknown means Xray runtime health could not be verified.' },
                     active:        { type: 'boolean', example: true },
                     onlineUsers:   { type: 'integer', example: 42 },
                     maxOnlineUsers: { type: 'integer', example: 200, description: '0 = unlimited' },
@@ -1980,7 +1980,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
                 summary: 'List nodes',
                 parameters: [
                     { name: 'active', in: 'query', schema: { type: 'boolean' }, description: 'Filter by active status' },
-                    { name: 'status', in: 'query', schema: { type: 'string', enum: ['online', 'offline', 'error', 'syncing'] } },
+                    { name: 'status', in: 'query', schema: { type: 'string', enum: ['online', 'offline', 'unknown', 'error', 'syncing'] } },
                     { name: 'group',  in: 'query', schema: { type: 'string' }, description: 'Filter by group ObjectId' },
                 ],
                 responses: {
@@ -2136,7 +2136,7 @@ See the request body examples panel for both flavours.`,
                                     type: 'object',
                                     properties: {
                                         name:        { type: 'string', example: 'Germany 1' },
-                                        status:      { type: 'string', enum: ['online', 'offline', 'error', 'syncing'] },
+                                        status:      { type: 'string', enum: ['online', 'offline', 'unknown', 'error', 'syncing'] },
                                         onlineUsers: { type: 'integer' },
                                         lastError:   { type: 'string' },
                                         lastSync:    { type: 'string', format: 'date-time', nullable: true },
@@ -2157,7 +2157,7 @@ See the request body examples panel for both flavours.`,
             post: {
                 tags: ['Nodes'],
                 summary: 'Reset node status',
-                description: 'Marks a node as online and clears the last error/health failure counter.',
+                description: 'Rechecks Xray runtime readiness and marks it online only with authenticated proof. For other node types, resets status and the error/failure counter.',
                 responses: {
                     200: {
                         description: 'Status reset',
@@ -2177,6 +2177,7 @@ See the request body examples panel for both flavours.`,
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
+                    409: { description: 'Xray is disabled, offline, or has no valid runtime health proof' },
                 },
             },
         },
@@ -2186,7 +2187,7 @@ See the request body examples panel for both flavours.`,
             get: {
                 tags: ['Nodes'],
                 summary: 'Get Xray agent info',
-                description: 'Fetches live info from the CC Agent for an Xray node.',
+                description: 'Fetches live CC Agent metadata and separate xray_status (online, offline or unknown). Agent reachability alone does not establish Xray readiness. This does not change the saved node status.',
                 responses: {
                     200: { description: 'Agent info', content: { 'application/json': { schema: { type: 'object' } } } },
                     400: { description: 'Node is not Xray', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, examples: { notXray: { value: { error: 'Not an Xray node' } } } } } },
@@ -2235,13 +2236,13 @@ See the request body examples panel for both flavours.`,
 
 **Hysteria nodes** (\`type=hysteria\`, default): optional body flags \`installHysteria\`, \`setupPortHopping\`, \`restartService\` (all default \`true\`). Installs/updates Hysteria, uploads config, configures port hopping, restarts \`hysteria-server\`.
 
-**Xray nodes** (\`type=xray\`): runs Xray agent setup; only \`restartService\` from the body is used.
+**Xray nodes** (\`type=xray\`): provisions Xray; only \`restartService\` from the body is used. The final read-only agent probe reports \`xray_status\` and \`xray_verification\`. Verified offline after a requested restart returns **502**. Missing verification returns **200** with \`xray_status: unknown\` and a warning. With \`restartService: false\`, setup can complete even when Xray is offline.
 
 **Virtual nodes** (\`type=virtual\`): not supported — returns **400** because virtual nodes have no remote service to provision.
 
 **⚠️ Long-running:** typically **30 seconds to 2 minutes**. Set client timeout to at least **3 minutes**.
 
-**Requires SSH credentials** on the node (password or private key). Returns \`{ success, logs }\` on success or \`500\` with \`{ success: false, error, logs }\` on failure.`,
+**Requires SSH credentials** on the node (password or private key). Provisioning errors return \`500\` with \`{ success: false, error, logs }\`.`,
                 requestBody: {
                     content: {
                         'application/json': {
@@ -2250,7 +2251,7 @@ See the request body examples panel for both flavours.`,
                                 properties: {
                                     installHysteria:  { type: 'boolean', default: true, description: 'Install/update Hysteria binary' },
                                     setupPortHopping: { type: 'boolean', default: true, description: 'Configure iptables NAT rules for port hopping range' },
-                                    restartService:   { type: 'boolean', default: true, description: 'Enable and restart hysteria-server systemd unit' },
+                                    restartService:   { type: 'boolean', default: true, description: 'Enable and restart the node service' },
                                 },
                             },
                             example: {
@@ -2271,12 +2272,22 @@ See the request body examples panel for both flavours.`,
                                     properties: {
                                         success: { type: 'boolean', example: true },
                                         logs:    { type: 'array', items: { type: 'string' }, description: 'Setup log lines' },
+                                        xray_status: { type: 'string', enum: ['online', 'offline', 'unknown'], description: 'Xray nodes only' },
+                                        xray_verification: { type: 'string', enum: ['available', 'unavailable'], description: 'Xray nodes only' },
+                                        warning: { type: 'string', description: 'Runtime could not be verified, or is offline with restart disabled' },
                                     },
                                 },
                             },
                         },
                     },
                     400: { description: 'SSH credentials not configured', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+                    502: {
+                        description: 'Setup requested a restart, but the final agent probe reports Xray offline',
+                        content: { 'application/json': { example: {
+                            success: false, error: 'Xray runtime API unavailable', logs: ['[FAIL] Xray runtime API unavailable'],
+                            xray_status: 'offline', xray_verification: 'available',
+                        } } },
+                    },
                     500: {
                         description: 'Setup failed',
                         content: {

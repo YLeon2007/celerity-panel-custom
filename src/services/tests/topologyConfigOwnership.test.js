@@ -103,7 +103,10 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = []
     t.mock.method(CascadeRouteGroup, 'find', () => ({ lean: async () => [] }));
     t.mock.method(nodeSetup, 'reloadCcAgent', async () => {});
     t.mock.method(syncService, '_getUsersForNode', async () => [{ userId: 'u1', xrayUuid: 'uuid-1' }]);
-    t.mock.method(syncService, 'checkXrayAgentHealth', async () => ({ online: true }));
+    t.mock.method(syncService, 'checkXrayAgentHealth', async (_node, options) => {
+        calls.updates.push({ $set: { status: 'online', lastSync: options.lastSync } });
+        return { online: true };
+    });
     for (const key of ['invalidateNodes', 'invalidateAllSubscriptions', 'invalidateDashboardCounts']) {
         t.mock.method(cache, key, async () => {});
     }

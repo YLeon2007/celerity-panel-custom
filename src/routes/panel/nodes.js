@@ -816,29 +816,38 @@ router.post('/nodes/:id/setup', async (req, res) => {
             }
 
             if (result.success) {
-                const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
-                if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
-                if (node.cascadeRole === 'bridge') updateFields.status = 'offline';
-                await verify();
-                await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields }, options);
+                let completion;
+                if (node.type === 'xray' && node.cascadeRole !== 'bridge') {
+                    completion = await syncService.finishXraySetup(node, result.logs, {
+                        agentToken: result.agentToken, writeOptions: options, verify,
+                    });
+                } else {
+                    const updateFields = { status: node.cascadeRole === 'bridge' ? 'offline' : 'online',
+                        lastSync: new Date(), lastError: '', healthFailures: 0 };
+                    if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
+                    await verify();
+                    await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields }, options);
+                }
                 await invalidateNodesCache();
+                if (completion && !completion.success) return reply(502, completion);
 
-                if (node.type === 'xray' && node.cascadeRole !== 'bridge' && !current) {
+                if (completion?.xray_status === 'online' && !current) {
                     const CascadeLink = require('../../models/cascadeLinkModel');
                     const linkCount = await CascadeLink.countDocuments({
                         $or: [{ portalNode: node._id }, { bridgeNode: node._id }],
                         active: true,
                     });
                     if (linkCount > 0) {
-                        result.logs = result.logs || [];
-                        result.logs.push(`[Cascade] Re-deploying ${linkCount} cascade link(s)...`);
+                        completion.logs.push(`[Cascade] Re-deploying ${linkCount} cascade link(s)...`);
                         cascadeService.redeployAllLinksForNode(node._id).catch(err => {
                             logger.error(`[Cascade] Auto-redeploy after setup: ${err.message}`);
                         });
                     }
                 }
 
-                return reply(200, { success: true, message: 'Нода успешно настроена', logs: result.logs || [] });
+                return reply(200, completion?.warning ? completion : {
+                    success: true, message: 'Нода успешно настроена', logs: result.logs || [], ...completion,
+                });
             } else {
                 await verify();
                 await HyNode.findByIdAndUpdate(req.params.id, {
@@ -1303,8 +1312,10 @@ router.post('/nodes/:id/restart', async (req, res) => {
             // Xray nodes with agent: restart + sync through the agent API
             if (node.type === 'xray' && node.xray?.agentToken) {
                 try {
-                    await syncService.updateNodeConfig(node);
-                    return reply(200, { success: true, output: 'Restarted and synced via agent' });
+                    if (!await syncService.updateNodeConfig(node)) {
+                        return reply(502, { success: false, error: 'Xray restart and sync could not be verified' });
+                    }
+                    return reply(200, { success: true, output: 'Xray sync completed and runtime API verified' });
                 } catch (agentErr) {
                     if (describeRoleError(agentErr, res.locals.t)) throw agentErr;
                     return reply(500, { error: `Agent restart failed: ${agentErr.message}` });
@@ -1321,6 +1332,11 @@ router.post('/nodes/:id/restart', async (req, res) => {
             const result = await nodeSetup.execSSH(conn, `systemctl restart ${serviceName} && sleep 2 && systemctl is-active ${serviceName}`);
             conn.end();
 
+            if (node.type === 'xray') {
+                const health = await syncService.refreshXraySetupHealth(node, { writeOptions: options, verify });
+                return reply(200, { success: result.success && result.output.trim() === 'active',
+                    output: result.output, xray_status: health.xrayStatus });
+            }
             const isActive = result.output.trim().includes('active');
 
             await verify();

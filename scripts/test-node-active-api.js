@@ -71,6 +71,8 @@ const stubs = {
     '../services/syncService': {
         updateNodeConfig: async (node) => {
             xraySyncCalls.push(clone(node));
+            // Sync owns the Xray readiness write; enable must not make one up.
+            if (xraySyncResult) await HyNode.updateOne({ _id: node._id }, { $set: { status: 'online' } });
             return xraySyncResult;
         },
         schedulePush: () => {

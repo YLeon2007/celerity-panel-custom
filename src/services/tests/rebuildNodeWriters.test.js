@@ -113,6 +113,7 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
         t.mock.method(setup, method, async () => { observe(method); return { success: true }; });
     }
     t.mock.method(sync, 'schedulePush', () => { effects.push('schedule push'); });
+    t.mock.method(sync, 'probeXrayHealth', async () => ({ online: true, xrayStatus: 'online', agentStatus: 'online', info: {}, lastError: '' }));
     const syncStub = t.mock.method(sync, 'updateNodeConfig', async () => { observe('sync'); return true; });
     t.mock.method(panelHelpers, 'connectNodeSSH', async () => { effects.push('connectNodeSSH'); assert.fail('no SSH key transport'); });
     t.mock.method(require('../nodeSSH').prototype, 'connect', async () => { effects.push('NodeSSH.connect'); assert.fail('no config transport'); });
@@ -223,7 +224,6 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
             assert.equal(method, 'POST');
             effects.push(path);
         });
-        t.mock.method(sync, 'checkXrayAgentHealth', async () => ({ online: true }));
         pending = true;
         effects.length = 0;
         row.cascadeRole = 'standalone';

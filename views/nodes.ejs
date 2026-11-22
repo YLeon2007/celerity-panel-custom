@@ -42,6 +42,7 @@ function nodeMetaFor(node) {
                 <option value=""><%= t('nodes.allStatuses') %></option>
                 <option value="online"><%= t('nodes.statusOnline') %></option>
                 <option value="offline"><%= t('nodes.statusOffline') %></option>
+                <option value="unknown"><%= t('nodes.statusUnknown') %></option>
                 <option value="error"><%= t('nodes.statusError') %></option>
             </select>
             <select id="filterGroup" class="filter-select" onchange="applyFilters()">
@@ -187,7 +188,7 @@ function nodeMetaFor(node) {
                                 <span class="badge badge-secondary" data-node-status-badge data-node-id="<%= node._id %>" data-node-virtual-status="true" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
                             <% } else { %>
                                 <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>" data-node-status-badge data-node-id="<%= node._id %>">
-                                    <%= node.status %>
+                                    <%= node.status === 'unknown' ? t('nodes.statusUnknown') : node.status %>
                                 </span>
                             <% } %>
                             <% if (!node.active) { %>
@@ -315,7 +316,7 @@ function nodeMetaFor(node) {
                             <span class="badge badge-secondary" data-node-status-badge data-node-id="<%= node._id %>" data-node-virtual-status="true" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
                             <% } else { %>
                             <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>" data-node-status-badge data-node-id="<%= node._id %>">
-                                <%= node.status %>
+                                <%= node.status === 'unknown' ? t('nodes.statusUnknown') : node.status %>
                             </span>
                             <% } %>
                             <% if (!node.active) { %>
@@ -908,6 +909,7 @@ function nodeMetaFor(node) {
 <% } %>
 <script>
 const i18n = {
+    statusUnknown: <%- JSON.stringify(t('nodes.statusUnknown')) %>,
     confirmDelete: <%- JSON.stringify(t("nodes.confirmDelete")) %>,
     deleteError: <%- JSON.stringify(t("nodes.deleteError")) %>,
     restartSuccess: <%- JSON.stringify(t("nodes.restartSuccess")) %>,
@@ -960,7 +962,7 @@ function applyFilters() {
     document.getElementById('resultsCount').textContent = i18n.total + ': ' + visibleCount;
 }
 
-// Map status strings to sort order (online first, then error, then offline)
+// Map status strings to sort order (online first, then error, then the rest)
 function statusSortOrder(s) {
     return s === 'online' ? 0 : s === 'error' ? 1 : 2;
 }
@@ -1023,7 +1025,7 @@ function setNodeStatusUi(nodeId, status, nodeType) {
     document.querySelectorAll(`[data-node-status-badge][data-node-id="${nodeId}"]`).forEach(badge => {
         if (badge.dataset.nodeVirtualStatus === 'true') return;
         badge.className = `badge badge-${statusBadgeVariant(status)}`;
-        badge.textContent = status;
+        badge.textContent = status === 'unknown' ? i18n.statusUnknown : status;
     });
 }
 
