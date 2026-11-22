@@ -934,6 +934,14 @@ echo "Done: Directory /usr/local/etc/xray ready"
 ${TCP_BBR_SNIPPET}
 `;
 
+function installedXrayIs2611(output) {
+    // execSSH appends stderr separately. Only the installer's own stdout completion line counts.
+    if (typeof output !== 'string') return false;
+    const [stdout] = output.split('\n[STDERR]:\n', 1);
+    const markers = stdout.split(/\r?\n/).filter(line => /^Done: Xray (?:already )?installed\b/.test(line));
+    return markers.length === 1 && /^Done: Xray (?:already )?installed \(Xray 26\.11\.\d{1,4}(?: \([ -~]*\))?\)$/.test(markers[0]);
+}
+
 // ACME (acme.sh) setup for tlsSource='acme': issue LE cert for `domain` via
 // HTTP-01 standalone, install to /usr/local/etc/xray/{cert,key}.pem, register
 // acme.sh cron for autonomous renewal. Inputs sanitized at the call-site.
@@ -1090,9 +1098,12 @@ async function setupXrayNode(node, options = {}) {
 
         // Install Xray
         log('Installing Xray-core...');
-        await checkedExec(exec, XRAY_INSTALL_SCRIPT, 'Не удалось установить Xray-core.',
+        const installOutput = await checkedExec(exec, XRAY_INSTALL_SCRIPT, 'Не удалось установить Xray-core.',
             { timeoutMs: 0, usePhaseCodes: false });
         log('Xray-core installed');
+        if (installedXrayIs2611(installOutput)) {
+            log('⚠ Xray 26.11.x: на набирающей стороне REALITY для поля fingerprint поддерживаются только chrome, firefox и safari.');
+        }
 
         const configGenerator = require('./configGenerator');
         const prepareAccess = () => checkedExec(exec,

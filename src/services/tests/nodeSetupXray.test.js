@@ -183,7 +183,7 @@ done`, { mode: 0o755 });
     const logs = [];
     const translate = cmd => cmd.replaceAll('/usr/local/etc/xray', dir)
         .replaceAll('/etc/systemd/system', units);
-    let connections = 0;
+    let connections = 0, execCount = 0;
     class FakeClient extends EventEmitter {
         connect() { this.agentPhase = ++connections === 2 && options.withAgent; queueMicrotask(() => this.emit('ready')); }
         end() {}
@@ -194,12 +194,15 @@ done`, { mode: 0o755 });
             callback(null, { createWriteStream: target => fs.createWriteStream(translate(target)) });
         }
         exec(command, callback) {
+            execCount++;
             assert.equal(command.includes(secret), false, 'secrets must not appear in SSH argv');
             let local = command;
             if (this.agentPhase && !command.includes('NRestarts')) {
                 local = command.includes('systemctl restart cc-agent') ? "printf 'OK: cc-agent running\\n'" : ':';
-            } else if (/Installing Xray-core|Opening firewall ports/.test(command)) {
-                // Never run installer, firewall or host tuning commands.
+            } else if (command.includes('Installing Xray-core')) {
+                // Exercise the existing SSH output boundary, never the real installer.
+                local = 'printf "%s" "$FIXTURE_INSTALL_STDOUT"; printf "%s" "$FIXTURE_INSTALL_STDERR" >&2';
+            } else if (command.includes('Opening firewall ports')) {
                 local = ':';
             } else if (!(options.acme && command.includes('--install-cert'))) {
                 assert.doesNotMatch(command, /curl |apt-get|github\.com|iptables|modprobe/);
@@ -241,7 +244,7 @@ done`, { mode: 0o755 });
     delete require.cache[source];
     const setup = require(source);
     t.after(() => { Module._load = original; delete require.cache[source]; });
-    return { dir, unit, conf, dropdir, adminDropIn, logs, home, env,
+    return { dir, unit, conf, dropdir, adminDropIn, logs, home, env, execCount: () => execCount,
         calls: () => fs.readFileSync(journal, 'utf8').trim().split('\n'),
         fullSetup: () => setup.setupXrayNodeWithAgent({ type: 'xray', ip: '192.0.2.5', port: 8443,
             name: 'fixture', ssh: { password: 'fixture' }, xray: { security: 'none', agentToken: 'fixture', agentTls: false } }),
@@ -251,6 +254,33 @@ done`, { mode: 0o755 });
 
 function noSecrets(f, result) {
     assert.equal(JSON.stringify([result, f.logs]).includes(secret), false, 'no config or raw systemd output');
+}
+
+const installed = (version, already = false) =>
+    `Done: Xray ${already ? 'already ' : ''}installed (Xray ${version} (Xray, Penetrates Everything.) 676eaf6 (go1.27.3 linux/amd64))`;
+for (const [name, stdout, stderr, warn] of [
+    ['new install 26.11.9', installed('26.11.9'), '', true],
+    ['existing 26.11.10', installed('26.11.10', true), '', true],
+    ['26.3.27', installed('26.3.27'), '', false],
+    ['no version', 'Done: Xray installed ()', '', false],
+    ['unmarked banner', 'Xray 26.11.9', '', false],
+    ['non-release suffix', installed('26.11.9-custom'), '', false],
+    ['conflicting markers', installed('26.11.9') + '\n' + installed('26.3.27'), '', false],
+    ['marker only on stderr', '', installed('26.11.9'), false],
+]) {
+    test(`setup compatibility notice: ${name}`, async t => {
+        const f = fixture(t);
+        f.env.FIXTURE_INSTALL_STDOUT = `${secret}\n${stdout}\nDone: Directory /usr/local/etc/xray ready\n`;
+        f.env.FIXTURE_INSTALL_STDERR = `${stderr}\n${secret}`;
+        const result = await f.run({ restartService: false });
+        assert.equal(result.success, true, result.error);
+        assert.equal(f.execCount(), 4, 'only install, access, config write and firewall');
+        noSecrets(f, result);
+        assert.doesNotMatch(JSON.stringify([result.logs, f.logs]), /Penetrates Everything|Done: Xray|676eaf6|\[STDERR\]/);
+        const notices = result.logs.filter(line => /REALITY|fingerprint|совместим/i.test(line));
+        assert.equal(notices.length, warn ? 1 : 0);
+        if (warn) assert.match(notices[0], /⚠.*Xray 26\.11\.x.*набирающей стороне REALITY.*только chrome, firefox и safari\./);
+    });
 }
 
 // Optional kernel-DAC probe in a private multi-ID user namespace and tmpfs.
