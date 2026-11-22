@@ -1,17 +1,15 @@
 name: CC Agent Release Assets
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing release tag to build and attach assets to
+        description: Existing release tag to build as an Actions artifact
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-agent-assets:
@@ -19,17 +17,11 @@ jobs:
     steps:
       - name: Resolve release tag
         id: release
+        shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.release_tag }}
+          TAG: ${{ inputs.release_tag }}
         run: |
-          if [ "$EVENT_NAME" = "release" ]; then
-            TAG="$EVENT_TAG"
-          else
-            TAG="$INPUT_TAG"
-          fi
-          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+          if ! [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "Invalid stable release tag: $TAG" >&2
             exit 1
           fi
@@ -38,7 +30,8 @@ jobs:
       - name: Checkout exact release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.release.outputs.tag }}
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+          persist-credentials: false
 
       - name: Set up Go from cc-agent/go.mod
         uses: actions/setup-go@v5
@@ -64,16 +57,6 @@ jobs:
         with:
           name: cc-agent-${{ steps.release.outputs.tag }}
           path: |
-            cc-agent/dist/cc-agent-linux-amd64
-            cc-agent/dist/cc-agent-linux-arm64
-            cc-agent/dist/SHA256SUMS
-
-      - name: Attach binaries to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release.outputs.tag }}
-          fail_on_unmatched_files: true
-          files: |
             cc-agent/dist/cc-agent-linux-amd64
             cc-agent/dist/cc-agent-linux-arm64
             cc-agent/dist/SHA256SUMS
