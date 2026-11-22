@@ -251,12 +251,14 @@
   },
   "rebuildL2tp": {
     "installProfileHint": "安装需要已应用的兼容 Xray rebuild 配置。常规节点设置只会生成旧版 JSON。如有需要，请在「节点 → 网络地图」配置此中继所需的链路，关闭自动部署后保存，再点击「部署」预览变更。仅在确认变更且所有受影响的配置均由此面板管理时才应用。请勿覆盖自定义或由外部管理的配置。",
+    "installPackageHint": "对于受支持且拥有数据库准入授权的 Debian 13 中继，安装操作可以准备缺少的 VPN 软件包。请在维护窗口内操作。L2TP 安装失败不会回滚软件包变更。如果结果不确定，请勿重试，请中继管理员核实软件包及 L2TP 的状态。",
     "installChecks": {
       "REBUILD_LINKS_NOT_APPLIED": "中继存在尚未应用的链路或不受支持的对端。请在网络地图上确认所需链路已应用，且对端均为由面板管理的活动 Xray 节点。请勿为通过检查而部署无关链路。",
       "XRAY_BASELINE_UNSUPPORTED": "安装不支持现有 Xray 配置的格式或路由结构。重新格式化 JSON 不会生成 rebuild 配置。仅对面板管理的配置按此中继卡片上的说明操作。",
       "XRAY_PROFILE_OWNER_UNSUPPORTED": "安装不支持某个 Xray 配置文件的所有者。请与中继管理员确认该配置由谁管理。不要为了通过检查而更改文件所有者或覆盖配置。",
       "XRAY_PROFILE_USERS_UNPROVED": "安装无法核实 Xray 用户列表，或无法确认中转入站与已应用的链路一致。重试前，请与中继所有者核对已应用的链路和运行中的 Xray 用户列表。",
-      "XRAY_RUNTIME_UNPROVED": "安装无法核实运行中的 Xray 进程或监听套接字的归属。重试前，请确认哪个服务正在使用该配置和端口。"
+      "XRAY_RUNTIME_UNPROVED": "安装无法核实运行中的 Xray 进程或监听套接字的归属。重试前，请确认哪个服务正在使用该配置和端口。",
+      "RUNTIME_PACKAGE_AUTOSTART_UNSAFE": "安装无法核实所需的 Debian 软件包，或无法确认准备软件包是安全的。请中继管理员检查软件包及服务自动启动策略。请勿绕过检查，也不要重试结果未确认的安装。"
     },
     "messages": {
       "installRefused": "L2TP 安装已拒绝。请检查中继的安装条件并刷新状态。",

@@ -712,7 +712,7 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
     const { createHash, randomUUID } = require('node:crypto');
     const digest = value => createHash('sha256').update(value).digest('hex');
     const f = fixture(t);
-    sessionFixture(t, f);
+    const session = sessionFixture(t, f);
     const intents = accountIntentFixture(t, f);
     delete f.env.C3_REBUILD_L2TP_RELAY_ID;
     delete f.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
@@ -790,7 +790,8 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
         stream.end = done => {
             done();
             queueMicrotask(() => {
-                const { action, backupId, machineId: expected, currentUsers, desiredUsers } = JSON.parse(Buffer.concat(chunks));
+                const input = JSON.parse(Buffer.concat(chunks));
+                const { action, backupId, machineId: expected, currentUsers, desiredUsers } = input;
                 frames.push([host.binding.nodeId, action]);
                 hooks.atDispatch?.(action, host);
                 let value;
@@ -799,6 +800,13 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
                     stream.stderr.emit('data', action === 'install' ? 'DIRECT_NO_WRITE_IDENTITY\n' : 'DIRECT_IDENTITY\n');
                     stream.stderr.emit('end');
                     return stream.emit('close', 70);
+                }
+                const reply = hooks.reply?.(input);
+                if (reply) {
+                    if (reply.stdout) stream.emit('data', reply.stdout);
+                    if (reply.stderr) stream.stderr.emit('data', reply.stderr);
+                    stream.stderr.emit('end');
+                    return stream.emit('close', reply.code);
                 }
                 if (action === 'preflight') value = readiness;
                 else if (action === 'prepare') value = { ...readiness, main, mainSha256: digest(main),
@@ -822,8 +830,165 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
         return this;
     });
     t.after(() => require('../sshPoolService').closeAll());
-    return { ...f, service, intents, hosts, grants, grant, frames, effects, opens, hooks };
+    return { ...f, get lockHeld() { return f.lockHeld; }, service, session, intents, hosts, grants, grant, frames, effects, opens, hooks };
 }
+
+const packageDigest = 'a1'.repeat(32);
+const wire = value => ({ code: 0, stdout: JSON.stringify(value) + '\n' });
+// Consumer-frame fixtures: real panel handler, locks, store and DIRECT driver;
+// only the DB/session and SSH channel boundaries are modeled.
+function packageFlow(t, { grant = true, proof = wire({ machineId, packagePreparation: packageDigest }), reply } = {}) {
+    const f = admissionEffects(t);
+    if (grant) f.grant();
+    else f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([f.hosts[0].binding]);
+    const byAction = () => f.frames.map(([, action]) => action);
+    let initial = true;
+    f.hooks.reply = input => {
+        if (input.action === 'preflight' && initial) {
+            initial = false;
+            return proof;
+        }
+        return reply?.(input, f);
+    };
+    const path = require('../../routes/panel/rebuildRelayInstall').handler(() => f.service);
+    const click = async (body = {}, query = {}) => {
+        const response = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(value) { return value; } };
+        const data = await path({ params: { id }, body, query }, response);
+        return { status: response.statusCode, data };
+    };
+    return Object.assign(f, { click, byAction });
+}
+
+test('package flow: one panel click commits the reservation before exact stdin; the same pinned client finishes with that ID', async t => {
+    let reserved;
+    const f = packageFlow(t, { reply(input, f) {
+        if (input.action === 'prepare-packages') {
+            assert.deepEqual(f.session.events, ['commit']);
+            assert.ok(f.lockHeld);
+            reserved = f.states[0].backupId;
+            assert.match(reserved, /^[a-f0-9]{32}$/);
+            assert.deepEqual(input, { action: 'prepare-packages', machineId, backupId: reserved, packagePreparation: packageDigest });
+            assert.deepEqual(f.states.map(row => row.status), ['installing']);
+            assert.deepEqual(f.users.map(row => [row.syncStatus, Boolean(row.passwordEncrypted)]), [['pending', true]]);
+            return wire({ ok: true, backupId: reserved, packagesReady: true });
+        }
+        if (['check', 'install', 'verify'].includes(input.action)) assert.equal(input.backupId, reserved);
+    } });
+    for (const key of ['machineId', 'backupId', 'packagePreparation']) {
+        assert.equal((await f.click({ [key]: packageDigest })).status, 400);
+        assert.equal((await f.click({}, { [key]: packageDigest })).status, 400);
+    }
+    assert.deepEqual(f.opens, []);
+    assert.deepEqual(await f.click(), { status: 200, data: { executionMode: 'rebuild', status: 'installed', nodeId: id } });
+    assert.deepEqual(f.opens, [id]);
+    assert.deepEqual(f.byAction(), ['preflight', 'prepare-packages', 'preflight', 'prepare', 'check', 'install', 'verify']);
+    assert.deepEqual(f.session.events, ['commit', 'commit']);
+    assert.deepEqual(f.states.map(row => [row.status, row.backupId]), [['installed', reserved]]);
+    assert.deepEqual(f.users.map(row => row.syncStatus), ['synced']);
+    assert.equal(f.lockHeld, false);
+});
+
+test('package flow: unsupported and unsafe preflight frames refuse before reservation', async t => {
+    const cases = [
+        ['ENV-only', { grant: false }, 'refused', 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'],
+        ['guard refusal', { proof: { code: 70, stderr: 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n' } }, 'refused', 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'],
+        ['foreign machine', { proof: wire({ machineId: '1'.repeat(32), packagePreparation: packageDigest }) }, 'refused'],
+        ...[true, 'G'.repeat(64), `${packageDigest}\n`, { sha: packageDigest }].map((value, i) => [`invalid digest ${i}`,
+            { proof: wire({ machineId, packagePreparation: value }) }, 'unknown']),
+        ['mixed proof', { proof: wire({ machineId, packagePreparation: packageDigest, ppp: true, masked: false, unitsLoaded: true }) }, 'unknown'],
+        ['duplicate key', { proof: { code: 0, stdout: `{"machineId":"${machineId}","packagePreparation":"${packageDigest}","packagePreparation":"${packageDigest}"}\n` } }, 'unknown'],
+    ];
+    for (const [name, options, outcome, check] of cases) await t.test(name, async child => {
+        const f = packageFlow(child, options);
+        const { status, data } = await f.click();
+        assert.equal(status, 409);
+        assert.equal(data.error.outcome, outcome);
+        assert.equal(data.error.check, check);
+        if (name === 'foreign machine') assert.equal(data.error.code, 'REBUILD_L2TP_IDENTITY_CHANGED');
+        assert.deepEqual(f.byAction(), ['preflight']);
+        assert.deepEqual([f.session.events, f.states, f.users], [[], [], []]);
+        assert.equal(f.lockHeld, false);
+    });
+});
+
+test('package flow: lost majority reservation ACK never opens a package receiver or retries the reservation', async t => {
+    const f = packageFlow(t);
+    f.session.hooks.commit = commit => { commit(); throw Error('simulated lost reply'); };
+    const { data } = await f.click();
+    assert.deepEqual(data.error, { code: 'REBUILD_L2TP_RESERVATION_FAILED', outcome: 'unknown', retryAllowed: false });
+    assert.deepEqual(f.byAction(), ['preflight']);
+    assert.deepEqual(f.states.map(row => row.status), ['installing']);
+    assert.deepEqual(f.users.map(row => row.syncStatus), ['pending']);
+    assert.equal(f.lockHeld, true);
+    assert.equal((await f.click()).data.error.code, 'REBUILD_BUSY');
+    assert.deepEqual(f.session.events, ['commit']);
+    assert.deepEqual(f.opens, [id]);
+});
+
+test('package flow: late identity or reservation drift vetoes stdin on the open pinned channel', async t => {
+    for (const kind of ['machine', 'grant', 'reservation']) await t.test(kind, async child => {
+        const f = packageFlow(child);
+        f.hooks.beforeAttestation = host => {
+            if (kind === 'machine' && f.states[0]?.status === 'installing') host.machine = '1'.repeat(32);
+        };
+        f.hooks.beforeChannel = () => {
+            if (f.states[0]?.status !== 'installing') return;
+            if (kind === 'grant') { f.grants.pop(); f.grant(); }
+            if (kind === 'reservation') f.users[0].syncStatus = 'drifted';
+        };
+        const { data } = await f.click();
+        assert.deepEqual(data.error, { code: kind === 'reservation' ? 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_IDENTITY_CHANGED',
+            outcome: 'unknown', retryAllowed: false });
+        assert.deepEqual(f.byAction(), ['preflight']);
+        assert.deepEqual(f.session.events, ['commit']);
+        assert.equal(f.lockHeld, true);
+    });
+});
+
+test('package flow: unknown package ACKs and failures after package success leave the original reservation fenced', async t => {
+    const cases = [
+        ['missing ACK', () => ({ code: 75 })],
+        ['wrong ID', () => wire({ ok: true, backupId: '0'.repeat(32), packagesReady: true })],
+        ['not ready', ({ backupId }) => wire({ ok: true, backupId, packagesReady: false })],
+        ['numeric ready', ({ backupId }) => wire({ ok: true, backupId, packagesReady: 1 })],
+        ['extra field', ({ backupId }) => wire({ ok: true, backupId, packagesReady: true, packagePreparation: packageDigest })],
+        ['duplicate field', ({ backupId }) => ({ code: 0,
+            stdout: `{"ok":true,"backupId":"${backupId}","packagesReady":true,"packagesReady":true}\n` })],
+        ['tainted stderr', ({ backupId }) => ({ ...wire({ ok: true, backupId, packagesReady: true }), stderr: 'unexpected\n' })],
+        ['foreign no-write frame', () => ({ code: 70, stderr: 'DIRECT_NO_WRITE_COMMAND_FAILED\n' })],
+        ['package guard refusal after reservation', () => ({ code: 70, stderr: 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n' }),
+            undefined, undefined, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'],
+        ['stock refusal after ACK', null, 'preflight', { code: 70, stderr: 'DIRECT_RUNTIME_NATIVE_UNIT_REQUIRED\n' }, 'RUNTIME_NATIVE_UNIT_REQUIRED'],
+        ['still requests packages', null, 'preflight', wire({ machineId, packagePreparation: packageDigest }), 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'],
+        ['install no-write after ACK', null, 'install', { code: 70, stderr: 'DIRECT_NO_WRITE_BASELINE_CHANGED\n' }],
+    ];
+    for (const [name, badAck, last, failure, check] of cases) await t.test(name, async child => {
+        const f = packageFlow(child, { reply(input) {
+            if (input.action === 'prepare-packages') return badAck ? badAck(input) : wire({ ok: true, backupId: input.backupId, packagesReady: true });
+            if (input.action === last) return failure;
+        } });
+        const { status, data } = await f.click();
+        assert.equal(status, 409);
+        assert.equal(data.error.outcome, 'unknown');
+        assert.equal(data.error.retryAllowed, false);
+        assert.equal(data.error.check, check);
+        const actions = ['preflight', 'prepare-packages'];
+        if (last) actions.push('preflight');
+        if (last === 'install') actions.push('prepare', 'check', 'install');
+        assert.deepEqual(f.byAction(), actions);
+        assert.deepEqual(f.session.events, ['commit']);
+        assert.deepEqual(f.states.map(row => row.status), ['installing']);
+        assert.deepEqual(f.users.map(row => row.syncStatus), ['pending']);
+        assert.equal(f.lockHeld, true);
+        assert.equal((await f.click()).data.error.code, 'REBUILD_BUSY');
+        // The persisted reservation also refuses a fresh Install if the
+        // global lock is no longer present; it never acts as a resume token.
+        f.loseLock();
+        assert.equal((await f.click()).data.error.code, 'REBUILD_L2TP_NOT_FRESH_RELAY');
+        assert.deepEqual(f.byAction(), actions);
+        assert.deepEqual(f.opens, [id]);
+    });
+});
 
 async function assertGrantReachesInstall(t, useGrantDb) {
     const f = admissionEffects(t, { useGrantDb });

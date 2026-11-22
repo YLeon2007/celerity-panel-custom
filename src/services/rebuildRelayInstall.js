@@ -1,7 +1,8 @@
 'use strict';
 
+const { randomBytes } = require('node:crypto');
 const { AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError } = require('./rebuildRelayInstallTransaction');
-const { classifyInstallFailure, installFailure, requireInstallHostReady,
+const { classifyInstallFailure, installFailure, hasPackagePreparation, requireInstallHostReady,
     checkedInstallId } = require('./rebuildRelayInstallDiagnostics');
 const { IDENTITY_CHANGED, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 
@@ -44,11 +45,16 @@ async function runFreshRelayInstall(id, deps) {
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
                     throw fail(deps.unifiedIdentity ? IDENTITY_CHANGED : 'REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
                 }
-                requireInstallHostReady(host);
+                const preparePackages = deps.allowPackagePreparation === true && hasPackagePreparation(host);
+                if (!preparePackages) requireInstallHostReady(host);
                 if (deps.verifyBinding) await checkAuthority();
                 else await checkAuthorization();
-                const plan = await deps.prepare(inventory, remote);
-                const backupId = plan?.backupId;
+                // The fully installed path still does read-only prepare/check
+                // before reserving. The package path must reserve before its
+                // first host write, using an ID generated only on this server.
+                let plan;
+                if (!preparePackages) plan = await deps.prepare(inventory, remote);
+                const backupId = preparePackages ? randomBytes(16).toString('hex') : plan?.backupId;
                 if (typeof backupId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(backupId)) {
                     throw fail('REBUILD_L2TP_INSTALL_PLAN_INVALID');
                 }
@@ -70,7 +76,20 @@ async function runFreshRelayInstall(id, deps) {
                     await checkAuthority();
                 };
 
+                if (preparePackages) {
+                    await guard();
+                    if (await remote.preparePackages(backupId, guard) !== true) throw fail(UNKNOWN);
+                    await guard();
+                    // DIRECT repeats ordinary preflight in prepare, on this
+                    // same pinned client. Do not reserve or generate an ID again.
+                    plan = await deps.prepare(inventory, remote);
+                    if (plan?.backupId !== backupId) throw fail('REBUILD_L2TP_INSTALL_PLAN_INVALID');
+                }
+
                 const rollback = async (code, { noHostChanges = false, check } = {}) => {
+                    // Not even a no-write Install refusal establishes that the
+                    // earlier package phase was undone. Retain the reservation.
+                    if (preparePackages) throw installFailure(code, 'unknown', check, { retryAllowed: false });
                     try {
                         await guard();
                         if (!noHostChanges && await remote.rollback(plan, guard) !== true) throw fail(ROLLBACK_UNKNOWN);

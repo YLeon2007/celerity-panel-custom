@@ -29,11 +29,13 @@ test('all grant sources and permissions render in EN, RU and ZH; a registry fail
         const copy = require(`../../../locales/${lang}.json`).rebuildL2tp.admission;
         assert.deepEqual(Object.keys(copy).sort(), Object.keys(words.admission).sort());
         const html = await render(lang);
-        const hint = require(`../../../locales/${lang}.json`).rebuildL2tp.installProfileHint;
-        assert.ok(hint && html.includes(hint));
+        const { installProfileHint: hint, installPackageHint: packageHint } = require(`../../../locales/${lang}.json`).rebuildL2tp;
+        assert.ok(hint && html.includes(hint) && packageHint && html.includes(packageHint));
         for (const [i, relayId] of ids.entries()) {
             const card = html.match(new RegExp(`<tr id="relay-${relayId}"[\\s\\S]*?</tr>`))[0];
             assert.equal(card.includes(hint), i !== 0);
+            assert.equal(card.includes(packageHint), i === 1);
+            if (i === 1) assert.ok(card.includes(`aria-describedby="install-profile-${relayId} install-packages-${relayId}"`));
             assert.equal(card.includes('href="/panel/nodes"'), i !== 0);
         }
         for (const text of [copy.db, copy.env, copy.none, copy.envReadOnly, copy.verifyInstructions, copy.confirmInstructions]) {

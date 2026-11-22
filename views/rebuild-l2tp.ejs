@@ -135,8 +135,9 @@ function secretControl(kind, url, index, login) {
                                         <p class="text-muted" id="install-profile-<%= relay.id %>"><%= l('installProfileHint') %>
                                             <a href="/panel/nodes"><%= t('nodes.title') %></a>
                                         </p>
+                                        <% if (source === 'db') { %><p class="text-muted" id="install-packages-<%= relay.id %>"><%= l('installPackageHint') %></p><% } %>
                                         <button type="button" class="btn btn-sm btn-primary" data-install-url="<%= relayPath(relay.id) %>/install"
-                                                data-node-id="<%= relay.id %>" aria-describedby="install-profile-<%= relay.id %>"><%= l('install') %></button>
+                                                data-node-id="<%= relay.id %>" aria-describedby="install-profile-<%= relay.id %><%= source === 'db' ? ` install-packages-${relay.id}` : '' %>"><%= l('install') %></button>
                                     <% } %>
                                     <% if (actionable && !changed && relay.canRemove === true) { %>
                                         <a class="btn btn-sm btn-danger" data-remove-link href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a>

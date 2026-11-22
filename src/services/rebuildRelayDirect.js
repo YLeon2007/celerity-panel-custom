@@ -11,7 +11,7 @@ const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { validCensus, validRetirementCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
-const { isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, requireInstallHostReady,
+const { isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
     withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
@@ -151,6 +151,8 @@ function bundleDirectScript() {
             '/__c3_direct__/services/rebuildRelayStockRuntime.py'),
         load('C3_STOCK_ENSURE', '../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'c3_stock_ensure',
             '/__c3_direct__/modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'),
+        load('C3_PACKAGE_GUARD', 'rebuildRelayPackageGuard.py', 'c3_package_guard',
+            '/__c3_direct__/services/rebuildRelayPackageGuard.py'),
         `exec(_c3_compile("${pack('rebuildRelayDirectHost.py')}","<DIRECT host>"))`,
     ].join(';');
 }
@@ -180,7 +182,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
     });
     ssh.usePool = false;
     let closed = false, busy = false, poisoned = false;
-    let execPinned, held, chapObservation;
+    let execPinned, held, chapObservation, packagePreparation, packageAttempt;
     const disconnect = () => { try { ssh.disconnect(); } catch { /* cleanup cannot replace outcome */ } };
     const poison = () => { if (!poisoned && !closed) { poisoned = true; disconnect(); } };
     async function checkBinding() {
@@ -221,7 +223,9 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         const retirementCount = action === 'retirement-count';
         const count = action === 'session-count' || retirementCount;
         const chap = CHAP_ACTIONS.includes(action);
-        const guarded = chap || action === 'install' || (merged && write) || (action === 'remove' && verifyRemoveStdin === true);
+        const packageWrite = action === 'prepare-packages';
+        const guarded = chap || packageWrite || action === 'install' || (merged && write)
+            || (action === 'remove' && verifyRemoveStdin === true);
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         await checkBinding();
         await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
@@ -257,6 +261,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         let result;
         try { result = await execPinned(directCommand(retirementCount ? '-k 1s 22s' : count ? '-k 1s 9s' : '-k 4s 125s'), {
             stdin, timeout: retirementCount ? RETIREMENT_COUNT_TIMEOUT : count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
+            ...(packageWrite && { maxOutputBytes: 160 }),
         }, verifyBeforeStdin); }
         catch { throw identityRefusal ?? unknown(); }
         try { await checkBinding(); }
@@ -267,6 +272,15 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
                 && (result.stderr === 'DIRECT_IDENTITY\n' || action === 'install' && result.stderr === 'DIRECT_NO_WRITE_IDENTITY\n')) {
                 poison();
                 throw identityChanged();
+            }
+            // A package-phase refusal isn't an Install no-write certificate.
+            // Whatever stopped the helper, do not infer package settlement.
+            if (packageWrite) {
+                const error = unknown();
+                if (result.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n') {
+                    withInstallCheck(error, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
+                }
+                throw error;
             }
             if (action === 'inspect-chap') {
                 const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
@@ -301,11 +315,11 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             throw error;
         }
         try {
-            const replyLimit = action === 'inspect-chap' ? 170 : (count || chap) ? 160 : 46 * 1024 * 1024;
+            const replyLimit = action === 'inspect-chap' ? 170 : (count || chap || packageWrite) ? 160 : 46 * 1024 * 1024;
             if (result.stderr !== '' || Buffer.byteLength(result.stdout) > replyLimit) throw Error();
             const reply = JSON.parse(result.stdout);
             if ((count || chap) && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
-            if ((isInstallStage(action) || ['verify', 'rollback'].includes(action))
+            if ((packageWrite || isInstallStage(action) || ['verify', 'rollback'].includes(action))
                 && (closed || result.stdout !== installReplyFrame(reply))) throw Error();
             if (!validate(reply)) throw Error();
             return reply;
@@ -322,9 +336,9 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
     const validReadiness = value => tokenMatches(TOKEN, value.machineId) && value.machineId.length === 32
         && ['ppp', 'masked', 'unitsLoaded'].every(key => typeof value[key] === 'boolean');
     async function preflight() {
-        const proof = await exec('preflight', {}, false, value => (exactKeys(value, readinessKeys)
+        const proof = await exec('preflight', {}, false, value => hasPackagePreparation(value) || ((exactKeys(value, readinessKeys)
             || (exactKeys(value, preparationKeys) && value.pppPreparation === true)
-            || hasNativePreparation(value)) && validReadiness(value));
+            || hasNativePreparation(value)) && validReadiness(value)));
         if (proof.machineId !== machineId) { poison(); throw merged ? identityChanged() : fail('INSTALL_IDENTITY_MISMATCH'); }
         return proof;
     }
@@ -412,7 +426,26 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
     });
 
     return Object.freeze({
-        preflight: () => serial(preflight),
+        preflight: () => serial(async () => {
+            packagePreparation = undefined;
+            const proof = await preflight();
+            if (!packageAttempt && hasPackagePreparation(proof)) packagePreparation = proof.packagePreparation;
+            return proof;
+        }),
+        preparePackages: (backupId, verifyLock) => serial(async () => {
+            requireThat(merged && fence.listMode === true && fence.source === 'db' && !held && !packageAttempt
+                && packagePreparation !== undefined && validGeneration(backupId), 'INSTALL_INPUT_INVALID');
+            requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
+            // Only the pinned client's preflight can supply this proof. Burn
+            // it before attempting the write, even if the reply is lost.
+            const params = { backupId, packagePreparation };
+            packagePreparation = undefined;
+            packageAttempt = { backupId, ready: false };
+            await exec('prepare-packages', params, true, value => exactKeys(value, ['ok', 'backupId', 'packagesReady'])
+                && exactAck(backupId)(value) && value.packagesReady === true, verifyLock);
+            packageAttempt.ready = true;
+            return true;
+        }),
         checkChap: (...args) => chapOperation('check-chap', ...args),
         syncChap: (...args) => chapOperation('sync-chap', ...args),
         inspectChap: (...args) => chapOperation('inspect-chap', ...args),
@@ -420,7 +453,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         readSessionCount: input => sessionCount(input, false),
         readRetirementCount: input => sessionCount(input, true),
         prepare: input => serial(async () => {
-            requireThat(!held && input?.nodeId === nodeId && typeof input.carryDomain === 'boolean'
+            requireThat(!held && (!packageAttempt || packageAttempt.ready) && input?.nodeId === nodeId && typeof input.carryDomain === 'boolean'
                 && Array.isArray(input.controlPlaneAddresses), 'INSTALL_INPUT_INVALID');
             const d = makeDesired(input.desired);
             const controlPlaneAddresses = [...input.controlPlaneAddresses], carryDomain = input.carryDomain;
@@ -437,7 +470,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             requireInstallHostReady(snapshot, host);
             const profiles = composeRebuildRelayPair(snapshot, { nodeId, tproxyPort: d.tproxyPort, controlPlaneAddresses,
                 carryDomain, mainSha256: snapshot.mainSha256, bridgeSha256: snapshot.bridgeSha256 });
-            const backupId = randomBytes(16).toString('hex');
+            const backupId = packageAttempt?.backupId ?? randomBytes(16).toString('hex');
             const params = { backupId, baseline: snapshot.baseline, network, ...topology, files: buildFiles(d, profiles, backupId) };
             await exec('check', params, false, installAck(backupId));
             const plan = { nodeId, backupId };

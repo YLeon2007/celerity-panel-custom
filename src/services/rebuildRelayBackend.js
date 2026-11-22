@@ -90,6 +90,7 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
                 : () => { try { fence.check(); return true; } catch { return false; } },
             machineId,
             ...(relayGrantStore && { unifiedIdentity: true }),
+            allowPackagePreparation: fence.listMode === true && fence.source === 'db',
             lock: fn => locks.run((verifyLock, retainLock) => withNode(id, async () => {
                 if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                 return fn(verifyLock, retainLock);

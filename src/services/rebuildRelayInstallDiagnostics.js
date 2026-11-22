@@ -51,6 +51,12 @@ function specificHostRefusal(action, suffix, noWrite) {
 const prerequisiteCheck = action => stages.get(action);
 
 const nativePreparationKeys = ['machineId', 'ppp', 'masked', 'unitsLoaded', 'pppPreparation', 'nativePreparation'];
+function hasPackagePreparation(host) {
+    return host && Object.keys(host).length === 2 && Object.hasOwn(host, 'machineId') && Object.hasOwn(host, 'packagePreparation')
+        && typeof host.machineId === 'string' && /^[a-f0-9]{32}(?![\s\S])/.test(host.machineId)
+        && typeof host.packagePreparation === 'string' && /^[a-f0-9]{64}(?![\s\S])/.test(host.packagePreparation);
+}
+
 function hasNativePreparation(host) {
     return host?.nativePreparation === true && host.pppPreparation === true && host.unitsLoaded === false
         && host.masked === false && typeof host.ppp === 'boolean'
@@ -63,7 +69,8 @@ function requireInstallHostReady(host, preflight = host) {
         && (hasNativePreparation(preflight) || (host.unitsLoaded === true && !Object.hasOwn(preflight, 'nativePreparation')))
         && (host.ppp === true || (host.ppp === false && preflight.pppPreparation === true))) return;
     const code = 'REBUILD_L2TP_HOST_NOT_READY';
-    const check = host?.masked === true ? 'VPN_UNITS_MASKED' : host?.unitsLoaded === false ? 'VPN_UNITS_NOT_LOADED'
+    const check = hasPackagePreparation(host) ? 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
+        : host?.masked === true ? 'VPN_UNITS_MASKED' : host?.unitsLoaded === false ? 'VPN_UNITS_NOT_LOADED'
         : host?.unitsLoaded !== preflight?.unitsLoaded ? 'HOST_BASELINE'
         : host?.ppp === false ? 'PPP_MODULES_REQUIRED' : 'HOST_PREFLIGHT';
     throw withInstallCheck(Object.assign(new Error(code), { code }), check);
@@ -135,5 +142,5 @@ function publicInstallFailure(error) {
     return { code, outcome, ...(check !== undefined && { check }), ...(retryAllowed === false && { retryAllowed }) };
 }
 
-module.exports = { installCheckIds, isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, requireInstallHostReady,
+module.exports = { installCheckIds, isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
     withInstallCheck, checkedInstallId, installFailure, classifyInstallFailure, publicInstallFailure };

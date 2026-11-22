@@ -1,5 +1,5 @@
 # DIRECT TEST install and owned removal. This private endpoint accepts only the fixed
-# actions/paths below. No remote runner, package installs, or global flushes.
+# actions/paths below. Package preparation is a separate guarded prerequisite.
 import base64
 import contextlib
 import ctypes
@@ -13,6 +13,7 @@ import os
 import pwd
 import re
 import select
+import selectors
 import shlex
 import signal
 import socket
@@ -28,6 +29,7 @@ from typing import Any, cast
 # Injected by the DIRECT payload, not loaded from the remote disk.
 C3_STOCK_RUNTIME: dict[str, Any]
 C3_STOCK_ENSURE: dict[str, Any]
+C3_PACKAGE_GUARD: dict[str, Any]
 
 MAIN = '/usr/local/etc/xray/config.json'
 XRAY_CONFIG_WRITABLE = 'XRAY_CONFIG_WRITABLE'
@@ -60,6 +62,10 @@ STOCK_XL_DEFAULT_SHA = '37b5938f462ec60b4f8c179b34f70b548c09da4691c938e88ce111ce
 STOCK_XL_DEFAULT_MD5 = b'fadc31f26078d8c3fb033d7d4516500b'
 REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables')
 PACKAGE_AUTOSTART_UNSAFE = 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
+PACKAGE_PENDING = 'package-preparation.pending'
+PACKAGE_MAX_OUTPUT = 256 * 1024  # per stream
+PACKAGE_MAX_COMMANDS = 256      # two observations (up to 48 dependencies each), plus readbacks
+NATIVE_MAX_OUTPUT = 128 * 1024
 NATIVE_UNIT_REQUIRED = 'RUNTIME_NATIVE_UNIT_REQUIRED'
 STOCK_IKE_INCLUDE = b'include /etc/ipsec.d/*.conf'
 # Original Debian strongswan-starter 6.0.1-6+deb13u7 conffile, before
@@ -147,6 +153,51 @@ def command(*args, data=None, wait=6, unit_show=False, quiet=False, negative=Non
         need(result.returncode == 0 or (unit_show and result.returncode == 1
              and result.stdout.splitlines().count(b'LoadState=not-found') == 1), why)
     return result.stdout
+
+
+def bounded_status(argv, end, maximum, *, may_write=False):
+    """A status exists only after both bounded streams reach EOF and we reap the original child."""
+    def left():
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired((), 0)
+        return remaining
+
+    left()
+    # With SIGCHLD ignored, Popen.wait() can turn ECHILD into a false zero.
+    need(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, 'IN_FLIGHT')
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             cwd='/', env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C',
+                                           'DEBIAN_FRONTEND': 'noninteractive'})
+    try:
+        assert child.stdout is not None and child.stderr is not None
+        with child.stdout as stdout, child.stderr as stderr, selectors.DefaultSelector() as pipes:
+            out, err = bytearray(), bytearray()
+            pipes.register(stdout, selectors.EVENT_READ, out)
+            pipes.register(stderr, selectors.EVENT_READ, err)
+            while pipes.get_map():
+                for key, _ in pipes.select(left()):
+                    buf = key.data
+                    data = os.read(key.fd, min(16384, maximum + 1 - len(buf)))
+                    if not data:
+                        pipes.unregister(key.fileobj)
+                    else:
+                        buf.extend(data)
+                        if len(buf) > maximum:
+                            raise subprocess.TimeoutExpired((), 0)
+            status = child.wait(timeout=left())
+        left()
+        if status < 0:
+            raise subprocess.TimeoutExpired((), 0)
+        return status, bytes(out), bytes(err)
+    except BaseException:
+        # Do not interrupt a package writer to manufacture settlement. The
+        # durable pending fence survives us even if descendants remain live.
+        if not may_write:
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                child.kill()
+                child.wait(timeout=0.25)
+        raise
 
 
 def sc(*args, wait=6):
@@ -343,13 +394,19 @@ def require_machine(machine):
     return machine_id
 
 
-def preflight(machine, *, fresh=False):
+def preflight(machine, *, fresh=False, package_offer=False):
     machine_id = require_machine(machine)
     if fresh:
+        package_no_pending()
         # A missing runtime package can start IKE/LNS in its maintainer
         # scripts. Check dpkg before interpreting unit state or preparing PPP;
-        # never call apt, change service policy, or stop an existing service.
-        require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
+        # Never change service policy or stop an existing service here.
+        try:
+            require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
+        except Refusal as error:
+            if not package_offer or str(error) != PACKAGE_AUTOSTART_UNSAFE:
+                raise
+            return package_preflight(machine_id)
     ppp = ppp_device() is True and ppp_registered()
     xl, ike = (unit(name) for name in (XL, IKE))
     units = [xl['LoadState'], ike['LoadState']]
@@ -363,10 +420,8 @@ def stock_runtime_root():
 
 
 def stock_runtime_command(*argv):
-    left = DEADLINE - time.monotonic()
-    if left <= 0:
-        raise subprocess.TimeoutExpired(argv, 0)
-    return C3_STOCK_RUNTIME['command'](*argv, timeout=min(12, left))
+    status, stdout, stderr = bounded_status(argv, min(DEADLINE, time.monotonic() + 12), NATIVE_MAX_OUTPUT)
+    return subprocess.CompletedProcess(argv, status, stdout.decode(), stderr.decode())
 
 
 def pending_xl(info):
@@ -4542,6 +4597,197 @@ def install_lock_identity(lock_fd):
     return lock_id
 
 
+class PackageRunner:
+    def __init__(self):
+        self.remaining = PACKAGE_MAX_COMMANDS
+        self.entered = False
+        self.failed = False
+        self.apt_dispatched = False
+
+    def __call__(self, argv: tuple[str, ...], timeout: int) -> tuple[int, bytes, bytes]:
+        try:
+            need(not self.failed and self.remaining > 0, 'IN_FLIGHT')
+            # Only bundled guard code supplies argv. A closed executable set,
+            # empty stdin and fixed environment keep this from being a shell seam.
+            need(type(argv) is tuple and 1 < len(argv) <= 128 and all(
+                type(arg) is str and 0 < len(arg) <= 4096 and '\0' not in arg for arg in argv)
+                 and type(timeout) is int and timeout > 0, 'IN_FLIGHT')
+            end = min(DEADLINE, time.monotonic() + timeout)
+            read_only = self.admit(argv)
+            self.remaining -= 1
+            return bounded_status(argv, end, PACKAGE_MAX_OUTPUT, may_write=not read_only)
+        except Exception:
+            # An ordinary nonzero status is returned to the guard and may
+            # permit checked cleanup. A timeout, signal or broken status
+            # channel must never be treated as a settled package command.
+            self.failed = True
+            raise subprocess.TimeoutExpired((), 0) from None
+
+    def admit(self, argv):
+        binary, *args = argv
+        if binary == '/usr/bin/env':
+            # The guard gives only this sandboxed APT prefix, with its own
+            # sealed configuration descriptor. Do not forward arbitrary env.
+            need(len(argv) >= 9 and argv[:6] == ('/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+                 'LC_ALL=C', 'DEBIAN_FRONTEND=noninteractive', 'UCF_FORCE_CONFFOLD=1') and
+                 re.fullmatch(rf'APT_CONFIG=/proc/{os.getpid()}/fd/[0-9]{{1,10}}', argv[6]), 'IN_FLIGHT')
+            binary, verb, *args = argv[7:]
+            spec = r'[a-z0-9][a-z0-9+.-]+(?:=[0-9][A-Za-z0-9.+:~\-]*)?'
+            if binary == '/usr/bin/apt-cache' and verb == 'show':
+                need(len(args) == 1 and re.fullmatch(spec, args[0]), 'IN_FLIGHT')
+                return True
+            if binary == '/usr/bin/apt-get' and verb == '-s' and args == ['check']:
+                return True
+            need(binary == '/usr/bin/apt-get' and len(args) > 5 and
+                 args[:5] == ['--no-install-recommends', '--no-install-suggests', '--no-remove', '--no-upgrade', 'install']
+                 and all(re.fullmatch(spec, arg) for arg in args[5:]), 'IN_FLIGHT')
+            if verb == '-s':
+                return True
+            need(verb == '-y' and self.entered and not self.apt_dispatched, 'IN_FLIGHT')
+            self.apt_dispatched = True
+            return False
+        if binary == '/usr/bin/systemctl':
+            need(argv[1:5] == ('--system', '--no-pager', '--no-ask-password', '--full') and len(argv) >= 6,
+                 'IN_FLIGHT')
+            if argv[5] in ('show', 'list-jobs'):
+                return True
+            need(self.entered and argv[5:] == ('daemon-reload',), 'IN_FLIGHT')
+            return False
+        if binary == '/usr/sbin/update-rc.d':
+            need(self.entered and len(args) == 2 and args[0] in ('xl2tpd', 'ipsec', 'strongswan-starter', 'nftables')
+                 and args[1] == 'disable', 'IN_FLIGHT')
+            return False
+        need((binary == '/usr/bin/dpkg' and len(args) == 1 and args[0] in (
+              '--print-architecture', '--print-foreign-architectures', '--audit')) or
+             (binary == '/usr/bin/dpkg-query' and args[0] == '-W') or
+             (binary == '/usr/bin/ps' and args == ['-e', '-o', 'pid=,comm=']) or
+             (binary == '/usr/bin/ss' and args == ['-H', '-aun', '( sport = :500 or sport = :4500 or sport = :1701 )']),
+             'IN_FLIGHT')
+        return True
+
+
+def package_entry_exists(name):
+    try:
+        with directory(VAULT, private=True) as fd:
+            os.stat(name, dir_fd=fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def package_no_pending():
+    need(not package_entry_exists(PACKAGE_PENDING), 'IN_FLIGHT')
+
+
+def package_scope(machine, fd):
+    machine_id = require_machine(machine)
+    boot_id = boot()
+    need(re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot_id), PACKAGE_AUTOSTART_UNSAFE)
+    need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    return {'machineId': machine_id, 'boot': boot_id, 'installLock': install_lock_identity(fd)}
+
+
+def package_observation(guard, machine, fd, run):
+    scope = package_scope(machine, fd)
+    try:
+        plan = guard['observe'](stock_runtime_root(), run)
+    except guard['Refusal']:
+        need(not run.failed, 'IN_FLIGHT')
+        raise Refusal(PACKAGE_AUTOSTART_UNSAFE) from None
+    need(not run.failed, 'IN_FLIGHT')
+    need(type(plan) is dict and type(plan.get('missing')) is list and bool(plan['missing']), PACKAGE_AUTOSTART_UNSAFE)
+    need(package_scope(machine, fd) == scope, 'BASELINE_CHANGED')
+    commit = encode({'version': 'direct-package-preparation-v1', 'scope': scope, 'plan': plan})
+    need(len(commit) <= PACKAGE_MAX_OUTPUT and time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    return plan, scope, digest(commit)
+
+
+def package_preflight(machine):
+    guard = globals().get('C3_PACKAGE_GUARD')
+    need(guard is not None, PACKAGE_AUTOSTART_UNSAFE)
+    with directory(SYSTEM) as fd:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        package_no_pending()
+        _, _, commit = package_observation(guard, machine, fd, PackageRunner())
+    need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    return {'machineId': machine, 'packagePreparation': commit}
+
+
+def prepare_packages(request):
+    need(set(request) == {'action', 'machineId', 'backupId', 'packagePreparation'} and all(
+        type(request[key]) is str and re.fullmatch(pattern, request[key])
+        for key, pattern in (('machineId', r'[a-f0-9]{32}'), ('backupId', r'[a-f0-9]{32}'),
+                             ('packagePreparation', r'[a-f0-9]{64}'))), 'CANDIDATE_INVALID')
+    guard = globals().get('C3_PACKAGE_GUARD')
+    if guard is None:
+        raise Refusal(PACKAGE_AUTOSTART_UNSAFE)
+    machine, token = request['machineId'], request['backupId']
+    receipt_name = 'packages-' + token + '.json'
+    receipt_path, pending_path = VAULT + '/' + receipt_name, VAULT + '/' + PACKAGE_PENDING
+    journaling = refused = False
+    try:
+        with directory(SYSTEM) as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            require_machine(machine)
+            package_no_pending()
+            need(not package_entry_exists(receipt_name) and not package_entry_exists(token), 'BASELINE_CHANGED')
+            try:
+                require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
+            except Refusal as error:
+                if str(error) != PACKAGE_AUTOSTART_UNSAFE:
+                    raise
+            else:
+                raise Refusal('BASELINE_CHANGED')
+
+            run = PackageRunner()
+            plan, scope, commit = package_observation(guard, machine, fd, run)
+            need(commit == request['packagePreparation'], 'BASELINE_CHANGED')
+            binding = {**scope, 'backupId': token, 'packagePreparation': commit}
+            intent = entry(encode({**binding, 'phase': 'preparing'}))
+            journaling = True
+            # Do not create VAULT/<backupId>: stock Install still owns the
+            # creation and no-replace publication of that directory/manifest.
+            mkdir(VAULT, 0o700, exist_ok=True)
+            with directory(os.path.dirname(VAULT)) as parent:
+                os.fsync(parent)
+            write(receipt_path, None, intent)
+            write(pending_path, None, intent)
+
+            def recheck():
+                need(not run.failed and package_scope(machine, fd) == scope and
+                     read(receipt_path, 1024) == read(pending_path, 1024) == intent, 'IN_FLIGHT')
+                need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+
+            def enter():
+                need(not run.entered, 'IN_FLIGHT')
+                recheck()
+                run.entered = True
+
+            try:
+                result = guard['prepare'](stock_runtime_root(), run, plan, enter)
+            except guard['Refusal']:
+                # No effect grant, no unsettled command, and exact ownership
+                # below: this refusal is definitive, but still not replayable.
+                need(not run.entered and not run.failed, 'IN_FLIGHT')
+                refused = True
+            else:
+                # Only the guard's normal post-cleanup return proves packages
+                # installed, with no owned masks/policy, and services idle.
+                need(run.entered and result is None, 'IN_FLIGHT')
+            recheck()
+            write(receipt_path, intent, entry(encode({**binding, 'phase': 'refused' if refused else 'ready'})))
+            write(pending_path, intent, None)
+            package_no_pending()
+        need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    except Exception:
+        if journaling:
+            raise Refusal('IN_FLIGHT') from None
+        raise
+    if refused:
+        raise Refusal(PACKAGE_AUTOSTART_UNSAFE)
+    return {'ok': True, 'backupId': token, 'packagesReady': True}
+
+
 def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
     lock_id = install_lock_identity(lock_fd)
     modules = observe_ppp_preparation()
@@ -4554,21 +4800,31 @@ def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owne
 def dispatch(request: dict[str, Any]):
     global STAGE, NO_INSTALL_WRITES
     need(os.geteuid() == 0 and type(request) is dict, 'PREREQUISITE')
-    action, machine = request['action'], request['machineId']
+    action = request['action']
+    if action == 'prepare-packages':
+        NO_INSTALL_WRITES = False
+        return prepare_packages(request)
+    machine = request['machineId']
     if action in ('session-count', 'retirement-count'):
         return read_session_count(request)
     need(re.fullmatch(r'[a-f0-9]{32}', machine) and action in
          ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove')
          + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
     NO_INSTALL_WRITES = action == 'install'
-    ready = preflight(machine, fresh=True) if action in ('preflight', 'prepare', 'check', 'install') else preflight(machine)
+    fresh = action in ('preflight', 'prepare', 'check', 'install')
+    ready = (preflight(machine, fresh=True, package_offer=True) if action == 'preflight' else
+             preflight(machine, fresh=True) if fresh else preflight(machine))
     if action == 'preflight':
+        if 'packagePreparation' in ready:
+            return ready
         xl = unit(XL)
         pending = pending_xl(xl)
         if pending:
             need(not ready['masked'], NATIVE_UNIT_REQUIRED)
             pending_native(xl, unit(IKE), pending)
+            package_no_pending()
             return {**ready, 'unitsLoaded': False, 'pppPreparation': True, 'nativePreparation': True}
+        package_no_pending()
         return {**ready, 'pppPreparation': True}
     d = routing(request['network'])
     # Lock a stable system directory without creating a lock file in prepare.
@@ -4577,6 +4833,8 @@ def dispatch(request: dict[str, Any]):
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, (fcntl.LOCK_SH if action in ('inspect-chap', 'read-chap-generation') else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         require_machine(machine)
+        if fresh:
+            package_no_pending()
         if action in APPLY_NETWORK_ACTIONS:
             keys = {'action', 'machineId', 'backupId', 'network'}
             if action in ('verify-apply-network', 'restart-apply-network'):
@@ -4677,7 +4935,18 @@ def main():
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
         request = json.loads(wire)
         action = request.get('action') if type(request) is dict else None
+        if action == 'prepare-packages':
+            need(len(wire) <= 1024, 'CANDIDATE_INVALID')
+
+            def unique_fields(pairs):
+                value = dict(pairs)
+                need(len(value) == len(pairs), 'CANDIDATE_INVALID')
+                return value
+
+            request = json.loads(wire, object_pairs_hook=unique_fields)
         result = dispatch(request)
+        if action == 'prepare-packages' or action == 'preflight' and 'packagePreparation' in result:
+            need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
     except (subprocess.TimeoutExpired, BlockingIOError):
         return 75
     except Refusal as error:

@@ -90,9 +90,9 @@ test('the exact SSH command shell and Python stdin reject invalid framing locall
     await remote.close();
 });
 
-test('DIRECT bootstrap compiles the three exact repo sources without loading them from the host', async () => {
+test('DIRECT bootstrap compiles the four exact repo sources without loading them from the host', async () => {
     const fingerprints = [
-        '../rebuildRelayDirectHost.py', '../rebuildRelayStockRuntime.py',
+        '../rebuildRelayDirectHost.py', '../rebuildRelayStockRuntime.py', '../rebuildRelayPackageGuard.py',
         '../../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py',
     ].map(file => sha(readFileSync(join(__dirname, file))));
     const probe = String.raw`
@@ -100,6 +100,7 @@ import hashlib, json, os, shlex, sys
 command, request, expected = json.load(sys.stdin)
 assert os.getcwd() == '/' and '' not in sys.path and '/' not in sys.path
 argv = shlex.split(command)
+assert len(command.encode('utf-8')) + 1 <= 128 * 1024
 assert argv[:-1] == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c']
 assert json.loads(request)['action'] == 'preflight'
 assert json.loads(request)['machineId'] not in command
@@ -108,8 +109,10 @@ def audit(event, args):
     if event == 'compile' and isinstance(args[0], bytes):
         sources.append(hashlib.sha256(args[0]).hexdigest())
     if (event in {'subprocess.Popen', 'os.system', 'os.exec', 'os.posix_spawn'} or event.startswith('socket.')
+            or event == 'open' and args[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT)
             or event == 'open' and isinstance(args[0], str) and args[0].endswith(
-                ('rebuildRelayDirectHost.py', 'rebuildRelayStockRuntime.py', 'ensure-xl2tpd-unit.py'))):
+                ('rebuildRelayDirectHost.py', 'rebuildRelayStockRuntime.py', 'ensure-xl2tpd-unit.py',
+                 'rebuildRelayPackageGuard.py'))):
         faults.append(event)
         raise AssertionError('unexpected external source or dispatch')
 sys.addaudithook(audit)
@@ -119,9 +122,10 @@ assert not faults, faults
 assert sorted(digest for digest in sources if digest in expected) == sorted(expected), 'missing or duplicated source'
 for name, function in [('C3_STOCK_RUNTIME', 'verify_package'), ('C3_STOCK_ENSURE', 'ensure')]:
     scope = host[name]
-    assert type(scope) is dict and scope['__name__'] not in ('__main__', host['__name__'])
     assert scope[function].__globals__ is scope
-assert host['C3_STOCK_RUNTIME']['__name__'] != host['C3_STOCK_ENSURE']['__name__']
+scopes = [host[key] for key in ['C3_STOCK_RUNTIME', 'C3_STOCK_ENSURE', 'C3_PACKAGE_GUARD']]
+assert all(type(scope) is dict and scope['__name__'] not in ('__main__', host['__name__']) for scope in scopes)
+assert len({scope['__name__'] for scope in scopes}) == len(scopes)
 `;
     class SSH {
         connect() {}
