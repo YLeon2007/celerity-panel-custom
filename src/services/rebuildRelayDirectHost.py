@@ -43,6 +43,11 @@ NFT_FILE = NFT_DIR + '/ingress.nft'
 VAULT = '/var/lib/celerity-rebuild-l2tp-direct'
 XL, IKE, X, B = 'xl2tpd.service', 'strongswan-starter.service', 'xray.service', 'xray-bridge.service'
 XRAY_DROPIN_NAME = '10-donot_touch_single_conf.conf'
+# Exact files emitted by prepareAccessCommand in xraySetupRuntime.js.
+XRAY_SETUP_DROPINS = {
+    '90-celerity-config-access.conf': b'# Managed by Celerity Xray setup\n[Service]\nSupplementaryGroups=xray\n',
+    '90-celerity-logs-directory.conf': b'# Managed by Celerity Xray setup\n[Service]\nLogsDirectory=xray\n',
+}
 XRAY_DROPIN_UNSUPPORTED = 'XRAY_DROPIN_UNSUPPORTED'
 # Exact native unit emitted by the stock prerequisite installer.
 NATIVE_XL_SHA = '20e9c67838fa8072a5378839fc729a1123d1580879fbf20f9121d558fd0fe0df'
@@ -593,13 +598,24 @@ def no_hooks(info):
 
 def xray_dropin(info, path, argv):
     loaded = info.get('DropInPaths')
-    if not loaded:
-        return
     bad = XRAY_DROPIN_UNSUPPORTED
+    if path != MAIN:
+        need(not loaded, bad)  # No exception for the separate xray-bridge service.
+        return
     folder = SYSTEM + '/' + X + '.d'
-    stock = folder + '/' + XRAY_DROPIN_NAME
-    need(path == MAIN and loaded == stock and info.get('LoadState') == 'loaded'
-         and info.get('NeedDaemonReload') == 'no', bad)
+    try:
+        with directory(folder) as fd:
+            names = sorted(n for n in os.listdir(fd) if n.endswith('.conf'))
+    except FileNotFoundError:
+        names = []
+    except (OSError, Refusal):
+        raise Refusal(bad) from None
+    # Check even an empty manager list: a pending or foreign file is not absence.
+    need(isinstance(loaded, str) and all(n == XRAY_DROPIN_NAME or n in XRAY_SETUP_DROPINS for n in names)
+         and sorted(loaded.split(' ') if loaded else []) == [folder + '/' + n for n in names], bad)
+    if not names:
+        return
+    need(info.get('LoadState') == 'loaded' and info.get('NeedDaemonReload') == 'no', bad)
     # An exact systemctl command record, not a prefix or the first of several.
     prefix = '{ path=' + XRAY + ' ; argv[]=' + ' '.join(argv) + ' ; '
     need(re.fullmatch(re.escape(prefix) + r'ignore_errors=no ; start_time=\[[^\[\]{};\r\n]+\] ; '
@@ -609,16 +625,20 @@ def xray_dropin(info, path, argv):
                                            'PassEnvironment', 'UnsetEnvironment'))
          and info.get('WorkingDirectory') in ('', '/') and info.get('KillMode') == 'control-group', bad)
     try:
-        with directory(folder) as fd:
-            need([n for n in os.listdir(fd) if n.endswith('.conf')] == [XRAY_DROPIN_NAME], bad)
-        record = read(stock, 16384)
+        for name in names:
+            record = read(folder + '/' + name, 16384)
+            need(record is not None and record['mode'] == 0o644 and record['gid'] == 0, bad)
+            data = raw(record)
+            if name != XRAY_DROPIN_NAME:
+                need(data == XRAY_SETUP_DROPINS[name], bad)
+                continue
+            # Only the existing XTLS file permits inert comments and CRLF.
+            lines = [line.removesuffix(b'\r').strip(b' \t') for line in data.split(b'\n')]
+            need(all(not any(c in line for c in (b'\0', b'\r')) and not line.endswith(b'\\') for line in lines)
+                 and [line for line in lines if line and not line.startswith((b'#', b';'))]
+                     == [b'[Service]', b'ExecStart=', b'ExecStart=' + ' '.join(argv).encode()], bad)
     except (OSError, Refusal):
         raise Refusal(bad) from None
-    need(record is not None and record['mode'] == 0o644 and record['gid'] == 0, bad)
-    lines = [line.removesuffix(b'\r').strip(b' \t') for line in raw(record).split(b'\n')]
-    need(all(not any(c in line for c in (b'\0', b'\r')) and not line.endswith(b'\\') for line in lines)
-         and [line for line in lines if line and not line.startswith((b'#', b';'))]
-             == [b'[Service]', b'ExecStart=', b'ExecStart=' + ' '.join(argv).encode()], bad)
 
 
 def same_xray_dropin(info, original):

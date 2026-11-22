@@ -1,14 +1,19 @@
-"""DIRECT XTLS drop-in admission; manager and /proc are modeled, disk is real."""
+"""DIRECT MAIN drop-in admission; manager and /proc are modeled, disk is real."""
 import io
 import os
 from pathlib import Path
 import runpy
+import stat
 import tempfile
 from types import SimpleNamespace
 import unittest
 
 HOST = Path(__file__).resolve().parents[1] / 'rebuildRelayDirectHost.py'
 DROP = '/etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf'
+ACCESS = '/etc/systemd/system/xray.service.d/90-celerity-config-access.conf'
+LOGS = '/etc/systemd/system/xray.service.d/90-celerity-logs-directory.conf'
+SETUP = {ACCESS: b'# Managed by Celerity Xray setup\n[Service]\nSupplementaryGroups=xray\n',
+         LOGS: b'# Managed by Celerity Xray setup\n[Service]\nLogsDirectory=xray\n'}
 XRAY = '/usr/local/bin/xray'
 ARGV = XRAY + ' run -config /usr/local/etc/xray/config.json'
 STOCK = (b'# Customize startup parameters in a separate file.\n\n[Service]\nExecStart=\nExecStart='
@@ -46,7 +51,7 @@ class XrayDropinTest(unittest.TestCase):
 
         def fstat(fd):
             st = os.fstat(fd)
-            leaf = st.st_ino == self.drop.lstat().st_ino if self.drop.exists() else False
+            leaf = stat.S_ISREG(st.st_mode)
             return SimpleNamespace(st_uid=self.uid if leaf else 0, st_gid=self.gid if leaf else 0,
                                    st_mode=st.st_mode, st_nlink=st.st_nlink, st_size=st.st_size)
 
@@ -77,6 +82,100 @@ class XrayDropinTest(unittest.TestCase):
         self.assertEqual(self.host['xray_argv'](self.info), '42')
         self.drop.unlink()
         self.assertEqual(self.host['xray_argv'](dict(self.info, DropInPaths='')), '42')
+        self.drop.parent.rmdir()
+        self.assertEqual(self.host['xray_argv'](dict(self.info, DropInPaths='')), '42')
+
+    def put_setup(self, path):
+        file = self.drop.with_name(Path(path).name)
+        file.write_bytes(SETUP[path])
+        file.chmod(0o644)
+        return file
+
+    def test_node_setup_combinations(self):
+        for stock in (True, False):
+            if not stock:
+                self.drop.unlink()
+            for additions in ((ACCESS,), (LOGS,), (ACCESS, LOGS)):
+                with self.subTest(stock=stock, additions=additions):
+                    for path in SETUP:
+                        self.drop.with_name(Path(path).name).unlink(missing_ok=True)
+                    for path in additions:
+                        self.put_setup(path)
+                    paths = ((DROP,) if stock else ()) + additions
+                    before = {p: (p.lstat().st_ctime_ns, p.read_bytes()) for p in self.drop.parent.iterdir()}
+                    self.assertEqual(self.host['xray_argv'](dict(self.info, DropInPaths=' '.join(paths))), '42')
+                    self.assertEqual({p: (p.lstat().st_ctime_ns, p.read_bytes()) for p in self.drop.parent.iterdir()}, before)
+
+    def test_node_setup_requires_exact_bytes_at_the_named_path(self):
+        for path, other in ((ACCESS, LOGS), (LOGS, ACCESS)):
+            leaf = self.put_setup(path)
+            for data in (SETUP[other], SETUP[path].rstrip(b'\n'), SETUP[path].replace(b'\n', b'\r\n'),
+                         SETUP[path] + b'# comment\n', SETUP[path] + b'Environment=EXTRA=1\n'):
+                with self.subTest(path=path, data=data):
+                    leaf.write_bytes(data)
+                    self.assertRefusal(DropInPaths=DROP + ' ' + path)
+            leaf.unlink()
+
+    def test_loaded_set_must_match_disk_even_when_empty(self):
+        self.put_setup(ACCESS)
+        for loaded in ('', DROP, ACCESS, DROP + ' ' + LOGS, DROP + ' ' + ACCESS + ' ' + LOGS,
+                       DROP + ' ' + ACCESS + ' ' + ACCESS, DROP + ' ' + ACCESS.replace('/etc/', '/run/')):
+            with self.subTest(loaded=loaded):
+                self.assertRefusal(DropInPaths=loaded)
+        self.drop.with_name('99-foreign.conf').write_bytes(SETUP[LOGS])
+        for suffix in ('', ' ' + LOGS.replace(Path(LOGS).name, '99-foreign.conf')):
+            self.assertRefusal(DropInPaths=DROP + ' ' + ACCESS + suffix)
+
+    def test_node_setup_metadata_and_links(self):
+        self.drop.unlink()
+        for path in SETUP:
+            with self.subTest(path=path):
+                leaf = self.put_setup(path)
+                for mode in (0o600, 0o664, 0o4755):
+                    leaf.chmod(mode)
+                    self.assertRefusal(DropInPaths=path)
+                leaf.chmod(0o644)
+                self.uid = 12
+                self.assertRefusal(DropInPaths=path)
+                self.uid, self.gid = 0, 12
+                self.assertRefusal(DropInPaths=path)
+                self.gid = 0
+                self.attrs = ['user.fixture']
+                self.assertRefusal(DropInPaths=path)
+                self.attrs = []
+                other = leaf.with_suffix('.saved')
+                leaf.rename(other)
+                leaf.symlink_to(other.name)
+                self.assertRefusal(DropInPaths=path)
+                leaf.unlink()
+                leaf.hardlink_to(other)
+                self.assertRefusal(DropInPaths=path)
+                leaf.unlink()
+                other.unlink()
+
+    def test_retained_setup_rechecks_disk_and_selection(self):
+        leaf = self.put_setup(ACCESS)
+        self.put_setup(LOGS)
+        saved = dict(self.info, DropInPaths=' '.join((DROP, ACCESS, LOGS)))
+        check = self.host['retained_xray_dropin']
+        check(saved, saved)
+        leaf.write_bytes(SETUP[LOGS])
+        with self.assertRaisesRegex(self.host['Refusal'], '^XRAY_DROPIN_UNSUPPORTED$'):
+            check(saved, saved)
+        leaf.unlink()
+        now = dict(self.info, DropInPaths=' '.join((DROP, LOGS)))
+        self.assertEqual(self.host['xray_argv'](now), '42')
+        with self.assertRaisesRegex(self.host['Refusal'], '^XRAY_DROPIN_UNSUPPORTED$'):
+            check(now, saved)
+
+    def test_setup_only_cannot_bypass_main_process_or_bridge_guards(self):
+        self.drop.unlink()
+        self.put_setup(LOGS)
+        self.info['DropInPaths'] = LOGS
+        self.assertRefusal(ExecStart=START + ' ' + START)
+        self.assertRefusal(NeedDaemonReload='yes')
+        self.assertRefusal(ExecStartPre='unexpected')
+        self.assert_main_only_and_live_checks()
 
     def test_rejects_adjacent_loaded_overrides(self):
         for props in (
@@ -145,10 +244,17 @@ class XrayDropinTest(unittest.TestCase):
         self.assertRefusal()
 
     def test_main_only_and_live_checks_unchanged(self):
+        self.assert_main_only_and_live_checks()
+
+    def assert_main_only_and_live_checks(self):
         bridge = self.host['BRIDGE']
+        start = START.replace(self.host['MAIN'], bridge)
         with self.assertRaisesRegex(self.host['Refusal'], '^XRAY_DROPIN_UNSUPPORTED$'):
-            self.host['xray_argv'](dict(self.info, ExecStart=START.replace(self.host['MAIN'], bridge)), bridge)
+            self.host['xray_argv'](dict(self.info, ExecStart=start), bridge)
         cmdline = self.cmdline
+        self.cmdline = cmdline.replace(self.host['MAIN'].encode(), bridge.encode())
+        self.assertEqual(self.host['xray_argv'](dict(self.info, ExecStart=start, DropInPaths=''), bridge), '42')
+        self.cmdline = cmdline
         self.cmdline += b'extra\0'
         self.assertRefusal('RUNTIME_UNPROVED')
         self.cmdline = cmdline
