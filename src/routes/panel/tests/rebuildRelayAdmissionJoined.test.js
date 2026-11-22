@@ -188,7 +188,8 @@ function hostFixture(t, mongo) {
         ] } });
     const remote = { key, machineId, checks: [], effects: [] };
     let candidate, installedId;
-    const frames = bindWire(t, [{ id: nodeId, relay: { ip: host }, key, applyHandlers: new Map(), execute(command, stdin) {
+    const frames = bindWire(t, [{ id: nodeId, relay: { ip: host }, key, get machineId() { return remote.machineId; },
+        applyHandlers: new Map(), execute(command, stdin) {
         const req = JSON.parse(stdin);
         assert.equal(req.machineId, machineId);
         assert.equal(mongo.rows(LOCK).length, 1);
@@ -401,7 +402,7 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
     assert.deepEqual(await f.send('install', {}, { expected: 409 }), {
         error: { code: CHANGED, outcome: 'refused', retryAllowed: false },
     });
-    assert.deepEqual(f.frames, [[nodeId, 'preflight']]);
+    assert.deepEqual(f.frames, [], 'changed machine received no DIRECT payload');
     assert.deepEqual(f.mongo.writes(), [LOCK, LOCK]);
     assert.deepEqual(f.mongo.commits, [['grant', GRANTS, AUDIT]]);
     assert.deepEqual(f.remote.effects, []);
@@ -410,7 +411,7 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
 
     f.remote.machineId = machineId;
     assert.deepEqual(await f.send('install'), { executionMode: 'rebuild', status: 'installed', nodeId });
-    assert.deepEqual(f.frames.slice(1).map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
+    assert.deepEqual(f.frames.map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
     assert.deepEqual(f.remote.effects, ['install']);
     assert.deepEqual(f.mongo.commits, [['grant', GRANTS, AUDIT], ['install', STATES, USERS], ['install', USERS, DIRECTORY, STATES]]);
     const states = f.mongo.rows(STATES), accounts = f.mongo.rows(USERS), directory = f.mongo.rows(DIRECTORY);
@@ -427,7 +428,7 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
     assert.deepEqual(f.mongo.rows(LOCK), []);
     assert.deepEqual(f.mongo.rows(GRANTS), [grant]);
     assert.deepEqual([f.mongo.rows(STATES), f.mongo.rows(USERS), f.mongo.rows(DIRECTORY)], [states, accounts, directory]);
-    assert.equal(f.frames.length, 7);
+    assert.equal(f.frames.length, 6);
     assert.deepEqual(f.remote.effects, ['install']);
     assert.deepEqual(f.remote.checks, checks);
     audit(f.mongo, [ok('probe'), ok('verify'), ok('grant'), ['confirm', 'denied', CHALLENGE], ['revoke', 'denied', CONFLICT]]);

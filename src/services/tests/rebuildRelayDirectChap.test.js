@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const attested = require('./helpers/rebuildRelayDirectWire');
 
 const nodeId = 'a'.repeat(24), machineId = 'b'.repeat(32), backupId = 'c'.repeat(32);
 const network = { clientCidr: '10.44.0.0/24', tproxyPort: 17891, fwmark: 123, routeTable: 201 };
@@ -23,17 +24,13 @@ function driver(respond = () => accepted) {
         async exec(command, { stdin }, verifyBeforeStdin) {
             assert.ok(!command.includes(row.password));
             const input = JSON.parse(stdin);
-            if (input.action.endsWith('-chap') || input.action === 'read-chap-generation') {
-                assert.equal(typeof verifyBeforeStdin, 'function');
-                await verifyBeforeStdin();
-            } else {
-                assert.equal(verifyBeforeStdin, undefined);
-            }
+            assert.equal(typeof verifyBeforeStdin, 'function');
+            await verifyBeforeStdin();
             seen.push(input);
             return respond(input.action);
         }
     }
-    return { remote: createRelayDirect({ node, env, SSH }), seen };
+    return { remote: createRelayDirect({ node, env, SSH: attested(SSH, machineId) }), seen };
 }
 
 for (const [method, action] of [['checkChap', 'check-chap'], ['syncChap', 'sync-chap']]) {

@@ -484,6 +484,7 @@ test('mounted reconcile reports only a bounded DIRECT inspection refusal while i
     const Settings = require('../../models/settingsModel');
     const { issuePanelCsrfToken } = require('../../routes/panel/csrf');
     const { createRelayDirect } = require('../rebuildRelayDirect');
+    const attested = require('./helpers/rebuildRelayDirectWire');
     const service = require('../rebuildService');
     const { i18nMiddleware } = require('../../middleware/i18n');
     const peer = '192.0.2.10';
@@ -550,7 +551,7 @@ test('mounted reconcile reports only a bounded DIRECT inspection refusal while i
             }
         }
         if (wire) f.deps.createRelayDirect = options => options.node._id === B
-            ? createRelayDirect({ ...options, SSH }) : createMockRelay(options);
+            ? createRelayDirect({ ...options, SSH: attested(SSH, f.rows[1].state.rebuildMachineId) }) : createMockRelay(options);
         if (mode === 'busy Apply') f.deps.locks.run = async () => { throw Object.assign(new Error(), { code: 'REBUILD_BUSY' }); };
         f.service = f.restart();
         const previousWriters = writer.mock.callCount();

@@ -381,6 +381,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                     assert.equal(peer.pinned, Boolean(host));
                     if (command === '/usr/bin/head -c 34 /etc/machine-id') {
                         assert.ok(host && stdin === undefined);
+                        peer.observed = true;
                         return { status: 0, stdout: `${host.machineId}\n`, stderr: '' };
                     }
                     assert.ok(applyHandlers.has(peer.ip));
@@ -390,7 +391,12 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 }
                 const host = routes.get(peer.ip);
                 assert.ok(peer.pinned && host);
-                frames.push([host.id, JSON.parse(stdin).action]);
+                const { action } = JSON.parse(stdin);
+                if (!action.endsWith('-apply-network')) {
+                    assert.equal(peer.observed, true, 'DIRECT payload requires attestation on this client');
+                    peer.observed = false;
+                }
+                frames.push([host.id, action]);
                 return host.execute(command, stdin);
             };
             let ended = false;
@@ -399,6 +405,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                     const result = execute(stdin);
                     stream.emit('data', result.stdout);
                     stream.stderr.emit('data', result.stderr);
+                    stream.stderr.emit('end');
                     stream.emit('close', result.status);
                 } catch (error) {
                     wireFaults.push(error);
@@ -434,7 +441,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const command = '/usr/bin/timeout -k fixture';
         const ip = '192.0.2.4', key = Buffer.from('fixture key');
         const received = [], events = [];
-        const frames = wire(t, [{ id, relay: { ip }, key, applyHandlers: new Map(), execute(cmd, stdin) {
+        const frames = wire(t, [{ id, relay: { ip }, key, machineId, applyHandlers: new Map(), execute(cmd, stdin) {
             assert.equal(cmd, command);
             received.push(stdin);
             return { status: 0, stdout: 'ok', stderr: '' };
@@ -442,6 +449,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const client = new Client();
         client.connect({ host: ip, port: 22, username: 'root', hostVerifier: candidate => candidate.equals(key) });
         try {
+            await new Promise(resolve => client.exec('/usr/bin/head -c 34 /etc/machine-id', (error, channel) => {
+                assert.ifError(error);
+                channel.on('close', status => { assert.equal(status, 0); resolve(); });
+            }));
             let stream;
             client.exec(command, (error, channel) => {
                 assert.ifError(error);

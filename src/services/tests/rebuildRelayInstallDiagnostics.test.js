@@ -11,6 +11,7 @@ const express = require('express');
 const session = require('express-session');
 const { request } = require('./helpers/rebuildPanelRequest');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const attested = require('./helpers/rebuildRelayDirectWire');
 const { runFreshRelayInstall } = require('../rebuildRelayInstall');
 const { installCheckIds } = require('../rebuildRelayInstallDiagnostics');
 const { AcknowledgedCommitCleanupError } = require('../rebuildRelayInstallTransaction');
@@ -200,7 +201,7 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
                 if (scenario === 'busy') throw Object.assign(new Error(marker), { code: 'REBUILD_BUSY' });
                 return fn(() => true);
             },
-            connect: async () => createRelayDirect({ node, env, SSH }),
+            connect: async () => createRelayDirect({ node, env, SSH: attested(SSH, machineId) }),
             prepare: (_, remote) => remote.prepare({ nodeId, desired, carryDomain: false, controlPlaneAddresses: ['panel.fixture.invalid'] }),
             reserve: async () => { log.push('reserve'); return {}; }, verifyReservation: async () => {},
             restore: async () => {

@@ -7,6 +7,7 @@ const { spawnSync } = require('node:child_process');
 const { existsSync, readFileSync, readlinkSync } = require('node:fs');
 const { join } = require('node:path');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const attested = require('./helpers/rebuildRelayDirectWire');
 const { runFreshRelayInstall } = require('../rebuildRelayInstall');
 
 const nodeId = 'a'.repeat(24);
@@ -57,7 +58,7 @@ function fixture(handler = () => {}) {
             return ok({ ok: true, backupId: input.backupId });
         }
     }
-    return { remote: createRelayDirect({ node, env, SSH }), calls };
+    return { remote: createRelayDirect({ node, env, SSH: attested(SSH, machineId) }), calls };
 }
 
 test('requires authority and canonical ssh2 pin before construction', () => {
@@ -84,7 +85,7 @@ test('the exact SSH command shell and Python stdin reject invalid framing locall
             return { code: result.status, stdout: result.stdout, stderr: result.stderr };
         }
     }
-    const remote = createRelayDirect({ node, env, SSH });
+    const remote = createRelayDirect({ node, env, SSH: attested(SSH, machineId) });
     await assert.rejects(remote.preflight(), { code: 'REBUILD_L2TP_DIRECT_PREREQUISITE' });
     await remote.close();
 });
@@ -135,7 +136,7 @@ assert host['C3_STOCK_RUNTIME']['__name__'] != host['C3_STOCK_ENSURE']['__name__
         }
     }
     let outcome;
-    const remote = createRelayDirect({ node, env, SSH });
+    const remote = createRelayDirect({ node, env, SSH: attested(SSH, machineId) });
     try { assert.deepEqual(await remote.preflight(), ready); }
     finally { await remote.close(); }
     assert.deepEqual(outcome, [0, '', '']);
@@ -215,7 +216,8 @@ test('malformed native capability, forged snapshot capability and readiness drif
             : action === 'prepare' ? prepare : undefined);
         try {
             await assert.rejects(remote.prepare(args), { code });
-            assert.deepEqual(calls, ['connect', 'preflight', ...(prepare ? ['prepare'] : [])]);
+            assert.deepEqual(calls, ['connect', 'preflight', ...(prepare ? ['prepare'] : []),
+                ...(code === mismatch ? ['close'] : [])]);
         } finally { await remote.close(); }
     }
 });
@@ -362,7 +364,7 @@ test('masked or wrong machine and invalid generated addresses cannot dispatch wr
     for (const response of [{ ...ready, machineId: 'e'.repeat(32) }, { ...ready, masked: true }, { ...ready, ppp: false }]) {
         const { remote, calls } = fixture(() => ok(response));
         await assert.rejects(remote.prepare(args));
-        assert.deepEqual(calls, ['connect', 'preflight']);
+        assert.deepEqual(calls, ['connect', 'preflight', ...(response.machineId !== machineId ? ['close'] : [])]);
         await remote.close();
     }
     const { remote, calls } = fixture();

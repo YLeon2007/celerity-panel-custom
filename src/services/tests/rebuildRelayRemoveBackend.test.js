@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const attested = require('./helpers/rebuildRelayDirectWire');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { Types, mongo } = require('mongoose');
 const { createRebuildService } = require('../rebuildService');
@@ -210,7 +211,7 @@ async function sharedFixture(t, { singleton = false } = {}) {
     const expectedUsers = selected().map(({ login, enabled, ip, passwordEncrypted }) => ({
         login, enabled, ipAddress: ip, password: decrypt(passwordEncrypted, f.env.ENCRYPTION_KEY),
     })).sort((a, b) => a.login.localeCompare(b.login));
-    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
+    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH: attested(SSH, machineId) }) });
     return { ...f, service, selected, sibling, frames, attempts, dbHooks, wire, sessions, get lock() { return f.lock; } };
 }
 
@@ -535,7 +536,7 @@ test('list Remove requires card corroboration and a preview from the same bindin
         }
     }
     t.mock.method(User.collection, 'countDocuments', async () => f.users.length);
-    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
+    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH: attested(SSH, row.machineId) }) });
     const preview = await service.previewRemoveRelay(id);
     assert.equal(preview.confirmable, true);
     f.env[key] = JSON.stringify([{ ...row, sshHostKeySha256: '2'.repeat(64) }]);
@@ -580,7 +581,7 @@ test('final host refusal restores only the exact reservation; unknown outcomes r
         }
     }
     t.mock.method(User.collection, 'countDocuments', async () => f.users.length);
-    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) });
+    const service = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH: attested(SSH, machineId) }) });
     const tryRemove = async code => {
         const preview = await service.previewRemoveRelay(id);
         assert.equal(preview.confirmable, true);

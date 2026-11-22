@@ -47,10 +47,11 @@ async function createGuardedChannel() {
     client.exec = (...args) => { calls.push(args); callback = args[1]; };
     client.end = () => {}; // Explicit disconnect must not depend on a peer event.
     direct._openDirectClient = async () => client;
-    await direct.connectDirectOnce(1000);
+    const execPinned = await direct.connectDirectOnce(1000);
+    const listeners = Object.fromEntries(['end', 'close', 'error'].map(event => [event, client.listenerCount(event)]));
     const stream = createExecStream({ onWrite: chunk => writes.push(chunk.toString()), onEnd: () => ends++ });
     stream.destroy = () => { disposed++; stream.emit('close'); };
-    return { direct, client, node, calls, writes, stream, open: () => callback(null, stream),
+    return { direct, client, node, calls, writes, stream, listeners, execPinned, open: () => callback(null, stream),
         counts: () => ({ ends, disposed }) };
 }
 
@@ -84,7 +85,78 @@ test('guarded direct exec waits for the late channel and the local guard before 
     assert.deepEqual(await done, { code: 0, stdout: '', stderr: '' });
     assert.deepEqual(fixture.writes, ['fixture-payload']);
     assert.deepEqual(fixture.counts(), { ends: 1, disposed: 0 });
-    for (const event of ['end', 'close', 'error']) assert.equal(fixture.client.listenerCount(event), event === 'error' ? 1 : 0);
+    for (const event of ['end', 'close', 'error']) assert.equal(fixture.client.listenerCount(event), fixture.listeners[event]);
+});
+
+test('one-shot exec joins exit status with stderr EOF and writes subsequent payload on the original client', async () => {
+    const f = await createGuardedChannel();
+    const probe = f.execPinned('/fixed/observation', { timeout: 5000, maxOutputBytes: 34 });
+    let resolved = false;
+    void probe.then(() => { resolved = true; });
+    f.open();
+    f.stream.emit('data', Buffer.from('b'.repeat(32) + '\n'));
+    f.stream.emit('close', 0);
+    await nextTurn();
+    assert.equal(resolved, false);
+    assert.deepEqual(f.counts(), { ends: 0, disposed: 0 });
+    f.stream.stderr.emit('data', Buffer.from('!'));
+    f.stream.stderr.emit('end');
+    assert.deepEqual(await probe, { code: 0, stdout: 'b'.repeat(32) + '\n', stderr: '!' });
+
+    const receiver = f.execPinned('/fixed/receiver', guardedOptions, async () => true);
+    f.open();
+    f.stream.stderr.emit('end');
+    assert.deepEqual(await receiver, { code: 0, stdout: '', stderr: '' });
+    assert.deepEqual(f.calls.map(([command]) => command), ['/fixed/observation', '/fixed/receiver']);
+    assert.deepEqual(f.writes, ['fixture-payload']);
+    f.direct.disconnect();
+});
+
+test('one-shot exec bounds observation bytes across both streams without sending stdin', async () => {
+    const f = await createGuardedChannel();
+    const probe = assert.rejects(f.execPinned('/fixed/observation', { timeout: 5000, maxOutputBytes: 34 }),
+        { message: 'SSH exec output exceeded its limit' });
+    f.open();
+    f.stream.emit('data', Buffer.from('b'.repeat(32) + '\n'));
+    f.stream.stderr.emit('data', Buffer.from('xx'));
+    await probe;
+    assert.deepEqual(f.counts(), { ends: 0, disposed: 1 });
+    assert.deepEqual(f.writes, []);
+    f.direct.disconnect();
+});
+
+test('one-shot exec cannot open a payload channel on an independently pinned replacement', async () => {
+    const f = await createGuardedChannel();
+    const probe = f.execPinned('/fixed/observation', { timeout: 5000 });
+    f.open();
+    f.stream.emit('data', Buffer.from('b'.repeat(32) + '\n'));
+    f.stream.stderr.emit('end');
+    f.stream.emit('close', 0);
+    assert.equal((await probe).code, 0);
+
+    const replacement = new EventEmitter();
+    replacement.exec = () => assert.fail('replacement received payload exec');
+    replacement.end = () => {};
+    f.direct._openDirectClient = async () => replacement;
+    await f.direct.connectDirect();
+    assert.equal(f.direct.directClient, replacement);
+    await assert.rejects(f.execPinned('/fixed/receiver', guardedOptions, () => true), stdinFailure);
+    assert.deepEqual(f.calls.map(([command]) => command), ['/fixed/observation']);
+    assert.deepEqual(f.writes, []);
+    f.direct.disconnect();
+});
+
+test('one-shot exec refuses a changed underlying socket during the stdin guard', async () => {
+    const f = await createGuardedChannel();
+    const allowed = Promise.withResolvers();
+    const receiver = assert.rejects(f.execPinned('/fixed/receiver', guardedOptions, () => allowed.promise), stdinFailure);
+    f.open();
+    f.client._sock = {};
+    allowed.resolve(true);
+    await receiver;
+    assert.deepEqual(f.writes, []);
+    assert.deepEqual(f.counts(), { ends: 0, disposed: 1 });
+    f.direct.disconnect();
 });
 
 test('guarded direct exec sanitizes a busy lock or a rejected or throwing guard', async () => {

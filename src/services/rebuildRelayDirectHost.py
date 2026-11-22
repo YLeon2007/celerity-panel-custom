@@ -331,8 +331,12 @@ def require_runtime_packages(refusal):
 
 
 def require_machine(machine):
-    machine_id = open('/etc/machine-id', 'rb').read(34).strip().decode('ascii')
-    need(re.fullmatch(r'[a-f0-9]{32}', machine_id) and machine_id == machine, 'IDENTITY')
+    with open('/etc/machine-id', 'rb') as source:
+        match = re.fullmatch(rb'([a-f0-9]{32})\n?', source.read(34))
+    if match is None:
+        raise Refusal('PREREQUISITE')
+    machine_id = match[1].decode('ascii')
+    need(machine_id == machine, 'IDENTITY')
     return machine_id
 
 
@@ -3021,6 +3025,14 @@ def session_need(ok):
     need(ok, SESSION_UNKNOWN)
 
 
+def require_census_machine(machine):
+    identity = read('/etc/machine-id', 34)
+    match = None if identity is None else re.fullmatch(rb'([a-f0-9]{32})\n?', raw(identity))
+    if match is None:
+        raise Refusal(SESSION_UNKNOWN)
+    need(match[1] == machine.encode('ascii'), 'IDENTITY')
+
+
 def session_fs(libc, fd, magic):
     # x86_64 Linux: struct statfs begins with a native long f_type.
     buf = (ctypes.c_long * 32)()
@@ -3077,8 +3089,7 @@ def session_profile(lns, options, network):
 
 def session_owner(request):
     token, machine, network = (request[k] for k in ('backupId', 'machineId', 'network'))
-    identity = read('/etc/machine-id', 34)
-    session_need(identity is not None and raw(identity) in (machine.encode('ascii'), (machine + '\n').encode('ascii')))
+    require_census_machine(machine)
     path, manifest, backup = read_manifest(token)
     before, runtime = runtime_before(backup), backup['runtime']
     session_need(installed_phase(backup['phase']) and backup['backupId'] == token and backup['machineId'] == machine
@@ -3670,8 +3681,7 @@ def ipsec_status_inventory(status):
 
 
 def ipsec_session_sample(request):
-    identity = read('/etc/machine-id', 34)
-    session_need(identity is not None and raw(identity).strip() == request['machineId'].encode('ascii'))
+    require_census_machine(request['machineId'])
     path, manifest, backup, _ = owned_installation(request)
     before, runtime = runtime_before(backup), backup['runtime']
     # Match installed configuration and starter include, not just a connection
@@ -3726,7 +3736,7 @@ def census_observation(probe, request):
     try:
         return probe(request)
     except Refusal as error:
-        if str(error) == 'IN_FLIGHT':
+        if str(error) in ('IN_FLIGHT', 'IDENTITY'):
             raise
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         pass  # Unreadable or unsupported, never a count of zero.
@@ -3806,7 +3816,10 @@ def read_session_count(request):
     routing(request['network'])
     with directory(SYSTEM) as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        return relay_session_census(request)
+        require_census_machine(request['machineId'])
+        census = relay_session_census(request)
+        require_census_machine(request['machineId'])
+        return census
 
 
 def install_lock_identity(lock_fd):
