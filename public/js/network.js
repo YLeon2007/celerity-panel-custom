@@ -578,7 +578,7 @@
             updateLinkFormWarnings();
         });
 
-        initPortWarnings();
+        if (!rebuild) initPortWarnings();
 
         // Geo routing toggle
         var geoCheck = document.getElementById('geoRoutingEnabled');
@@ -2254,6 +2254,8 @@
     }
 
     function schedulePortWarning(kind) {
+        // The classic listener probe is unavailable in rebuild mode.
+        if (rebuild) return;
         const context = portWarningContext(kind);
         const state = portWarnings[kind];
         if (context.key === state.key) { renderPortWarning(kind, context); return; }
@@ -2302,6 +2304,8 @@
     }
 
     function portSubmissionBlocked(kind) {
+        // Rebuild leaves admission to the server and its guarded preview.
+        if (rebuild) return false;
         schedulePortWarning(kind);
         const context = portWarningContext(kind);
         const deploying = kind === 'quick' ? document.getElementById('quickAutoDeploy')?.checked

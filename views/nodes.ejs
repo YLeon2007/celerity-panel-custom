@@ -476,9 +476,11 @@ function nodeMetaFor(node) {
                 <div class="form-row">
                     <div class="form-group">
                         <label><%= t('network.tunnelPort') %></label>
-                        <input type="number" name="tunnelPort" class="form-input" value="10086" min="1" max="65535" aria-describedby="tunnelPortHint portConflictHint">
+                        <input type="number" name="tunnelPort" class="form-input" value="10086" min="1" max="65535" aria-describedby="tunnelPortHint<% if (typeof c3Rebuild === 'undefined' || !c3Rebuild) { %> portConflictHint<% } %>">
                         <div class="form-hint" id="tunnelPortHint" style="margin-top:3px"><%= t('network.tunnelPortReverseHint') %></div>
+                        <% if (typeof c3Rebuild === 'undefined' || !c3Rebuild) { %>
                         <div class="form-warning" id="portConflictHint" role="status" aria-live="polite" style="display:none;margin-top:5px"></div>
+                        <% } %>
                     </div>
                     <div class="form-group">
                         <label><%= t('network.tunnelProtocol') %></label>
@@ -667,8 +669,10 @@ function nodeMetaFor(node) {
                 <div class="form-row">
                     <div class="form-group">
                         <label><%= t('network.tunnelPort') %></label>
-                        <input type="number" id="quickTunnelPort" class="form-input" value="10086" min="1" max="65535" aria-describedby="quickPortConflictHint">
+                        <input type="number" id="quickTunnelPort" class="form-input" value="10086" min="1" max="65535"<% if (typeof c3Rebuild === 'undefined' || !c3Rebuild) { %> aria-describedby="quickPortConflictHint"<% } %>>
+                        <% if (typeof c3Rebuild === 'undefined' || !c3Rebuild) { %>
                         <div class="form-warning" id="quickPortConflictHint" role="status" aria-live="polite" style="display:none;margin-top:5px"></div>
+                        <% } %>
                     </div>
                     <div class="form-group">
                         <label><%= t('network.tunnelProtocol') %></label>
@@ -1333,7 +1337,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=a58cbe4c8d87339b' : '/js/network.min.js?v=8c1440573d630ba3'
+        window._c3Rebuild ? '/js/network.js?v=a22dff59e044cf75' : '/js/network.min.js?v=8c1440573d630ba3'
     ];
 
     let idx = 0;
