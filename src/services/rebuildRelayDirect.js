@@ -9,7 +9,7 @@ const { performance } = require('node:perf_hooks');
 const { identityChanged, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
-const { validCensus } = require('./rebuildRelayCounts');
+const { validCensus, validRetirementCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
 const { isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, requireInstallHostReady,
     withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
@@ -19,6 +19,7 @@ const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
 
 const TIMEOUT = 145000;
 const SESSION_COUNT_TIMEOUT = 12000;
+const RETIREMENT_COUNT_TIMEOUT = 25000;
 const MACHINE_ID_COMMAND = '/usr/bin/head -c 34 /etc/machine-id';
 const MACHINE_ID_FRAME = /^([a-f0-9]{32})\n?(?![\s\S])/;
 const PIN = /^[a-f0-9]{64}$/;
@@ -163,7 +164,7 @@ function directCommand(limits) {
     return command;
 }
 
-function createRelayDirect({ node, env = process.env, SSH, fence: authority } = {}) {
+function createRelayDirect({ node, env = process.env, SSH, fence: authority, verifyRemoveStdin = false } = {}) {
     const nodeId = String(node?._id ?? node?.id ?? '');
     const fence = authority ?? captureRelayBinding(env, nodeId, node);
     const merged = fence.merged === true;
@@ -217,9 +218,10 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority } = 
     }
 
     async function exec(action, params = {}, write = false, validate = () => true, verifyLock) {
-        const count = action === 'session-count';
+        const retirementCount = action === 'retirement-count';
+        const count = action === 'session-count' || retirementCount;
         const chap = CHAP_ACTIONS.includes(action);
-        const guarded = chap || action === 'install' || (merged && write);
+        const guarded = chap || action === 'install' || (merged && write) || (action === 'remove' && verifyRemoveStdin === true);
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         await checkBinding();
         await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
@@ -253,8 +255,8 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority } = 
             return fail('DIRECT_OUTCOME_UNKNOWN', write);
         };
         let result;
-        try { result = await execPinned(directCommand(count ? '-k 1s 9s' : '-k 4s 125s'), {
-            stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
+        try { result = await execPinned(directCommand(retirementCount ? '-k 1s 22s' : count ? '-k 1s 9s' : '-k 4s 125s'), {
+            stdin, timeout: retirementCount ? RETIREMENT_COUNT_TIMEOUT : count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
         }, verifyBeforeStdin); }
         catch { throw identityRefusal ?? unknown(); }
         try { await checkBinding(); }
@@ -277,10 +279,12 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority } = 
             if (noWrite && action !== 'install') throw unknown();
             const specific = specificHostRefusal(action, raw, Boolean(noWrite));
             const ipsecBusy = ['prepare-remove', 'remove'].includes(action) && raw === 'REMOVE_IPSEC_BUSY';
+            const retirementChanged = ['prepare-remove', 'remove'].includes(action) && params.retirement === true
+                && raw === 'REMOVE_PREVIEW_CHANGED';
             const allowed = count ? raw === 'SESSION_COUNT_UNPROVED'
                 : chap ? raw === 'CHAP_REFUSED'
-                    : action === 'remove' ? ipsecBusy || raw === 'REMOVE_REFUSED'
-                        : ipsecBusy || directRefusals.has(raw) || specific !== undefined;
+                    : action === 'remove' ? retirementChanged || ipsecBusy || raw === 'REMOVE_REFUSED'
+                        : retirementChanged || ipsecBusy || directRefusals.has(raw) || specific !== undefined;
             if (!allowed) throw unknown();
             // Only the installed helper's closed refusal frame certifies a settled write.
             // A shell/transport exit alone is not authority to race a remote mutation.
@@ -391,26 +395,30 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority } = 
         return draining ? { changed, sessionsTerminated, complete } : { changed };
     });
 
+    const sessionCount = (input, retirement) => serial(async () => {
+        const invalid = 'SESSION_COUNT_INPUT_INVALID';
+        requireThat(input?.nodeId === nodeId
+            && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(input, key))
+            && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'currentUsers'].includes(key))
+            && (!Object.hasOwn(input, 'transit') || Array.isArray(input.transit))
+            && input.backupId?.length === 32 && tokenMatches(TOKEN, input.backupId), invalid);
+        const { backupId } = input;
+        const network = removeNetwork(input.network, invalid);
+        const params = { nodeId, backupId, network,
+            ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
+            ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
+        return retirement ? exec('retirement-count', params, false, validRetirementCensus)
+            : exec('session-count', params, false, validCensus);
+    });
+
     return Object.freeze({
         preflight: () => serial(preflight),
         checkChap: (...args) => chapOperation('check-chap', ...args),
         syncChap: (...args) => chapOperation('sync-chap', ...args),
         inspectChap: (...args) => chapOperation('inspect-chap', ...args),
         fenceChap: (...args) => chapOperation('fence-chap', ...args),
-        readSessionCount: input => serial(async () => {
-            const invalid = 'SESSION_COUNT_INPUT_INVALID';
-            requireThat(input?.nodeId === nodeId
-                && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(input, key))
-                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'currentUsers'].includes(key))
-                && (!Object.hasOwn(input, 'transit') || Array.isArray(input.transit))
-                && input.backupId?.length === 32 && tokenMatches(TOKEN, input.backupId), invalid);
-            const { backupId } = input;
-            const network = removeNetwork(input.network, invalid);
-            const params = { nodeId, backupId, network,
-                ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
-                ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
-            return exec('session-count', params, false, validCensus);
-        }),
+        readSessionCount: input => sessionCount(input, false),
+        readRetirementCount: input => sessionCount(input, true),
         prepare: input => serial(async () => {
             requireThat(!held && input?.nodeId === nodeId && typeof input.carryDomain === 'boolean'
                 && Array.isArray(input.controlPlaneAddresses), 'INSTALL_INPUT_INVALID');
@@ -477,15 +485,19 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority } = 
         prepareRemove: input => serial(async () => {
             const invalid = 'REMOVE_INPUT_INVALID';
             requireThat(!held && input?.nodeId === nodeId
-                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'expectedCensus', 'currentUsers'].includes(key))
+                && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'expectedCensus', 'currentUsers', 'retirement', 'drain'].includes(key))
                 && typeof input.backupId === 'string'
                 && input.backupId.length === 32 && TOKEN.test(input.backupId), 'REMOVE_INPUT_INVALID');
             const hasCensus = Object.hasOwn(input, 'expectedCensus');
             const { expectedCensus } = input;
             requireThat(!hasCensus || (tokenMatches(PIN, expectedCensus) && expectedCensus.length === 64), 'REMOVE_INPUT_INVALID');
+            const retirement = Object.hasOwn(input, 'retirement'), drain = Object.hasOwn(input, 'drain');
+            requireThat((!retirement || (input.retirement === true && hasCensus && verifyRemoveStdin === true))
+                && (!drain || (retirement && input.drain === true)), invalid);
             const params = { nodeId, backupId: input.backupId, network: removeNetwork(input.network),
                 ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
-                ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
+                ...(input.transit !== undefined && { transit: structuredClone(input.transit) }),
+                ...(retirement && { retirement: true, expectedCensus, ...(drain && { drain: true }) }) };
             const proof = await exec('prepare-remove', params, false, value => exactAck(params.backupId)(value)
                 && tokenMatches(TOKEN, value.machineId) && typeof value.baseline === 'string' && value.baseline.length === 64
                 && PIN.test(value.baseline));

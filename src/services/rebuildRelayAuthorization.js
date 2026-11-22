@@ -60,7 +60,7 @@ function assertUniqueRelayBindings(entries) {
     }
 }
 
-function parseRelayBindingList(raw, invalid = disabled) {
+function parseRelayBindingList(raw, invalid = disabled, { checkUniqueness = true } = {}) {
     if (typeof raw !== 'string' || raw.length > LIST_LIMIT) throw invalid();
     let rows;
     try { rows = JSON.parse(raw); } catch { throw invalid(); }
@@ -71,7 +71,7 @@ function parseRelayBindingList(raw, invalid = disabled) {
     let members = 0;
     for (const [, separator] of raw.matchAll(/"(?:[^"\\]|\\[\s\S])*"\s*(:)?/g)) if (separator) members++;
     if (members !== rows.length * fields.length) throw invalid();
-    assertUniqueRelayBindings(rows.map(binding => ({ binding, source: 'env' })));
+    if (checkUniqueness) assertUniqueRelayBindings(rows.map(binding => ({ binding, source: 'env' })));
     return rows;
 }
 

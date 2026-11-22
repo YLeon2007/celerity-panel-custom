@@ -39,6 +39,10 @@ function fixture(env = { ...enabled }) {
     const db = {
         readyState: 1,
         collection(name) {
+            if (name === 'c3_rebuild_l2tp_retired_relays') return {
+                find: () => ({ toArray: async () => [] }),
+                findOne: async () => null,
+            };
             if (name === 'hynodes') return { async findOne(filter, options) {
                 touches.push(name);
                 assert.deepEqual(options.projection, { _id: 1, ip: 1, 'ssh.port': 1, 'ssh.username': 1 });

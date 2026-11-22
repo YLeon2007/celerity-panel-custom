@@ -114,5 +114,5 @@ function mountAdmission(router, service, { requireSessionId, checkCsrf, requireC
     router.all(admissionPath, (_err, _req, res, _next) => errorResponse(res, 503, unavailable));
 }
 
-module.exports = { mountAdmission, admissionPath, validAdmissionJson, reject, validNodeId,
+module.exports = { mountAdmission, admissionPath, validAdmissionJson, reject, validNodeId, validActor,
     identityChanged, grantConflict, grantUnavailable, grantEffectStatus };

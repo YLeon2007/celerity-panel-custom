@@ -130,7 +130,10 @@ class NodeSSH {
         const controller = this.#pendingDirect = new AbortController();
         const { signal } = controller;
         const deadline = performance.now() + timeout;
-        const expire = () => controller.abort(new Error('SSH admission timed out'));
+        let opening = false;
+        const expire = () => controller.abort(Object.assign(new Error('SSH admission timed out'), {
+            code: opening ? 'SSH_ADMISSION_TIMEOUT' : 'SSH_ADMISSION_QUEUE_TIMEOUT',
+        }));
         const checkDeadline = () => {
             if (performance.now() >= deadline) expire();
             signal.throwIfAborted();
@@ -141,6 +144,7 @@ class NodeSSH {
             await NodeSSH._acquireDirectSlot(signal);
             acquired = true;
             checkDeadline();
+            opening = true;
             client = await this._openDirectClient(signal);
             checkDeadline();
             this.directClient = this.#verifiedDirectClient = client;
@@ -189,6 +193,42 @@ class NodeSSH {
             logger.error(`[SSH] Direct connection failed for ${this.node.name}: ${err.message}`);
             throw err;
         }
+    }
+
+    /** Reachability only, under the caller's direct slot and deadline. */
+    static probeDirectKex(host, port, signal) {
+        return new Promise((resolve, reject) => {
+            const client = new Client();
+            let settled = false;
+            const finish = (complete, value) => {
+                if (settled) return;
+                settled = true;
+                client.off('end', onIncomplete).off('close', onIncomplete).off('ready', onIncomplete)
+                    .off('error', onError).on('error', () => {}); // Drain errors during/after disposal.
+                signal.removeEventListener('abort', onAbort);
+                discardPendingClient(client);
+                complete(value);
+            };
+            const onError = error => finish(reject, error);
+            const onIncomplete = () => onError(Object.assign(new Error('SSH KEX observation unavailable'), { code: 'SSH_KEX_UNAVAILABLE' }));
+            const onAbort = () => onError(signal.reason);
+            client.on('end', onIncomplete).on('close', onIncomplete).on('ready', onIncomplete).on('error', onError);
+            signal.addEventListener('abort', onAbort, { once: true });
+            if (signal.aborted) return onAbort();
+            try {
+                client.connect({
+                    host, port, username: '', readyTimeout: 0, // ssh2 requires a string; it never goes on the wire.
+                    authHandler: () => false, // No USERAUTH, including the default 'none' request.
+                    hostVerifier(key) {
+                        // An offered key is enough for reachability, not identity.
+                        // Stop here; never accept, fingerprint or retain the key.
+                        if (Buffer.isBuffer(key) && key.length > 0) finish(resolve);
+                        else onIncomplete();
+                        return false;
+                    },
+                });
+            } catch (error) { onError(error); }
+        });
     }
 
     /**

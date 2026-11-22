@@ -2374,7 +2374,11 @@ def removal_main_sockets(rows, pid, reserved, udp_endpoints):
     return sorted(tcp + udp)
 
 
-def owned_installation(request):
+def removal_intent_matches(path, expected):
+    return directory_absent(path) if expected is None else read(path, 128) == expected
+
+
+def owned_installation(request, *, remove_intent=None):
     bad = 'ROLLBACK_DRIFT'
     token = request['backupId']
     path, manifest, backup = read_manifest(token)
@@ -2382,7 +2386,7 @@ def owned_installation(request):
          and backup['backupId'] == token and encode(backup['network']) == encode(request['network'])
          and backup['before']['boot'] == boot(), bad)
     intent = os.path.join(os.path.dirname(path), 'remove-attempt.json')
-    need(directory_absent(intent), bad)
+    need(removal_intent_matches(intent, remove_intent), bad)
     return path, manifest, backup, intent
 
 
@@ -2661,10 +2665,10 @@ def inspect_chap(request):
     return reply
 
 
-def observe_removal(request, *, quiescent=False):
+def observe_removal(request, *, quiescent=False, active=False, remove_intent=None):
     bad = 'ROLLBACK_DRIFT'
     token, d = request['backupId'], request['network']
-    path, manifest, backup, intent = owned_installation(request)
+    path, manifest, backup, intent = owned_installation(request, remove_intent=remove_intent)
     before, runtime = runtime_before(backup), backup['runtime']
     no_jobs(UNITS)
     boot_enrollment = removal_boot(before, backup, runtime)
@@ -2709,6 +2713,8 @@ def observe_removal(request, *, quiescent=False):
         # ownership and the PPP guard; Remove still requires full VPN idleness.
         vpn_listener_ownership(rows, units, require_xl_listener=True)
         need(ppp_empty(), bad)
+    elif active:
+        vpn_listener_ownership(rows, units, require_xl_listener=True)
     else:
         removal_idle(request, rows, units)
     reserved = removal_sockets(rows, units, d, handoff, handoff_unit)
@@ -2840,7 +2846,7 @@ def removal_ike_ready(state):
             time.sleep(0.2)
 
 
-def remove_installation(request, state):
+def remove_installation(request, state, *, drain=None):
     global REMOVE_ENTERED, STAGE
     token, d = request['backupId'], request['network']
     before, current, profiles, units = (state[k] for k in ('before', 'current', 'profiles', 'units'))
@@ -2860,11 +2866,13 @@ def remove_installation(request, state):
         return record, restored
 
     live_chap()
-    if 'expectedCensus' in request:
+    if drain is not None:
+        drain[0]()  # Last full observation; retains the original pidfd and VICI peer.
+    elif 'expectedCensus' in request:
         # Still under the exclusive DIRECT flock. A panel recount and prepare
         # snapshot cannot authorize a write against a busy or unknown census.
         census = relay_session_census(request, state['baseline'] if rollback_quiescent(units[XL]) else None)
-        if census['activeIpsec'] is not None:
+        if census['activeIpsec'] is not None and not request.get('retirement'):
             need(census['activeIpsec'] == 0, 'REMOVE_IPSEC_BUSY')
         session_need(census['activeSessions'] == census['activeIpsec'] == 0
                      and census['census'] == request['expectedCensus'])
@@ -2874,11 +2882,15 @@ def remove_installation(request, state):
         count, _ = ipsec_session_sample(request)
         need(count == 0, 'REMOVE_IPSEC_BUSY')
     # Keep the original residual guards, including unscoped/foreign state.
-    removal_idle(request, sock_rows(), units)
+    if drain is None:
+        removal_idle(request, sock_rows(), units)
     # Retain the install manifest unchanged. Durable no-replace intent
     # prevents blind replay even if the first stop's result is unknown.
+    intent_record = entry(encode({'baseline': state['baseline']}))
     REMOVE_ENTERED = True
-    write(state['intent'], None, entry(encode({'baseline': state['baseline']})))
+    write(state['intent'], None, intent_record)
+    if drain is not None:
+        drain[1](intent_record)
     for name in (XL, IKE, NET_UNIT):
         fresh = {n: unit(n) for n in (X, XL, IKE, NET_UNIT)}
         removal_dependencies(fresh, installed=True)
@@ -2889,6 +2901,10 @@ def remove_installation(request, state):
         if info['ActiveState'] == 'active':
             if name in (XL, IKE):
                 removal_vpn_runtime(sock_rows(), fresh)
+            if name == XL and drain is not None:
+                drain[2](1)  # No second pppd can be born while XL is still live.
+            if name == IKE and drain is not None:
+                drain[3]()
             if name == IKE and 'swan' in current:
                 check_swan_profile(state['swanBackup'], read(SWAN_PROFILE))
             sc('stop', name, wait=14)
@@ -3091,14 +3107,14 @@ def session_profile(lns, options, network):
     return local, start, end
 
 
-def session_owner(request):
+def session_owner(request, *, remove_intent=None):
     token, machine, network = (request[k] for k in ('backupId', 'machineId', 'network'))
     require_census_machine(machine)
     path, manifest, backup = read_manifest(token)
     before, runtime = runtime_before(backup), backup['runtime']
     session_need(installed_phase(backup['phase']) and backup['backupId'] == token and backup['machineId'] == machine
                  and encode(backup['network']) == encode(network) and before['boot'] == boot()
-                 and directory_absent(os.path.dirname(path) + '/remove-attempt.json'))
+                 and removal_intent_matches(os.path.dirname(path) + '/remove-attempt.json', remove_intent))
     no_jobs((XL, NET_UNIT, IKE))
     info = unit(XL)
     session_need(info['FragmentPath'] == SYSTEM + '/' + XL and removal_native(info, XL, before, installed=True)
@@ -3467,18 +3483,30 @@ def revoke_peer_logins(rows, users):
 
 @contextlib.contextmanager
 def revoke_ppp_view(owner):
+    with owned_ppp_view(owner) as (sample, held, watch, _):
+        yield sample, held, watch
+
+
+@contextlib.contextmanager
+def owned_ppp_view(owner, *, retirement=False):
     libc = ctypes.CDLL(None, use_errno=True)
     path = '/sys/fs/cgroup' + SESSION_GROUP
-    with directory('/proc') as proc, directory(path) as group, contextlib.ExitStack() as stack:
+    with directory('/proc') as proc, directory(path) as group, contextlib.ExitStack() as stack, contextlib.ExitStack() as events:
         session_fs(libc, proc, 0x9fa0)
         session_fs(libc, group, 0x63677270)
-        route = stack.enter_context(socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK, 0))
-        route.bind((0, 1 | 16))
         poll = select.poll()
-        poll.register(route, select.POLLIN)
-        pids = {}
+
+        def route_watch(scope):
+            sock = scope.enter_context(socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_NONBLOCK, 0))
+            sock.bind((0, 1 | 16))  # RTMGRP_LINK | RTMGRP_IPV4_IFADDR; overflow also refuses.
+            poll.register(sock, select.POLLIN)
+            return sock
+
+        route = route_watch(events)
+        pids, exited = {}, set()
 
         def held(pid):
+            session_need(pid not in exited)
             if pid not in pids:
                 fd = os.pidfd_open(pid)
                 stack.callback(os.close, fd)
@@ -3494,7 +3522,31 @@ def revoke_ppp_view(owner):
             session_need(session_generation(os.fstat(group)) == session_generation(os.lstat(path)))
             return value
 
-        yield sample, held, watch
+        def advance(pid):
+            nonlocal route
+            # Only after the selected original pidfd reported exit. Its link
+            # removal makes the old route watch unusable. Arm the replacement
+            # before resampling; never drop a surviving pidfd or allow reuse of
+            # an exited PID. The caller must prove the exact shrinking set.
+            session_need(pid in pids and pid not in exited and pid != owner[2])
+            with contextlib.ExitStack() as next_events:
+                fresh = route_watch(next_events)
+                poll.unregister(route)
+                events.close()
+                events.enter_context(next_events.pop_all())
+                route = fresh
+            poll.unregister(pids[pid])
+            exited.add(pid)
+            watch()
+
+        yield (sample, held, watch, group, advance) if retirement else (sample, held, watch, group)
+
+
+def wait_ppp_exit(pfd):
+    exited = select.poll()
+    exited.register(pfd, select.POLLIN)
+    session_need(any(fd == pfd and flags & select.POLLIN for fd, flags in
+                     exited.poll(max(0, int((DEADLINE - time.monotonic()) * 1000)))))
 
 
 def revoke_ppp(request, blocked, chap, path, manifest, xl):
@@ -3553,10 +3605,7 @@ def revoke_ppp(request, blocked, chap, path, manifest, xl):
                 except ProcessLookupError:
                     # Natural exit before delivery, not an operation closure.
                     continue
-                exited = select.poll()
-                exited.register(pfd, select.POLLIN)
-                session_need(any(fd == pfd and flags & select.POLLIN for fd, flags in
-                                 exited.poll(max(0, int((DEADLINE - time.monotonic()) * 1000)))))
+                wait_ppp_exit(pfd)
                 # A count requires an accepted signal to the pinned instance,
                 # its exit, and absence of both call and interface on readback.
                 # It does not distinguish a concurrent natural disconnect as
@@ -3632,7 +3681,7 @@ def quiescent_session_token(baseline):
     return digest(encode(['ppp-quiescent-v1', baseline]))
 
 
-def ipsec_status_inventory(status):
+def ipsec_status_inventory(status, *, joined=False):
     # strongSwan starter/stroke statusall prints each CHILD under its parent
     # IKE SA. Count managed IKEv1 connections, never ESP directions, overlapping
     # CHILD rekeys, address pairs or kernel policy templates.
@@ -3648,6 +3697,7 @@ def ipsec_status_inventory(status):
         session_need(body.strip() == b'none')
         return []
     inventory, children, parent, last_child = {}, set(), None, None
+    installed = {}
     for line in body.split(b'\n')[:-1]:
         # stroke uses %12s, a minimum width; celerity-l2tp needs no padding.
         row = re.fullmatch(rb'[ \t]*celerity-l2tp(?:\[([1-9][0-9]{0,9})\]|\{([1-9][0-9]{0,9})\}):[ \t]+([^\x00-\x1f]+)', line)
@@ -3670,17 +3720,23 @@ def ipsec_status_inventory(status):
         else:
             child = int(child)
             session_need(parent is not None)
-            sa = re.fullmatch(rb'(?:INSTALLED, TRANSPORT, reqid [0-9]+, ESP(?: in UDP)? SPIs: [a-f0-9]{8}_i [a-f0-9]{8}_o'
-                              rb'|(?:REKEYING|REKEYED), TRANSPORT, reqid [0-9]+, expires in [0-9]+ (?:second|minute|hour|day)s?'
-                              rb'|DELETING, TRANSPORT, reqid [0-9]+)', detail)
-            if sa:
+            transform = re.fullmatch(rb'INSTALLED, TRANSPORT, reqid ([0-9]+), ESP( in UDP)? SPIs: ([a-f0-9]{8})_i ([a-f0-9]{8})_o', detail)
+            if transform or (not joined and re.fullmatch(
+                    rb'(?:REKEYING|REKEYED), TRANSPORT, reqid [0-9]+, expires in [0-9]+ (?:second|minute|hour|day)s?'
+                    rb'|DELETING, TRANSPORT, reqid [0-9]+', detail)):
                 session_need(child not in children)
                 children.add(child)
                 last_child = child
+                if joined:
+                    session_need(transform is not None and len(transform[1]) <= 10 and parent not in installed)
+                    installed[parent] = child, int(transform[1]), transform[3].decode(), transform[4].decode(), bool(transform[2])
             else:
                 session_need(last_child == child and (b' === ' in detail or b' bytes_i' in detail))
     identities = set(inventory.values())
     session_need(len(inventory) == len(identities) == int(up) and None not in identities)
+    if joined:
+        session_need(installed.keys() == inventory.keys())
+        return sorted((ike_id, spis, installed[ike_id]) for ike_id, spis in inventory.items())
     return sorted(inventory.items())
 
 
@@ -3721,6 +3777,571 @@ def ipsec_session_sample(request):
     no_jobs((IKE,))
     return len(inventory), digest(encode([before['boot'], remove_generation(path), digest(raw(manifest)),
                                          generations, ike['InvocationID'], ike['MainPID'], sockets, inventory]))
+
+
+# Only bounded one-call-per-peer IPv4 cohorts are drainable. Plain ESP and
+# common ESP-in-UDP are supported; shared addresses/transport selectors and
+# rekey overlap are not. No raw keys or client identities leave the helper.
+RETIRE_MAX_CLIENTS = 32  # Keep in sync with validRetirementCensus in JS.
+RETIRE_CHANGED = 'REMOVE_PREVIEW_CHANGED'
+RETIRE_ERRORS = (OSError, ValueError, KeyError, TypeError, IndexError, struct.error)
+RETIRE_IP4 = rb'([0-9.]{7,15})'
+RETIRE_SA = 'celerity-l2tp'
+RETIRE_IKE_GROUP = '/system.slice/' + IKE
+
+
+def retire_addresses(local, peer):
+    pair = tuple(ipaddress.IPv4Address(value.decode('ascii')) for value in (local, peer))
+    session_need(pair[0] != pair[1] and all(not (a.is_unspecified or a.is_multicast or a.is_loopback) for a in pair))
+    return tuple(map(str, pair))
+
+
+def retire_l2tp_endpoints():
+    # Generic netlink reports the tunnel UDP tuple, independently of IPCP.
+    data = command('/usr/sbin/ip', 'l2tp', 'show', 'tunnel', quiet=True)
+    pattern = re.compile(rb'Tunnel ([0-9]{1,5}), encap UDP[ \t]*\n[ \t]+From ' + RETIRE_IP4 + rb' to ' + RETIRE_IP4
+                         + rb'[ \t]*\n[ \t]+Peer tunnel ([0-9]{1,5})[ \t]*\n[ \t]+UDP source / dest ports:'
+                         + rb'[ \t]+1701[ \t]*/[ \t]*1701[ \t]*\n'
+                         + rb'(?:[ \t]+UDP checksum: (?:enabled|disabled)[ \t]*\n)?')
+    tunnels, local_ids, peers = {}, set(), set()
+    offset = 0
+    while offset < len(data):
+        row = pattern.match(data, offset)
+        session_need(row is not None and len(tunnels) < RETIRE_MAX_CLIENTS)
+        ids = int(row[1]), int(row[4])
+        endpoints = retire_addresses(row[2], row[3])
+        session_need(all(0 < n <= 65535 for n in ids) and ids[0] not in local_ids and endpoints[1] not in peers)
+        tunnels[ids] = endpoints
+        local_ids.add(ids[0])
+        peers.add(endpoints[1])
+        offset = row.end()
+    return tunnels
+
+
+def retire_xfrm(sas):
+    states = command('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys', quiet=True)
+    policies = command('/usr/sbin/ip', 'xfrm', 'policy', 'list', 'nosock', quiet=True)
+    expected_states, expected_policies = {}, {}
+    for endpoints, _, _, _, _, reqid, spi_in, spi_out, ports in sas:
+        local, peer = endpoints
+        expected_states[local, peer, spi_out, reqid] = ports
+        expected_states[peer, local, spi_in, reqid] = ports[::-1] if ports else None
+        expected_policies[local, peer, 'out'] = expected_policies[peer, local, 'in'] = reqid, endpoints
+    session_need(len({(dst, spi) for _, dst, spi, _ in expected_states}) == len(expected_states))
+
+    state_start = re.compile(rb'^src ' + RETIRE_IP4 + rb' dst ' + RETIRE_IP4 + rb'[ \t]*\n', re.M)
+    chunks = list(state_start.finditer(states))
+    session_need(len(chunks) == len(expected_states) and (chunks[0].start() == 0 if chunks else not states))
+    for i, row in enumerate(chunks):
+        data = states[row.end():chunks[i + 1].start() if i + 1 < len(chunks) else len(states)]
+        head, *tail = data.splitlines()
+        sa = re.fullmatch(rb'[ \t]+proto esp spi 0x([a-f0-9]{8}) reqid ([0-9]{1,10}) mode transport[ \t]*', head)
+        session_need(sa is not None)
+        item = (row[1].decode(), row[2].decode(), sa[1].decode(), int(sa[2]))
+        session_need(item in expected_states)
+        ports = expected_states.pop(item)
+        encap = None
+        # Closed grammar: marks, if_id, offload and unsupported selectors
+        # cannot project as one of these transport ESP transforms.
+        for line in tail:
+            udp = re.fullmatch(rb'[ \t]+encap type espinudp sport ([0-9]{1,5}) dport ([0-9]{1,5}) addr 0\.0\.0\.0[ \t]*', line)
+            if udp:
+                session_need(encap is None)
+                encap = int(udp[1]), int(udp[2])
+            else:
+                session_need(re.fullmatch(rb'[ \t]+(?:replay-window [0-9]+(?: flag (?:af-unspec|noecn))?|'
+                                          rb'(?:auth(?:-trunc)?|enc|aead) [^\x00-\x1f]+|'
+                                          rb'anti-replay context: seq 0x[a-f0-9]+, oseq 0x[a-f0-9]+, bitmap 0x[a-f0-9]+)[ \t]*', line))
+        session_need(encap == ports)
+    session_need(not expected_states)
+
+    policy = re.compile(rb'src ' + RETIRE_IP4 + rb'(?:/32)? dst ' + RETIRE_IP4
+                        + rb'(?:/32)? proto udp sport 1701 dport 1701[ \t]*\n[ \t]+dir (in|out) priority ([0-9]{1,10})'
+                        + rb'(?: ptype main)?[ \t]*\n[ \t]+tmpl src ' + RETIRE_IP4 + rb' dst ' + RETIRE_IP4
+                        + rb'[ \t]*\n[ \t]+proto esp reqid ([0-9]{1,10}) mode transport(?: level required)?[ \t]*\n')
+    by_tunnel = {sa[0]: [] for sa in sas}
+    offset = 0
+    while offset < len(policies):
+        row = policy.match(policies, offset)
+        session_need(row is not None)
+        s, d, direction, priority, ts, td, req = row.groups()
+        item = tuple(x.decode() for x in (s, d, direction))
+        session_need(item in expected_policies)
+        reqid, endpoints = expected_policies.pop(item)
+        # StrongSwan can leave transport template endpoints at INADDR_ANY.
+        session_need((ts, td) in ((s, d), (b'0.0.0.0', b'0.0.0.0')) and int(req) == reqid)
+        by_tunnel[endpoints].append((*item, int(priority), ts.decode(), td.decode()))
+        offset = row.end()
+    session_need(not expected_policies)
+    return tuple((sa, tuple(sorted(by_tunnel[sa[0]]))) for sa in sas)
+
+
+def retire_vici_message(data):
+    # VICI element stream: sections, byte values and lists. Reject duplicate
+    # names and any truncation; don't include unrecognized data in diagnostics.
+    root, stack, items, offset = {}, [], None, 0
+    node = root
+
+    def take(n):
+        nonlocal offset
+        part = data[offset:offset + n]
+        session_need(len(part) == n)
+        offset += n
+        return part
+
+    while offset < len(data):
+        tag = take(1)[0]
+        if tag in (1, 3, 4) and items is None:
+            key = take(take(1)[0]).decode('ascii')
+            session_need(key and key not in node)
+            if tag == 1:
+                session_need(len(stack) < 6)
+                stack.append(node)
+                node[key] = child = {}
+                node = child
+            elif tag == 3:
+                node[key] = take(int.from_bytes(take(2), 'big'))
+            else:
+                node[key] = items = []
+        elif tag == 2 and stack and items is None:
+            node = stack.pop()
+        elif tag == 5 and items is not None:
+            items.append(take(int.from_bytes(take(2), 'big')))
+        elif tag == 6 and items is not None:
+            items = None
+        else:
+            raise Refusal(SESSION_UNKNOWN)
+    session_need(not stack and items is None)
+    return root
+
+
+def retire_udp_rows():
+    # Include connected UDP sockets, which ordinary listener checks omit.
+    data = command('/usr/bin/ss', '-H', '-aunp', '--cgroup', '-A', 'udp', quiet=True)
+    for line in data.decode('utf-8').splitlines():
+        cols = line.split(maxsplit=6)
+        if cols and cols[0] == 'udp':
+            _, state, rx, _, local, remote, *rest = cols
+        else:  # ss may omit Netid for a single explicitly selected protocol.
+            state, rx, _, local, remote, *rest = line.split(maxsplit=5)
+        _, port = local.rsplit(':', 1)
+        session_need(port.isdecimal())
+        if int(port) not in (500, 4500, 1701):
+            continue
+        (details,) = rest
+        yield (int(port), state, rx, local, remote, set(re.findall(r'\bpid=(\d+),', details)),
+               re.findall(r'\bcgroup:(\S+)', details))
+
+
+def retire_ike_sockets(pid):
+    # Check both families; a distinct IPv6 bind is fine, a duplicate bind or
+    # another owner is not. No queued UDP inputs at the fenced recheck.
+    sockets = set()
+    for port, state, rx, local, remote, owners, groups in retire_udp_rows():
+        if port == 1701:
+            continue
+        session_need(state == 'UNCONN' and rx == '0' and (port, local, remote) not in sockets
+                     and owners == {str(pid)} and groups == [RETIRE_IKE_GROUP])
+        sockets.add((port, local, remote))
+    session_need({port for port, _, _ in sockets} == {500, 4500})
+    return tuple(sorted(sockets))
+
+
+def retire_l2tp_sockets(main, tunnels, live):
+    # Join each connected socket to exactly one observed tunnel. Only an
+    # already closed call may have a tunnel without a connected socket.
+    expected = {tuple(a + ':1701' for a in endpoints): live.get(ids) for ids, endpoints in tunnels.items()}
+    rows, bound = {}, None
+    for port, state, _, local, remote, owners, groups in retire_udp_rows():
+        if port != 1701:
+            continue
+        session_need(groups == [SESSION_GROUP] and main in owners)
+        if state == 'UNCONN':
+            session_need(owners == {main} and bound is None)
+            bound = local, remote
+        else:
+            key = local, remote
+            session_need(state == 'ESTAB' and key in expected and key not in rows)
+            pid = expected[key]
+            session_need(owners <= ({main, str(pid)} if pid else {main}))
+            rows[key] = tuple(sorted(owners))
+    session_need(bound is not None and all(key in rows for key, pid in expected.items() if pid is not None))
+    return bound, tuple(sorted(rows.items()))
+
+
+@contextlib.contextmanager
+def retire_vici(ike, held):
+    # Use one peer-authenticated connection through census and exact delete.
+    # A reused uniqueid on a newly started daemon cannot receive our request.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        def bounded():
+            left = DEADLINE - time.monotonic()
+            session_need(left > 0)
+            channel.settimeout(min(left, 4))
+
+        bounded()
+        channel.connect('/run/charon.vici')
+        pid, uid, _ = struct.unpack('=iII', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        session_need(pid > 1 and uid == 0)
+        pfd = held(pid)
+        poll = select.poll()
+        poll.register(pfd, select.POLLIN)
+
+        sockets = None
+
+        def peer_check():
+            session_need(not poll.poll(0) and unit(IKE) == ike and in_cgroup(str(pid), ike)
+                         and os.readlink(f'/proc/{pid}/exe') == '/usr/lib/ipsec/charon')
+            current = retire_ike_sockets(pid)
+            session_need(sockets is None or sockets == current)
+            return current
+
+        def send(tag, name, data=b''):
+            name = name.encode('ascii')
+            packet = bytes((tag, len(name))) + name + data
+            bounded()
+            channel.sendall(struct.pack('!I', len(packet)) + packet)
+
+        def recv():
+            def read_full(n):
+                value = bytearray()
+                while len(value) < n:
+                    bounded()
+                    chunk = channel.recv(n - len(value))
+                    session_need(chunk)
+                    value.extend(chunk)
+                return bytes(value)
+            size, = struct.unpack('!I', read_full(4))
+            session_need(0 < size <= 65536)
+            return read_full(size)
+
+        def list_sas():
+            peer_check()
+            send(3, 'list-sa')
+            session_need(recv() == b'\x05')
+            send(0, 'list-sas')
+            prefix = b'\x07\x07list-sa'
+            rows = []
+            while (row := recv()) != b'\x01':
+                session_need(row.startswith(prefix) and len(rows) < RETIRE_MAX_CLIENTS)
+                rows.append(retire_ike_identity(retire_vici_message(row[len(prefix):])))
+            send(4, 'list-sa')
+            session_need(recv() == b'\x05')
+            peer_check()
+            # Independently reject duplicate peer, IKE ID, cookie pair, CHILD
+            # ID and reqid; none may authorize two calls or two deletions.
+            for values in ([r[0][1] for r in rows], [r[1] for r in rows], [r[2:4] for r in rows],
+                           [r[4] for r in rows], [r[5] for r in rows]):
+                session_need(len(set(values)) == len(rows))
+            return tuple(sorted(rows))
+
+        def terminate(ike_id):
+            peer_check()
+            value = str(ike_id).encode('ascii')
+            send(0, 'terminate', b'\x03\x06ike-id' + struct.pack('!H', len(value)) + value
+                 + b'\x03\x07timeout\x00\x042000')
+            reply = recv()
+            session_need(reply[:1] == b'\x01')
+            props = retire_vici_message(reply[1:])
+            session_need(all(props.get(k) == v for k, v in (('success', b'yes'), ('matches', b'1'), ('terminated', b'1'))))
+            peer_check()
+
+        with directory('/proc') as proc:
+            start = int(session_read(proc, f'{pid}/stat', 4096).rsplit(b') ', 1)[1].split()[19])
+        sockets = peer_check()
+        yield (pid, start, sockets), list_sas, terminate, peer_check
+
+
+def retire_ike_identity(info):
+    session_need(set(info) == {RETIRE_SA})
+    ike = info[RETIRE_SA]
+    session_need(type(ike) is dict and (ike['version'], ike['state']) == (b'1', b'ESTABLISHED'))
+    local, peer = ike['local-host'], ike['remote-host']
+    endpoints = retire_addresses(local, peer)
+    children = ike['child-sas']
+    session_need(type(children) is dict and len(children) == 1)
+    (child,) = children.values()
+    session_need(type(child) is dict and (child['name'], child['state'], child['mode'], child['protocol']) ==
+                 (RETIRE_SA.encode(), b'INSTALLED', b'TRANSPORT', b'ESP'))
+    encap = child.get('encap')
+    session_need(encap in (None, b'no', b'yes'))
+    for who, address in (('local', local), ('remote', peer)):
+        selector = child[who + '-ts']
+        session_need(selector in ([address + b'/32[udp/1701]'], [address + b'/32[udp/l2f]']))
+
+    def number(value):
+        session_need(re.fullmatch(rb'[1-9][0-9]{0,9}', value) and int(value) <= 0xffffffff)
+        return int(value)
+
+    def spi(value, width):
+        session_need(len(value) == width and re.fullmatch(rb'[a-f0-9]+', value) and int(value, 16))
+        return value.decode('ascii')
+
+    ports = None
+    if encap == b'yes':
+        ports = number(ike['local-port']), number(ike['remote-port'])
+        session_need(ports[0] == 4500 and 0 < ports[1] <= 65535)
+    return (endpoints, number(ike['uniqueid']), spi(ike['initiator-spi'], 16), spi(ike['responder-spi'], 16),
+            number(child['uniqueid']), number(child['reqid']), spi(child['spi-in'], 8), spi(child['spi-out'], 8), ports)
+
+
+def retire_ppp_links(expected):
+    links = json.loads(command('/usr/sbin/ip', '-j', '-details', 'link', 'show', quiet=True))
+    kinds = [row['link_type'] for row in links]
+    session_need('loopback' in kinds and sorted(row['ifindex'] for row in links if row['link_type'] == 'ppp') == expected)
+
+
+def retire_pids_input(group):
+    limit = session_read(group, 'pids.max', 32)
+    session_need(re.fullmatch(rb'(?:max|[1-9][0-9]{0,18})\n', limit))
+    return limit
+
+
+def retire_write_pids(group, value):
+    fd = os.open('pids.max', os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=group)
+    try:
+        session_need(os.write(fd, value) == len(value))
+    finally:
+        os.close(fd)
+
+
+def retire_group_same(group):
+    path = '/sys/fs/cgroup' + SESSION_GROUP
+    return session_generation(os.fstat(group)) == session_generation(os.lstat(path))
+
+
+def retire_ike_gate(request):
+    return 'celerity_retire_' + request['backupId']
+
+
+def retire_ike_gate_absent(name):
+    return not any(row.get('family') == 'inet' and row.get('name') == name for row in nft_tables())
+
+
+@contextlib.contextmanager
+def retire_ike_admission(name, peer_check):
+    # Only drop ingress addressed to the owned service's sockets, even if an
+    # unrelated application starts listening on the same ports elsewhere.
+    # UDP/4500 carries both IKE (the four zero-byte Non-ESP Marker after
+    # the UDP header) and live ESP (nonzero SPI). Do not drop data or short
+    # NAT keepalives while the gate is still classifying pre-intent drift.
+    peer_check()
+    session_need(retire_ike_gate_absent(name))
+    path = RETIRE_IKE_GROUP.lstrip('/')
+    scope = f'socket cgroupv2 level 2 "{path}" drop'
+    rules = (f'udp dport 500 {scope}', f'udp dport 4500 @th,64,32 0x0 {scope}')
+    batch = (f'create table inet {name}\n'
+             f'add chain inet {name} ingress {{ type filter hook input priority -10; policy accept; }}\n'
+             + ''.join(f'add rule inet {name} ingress {rule}\n' for rule in rules)).encode()
+    # Unsupported socket expression or missing cgroup: no installed rule.
+    command('/usr/sbin/nft', '-c', '-f', '-', data=batch, quiet=True)
+
+    def project():
+        data = command('/usr/sbin/nft', '-a', '-s', '-y', 'list', 'table', 'inet', name, quiet=True)
+        template = (rb'table inet ' + name.encode() + rb' \{ # handle ([1-9][0-9]*)\s+'
+                    rb'chain ingress \{ # handle ([1-9][0-9]*)\s+'
+                    rb'type filter hook input priority -10; policy accept;\s+'
+                    + b''.join(re.escape(rule.encode()).replace(b'0x0', rb'(?:0|0x0{1,8})')
+                               + rb' # handle ([1-9][0-9]*)\s+' for rule in rules)
+                    + rb'\}\s+\}\s*')
+        row = re.fullmatch(template, data)
+        if row is None:
+            raise Refusal(SESSION_UNKNOWN)
+        return tuple(x.decode('ascii') for x in row.groups())
+
+    try:
+        command('/usr/sbin/nft', '-f', '-', data=batch, quiet=True)
+        created = project()
+    except (Refusal, *RETIRE_ERRORS, subprocess.TimeoutExpired) as error:
+        # The atomic write might have landed, but we have no owned readback.
+        raise Refusal('IN_FLIGHT') from error
+
+    def checked():
+        session_need(project() == created)
+        peer_check()
+
+    try:
+        yield checked
+    finally:
+        try:
+            # No auto-thaw/retry after a potentially partial drain. The exact
+            # gate may be released after IKE stop or on a clean pre-effect veto.
+            if not REMOVE_ENTERED:
+                session_need(project() == created)
+            if not REMOVE_ENTERED or rollback_quiescent(unit(IKE)):
+                # The socket cgroup can already be gone, so nft may no longer
+                # render its name. Delete the original handle, not a successor
+                # table at the same pathname. DIRECT and other host writers
+                # must be serialized as for ordinary Remove.
+                command('/usr/sbin/nft', 'delete', 'table', 'inet', 'handle', created[0], quiet=True)
+                session_need(retire_ike_gate_absent(name))
+        except (Refusal, *RETIRE_ERRORS, subprocess.TimeoutExpired) as error:
+            raise Refusal('IN_FLIGHT') from error
+
+
+@contextlib.contextmanager
+def retire_admission(group, original):
+    # cgroup v2 pids.max=0 does not suspend or kill existing tasks. Already
+    # charged forks must be visible/accounted in pids.current before the
+    # fenced sample is admitted. No network path or other unit is changed.
+    session_need(retire_group_same(group) and retire_pids_input(group) == original)
+
+    def checked(tasks):
+        session_need(retire_group_same(group) and session_read(group, 'pids.max', 32) == b'0\n'
+                     and session_read(group, 'pids.current', 32) == f'{tasks}\n'.encode())
+
+    complete = False
+    try:
+        retire_write_pids(group, b'0\n')
+        yield checked
+        complete = True
+    finally:
+        if complete or not REMOVE_ENTERED:
+            try:
+                try:
+                    same = retire_group_same(group)
+                except FileNotFoundError:
+                    # systemd normally removes the original empty cgroup.
+                    session_need(complete and rollback_quiescent(unit(XL)))
+                else:
+                    session_need(same)
+                    if complete:
+                        session_need(rollback_quiescent(unit(XL)))
+                        checked(0)
+                    value = session_read(group, 'pids.max', 32)
+                    session_need(value in (b'0\n', original))
+                    if value != original:
+                        retire_write_pids(group, original)
+                    session_need(retire_group_same(group) and retire_pids_input(group) == original)
+            except (Refusal, *RETIRE_ERRORS) as error:
+                raise Refusal('IN_FLIGHT') from error
+
+
+@contextlib.contextmanager
+def retire_active_view(request, state):
+    session_need(os.uname().machine == 'x86_64' and hasattr(signal, 'pidfd_send_signal'))
+    # Do not autoload the generic-netlink L2TP provider in a read-only preview.
+    session_need('l2tp_netlink' in live_modules(SESSION_UNKNOWN))
+    backup = state['chap_backup']
+    xl, ike = (state['units'][n] for n in (XL, IKE))
+    session_need(working(xl) and working(ike) and not state['ike_sockets']
+                 and ike['ControlGroup'] == RETIRE_IKE_GROUP and retire_ike_gate_absent(retire_ike_gate(request)))
+    owner = session_owner(request)
+    session_need((owner[1], str(owner[2])) == (xl['InvocationID'], xl['MainPID']))
+    _, _, rows = owned_chap(state['current']['chap'], backup, state['chap_expected'])
+    users = {login.decode(): line.rstrip(b'\n').rsplit(b' ', 1)[1].decode() for login, line in rows.items()}
+    # Reuse the stock pppd process/PPPoX/netdev watcher and TDB join from Disable.
+    with owned_ppp_view(owner, retirement=True) as (ppp, held, watch, group, advance), \
+            retire_vici(ike, held) as (charon, list_sas, terminate, peer_check):
+        limit = retire_pids_input(group)
+
+        def ike_snapshot():
+            sas = list_sas()
+            inventory = ipsec_status_inventory(command('/usr/sbin/ipsec', 'statusall', quiet=True), joined=True)
+            stroke = sorted((sa[1], sa[2:4], (sa[4], sa[5], sa[6], sa[7], sa[8] is not None)) for sa in sas)
+            session_need(inventory == stroke)  # No foreign config, negotiating IKE or extra CHILD.
+            return retire_xfrm(sas)
+
+        def ppp_snapshot(fence):
+            def capacity():
+                current = session_read(group, 'pids.current', 32)
+                session_need(re.fullmatch(rb'[1-9][0-9]?\n', current) and int(current) <= 1 + RETIRE_MAX_CLIENTS)
+                if fence:
+                    fence(int(current))
+                else:
+                    session_need(retire_group_same(group) and retire_pids_input(group) == limit)
+                return int(current)
+
+            n = capacity()
+            start, rows = ppp()
+            rows = sorted(rows)
+            logins = revoke_peer_logins(rows, users)
+            for values in ([r[2] for r in rows], [r[3] for r in rows], [r[6] for r in rows], list(logins.values())):
+                session_need(len(set(values)) == len(rows))
+            retire_ppp_links(sorted(row[6] for row in rows))
+            session_need(n == capacity() == 1 + len(rows))
+            return start, tuple((row, logins[row[3]]) for row in rows)
+
+        def l2tp_snapshot(native, allowed=None):
+            live = {}
+            for (key, _, _, pid, *_), _ in native[1]:
+                ids = key[0], key[2]
+                session_need(ids not in live)  # Never share a transport tunnel.
+                live[ids] = pid
+            tunnels = retire_l2tp_endpoints()
+            session_need(live.keys() <= tunnels.keys())
+            if allowed is None:
+                session_need(live.keys() == tunnels.keys())
+            else:
+                session_need(all(allowed.get(ids) == peer for ids, peer in tunnels.items()))
+            return tunnels, retire_l2tp_sockets(xl['MainPID'], tunnels, live)
+
+        def witnessed():
+            peer_check()
+            require_census_machine(request['machineId'])
+            watch()
+
+        def sample(fence=None, *, remove_intent=None):
+            def read_join():
+                native = ppp_snapshot(fence)
+                session_need(native[1])
+                tunnels, sockets = l2tp_snapshot(native)
+                generation = ike_snapshot()
+                session_need(sorted(tunnels.values()) == [sa[0] for sa, _ in generation])
+                return native, tuple(sorted(tunnels.items())), sockets, generation
+
+            snapshot = read_join()
+            session_need(owner == session_owner(request, remove_intent=remove_intent)
+                         and observe_removal(request, active=True, remove_intent=remove_intent)['baseline'] == state['baseline'])
+            session_need(snapshot == read_join())
+            witnessed()
+            return snapshot
+
+        def token(snapshot):
+            return digest(encode(['retirement-active-v2', state['baseline'], owner[:6], charon, limit.decode(),
+                                  session_generation(os.fstat(group)), snapshot]))
+
+        def disconnect(snapshot, fence, ike_fence):
+            native, tunnels, (listener, sockets), generation = snapshot
+            start, cohort = native
+            live, sas = list(cohort), list(generation)
+            tunnels, sockets = dict(tunnels), dict(sockets)
+
+            def survivors():
+                ike_fence()
+                expected = start, tuple(live)
+                session_need(ppp_snapshot(fence) == expected)
+                observed, (bound, connected) = l2tp_snapshot(expected, tunnels)
+                session_need(bound == listener)
+                connected = dict(connected)
+                for (key, *_), _ in live:
+                    ids = key[0], key[2]
+                    endpoints = tuple(a + ':1701' for a in tunnels[ids])
+                    session_need(observed[ids] == tunnels[ids] and connected[endpoints] == sockets[endpoints])
+                session_need(ike_snapshot() == tuple(sas))
+                ike_fence()
+                witnessed()
+
+            # After each acknowledged effect, only the exact prior set minus
+            # that identity is admissible. Do not chase arrivals or rekeys.
+            survivors()
+            for client in cohort:
+                pid = client[0][3]
+                pfd = held(pid)
+                watch()
+                signal.pidfd_send_signal(pfd, signal.SIGTERM)
+                wait_ppp_exit(pfd)
+                advance(pid)
+                live.remove(client)
+                survivors()
+            for sa in generation:
+                watch()
+                terminate(sa[0][1])
+                sas.remove(sa)
+                survivors()
+            return survivors
+
+        yield group, limit, sample, token, disconnect, peer_check
 
 
 def removal_idle(request, rows, units):
@@ -3811,6 +4432,77 @@ def collect_session_census(request):
         [row[3:] for row in sample[1]]]))}
 
 
+@contextlib.contextmanager
+def retirement_observation():
+    try:
+        yield
+    except Refusal as error:
+        if str(error) in ('IDENTITY', 'IN_FLIGHT') or REMOVE_ENTERED:
+            raise
+        raise Refusal(RETIRE_CHANGED) from None
+    except RETIRE_ERRORS:
+        if REMOVE_ENTERED:
+            raise
+        raise Refusal(RETIRE_CHANGED) from None
+
+
+def retirement_prepare_or_remove(request):
+    active = request.get('drain', False)
+    prepare = request['action'] == 'prepare-remove'
+    with retirement_observation():
+        state = observe_removal(request, active=True) if active else observe_removal(request)
+        session_need(retire_ike_gate_absent(retire_ike_gate(request)))
+        if not prepare:
+            session_need(state['baseline'] == request['baseline'])
+        if active:
+            with retire_active_view(request, state) as (group, limit, sample, token, disconnect, peer_check):
+                session_need(token(sample()) == request['expectedCensus'])
+                if not prepare:
+                    with retire_ike_admission(retire_ike_gate(request), peer_check) as ike_fence, retire_admission(group, limit) as fence:
+                        rechecked = None
+
+                        def check():
+                            nonlocal rechecked
+                            ike_fence()
+                            rechecked = sample(fence)
+                            session_need(token(rechecked) == request['expectedCensus'])
+                            ike_fence()
+
+                        drained = None
+
+                        def finish(intent_record):
+                            nonlocal drained
+                            # Intent publication/fsync is itself a race window.
+                            # The held proof must still match before signalling;
+                            # reread ownership against our own intent rather
+                            # than skipping the install/CHAP proof. Any
+                            # failure here retains the published intent.
+                            ike_fence()
+                            session_need(rechecked == sample(fence, remove_intent=intent_record))
+                            ike_fence()
+                            drained = disconnect(rechecked, fence, ike_fence)
+
+                        def before_xl_stop(tasks):
+                            if drained is None or tasks != 1:
+                                raise Refusal('IN_FLIGHT')
+                            drained()
+
+                        def before_ike_stop():
+                            session_need(not retire_l2tp_endpoints() and all(row[0] != 1701 for row in retire_udp_rows()))
+                            ike_fence()
+
+                        remove_installation(request, state, drain=(check, finish, before_xl_stop, before_ike_stop))
+        elif prepare:
+            census = relay_session_census(request, state['baseline'] if rollback_quiescent(state['units'][XL]) else None)
+            session_need(census['activeSessions'] == census['activeIpsec'] == 0 and census['census'] == request['expectedCensus'])
+        else:
+            remove_installation(request, state)
+    if prepare:
+        validate_profiles(state['profiles'])
+        return {'ok': True, 'backupId': request['backupId'], 'machineId': request['machineId'], 'baseline': state['baseline']}
+    return {'ok': True, 'backupId': request['backupId'], 'removed': True}
+
+
 def read_session_count(request):
     keys = {'action', 'machineId', 'nodeId', 'backupId', 'network'}
     session_need(keys <= set(request) <= keys | {'transit', 'currentUsers'}
@@ -3821,8 +4513,23 @@ def read_session_count(request):
     with directory(SYSTEM) as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
         require_census_machine(request['machineId'])
+        if request['action'] == 'retirement-count':
+            # Try the joined positive shape first. An independently reported
+            # pair of nonzero counts is never a positive retirement receipt.
+            try:
+                with retirement_observation():
+                    state = observe_removal(request, active=True)
+                    with retire_active_view(request, state) as (_, _, sample, token, _, _):
+                        snapshot = sample()
+                        count = len(snapshot[0][1])
+                        return {'activeSessions': count, 'activeIpsec': count, 'census': token(snapshot), 'activeClients': count}
+            except Refusal as error:
+                if str(error) != RETIRE_CHANGED:
+                    raise
         census = relay_session_census(request)
         require_census_machine(request['machineId'])
+        if request['action'] == 'retirement-count':
+            census['activeClients'] = 0 if census['activeSessions'] == census['activeIpsec'] == 0 else None
         return census
 
 
@@ -3848,7 +4555,7 @@ def dispatch(request: dict[str, Any]):
     global STAGE, NO_INSTALL_WRITES
     need(os.geteuid() == 0 and type(request) is dict, 'PREREQUISITE')
     action, machine = request['action'], request['machineId']
-    if action == 'session-count':
+    if action in ('session-count', 'retirement-count'):
         return read_session_count(request)
     need(re.fullmatch(r'[a-f0-9]{32}', machine) and action in
          ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove')
@@ -3908,10 +4615,16 @@ def dispatch(request: dict[str, Any]):
             keys = {'action', 'machineId', 'backupId', 'network', 'nodeId'}
             keys |= {'baseline'} if action == 'remove' else set()
             optional = {'transit', 'currentUsers'} | ({'expectedCensus'} if action == 'remove' else set())
+            if request.get('retirement') is True:
+                keys |= {'retirement', 'expectedCensus'}
+                optional.add('drain')
             need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
                  and keys <= set(request) <= keys | optional
+                 and ('drain' not in request or request['drain'] is True)
                  and ('expectedCensus' not in request or re.fullmatch(r'[a-f0-9]{64}', request['expectedCensus']))
                  and ('transit' not in request or type(request['transit']) is list), 'CANDIDATE_INVALID')
+            if request.get('retirement') is True:
+                return retirement_prepare_or_remove(request)
             state = observe_removal(request)
             if action == 'prepare-remove':
                 STAGE = 'CANDIDATE_INVALID'
@@ -3974,12 +4687,13 @@ def main():
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
               'IDENTITY' if str(error) == 'IDENTITY' else
+              RETIRE_CHANGED if action in ('prepare-remove', 'remove') and str(error) == RETIRE_CHANGED else
               'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
               'REMOVE_REFUSED' if action == 'remove' else
               'INSPECT_' + str(error) if action == 'inspect-chap' and isinstance(error, InspectUnproved)
               and str(error) in ('CHAP_PROJECTION_UNPROVED', 'PPP_UNPROVED', 'PIDFD_GETFD_EPERM', 'READBACK_UNPROVED') else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
-              SESSION_UNKNOWN if action == 'session-count' else str(error)), file=sys.stderr)
+              SESSION_UNKNOWN if action in ('session-count', 'retirement-count') else str(error)), file=sys.stderr)
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
@@ -3987,7 +4701,7 @@ def main():
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
-              SESSION_UNKNOWN if action == 'session-count' else STAGE), file=sys.stderr)
+              SESSION_UNKNOWN if action in ('session-count', 'retirement-count') else STAGE), file=sys.stderr)
         return 70
     print(json.dumps(result, ensure_ascii=True, separators=(',', ':')), flush=True)
     return 0

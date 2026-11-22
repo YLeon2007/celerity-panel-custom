@@ -5,6 +5,8 @@ const { makeLocks, withNode } = require('./rebuildLocks');
 const { t: translate } = require('../middleware/i18n');
 const { readAccountCount, formatRelayCounts } = require('./rebuildRelayCounts');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
+const { assertNoIncidentLinks, assertNoRelayEnrollment } = require('./rebuildNodeDeleteGuard');
+const { isPristine } = require('./rebuildRelayBackendStore');
 
 const BLOCKED = 'REBUILD_L2TP_ROLE_BLOCKED';
 const WRITE_BLOCKED = 'REBUILD_L2TP_NODE_WRITE_BLOCKED';
@@ -15,21 +17,26 @@ const reasons = Object.freeze({
     REBUILD_LOCK_LOST: 'nodes.rebuildRoleBusy',
     REBUILD_L2TP_ACCOUNTS_BLOCKED: 'nodes.rebuildNodeAccountsPending',
     REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE: 'nodes.rebuildRoleStateUnavailable',
+    REBUILD_NODE_HAS_LINKS: 'nodes.rebuildNodeHasLinks',
+    REBUILD_NODE_RETIRE_REQUIRED: 'nodes.rebuildNodeRetireRequired',
+    REBUILD_NODE_DELETE_UNAVAILABLE: 'nodes.rebuildNodeDeleteUnavailable',
 });
 const fail = code => Object.assign(new Error(code), { code });
 const primary = query => query.read('primary').readConcern('majority').maxTimeMS(5000);
 
-async function relayRoleBlock(nodeId, preview, code = BLOCKED) {
+async function relayRoleBlock(nodeId, preview, code = BLOCKED, bareDelete = false) {
     let state;
     try {
         const State = require('../modules/relay-l2tp/models/relayL2tpStateModel');
-        state = await primary(State.findOne({ node: nodeId }).select('status desiredState')).lean();
+        const fields = bareDelete ? '+pskEncrypted +rebuildInstallToken +rebuildMachineId' : 'status desiredState';
+        state = await primary(State.findOne({ node: nodeId }).select(fields)).lean();
     } catch {
         return fail(UNAVAILABLE);
     }
     // No managed state row is the stock uninstalled baseline. Do not let a
     // contradictory install intent or an unknown/nonterminal status pass.
-    if (!state || (state.status === 'not_installed' && ['absent', 'not_installed', undefined].includes(state.desiredState))) return null;
+    if (bareDelete ? isPristine(state)
+        : !state || (state.status === 'not_installed' && ['absent', 'not_installed', undefined].includes(state.desiredState))) return null;
 
     // Role writes never connect to the host just to decide a refusal. The
     // authenticated panel preview may supply a live estimate for display only.
@@ -58,19 +65,21 @@ async function withNodeWriterFence(write) {
     });
 }
 
-async function withNodeWrite(nodeId, write, { requireRemoval = false, fullSetup = false, select } = {}) {
+async function withNodeWrite(nodeId, write, { bareDelete = false, requireRemoval = false, fullSetup = false, select } = {}) {
     if (!isRebuildEnabled()) return write({}, undefined, async () => {});
     // Same singleton and lock ordering as Apply / Install / Remove. Never
     // admit from a route's previously loaded card or from a pending read made
     // outside the lock. Keep it held through host actions and related writes.
     const Node = require('../models/hyNodeModel');
     return withNodeWriterFence((options, verify) => withNode(nodeId, async () => {
+        if (bareDelete) await assertNoIncidentLinks(require('../models/cascadeLinkModel'), nodeId);
         const query = primary(Node.findById(nodeId));
         if (select) query.select(select);
         const node = await query;
         if (!node) return null;
         if (fullSetup) await assertRelaySetupAllowed(node);
-        else if (requireRemoval) await assertRelayNodeWritable(nodeId);
+        else if (requireRemoval || bareDelete) await assertRelayNodeWritable(nodeId, WRITE_BLOCKED, bareDelete);
+        if (bareDelete) await assertNoRelayEnrollment(Node, require('../modules/relay-l2tp/models/l2tpUserModel'), nodeId);
         await verify();
         currentWrites.set(node, verify);
         try { return await write(options, node, verify); }
@@ -78,8 +87,8 @@ async function withNodeWrite(nodeId, write, { requireRemoval = false, fullSetup 
     }));
 }
 
-async function assertRelayNodeWritable(nodeId, code = WRITE_BLOCKED) {
-    const block = await relayRoleBlock(nodeId, undefined, code);
+async function assertRelayNodeWritable(nodeId, code = WRITE_BLOCKED, bareDelete = false) {
+    const block = await relayRoleBlock(nodeId, undefined, code, bareDelete);
     if (block) throw block;
 }
 
@@ -131,7 +140,7 @@ function describeRoleError(error, t = translate) {
             accountCount, activeSessions, activeIpsec };
     }
     if (!Object.hasOwn(reasons, code)) return null;
-    return { status: code === UNAVAILABLE ? 503 : 409, code, message: t(reasons[code]),
+    return { status: [UNAVAILABLE, 'REBUILD_NODE_DELETE_UNAVAILABLE'].includes(code) ? 503 : 409, code, message: t(reasons[code]),
         ...(error.retryAllowed === false && { retryAllowed: false }) };
 }
 

@@ -18,9 +18,11 @@ const accountError = (suffix, details) => new RelayAccountsError(suffix, details
 // Every cooperating rebuild writer must call this under the same Apply lock,
 // before any host action or business write, even for unrelated nodes. Stale
 // Apply unlock does not clear this separate, non-expiring singleton.
-async function assertNoPendingRelayAccounts(db) {
+async function assertNoPendingRelayAccounts(db, session) {
     let row;
-    try { row = await db.collection(COLLECTION).findOne(singleton, { ...readOptions, projection: { _id: 1 } }); }
+    try { row = await db.collection(COLLECTION).findOne(singleton, {
+        ...(session ? { session, maxTimeMS: readOptions.maxTimeMS } : readOptions), projection: { _id: 1 },
+    }); }
     catch { throw accountError('PERSISTENCE_UNAVAILABLE'); }
     if (row !== null) throw accountError('BLOCKED', { retryAllowed: false });
 }

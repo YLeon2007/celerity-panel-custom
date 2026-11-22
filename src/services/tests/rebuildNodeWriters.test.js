@@ -57,6 +57,7 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
         { id: relayId, name: 'Relay', type: 'xray', cascadeRole: 'relay', xray: { agentToken: 'fixture' } },
     ].map(({ id, ...row }) => ({ ...row, _id: new mongoose.Types.ObjectId(id), ip, active: true, ssh: { port: 22, username: 'root', password: 'fixture' } }));
     let held, pending = true, inRebuild = true, expectUserSync = false, relayState = 'installed';
+    let incident, grant, replica;
     const effects = [];
     const lockStore = {
         async insertOne(row) { if (held) throw Object.assign(new Error('busy'), { code: 11000 }); held = row; },
@@ -66,6 +67,15 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     const collection = mongoose.connection.collection.bind(mongoose.connection);
     t.mock.method(mongoose.connection, 'collection', (name, ...options) => {
         if (name === 'c3_rebuild_locks') return lockStore;
+        if (name === 'c3_rebuild_l2tp_retired_relays') return { async findOne({ _id }) {
+            assert.ok(held);
+            assert.equal(_id, relayId);
+            return null;
+        } };
+        if (name === 'c3_rebuild_l2tp_relay_grants') return { async findOne({ nodeId }) {
+            assert.ok(held);
+            return nodeId === relayId && grant ? { nodeId } : null;
+        } };
         if (name !== 'c3_rebuild_relay_accounts') return collection(name, ...options);
         return { async findOne(filter, options) {
             assert.ok(held, 'pending read must hold Apply');
@@ -108,7 +118,10 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
         if (relayState instanceof Error) throw relayState;
         return String(node) === relayId && relayState ? { status: relayState, desiredState: 'installed' } : null;
     } });
-    fixture(Account, { async countDocuments() { return 2; } });
+    fixture(Account, { async countDocuments() { return 2; }, async findOne({ relayNode: { $in: [relayNode] } }) {
+        assert.ok(held);
+        return String(relayNode) === relayId && replica ? { _id: rows[1]._id } : null;
+    } });
     for (const method of ['setupXrayNode', 'setupXrayNodeWithAgent', 'setupNode', 'startNodeRuntime', 'stopNodeRuntime', 'connectSSH']) {
         t.mock.method(setup, method, async () => { observe(method); return { success: true }; });
     }
@@ -120,7 +133,16 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     fixture(require('../../models/serverGroupModel'), {
         async findOneAndUpdate() { effects.push('starter group'); assert.fail('no starter bundle after refusal'); },
     });
-    fixture(require('../../models/cascadeLinkModel'), { async findOne() { return null; } });
+    fixture(require('../../models/cascadeLinkModel'), { async findOne(filter, options) {
+        if (!incident) return null;
+        assert.ok(held, 'incident check holds the same lock as deletion');
+        assert.equal(options.readConcern.level, 'majority');
+        assert.equal(options.readPreference, 'primary');
+        assert.deepEqual(filter, { $or: ['portalNode', 'bridgeNode', 'source', 'target', 'rebuildApplied.listener'].map(field => ({
+            [field]: { $in: [rows[1]._id, relayId] },
+        })) });
+        return incident;
+    } });
     const { createPanelRouter } = require('../../routes/panel');
 
     const app = express();
@@ -210,6 +232,28 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     assert.equal((await mcp('setup', relayId)).success, true);
     assert.deepEqual(effects, ['setupXrayNodeWithAgent', 'edit', 'setupXrayNode', 'edit']);
     effects.length = 0;
+    incident = { _id: rows[0]._id, active: false, rebuildDelete: true };
+    await writers['REST delete']('REBUILD_NODE_HAS_LINKS');
+    await writers['MCP delete']('REBUILD_NODE_HAS_LINKS');
+    assert.deepEqual(effects, []);
+    assert.equal((await api('PUT', relayId, '', { name: 'still editable' })).status, 200);
+    effects.length = 0;
+    incident = null;
+    grant = true;
+    await writers['REST delete']('REBUILD_NODE_RETIRE_REQUIRED');
+    await writers['MCP delete']('REBUILD_NODE_RETIRE_REQUIRED');
+    grant = false;
+    const keys = ['C3_REBUILD_L2TP_RELAY_ID', 'C3_REBUILD_L2TP_RELAY_MACHINE_ID', 'C3_REBUILD_L2TP_RELAYS_JSON'];
+    const previous = keys.map(key => process.env[key]);
+    process.env[keys[0]] = relayId;
+    process.env[keys[1]] = 'b'.repeat(32);
+    delete process.env[keys[2]];
+    try { await writers['REST delete']('REBUILD_NODE_RETIRE_REQUIRED'); }
+    finally { keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; }); }
+    replica = true;
+    await writers['REST delete']('REBUILD_NODE_RETIRE_REQUIRED');
+    replica = false;
+    assert.deepEqual(effects, []);
     assert.equal((await mcp('delete', relayId)).success, true);
     assert.deepEqual(effects, ['delete', 'user unlink']);
 

@@ -36,7 +36,7 @@ function mongoFixture(t) {
             _id: new mongoose.Types.ObjectId(id), name: 'Joined relay', ip, type: 'xray', active: true, cascadeRole: 'relay',
             ssh: { port: 22, username: 'root', password },
         }))],
-        ...[GRANTS, AUDIT, STATES, USERS, LOCK, DIRECTORY, 'l2tpoperations', 'remoteadmissions',
+        ...[GRANTS, AUDIT, STATES, USERS, LOCK, DIRECTORY, 'c3_rebuild_l2tp_retired_relays', 'l2tpoperations', 'remoteadmissions',
             'nodeoperationlocks', 'cascadelinks'].map(name => [name, []]),
     ]);
     const writes = [], commits = [];

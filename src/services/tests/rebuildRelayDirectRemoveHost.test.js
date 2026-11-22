@@ -2,7 +2,8 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const { createInterface } = require('node:readline');
 const { createHash } = require('node:crypto');
 const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
 const { join } = require('node:path');
@@ -59,7 +60,7 @@ const fixture = String.raw`
 import contextlib, copy, ctypes, errno, io, json, os, pathlib, shlex, subprocess, sys, types
 from pathlib import Path
 source, tmp, scenario = sys.argv[1:]
-f = json.load(sys.stdin)
+f = json.loads(sys.stdin.readline()) if scenario == 'retire-active' else json.load(sys.stdin)
 root = Path(tmp)
 os.umask(0o077)
 h = {'__name__': 'fixture'}
@@ -71,7 +72,8 @@ def no_host_dispatch(event, _):
 sys.addaudithook(no_host_dispatch)
 if 'command' in f:
     argv = shlex.split(f['command'])
-    assert argv[:-1] == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c']
+    assert argv[:-1] == ['/usr/bin/timeout', '-k', *(['1s', '22s'] if scenario == 'retire-active' else ['4s', '125s']),
+                         '/usr/bin/python3', '-I', '-B', '-c']
     exec(compile(argv[-1], '<DIRECT command>', 'exec'), h)
 else:
     exec(compile(Path(source).read_bytes(), source, 'exec'), h)
@@ -97,7 +99,7 @@ if scenario.startswith('chap-unterminated-'):
     Path(P['chap']).write_bytes(b'# original comment with opaque byte \xff')
 
 def stat(value):
-    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size','st_dev','st_ino')})
+    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size','st_dev','st_ino','st_ctime_ns')})
 class FixtureOS:
     def __getattr__(self, name): return getattr(os, name)
     def lstat(self, path):
@@ -127,6 +129,7 @@ h['directory'] = directory
 machine_file = root / 'etc/machine-id'
 machine_file.write_text(f['machineId'] + '\n')
 h['read'] = lambda path, *args: R(str(machine_file) if path == '/etc/machine-id' else path, *args)
+h['open'] = lambda path, *args, **kw: open(machine_file if path == '/etc/machine-id' else path, *args, **kw)
 
 def preflight(machine, *, fresh=False):
     h['need'](machine == f['machineId'], 'IDENTITY')
@@ -188,6 +191,8 @@ if scenario.startswith('xtls-'):
     units[X].update(DropInPaths=str(xtls), ExecStart=f"{{ path={h['XRAY']} ; argv[]={start} ; ignore_errors=no ; "
                                                    'start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
     def proc_cmdline(path, mode):
+        if path == '/etc/machine-id':
+            return open(machine_file, mode)
         assert (path, mode) == ('/proc/' + units[X]['MainPID'] + '/cmdline', 'rb')
         return io.BytesIO(b'\0'.join(arg.encode() for arg in (h['XRAY'], 'run', '-config', h['MAIN'], '')))
     def realpath(path):
@@ -389,7 +394,7 @@ before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stoc
               globalFiles={}, installBoot=False, ikeSockets=[],
               sockets=h['owned_sockets'](h['sock_rows'](), units[X]['MainPID']))
 if scenario == 'apply-quiescent-dependent': before['transit'] = []
-h['observe'] = lambda m,d,transit: before
+h['observe'] = lambda m,d,transit,**kw: before
 req = {k: f[k] for k in ('network','backupId','machineId')}
 nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
 begin = b'# BEGIN CELERITY MANAGED L2TP USERS\n'
@@ -397,7 +402,10 @@ end = b'# END CELERITY MANAGED L2TP USERS\n'
 old_row = b'"alice" l2tpd "test-old" 10.255.1.10\n'
 new_row = b'"bob" l2tpd "test-new" 10.255.1.11\n'
 foreign = b'elsewhere other "foreign # value" *\r\n# opaque \xff'
-files = dict(main=f['installed'], nft=nft, chap=(begin + old_row + end).decode(),
+retirement_test = f.get('retirement', '')
+cohort = retirement_test.startswith('cohort-')
+nat = retirement_test in ('cohort-nat', 'cohort-two-nat', 'cohort-nat-drift', 'cohort-wrong-encap')
+files = dict(main=f['installed'], nft=nft, chap=(begin + old_row + (new_row if cohort else b'') + end).decode(),
              lns='ip range = 10.255.1.10-10.255.1.19\n', **{k: 'secret-fixture-only' for k in ('ike','options','secrets')})
 if scenario == 'chap-inspect-active':
     files['lns'] = ('[global]\nport = 1701\n\n[lns default]\n' + files['lns'] + 'local ip = 10.255.1.1\n'
@@ -466,7 +474,8 @@ def wire(action, *, stdin=None, helper=h, **kw):
     stdout, stderr = io.StringIO(), io.StringIO()
     saved = sys.stdin
     try:
-        helper['CHAP_ENTERED'] = False  # one invocation per process on the host
+        helper['REMOVE_ENTERED'] = False  # one invocation per process on the host
+        helper['CHAP_ENTERED'] = False
         helper['NETWORK_UPGRADE_ENTERED'] = False
         sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(
             stdin.encode() if stdin is not None else h['encode'](dict(req, action=action, **kw))))
@@ -482,11 +491,351 @@ def snapshot():
     return sorted((str(p.relative_to(root)), p.lstat().st_ino, p.lstat().st_ctime_ns,
                    p.read_bytes() if p.is_file() else None) for p in root.rglob('*'))
 
+if scenario.startswith('retire-'):
+    # Same emitted helper bytes as the SSH transport. The file/manifest and
+    # flock are real scratch objects; no kernel VPN socket or signal is used.
+    retirement = f['retirement']
+    units[IKE]['ControlGroup'] = '/system.slice/' + IKE
+    req['currentUsers'] = old_users + (new_users[:1] if cohort else [])
+    group = os.open(root, os.O_DIRECTORY | os.O_RDONLY)
+    native_read, base_command = h['session_read'], command
+    (root / 'proc').mkdir()
+    (root / 'proc/12').mkdir()
+    (root / 'proc/12/stat').write_bytes(b'12 (charon) ' + b'0 ' * 19 + b'808\n')
+    base_directory = h['directory']
+    @contextlib.contextmanager
+    def retire_directory(path, private=False):
+        with base_directory(str(root / 'proc') if path == '/proc' else path, private) as fd:
+            yield fd
+    h['directory'] = retire_directory
+    events, cap, gate = [], b'max\n', False
+    ppp_clients = {0, 1} if cohort else {0}
+    ike_clients = set(ppp_clients)
+    sa_ids = [9, 19, 29]
+    ppp = ipsec_live = True  # Legacy idle/stop fixture booleans.
+    altered, rebound = False, False
+    src = '192.0.2.1'
+    def dst(i): return '203.0.113.' + str(99 + (0 if retirement == 'cohort-shared-peer' else i))
+    def spis(i): return (f'{0xabcdef11 + i:08x}', f'{0xfedcba11 + i:08x}')
+    def ike_spis(i): return (f'{0x8877665544332211 + i:016x}', f'{0x0011223344556677 + i:016x}')
+    original_readlink = os.readlink
+    h['os'].readlink = lambda path, *a, **kw: '/usr/lib/ipsec/charon' if path == '/proc/12/exe' else original_readlink(path, *a, **kw)
+    owner = ('fixture-boot', units[XL]['InvocationID'], 11, '42', 'proof', 'chap')
+    def ppp_sample(_, proc, fd, selected, hold, watch, *, revoke=False):
+        assert selected == owner
+        assert revoke
+        for pid in [11, *(501 + i for i in ppp_clients)]: hold(pid)
+        watch()
+        return 131, [((31+(0 if retirement == 'cohort-shared-tunnel' else i), 32+i,
+                       41+(0 if retirement == 'cohort-shared-tunnel' else i), 42+i), '10.255.1.1', f'10.255.1.{10+i}',
+                      501+i, 1337+int(altered), 77+i, 22+i, (1, 7, 8+i)) for i in sorted(ppp_clients)]
+    h.update(session_owner=lambda _, **kw: owner, session_sample=ppp_sample, session_fs=lambda *_: None,
+             revoke_peer_logins=lambda rows, users: {r[3]: login for r in rows for login, ip in users.items() if r[2] == ip},
+             session_census=lambda _: dict(activeSessions=len(ppp_clients), census='a'*64),
+             live_modules=lambda _: set() if retirement == 'no-l2tp-netlink' else {'l2tp_netlink'},
+             ppp_empty=lambda: not ppp, retire_group_same=lambda fd: fd == group)
+
+    @contextlib.contextmanager
+    def ppp_directory(path, private=False):
+        if path == '/sys/fs/cgroup' + h['SESSION_GROUP']: yield group
+        else:
+            with retire_directory(path, private) as fd: yield fd
+    h['directory'] = ppp_directory
+    h['os'].lstat = lambda path, *a, **kw: os.lstat(root if path == '/sys/fs/cgroup' + h['SESSION_GROUP'] else path, *a, **kw)
+    route_watchers = set()
+    pfd_set = set()
+    def pidfd_open(pid):
+        assert pid in (11, 12) or pid - 501 in ppp_clients
+        fd = pid + 1000
+        assert fd not in pfd_set, 'did not keep the original pidfd'
+        pfd_set.add(fd)
+        return fd
+    h['os'].pidfd_open = pidfd_open
+    h['os'].close = lambda fd: pfd_set.remove(fd) if fd in pfd_set else os.close(fd)
+
+    def session_read(fd, name, size):
+        if fd == group:
+            if name == 'pids.max': return cap
+            assert name == 'pids.current'
+            return f'{len(ppp_clients) + 1}\n'.encode() if units[XL]['ActiveState'] == 'active' else b'0\n'
+        return native_read(fd, name, size)
+    def write_pids(fd, limit):
+        global cap, altered, rebound
+        assert fd == group and gate
+        events.append('fence-ppp' if limit == b'0\n' else 'restore-ppp')
+        cap = limit
+        if retirement in ('fenced-drift', 'cleanup-unknown') and cap == b'0\n': altered = True
+        if cap == b'0\n' and retirement == 'cohort-ike-arrival': ike_clients.add(2)
+        if cap == b'0\n' and retirement == 'cohort-nat-drift': rebound = True
+    def signal_ppp(pfd, sig):
+        global ppp
+        i = pfd - 1501
+        assert pfd in pfd_set and sig == h['signal'].SIGTERM and i in ppp_clients and gate and cap == b'0\n' and intent.exists()
+        events.append('disconnect-ppp')
+        ppp_clients.remove(i)
+        ppp = bool(ppp_clients)
+        for route in route_watchers: route.pending = True
+        if retirement == 'cohort-survivor-drift': sa_ids[1] = 20
+    class Poll:
+        def __init__(self): self.fds = set()
+        def register(self, fd, mask): self.fds.add(fd)
+        def unregister(self, fd): self.fds.remove(fd)
+        def poll(self, _):
+            return [(fd, 1) for fd in self.fds if (fd.pending if isinstance(fd, Route) else
+                                                    fd >= 1501 and fd - 1501 not in ppp_clients)]
+    h.update(session_read=session_read, retire_write_pids=write_pids,
+             select=types.SimpleNamespace(poll=Poll, POLLIN=1),
+             signal=types.SimpleNamespace(SIGTERM=15, pidfd_send_signal=signal_ppp))
+    original_write = h['write']
+    def retire_write(path, *args, **kwargs):
+        original_write(path, *args, **kwargs)
+        if path == str(intent) and retirement == 'late-intent-drift': sa_ids[0] = 10
+        if path == str(intent) and retirement == 'late-intent-chap-drift':
+            chap.write_bytes(chap.read_bytes().replace(old_row, new_row))
+    h['write'] = retire_write
+
+    def attribute(k, v):
+        k, v = k.encode(), str(v).encode()
+        return bytes((3, len(k))) + k + len(v).to_bytes(2, 'big') + v
+    def section(k, children):
+        k = k.encode()
+        return bytes((1, len(k))) + k + children + b'\x02'
+    def listing(k, v):
+        k, v = k.encode(), v.encode()
+        return bytes((4, len(k))) + k + b'\x05' + len(v).to_bytes(2, 'big') + v + b'\x06'
+    def encapped(i): return nat and (i == 0 or retirement == 'cohort-two-nat')
+    def remote_port(i): return 60123 + i + (100 if rebound else 0)
+    def ike_event(i):
+        spi_in, spi_out = spis(i)
+        initiator, responder = ike_spis(i)
+        child_id = 4+i
+        child = b''.join(attribute(*kv) for kv in {'uniqueid': child_id, 'name': 'celerity-l2tp', 'state': 'INSTALLED',
+            'mode': 'TRANSPORT', 'protocol': 'ESP', 'reqid': 1+i, 'spi-in': spi_in, 'spi-out': spi_out}.items())
+        if encapped(i): child += attribute('encap', 'yes')
+        child += listing('local-ts', src+'/32[udp/l2f]') + listing('remote-ts', dst(i)+'/32[udp/1701]')
+        sa = b''.join(attribute(*kv) for kv in {'uniqueid': sa_ids[i], 'version': 1, 'state': 'ESTABLISHED',
+            'local-host': src, 'remote-host': dst(i), 'initiator-spi': initiator, 'responder-spi': responder,
+            'local-port': 4500 if encapped(i) else 500, 'remote-port': remote_port(i) if encapped(i) else 500}.items())
+        children = section(f'celerity-l2tp-{child_id}', child)
+        if retirement == 'cohort-shared-child' and i == 1: children += section('celerity-l2tp-extra', child)
+        return b'\x07\x07list-sa' + section('celerity-l2tp', sa + section('child-sas', children))
+    class Route:
+        def __init__(self): self.pending = False
+        def __enter__(self): route_watchers.add(self); return self
+        def __exit__(self, *_): route_watchers.remove(self)
+        def bind(self, address): assert address == (0, 17)
+    class Vici:
+        def __init__(self, *args): self.pending = b''
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def settimeout(self, t): assert t > 0
+        def connect(self, p):
+            assert p == '/run/charon.vici'
+            if retirement == 'no-vici': raise FileNotFoundError()
+        def getsockopt(self, *a): return h['struct'].pack('=iII', 12, 0, 0)
+        def recv(self, n):
+            value, self.pending = self.pending[:n], self.pending[n:]
+            return value
+        def sendall(self, frame):
+            global ipsec_live
+            assert not self.pending and int.from_bytes(frame[:4], 'big') == len(frame)-4
+            name, data = frame[6:6+frame[5]], frame[6+frame[5]:]
+            replies = [b'\x05']
+            if name == b'list-sa': assert frame[4] in (3, 4) and not data
+            elif name == b'list-sas':
+                assert frame[4] == 0 and not data
+                replies = [ike_event(i) for i in sorted(ike_clients, reverse=True)]
+                if retirement == 'extra-sa': replies *= 2
+                replies.append(b'\x01')
+            else:
+                assert name == b'terminate' and frame[4] == 0
+                i, = [i for i in ike_clients if data == attribute('ike-id', sa_ids[i]) + attribute('timeout', 2000)]
+                assert i not in ppp_clients and gate and cap == b'0\n' and intent.exists()
+                events.append('disconnect-ike')
+                ike_clients.remove(i)
+                if retirement == 'cohort-late-ike-arrival': ike_clients.add(2)
+                ipsec_live = bool(ike_clients)
+                if retirement == 'lost-terminate': replies = []
+                else: replies = [b'\x01' + attribute('success', 'yes') + attribute('matches', 1) + attribute('terminated', 1)]
+            self.pending = b''.join(len(item).to_bytes(4, 'big') + item for item in replies)
+    s = h['socket']
+    h['socket'] = types.SimpleNamespace(socket=lambda family, *_: Route() if family == s.AF_NETLINK else Vici(),
+        **{k: getattr(s, k) for k in ('AF_UNIX', 'SOCK_STREAM', 'SOL_SOCKET', 'SO_PEERCRED', 'AF_NETLINK',
+                                      'SOCK_RAW', 'SOCK_NONBLOCK')})
+
+    gate_name = 'celerity_retire_' + token
+    cgroup_match = f'socket cgroupv2 level 2 "system.slice/{IKE}" drop'
+    matches = (f'udp dport 500 {cgroup_match}', f'udp dport 4500 @th,64,32 0x0 {cgroup_match}')
+    gates = ('/usr/sbin/nft','-a','-s','-y','list','table','inet',gate_name)
+    def commands(*a, data=None):
+        global gate
+        if a == ('/usr/bin/ss', '-H', '-aunp', '--cgroup', '-A', 'udp'):
+            scope = IKE if retirement != 'wrong-socket-cgroup' else 'other.service'
+            rows = b''.join(l + f' cgroup:/system.slice/{XL if b":1701 " in l else scope}\n'.encode()
+                            for l in base_command('/usr/bin/ss', '-H', '-lntup').splitlines() if l.startswith(b'udp '))
+            if gate and retirement == 'queued-ike':
+                rows = b'\n'.join(l.replace(b'UNCONN 0 ', b'UNCONN 128 ', 1) if b':500 ' in l else l
+                                  for l in rows.split(b'\n'))
+            for i in sorted(ppp_clients):
+                socket_pid = 999 if retirement == 'foreign-l2tp-socket' else 11
+                row = (f'ESTAB 0 0 {src}:1701 {dst(i)}:1701 users:(("xl2tpd",pid={socket_pid},fd={4+i})) '
+                       f'cgroup:/system.slice/{XL}\n').encode()
+                rows += row * (2 if retirement == 'cohort-duplicate-socket' and i == 1 else 1)
+            if not ipsec_live and retirement == 'late-foreign-l2tp':
+                rows += b'ESTAB 0 0 192.0.2.1:1701 203.0.113.100:1701 users:(("other",pid=999,fd=3)) cgroup:/system.slice/other.service\n'
+            return rows + (b'ESTAB 0 0 192.0.2.1:500 203.0.113.100:500 users:(("fixture",pid=999,fd=3))\n'
+                           if retirement == 'foreign-socket' else b'')
+        if a == ('/usr/sbin/ip','l2tp','show','tunnel'):
+            assert retirement != 'no-l2tp-netlink'
+            # Model a single control tunnel lingering after the only PPP exit;
+            # in a cohort the closed calls' tunnels disappear immediately.
+            return ''.join(f'Tunnel {31+i}, encap UDP\n  From {src} to {dst(i) if retirement != "wrong-tunnel" else "203.0.113.100"}\n'
+                           f'  Peer tunnel {41+i}\n  UDP source / dest ports: 1701/1701\n  UDP checksum: enabled\n'
+                           for i in (sorted(ppp_clients) if cohort else [0] if units[XL]['ActiveState'] == 'active' else [])).encode()
+        if a == ('/usr/sbin/ip','-j','-details','link','show'):
+            return h['encode']([{'ifindex': 1, 'link_type': 'loopback'}] +
+                               [{'ifindex': 22+i, 'link_type': 'ppp'} for i in ppp_clients])
+        if a == ('/usr/sbin/ipsec', 'statusall') and ike_clients:
+            status = f'Status:\nConnections:\n   celerity-l2tp: transport\nSecurity Associations ({len(ike_clients)} up, 0 connecting):\n'
+            for i in sorted(ike_clients):
+                initiator, responder = ike_spis(i)
+                spi_in, spi_out = spis(i)
+                esp = 'ESP in UDP' if encapped(i) else 'ESP'
+                status += (f'celerity-l2tp[{sa_ids[i]}]: ESTABLISHED 3 seconds ago, {src}[{src}]...{dst(i)}[{dst(i)}]\n'
+                           f'celerity-l2tp[{sa_ids[i]}]: IKEv1 SPIs: {initiator}_i {responder}_r*\n'
+                           f'celerity-l2tp{{{4+i}}}:  INSTALLED, TRANSPORT, reqid {1+i}, {esp} SPIs: {spi_in}_i {spi_out}_o\n')
+            return status.encode()
+        if a == ('/usr/sbin/ip','xfrm','state','list','nokeys') and ipsec_live:
+            states = []
+            for i in sorted(ike_clients):
+                spi_in, spi_out = spis(i)
+                for x,y,spi,sport,dport in ((src,dst(i),spi_out,4500,remote_port(i)), (dst(i),src,spi_in,remote_port(i),4500)):
+                    states.append(f'src {x} dst {y}\n\tproto esp spi 0x{spi} reqid {1+i} mode transport\n\treplay-window 32\n')
+                    if encapped(i):
+                        bad = retirement == 'cohort-wrong-encap' and x == src
+                        states[-1] += f'\tencap type espinudp sport {sport} dport {dport+bad} addr 0.0.0.0\n'
+            if retirement == 'foreign-transform': states += [states[0].replace('fedcba11','a1234567')]
+            return ''.join(states).encode()
+        if a == ('/usr/sbin/ip','xfrm','policy','list','nosock') and ipsec_live:
+            policies = [f'src {x}/32 dst {y}/32 proto udp sport 1701 dport 1701\n\tdir {di} priority 350000 ptype main\n'
+                        f'\ttmpl src 0.0.0.0 dst 0.0.0.0\n\t\tproto esp reqid {1+i} mode transport\n'
+                        for i in sorted(ike_clients) for x,y,di in ((src,dst(i),'out'),(dst(i),src,'in'))]
+            if retirement == 'cohort-foreign-policy': policies += [policies[-1].replace('203.0.113.100','203.0.113.106')]
+            return ''.join(policies).encode()
+        if a in (('/usr/sbin/nft','-c','-f','-'), ('/usr/sbin/nft','-f','-')):
+            def batch(rules):
+                return (f'create table inet {gate_name}\n'
+                        f'add chain inet {gate_name} ingress {{ type filter hook input priority -10; policy accept; }}\n'
+                        + ''.join(f'add rule inet {gate_name} ingress {rule}\n' for rule in rules)).encode()
+            assert not gate
+            assert data == batch(matches)
+            if a[1] == '-c':
+                if retirement == 'gate-unsupported': raise Refusal('COMMAND_FAILED')
+                return b''
+            events.append('fence-ike')
+            gate = True
+            return b''
+        if a == gates:
+            assert gate
+            assert units[IKE]['ActiveState'] == 'active'
+            return (f'table inet {gate_name} {{ # handle 8\n\tchain ingress {{ # handle 1\n'
+                    '\t\ttype filter hook input priority -10; policy accept;\n'
+                    + ''.join(f'\t\t{rule} # handle {2+i}\n' for i, rule in enumerate(matches)) + '\t}\n}\n').encode()
+        if a == ('/usr/sbin/nft','-j','list','tables') and gate:
+            value = json.loads(base_command(*a))
+            value['nftables'].append({'table': {'family':'inet', 'name':gate_name}})
+            return h['encode'](value)
+        if a == ('/usr/sbin/nft','delete','table','inet','handle','8'):
+            assert gate
+            events.append('restore-ike')
+            if retirement == 'cleanup-unknown': raise Refusal('COMMAND_FAILED')
+            gate = False
+            return b''
+        if a[2:3] == ('stop',) and a[-1] in (XL,IKE):
+            assert not ppp and not ipsec_live and cap == b'0\n' and gate
+            events.append('stop-xl' if a[-1] == XL else 'stop-ike')
+        return base_command(*a, data=data)
+    command = commands  # all host subprocesses go to the model, including systemctl
+    initial = snapshot()
+    params = dict(retirement=True, drain=True)
+    def send(result): print(json.dumps(result), flush=True)
+    def received(action, **extra):
+        frame = json.loads(sys.stdin.readline())
+        cmd = shlex.split(frame['command'])
+        assert cmd == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c', argv[-1]]
+        assert json.loads(frame['stdin']) == dict(req, action=action, **extra)
+        return wire(action, stdin=frame['stdin'])
+    count_result = wire('retirement-count', stdin=f['stdin'])
+    assert count_result[0] == 0 and not count_result[2], count_result
+    proof = json.loads(count_result[1])
+    assert snapshot() == initial and not changes and not events
+    refusal = (70, '', 'DIRECT_REMOVE_PREVIEW_CHANGED\n')
+    if retirement in f['unproved']:
+        assert proof['activeClients'] is None
+        assert wire('prepare-remove', **params, expectedCensus=proof['census']) == refusal
+        assert snapshot() == initial and not events and not changes
+        send(count_result)
+    else:
+        assert proof['activeClients'] == proof['activeSessions'] == proof['activeIpsec'] == (2 if cohort else 1), proof
+        assert wire('prepare-remove')[0] == 70  # standalone Remove cannot arm this drain
+        send(count_result)
+        params['expectedCensus'] = proof['census']
+        preparation = received('prepare-remove', **params)
+        assert preparation[0] == 0 and not preparation[2], preparation
+        baseline = json.loads(preparation[1])['baseline']
+        assert snapshot() == initial and not changes and not events
+        send(preparation)
+        if retirement == 'same-count-drift': sa_ids[0] = 10
+        if retirement == 'cohort-same-count-drift': sa_ids[0], sa_ids[1] = sa_ids[1], sa_ids[0]
+
+        result = received('remove', baseline=baseline, **params)
+        if retirement in f['successful']:
+            assert json.loads(result[1]) == dict(ok=True, backupId=token, removed=True), result
+            n = proof['activeClients']
+            assert events == ['fence-ike','fence-ppp'] + ['disconnect-ppp']*n + ['disconnect-ike']*n + \
+                ['stop-xl','stop-ike','restore-ppp','restore-ike'], events
+            assert not ppp and not ipsec_live and intent.exists() and not any(policy.values())
+            assert not gate and cap == b'max\n' and chap.read_bytes() == chap_preimage
+        elif retirement in ('lost-terminate', 'late-foreign-l2tp'):
+            assert result == (75, '', '') and not changes and intent.exists() and gate and cap == b'0\n'
+            assert events == ['fence-ike','fence-ppp','disconnect-ppp','disconnect-ike']
+            assert wire('remove', baseline=baseline, **params)[0] != 0
+            assert events.count('disconnect-ppp') == events.count('disconnect-ike') == 1
+        elif retirement in ('late-intent-drift', 'late-intent-chap-drift'):
+            assert events == ['fence-ike','fence-ppp'], events
+            assert result == (75, '', '') and not changes and intent.exists() and gate and cap == b'0\n'
+            assert ppp and ipsec_live
+            if retirement == 'late-intent-chap-drift':
+                assert new_row in chap.read_bytes() and old_row not in chap.read_bytes()
+                assert wire('remove', baseline=baseline, **params)[0] != 0
+                assert events == ['fence-ike','fence-ppp'], events
+        elif retirement == 'cohort-survivor-drift':
+            assert result == (75, '', '') and not changes and intent.exists() and gate and cap == b'0\n'
+            assert events == ['fence-ike','fence-ppp','disconnect-ppp'] and ppp_clients == {1} and ike_clients == {0,1}
+        elif retirement == 'cohort-late-ike-arrival':
+            assert result == (75, '', '') and not changes and intent.exists() and gate and cap == b'0\n'
+            assert events == ['fence-ike','fence-ppp','disconnect-ppp','disconnect-ppp','disconnect-ike']
+            assert not ppp_clients and len(ike_clients) == 2 and 2 in ike_clients
+        elif retirement == 'cleanup-unknown':
+            assert result == (75, '', '') and not changes and not intent.exists() and gate and cap == b'max\n'
+            assert events == ['fence-ike','fence-ppp','restore-ppp','restore-ike']
+        else:
+            assert result == refusal and snapshot() == initial and not changes and not gate and cap == b'max\n', (result, events)
+            expected = {'fenced-drift': ['fence-ike','fence-ppp','restore-ppp','restore-ike'],
+                        'cohort-ike-arrival': ['fence-ike','fence-ppp','restore-ppp','restore-ike'],
+                        'cohort-nat-drift': ['fence-ike','fence-ppp','restore-ppp','restore-ike'],
+                        'queued-ike': ['fence-ike','fence-ppp','restore-ppp','restore-ike']}.get(retirement, [])
+            assert events == expected
+        send(result)
+    assert not pfd_set and not route_watchers
+    os.close(group)
+    sys.exit(0)
+
 if scenario.startswith('xtls-'):
     def xtls_wire(action, **extra):
         return wire(action, stdin=h['encode'](dict(
             {k: req[k] for k in ('machineId', 'network', 'backupId')}, action=action, **extra)).decode())
-    install_baseline = h['digest'](h['encode'](before))
+    install_baseline = baseline  # Use the acknowledged pre-install digest, not the now-mutated fixture.
     testing = False  # No foreign policy during the install-bound phases.
     a = xtls_wire('verify', baseline=install_baseline)
     assert a[0] == 0, a
@@ -1023,6 +1372,80 @@ for (const scenario of ['normal', 'xtls-apply-remove', 'xtls-rollback', 'apply',
         } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 }
+
+test('active retirement through the emitted DIRECT helper', async t => {
+    const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: nodeId,
+        C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, C3_REBUILD_L2TP_SSH_SHA256: 'd'.repeat(64) };
+    const node = { _id: nodeId, ip: relay.ip, ssh: { port: 22, username: 'root' } };
+    const successful = ['normal', 'cohort-plain', 'cohort-nat', 'cohort-two-nat'];
+    const unproved = ['foreign-transform', 'foreign-socket', 'wrong-socket-cgroup', 'wrong-tunnel', 'extra-sa', 'no-vici',
+        'foreign-l2tp-socket', 'no-l2tp-netlink', 'cohort-shared-peer', 'cohort-shared-child', 'cohort-foreign-policy',
+        'cohort-wrong-encap', 'cohort-shared-tunnel', 'cohort-duplicate-socket'];
+    const uncertain = ['lost-terminate', 'cleanup-unknown', 'late-intent-drift', 'late-intent-chap-drift', 'late-foreign-l2tp',
+        'cohort-survivor-drift', 'cohort-late-ike-arrival'];
+    const changed = ['same-count-drift', 'fenced-drift', 'queued-ike', 'gate-unsupported', 'cohort-same-count-drift',
+        'cohort-ike-arrival', 'cohort-nat-drift'];
+    for (const retirement of [...successful, ...changed, ...uncertain, ...unproved]) {
+        await t.test(retirement, async () => {
+            let worker, result, replies;
+            let workerStderr = '';
+            const cohort = retirement.startsWith('cohort-');
+            const currentUsers = [{ login: 'alice', password: 'test-old', ipAddress: '10.255.1.10', enabled: true }];
+            if (cohort) currentUsers.push({ login: 'bob', password: 'test-new', ipAddress: '10.255.1.11', enabled: true });
+            const dir = mkdtempSync(join(process.cwd(), '.direct-retirement-fixture-'));
+            class SSH {
+                connect() { assert.equal(this.usePool, false); }
+                disconnect() {}
+                async exec(command, { stdin }, verify) {
+                    assert.ok(currentUsers.every(user => !command.includes(user.password)));
+                    await verify();
+                    let frame = { command, stdin };
+                    if (!worker) {
+                        frame = { ...frame, old, installed, network, backupId, nodeId, machineId, retirement, unproved, successful };
+                        worker = spawn('/usr/bin/python3', ['-I', '-B', '-c', fixture,
+                            join(__dirname, '../rebuildRelayDirectHost.py'), dir, 'retire-active'], { env: {} });
+                        result = new Promise(resolve => {
+                            worker.on('error', error => { workerStderr += error.message; });
+                            worker.on('close', resolve);
+                        });
+                        worker.stdin.on('error', error => { workerStderr += error.message; });
+                        worker.stderr.setEncoding('utf8').on('data', text => { workerStderr += text; });
+                        replies = createInterface({ input: worker.stdout })[Symbol.asyncIterator]();
+                    }
+                    worker.stdin.write(`${JSON.stringify(frame)}\n`);
+                    const reply = await replies.next();
+                    assert.ok(!reply.done, 'missing emitted host reply');
+                    const [code, stdout, stderr] = JSON.parse(reply.value);
+                    return { code, stdout, stderr };
+                }
+            }
+            const remote = createRelayDirect({ node, env, SSH: attested(SSH, machineId), verifyRemoveStdin: true });
+            try {
+                const input = { nodeId, backupId, network, currentUsers };
+                const proof = await remote.readRetirementCount(input);
+                assert.equal(proof.activeClients, unproved.includes(retirement) ? null : cohort ? 2 : 1);
+                if (proof.activeClients === null) return;
+                const plan = await remote.prepareRemove({ ...input, retirement: true, drain: true, expectedCensus: proof.census });
+                const removing = remote.remove(plan, () => true);
+                if (successful.includes(retirement)) assert.equal(await removing, true);
+                else if (uncertain.includes(retirement)) {
+                    await assert.rejects(removing, { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', remoteOutcomeUncertain: true });
+                } else await assert.rejects(removing, { code: 'REBUILD_L2TP_DIRECT_REMOVE_PREVIEW_CHANGED', commandSettled: true });
+                assert.equal(await remote.remove(plan, () => assert.fail('replay')), false);
+            } finally {
+                try {
+                    await remote.close();
+                    if (worker) {
+                        worker.stdin.end();
+                        const status = await result;
+                        assert.equal(status, 0, workerStderr);
+                        assert.equal(workerStderr, '');
+                    }
+                } finally { rmSync(dir, { recursive: true, force: true }); }
+            }
+        });
+    }
+});
 
 test('inspectChap uses a full pinned transport and host frame without writes or signals', async t => {
     const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: nodeId,

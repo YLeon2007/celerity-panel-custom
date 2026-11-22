@@ -488,7 +488,7 @@ router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
                 await HyUser.updateMany({ nodes: deleted._id }, { $pull: { nodes: deleted._id } }, options);
             }
             return deleted;
-        }, { requireRemoval: true });
+        }, { bareDelete: true });
         if (!node) return res.status(404).json({ error: 'Node not found' });
 
         // Инвалидируем кэш

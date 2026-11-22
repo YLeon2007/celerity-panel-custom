@@ -158,4 +158,4 @@ function createStore(State, User, listMode) {
     return { snapshot, sourceRows, reserve, verifyReservation, finish, restore };
 }
 
-module.exports = { createStore, read };
+module.exports = { createStore, read, isPristine };

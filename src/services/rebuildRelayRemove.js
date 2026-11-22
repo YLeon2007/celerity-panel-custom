@@ -29,6 +29,8 @@ const COUNT_UNAVAILABLE = 'REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE';
 const SESSIONS_BUSY = 'REBUILD_L2TP_REMOVE_SESSIONS_BUSY';
 const IPSEC_BUSY = 'REBUILD_L2TP_REMOVE_IPSEC_BUSY';
 const DIRECT_IPSEC_BUSY = 'REBUILD_L2TP_DIRECT_REMOVE_IPSEC_BUSY';
+const DIRECT_PREVIEW_CHANGED = 'REBUILD_L2TP_DIRECT_REMOVE_PREVIEW_CHANGED';
+const LOCK_LOST = 'REBUILD_LOCK_LOST';
 const PREVIEW_TTL_MS = 120_000;
 // Private proof accompanying the immutable public estimate. Neither the
 // installation receipt nor the host census is sent to the browser.
@@ -96,12 +98,15 @@ function ownedAccount(rows, state, nodeId) {
     return account;
 }
 
-function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, relayGrantStore, createRelayDirect = defaultDriver }) {
-    const run = async (id, phase, estimate) => {
+function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, withHeldLock, env, relayGrantStore, createRelayDirect = defaultDriver }) {
+    const retirementPreviews = new WeakMap();
+    const run = async (id, phase, estimate, heldLock) => {
         if (typeof id !== 'string' || id.length !== 24 || !/^[a-f0-9]{24}$/.test(id)) throw fail('REBUILD_INVALID_REQUEST');
+        const proofStore = heldLock ? retirementPreviews : previews;
+        const phaseAware = !!(relayGrantStore || heldLock);
         let fence;
         const snapshot = await readRelayAuthority(env, relayGrantStore);
-        const proof = phase === 'confirm' ? previews.get(estimate) : undefined;
+        const proof = phase === 'confirm' ? proofStore.get(estimate) : undefined;
         if (relayGrantStore && proof && proof.source !== snapshot.sourceFor(id)) throw identityChanged();
         try { fence = captureRelayEffect(env, relayGrantStore, snapshot, id); }
         catch (error) { if (error?.code !== 'REBUILD_L2TP_INSTALL_DISABLED') throw error; throw fail(DISABLED); }
@@ -119,18 +124,19 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
             }
         };
         checkPreview();
+        if (heldLock && proof) proofStore.delete(estimate);
         if (proof && (proof.source !== fence.source || proof.generation !== fence.generation)) throw identityChanged();
         if (proof && (proof.listMode !== fence.listMode || !sameRelayBinding(proof.binding, fence.binding))) {
             throw relayGrantStore ? identityChanged() : fail(PREVIEW_CHANGED);
         }
         let primary, removed = false;
         try {
-            return await locks.run((verifyLock, retainLock) => withNode(id, async () => {
+            const removeUnderLock = (verifyLock, retainLock) => withNode(id, async () => {
                 let remote, reserved = false;
                 const authority = async () => {
-                    if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
+                    if (await verifyLock() === false) throw fail(LOCK_LOST);
                     await authorize();
-                    if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
+                    if (await verifyLock() === false) throw fail(LOCK_LOST);
                     if (fence.listMode && env.ENCRYPTION_KEY !== chapKey) throw fail(CHANGED);
                 };
                 try {
@@ -143,9 +149,10 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                     try { await fence.check(node, authoritySnapshot); }
                     catch (error) { if (error?.code === 'REBUILD_L2TP_INSTALL_DISABLED') throw fail(DISABLED); throw error; }
                     const bound = relayGrantStore && captureRelayEffect(env, relayGrantStore, authoritySnapshot, id, node);
-                    const open = () => createRelayDirect({ node, env, ...(bound && { fence: bound }) });
+                    const open = () => createRelayDirect({ node, env, ...(bound && { fence: bound }),
+                        ...(heldLock && { verifyRemoveStdin: true }) });
                     const checkNode = async () => {
-                        if (fence.listMode || bound) {
+                        if (fence.listMode || bound || heldLock) {
                             const current = await getNode();
                             if (bound) await bound.check(current ?? null);
                             if (!equal(current, node)) throw fail(CHANGED);
@@ -167,6 +174,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                     catch (error) { if (phase !== 'preview') throw error; }
                     const accounts = rows && orderedAccounts(rows);
                     if (proof && (!equal(proof.node, node) || !equal(proof.stateFence, stateFence)
+                        || (heldLock && !equal(proof.state, state))
                         || !equal(proof.accounts, accounts))) throw fail(PREVIEW_CHANGED);
                     try {
                         if (fence.listMode) currentUsers = projectRelayChap(state, accounts, chapKey);
@@ -181,8 +189,10 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                             : await Promise.all([getNode(), getState(), accounts && users()]);
                         if (bound) await bound.check(currentNode ?? null);
                         if (!equal(currentNode, node) || !currentState || !equal(exact(currentState, stateKeys), exact(expected, stateKeys))
+                            || (heldLock && !equal(currentState, expected))
                             || (accounts && !equal(orderedAccounts(currentRows), accounts))) throw fail(CHANGED);
                         await authority();
+                        return currentState;
                     };
                     // Legacy singleton still authenticates its unchanged block
                     // against the original host receipt. A list enrollment never
@@ -201,7 +211,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                         try {
                             if (!fence.listMode || approved) {
                                 remote = await open();
-                                census = await readSessionCensus(remote, input);
+                                census = await readSessionCensus(remote, input, !!heldLock);
                             }
                         } catch (error) { if (isIdentityChanged(error)) throw error; /* Unavailable, not zero. */ }
                         finally {
@@ -212,11 +222,22 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                         }
                         const activeSessions = !transitProved && census?.activeSessions === 0 ? null : census?.activeSessions ?? null;
                         const activeIpsec = census?.activeIpsec ?? null;
-                        const confirmable = approved && transitProved && accountCount === accounts.length
-                            && activeSessions === 0 && activeIpsec === 0 && !!census.census;
+                        const idle = activeSessions === 0 && activeIpsec === 0;
+                        const activeClients = heldLock ? census?.activeClients ?? null : null;
+                        let confirmable = approved && transitProved && accountCount === accounts.length
+                            && (heldLock ? activeClients !== null : idle) && !!census?.census;
+                        let directory;
+                        if (heldLock && confirmable) {
+                            try {
+                                directory = await readDirectory(User.db);
+                                confirmable = directory === null || sameAccounts(directory.accounts, accounts);
+                            } catch { confirmable = false; }
+                        }
                         await checkInventory(state, approved ? accounts : undefined);
-                        const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions, activeIpsec, confirmable });
-                        if (confirmable) previews.set(snapshot, { node, stateFence, accounts,
+                        const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions, activeIpsec,
+                            ...(heldLock && { activeClients }), confirmable });
+                        if (confirmable) proofStore.set(snapshot, { node, stateFence, accounts,
+                            ...(heldLock && { state, transit: input.transit, directory, activeClients }),
                             binding: fence.binding, listMode: fence.listMode, source: fence.source, generation: fence.generation, census: census.census,
                             expires: performance.now() + PREVIEW_TTL_MS });
                         return snapshot;
@@ -236,6 +257,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                         return { directory, legacy, rows };
                     };
                     const baselineDirectory = await directorySnapshot();
+                    if (heldLock && !equal(proof.directory, baselineDirectory.directory)) throw fail(PREVIEW_CHANGED);
                     let retainedDirectory = baselineDirectory.directory;
                     const preserveDirectory = async session => {
                         if (!equal(await directorySnapshot(session), baselineDirectory) || env.ENCRYPTION_KEY !== chapKey) throw fail(CHANGED);
@@ -244,6 +266,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                     // Only a confirmed Apply receipt can classify the physical
                     // MAIN listener as transport. A PUT can change draft fields.
                     if (Link) input.transit = await readAppliedTransit(Link, id);
+                    if (heldLock && !equal(proof.transit, input.transit)) throw fail(PREVIEW_CHANGED);
                     if (proof) {
                         const accountCount = await readAccountCount(User, id);
                         if (accountCount === null) throw fail(COUNT_UNAVAILABLE);
@@ -257,10 +280,16 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                     }
                     let expectedCensus;
                     if (proof || currentUsers) {
-                        const census = await readSessionCensus(remote, input);
-                        if (!census) throw fail(COUNT_UNAVAILABLE);
-                        if (census.activeSessions > 0) throw fail(SESSIONS_BUSY);
-                        if (census.activeIpsec > 0) throw fail(IPSEC_BUSY);
+                        const census = await readSessionCensus(remote, input, !!heldLock);
+                        if (heldLock) {
+                            if (!census || census.activeClients !== proof.activeClients || census.census !== proof.census) {
+                                throw fail(PREVIEW_CHANGED);
+                            }
+                        } else {
+                            if (!census) throw fail(COUNT_UNAVAILABLE);
+                            if (census.activeSessions > 0) throw fail(SESSIONS_BUSY);
+                            if (census.activeIpsec > 0) throw fail(IPSEC_BUSY);
+                        }
                         if (!census.census) throw fail(COUNT_UNAVAILABLE);
                         if (proof && census.census !== proof.census) throw fail(PREVIEW_CHANGED);
                         expectedCensus = census.census;
@@ -271,8 +300,14 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                     // prepares subtraction against the current physical profiles.
                     // The actual host Remove must recheck the confirmed census.
                     let plan;
-                    try { plan = await remote.prepareRemove({ ...input, ...(expectedCensus && { expectedCensus }) }); }
-                    catch (error) { if (error?.code === DIRECT_IPSEC_BUSY) throw fail(IPSEC_BUSY); throw error; }
+                    try {
+                        plan = await remote.prepareRemove({ ...input, ...(expectedCensus && { expectedCensus }),
+                            ...(heldLock && { retirement: true, ...(proof.activeClients > 0 && { drain: true }) }) });
+                    } catch (error) {
+                        if (heldLock && error?.code === DIRECT_PREVIEW_CHANGED) throw fail(PREVIEW_CHANGED);
+                        if (error?.code === DIRECT_IPSEC_BUSY) throw fail(IPSEC_BUSY);
+                        throw error;
+                    }
                     if (plan == null) throw fail('REBUILD_L2TP_REMOVE_PLAN_INVALID');
                     await checkInventory(state, accounts);
                     checkPreview();
@@ -312,7 +347,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                         }
                     } else {
                         let result;
-                        try { result = await State.updateMany(stateFence, { $set: transition }, write); }
+                        try { result = await State.updateMany(heldLock ? exactDocument(state, 'node') : stateFence, { $set: transition }, write); }
                         catch { throw fail(RESERVATION_UNKNOWN); }
                         if (result?.acknowledged !== true) throw fail(RESERVATION_UNKNOWN);
                         if (result.matchedCount !== 1) throw fail(CHANGED);
@@ -327,18 +362,21 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                     const guard = async () => {
                         if (revoked) throw revoked;
                         try {
-                            await checkInventory(reservation, accounts);
+                            const current = await checkInventory(reservation, accounts);
                             await checkDirectory(User.db, retainedDirectory);
+                            if (heldLock && Link && !equal(await readAppliedTransit(Link, id), input.transit)) throw fail(CHANGED);
                             await authority();
+                            return current;
                         }
                         catch (error) { revoked = safe(error); throw revoked; }
                     };
                     await guard();
                     try {
-                        if (await remote.remove(plan, guard) !== true) throw fail(UNKNOWN);
+                        if (await remote.remove(plan, async () => { await guard(); }) !== true) throw fail(UNKNOWN);
                     } catch (error) {
                         if (isIdentityChanged(error)) throw error;
-                        if (!['REBUILD_L2TP_DIRECT_REMOVE_REFUSED', DIRECT_IPSEC_BUSY].includes(error?.code) || error.commandSettled !== true
+                        const changed = !!heldLock && error?.code === DIRECT_PREVIEW_CHANGED;
+                        if ((!changed && !['REBUILD_L2TP_DIRECT_REMOVE_REFUSED', DIRECT_IPSEC_BUSY].includes(error?.code)) || error.commandSettled !== true
                             || error.remoteOutcomeUncertain) throw fail(UNKNOWN);
                         // DIRECT guarantees this receipt can only precede intent.
                         // Recheck our lease and exact inventories before a single
@@ -348,13 +386,15 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                             ? {} : { $unset: { updatedAt: '' } }) };
                         if (Object.hasOwn(state, 'updatedAt')) restore.$set.updatedAt = updatedAt;
                         try {
-                            await guard();
-                            const reverted = await State.updateMany(exact(reservation, stateKeys), restore, write);
+                            const current = await guard();
+                            // Whole-document BSON comparison is order-sensitive.
+                            const reverted = await State.updateMany(heldLock ? exactDocument(current, 'node')
+                                : exact(reservation, stateKeys), restore, write);
                             if (reverted?.acknowledged !== true || reverted.matchedCount !== 1) throw fail(CHANGED);
                             await checkInventory(state, accounts);
                         } catch (error) { if (isIdentityChanged(error)) throw error; throw fail(UNKNOWN); }
                         reserved = false;
-                        throw fail(error.code === DIRECT_IPSEC_BUSY ? IPSEC_BUSY : 'REBUILD_L2TP_REMOVE_REFUSED');
+                        throw fail(changed ? PREVIEW_CHANGED : error.code === DIRECT_IPSEC_BUSY ? IPSEC_BUSY : 'REBUILD_L2TP_REMOVE_REFUSED');
                     }
 
                     try {
@@ -366,13 +406,13 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                             for (const row of accounts) {
                                 // Match the entire list-mode row: enumerating known
                                 // fields could miss a field added since the snapshot.
-                                const filter = session ? exactDocument(row, 'relayNode')
+                                const filter = session || heldLock ? exactDocument(row, 'relayNode')
                                     : exact(row, [...new Set([...accountKeys, ...Object.keys(row)])]);
                                 const deleted = await User.deleteMany(filter, options);
                                 if (deleted?.acknowledged !== true || deleted.deletedCount !== 1) throw fail(CHANGED);
                             }
-                            await checkInventory(reservation, [], session);
-                            const finished = await State.updateMany(exact(reservation, stateKeys), {
+                            const current = await checkInventory(reservation, [], session);
+                            const finished = await State.updateMany(heldLock ? exactDocument(current, 'node') : exact(reservation, stateKeys), {
                                 $set: { status: 'not_installed', updatedAt: new Date() }, $unset: unsetInstalled,
                             }, options);
                             if (finished?.acknowledged !== true || finished.matchedCount !== 1) throw fail(CHANGED);
@@ -385,7 +425,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                         else await settle();
                     } catch (error) {
                         if (isIdentityChanged(error)) throw error;
-                        if (relayGrantStore && error instanceof AcknowledgedCommitCleanupError) {
+                        if (phaseAware && error instanceof AcknowledgedCommitCleanupError) {
                             reserved = false;
                             removed = true;
                             throw fail(CLEANUP);
@@ -396,7 +436,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                     return { executionMode: 'rebuild', status: 'not_installed', nodeId: id };
                 } catch (error) {
                     primary = safe(error);
-                    if (relayGrantStore && (reserved || primary.code === RESERVATION_UNKNOWN)) {
+                    if (phaseAware && (reserved || primary.code === RESERVATION_UNKNOWN)) {
                         retainLock?.();
                         phaseError(primary, 'unknown');
                     } else if (removed) {
@@ -411,15 +451,28 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                         catch { if (!primary) throw fail(CLEANUP); }
                     }
                 }
-            }));
+            });
+            return heldLock ? await removeUnderLock(heldLock.verify, heldLock.retain) : await locks.run(removeUnderLock);
         } catch (error) {
             // Do not allow lock/transport teardown to reclassify settlement.
-            throw primary ?? (removed ? (relayGrantStore ? phaseError(fail(CLEANUP), 'removed') : fail(CLEANUP)) : safe(error));
+            throw primary ?? (removed ? (phaseAware ? phaseError(fail(CLEANUP), 'removed') : fail(CLEANUP)) : safe(error));
         }
+    };
+    // Composition supplies a verifier/retain pair from the SAME active
+    // global-lock acquisition and runs the existing pending-account fence.
+    // Never accept a caller's stand-alone truthy callback or reacquire here.
+    const retire = async (id, phase, estimate, heldVerify, retain) => {
+        if (typeof withHeldLock !== 'function' || typeof heldVerify !== 'function') throw fail(LOCK_LOST);
+        return withHeldLock(heldVerify, retain, async (verify, retainLock) => {
+            if (verify !== heldVerify || typeof retainLock !== 'function' || await verify() === false) throw fail(LOCK_LOST);
+            return run(id, phase, estimate, { verify, retain: retainLock });
+        });
     };
     return {
         previewRemoveRelay: id => run(id, 'preview'),
         confirmRemoveRelay: (id, estimate) => run(id, 'confirm', estimate),
+        previewRetireL2tp: (id, heldVerify, retain) => retire(id, 'preview', undefined, heldVerify, retain),
+        confirmRetireL2tp: (id, estimate, heldVerify, retain) => retire(id, 'confirm', estimate, heldVerify, retain),
         // Trusted lifecycle caller only. The panel always uses confirmRemoveRelay.
         removeRelay: id => run(id, 'internal'),
     };

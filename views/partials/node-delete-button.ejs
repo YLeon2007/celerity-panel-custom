@@ -1,0 +1,6 @@
+<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild && node.cascadeRole === 'relay') { %>
+    <button type="button" class="<%= deleteClass %>" data-retire-node="<%= node._id %>" data-retire-name="<%= node.name %>"
+            aria-haspopup="dialog" title="<%= t('common.delete') %>" aria-label="<%= t('common.delete') %>" disabled><i class="ti ti-trash"></i></button>
+<% } else { %>
+    <button type="button" class="<%= deleteClass %>" onclick="deleteNode('<%= node._id %>')" title="<%= t('common.delete') %>" aria-label="<%= t('common.delete') %>"><i class="ti ti-trash"></i></button>
+<% } %>

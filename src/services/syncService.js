@@ -303,19 +303,30 @@ class SyncService {
             options.httpsAgent = selfSignedAgent;
         }
 
+        const signal = directRead && AbortSignal.timeout(directRead.timeout);
         if (directRead) {
             // The observation challenge and bearer must stay at the configured
             // receiving agent. This GET has a total deadline and never retries.
             Object.assign(options, {
                 proxy: false, maxRedirects: 0, timeout: directRead.timeout,
-                signal: AbortSignal.timeout(directRead.timeout), maxContentLength: 1024,
+                signal, maxContentLength: 1024,
                 responseType: 'text', transformResponse: [bytes => bytes],
             });
             options.headers.Accept = 'application/json';
             options.headers['Cache-Control'] = 'no-store';
         }
 
-        const response = await axios(options);
+        let response;
+        try { response = await axios(options); }
+        catch (error) {
+            // Axios reports our absolute deadline as cancellation, not as its
+            // socket timeout. Require an attempted request and no HTTP reply.
+            if (signal?.aborted && error?.code === 'ERR_CANCELED' && axios.isCancel(error)
+                && error.request && !error.request.res && !error.response) {
+                throw Object.assign(new Error('Agent observation timed out'), { code: 'AGENT_OBSERVATION_TIMEOUT' });
+            }
+            throw error;
+        }
 
         if (response.status === 401) {
             const error = new Error(`[Agent] Unauthorized — check agentToken for node ${node.name}`);

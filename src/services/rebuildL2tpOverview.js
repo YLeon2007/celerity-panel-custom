@@ -168,9 +168,9 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
     const hasKey = () => typeof env.ENCRYPTION_KEY === 'string' && env.ENCRYPTION_KEY.length >= 32;
     const eligible = (row, list) => row?.cascadeRole === 'relay' && row.active === true && row.type === 'xray'
         && !row.useCustomConfig && (list || !!isIP(row.ip));
-    async function readAuthority() {
+    async function readAuthority(options) {
         try {
-            const snapshot = await relayGrantStore.snapshot();
+            const snapshot = await relayGrantStore.snapshot(options);
             if (snapshot?.env && Array.isArray(snapshot.grants) && typeof snapshot.sourceFor === 'function') return snapshot;
         } catch (error) { throw grantError(grantProblems.has(error?.code) ? error.code : grantUnavailable); }
         throw grantError(grantUnavailable);
@@ -271,7 +271,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         const endpoints = new Map();
         for (const row of nodes) {
             const id = String(row._id);
-            if (authority.sourceFor(id) !== 'env' && eligible(row, true)) {
+            if (!authority.isRetired?.(id) && authority.sourceFor(id) !== 'env' && eligible(row, true)) {
                 const endpoint = admissionEndpoint(row);
                 if (endpoint) endpoints.set(id, endpointKey(endpoint));
             }
@@ -288,9 +288,11 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
 
     async function overview() {
         let grantProblem = null;
+        const cards = Promise.resolve(findNodes());
         const [nodes, states, rows, authority] = await Promise.all([
-            findNodes(), read(State.find({}), stateFields), read(L2tpUser.find({}), userFields),
-            readAuthority().catch(error => { grantProblem = error.code; return null; }),
+            cards, read(State.find({}), stateFields), read(L2tpUser.find({}), userFields),
+            cards.then(nodes => readAuthority({ nodeIds: nodes.filter(row => eligible(row, true)).map(row => String(row._id)) }))
+                .catch(error => { grantProblem = error.code; return null; }),
         ]);
         const byNode = new Map(), duplicates = new Set(), byMachine = new Map();
         for (const row of states) {

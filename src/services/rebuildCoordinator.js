@@ -37,6 +37,62 @@ function componentFor(links, seeds) {
     }
     return [...seen].sort();
 }
+const tunnelIdentity = value => typeof value === 'string' && value
+    ? (/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value) ? value.toLowerCase() : value) : null;
+const tunnelIdentities = row => [row.tunnelUuid, row.rebuildApplied?.uuid].map(tunnelIdentity).filter(Boolean);
+
+// Retirement is rooted in the old graph, not the resulting components. An
+// inactive row can still own runtime artifacts; only an explicitly unapplied
+// inactive non-incident draft can be left out of that closure.
+function retirementScope(inventory, target) {
+    const adjacent = new Map();
+    for (const row of inventory) {
+        const refs = new Set([...ends(row), ...[row.source, row.target, row.rebuildApplied?.listener]
+            .filter(ref => ref != null).map(id)]);
+        if (!refs.has(target) && row.active === false && !row.rebuildDelete && !row.lifecycle && row.rebuildApplied === null) continue;
+        for (const ref of refs) {
+            if (!adjacent.has(ref)) adjacent.set(ref, []);
+            adjacent.get(ref).push([row, refs]);
+        }
+    }
+    const nodes = new Set([target]), scoped = new Set();
+    for (const node of nodes) for (const [row, refs] of adjacent.get(node) || []) {
+        if (scoped.has(row)) continue;
+        scoped.add(row);
+        for (const ref of refs) nodes.add(ref);
+    }
+    const links = [...scoped];
+    const incident = links.filter(row => ends(row).includes(target));
+    // Removing an edge is not revocation if another edge retains its identity.
+    // Include the last applied UUID (which can differ from the draft), and
+    // inventory outside this component: retirement will not rewrite those hosts.
+    const dropping = new Set(incident);
+    const retiringIdentities = new Set(incident.flatMap(tunnelIdentities));
+    if (retiringIdentities.size && inventory.some(row => !dropping.has(row)
+        && tunnelIdentities(row).some(value => retiringIdentities.has(value)))) {
+        throw fail('REBUILD_RETIRE_TUNNEL_CREDENTIAL_CONFLICT');
+    }
+    return { nodes: [...nodes].sort(), links, incident };
+}
+function checkRetirementLinks(links) {
+    const seen = new Set();
+    for (const row of links) {
+        const [source, target] = ends(row);
+        if (![id(row), source, target].every(v => /^[a-f0-9]{24}$/.test(v)) || seen.has(id(row)) || source === target
+            || (row.source != null && id(row.source) !== source) || (row.target != null && id(row.target) !== target)
+            || (Object.hasOwn(row, 'active') && typeof row.active !== 'boolean')) throw fail('REBUILD_INVALID_LINK');
+        seen.add(id(row));
+        // The receipt only names the old listener. If an endpoint moved, the
+        // old dialer cannot be reconstructed from this row; refuse, not prune.
+        const applied = row.rebuildApplied;
+        if (applied != null && (typeof applied!=='object' || Object.keys(applied).length!==5
+            || !['forward','reverse'].includes(applied.mode) || !['vless','vmess'].includes(applied.protocol)
+            || (applied.mode==='reverse' && applied.protocol!=='vless')
+            || id(applied.listener)!==(applied.mode==='reverse'?source:target)
+            || !Number.isInteger(applied.port) || applied.port<1 || applied.port>65535
+            || typeof applied.uuid!=='string' || !/^\S+$/.test(applied.uuid))) throw fail('REBUILD_L2TP_APPLIED_LINK_UNPROVED');
+    }
+}
 // Only managed transport/control interfaces may disappear without a client diff.
 // A named subscriber on a purported tunnel makes it a client for this check.
 function protectedInterfaces(config) {
@@ -60,63 +116,91 @@ function hasProtectedClientInbound(main, tag) {
     if (!main) throw fail('REBUILD_MAIN_UNREADABLE');
     return protectedInterfaces(main).some(i => i.protocol === 'vless' && i.tag === tag);
 }
-function profilePreview(before, after, profile) {
+function profilePreview(before, after, profile, protectBridge = false) {
     if (!before && profile==='main') throw fail('REBUILD_MAIN_UNREADABLE');
     const sections=[...new Set([...Object.keys(before||{}),...Object.keys(after)])].filter(k=>!equal(before?.[k],after[k]));
     const legacy=Boolean(before?.reverse?.portals?.length || before?.reverse?.bridges?.length);
     const native=after.inbounds?.some(i=>i.settings?.clients?.some(c=>c.reverse?.tag)) || after.outbounds?.some(o=>o.settings?.reverse?.tag);
-    return {profile, change:!before?'create':sections.length?'replace':'unchanged', ...(legacy&&native&&!after.reverse?{tunnelMigration:'legacy-to-vless-reverse'}:{}),sections:sections.filter(k=>['inbounds','outbounds','routing','reverse','log','api','stats','policy','dns','observatory'].includes(k)).sort(),protectedChanged:profile==='main' && !equal(protectedInterfaces(before),protectedInterfaces(after))};
+    const protectedChanged = (profile === 'main' || protectBridge)
+        && !equal(protectedInterfaces(before ?? { inbounds: [] }), protectedInterfaces(after));
+    return {profile, change:!before?'create':sections.length?'replace':'unchanged', ...(legacy&&native&&!after.reverse?{tunnelMigration:'legacy-to-vless-reverse'}:{}),sections:sections.filter(k=>['inbounds','outbounds','routing','reverse','log','api','stats','policy','dns','observatory'].includes(k)).sort(),protectedChanged};
 }
 // DELETE retains the old endpoint row (a rebuild-only desired tombstone) until
 // readback succeeds for the whole original component. A fresh Apply uses the
 // same inventory after a crash. No operation replay or startup worker.
-async function runRebuild(d, req) {
+const runRebuild = (d, req) => runGraph(d, req);
+const runRetireGraph = (d, req) => runGraph(d, req, true);
+async function runGraph(d, req, retire = false) {
     return d.global(async(verify = async()=>{})=>{
         const inventory=await d.links(), anchor=inventory.find(row=>id(row)===req.linkId);
         const confirmedLinks=!req.preview && req.expectedPreview?.length===128;
         if (!anchor && !req.nodeId) throw fail(confirmedLinks?'REBUILD_LINK_CHANGED':'REBUILD_LINK_NOT_FOUND');
-        const nodes=componentFor(inventory,anchor?ends(anchor):[req.nodeId]);
-        return d.withNodes(nodes,async()=>{
-            const scope=new Set(nodes), links=inventory.filter(row=>ends(row).every(n=>scope.has(n)));
+        const retirement=retire?retirementScope(inventory,req.nodeId):null;
+        const lockedNodes=retirement?.nodes ?? componentFor(inventory,anchor?ends(anchor):[req.nodeId]);
+        const nodes=retire&&req.mode==='abandon'?lockedNodes.filter(n=>n!==req.nodeId):lockedNodes;
+        return d.withNodes(lockedNodes,async()=>{
+            const scope=new Set(nodes), links=retirement?.links ?? inventory.filter(row=>ends(row).every(n=>scope.has(n)));
             // Bind both the working rows and the profiles to the opaque token.
             // Separate digests let Apply identify row drift before composing.
             const linkVersion=fingerprintLinks(links);
+            if(retirement)retirement.version=linkVersion;
             if(confirmedLinks && !req.expectedPreview.startsWith(linkVersion)) {
                 throw fail('REBUILD_LINK_CHANGED');
             }
             if(links.some(row=>row.lifecycle)) throw fail('REBUILD_CONFLICTING_LINK_LIFECYCLE');
-            const removed=links.filter(row=>row.rebuildDelete===true || req.remove && id(row)===req.linkId);
-            const desired=links.filter(row=>!removed.includes(row)&&row.active!==false);
-            const {candidates,coreIdentities}=await d.build(nodes,desired);
+            if(retire)checkRetirementLinks(links);
+            const removed=retirement?.incident ?? links.filter(row=>row.rebuildDelete===true || req.remove && id(row)===req.linkId);
+            const removedSet=new Set(removed);
+            const desired=links.filter(row=>!removedSet.has(row)&&row.active!==false&&(!retire||row.rebuildDelete!==true));
+            const {candidates,coreIdentities}=await d.build(nodes,desired,retirement);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
             const pairs=new Map(), report=[], observedMain=req.remove&&d.nodeRole?new Map():null, fingerprint=createHmac('sha256',previewKey);
-            fingerprint.update(JSON.stringify([linkVersion,req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()]));
+            const survivor=retire?createHmac('sha256',previewKey):null;
+            const binding=[linkVersion,req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()];
+            if(retire)binding.push('retire',req.nodeId,req.mode);
+            fingerprint.update(JSON.stringify(binding));
+            survivor?.update(JSON.stringify(['retire-survivors',binding]));
             // Even if the newly composed profiles are byte-identical, a
             // desired REALITY dialer must still be the same checked build.
-            if(coreIdentities?.size)fingerprint.update(JSON.stringify(nodes.filter(id=>coreIdentities.has(id))
-                .map(id=>[id,...coreIdentities.get(id)])));
+            if(coreIdentities?.size){
+                const identities=nodes.filter(id=>coreIdentities.has(id)).map(id=>[id,...coreIdentities.get(id)]);
+                fingerprint.update(JSON.stringify(identities));
+                survivor?.update(JSON.stringify(identities.filter(([id])=>id!==req.nodeId)));
+            }
             for(const nodeId of nodes){
                 const pair=candidates.filter(p=>p.nodeId===nodeId); pairs.set(nodeId,pair);
                 if(pair.length!==2||new Set(pair.map(p=>p.profile)).size!==2||!pair.every(p=>['main','bridge'].includes(p.profile)))throw fail('REBUILD_INCOMPLETE_PROFILES');
                 const profiles=[];
                 for(const p of pair){
-                    const before=await d.read(nodeId,p.profile);
+                    const before=await d.read(nodeId,p.profile,true);
                     if(observedMain&&p.profile==='main')observedMain.set(nodeId,before);
-                    const diff=profilePreview(before,p.config,p.profile);
+                    // Unlike ordinary Apply, retirement replaces every peer
+                    // pair even if its links split off or all disappear.
+                    const diff=profilePreview(before,p.config,p.profile,retire);
                     if(p.publishedKeyMismatch)diff.protectedChanged=true;
                     profiles.push(diff);
-                    fingerprint.update(JSON.stringify([nodeId,p.profile,before,p.config,diff.protectedChanged]));
+                    const proof=[nodeId,p.profile,before,p.config,diff.protectedChanged];
+                    fingerprint.update(JSON.stringify(proof));
+                    if(survivor){
+                        if(nodeId!==req.nodeId)survivor.update(JSON.stringify(proof));
+                        else if(p.profile==='main')survivor.update(JSON.stringify([nodeId,p.profile,
+                            protectedInterfaces(before),protectedInterfaces(p.config),diff.protectedChanged]));
+                    }
                 }
                 report.push({nodeId,profiles});
             }
             const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
+            if(survivor)result.survivorPreview=linkVersion+survivor.digest('hex');
             const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;
             if(observedMain&&(req.preview||!result.allowed||stale))addRemoveExitImpacts(report,links,observedMain,candidates,d.nodeRole);
-            if(req.preview) return result;
+            if(req.preview){
+                if(retire){await verify(); await d.checkActivation(nodes,retirement);}
+                return result;
+            }
             if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);
             if(stale)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();
-            await d.checkActivation?.(nodes);
+            await d.checkActivation?.(nodes,retirement);
             if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }
             await d.prepareActivation?.(nodes);
             await verify();
@@ -128,8 +212,8 @@ async function runRebuild(d, req) {
             for(const [nodeId,pair] of pairs) for(const p of pair) {
                 if(!equal(await d.read(nodeId,p.profile),p.config))throw fail('REBUILD_READBACK_MISMATCH');
             }
-            await verify(); await d.finish({nodes,desired,removed});return result;
+            await verify(); await d.finish({nodes,desired,removed,retirement});return result;
         });
     });
 }
-module.exports={runRebuild,componentFor,profilePreview,hasProtectedClientInbound,previewForError};
+module.exports={runRebuild,runRetireGraph,retirementScope,fingerprintLinks,componentFor,profilePreview,hasProtectedClientInbound,previewForError};

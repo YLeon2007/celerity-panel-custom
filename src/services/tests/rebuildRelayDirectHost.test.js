@@ -120,7 +120,7 @@ original_units = {k: dict(v) for k, v in units.items()}
 before = dict(boot='boot-fixture', files={k: h['read'](p) for k, p in names.items()},
               units=original_units, bridge=None, globalFiles={}, sockets=[['tcp', '127.0.0.1', 8080]])
 h['unit'] = lambda name: dict(units[name])
-h['observe'] = lambda machine, d, transit: before
+h['observe'] = lambda machine, d, transit, **kw: before
 # Already-prepared PPP; the joined fixture exercises actual preparation.
 h['observe_ppp_preparation'] = lambda: dict(missing=[], persist=False, builtin=[], policy='fixture')
 h['apply_ppp_preparation'] = lambda expected: h['need'](expected == h['observe_ppp_preparation'](), 'BASELINE_CHANGED')

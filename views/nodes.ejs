@@ -256,7 +256,7 @@ function nodeMetaFor(node) {
                                 <% if (node.type !== 'virtual' && (ipProtocolCount || {})[node.ip] < 2) { %>
                                 <a href="/panel/nodes/add?cloneFrom=<%= node._id %>" class="btn-icon" title="<%= t('nodes.addPairedProtocol') %>"><i class="ti ti-plug-connected"></i></a>
                                 <% } %>
-                                <button class="btn-icon btn-icon-danger" onclick="deleteNode('<%= node._id %>')" title="<%= t('common.delete') %>"><i class="ti ti-trash"></i></button>
+                                <%- include('partials/node-delete-button', { node, deleteClass: 'btn-icon btn-icon-danger' }) %>
                             </div>
                         </td>
                     </tr>
@@ -366,7 +366,7 @@ function nodeMetaFor(node) {
                         <% if (node.type !== 'virtual' && (ipProtocolCount || {})[node.ip] < 2) { %>
                         <a href="/panel/nodes/add?cloneFrom=<%= node._id %>" class="btn btn-sm" title="<%= t('nodes.addPairedProtocol') %>" aria-label="<%= t('nodes.addPairedProtocol') %>"><i class="ti ti-plug-connected"></i></a>
                         <% } %>
-                        <button class="btn btn-sm btn-danger" onclick="deleteNode('<%= node._id %>')" title="<%= t('common.delete') %>" aria-label="<%= t('common.delete') %>"><i class="ti ti-trash"></i></button>
+                        <%- include('partials/node-delete-button', { node, deleteClass: 'btn btn-sm btn-danger' }) %>
                     </div>
                 </div>
             <% }); %>
@@ -906,6 +906,9 @@ function nodeMetaFor(node) {
 
 <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
 <%- include('partials/rebuild-preview') %>
+<% if (nodes.some(node => node.cascadeRole === 'relay')) { %>
+<%- include('partials/rebuild-relay-retire') %>
+<% } %>
 <% } %>
 <script>
 const i18n = {

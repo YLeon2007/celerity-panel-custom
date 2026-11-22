@@ -12,6 +12,7 @@ const { installCheckIds } = require('../../services/rebuildRelayInstallDiagnosti
 const { isInspectionReason } = require('../../services/rebuildRelayInspection');
 const { mountAdmission, admissionPath, validAdmissionJson, reject: rejectAdmission,
     validNodeId, grantEffectStatus, identityChanged } = require('./rebuildRelayAdmission');
+const { retirePath, validRetireJson, rejectRetire, mountRetire } = require('./rebuildRelayRetire');
 
 const pagePath = /^\/l2tp$/;
 const accountPath = /^\/rebuild\/relays\/l2tp\/accounts\/reveal$/;
@@ -55,7 +56,8 @@ const parseScopedJson = express.json({
         // Verify the wire shape before JSON.parse can discard duplicate keys.
         const path = req.path.slice('/panel'.length);
         const valid = admissionPath.test(path) ? validAdmissionJson(path, bytes)
-            : (accountPath.test(path) ? accountJson : emptyJson).test(bytes.toString('utf8'));
+            : retirePath.test(path) ? validRetireJson(path, bytes)
+                : (accountPath.test(path) ? accountJson : emptyJson).test(bytes.toString('utf8'));
         if (!valid) throw new Error('Invalid rebuild L2TP request');
     },
 });
@@ -67,13 +69,14 @@ function rebuildL2tpIngress(req, res, next) {
     if (effectPath.test(path)) return noStore(req, res, next);
     const reconcile = reconcilePath.test(path);
     const admission = admissionPath.test(path);
-    if (!admission && !reconcile && !accountPath.test(path) && !pskPath.test(path)) return next();
+    const retire = retirePath.test(path);
+    if (!admission && !retire && !reconcile && !accountPath.test(path) && !pskPath.test(path)) return next();
     res.set('Cache-Control', 'no-store');
     if (req.method !== 'POST') return next();
     const reject = () => admission ? rejectAdmission(res)
-        : reconcile ? revealError(res, 400, reconcileInvalid) : invalidRequest(res);
+        : retire ? rejectRetire(res) : reconcile ? revealError(res, 400, reconcileInvalid) : invalidRequest(res);
     if (req.url.includes('?') || !req.is('application/json') || req.get('content-length') === '0') return reject();
-    if (admission && !req.get('content-length') && !req.get('transfer-encoding')) return reject();
+    if ((admission || retire) && !req.get('content-length') && !req.get('transfer-encoding')) return reject();
     return parseScopedJson(req, res, err => err ? reject() : next());
 }
 
@@ -146,7 +149,7 @@ function revealInput(isAccount) {
 }
 
 function mountNoStore(router) {
-    router.all([accountPath, pskPath, reconcilePath, admissionPath, effectPath], noStore);
+    router.all([accountPath, pskPath, reconcilePath, admissionPath, effectPath, retirePath], noStore);
     router.get(pagePath, (req, res, next) => req.method === 'GET' ? noStore(req, res, next) : next());
 }
 
@@ -268,6 +271,8 @@ function createRoutes(service, admission) {
         mountReconcile: (router, limiter) => mountReconcile(router, getOverview, reconcile, limiter),
         mountReveals: router => mountReveals(router, getOverview),
         mountAdmission: (router, limiter) => mountAdmission(router, admission,
+            { requireSessionId, checkCsrf, requireCompletedOnboarding }, limiter),
+        mountRetire: (router, limiter) => mountRetire(router,
             { requireSessionId, checkCsrf, requireCompletedOnboarding }, limiter),
     };
 }

@@ -501,7 +501,7 @@ async function manageNodeAction(args, emit) {
                     await HyUser.updateMany({ nodes: deleted._id }, { $pull: { nodes: deleted._id } }, options);
                 }
                 return deleted;
-            }, { requireRemoval: true });
+            }, { bareDelete: true });
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             await invalidateNodesCache();
             logger.info(`[MCP] Deleted node ${node.name}`);

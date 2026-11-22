@@ -1,0 +1,26 @@
+<%
+const retireKeys = ['loading', 'onlineZero', 'onlineForce', 'offlineSince', 'offlineSinceUnknown', 'accountCount', 'accountCountUnknown',
+    'confirmDelete', 'confirmForce', 'confirmAbandon', 'changed', 'neighborUnavailable', 'protectedChange', 'previewUnavailable',
+    'outcomeUnconfirmed', 'newPreviewRequired', 'forceRequired', 'deleting'];
+const retireMessages = Object.fromEntries(retireKeys.map(key => [key, t(`nodes.retireRelay.${key}`)]));
+%>
+<style>
+    #relay-retire-dialog { position: fixed; color: inherit; width: min(36rem, calc(100% - 2rem)); overflow: auto; }
+    #relay-retire-dialog::backdrop { background: rgb(0 0 0 / 55%); }
+    #relay-retire-dialog p { overflow-wrap: anywhere; }
+    #relay-retire-message { white-space: pre-line; }
+    #relay-retire-dialog:not([open]), #relay-retire-dialog [hidden] { display: none; }
+</style>
+<dialog class="card" id="relay-retire-dialog" aria-labelledby="relay-retire-title" aria-describedby="relay-retire-message"
+        data-messages="<%= JSON.stringify(retireMessages) %>" data-csrf="<%= typeof csrfToken !== 'undefined' ? csrfToken : '' %>"
+        data-locale="<%= typeof lang !== 'undefined' ? lang : 'en' %>">
+    <h3 id="relay-retire-title"><%= t('nodes.retireRelay.title') %></h3>
+    <p data-retire-target></p>
+    <p id="relay-retire-message" data-retire-message></p>
+    <p role="status" data-retire-status></p>
+    <div class="form-actions">
+        <button type="button" class="btn" data-retire-close autofocus><%= t('common.cancel') %></button>
+        <button type="button" class="btn btn-danger" data-retire-confirm hidden disabled></button>
+    </div>
+</dialog>
+<script src="/js/rebuild-relay-retire.js?v=2" defer></script>

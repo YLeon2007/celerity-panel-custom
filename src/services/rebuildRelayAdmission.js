@@ -316,7 +316,8 @@ function createRebuildRelayAdmission({ db = require('mongoose').connection, env 
     };
     const prior = async nodeId => {
         enabled();
-        const snapshot = await store.snapshot();
+        const snapshot = await store.snapshot({ nodeIds: [nodeId] });
+        if (snapshot.isRetired?.(nodeId)) throw fail(CONFLICT, 'node-ineligible');
         const source = snapshot.sourceFor(nodeId);
         if (source === 'env') throw fail(CONFLICT, 'env-read-only');
         const rows = snapshot.grants.filter(row => row.nodeId === nodeId);

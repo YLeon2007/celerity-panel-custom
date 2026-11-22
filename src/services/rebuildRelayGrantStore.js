@@ -2,11 +2,12 @@
 
 const { randomUUID } = require('node:crypto');
 const { setTimeout: delay } = require('node:timers/promises');
-const { Types: { ObjectId } } = require('mongoose');
+const { Connection, mongo: { Db }, Types: { ObjectId } } = require('mongoose');
 const { relayListKey, relayListLimit, relayBindingFields, normalizeRelayBinding, parseRelayBindingList,
     assertUniqueRelayBindings, RelayGrantConflict, relayInstallEnabled } = require('./rebuildRelayAuthorization');
 
 const GRANTS = 'c3_rebuild_l2tp_relay_grants';
+const RETIRED = 'c3_rebuild_l2tp_retired_relays';
 const AUDIT = 'c3_rebuild_l2tp_relay_grant_audit';
 const LEGACY_ID = 'C3_REBUILD_L2TP_RELAY_ID';
 const LEGACY_MACHINE = 'C3_REBUILD_L2TP_RELAY_MACHINE_ID';
@@ -92,6 +93,27 @@ function createRelayGrantStore({ db, env = process.env }) {
         if (typeof db?.collection !== 'function' || (db.readyState !== undefined && db.readyState !== 1)) throw unavailable();
     }
     const grantsCollection = () => db.collection(GRANTS);
+    async function readRetired(ids, session) {
+        const retired = new Set();
+        if (!ids.length) return retired;
+        // Use the same driver DB that backs Mongoose, including when a driver
+        // adapter is injected at Connection.db. The older collection-only
+        // adapter implements just the grant registry, not retirement storage.
+        const native = db instanceof Db ? db : db.db;
+        if (native === undefined && !(db instanceof Connection)) return retired;
+        if (typeof native?.collection !== 'function') throw unavailable();
+        const collection = native.collection(RETIRED);
+        const keys = [...new Set(ids)];
+        for (let offset = 0; offset < keys.length; offset += 1024) {
+            const batch = new Set(keys.slice(offset, offset + 1024));
+            const rows = await collection.find({ _id: { $in: [...batch] } }, {
+                ...read(session), projection: { _id: 1 }, limit: batch.size + 1,
+            }).toArray();
+            if (!Array.isArray(rows) || rows.some(row => !batch.delete(row?._id))) throw registryInvalid();
+            for (const row of rows) retired.add(row._id);
+        }
+        return retired;
+    }
     // DDL happens outside the mutation transaction. Never publish a grant
     // until Mongo has acknowledged the four full unique indexes.
     async function ensureCollections() {
@@ -105,17 +127,34 @@ function createRelayGrantStore({ db, env = process.env }) {
         }
     }
 
-    async function registry(config, session, needLegacyEndpoint = false) {
+    async function registry(config, session, needLegacyEndpoint = false, nodeIds = []) {
         requireDb();
         const hasList = Object.hasOwn(config, relayListKey);
-        const singleton = hasList ? undefined : legacyBinding(config);
-        const envBindings = hasList ? parseRelayBindingList(config[relayListKey], envInvalid) : [];
+        let singleton = hasList ? undefined : legacyBinding(config);
+        let envBindings = hasList ? parseRelayBindingList(config[relayListKey], envInvalid, { checkUniqueness: false }) : [];
         // The binding array has a smaller serialization limit; cap records
         // separately so a corrupt collection cannot exhaust memory on readers.
         const cursor = await grantsCollection().find({}, { ...read(session), limit: 1025 });
         const rows = await cursor.toArray();
         if (!Array.isArray(rows) || rows.length > 1024) throw registryInvalid();
         const grants = rows.map(projectGrant);
+        const retired = await readRetired([
+            ...nodeIds, ...(singleton ? [singleton.nodeId] : envBindings.map(row => row.nodeId)),
+            ...grants.map(row => row.nodeId),
+        ], session);
+        // A committed retirement deletes the DB grant in the same transaction.
+        // Never emit a DB grant if a later read observes that node's retirement.
+        if (grants.some(row => retired.has(row.nodeId))) throw registryInvalid();
+        // Suppress only committed node IDs, before the inventory/uniqueness
+        // checks: a retired card is gone and its address may be reused.
+        if (singleton && retired.has(singleton.nodeId)) {
+            singleton = undefined;
+            for (const key of [LEGACY_ID, LEGACY_MACHINE, LEGACY_PIN]) delete config[key];
+        }
+        if (hasList && envBindings.some(row => retired.has(row.nodeId))) {
+            envBindings = envBindings.filter(row => !retired.has(row.nodeId));
+            config[relayListKey] = JSON.stringify(envBindings);
+        }
         if (singleton && (needLegacyEndpoint || grants.length)) {
             // Do not invent a port/login or trust a submitted endpoint. The
             // legacy binding comes from the same inventory as the SSH card.
@@ -130,19 +169,20 @@ function createRelayGrantStore({ db, env = process.env }) {
         }
         const entries = [...withSource(envBindings, 'env'), ...withSource(grants.map(bindingFields), 'db')];
         assertUniqueRelayBindings(entries);
-        return { grants, entries, singleton };
+        return { grants, entries, singleton, retired };
     }
 
-    async function snapshot({ session } = {}) {
+    async function snapshot({ session, nodeIds = [] } = {}) {
         try {
             const config = { ...env };
-            const { grants, entries, singleton } = await registry(config, session);
+            const { grants, entries, singleton, retired } = await registry(config, session, false, nodeIds.filter(validId));
             const sources = new Map(entries.map(({ binding, source }) => [binding.nodeId, source]));
             if (singleton) sources.set(singleton.nodeId, 'env');
             // Leave pure ENV unchanged, including legacy singleton's no-list
             // mode. DB-only and mixed registries use the synchronous list ABI.
             if (grants.length) config[relayListKey] = listOverlay(entries);
-            return { env: Object.freeze(config), grants, sourceFor: nodeId => sources.get(nodeId) ?? null };
+            return { env: Object.freeze(config), grants, sourceFor: nodeId => sources.get(nodeId) ?? null,
+                isRetired: nodeId => retired.has(nodeId) };
         } catch (cause) {
             throw safeError(cause);
         }
@@ -187,15 +227,16 @@ function createRelayGrantStore({ db, env = process.env }) {
 
     async function apply(changes, session) {
         const { action, binding, expectedGeneration, actor } = changes;
+        const { nodeId } = binding;
         const config = { ...env };
         if (!relayInstallEnabled(config)) throw new GrantError('REBUILD_L2TP_INSTALL_DISABLED');
-        const view = await registry(config, session, true);
+        const view = await registry({ ...config }, session, true, [nodeId]);
         const checkEnv = () => {
             if (!relayInstallEnabled(env) || authorityKeys.some(key => config[key] !== env[key]
                 || Object.hasOwn(config, key) !== Object.hasOwn(env, key))) throw error('CHANGED');
         };
         checkEnv();
-        const { nodeId } = binding;
+        if (view.retired.has(nodeId)) throw error('CHANGED');
         const current = checkMutation(changes, view);
         const options = write(session);
         const filter = { nodeId, generation: expectedGeneration };
@@ -308,4 +349,4 @@ function createRelayGrantStore({ db, env = process.env }) {
     return { snapshot, mutate, audit };
 }
 
-module.exports = { createRelayGrantStore };
+module.exports = { createRelayGrantStore, GRANTS, RETIRED, authorityKeys: Object.freeze(authorityKeys), legacyBinding };
