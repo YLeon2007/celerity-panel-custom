@@ -501,7 +501,7 @@ for (const mismatch of ['key', 'machineId', 'error']) {
         const expected = mismatch === 'error' ? 503 : 409;
         const result = await f.confirm(verified, expected);
         const code = mismatch === 'error' ? 'REBUILD_L2TP_IDENTITY_UNAVAILABLE' : CHANGED;
-        assert.deepEqual(result, refused(mismatch === 'error' ? 'REBUILD_L2TP_ADMISSION_UNAVAILABLE' : CHANGED));
+        assert.deepEqual(result, refused(code));
         assert.deepEqual(await f.confirm(verified, 409), refused(CHALLENGE));
         assert.deepEqual(f.remote.checks.slice(3), mismatch === 'key' ? ['key-only'] : ['pinned', 'machine']);
         assert.deepEqual(f.mongo.writes(), [LOCK, LOCK, AUDIT, AUDIT]);
