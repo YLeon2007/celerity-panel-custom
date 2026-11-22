@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { EventEmitter } = require('node:events');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const ssh2 = require('ssh2');
 
 // Stub the SSH wire, not NodeSSH or rebuildTransport. Real pin-verifier,
@@ -20,6 +20,7 @@ const pool = require('../sshPoolService');
 const poolConnection = pool.getConnection;
 const { MAIN, BRIDGE } = require('../classicAppliedConfig');
 const { READ_CHAIN, VERIFY_CHAIN } = require('../rebuildTunnelTls');
+const { rebuildApplyMachineGuard } = require('./helpers/rebuildApplyMachineGuard');
 const NodeSSH = require('../nodeSSH'); // lazy in rebuildTransport; capture the simulated wire here
 ssh2.Client = originalClient;
 
@@ -34,7 +35,7 @@ const query = fn => ({ select() { return this; }, sort() { return this; }, read(
     readConcern() { return this; }, session() { return this; }, async lean() { return structuredClone(fn()); } });
 const profileRead = path => `if test -f ${path}; then cat ${path}; elif test ! -e ${path}; then printf 'C3_CLASSIC_PROFILE_ABSENT'; else exit 1; fi`;
 
-function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } = {}) {
+function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false, merged = false } = {}) {
     const nodes = ['bridge', 'relay', 'relay'].slice(0, 1 + relayCount).map((role, i) => ({
         _id: objectId(i + 1), ip: `node${i}.fixture.invalid`, active: true, type: 'xray', cascadeRole: role,
         sshHostKeySha256: 'f'.repeat(64), ssh: { port: 2222 + i, username: 'root', password: 'fixture-auth',
@@ -87,16 +88,24 @@ function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } 
         });
         return {
             close() { if (!session.closed) { session.closed = true; client.emit('close'); } },
-            exec(command, cb) {
+            exec(frame, cb) {
                 inLock();
                 if (session.closed) return cb(Error('fixture channel closed'));
                 assert.ok(verified, 'no command after failed handshake');
-                commands.push({ session, command });
+                commands.push({ session, command: frame });
+                const { command, accepts } = rebuildApplyMachineGuard(frame);
                 const stream = new EventEmitter();
                 // Separately model stdin and stdout directions of an ssh2 Channel.
                 stream.stderr = new EventEmitter();
                 const dispatch = input => {
-                    const finish = (status, stdout = '') => { stream.emit('data', Buffer.from(stdout)); stream.emit('close', status); };
+                    const finish = (status, stdout = '', stderr = '') => {
+                        stream.emit('data', Buffer.from(stdout)); stream.stderr.emit('data', Buffer.from(stderr)); stream.emit('close', status);
+                    };
+                    if (accepts) {
+                        assert.ok(session.pinned);
+                        overrides.onGuard?.(host.id, command);
+                        if (!accepts(host.machine)) return finish(70, '', 'REBUILD_APPLY_MACHINE_ID_MISMATCH\n');
+                    }
                     if (command === '/usr/bin/head -c 34 /etc/machine-id') {
                         probes.push(session); return finish(0, `${host.machine}\n`);
                     }
@@ -131,7 +140,7 @@ function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } 
     };
     t.mock.method(pool, 'getConnection', async function (node, options) {
         poolRequests.push(node._id);
-        assert.ok(node._id === nodes[0]._id || ordinaryRelay && node._id === nodes[2]?._id,
+        assert.ok(node._id === nodes[0]._id || ordinaryRelay,
             'L2TP transport must not consult the pool');
         return poolConnection.call(this, node, options);
     });
@@ -144,13 +153,29 @@ function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } 
         effect('injected-stock');
         return require('../rebuildTransport').createTransport(node);
     } } : {};
-    const service = createRebuildService({ env, locks, ...transportOverrides, assertNoRelayAccountIntent: async () => inLock(),
-        Node: { find: ({ _id }) => query(() => nodes.filter(n => _id.$in.includes(n._id))) },
+    const grants = bindings.map(binding => ({ ...binding, host: binding.host.toLowerCase(), generation: randomUUID(),
+        createdBy: 'fixture', confirmedBy: 'fixture', createdAt: new Date(0), confirmedAt: new Date(0) }));
+    if (merged) for (const key of ['RELAYS_JSON', 'RELAY_ID', 'RELAY_MACHINE_ID', 'SSH_SHA256']) delete env[`C3_REBUILD_L2TP_${key}`];
+    const grantDb = merged ? { readyState: 1, collection(name) {
+        assert.equal(name, 'c3_rebuild_l2tp_relay_grants');
+        return { find(filter, options) {
+            inLock();
+            assert.deepEqual(filter, {});
+            assert.equal(options.readConcern.level, 'majority');
+            return { async toArray() { overrides.onGrantRead?.(); return structuredClone(grants); } };
+        } };
+    } } : undefined;
+    const service = createRebuildService({ env, locks, grantDb, ...transportOverrides, assertNoRelayAccountIntent: async () => inLock(),
+        Node: { find: ({ _id }) => query(() => nodes.filter(n => _id.$in.includes(n._id))),
+            findOne: ({ _id }) => query(() => nodes.find(n => n._id === _id)) },
         State: { find: ({ node }) => query(() => states.filter(s => node.$in.includes(s.node))),
             async updateOne() { effect('state'); return { matchedCount: 1 }; } },
         Link: { find: filter => query(() => links.filter(l => !filter._id || filter._id.$in.includes(l._id))),
             db: { async transaction(fn) { inLock(); return fn({}); } },
-            async updateOne() { effect('link'); return { acknowledged: true, matchedCount: 1, modifiedCount: 1 }; },
+            async updateOne(filter, update) {
+                effect(update.$set.rebuildApplied ? 'publish-link' : 'prepare-link');
+                return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
+            },
             async deleteMany() { effect('delete'); return { deletedCount: 1 }; } },
         sync: { async _getUsersForNode() { return []; } }, cache: { async invalidateAllSubscriptions() {} },
         compose: ({ affectedNodeIds }) => affectedNodeIds.flatMap(nodeId => [
@@ -158,10 +183,106 @@ function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } 
             { nodeId, profile: 'bridge', config: blank() },
         ]),
     });
-    return { service, request, nodes, states, hosts, bindings, env, setList, effects, sessions, probes, commands, poolRequests, overrides, links };
+    return { service, request, nodes, states, hosts, bindings, grants, env, setList, effects, sessions, probes, commands, poolRequests, overrides, links };
 }
 
 const assertNoWrites = f => assert.deepEqual(f.effects.filter(([type]) => type !== 'injected-stock'), []);
+
+test('ordinary non-L2TP Apply does not read the grant database', async t => {
+    const f = fixture(t, { relayCount: 0, merged: true });
+    f.overrides.onGrantRead = () => assert.fail('ordinary bridge has no L2TP effects or admission');
+    assert.equal((await f.service.execute(f.request)).allowed, true);
+    assert.equal(f.effects.filter(([verb]) => verb === 'replace').length, 2);
+});
+
+function disabledUninstalled(t) {
+    const f = fixture(t, { relayCount: 1, merged: true, ordinaryRelay: true });
+    f.env.C3_REBUILD_L2TP_INSTALL_ENABLED = 'false';
+    f.states.length = 0;
+    f.hosts[1].files[MAIN].inbounds = [];
+    return f;
+}
+
+for (const [label, arrange, code] of [
+    ['DB-only enrollment', () => {}, 'REBUILD_L2TP_INSTALL_DISABLED'],
+    ['invalid registry', f => { f.grants[0].generation = 'invalid'; }, 'REBUILD_L2TP_GRANT_REGISTRY_INVALID'],
+    ['unavailable registry', f => { f.overrides.onGrantRead = () => { throw Error('fixture read failure'); }; }, 'REBUILD_L2TP_GRANT_PERSISTENCE_UNAVAILABLE'],
+]) {
+    test(`disabled Install: ${label} refuses Apply before transport selection`, async t => {
+        const f = disabledUninstalled(t);
+        arrange(f);
+        await assert.rejects(f.service.execute(f.request), { code });
+        assertNoWrites(f);
+        assert.deepEqual(f.sessions, []);
+        assert.deepEqual(f.poolRequests, []);
+    });
+}
+
+test('disabled Install: ordinary relay Apply follows a successful absence read', async t => {
+    const f = disabledUninstalled(t);
+    f.grants.length = 0;
+    let reads = 0;
+    f.overrides.onGrantRead = () => { assert.deepEqual(f.sessions, []); reads++; };
+    assert.equal((await f.service.execute(f.request)).allowed, true);
+    assert.equal(reads, 1);
+    assert.deepEqual(new Set(f.poolRequests), new Set(f.nodes.map(node => node._id)));
+    assert.deepEqual(f.sessions.map(s => s.pinned), [false, false]);
+    assert.equal(f.effects.filter(([verb]) => verb === 'replace').length, 4);
+});
+
+test('enabled Install: Apply to a DB-only uninstalled relay uses only the pinned transport', async t => {
+    const f = disabledUninstalled(t);
+    f.env.C3_REBUILD_L2TP_INSTALL_ENABLED = 'true';
+    const relay = f.nodes[1]._id;
+    assert.equal((await f.service.execute(f.request)).allowed, true);
+    assert.deepEqual(f.sessions.filter(s => s.id === relay).map(s => [s.pinned, s.closed]), [[true, true]]);
+    assert.ok(!f.poolRequests.includes(relay));
+    assert.equal(f.effects.filter(([verb, id]) => verb === 'replace' && id === relay).length, 2);
+    assert.ok(!f.effects.some(([verb]) => verb === 'state'));
+});
+
+test('ordinary Apply rechecks the DB grant before any component write', async t => {
+    const f = fixture(t, { relayCount: 1, merged: true });
+    f.overrides.onRead = (nodeId, path) => {
+        if (nodeId === f.nodes[1]._id && path === BRIDGE) f.grants[0].generation = randomUUID();
+    };
+    await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assertNoWrites(f);
+    assert.deepEqual(f.probes.map(p => p.id), [f.nodes[1]._id]);
+});
+
+test('ordinary Apply re-attests the DB-bound relay before staging on any member', async t => {
+    const f = fixture(t, { relayCount: 1, merged: true });
+    f.overrides.onRead = (nodeId, path) => {
+        if (nodeId === f.nodes[1]._id && path === BRIDGE) f.hosts[1].machine = machine(9);
+    };
+    await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assertNoWrites(f);
+    assert.deepEqual(f.probes.map(p => p.id), [f.nodes[1]._id, f.nodes[1]._id]);
+});
+
+test('same-command drift refusal can leave earlier Apply effects and guarded staging files', async t => {
+    const f = fixture(t, { relayCount: 1, merged: true });
+    const relay = f.nodes[1]._id, bridge = f.nodes[0]._id;
+    let guardRefused = false;
+    f.overrides.onGuard = (id, command) => {
+        if (id === relay && command.includes('mv -fT')) {
+            assert.equal(guardRefused, false, 'no replay');
+            f.hosts[1].machine = machine(9);
+            guardRefused = true;
+        }
+    };
+    await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assert.equal(guardRefused, true);
+    assert.equal(f.effects.filter(([verb, id]) => verb === 'replace' && id === bridge).length, 2);
+    assert.deepEqual(f.effects.filter(([, id]) => id === relay).map(([verb]) => verb), ['stage', 'stage', 'systemctl']);
+    assert.equal(f.hosts[1].staged.size, 2, 'do not clean up after identity drift');
+    assert.ok(f.effects.some(([verb]) => verb === 'prepare-link'), 'earlier key persistence can remain');
+    assert.ok(!f.effects.some(([verb]) => ['state', 'publish-link', 'delete'].includes(verb)), 'no final publication');
+    assert.deepEqual(f.sessions.filter(s => s.id === relay).map(s => [s.pinned, s.closed]), [[true, true]]);
+    assert.ok(!f.poolRequests.includes(relay));
+    await f.service.locks.run(async () => {});
+});
 
 test('ordinary Apply attests A+B under its lock and both profile pairs use the actual attested wire', async t => {
     const f = fixture(t);
@@ -179,7 +300,10 @@ test('ordinary Apply attests A+B under its lock and both profile pairs use the a
         assert.ok(commands.includes(profileRead(MAIN)));
         assert.equal(commands.filter(c => c.includes(' run -test -config ')).length, 2);
         assert.equal(commands.filter(c => c.includes('mv -fT')).length, 2);
-        assert.ok(commands.at(-1).startsWith('rm -f -- '));
+        const guarded = commands.map(rebuildApplyMachineGuard).filter(g => g.accepts);
+        assert.equal(guarded.length, 8);
+        assert.ok(guarded.every(g => g.accepts(binding.machineId)));
+        assert.ok(guarded.at(-1).command.startsWith('rm -f -- '));
     }
     assert.ok(f.sessions.some(s => s.id === f.nodes[0]._id && !s.pinned), 'stock non-relay still uses the ordinary pool');
     assert.equal(f.effects.filter(([verb]) => verb === 'replace').length, 6);

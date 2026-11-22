@@ -1,7 +1,8 @@
 'use strict';
 
 const { randomBytes } = require('node:crypto');
-const { canInstallRelay } = require('../../services/rebuildRelayAuthorization');
+const { isRebuildEnabled } = require('../../services/rebuildMode');
+const { validNodeId, identityChanged, grantConflict, grantUnavailable, grantEffectStatus } = require('./rebuildRelayAdmission');
 
 // One-use, process-local tickets. A restart evicts them; keys and the private
 // estimates never enter the session store. This panel has one active instance.
@@ -9,10 +10,33 @@ const tickets = new Map();
 const ttl = 120_000;
 const max = 256;
 const required = 'REBUILD_L2TP_REMOVE_CONFIRMATION_REQUIRED';
+const uncertainCodes = new Set(['OUTCOME_UNKNOWN', 'FINISH_OUTCOME_UNKNOWN', 'RESERVATION_OUTCOME_UNKNOWN',
+    'RESERVATION_CLEANUP_FAILED'].map(code => `REBUILD_L2TP_REMOVE_${code}`));
+const removedCleanup = 'REBUILD_L2TP_REMOVED_CLEANUP_FAILED';
 
 function canPreviewRemoval(req) {
     return req.method === 'GET' && !!req.session?.authenticated && !!req.sessionID
-        && req.headers['sec-fetch-site'] !== 'cross-site' && canInstallRelay(process.env, req.params.id);
+        && req.headers['sec-fetch-site'] !== 'cross-site' && isRebuildEnabled() && validNodeId(req.params.id);
+}
+
+const identityReviewUrl = nodeId => `/panel/l2tp?identityChanged=${nodeId}#relay-${nodeId}`;
+
+// Only charge the limiter once the node page actually needs a removal preview.
+// Let the service own the current ENV/DB grant and install-ownership checks.
+function admitPreview(req, res) {
+    const limiter = res.locals.rebuildRemovalLimiter;
+    if (!limiter) return Promise.resolve(false);
+    return new Promise(resolve => {
+        const stopped = () => finish(false);
+        function finish(allowed) {
+            res.off('finish', stopped);
+            res.off('close', stopped);
+            resolve(allowed);
+        }
+        res.once('finish', stopped);
+        res.once('close', stopped);
+        limiter(req, res, error => finish(!error));
+    });
 }
 
 function issueRemovalTicket(req, estimate) {
@@ -32,7 +56,15 @@ const localizedErrors = Object.freeze({
     REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE: 'nodes.rebuildRemoveCountUnavailable',
     REBUILD_L2TP_REMOVE_SESSIONS_BUSY: 'nodes.rebuildRemoveBusy',
     REBUILD_L2TP_REMOVE_IPSEC_BUSY: 'nodes.rebuildRemoveIpsecBusy',
+    REBUILD_L2TP_ACCOUNTS_BLOCKED: 'rebuildL2tp.admission.blocked',
+    [grantConflict]: 'rebuildL2tp.admission.grantConflict',
+    [grantUnavailable]: 'rebuildL2tp.admission.grantUnavailable',
 });
+const publicCodes = new Set([...Object.keys(localizedErrors), identityChanged,
+    'REBUILD_BUSY', 'REBUILD_LOCK_LOST', 'REBUILD_LOCK_RELEASE_UNCONFIRMED', 'REBUILD_TRANSPORT_CLEANUP_FAILED',
+    ...['DISABLED', 'NOT_OWNED', 'CHANGED', 'REFUSED', 'OUTCOME_UNKNOWN', 'FINISH_OUTCOME_UNKNOWN', 'RESERVATION_FAILED',
+        'RESERVATION_OUTCOME_UNKNOWN', 'BACKEND_UNAVAILABLE', 'PLAN_INVALID', 'RESERVATION_CLEANUP_FAILED'].map(code => `REBUILD_L2TP_REMOVE_${code}`),
+    'REBUILD_L2TP_REMOVED_CLEANUP_FAILED', 'REBUILD_L2TP_ACCOUNTS_BLOCKED']);
 
 async function handleRemoval(req, res, decision) {
     const { id } = req.params;
@@ -40,15 +72,25 @@ async function handleRemoval(req, res, decision) {
     const invalid = () => res.status(400).json({ error: { code: 'REBUILD_INVALID_REQUEST' } });
     const nodeUrl = `/panel/nodes/${id}`;
     const html = req.accepts(['json', 'html']) === 'html';
-    const conflict = code => {
+    const conflict = (code, error) => {
+        const status = grantEffectStatus(code) ?? 409;
+        const outcome = uncertainCodes.has(code) || error?.outcome === 'unknown' ? 'unknown'
+            : code === removedCleanup ? 'removed' : code === identityChanged && error?.retryAllowed === false ? 'unknown' : undefined;
+        if (outcome) {
+            if (html) return res.redirect(303, `/panel/l2tp?view=${outcome === 'unknown' ? 'remove-unconfirmed' : 'remove-cleanup'}`);
+            return res.status(status).json({ error: { code, outcome, retryAllowed: false } });
+        }
+        if (html && code === identityChanged) return res.redirect(303, identityReviewUrl(id));
         if (html && res.locals.t) {
-            const key = Object.hasOwn(localizedErrors, code) ? localizedErrors[code] : 'nodes.rebuildRemoveFailed';
+            const key = localizedErrors[code] ?? (grantEffectStatus(code) === 503 ? localizedErrors[grantUnavailable]
+                : grantEffectStatus(code) === 409 ? localizedErrors[grantConflict] : 'nodes.rebuildRemoveFailed');
             return res.redirect(303, `${nodeUrl}?error=${encodeURIComponent(`${res.locals.t(key)} (${code})`)}`);
         }
-        return res.status(409).json({ error: { code } });
+        return res.status(status).json({ error: { code, ...(code === identityChanged && { outcome: 'refused' }),
+            ...(error?.retryAllowed === false && { retryAllowed: false }) } });
     };
     res.set('Cache-Control', 'no-store');
-    if (typeof id !== 'string' || id.length !== 24 || !/^[a-f0-9]{24}$/.test(id) || Object.keys(req.query || {}).length
+    if (!validNodeId(id) || Object.keys(req.query || {}).length
         || !body || typeof body !== 'object' || Array.isArray(body)
         || Object.keys(body).some(key => !['_csrf', 'decision', 'ticket'].includes(key))) return invalid();
     if (body.decision !== decision || typeof body.ticket !== 'string'
@@ -61,16 +103,16 @@ async function handleRemoval(req, res, decision) {
     if (decision === 'cancel') return res.redirect(303, '/panel/nodes');
     try {
         const result = await require('../../services/rebuildService').createRebuildService().confirmRemoveRelay(id, entry.estimate);
-        return html ? res.redirect(303, nodeUrl) : res.json(result);
+        if (result?.status !== 'not_installed' || result.nodeId !== id) return conflict('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
+        return html ? res.redirect(303, nodeUrl) : res.json({ executionMode: 'rebuild', status: 'not_installed', nodeId: id });
     } catch (error) {
-        const code = typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$(?!\n)/.test(error.code)
-            ? error.code : 'REBUILD_L2TP_REMOVE_FAILED';
-        return conflict(code);
+        const code = publicCodes.has(error?.code) || grantEffectStatus(error?.code) ? error.code : 'REBUILD_L2TP_REMOVE_FAILED';
+        return conflict(code, error);
     }
 }
 
 module.exports = {
-    canPreviewRemoval, issueRemovalTicket,
+    canPreviewRemoval, issueRemovalTicket, identityReviewUrl, admitPreview,
     submitRemoval: (req, res) => handleRemoval(req, res, 'confirm'),
     cancelRemoval: (req, res) => handleRemoval(req, res, 'cancel'),
 };

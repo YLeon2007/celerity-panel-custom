@@ -61,14 +61,16 @@ test('a read-only singleton exposes password reveal but no account mutation cont
     assert.doesNotMatch(content, /data-create|data-account-action|SERVER-ONLY-PASSWORD/);
 });
 
-test('pending supersedes generic conflict/unavailable text and hides mutation and reveal controls in RU and EN', async () => {
-    for (const [lang, message] of [['ru', 'Незавершённая операция, выполняется сверка'], ['en', 'Unfinished operation, reconciliation in progress']]) {
+test('pending offers manual recovery and hides mutation and reveal controls in RU and EN', async () => {
+    for (const [lang, message] of [['ru', 'Есть незавершённая операция. Действия заблокированы.'],
+        ['en', 'An unfinished operation is pending. Controls are locked.']]) {
         const { content } = await render(lang, { accountsPending: true, canReconcileAccounts: true });
-        assert.match(content, new RegExp(`>${message}<`));
+        assert.ok(content.includes(`>${message}<`));
         assert.ok(content.includes(`data-reconcile-url="${route}/l2tp/accounts/reconcile"`));
-        assert.match(content, /href="\/panel\/l2tp\?view=only" data-refresh/);
+        assert.ok(content.includes(`data-reconcile disabled>${t('rebuildL2tp.admission.recoverAccounts', lang)}<`));
+        assert.match(content, /href="\/panel\/l2tp" data-refresh hidden/);
         for (const key of ['inconsistent', 'accountsReadOnly', 'loadError']) assert.ok(!content.includes(t(`rebuildL2tp.${key}`, lang)));
-        assert.doesNotMatch(content, /data-create|data-account-action|data-secret-url|data-install-url|#rebuild-l2tp-remove|SERVER-ONLY-/);
+        assert.doesNotMatch(content, /data-create|data-account-action|data-secret-url|data-install-url|#rebuild-l2tp-remove|data-admission-action|SERVER-ONLY-/);
     }
     const singleton = await render('ru', { accountsPending: true, canReconcileAccounts: false });
     assert.doesNotMatch(singleton.content, /data-reconcile-url|data-secret-url/);
@@ -79,7 +81,13 @@ test('pending supersedes generic conflict/unavailable text and hides mutation an
     assert.doesNotMatch(refreshed.content, /data-reconcile-url|data-install-url|data-secret-url|data-account-action|data-create/);
 });
 
-test('opening a pending section POSTs once, then shows settled, pending or unconfirmed without retry/reload', async () => {
+function clickControl(disabled = false) {
+    let click;
+    return { disabled, addEventListener(name, handler) { if (name === 'click') click = handler; },
+        click() { if (!this.disabled) click?.(); } };
+}
+
+test('pending page does not POST until click; each outcome requires a fresh view before retry', async () => {
     const script = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
     for (const [outcome, responseStatus, receipt, messageKey, count] of [
         ['settled', 200, { executionMode: 'rebuild', status: 'settled' }, 'reconcileSettled'],
@@ -89,32 +97,54 @@ test('opening a pending section POSTs once, then shows settled, pending or uncon
         ['pending', 200, { executionMode: 'rebuild', status: 'pending', sessionsTerminated: 2,
             sessionsTerminatedScope: 'request' }, 'reconcileStillPending'],
         ['refused', 503, { error: { message: 'PRIVATE_FIXTURE' } }, 'reconcileUnconfirmed'],
+        ['rate limited', 429, { error: { code: 'REBUILD_RATE_LIMITED' } }, 'rateLimited'],
+        ['ineligible', 409, { error: { code: 'REBUILD_L2TP_RECONCILE_DISABLED' } }, 'recoveryIneligible'],
         ['unexpected', 200, { executionMode: 'classic', status: 'settled' }, 'reconcileUnconfirmed'],
         ['lost', null, null, 'reconcileUnconfirmed'],
         ['disabled', null, null, null],
     ]) {
         const url = `${route}/l2tp/accounts/reconcile`;
         const words = require('../../locales/ru.json').rebuildL2tp;
-        const status = { textContent: words.accountsPending }, refresh = { hidden: true };
+        const status = { textContent: words.accountsPendingLocked }, refresh = { hidden: true };
+        const recover = messageKey ? clickControl(true) : null;
         const page = {
-            dataset: { csrf, messages: JSON.stringify(words.messages), ...(messageKey && { reconcileUrl: url }) },
-            querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh })[key] ?? null,
+            dataset: { csrf, messages: JSON.stringify(words.messages), admissionMessages: JSON.stringify(words.admission),
+                ...(messageKey && { reconcileUrl: url }) },
+            querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': recover })[key] ?? null,
             querySelectorAll: () => [],
         };
         const calls = [];
+        let complete;
         runInNewContext(script, {
             document: { getElementById: () => page },
             window: { addEventListener() {}, location: { reload: () => calls.push('reload') } },
             async fetch(path, options) {
                 calls.push({ path, options });
+                await new Promise(resolve => { complete = resolve; });
                 if (responseStatus === null) throw new Error('PRIVATE_FIXTURE');
                 return { ok: responseStatus === 200, status: responseStatus, json: async () => receipt };
             },
         });
         await new Promise(resolve => setImmediate(resolve));
-        assert.equal(calls.length, messageKey ? 1 : 0, outcome);
+        assert.deepEqual(calls, [], outcome);
+        assert.equal(status.textContent, words.accountsPendingLocked, outcome);
+        assert.equal(refresh.hidden, true, outcome);
+        if (recover) {
+            assert.equal(recover.disabled, false, outcome);
+            recover.click();
+            assert.equal(status.textContent, words.messages.working, outcome);
+            assert.ok(recover.disabled && refresh.hidden, outcome);
+            recover.click();
+            assert.equal(calls.length, 1, outcome);
+            complete();
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(recover.disabled, true, outcome);
+            recover.click();
+            await new Promise(resolve => setImmediate(resolve));
+        }
+        assert.equal(calls.length, recover ? 1 : 0, outcome);
         assert.equal(refresh.hidden, !messageKey, outcome);
-        const message = messageKey ? words.messages[messageKey] : words.accountsPending;
+        const message = messageKey ? words.messages[messageKey] ?? words.admission[messageKey] : words.accountsPendingLocked;
         assert.equal(status.textContent, count === undefined ? message : `${message} Подтверждено завершение сеансов этим запросом: ${count}.`, outcome);
         if (messageKey) {
             assert.equal(calls[0].path, url);
@@ -143,10 +173,10 @@ test('unproved inspection replaces the working status with localized, allowliste
             ['inspect-readback-unproved', 'reconcileInspectReadback'], ['FIXTURE_PRIVATE_DETAIL', null], ['constructor', null],
         ]) {
             const status = { textContent: /data-action-status role="status">([^<]+)</.exec(content)[1] };
-            const refresh = { hidden: true }, staleControl = { disabled: false, addEventListener() {} };
+            const refresh = { hidden: true }, staleControl = clickControl(), recover = clickControl(true);
             const url = /data-reconcile-url="([^"]+)"/.exec(content)[1];
             const page = { dataset: { csrf, messages, reconcileUrl: url },
-                querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh })[selector] ?? null,
+                querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': recover })[selector] ?? null,
                 querySelectorAll: selector => selector === '[data-install-url]' ? [staleControl] : [] };
             const calls = [];
             runInNewContext(script, {
@@ -158,11 +188,17 @@ test('unproved inspection replaces the working status with localized, allowliste
                         reason, retryAllowed: false, message: 'FIXTURE_PRIVATE_DETAIL', sessionsTerminated: 2, sessionsTerminatedScope: 'request' }) };
                 },
             });
-            assert.equal(staleControl.disabled, true);
+            await new Promise(resolve => setImmediate(resolve));
+            assert.deepEqual(calls, []);
+            recover.click();
+            assert.equal(status.textContent, text.working);
+            assert.ok(staleControl.disabled && recover.disabled);
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(refresh.hidden, false);
+            assert.ok(staleControl.disabled && recover.disabled);
+            recover.click(); staleControl.click();
             await new Promise(resolve => setImmediate(resolve));
             assert.deepEqual(calls, [url]);
-            assert.equal(refresh.hidden, false);
-            assert.equal(staleControl.disabled, true);
             assert.equal(status.textContent, text.reconcileInspectionUnproved + (key ? ` ${text[key]}` : ''));
             assert.ok(status.textContent.includes(guidance));
             assert.doesNotMatch(status.textContent, /FIXTURE_PRIVATE_DETAIL|undefined|seccomp/i);
@@ -380,12 +416,86 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
 const firefox = process.env.REBUILD_L2TP_FIREFOX || 'firefox';
 const browserAvailable = spawnSync(firefox, ['--version'], { timeout: 3000 }).status === 0;
 
+async function admissionVisibility({ route, id, otherId }) {
+    const $ = selector => document.querySelector(selector);
+    const click = selector => $(selector).click();
+    const check = (ok, message) => { if (!ok) throw new Error(message); };
+    const approvals = ['verify', 'confirm', 'revoke'];
+    const dialog = $('[data-admission-dialog]');
+    const review = $('[data-review]');
+    const visible = el => getComputedStyle(el).display !== 'none' && el.getClientRects().length > 0;
+    function buttons(step) {
+        for (const action of approvals) {
+            const button = $(`[data-admission-approve="${action}"]`);
+            const display = getComputedStyle(button).display;
+            check(display === (action === step ? 'inline-flex' : 'none'), `${step ?? 'no approval'}: ${action} has display ${display}`);
+            check(visible(button) === (action === step), `${action} has wrong layout visibility`);
+            const instruction = $(`[data-admission-step="${action}"]`);
+            check(visible(instruction) === (action === step), `${action} instructions have wrong visibility`);
+        }
+    }
+    const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+    const requests = [];
+    window.fetch = (url, options) => new Promise(resolve => requests.push({ url, options, resolve }));
+    const respond = async (path, data, ok = true) => {
+        const request = requests.shift();
+        check(request?.url === path && request.options.method === 'POST', `expected ${path}`);
+        request.resolve({ ok, status: ok ? 200 : 409, json: async () => data });
+        await flush();
+        check(requests.length === 0, 'a later step was dispatched automatically');
+    };
+
+    await flush(); // allow the shipped script to bind the real rendered DOM
+    check(getComputedStyle(dialog).display === 'none' && !visible(review), 'closed dialog or review is visible');
+    buttons(null);
+    click('[data-admission-action="grant"]');
+    check(dialog.open && visible(dialog), 'grant dialog did not open');
+    buttons(null);
+    const binding = { nodeId: id, host: '192.0.2.42', port: 22, username: 'root', sshHostKeySha256: 'b'.repeat(64) };
+    await respond(`${route}/${otherId}/l2tp/admission/probe`, { ...binding, nodeId: otherId, challenge: 'c'.repeat(64) });
+    buttons('verify');
+    click('[data-admission-cancel]');
+
+    click('[data-admission-action="revoke"]');
+    check(dialog.open && visible(dialog), 'revoke dialog did not open');
+    buttons('revoke');
+    check(requests.length === 0, 'opening revoke dispatched a request');
+    click('[data-admission-cancel]');
+    check(getComputedStyle(dialog).display === 'none', 'cancel did not hide the dialog');
+
+    click('[data-account-action="disable"]');
+    await respond(`${route}/l2tp/accounts/disable`, { error: { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'refused', nodeId: id } }, false);
+    check(visible(review) && review.getAttribute('href') === `#relay-${id}`, 'identity refusal did not expose scoped review');
+    check($(`[data-node-id="${otherId}"][data-admission-action="grant"]`).disabled, 'unrelated grant became enabled');
+    click('[data-admission-action="reconfirm"]');
+    check(dialog.open && visible(dialog), 'reconfirm dialog did not open');
+    buttons(null);
+    const url = `${route}/${id}/l2tp/admission`;
+    const identified = { ...binding, machineId: 'e'.repeat(32) };
+    await respond(`${url}/probe`, { ...binding, challenge: 'c'.repeat(64) });
+    buttons('verify');
+    check(!visible($('[data-admission-machine-row]')), 'probe exposed the machine field before verification');
+    click('[data-admission-approve="verify"]');
+    await respond(`${url}/verify`, { ...identified, challenge: 'd'.repeat(64) });
+    buttons('confirm');
+    check(visible($('[data-admission-machine-row]')), 'verification did not expose the machine field');
+    click('[data-admission-approve="confirm"]');
+    await respond(`${url}/confirm`, identified);
+    check(getComputedStyle(dialog).display === 'none' && !visible(review) && visible($('[data-refresh]')),
+        'confirmation did not close the dialog and replace review with refresh');
+}
+
 for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainInstall'], ['en', 'created'],
-    ...['canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial'].map(terminal => ['en', terminal])]) {
-    test(`Firefox: clicks, secret lifecycle and account/relay requests (${lang}, ${terminal})`, {
+    ...['canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial', 'admissionVisibility'].map(terminal => ['en', terminal])]) {
+    const admission = terminal === 'admissionVisibility';
+    test(admission ? 'Firefox: only the current admission/reconfirm approval is displayed'
+        : `Firefox: clicks, secret lifecycle and account/relay requests (${lang}, ${terminal})`, {
         skip: browserAvailable ? false : 'requires local Firefox (or REBUILD_L2TP_FIREFOX)',
     }, async () => {
-        const { content } = await render(lang);
+        const { content } = await render(lang, admission ? { relays: [
+            { ...installed, grantSource: 'db', canReconfirm: true, canRevoke: true },
+            { ...fresh, grantSource: null, canGrant: true },
+        ] } : undefined);
         const client = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
         const words = require(`../../locales/${lang}.json`).rebuildL2tp;
         const input = JSON.stringify({ route, id, otherId, csrf, words, terminal }).replaceAll('<', '\\u003c');
@@ -409,12 +519,14 @@ for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainIns
             writeFileSync(join(home, 'user.js'), Object.entries(settings)
                 .map(([key, value]) => `user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`).join('\n'));
             const file = join(home, 'fixture.html');
-            const inline = `<script>(${browserScenario})(${input}).then(() => dump('L2TP_UI:OK\\n'),
+            const scenario = admission ? admissionVisibility : browserScenario;
+            const stylesheet = admission ? `<style>${readFileSync(join(root, 'public/css/style.min.css'), 'utf8')}</style>` : '';
+            const inline = `<script>(${scenario})(${input}).then(() => dump('L2TP_UI:OK\\n'),
                 error => dump('L2TP_UI:FAIL ' + error.message + '\\n'));</script><script>${client}</script>`;
             assert.ok(content.includes(scriptTag));
             writeFileSync(file, '<!doctype html><meta charset="UTF-8">' +
                 '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; style-src \'unsafe-inline\'">' +
-                content.replace(scriptTag, () => inline));
+                stylesheet + content.replace(scriptTag, () => inline));
             await new Promise((resolve, reject) => {
                 const child = spawn(firefox, ['--no-remote', '--headless', '--profile', home, pathToFileURL(file).href], {
                     env: { PATH: process.env.PATH, HOME: home, TMPDIR: home, MOZ_CRASHREPORTER_DISABLE: '1' },

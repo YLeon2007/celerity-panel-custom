@@ -6,6 +6,7 @@ const { join } = require('node:path');
 const { randomBytes } = require('node:crypto');
 const { isIPv4 } = require('node:net');
 const { performance } = require('node:perf_hooks');
+const { identityChanged, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { validCensus } = require('./rebuildRelayCounts');
@@ -18,6 +19,8 @@ const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
 
 const TIMEOUT = 145000;
 const SESSION_COUNT_TIMEOUT = 12000;
+const MACHINE_ID_COMMAND = '/usr/bin/head -c 34 /etc/machine-id';
+const MACHINE_ID_FRAME = /^([a-f0-9]{32})\n?(?![\s\S])/;
 const PIN = /^[a-f0-9]{64}$/;
 const TOKEN = /^[a-f0-9]{32}$/;
 const CHAP_ACTIONS = ['check-chap', 'sync-chap', 'inspect-chap', 'read-chap-generation', 'fence-chap'];
@@ -160,9 +163,10 @@ function directCommand(limits) {
     return command;
 }
 
-function createRelayDirect({ node, env = process.env, SSH } = {}) {
+function createRelayDirect({ node, env = process.env, SSH, fence: authority } = {}) {
     const nodeId = String(node?._id ?? node?.id ?? '');
-    const fence = captureRelayBinding(env, nodeId, node);
+    const fence = authority ?? captureRelayBinding(env, nodeId, node);
+    const merged = fence.merged === true;
     const { host: ip, port, username, machineId, sshHostKeySha256 } = fence.binding;
     // In list mode the card corroborates the endpoint but supplies only auth
     // material to the transport: no socket, proxy, or host verification options.
@@ -174,67 +178,94 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         expectedHostKeySha256: sshHostKeySha256, expectedEndpoint: { ip, port, username },
     });
     ssh.usePool = false;
-    let connected = false, closed = false, busy = false, poisoned = false;
-    let held, chapObservation;
+    let closed = false, busy = false, poisoned = false;
+    let execPinned, held, chapObservation;
     const disconnect = () => { try { ssh.disconnect(); } catch { /* cleanup cannot replace outcome */ } };
-    function checkBinding() {
+    const poison = () => { if (!poisoned && !closed) { poisoned = true; disconnect(); } };
+    async function checkBinding() {
         try {
-            fence.check();
+            await fence.check();
         } catch (error) {
-            poisoned = true;
-            disconnect();
+            poison();
             throw error;
         }
     }
 
     async function connect(timeout) {
-        if (connected) return;
-        let timer, pending;
+        if (execPinned) return;
         try {
-            pending = Promise.resolve(ssh.connect());
-            await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(reject, timeout); })]);
-            requireThat(!closed, 'DIRECT_CLOSED');
-            connected = true;
-        } catch {
+            const run = await ssh.connectDirectOnce(timeout);
+            requireThat(!closed && typeof run === 'function', 'DIRECT_UNAVAILABLE');
+            execPinned = run;
+        } catch (error) {
             closed = true;
             disconnect();
-            void pending?.then(disconnect, () => {});
+            if (error?.code === 'SSH_HOST_KEY_MISMATCH') throw identityChanged();
             throw fail('SSH_CONNECT_FAILED');
-        } finally { clearTimeout(timer); }
+        }
+    }
+
+    async function attestMachine(timeout) {
+        let result;
+        try { result = await execPinned(MACHINE_ID_COMMAND, { timeout, maxOutputBytes: 34 }); }
+        catch { /* Unavailable, not evidence of a changed identity. */ }
+        const observed = result?.code === 0 && result.stderr === '' && typeof result.stdout === 'string'
+            && MACHINE_ID_FRAME.exec(result.stdout)?.[1];
+        if (observed === machineId && !closed && !poisoned) return;
+        poison();
+        throw observed && observed !== machineId ? identityChanged() : fail('DIRECT_OUTCOME_UNKNOWN');
     }
 
     async function exec(action, params = {}, write = false, validate = () => true, verifyLock) {
         const count = action === 'session-count';
         const chap = CHAP_ACTIONS.includes(action);
-        const guarded = chap || action === 'install';
+        const guarded = chap || action === 'install' || (merged && write);
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
-        checkBinding();
+        await checkBinding();
         await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
         requireThat(!closed, 'DIRECT_CLOSED');
-        checkBinding();
+        await checkBinding();
         if (guarded) requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
+        // No payload construction or receiver channel until this operation's
+        // secret-free observation succeeds on the original pinned client.
+        await attestMachine(count ? 5000 : CONNECT_TIMEOUT_MS);
+        await checkBinding();
+        requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         const stdin = JSON.stringify({ action, machineId, ...params });
         requireThat(Buffer.byteLength(stdin) <= 25 * 1024 * 1024, 'INSTALL_INPUT_INVALID');
+        let identityRefusal;
         const verifyBeforeStdin = async () => {
-            requireThat(busy && !closed && !poisoned, 'DIRECT_UNAVAILABLE');
-            checkBinding();
-            await lock(verifyLock);
-            requireThat(busy && !closed && !poisoned, 'DIRECT_UNAVAILABLE');
-            checkBinding();
+            try {
+                requireThat(busy && !closed && !poisoned, 'DIRECT_UNAVAILABLE');
+                if (guarded) await lock(verifyLock);
+                await fence.check();
+                requireThat(busy && !closed && !poisoned, 'DIRECT_UNAVAILABLE');
+            } catch (error) {
+                // The SSH wrapper sanitizes stdin errors; preserve a local
+                // identity veto made before the stream is allowed to write.
+                if (isIdentityChanged(error)) identityRefusal = error;
+                poison();
+                throw error;
+            }
         };
         const unknown = () => {
-            if (write) { poisoned = true; disconnect(); }
+            if (write) poison();
             return fail('DIRECT_OUTCOME_UNKNOWN', write);
         };
         let result;
-        try { result = await ssh.exec(directCommand(count ? '-k 1s 9s' : '-k 4s 125s'), {
+        try { result = await execPinned(directCommand(count ? '-k 1s 9s' : '-k 4s 125s'), {
             stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
-        }, ...(guarded ? [verifyBeforeStdin] : [])); }
-        catch { throw unknown(); }
-        try { checkBinding(); }
-        catch (error) { if (write) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
+        }, verifyBeforeStdin); }
+        catch { throw identityRefusal ?? unknown(); }
+        try { await checkBinding(); }
+        catch (error) { if (write && !isIdentityChanged(error)) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
+            if (result.code === 70 && result.stdout === ''
+                && (result.stderr === 'DIRECT_IDENTITY\n' || action === 'install' && result.stderr === 'DIRECT_NO_WRITE_IDENTITY\n')) {
+                poison();
+                throw identityChanged();
+            }
             if (action === 'inspect-chap') {
                 const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
                 if (!reason) throw unknown();
@@ -290,7 +321,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         const proof = await exec('preflight', {}, false, value => (exactKeys(value, readinessKeys)
             || (exactKeys(value, preparationKeys) && value.pppPreparation === true)
             || hasNativePreparation(value)) && validReadiness(value));
-        requireThat(proof.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
+        if (proof.machineId !== machineId) { poison(); throw merged ? identityChanged() : fail('INSTALL_IDENTITY_MISMATCH'); }
         return proof;
     }
     async function lock(check) {
@@ -322,7 +353,6 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             requireThat(chapObservation?.installKey === installKey, 'DIRECT_CHAP_CHECK_REQUIRED');
             if (chapObservation.generation !== undefined) params.generation = chapObservation.generation;
         }
-        await connect(CONNECT_TIMEOUT_MS);
         await lock(verifyLock);
         if (retire) {
             // Read only the CAS preimage, not the CHAP/PPP projection. The
@@ -350,8 +380,8 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             requireThat(!closed, 'DIRECT_CLOSED');
         } catch (error) {
             if (!write) throw error;
-            poisoned = true;
-            disconnect();
+            poison();
+            if (isIdentityChanged(error)) throw error;
             throw fail('DIRECT_OUTCOME_UNKNOWN', true);
         }
         if (retire) return { fenced: true };
@@ -393,7 +423,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             const snapshot = await exec('prepare', { network, ...topology }, false, v => exactKeys(v,
                 [...readinessKeys, 'baseline', 'main', 'mainSha256', 'bridge', 'bridgeSha256'])
                 && validReadiness(v) && tokenMatches(PIN, v.baseline) && v.baseline.length === 64);
-            requireThat(snapshot.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
+            if (snapshot.machineId !== machineId) { poison(); throw merged ? identityChanged() : fail('INSTALL_IDENTITY_MISMATCH'); }
             // Prepare has no capability fields. Use only the fresh preflight
             // proof from this serial exchange on the same pinned connection.
             requireInstallHostReady(snapshot, host);
@@ -427,7 +457,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             try { await exec('verify', { backupId, baseline, network }, false, installAck(backupId)); return true; }
             catch (error) {
                 // Bad or lost readback is not a checked negative receipt.
-                if (error.code === 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN') throw error;
+                if (error.code === 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' || isIdentityChanged(error)) throw error;
                 return false;
             }
         }),
@@ -440,8 +470,8 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 await lock(verifyLock);
                 if (closed || performance.now() >= deadline) return false;
                 held.phase = 'rollback-attempted';
-                try { await exec('rollback', { backupId, baseline, network }, true, installAck(backupId)); return true; }
-                catch (err) { if (err.remoteOutcomeUncertain) throw err; return false; }
+                try { await exec('rollback', { backupId, baseline, network }, true, installAck(backupId), verifyLock); return true; }
+                catch (err) { if (err.remoteOutcomeUncertain || isIdentityChanged(err)) throw err; return false; }
             });
         },
         prepareRemove: input => serial(async () => {
@@ -457,8 +487,9 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
                 ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
             const proof = await exec('prepare-remove', params, false, value => exactAck(params.backupId)(value)
-                && value.machineId === machineId && typeof value.baseline === 'string' && value.baseline.length === 64
+                && tokenMatches(TOKEN, value.machineId) && typeof value.baseline === 'string' && value.baseline.length === 64
                 && PIN.test(value.baseline));
+            if (proof.machineId !== machineId) { poison(); throw identityChanged(); }
             const plan = Object.freeze({});
             held = { plan, params: { ...params, baseline: proof.baseline, ...(hasCensus && { expectedCensus }) },
                 phase: 'remove-prepared' };
@@ -471,27 +502,27 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 held.phase = 'remove-attempted';
                 // The caller owns exclusion against Apply throughout; DIRECT
                 // also rechecks the host snapshot under its local flock.
-                try { await lock(verifyLock); } catch { return false; }
+                try { await lock(verifyLock); } catch (error) { if (isIdentityChanged(error)) throw error; return false; }
                 if (closed) return false;
                 // Preserve the authenticated pre-intent refusal; only this
                 // exact frame permits the caller to unwind its DB reservation.
-                await exec('remove', params, true, value => exactAck(params.backupId)(value) && value.removed === true);
+                await exec('remove', params, true, value => exactAck(params.backupId)(value) && value.removed === true, verifyLock);
                 try {
                     await lock(verifyLock);
                     requireThat(!closed, 'DIRECT_CLOSED');
-                } catch {
-                    poisoned = true;
-                    disconnect();
+                } catch (error) {
+                    poison();
+                    if (isIdentityChanged(error)) throw error;
                     throw fail('DIRECT_OUTCOME_UNKNOWN', true);
                 }
                 return true;
             });
         },
-        async close() { if (!closed) { closed = true; held = undefined; disconnect(); } },
+        async close() { if (!closed) { closed = true; held = undefined; if (!poisoned) disconnect(); } },
     });
 }
 
-async function applyRelayNetwork(run, machineId, state, action, proof) {
+async function applyRelayNetwork(run, machineId, state, action, proof, merged = false) {
     const invalid = 'APPLY_NETWORK_NOT_OWNED';
     const { backupId, rebuildMachineId, clientCidr, tproxyPort, fwmark, routeTable } = state;
     requireThat(rebuildMachineId === machineId && backupId?.length === 32 && tokenMatches(TOKEN, backupId)
@@ -503,7 +534,8 @@ async function applyRelayNetwork(run, machineId, state, action, proof) {
     try {
         result = await run(directCommand('-k 4s 125s'), { timeout: TIMEOUT,
             stdin: JSON.stringify({ action, machineId, backupId, network, ...(proof !== undefined && { proof }) }) });
-    } catch { throw unknown(); }
+    } catch (error) { if (isIdentityChanged(error)) throw error; throw unknown(); }
+    if (merged && result?.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_IDENTITY\n') throw identityChanged();
     if (result?.code === 70 && result.stdout === '' && /^DIRECT_(?:ROLLBACK_DRIFT|IDENTITY|PREREQUISITE|RUNTIME_UNPROVED|CANDIDATE_INVALID|COMMAND_FAILED)\n$(?![\s\S])/.test(result.stderr)) {
         throw fail('APPLY_NETWORK_REFUSED');
     }

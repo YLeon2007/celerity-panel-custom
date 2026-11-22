@@ -3,7 +3,8 @@
 const { isIP } = require('node:net');
 const { withNode } = require('./rebuildLocks');
 const { componentFor } = require('./rebuildCoordinator');
-const { captureRelayBinding } = require('./rebuildRelayAuthorization');
+const { readRelayAuthority, captureRelayEffect, isIdentityChanged, isGrantAuthorityError } = require('./rebuildRelayEffectAuthority');
+const { validateRebuildMode } = require('./rebuildMode');
 const { runFreshRelayInstall } = require('./rebuildRelayInstall');
 const { createStore, read } = require('./rebuildRelayBackendStore');
 const { makeDesired } = require('./rebuildRelayBackendDesired');
@@ -50,19 +51,19 @@ function defaultDriver(options) {
     return require('./rebuildRelayDirect').createRelayDirect(options);
 }
 
-async function precheckSource({ node, binding, installation, currentUsers }, createRelayDirect, env, checkAuthority) {
+async function precheckSource({ node, fence, installation, currentUsers }, createRelayDirect, env, checkAuthority) {
     await checkAuthority();
     const refused = () => fail('REBUILD_L2TP_ACCOUNT_SOURCE_PREFLIGHT_REFUSED');
     let remote, primary;
     try {
-        remote = await createRelayDirect({ node, env, binding });
+        remote = await createRelayDirect({ node, env, binding: fence.binding, fence });
         if (typeof remote?.checkChap !== 'function' || typeof remote?.close !== 'function') throw refused();
         // The persisted source projection is an expected preimage, not evidence
         // of host state. DIRECT authenticates the host, receipt and actual CHAP
         // rows. This is an inspection only, with no requested CHAP delta.
         if ((await remote.checkChap(installation, currentUsers, currentUsers, checkAuthority))?.changed !== false) throw refused();
     } catch (error) {
-        primary = error?.code === 'REBUILD_LOCK_LOST' ? error : refused();
+        primary = error?.code === 'REBUILD_LOCK_LOST' || isIdentityChanged(error) || isGrantAuthorityError(error) ? error : refused();
         throw primary;
     } finally {
         try { await remote?.close?.(); }
@@ -71,49 +72,62 @@ async function precheckSource({ node, binding, installation, currentUsers }, cre
     await checkAuthority();
 }
 
-function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
+function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, relayGrantStore, createRelayDirect = defaultDriver }) {
     return async function installRelay(id) {
-        const fence = captureRelayBinding(env, id);
+        let enabled;
+        try { enabled = validateRebuildMode(env); } catch { /* Conflicting mode. */ }
+        if (enabled !== true || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== 'true' || typeof id !== 'string'
+            || id.length !== 24 || !/^[a-f0-9]{24}$/.test(id)) {
+            throw fail('REBUILD_L2TP_INSTALL_DISABLED');
+        }
+        const snapshot = relayGrantStore ? await relayGrantStore.snapshot() : readRelayAuthority(env);
+        const fence = captureRelayEffect(env, relayGrantStore, snapshot, id);
         const { machineId } = fence.binding;
-        const authorize = () => { try { fence.check(); return true; } catch { return false; } };
         const getNode = (nodeId = id) => read(Node.findById(nodeId).select('ip domain active type cascadeRole useCustomConfig ssh'));
         let store;
         return runFreshRelayInstall(id, {
-            authorize, machineId,
-            lock: fn => locks.run(verifyLock => withNode(id, async () => {
+            authorize: relayGrantStore ? async () => { await fence.check(); return true; }
+                : () => { try { fence.check(); return true; } catch { return false; } },
+            machineId,
+            ...(relayGrantStore && { unifiedIdentity: true }),
+            lock: fn => locks.run((verifyLock, retainLock) => withNode(id, async () => {
                 if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
-                return fn(verifyLock);
+                return fn(verifyLock, retainLock);
             })),
             async inventory() {
                 const node = await getNode();
                 if (!eligible(node, id, fence.listMode)) return { eligible: false };
-                fence.check(node);
+                const authority = await readRelayAuthority(env, relayGrantStore);
+                await fence.check(node, authority);
+                const bound = relayGrantStore && captureRelayEffect(env, relayGrantStore, authority, id, node);
                 store = createStore(State, L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel'), fence.listMode);
                 const snapshot = await store.snapshot(id);
                 if (!snapshot.pristine) return snapshot;
                 const topology = await readTopology(Node, Link, node, env.PANEL_DOMAIN);
                 const sourceSnapshot = await store.sourceRows(id);
                 const key = env.ENCRYPTION_KEY;
-                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env, key, machineId,
+                const sourceInventory = await resolveAccountSources({ nodeId: id, rows: sourceSnapshot, env, relayGrantStore,
+                    snapshot: authority, key, machineId,
                     readNode: getNode, listMode: fence.listMode });
                 const payload = makeDesired(id, sourceInventory.occupied, topology.controlPlaneAddresses, key, sourceInventory);
                 if (sourceInventory.inherited && payload.desired.users[0].ipAddress !== payload.desired.poolStart) {
                     throw fail('REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID');
                 }
                 return { ...snapshot, ...topology, ...payload, sourceSnapshot, inherited: sourceInventory.inherited,
-                    sources: sourceInventory.prechecks, key, node, eligible: true, nodeId: id };
+                    sources: sourceInventory.prechecks, key, node, bound, eligible: true, nodeId: id };
             },
-            verifyBinding: fence.listMode ? async inventory => {
+            verifyBinding: fence.listMode || relayGrantStore ? async inventory => {
                 const current = await getNode();
-                if (!eligible(current, id, true)) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
-                fence.check(current);
+                if (!eligible(current, id, fence.listMode)) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
+                await (inventory?.bound ?? fence).check(current);
                 if (inventory?.key !== undefined && env.ENCRYPTION_KEY !== inventory.key) throw fail('REBUILD_L2TP_CREDENTIAL_KEY_INVALID');
                 for (const source of inventory?.sources ?? []) await source.verifyBinding();
             } : undefined,
             precheckSources: async ({ sources }, checkAuthority) => {
                 for (const source of sources) await precheckSource(source, createRelayDirect, env, checkAuthority);
             },
-            connect: inventory => createRelayDirect({ node: inventory.node, env }),
+            connect: inventory => createRelayDirect({ node: inventory.node, env,
+                ...(inventory.bound && { fence: inventory.bound }) }),
             prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit }, remote) =>
                 remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, ...(transit && { transit }) }),
             reserve: (inventory, backupId, verifyLock) => store.reserve({ ...inventory, backupId, machineId }, verifyLock),

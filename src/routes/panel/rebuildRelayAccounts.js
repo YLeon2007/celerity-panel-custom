@@ -1,11 +1,13 @@
 'use strict';
 
 const { createRebuildService } = require('../../services/rebuildService');
+const { identityChanged, grantEffectStatus, validNodeId } = require('./rebuildRelayAdmission');
 
 const methods = Object.freeze({ create: 'createRelayAccount', disable: 'disableRelayAccount', delete: 'deleteRelayAccount' });
 const statuses = Object.freeze({ create: 'created', disable: 'disabled', delete: 'deleted' });
 const blocked = new Set(['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'REBUILD_L2TP_ACCOUNTS_INTENT_UNKNOWN',
-    'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', 'REBUILD_L2TP_ACCOUNTS_FINISH_UNKNOWN',
+    'REBUILD_L2TP_ACCOUNTS_PRE_EFFECT_BLOCKED', 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN',
+    'REBUILD_L2TP_ACCOUNTS_FINISH_UNKNOWN', 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK',
     'REBUILD_L2TP_ACCOUNTS_CLEANUP_FAILED']);
 const unavailable = new Set(['REBUILD_L2TP_ACCOUNTS_UNAVAILABLE', 'REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE']);
 const rejected = new Set(['REBUILD_L2TP_ACCOUNTS_DISABLED', 'REBUILD_L2TP_ACCOUNTS_NO_INSTALLED',
@@ -40,6 +42,15 @@ function accountHandler(action, service = createRebuildService) {
                 ...(revocation && { sessionsTerminated, ...(recovered && { sessionsTerminatedScope: 'request' }) }) });
         } catch (error) {
             const { code } = error ?? {};
+            const grantStatus = grantEffectStatus(code);
+            if (grantStatus) {
+                if (code === identityChanged && error.retryAllowed !== false && error.outcome !== 'unknown') {
+                    return res.status(grantStatus).json({ error: { code, outcome: 'refused',
+                        ...(validNodeId(error.nodeId) && { nodeId: error.nodeId }) } });
+                }
+                return res.status(grantStatus).json({ error: { code, retryAllowed: false,
+                    ...((code === identityChanged || error.outcome === 'unknown') && { outcome: 'unknown' }) } });
+            }
             if (code === invalid) return res.status(400).json({ error: { code } });
             if (blocked.has(code)) {
                 const count = error.confirmedSessionsTerminated;

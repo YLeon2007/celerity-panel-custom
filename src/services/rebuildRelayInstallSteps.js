@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const { join } = require('node:path');
 const { createHash } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
+const { readRelayAuthority, captureRelayEffect } = require('./rebuildRelayEffectAuthority');
 const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { applyFollowRelay, attachLocalFollowRelay, REBUILD_RELAY_INGRESS_TAG, FOLLOW_RELAY_OUTBOUND_TAG } = require('../modules/relay-l2tp/services/l2tpFollowRelay');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
@@ -192,7 +193,7 @@ function composeRebuildRelayPair(snapshot, options) {
 }
 
 /** Snapshot and independent byte pins must come from a trusted TEST caller, never an HTTP body. */
-function createRebuildRelayInstallSteps({ env = process.env } = {}) {
+function createRebuildRelayInstallSteps({ env = process.env, relayGrantStore } = {}) {
     const plans = new WeakMap();
     function requireFresh(inventory) {
         const fence = captureRelayBinding(env, inventory?.nodeId);
@@ -225,43 +226,46 @@ function createRebuildRelayInstallSteps({ env = process.env } = {}) {
     // Only a trusted server-generated desired may enter DIRECT. A legacy
     // inventory/transport without that contract cannot opt into dispatch.
     async function prepare(inventory, remote) {
-        const fence = requireFresh(inventory);
+        const fence = relayGrantStore
+            ? captureRelayEffect(env, relayGrantStore, await readRelayAuthority(env, relayGrantStore), inventory?.nodeId, inventory?.node)
+            : requireFresh(inventory);
+        requireThat(inventory.eligible === true && inventory.pristine === true, 'REBUILD_L2TP_NOT_FRESH_RELAY');
         const { nodeId } = fence.binding;
         requireThat(inventory.desired && typeof remote.prepare === 'function', BLOCKER);
         const plan = await remote.prepare({ nodeId, desired: inventory.desired,
             controlPlaneAddresses: inventory.controlPlaneAddresses, carryDomain: inventory.carryDomain });
         const check = () => fence.check(inventory.node);
-        check();
+        await check();
         requireThat(plan && typeof plan === 'object', 'REBUILD_L2TP_INSTALL_PLAN_INVALID');
         plans.set(plan, { check, remote });
         return plan;
     }
-    function checkPlan(plan, remote) {
+    async function checkPlan(plan, remote) {
         const proof = plans.get(plan);
         requireThat(proof && proof.remote === remote, BLOCKER);
-        proof.check();
+        await proof.check();
         return proof.check;
     }
     const guarded = (check, verifyLock) => async () => {
-        check();
+        await check();
         const result = await verifyLock();
-        check();
+        await check();
         return result;
     };
     async function install(plan, remote, verifyLock) {
         requireThat(typeof remote.install === 'function', BLOCKER);
-        return remote.install(plan, guarded(checkPlan(plan, remote), verifyLock));
+        return remote.install(plan, guarded(await checkPlan(plan, remote), verifyLock));
     }
     async function verify(plan, remote) {
         if (typeof remote.verify !== 'function') return false;
-        const check = checkPlan(plan, remote);
+        const check = await checkPlan(plan, remote);
         const verified = await remote.verify(plan) === true;
-        check();
+        await check();
         return verified;
     }
     async function rollback(plan, remote, verifyLock) {
         return typeof remote.rollback === 'function'
-            && await remote.rollback(plan, guarded(checkPlan(plan, remote), verifyLock)) === true;
+            && await remote.rollback(plan, guarded(await checkPlan(plan, remote), verifyLock)) === true;
     }
 
     return Object.freeze({ materialize, prepare, install, verify, rollback });

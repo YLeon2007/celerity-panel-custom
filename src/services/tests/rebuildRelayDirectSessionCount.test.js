@@ -4,6 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const attested = require('./helpers/rebuildRelayDirectWire');
 
 const nodeId = 'a'.repeat(24), machineId = 'b'.repeat(32), pin = 'c'.repeat(64);
 const backupId = 'd'.repeat(32), census = 'e'.repeat(64);
@@ -34,7 +35,7 @@ function fixture(reply, override = {}) {
             return typeof reply === 'function' ? reply(command) : reply;
         }
     }
-    return { remote: createRelayDirect({ node, env: { ...env, ...override }, SSH }), calls };
+    return { remote: createRelayDirect({ node, env: { ...env, ...override }, SSH: attested(SSH, machineId) }), calls };
 }
 
 for (const receipt of [{ activeSessions: 0, activeIpsec: 1, census }, { activeSessions: 3, activeIpsec: null, census: null },

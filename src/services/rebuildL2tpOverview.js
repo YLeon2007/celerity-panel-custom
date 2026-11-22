@@ -2,13 +2,26 @@
 
 const { isIP, isIPv4 } = require('node:net');
 const { isDeepStrictEqual: equal } = require('node:util');
-const { resolveRelayBinding: defaultResolveBinding } = require('./rebuildRelayAuthorization');
+const { Types: { ObjectId } } = require('mongoose');
+const { resolveRelayBinding: defaultResolveBinding, normalizeRelayBinding, parseRelayBindingList, sameRelayBinding,
+    relayInstallEnabled, relayBindingFields, relayListKey: relayList } = require('./rebuildRelayAuthorization');
+const { createRelayGrantStore } = require('./rebuildRelayGrantStore');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
-const { readDirectory, sameAccounts } = require('./rebuildRelayDirectory');
+const { readDirectory, sameAccounts, collectionName: accountsCollection } = require('./rebuildRelayDirectory');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 
-const relayList = 'C3_REBUILD_L2TP_RELAYS_JSON';
+const legacyId = 'C3_REBUILD_L2TP_RELAY_ID';
+const legacyMachine = 'C3_REBUILD_L2TP_RELAY_MACHINE_ID';
+const legacyPin = 'C3_REBUILD_L2TP_SSH_SHA256';
+const identityChanged = 'REBUILD_L2TP_IDENTITY_CHANGED';
+const disabled = 'REBUILD_L2TP_INSTALL_DISABLED';
+const conflict = 'REBUILD_L2TP_GRANT_CONFLICT';
+const grantUnavailable = 'REBUILD_L2TP_GRANT_PERSISTENCE_UNAVAILABLE';
+const grantProblems = new Set([conflict, grantUnavailable, 'REBUILD_L2TP_GRANT_ENV_INVALID',
+    'REBUILD_L2TP_GRANT_REGISTRY_INVALID', 'REBUILD_L2TP_GRANT_INVALID', 'REBUILD_L2TP_GRANT_CHANGED',
+    'REBUILD_L2TP_GRANT_UNAVAILABLE']);
+const grantError = code => Object.assign(new Error(code), { code });
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
 const loginPattern = /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/;
 const receiptPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}(?![\s\S])/;
@@ -19,6 +32,7 @@ const empty = value => value == null || value === '';
 const stamp = value => value instanceof Date ? value.getTime() : NaN;
 const compare = (a, b) => (a > b) - (a < b);
 const read = (query, fields) => query.select(fields).read('primary').readConcern('majority').maxTimeMS(5000).lean();
+const nativeRead = { readPreference: 'primary', readConcern: { level: 'majority' }, maxTimeMS: 5000, timeoutMS: 5000 };
 
 const nodeFields = '_id name ip cascadeRole ssh.port ssh.username type active useCustomConfig';
 // Name hidden paths explicitly in these inclusive projections: +path alone
@@ -29,17 +43,49 @@ const stateFields = '_id node status desiredState routingMode routingVersion rou
 const userFields = '_id relayNode login ip enabled syncStatus syncOperationId desiredRevision appliedRevision'
     + ' createdAt updatedAt lastSyncedAt createdBy updatedBy';
 const absentState = { status: 'not_installed', desiredState: 'absent' };
+const isAbsent = row => row.status === absentState.status && row.desiredState === absentState.desiredState;
+const fences = ['pppDriftQueueFence', 'replacementFence'];
+const emptyInstallFields = ['pskEncrypted', 'pskHint', 'backupId', 'managedVersion', 'configFingerprint', 'rebuildInstallToken',
+    'rebuildMachineId', 'activePathKey'];
+const nullableInstallFields = ['routeGroup', 'routingVersion', 'operationId', 'installedAt', 'lastVerifiedAt',
+    'lastSyncAt', 'appliedTopologyRevision'];
 // Match the first Install store's pristine metadata, without retrieving a
 // retained envelope or hint in the ordinary overview.
 const pristineFilter = {
     ...absentState,
     routingMode: { $in: [null, 'route-group'] },
-    ...Object.fromEntries(['secretRevision', 'pppDriftQueueFence', 'replacementFence'].map(key => [key, { $in: [null, 0] }])),
-    ...Object.fromEntries(['pskEncrypted', 'pskHint', 'backupId', 'managedVersion', 'configFingerprint', 'rebuildInstallToken',
-        'rebuildMachineId', 'activePathKey'].map(key => [key, { $in: [null, ''] }])),
-    ...Object.fromEntries(['routeGroup', 'routingVersion', 'operationId', 'installedAt', 'lastVerifiedAt', 'lastSyncAt',
-        'appliedTopologyRevision'].map(key => [key, null])),
+    ...Object.fromEntries(['secretRevision', ...fences].map(key => [key, { $in: [null, 0] }])),
+    ...Object.fromEntries(emptyInstallFields.map(key => [key, { $in: [null, ''] }])),
+    ...Object.fromEntries(nullableInstallFields.map(key => [key, null])),
 };
+// Admission's absence predicate is distinct from first Install: a settled
+// Remove may leave monotonically increasing fences, but not a footprint.
+const admissionPristineFilter = {
+    ...absentState,
+    routingMode: pristineFilter.routingMode,
+    secretRevision: pristineFilter.secretRevision,
+    ...Object.fromEntries([...emptyInstallFields, ...nullableInstallFields, 'lastErrorCode', 'lastError', 'tproxyPort',
+        'fwmark', 'routeTable', 'poolStart', 'poolEnd'].map(key => [key, { $in: [null, ''] }])),
+};
+
+function admissionEndpoint(row) {
+    const nodeId = String(row._id);
+    try {
+        return normalizeRelayBinding({ nodeId, host: row.ip, port: row.ssh?.port, username: row.ssh?.username,
+            machineId: '0'.repeat(32), sshHostKeySha256: '0'.repeat(64) });
+    } catch { return null; }
+}
+const endpointKey = ({ host, port }) => `${host}/${port}`;
+
+function authorityWitness({ env, grants }) {
+    return {
+        enabled: relayInstallEnabled(env),
+        // Distinguish absent from explicitly malformed ENV, including the
+        // singleton's no-list contract. Do not compare unrelated secrets.
+        config: [relayList, legacyId, legacyMachine, legacyPin].map(key => [Object.hasOwn(env, key), env[key]]),
+        grants: grants.map(row => [row.nodeId, row.generation]).sort(([a], [b]) => compare(a, b)),
+    };
+}
 
 // These are persisted DB receipts, not live attestation or mutation admission.
 function ownedState(row, binding) {
@@ -115,18 +161,25 @@ function replicasAgree(rows, cohort, listMode, ciphertext = false) {
 function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
     State = require('../modules/relay-l2tp/models/relayL2tpStateModel'),
     L2tpUser = require('../modules/relay-l2tp/models/l2tpUserModel'), env = process.env,
-    resolveRelayBinding = defaultResolveBinding } = {}) {
-    const listMode = () => Object.hasOwn(env, relayList);
+    resolveRelayBinding = defaultResolveBinding, relayGrantStore = createRelayGrantStore({ db: Node.db, env }) } = {}) {
+    const db = Node.db;
     const statuses = State.schema.path('status').enumValues;
     const findNodes = (filter = {}) => read(Node.find({ ...filter, cascadeRole: 'relay' }).sort('_id'), nodeFields);
     const hasKey = () => typeof env.ENCRYPTION_KEY === 'string' && env.ENCRYPTION_KEY.length >= 32;
     const eligible = (row, list) => row?.cascadeRole === 'relay' && row.active === true && row.type === 'xray'
         && !row.useCustomConfig && (list || !!isIP(row.ip));
-    function bindingFor(row) {
+    async function readAuthority() {
+        try {
+            const snapshot = await relayGrantStore.snapshot();
+            if (snapshot?.env && Array.isArray(snapshot.grants) && typeof snapshot.sourceFor === 'function') return snapshot;
+        } catch (error) { throw grantError(grantProblems.has(error?.code) ? error.code : grantUnavailable); }
+        throw grantError(grantUnavailable);
+    }
+    function bindingFor(row, config) {
         if (!row || row.cascadeRole !== 'relay') return null;
         const { _id, name, ip, cascadeRole, ssh } = row;
         try {
-            return resolveRelayBinding(env, String(_id), { _id, name, ip, cascadeRole, ssh: { port: ssh?.port, username: ssh?.username } });
+            return resolveRelayBinding(config, String(_id), { _id, name, ip, cascadeRole, ssh: { port: ssh?.port, username: ssh?.username } });
         } catch { return null; }
     }
     async function hasPendingAccounts() {
@@ -146,49 +199,171 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
     async function stableReveal(load, envelopeFor) {
         const key = env.ENCRYPTION_KEY;
         if (!hasKey() || await hasPendingAccounts()) return null;
-        const before = await load();
-        if (!before || !nonempty(envelopeFor(before)) || await hasPendingAccounts()) return null;
+        const authority = await readAuthority();
+        const witness = authorityWitness(authority);
+        const before = await load(authority);
+        if (!before || !nonempty(envelopeFor(before, authority)) || await hasPendingAccounts()) return null;
         // Read-only recheck: a Remove reservation can leave the account rows
         // untouched, and an account publication can clear its intent. Recheck
         // both witnesses without taking a writer lock or requiring a replica set.
-        const after = await load();
-        if (!equal(before, after) || await hasPendingAccounts() || env.ENCRYPTION_KEY !== key) return null;
-        const value = envelopeFor(after);
+        const after = await load(authority);
+        if (!equal(before, after) || await hasPendingAccounts()) return null;
+        // The grant can change during the last inventory/envelope read without
+        // changing either. Compare the effective union AND DB generations.
+        const current = await readAuthority();
+        if (!equal(witness, authorityWitness(current)) || await hasPendingAccounts() || env.ENCRYPTION_KEY !== key) return null;
+        const value = envelopeFor(after, current);
         if (!nonempty(value)) return null;
         try { return decrypt(value, key) || null; } catch { return null; }
     }
 
-    async function overview() {
-        const [nodes, states, rows] = await Promise.all([
-            findNodes(), read(State.find({}), stateFields), read(L2tpUser.find({}), userFields),
+    async function readBusyAdmissions(ids) {
+        if (!ids.length) return new Set();
+        const nodes = ids.map(id => new ObjectId(id));
+        // Same footprint as Admission, only the affected IDs, no lock tokens
+        // or operation data. POST repeats these checks under its writer lock.
+        const scopes = await Promise.all([
+            db.collection('l2tpoperations').distinct('node', { node: { $in: nodes },
+                status: { $nin: ['succeeded', 'rolled_back', 'cancelled'] } }, nativeRead),
+            db.collection('remoteadmissions').distinct('nodeId', { nodeId: { $in: ids }, phase: { $ne: 'completed' } }, nativeRead),
+            db.collection('nodeoperationlocks').distinct('node', { node: { $in: nodes } }, nativeRead),
         ]);
-        const byNode = new Map(), duplicates = new Set();
+        return new Set(scopes.flat().map(String));
+    }
+
+    async function recoveryAttestation(cohort, bindings, grants) {
+        const keys = [...relayBindingFields, 'grantGeneration', 'backupId'];
+        const intent = await db.collection(accountsCollection).findOne({ _id: 'pending' }, {
+            ...nativeRead, projection: { intentId: 1, action: 1, login: 1, ...Object.fromEntries(keys.map(key => [`relays.${key}`, 1])) },
+        });
+        const { relays } = intent ?? {};
+        if (!matches(receiptPattern, intent?.intentId) || !['create', 'disable', 'delete'].includes(intent.action)
+            || !matches(loginPattern, intent.login) || intent.login === bootstrap
+            || !Array.isArray(relays) || !relays.length || relays.some(row => !matches(idPattern, row?.nodeId))) return false;
+        const ids = cohort && [...cohort.keys()].sort();
+        if (!ids || !equal(relays.map(row => row.nodeId), ids)) throw grantError(identityChanged);
+        for (const row of relays) {
+            if (!sameRelayBinding(bindings.get(row.nodeId), row)
+                || grants.get(row.nodeId)?.generation !== row.grantGeneration
+                || cohort.get(row.nodeId).backupId !== row.backupId) throw grantError(identityChanged);
+        }
+        return true;
+    }
+
+    async function admissionOverview(nodes, states, authority) {
+        const { env: config } = authority;
+        const list = Object.hasOwn(config, relayList);
+        const registered = list ? parseRelayBindingList(config[relayList]).map(row => normalizeRelayBinding(row)) : [];
+        if (!list && config[legacyId]) {
+            // The store's first mutation also requires a complete legacy
+            // endpoint before it can add any DB grant to the union.
+            const legacy = nodes.find(row => String(row._id) === config[legacyId])
+                ?? await db.collection('hynodes').findOne({ _id: new ObjectId(config[legacyId]) }, {
+                    ...nativeRead, projection: { ip: 1, 'ssh.port': 1, 'ssh.username': 1 },
+                });
+            if (legacy?.ssh?.username !== 'root') return null;
+            try {
+                registered.push(normalizeRelayBinding({ nodeId: config[legacyId], host: legacy.ip, port: legacy.ssh.port,
+                    username: legacy.ssh.username, machineId: config[legacyMachine], sshHostKeySha256: config[legacyPin] }));
+            } catch { return null; }
+        }
+        const claimed = new Map(registered.map(binding => [endpointKey(binding), binding.nodeId]));
+        const endpoints = new Map();
+        for (const row of nodes) {
+            const id = String(row._id);
+            if (authority.sourceFor(id) !== 'env' && eligible(row, true)) {
+                const endpoint = admissionEndpoint(row);
+                if (endpoint) endpoints.set(id, endpointKey(endpoint));
+            }
+        }
+        const absentIds = states.filter(row => endpoints.has(String(row.node)) && isAbsent(row)
+            && fences.every(key => row[key] == null || (Number.isSafeInteger(row[key]) && row[key] >= 0))).map(row => row._id);
+        const [busy, pristine] = await Promise.all([
+            readBusyAdmissions([...endpoints.keys()]),
+            absentIds.length ? db.collection('relayl2tpstates').find({ ...admissionPristineFilter, _id: { $in: absentIds } },
+                { ...nativeRead, projection: { _id: 1 } }).toArray() : [],
+        ]);
+        return { endpoints, claimed, busy, pristine: new Set(pristine.map(row => String(row._id))) };
+    }
+
+    async function overview() {
+        let grantProblem = null;
+        const [nodes, states, rows, authority] = await Promise.all([
+            findNodes(), read(State.find({}), stateFields), read(L2tpUser.find({}), userFields),
+            readAuthority().catch(error => { grantProblem = error.code; return null; }),
+        ]);
+        const byNode = new Map(), duplicates = new Set(), byMachine = new Map();
         for (const row of states) {
             const id = String(row.node);
             if (byNode.has(id)) duplicates.add(id);
             byNode.set(id, row);
+            if (matches(hex32, row.rebuildMachineId)) {
+                if (!byMachine.has(row.rebuildMachineId)) byMachine.set(row.rebuildMachineId, new Set());
+                byMachine.get(row.rebuildMachineId).add(id);
+            }
         }
-        const maybePristine = states.filter(row => row.status === 'not_installed' && row.desiredState === 'absent');
+        const accountsPending = await hasPendingAccounts().catch(error => {
+            if (!grantProblem) throw error;
+            return false; // No affirmative pending observation; union still blocks everything.
+        });
+        const clear = !!authority && !accountsPending;
+        const config = authority?.env;
+        const list = !!config && Object.hasOwn(config, relayList), enabled = !!config && relayInstallEnabled(config);
+        const maybePristine = clear ? states.filter(isAbsent) : [];
         const pristineIds = new Set(maybePristine.length ? (await read(State.find({ ...pristineFilter,
             _id: { $in: maybePristine.map(row => row._id) } }), '_id')).map(row => String(row._id)) : []);
-        const accountsPending = await hasPendingAccounts();
-        const clear = !accountsPending, list = listMode(), owned = new Map();
+        // Failed footprint reads are not proof of absence and do not alter
+        // the already verified grant registry or installed-state receipts.
+        const admission = clear && enabled ? await admissionOverview(nodes, states, authority)
+            .catch(() => null) : null;
+        const owned = new Map(), bindings = new Map(), displayOwned = new Map();
+        const grants = new Map(authority?.grants.map(grant => [grant.nodeId, grant]));
         const withUsers = new Set(rows.map(row => String(row.relayNode)));
         const relays = nodes.sort((a, b) => compare(String(a._id), String(b._id))).map(row => {
-            const id = String(row._id), state = byNode.get(id), binding = bindingFor(row);
-            const qualified = eligible(row, list) && !duplicates.has(id);
-            if (qualified && ownedState(state, binding)) owned.set(id, state);
+            const id = String(row._id), state = byNode.get(id), grantSource = authority?.sourceFor(id) ?? null;
+            const binding = grantSource && bindingFor(row, config);
+            const qualified = matches(idPattern, id) && eligible(row, list) && !duplicates.has(id);
+            const grant = grants.get(id), endpoint = admission?.endpoints.get(id), claimant = admission?.claimed.get(endpoint);
+            const endpointConflict = !!claimant && claimant !== id;
+            const machineChanged = !!binding && !empty(state?.rebuildMachineId) && binding.machineId !== state.rebuildMachineId;
+            const problem = !authority ? grantProblem : !enabled ? disabled
+                : grantSource && (!binding || machineChanged) ? identityChanged : endpointConflict ? conflict : null;
+            if (qualified && ownedState(state, binding)) {
+                owned.set(id, state);
+                bindings.set(id, binding);
+                displayOwned.set(id, state);
+            } else if (!authority && !duplicates.has(id) && ownedState(state, { nodeId: id, machineId: state?.rebuildMachineId })) {
+                // Show persisted DIRECT inventory as read-only, never as proof
+                // of a binding and never by falling back to raw ENV.
+                displayOwned.set(id, state);
+            }
+            const isForeign = machineId => [...(byMachine.get(machineId) ?? [])].some(nodeId => nodeId !== id);
+            const foreignMachine = !!grant && isForeign(grant.machineId);
+            const admissionReady = !!endpoint && !admission.busy.has(id);
+            const admit = admissionReady && !endpointConflict && !duplicates.has(id) && !foreignMachine;
+            const admissionAbsent = admit && !withUsers.has(id) && (!state || admission.pristine.has(String(state._id)));
+            const refreshOwned = admit && !!binding && state?.status === 'installed' && state.desiredState === 'installed'
+                && state.rebuildMachineId === grant?.machineId;
             return { id, name: typeof row.name === 'string' ? row.name : '', ip: typeof row.ip === 'string' ? row.ip : '',
                 status: !state ? 'not_installed' : statuses.includes(state.status) ? state.status : 'error', bound: !!binding,
-                canInstall: clear && qualified && !!binding && !withUsers.has(id) && (!state || pristineIds.has(String(state._id))),
+                grantSource, grantProblem: problem,
+                canGrant: grantSource === null && admissionAbsent,
+                canReconfirm: grantSource === 'db' && (admissionAbsent || refreshOwned),
+                canRevoke: grantSource === 'db' && !problem && !!binding && admissionAbsent,
+                canInstall: clear && qualified && !!binding && !problem && (grantSource === 'env' || admissionReady)
+                    && !isForeign(binding.machineId) && hasKey()
+                    && !withUsers.has(id) && (!state || pristineIds.has(String(state._id))),
                 canRemove: clear && owned.has(id), canRevealPsk: clear && owned.has(id) && hasKey() };
         });
-        const cohort = list ? ownedCohort(states.filter(row => row.status !== 'not_installed' || row.desiredState !== 'absent'), owned, list)
+        const cohort = list ? ownedCohort(states.filter(row => !isAbsent(row)), owned, list)
             : owned.size === 1 ? owned : null;
-        const accountRows = list ? rows : rows.filter(row => owned.has(String(row.relayNode)));
+        const accountRows = list ? rows : rows.filter(row => displayOwned.has(String(row.relayNode)));
         // An unfinished operation can leave this inventory unsettled. Do not
         // require a consistent directory to report the persisted fence.
-        const directory = clear ? await readDirectory(L2tpUser.db, undefined, true) : null;
+        const directory = !accountsPending ? await readDirectory(L2tpUser.db, undefined, true).catch(error => {
+            if (!grantProblem) throw error;
+            return null;
+        }) : null;
         const inventoryOk = clear && inventoryMatches(rows.filter(row => owned.has(String(row.relayNode))), cohort, list)
             && (!directory || [...cohort.keys()].every(id => sameAccounts(directory.accounts,
                 rows.filter(row => String(row.relayNode) === id), false)));
@@ -201,8 +376,8 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         const accounts = [];
         for (const [login, copies] of grouped) {
             const visible = copies.filter(row => {
-                const state = owned.get(String(row.relayNode));
-                return state && (list || legacyAccount(row, state));
+                const state = displayOwned.get(String(row.relayNode));
+                return state && (list || !authority || legacyAccount(row, state));
             });
             if (!visible.length) continue;
             const consistent = inventoryOk && replicasAgree(copies, cohort, list);
@@ -213,46 +388,51 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 addresses: visible.filter(row => isIPv4(row.ip)).map(row => ({ id: String(row.relayNode), ip: row.ip }))
                     .sort((a, b) => compare(a.id, b.id)) });
         }
-        if (directory && !rows.length && states.every(row => row.status === absentState.status && row.desiredState === absentState.desiredState)
-            && (list || (directory.accounts.length === 1 && matches(idPattern, env.C3_REBUILD_L2TP_RELAY_ID)))) {
+        if (directory && !rows.length && states.every(isAbsent)
+            && (list || !authority || (directory.accounts.length === 1 && matches(idPattern, config[legacyId])))) {
             for (const { login, enabled } of directory.accounts) {
                 accounts.push({ login, enabled, consistent: clear, canRevealPassword: clear && hasKey(), addresses: [] });
             }
         }
         accounts.sort((a, b) => compare(a.login, b.login));
-        return { relays, accounts, accountsPending, canReconcileAccounts: accountsPending && list,
+        const canReconcileAccounts = accountsPending && list && enabled && hasKey()
+            && await recoveryAttestation(cohort, bindings, grants).catch(error => {
+                grantProblem = error.code === identityChanged ? identityChanged : grantUnavailable;
+                return false;
+            });
+        return { relays, accounts, accountsPending, grantProblem, canReconcileAccounts,
             canManageAccounts: list && hasKey() && inventoryOk && accounts.every(row => row.consistent) };
     }
 
-    function passwordCohort(states, nodes, list) {
+    function passwordCohort(states, nodes, authority, list) {
         const byNode = new Map(nodes.map(node => [String(node._id), node]));
         const owned = new Map();
         for (const state of states) {
             const id = String(state.node), node = byNode.get(id);
-            if (eligible(node, list) && ownedState(state, bindingFor(node))) owned.set(id, state);
+            if (authority.sourceFor(id) && eligible(node, list) && ownedState(state, bindingFor(node, authority.env))) owned.set(id, state);
         }
         return ownedCohort(states, owned, list);
     }
 
     async function revealPassword(login) {
         if (!matches(loginPattern, login)) return null;
-        return stableReveal(async () => {
-            const list = listMode();
-            const singleton = env.C3_REBUILD_L2TP_RELAY_ID;
+        return stableReveal(async authority => {
+            const config = authority.env;
+            const list = Object.hasOwn(config, relayList);
+            const singleton = config[legacyId];
             if (!list && (!matches(idPattern, singleton) || login !== bootstrap)) return null;
             const filter = list ? { $nor: [absentState] } : { node: singleton };
             const states = await read(State.find(filter).sort('_id'), stateFields);
             if (states.some(row => !matches(idPattern, String(row.node)))) return null;
             const directory = await readDirectory(L2tpUser.db);
-            if (states.length === 0 || (!list && states.length === 1 && states[0].status === absentState.status
-                && states[0].desiredState === absentState.desiredState)) {
+            if (states.length === 0 || (!list && states.length === 1 && isAbsent(states[0]))) {
                 if (!directory || (!list && directory.accounts.length !== 1)) return null;
                 if ((!list && await read(State.findOne({ $nor: [absentState] }), '_id'))
                     || await read(L2tpUser.findOne({}), '_id')) return null;
                 return { list, dormant: true, directory, states };
             }
             const nodes = await findNodes({ _id: { $in: states.map(row => row.node) } });
-            const cohort = passwordCohort(states, nodes, list);
+            const cohort = passwordCohort(states, nodes, authority, list);
             if (!cohort) return null;
             const scope = list ? {} : { relayNode: singleton };
             const inventoryScope = list ? { $or: [{ relayNode: { $in: states.map(row => row.node) } }, { login }] } : scope;
@@ -265,11 +445,10 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             const copies = await read(L2tpUser.find({ ...scope, login }).sort('_id'), `${userFields} passwordEncrypted`);
             if (!equal(inventory.filter(row => row.login === login), copies.map(({ passwordEncrypted: _, ...row }) => row))) return null;
             return { list, nodes, states, inventory, copies, directory };
-        }, ({ list, dormant, states, nodes, copies, directory }) => {
-            if (list !== listMode()) return null;
+        }, ({ list, dormant, states, nodes, copies, directory }, authority) => {
             const account = directory?.accounts.find(row => row.login === login);
             if (dormant) return account?.passwordEncrypted;
-            if (!replicasAgree(copies, passwordCohort(states, nodes, list), list, true)) return null;
+            if (!replicasAgree(copies, passwordCohort(states, nodes, authority, list), list, true)) return null;
             if (directory && (!account || account.enabled !== copies[0].enabled || account.passwordEncrypted !== copies[0].passwordEncrypted)) return null;
             return copies[0].passwordEncrypted;
         });
@@ -277,13 +456,15 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
 
     async function revealPsk(id) {
         if (!matches(idPattern, id)) return null;
-        return stableReveal(async () => {
-            const list = listMode();
+        return stableReveal(async authority => {
+            const config = authority.env;
+            const list = Object.hasOwn(config, relayList);
             const [node] = await findNodes({ _id: id });
-            if (!eligible(node, list) || !bindingFor(node)) return null;
+            if (!authority.sourceFor(id) || !eligible(node, list) || !bindingFor(node, config)) return null;
             const state = await read(State.findOne({ node: id }), `${stateFields} pskEncrypted`);
-            return { list, node, state };
-        }, ({ list, node, state }) => list === listMode() && ownedState(state, bindingFor(node)) ? state.pskEncrypted : null);
+            return { node, state };
+        }, ({ node, state }, authority) => authority.sourceFor(id) && ownedState(state, bindingFor(node, authority.env))
+            ? state.pskEncrypted : null);
     }
     return Object.freeze({ overview, revealPassword, revealPsk, hasPendingAccounts });
 }

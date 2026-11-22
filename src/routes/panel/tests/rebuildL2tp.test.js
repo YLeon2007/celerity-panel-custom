@@ -27,6 +27,7 @@ const login = 'Fixture.Account@local';
 const marker = 'FIXTURE_PRIVATE_VALUE';
 const password = `${marker}_PASSWORD`;
 const sharedKey = `${marker}_PSK`;
+const effects = /data-create|data-account-action|data-secret-url|data-install-url|data-remove-link|data-admission-action/;
 
 test.after(() => require('../../../services/sshPoolService').closeAll());
 
@@ -70,9 +71,9 @@ async function mount(t, { rebuild = true, ingress = false, realView = false } = 
         async overview() {
             state.calls.push(['overview']);
             if (state.overviewFailure) throw new Error(marker);
-            if (realView) return { relays: [], accounts: [], canManageAccounts: false, accountsPending: state.pending === true,
+            return { relays: [], accounts: realView ? [] : [{ login }], canManageAccounts: false,
+                accountsPending: state.pending === true,
                 canReconcileAccounts: state.pending === true && Object.hasOwn(process.env, listKey) };
-            return { relays: [], accounts: [{ login }] };
         },
         async hasPendingAccounts() {
             state.calls.push(['read fence']);
@@ -201,26 +202,36 @@ test('only exact authenticated, onboarded GET /panel/l2tp renders the rebuild ov
     assert.deepEqual(state.calls, [['overview'], ['overview']]);
 });
 
-test('pending GET renders recovery metadata without invoking the writer; unknown GET has no trigger', async t => {
+test('pending GET and refresh render without a writer or SSH; view-only and unknown GET have no trigger', async t => {
     const { request, signIn, state } = await mount(t, { realView: true });
+    const connect = t.mock.method(require('ssh2').Client.prototype, 'connect', () => assert.fail('GET attempted SSH'));
     process.env[listKey] = '[]';
     const auth = await signIn();
     state.pending = true;
-    const pending = await request(`${page}?lang=ru`, { auth });
-    safe(pending, 200);
-    assert.match(pending.text, /Незавершённая операция, выполняется сверка/);
-    assert.ok(pending.text.includes(`data-reconcile-url="${reconcile}"`));
-    assert.deepEqual(state.calls, [['overview']]);
+    for (const suffix of ['?lang=ru', '?view=only&lang=ru', '?lang=ru']) {
+        const pending = await request(page + suffix, { auth });
+        safe(pending, 200);
+        assert.match(pending.text, /Есть незавершённая операция\. Действия заблокированы\./);
+        assert.doesNotMatch(pending.text, effects);
+        if (suffix.includes('view=only')) assert.doesNotMatch(pending.text, /data-reconcile/);
+        else {
+            assert.ok(pending.text.includes(`data-reconcile-url="${reconcile}"`));
+            assert.match(pending.text, /data-reconcile disabled/);
+        }
+        assert.deepEqual(state.calls.splice(0), [['overview']]);
+    }
     state.overviewFailure = true;
     const unknown = await request(`${page}?lang=ru`, { auth });
     safe(unknown, 503);
-    assert.doesNotMatch(unknown.text, /data-reconcile-url|Незавершённая операция, выполняется сверка/);
-    assert.deepEqual(state.calls, [['overview'], ['overview']]);
+    assert.doesNotMatch(unknown.text, /data-reconcile|Есть незавершённая операция/);
+    assert.doesNotMatch(unknown.text, effects);
+    assert.deepEqual(state.calls, [['overview']]);
     assert.equal(state.rebuildService.mock.callCount(), 0);
+    assert.equal(connect.mock.callCount(), 0);
 });
 
 test('reconciliation requires a guarded POST and returns only the observed public fence status', async t => {
-    const { request, postRaw, signIn, state } = await mount(t, { ingress: true });
+    const { request, postRaw, signIn, state } = await mount(t, { ingress: true, realView: true });
     process.env[listKey] = '[]';
     const auth = await signIn();
     const post = (options = {}) => request(reconcile, { method: 'POST', auth, json: {}, ...options });
@@ -240,9 +251,12 @@ test('reconciliation requires a guarded POST and returns only the observed publi
     state.onboardingFailure = true;
     safe(await post(), 503);
     state.onboardingFailure = false;
-    delete process.env[listKey];
-    safe(await post(), 409);
     assert.deepEqual(state.calls, []);
+    delete process.env[listKey];
+    const ineligible = await post();
+    safe(ineligible, 409);
+    assert.deepEqual(JSON.parse(ineligible.text), { error: { code: 'REBUILD_L2TP_RECONCILE_DISABLED' } });
+    assert.deepEqual(state.calls.splice(0), [['read fence'], ['overview'], ['read fence']]);
     assert.equal(state.rebuildService.mock.callCount(), 0);
 
     process.env[listKey] = '[]';
@@ -257,15 +271,24 @@ test('reconciliation requires a guarded POST and returns only the observed publi
     state.fenceFailure = false;
     state.reconcileFailure = true;
     await receipt('pending');
-    assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+    assert.deepEqual(state.calls.splice(0), [['read fence'], ['overview'], ['reconcile'], ['read fence']]);
+    const refreshPending = await request(page, { auth });
+    safe(refreshPending, 200);
+    assert.match(refreshPending.text, /data-reconcile disabled/);
+    assert.doesNotMatch(refreshPending.text, effects);
+    assert.deepEqual(state.calls.splice(0), [['overview']]);
     state.reconcileFailure = false;
     state.loseReadback = true;
     safe(await post(), 503);
-    assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+    assert.deepEqual(state.calls.splice(0), [['read fence'], ['overview'], ['reconcile'], ['read fence']]);
     state.loseReadback = state.fenceFailure = false;
     state.settles = true;
     await receipt('settled');
-    assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+    assert.deepEqual(state.calls.splice(0), [['read fence'], ['overview'], ['reconcile'], ['read fence']]);
+    const refreshSettled = await request(page, { auth });
+    safe(refreshSettled, 200);
+    assert.doesNotMatch(refreshSettled.text, /data-reconcile/);
+    assert.deepEqual(state.calls.splice(0), [['overview']]);
     await receipt('settled');
     assert.deepEqual(state.calls, [['read fence']]);
 });
@@ -288,7 +311,7 @@ test('settled reconcile projects only closures proved by this POST, never a prio
         safe(response, 200);
         assert.deepEqual(JSON.parse(response.text), { executionMode: 'rebuild', status: settles ? 'settled' : 'pending',
             ...(count !== undefined && { sessionsTerminated: count, sessionsTerminatedScope: 'request' }) });
-        assert.deepEqual(state.calls.splice(0), [['read fence'], ['reconcile'], ['read fence']]);
+        assert.deepEqual(state.calls.splice(0), [['read fence'], ['overview'], ['reconcile'], ['read fence']]);
     }
 });
 

@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { canInstallRelay, resolveRelayBinding } = require('../rebuildRelayAuthorization');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const attested = require('./helpers/rebuildRelayDirectWire');
 
 const a = { nodeId: 'a'.repeat(24), host: '192.0.2.19', port: 22, username: 'root',
     machineId: '1'.repeat(32), sshHostKeySha256: '2'.repeat(64) };
@@ -90,7 +91,7 @@ test('DIRECT uses only operator endpoint and pin, plus allowlisted card credenti
                 return { code: 0, stderr: '', stdout: `${JSON.stringify({ machineId: row.machineId, ppp: true, masked: false, unitsLoaded: true })}\n` };
             }
         }
-        const remote = createRelayDirect({ env: list(a, b), node, SSH });
+        const remote = createRelayDirect({ env: list(a, b), node, SSH: attested(SSH, row.machineId) });
         assert.equal((await remote.preflight()).machineId, row.machineId);
         await remote.close();
     }
@@ -102,9 +103,8 @@ test('DIRECT fences config and card drift across an awaited handshake without di
         env => Object.assign(env, list(a, { ...b, sshHostKeySha256: '5'.repeat(64) }))]) {
         const env = list(a, b), node = card(b);
         class SSH {
-            connect() { drift(env, node); }
+            connectDirectOnce() { drift(env, node); return () => assert.fail('binding drift must block dispatch'); }
             disconnect() {}
-            exec() { assert.fail('binding drift must block dispatch'); }
         }
         const remote = createRelayDirect({ env, node, SSH });
         await assert.rejects(remote.preflight(), { code: /^REBUILD_L2TP_(INSTALL_DISABLED|BINDING_MISMATCH)$/ });

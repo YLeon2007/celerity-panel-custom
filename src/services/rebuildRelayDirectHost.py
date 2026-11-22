@@ -188,7 +188,7 @@ def directory(path, private=False):
         os.close(fd)
 
 
-def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False):
+def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False, diagnose_profile_owner=False):
     parent, name = os.path.split(path)
     try:
         with directory(parent) as fd:
@@ -197,9 +197,12 @@ def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False):
                 owner_ok = st.st_uid == 0 or (path in (MAIN, BRIDGE) and st.st_uid == pwd.getpwnam('nobody').pw_uid)
                 writable = bool(st.st_mode & 0o022)
                 diagnose_writable = diagnose_main_mode and path == MAIN
+                owner_refusal = (diagnose_profile_owner and path in (MAIN, BRIDGE)
+                                 and stat.S_ISREG(st.st_mode) and not owner_ok)
                 need(stat.S_ISREG(st.st_mode) and owner_ok and st.st_nlink == 1
                      and not st.st_mode & 0o7000 and (not writable or diagnose_writable)
-                     and not os.listxattr(handle.fileno()), 'PREREQUISITE')
+                     and not os.listxattr(handle.fileno()),
+                     'XRAY_PROFILE_OWNER_UNSUPPORTED' if owner_refusal else 'PREREQUISITE')
                 # Only install observation distinguishes this mode; do not read the payload.
                 need(not writable, XRAY_CONFIG_WRITABLE)
                 data = handle.read(maximum + 1)
@@ -330,9 +333,18 @@ def require_runtime_packages(refusal):
         need(status.startswith(b'ii '), refusal)
 
 
+def require_machine(machine):
+    with open('/etc/machine-id', 'rb') as source:
+        match = re.fullmatch(rb'([a-f0-9]{32})\n?', source.read(34))
+    if match is None:
+        raise Refusal('PREREQUISITE')
+    machine_id = match[1].decode('ascii')
+    need(machine_id == machine, 'IDENTITY')
+    return machine_id
+
+
 def preflight(machine, *, fresh=False):
-    machine_id = open('/etc/machine-id', 'rb').read(34).strip().decode('ascii')
-    need(re.fullmatch(r'[a-f0-9]{32}', machine_id) and machine_id == machine, 'IDENTITY')
+    machine_id = require_machine(machine)
     if fresh:
         # A missing runtime package can start IKE/LNS in its maintainer
         # scripts. Check dpkg before interpreting unit state or preparing PPP;
@@ -1033,7 +1045,7 @@ def boot():
     return open('/proc/sys/kernel/random/boot_id').read(64).strip()
 
 
-def observe(machine, d, transit=None) -> dict[str, Any]:
+def observe(machine, d, transit=None, *, diagnose_profile_owner=False) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
     ready = preflight(machine)
@@ -1062,7 +1074,8 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
         need(directory_absent(path), 'PREREQUISITE')
     need(not any(os.path.lexists(p) for p in ('/etc/nftables.d/celerity-l2tp.nft', '/etc/ipsec.d/celerity-l2tp.conf')),
          'PREREQUISITE')
-    files = {key: read(path, diagnose_main_mode=True) if key == 'main' else read(path)
+    files = {key: read(path, diagnose_main_mode=True, diagnose_profile_owner=diagnose_profile_owner)
+             if key == 'main' else read(path)
              for key, path in NAMES.items()}
     need(all(files[k] is None for k in ('ike', 'options', 'nft', 'net', 'drop'))
          and all(files[k] is not None for k in ('main', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
@@ -1080,7 +1093,7 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     stock_starter = digest(raw(files['starter'])) == STOCK_IKE_STARTER_SHA
     need(ike_include_matches(files['starter'], [], check_tree=True) if stock_starter
          else ike_include_matches(files['starter'], []), 'PREREQUISITE')
-    bridge = read(BRIDGE)
+    bridge = read(BRIDGE, diagnose_profile_owner=diagnose_profile_owner)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
     global_paths = ('/etc/ppp/options', SWAN_CONF, XL_DEFAULT)
     for path in global_paths:
@@ -3016,6 +3029,14 @@ def session_need(ok):
     need(ok, SESSION_UNKNOWN)
 
 
+def require_census_machine(machine):
+    identity = read('/etc/machine-id', 34)
+    match = None if identity is None else re.fullmatch(rb'([a-f0-9]{32})\n?', raw(identity))
+    if match is None:
+        raise Refusal(SESSION_UNKNOWN)
+    need(match[1] == machine.encode('ascii'), 'IDENTITY')
+
+
 def session_fs(libc, fd, magic):
     # x86_64 Linux: struct statfs begins with a native long f_type.
     buf = (ctypes.c_long * 32)()
@@ -3072,8 +3093,7 @@ def session_profile(lns, options, network):
 
 def session_owner(request):
     token, machine, network = (request[k] for k in ('backupId', 'machineId', 'network'))
-    identity = read('/etc/machine-id', 34)
-    session_need(identity is not None and raw(identity) in (machine.encode('ascii'), (machine + '\n').encode('ascii')))
+    require_census_machine(machine)
     path, manifest, backup = read_manifest(token)
     before, runtime = runtime_before(backup), backup['runtime']
     session_need(installed_phase(backup['phase']) and backup['backupId'] == token and backup['machineId'] == machine
@@ -3665,8 +3685,7 @@ def ipsec_status_inventory(status):
 
 
 def ipsec_session_sample(request):
-    identity = read('/etc/machine-id', 34)
-    session_need(identity is not None and raw(identity).strip() == request['machineId'].encode('ascii'))
+    require_census_machine(request['machineId'])
     path, manifest, backup, _ = owned_installation(request)
     before, runtime = runtime_before(backup), backup['runtime']
     # Match installed configuration and starter include, not just a connection
@@ -3721,7 +3740,7 @@ def census_observation(probe, request):
     try:
         return probe(request)
     except Refusal as error:
-        if str(error) == 'IN_FLIGHT':
+        if str(error) in ('IN_FLIGHT', 'IDENTITY'):
             raise
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         pass  # Unreadable or unsupported, never a count of zero.
@@ -3801,7 +3820,10 @@ def read_session_count(request):
     routing(request['network'])
     with directory(SYSTEM) as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        return relay_session_census(request)
+        require_census_machine(request['machineId'])
+        census = relay_session_census(request)
+        require_census_machine(request['machineId'])
+        return census
 
 
 def install_lock_identity(lock_fd):
@@ -3813,11 +3835,11 @@ def install_lock_identity(lock_fd):
     return lock_id
 
 
-def observe_install(machine, network, transit, lock_fd):
+def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
     lock_id = install_lock_identity(lock_fd)
     modules = observe_ppp_preparation()
     require_network_observers()
-    before = observe(machine, network, transit)
+    before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner)
     need(install_lock_identity(lock_fd) == lock_id, 'BASELINE_CHANGED')
     return {**before, 'pppModules': modules, 'installLock': lock_id}
 
@@ -3847,6 +3869,7 @@ def dispatch(request: dict[str, Any]):
     # administrative writers. No locks from the old runners are consulted.
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, (fcntl.LOCK_SH if action in ('inspect-chap', 'read-chap-generation') else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        require_machine(machine)
         if action in APPLY_NETWORK_ACTIONS:
             keys = {'action', 'machineId', 'backupId', 'network'}
             if action in ('verify-apply-network', 'restart-apply-network'):
@@ -3900,7 +3923,7 @@ def dispatch(request: dict[str, Any]):
         transit = request.get('transit')
         need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
         if action == 'prepare':
-            before = observe_install(machine, d, transit, fd)
+            before = observe_install(machine, d, transit, fd, diagnose_profile_owner=True)
             if 'nativePreparation' in before:
                 ready = {**ready, 'unitsLoaded': False}
             main = raw(before['files']['main'])
@@ -3950,6 +3973,7 @@ def main():
         if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED):
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
+              'IDENTITY' if str(error) == 'IDENTITY' else
               'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
               'REMOVE_REFUSED' if action == 'remove' else
               'INSPECT_' + str(error) if action == 'inspect-chap' and isinstance(error, InspectUnproved)

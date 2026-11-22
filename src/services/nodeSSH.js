@@ -68,6 +68,7 @@ class NodeSSH {
     #hostKeyOptions;
     #verifiedDirectClient = null;
     #pendingDirect = null;
+    #oneShotExec = null;
     #pendingStdin = new Set();
 
     constructor(node, options) {
@@ -143,6 +144,23 @@ class NodeSSH {
             client = await this._openDirectClient(signal);
             checkDeadline();
             this.directClient = this.#verifiedDirectClient = client;
+            // A machine-attested sequence must use this client, not whichever
+            // verified client happens to be current when the next exec starts.
+            const socket = client._sock;
+            const revoke = () => {
+                client.off('end', revoke).off('close', revoke).off('error', revoke);
+                if (this.#oneShotExec === exec) this.#oneShotExec = null;
+            };
+            const assertConnection = () => {
+                this.#assertPinnedEndpoint();
+                if (this.usePool || this.#oneShotExec !== exec || this.directClient !== client
+                    || client._sock !== socket || socket?.destroyed || socket?.readableEnded || socket?.writableEnded) {
+                    throw new Error('SSH one-shot connection is no longer active');
+                }
+            };
+            const exec = (command, options, verify) => this.#exec(command, options, verify, assertConnection);
+            client.on('end', revoke).on('close', revoke).on('error', revoke);
+            return this.#oneShotExec = exec;
         } catch (error) {
             discardPendingClient(client);
             throw error;
@@ -187,6 +205,15 @@ class NodeSSH {
                 readyTimeout: getDirectReadyTimeoutMs(),
                 ...sshPool.hostKeyConfig(this.node, this.#hostKeyOptions),
             };
+            let rejectedKey = false;
+            if (signal && config.hostVerifier) {
+                const verify = config.hostVerifier;
+                config.hostVerifier = key => {
+                    const accepted = verify(key);
+                    rejectedKey ||= !accepted;
+                    return accepted;
+                };
+            }
 
             if (this.node.ssh?.privateKey) {
                 config.privateKey = cryptoService.decryptPrivateKey(this.node.ssh.privateKey);
@@ -212,7 +239,7 @@ class NodeSSH {
                 const onError = error => {
                     if (!cleanup()) return; // Revoke readiness before destroying the pending socket.
                     discardPendingClient(client);
-                    reject(error);
+                    reject(rejectedKey ? Object.assign(new Error('SSH host key changed'), { code: 'SSH_HOST_KEY_MISMATCH' }) : error);
                 };
                 const onClosed = () => onError(new Error('SSH closed before ready'));
                 const onAbort = () => onError(signal.reason);
@@ -285,6 +312,7 @@ class NodeSSH {
      */
     disconnect() {
         this.#pendingDirect?.abort();
+        this.#oneShotExec = null;
         this.#verifiedDirectClient = null;
         for (const revoke of this.#pendingStdin) revoke();
         if (this.directClient) {
@@ -307,8 +335,13 @@ class NodeSSH {
      * on a pinned direct channel; it may throw, reject or return false to refuse.
      */
     async exec(command, options = {}, verifyBeforeStdin) {
+        return this.#exec(command, options, verifyBeforeStdin);
+    }
+
+    async #exec(command, options = {}, verifyBeforeStdin, assertConnection) {
         const guarded = !this.usePool && verifyBeforeStdin !== undefined;
-        try { this.#assertPinnedEndpoint(); }
+        const watched = guarded || assertConnection;
+        try { if (assertConnection) assertConnection(); else this.#assertPinnedEndpoint(); }
         catch (error) { throw guarded ? createExecStdinError() : error; }
         if (this.usePool) {
             return sshPool.exec(this.node, command, options, this.#hostKeyOptions);
@@ -339,7 +372,7 @@ class NodeSSH {
                 settled = true;
                 clearTimeout(timer);
                 stdinController?.cancel();
-                if (guarded) {
+                if (watched) {
                     stopWatchingHandoff();
                     discardLateExecStream(pendingStream);
                     pendingStream = undefined;
@@ -350,15 +383,15 @@ class NodeSSH {
             // Match the explicit runner exec budget without changing the legacy
             // direct default. Neither a timeout nor a late reply permits replay.
             const execTimeout = options.timeout;
-            const deadline = guarded && execTimeout ? performance.now() + Number(execTimeout) : Infinity;
+            const deadline = watched && execTimeout ? performance.now() + Number(execTimeout) : Infinity;
             const assertHandoff = () => {
-                this.#assertPinnedEndpoint();
+                if (assertConnection) assertConnection(); else this.#assertPinnedEndpoint();
                 if (this.usePool || client !== this.directClient || performance.now() >= deadline) throw createExecStdinError();
             };
             const timer = execTimeout ? setTimeout(() => settle(includesStdin
                 ? createExecStdinError() : new Error(`Exec timeout (${execTimeout}ms)`)), execTimeout) : undefined;
             try {
-                if (guarded) {
+                if (watched) {
                     this.#pendingStdin.add(revoke);
                     client.on('end', revoke).on('close', revoke).on('error', revoke);
                 }
@@ -374,8 +407,25 @@ class NodeSSH {
 
                     let stdout = '';
                     let stderr = '';
+                    let outputBytes = 0;
+                    const withinOutputLimit = data => {
+                        if (!assertConnection || options.maxOutputBytes === undefined) return true;
+                        outputBytes += Buffer.byteLength(data);
+                        if (outputBytes <= options.maxOutputBytes) return true;
+                        settle(new Error('SSH exec output exceeded its limit'));
+                        return false;
+                    };
                     let stdinComplete = !includesStdin;
-                    if (guarded) pendingStream = stream;
+                    if (watched) pendingStream = stream;
+                    let channelClosed = false, exitCode;
+                    let stderrEnded = !assertConnection || stream.stderr.readableEnded === true;
+                    const finish = () => {
+                        if (!channelClosed || !stderrEnded) return;
+                        if (assertConnection) {
+                            try { assertHandoff(); } catch { return revoke(); }
+                        }
+                        settle(null, { code: exitCode, stdout, stderr });
+                    };
 
                     stream
                         .on('close', (code) => {
@@ -384,16 +434,22 @@ class NodeSSH {
                                 settle(createExecStdinError());
                                 return;
                             }
-                            settle(null, { code, stdout, stderr });
+                            channelClosed = true;
+                            exitCode = code;
+                            finish();
                         })
                         .on('data', (data) => {
-                            stdout += data.toString();
+                            if (withinOutputLimit(data)) stdout += data.toString();
                         })
                         .on('error', (error) => {
                             settle(includesStdin ? createExecStdinError() : error);
                         })
                         .stderr.on('data', (data) => {
-                            stderr += data.toString();
+                            if (withinOutputLimit(data)) stderr += data.toString();
+                        }).on('end', () => {
+                            // ssh2 can emit the channel close before stderr EOF.
+                            stderrEnded = true;
+                            finish();
                         }).on('error', (error) => {
                             settle(includesStdin ? createExecStdinError() : error);
                         });
@@ -416,12 +472,19 @@ class NodeSSH {
                                 if (settled) return;
                                 if (allowed === false) return revoke();
                                 assertHandoff();
-                                stopWatchingHandoff();
-                                pendingStream = undefined;
+                                if (!assertConnection) {
+                                    stopWatchingHandoff();
+                                    pendingStream = undefined;
+                                }
                                 startStdin();
                             } catch { revoke(); }
                         })();
-                    } else if (includesStdin) startStdin();
+                    } else if (includesStdin) {
+                        if (assertConnection) {
+                            try { assertHandoff(); } catch { return revoke(); }
+                        }
+                        startStdin();
+                    }
                 });
             } catch (error) {
                 settle(includesStdin ? createExecStdinError() : error);

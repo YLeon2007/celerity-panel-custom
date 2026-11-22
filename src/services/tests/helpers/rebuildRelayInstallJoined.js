@@ -5,13 +5,14 @@ const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { Client } = require('ssh2');
-const { generateXraySystemdService, generateBridgeSystemdService } = require('../../configGenerator');
+const { generateXrayConfigWithApi, generateXraySystemdService, generateBridgeSystemdService } = require('../../configGenerator');
 const { composeRebuildProfiles } = require('../../../modules/relay-l2tp/services/rebuildTopologyComposer');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join, dirname } = require('node:path');
 const applyWire = require('./rebuildRelayApplyWire');
+const { rebuildApplyMachineGuard } = require('./rebuildApplyMachineGuard');
 const stockSwan = require('./rebuildRelayStockSwan');
 const { handler: installHandler } = require('../../../routes/panel/rebuildRelayInstall');
 
@@ -57,8 +58,8 @@ function seedNativeStock(put, root, generated) {
     }
 }
 
-module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt }) => {
-    test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
+module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt, wireOnly = false }) => {
+    if (!wireOnly) test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
 
     function seedHost(t, f, relay, machineId, scenario, { preEnabled = false, idleIke = false, subscribers = [], lifecycle = false,
         mainUid = 65534, cohort = false } = {}) {
@@ -107,7 +108,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const usersByNode = { [id]: subscribers };
         const dialerVersions = new Map([[String(exit._id), '26.3.27']]); // Matches the apply-wire fixture.
         const generated = composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode, dialerVersions });
-        const main = generated.find(row => row.nodeId === id && row.profile === 'main').config;
+        // Use the same unmodified pretty JSON as regular Setup for the negative.
+        const setupMain = scenario === 'legacy-setup-profile' ? generateXrayConfigWithApi(relay, subscribers) : null;
+        const main = setupMain ? JSON.parse(setupMain) : generated.find(row => row.nodeId === id && row.profile === 'main').config;
         const bridge = generated.find(row => row.nodeId === id && row.profile === 'bridge').config;
         if (scenario === 'transit-drift') {
             main.inbounds.find(row => row.tag === 'rebuild-rp-conn-eeeeeeee').settings.clients[0].id =
@@ -142,7 +145,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         }
         const bridgeActive = bridge.inbounds.length > 0;
         const mainMode = 0o640, bridgeMode = lifecycle && bridgeActive ? 0o644 : 0o640;
-        const mpath = put(mainPath, JSON.stringify(main), mainMode), bpath = put(bridgePath, JSON.stringify(bridge), bridgeMode);
+        const mpath = put(mainPath, setupMain ?? JSON.stringify(main), mainMode), bpath = put(bridgePath, JSON.stringify(bridge), bridgeMode);
         put('/usr/local/bin/xray', 'modeled executable\n', 0o755);
         put('/etc/systemd/system/' + x, generateXraySystemdService(), 0o644);
         if (bridgeActive) put('/etc/systemd/system/' + b, generateBridgeSystemdService(), 0o644);
@@ -380,14 +383,22 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                     assert.equal(peer.pinned, Boolean(host));
                     if (command === '/usr/bin/head -c 34 /etc/machine-id') {
                         assert.ok(host && stdin === undefined);
+                        peer.observed = true;
                         return { status: 0, stdout: `${host.machineId}\n`, stderr: '' };
                     }
                     assert.ok(applyHandlers.has(peer.ip));
-                    return applyHandlers.get(peer.ip)(command, stdin);
+                    const guarded = rebuildApplyMachineGuard(command);
+                    if (guarded.accepts) assert.ok(peer.pinned && guarded.accepts(host.machineId));
+                    return applyHandlers.get(peer.ip)(guarded.command, stdin);
                 }
                 const host = routes.get(peer.ip);
                 assert.ok(peer.pinned && host);
-                frames.push([host.id, JSON.parse(stdin).action]);
+                const { action } = JSON.parse(stdin);
+                if (!action.endsWith('-apply-network')) {
+                    assert.equal(peer.observed, true, 'DIRECT payload requires attestation on this client');
+                    peer.observed = false;
+                }
+                frames.push([host.id, action]);
                 return host.execute(command, stdin);
             };
             let ended = false;
@@ -396,6 +407,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                     const result = execute(stdin);
                     stream.emit('data', result.stdout);
                     stream.stderr.emit('data', result.stderr);
+                    stream.stderr.emit('end');
                     stream.emit('close', result.status);
                 } catch (error) {
                     wireFaults.push(error);
@@ -425,11 +437,13 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         return frames;
     }
 
+    if (wireOnly) return wire;
+
     test('joined DIRECT wire waits for stdin EOF and completes only once', async t => {
         const command = '/usr/bin/timeout -k fixture';
         const ip = '192.0.2.4', key = Buffer.from('fixture key');
         const received = [], events = [];
-        const frames = wire(t, [{ id, relay: { ip }, key, applyHandlers: new Map(), execute(cmd, stdin) {
+        const frames = wire(t, [{ id, relay: { ip }, key, machineId, applyHandlers: new Map(), execute(cmd, stdin) {
             assert.equal(cmd, command);
             received.push(stdin);
             return { status: 0, stdout: 'ok', stderr: '' };
@@ -437,6 +451,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const client = new Client();
         client.connect({ host: ip, port: 22, username: 'root', hostVerifier: candidate => candidate.equals(key) });
         try {
+            await new Promise(resolve => client.exec('/usr/bin/head -c 34 /etc/machine-id', (error, channel) => {
+                assert.ifError(error);
+                channel.on('close', status => { assert.equal(status, 0); resolve(); });
+            }));
             let stream;
             client.exec(command, (error, channel) => {
                 assert.ifError(error);
@@ -735,6 +753,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 const expected = scenario.startsWith('transit-ambiguous') ? 'CANDIDATE_INVALID'
                     : scenario === 'transit-loopback-listener' ? 'RUNTIME_UNPROVED' : 'PROFILE_USERS';
                 assert.equal(result.code, `REBUILD_L2TP_DIRECT_${expected}`, diagnostic(f));
+                if (expected === 'PROFILE_USERS') assert.equal(result.check, 'XRAY_PROFILE_USERS_UNPROVED');
+                if (expected === 'RUNTIME_UNPROVED') assert.equal(result.check, 'XRAY_RUNTIME_UNPROVED');
                 assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
                 assert.equal(f.states.length + f.users.length + f.records().effects.length, 0);
                 assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
@@ -744,25 +764,39 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
     }
 
     for (const scenario of ['main', 'sidecar', 'offline', 'settled', 'sidecar-refusal', 'prewrite', 'masked', 'package',
-        'ike-active', 'unit-drift', 'user-rpc-error', 'sidecar-unsafe', 'foreign-rpdb6', 'manager-override', 'unacknowledged-start']) {
+        'ike-active', 'unit-drift', 'user-rpc-error', 'legacy-setup-profile', 'foreign-profile-owner', 'sidecar-unsafe',
+        'foreign-rpdb6', 'manager-override', 'unacknowledged-start']) {
         test(`joined DIRECT + stock prerequisites: ${scenario}`, async t => {
-            const f = host(t, scenario);
+            const f = host(t, scenario, scenario === 'foreign-profile-owner' ? { mainUid: 12345 } : undefined);
             const expected = { settled: 'REBUILD_L2TP_INSTALL_FAILED', 'sidecar-refusal': 'REBUILD_L2TP_INSTALL_FAILED',
                 'ike-active': 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'unit-drift': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
                 'foreign-rpdb6': 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'manager-override': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
                 'unacknowledged-start': 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN',
                 prewrite: 'REBUILD_L2TP_INSTALL_FAILED', masked: 'REBUILD_L2TP_HOST_NOT_READY',
                 package: 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'user-rpc-error': 'REBUILD_L2TP_DIRECT_PROFILE_USERS',
-                'sidecar-unsafe': 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' }[scenario];
+                'sidecar-unsafe': 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED',
+                'foreign-profile-owner': 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                'legacy-setup-profile': 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' }[scenario];
             const outcome = await f.create().installRelay(id).catch(error => error);
             assert.equal(outcome.code ?? outcome.status, expected ?? 'installed', diagnostic(f));
             if (scenario === 'package') assert.equal(outcome.check, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
+            if (expected === 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' || scenario === 'foreign-profile-owner') {
+                assert.equal(outcome.outcome, 'refused');
+                assert.equal(outcome.check, scenario === 'foreign-profile-owner'
+                    ? 'XRAY_PROFILE_OWNER_UNSUPPORTED' : 'XRAY_BASELINE_UNSUPPORTED');
+                assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
+                assert.deepEqual(f.events, []); // No installation-state or account writes.
+            }
             if (scenario === 'ike-active' || scenario === 'foreign-rpdb6') {
                 assert.equal(outcome.check, scenario === 'ike-active' ? 'IKE_ACTIVE_UNMANAGED' : 'RULE_220_CONFLICT');
                 assert.equal(outcome.outcome, 'refused');
             }
             if (!expected) {
                 assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
+                if (scenario === 'main') {
+                    const main = f.generated.find(row => row.nodeId === id && row.profile === 'main').config;
+                    assert.equal(f.before[f.mainPath].toString(), JSON.stringify(main));
+                }
                 assert.ok(fs.lstatSync(join(f.root, f.bootLink)).isSymbolicLink());
                 const current = JSON.parse(fs.readFileSync(f.mpath)), side = JSON.parse(fs.readFileSync(f.bpath));
                 assert.ok(current.inbounds.some(row => row.tag === `relay-l2tp-${id}`));

@@ -3,10 +3,19 @@ const { createHash, randomUUID } = require('node:crypto');
 const { MAIN, BRIDGE, readClassicProfile }=require('./classicAppliedConfig');
 const {generateBridgeSystemdService}=require('./configGenerator');
 const {READ_CHAIN,VERIFY_CHAIN}=require('./rebuildTunnelTls');
+const {identityChanged,isIdentityChanged,isGrantAuthorityError}=require('./rebuildRelayEffectAuthority');
 const {CONNECT_TIMEOUT_MS}=require('./rebuildSshLimits');
 const fail=code=>Object.assign(new Error(code),{code});
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
 const readMachineId='/usr/bin/head -c 34 /etc/machine-id';
+const guardExit=70, machineUnavailable='REBUILD_APPLY_MACHINE_ID_UNAVAILABLE', machineMismatch='REBUILD_APPLY_MACHINE_ID_MISMATCH';
+function guardMutation(machineId,command){
+    // Read at most one byte past the longest accepted value. Encoding bytes
+    // avoids shell command substitution silently dropping LF or NUL bytes.
+    const expected=Buffer.from(machineId).toString('hex').replace(/../g,' $&');
+    return `c3_machine_bytes=$(LC_ALL=C /usr/bin/od -An -v -N 34 -w34 -tx1 -- /etc/machine-id 2>/dev/null) || { printf '%s\\n' ${machineUnavailable} >&2; exit ${guardExit}; }; `+
+        `case "$c3_machine_bytes" in '${expected}'|'${expected} 0a') ;; *) printf '%s\\n' ${machineMismatch} >&2; exit ${guardExit};; esac; ${command}`;
+}
 // All shell strings are fixed or constructed from locally generated constants.
 // Profile contents (including REALITY private keys) are only passed via stdin.
 function createTransport(node, SSH=require('./nodeSSH'), authority) {
@@ -16,33 +25,55 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
     // one direct client from machine-ID attestation through cleanup, with no replay.
     if(authority)ssh.usePool=false;
     const temp=profile=>`${paths[profile]}.rebuild-${token}.json`;
+    async function attestMachine(){
+        let result;
+        try{result=await ssh.exec(readMachineId,{timeout:10000});}
+        catch{throw fail(authority.merged?'REBUILD_L2TP_SSH_CONNECT_FAILED':'REBUILD_L2TP_MACHINE_ID_MISMATCH');}
+        if(result?.code!==0 || result.stderr!==''){
+            throw fail(authority.merged?'REBUILD_L2TP_SSH_CONNECT_FAILED':'REBUILD_L2TP_MACHINE_ID_MISMATCH');
+        }
+        if(![authority.machineId,`${authority.machineId}\n`].includes(result.stdout)){
+            throw authority.merged?identityChanged():fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');
+        }
+    }
     async function attest(){
         if(closed||attestationStarted)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         attestationStarted=true;
         await authority.verify();
         if(closed)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
-        try{await ssh.connectDirectOnce(CONNECT_TIMEOUT_MS);}catch{throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');}
+        try{await ssh.connectDirectOnce(CONNECT_TIMEOUT_MS);}catch(error){
+            if(authority.merged && error?.code==='SSH_HOST_KEY_MISMATCH')throw identityChanged();
+            throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');
+        }
         if(closed)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         connected=true;
         await authority.verify();
         if(closed)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
-        let result;
-        try{result=await ssh.exec(readMachineId,{timeout:10000});}catch{throw fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');}
-        if(result?.code!==0 || result.stderr!=='' || ![authority.machineId,`${authority.machineId}\n`].includes(result.stdout)){
-            throw fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');
-        }
+        await attestMachine();
         await authority.verify();attested=true;
     }
-    async function run(command,options){
+    async function verifyIdentity(){
+        await authority.verify();
+        await attestMachine();
+        await authority.verify();
+    }
+    async function run(command,options,write=false){
         if(closed || authority && !attested)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         if(authority){
-            await authority.verify();
+            if(authority.merged && write)await verifyIdentity();
+            else await authority.verify();
             if(closed||!connected)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         }else if(!connected){await ssh.connect();connected=true;}
         return ssh.exec(command,options);
     }
-    async function check(command,stdin) {
-        const result=await run(command,{timeout:60000,...(stdin===undefined?{}:{stdin})});
+    async function check(command,stdin,write=false) {
+        const guarded=authority&&write;
+        const result=await run(guarded?guardMutation(authority.machineId,command):command,{timeout:60000,...(stdin===undefined?{}:{stdin})},write);
+        // This refusal only describes this command, not earlier Apply effects.
+        if(guarded&&result?.code===guardExit&&result.stdout===''){
+            if(result.stderr===`${machineMismatch}\n`)throw authority.merged?identityChanged():fail('REBUILD_L2TP_MACHINE_ID_MISMATCH');
+            if(result.stderr===`${machineUnavailable}\n`)throw fail(authority.merged?'REBUILD_L2TP_SSH_CONNECT_FAILED':'REBUILD_L2TP_MACHINE_ID_MISMATCH');
+        }
         if(result?.code!==0)throw fail('REBUILD_NODE_COMMAND_FAILED');return result.stdout;
     }
     async function read(profile){
@@ -53,7 +84,10 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         // Probe the exact binary used by the checked units, not a cached DB
         // value or the agent's PATH. Do not include remote output in errors.
         let output;
-        try {output=await check('/usr/local/bin/xray version');} catch {throw fail('REBUILD_XRAY_VERSION_UNKNOWN');}
+        try {output=await check('/usr/local/bin/xray version');} catch(error) {
+            if(isIdentityChanged(error)||isGrantAuthorityError(error))throw error;
+            throw fail('REBUILD_XRAY_VERSION_UNKNOWN');
+        }
         const match=typeof output==='string' && /^Xray (\d{1,4}\.\d{1,4}\.\d{1,4})(?=\s|$)/.exec(output);
         if(!match)throw fail('REBUILD_XRAY_VERSION_UNKNOWN');
         const version=match[1], [year,month,day]=version.split('.').map(Number);
@@ -75,13 +109,15 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             }
             const active=profile==='main'||config.inbounds.length>0||config.outbounds.some(o=>o.protocol==='vless' && o.settings?.reverse?.tag);
             attemptedStage=true;
-            await check(`set -eu; umask 077; test ! -L ${dir}; test ! -L ${path}; if ! test -d ${dir}; then install -d -m 0755 ${dir}; fi; (set -C; cat > ${file}); /usr/local/bin/xray run -test -config ${file} >/dev/null 2>&1`,JSON.stringify(config));
+            await check(`set -eu; umask 077; test ! -L ${dir}; test ! -L ${path}; if ! test -d ${dir}; then install -d -m 0755 ${dir}; fi; (set -C; cat > ${file}); /usr/local/bin/xray run -test -config ${file} >/dev/null 2>&1`,JSON.stringify(config),true);
             staged.set(profile,{active,state});
         }
     }
     let networkProof;
+    // DIRECT checks the machine ID within its own command under its host flock.
     const relayNetwork=(action,proof)=>require('./rebuildRelayDirect').applyRelayNetwork(
-        run,authority.machineId,authority.installation,action,proof);
+        (cmd,options)=>run(cmd,options,['prepare-apply-network','restart-apply-network'].includes(action)),
+        authority.machineId,authority.installation,action,proof,authority.merged);
     async function prepareActivation(){
         networkProof=await relayNetwork('prepare-apply-network');
     }
@@ -94,42 +130,43 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         // Release the previous socket owner before moving any listener between
         // services; enable both effective profiles for a normal unattended boot.
         const side=staged.get('bridge');
-        if(side.state==='loaded')await check('systemctl stop xray-bridge.service');
+        if(side.state==='loaded')await check('systemctl stop xray-bridge.service',undefined,true);
         for(const profile of ['bridge','main']){
             const path=paths[profile], f=temp(profile);
             // Keep an existing profile's service readability and privileges;
             // classic freshly provisioned bridge units run as nobody.
-            await check(`set -eu; if test -f ${path}; then chown --reference=${path} ${f}; chmod --reference=${path} ${f}; else chown root:$(id -gn nobody) ${f}; chmod 0640 ${f}; fi; mv -fT ${f} ${path}`);
+            await check(`set -eu; if test -f ${path}; then chown --reference=${path} ${f}; chmod --reference=${path} ${f}; else chown root:$(id -gn nobody) ${f}; chmod 0640 ${f}; fi; mv -fT ${f} ${path}`,undefined,true);
         }
         if(side.active && side.state==='not-found'){
             const unit='/etc/systemd/system/xray-bridge.service';
-            await check(`set -eu; test ! -e ${unit}; test ! -L ${unit}; (umask 022; set -C; cat > ${unit}); systemctl daemon-reload`,generateBridgeSystemdService());
+            await check(`set -eu; test ! -e ${unit}; test ! -L ${unit}; (umask 022; set -C; cat > ${unit}); systemctl daemon-reload`,generateBridgeSystemdService(),true);
         }
         if(authority?.installation){
-            await check('systemctl enable xray.service');
+            await check('systemctl enable xray.service',undefined,true);
             await relayNetwork('restart-apply-network',networkProof);
-        }else await check('systemctl enable xray.service && systemctl restart xray.service && systemctl is-active --quiet xray.service');
-        if(side.active)await check('systemctl enable xray-bridge.service && systemctl restart xray-bridge.service && systemctl is-active --quiet xray-bridge.service');
-        else if(side.state==='loaded') await check('systemctl disable xray-bridge.service');
+        }else await check('systemctl enable xray.service && systemctl restart xray.service && systemctl is-active --quiet xray.service',undefined,true);
+        if(side.active)await check('systemctl enable xray-bridge.service && systemctl restart xray-bridge.service && systemctl is-active --quiet xray-bridge.service',undefined,true);
+        else if(side.state==='loaded') await check('systemctl disable xray-bridge.service',undefined,true);
         if(authority?.installation)await relayNetwork('verify-apply-network',networkProof);
     }
     async function close(){
         if(closed)return;
-        try{if(connected&&attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`);}
+        try{if(connected&&attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`,undefined,true);}
         finally{closed=true;if(connected||attestationStarted)ssh.disconnect();}
     }
     return {read,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,
         ...(authority&&{attest}),
+        ...(authority?.merged&&{verifyIdentity}),
         ...(authority?.installation&&{checkActivation:()=>relayNetwork('check-apply-network'),prepareActivation}),
         readTunnelCertificate:()=>check(READ_CHAIN),verifyTunnelCertificate:input=>check(VERIFY_CHAIN,input)};
 }
 
-function createBoundRelayTransport(node,fence,verifyLock,installation){
+function createBoundRelayTransport(node,fence,verifyLock,installation,verifyBinding=()=>fence.check()){
     const {nodeId,host:ip,port,username,sshHostKeySha256,machineId}=fence.binding;
     // Same binding as DIRECT. In list mode, use the operator endpoint and
     // take only authentication material from the corroborating card.
     const target={_id:nodeId,name:nodeId,ip,ssh:{port,username,password:node.ssh.password,privateKey:node.ssh.privateKey}};
-    return createTransport(target,undefined,{machineId,installation,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
-        expectedEndpoint:{ip,port,username}},async verify(){await verifyLock();fence.check();}});
+    return createTransport(target,undefined,{machineId,installation,merged:fence.merged,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
+        expectedEndpoint:{ip,port,username}},async verify(){await verifyLock();await verifyBinding();}});
 }
 module.exports={createTransport,createBoundRelayTransport};

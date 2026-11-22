@@ -249,6 +249,65 @@
     "logsConnected": "实时",
     "logsDisconnected": "已断开"
   },
+  "rebuildL2tp": {
+    "installProfileHint": "安装需要已应用的兼容 Xray rebuild 配置。常规节点设置只会生成旧版 JSON。如有需要，请在「节点 → 网络地图」配置此中继所需的链路，关闭自动部署后保存，再点击「部署」预览变更。仅在确认变更且所有受影响的配置均由此面板管理时才应用。请勿覆盖自定义或由外部管理的配置。",
+    "installChecks": {
+      "REBUILD_LINKS_NOT_APPLIED": "中继存在尚未应用的链路或不受支持的对端。请在网络地图上确认所需链路已应用，且对端均为由面板管理的活动 Xray 节点。请勿为通过检查而部署无关链路。",
+      "XRAY_BASELINE_UNSUPPORTED": "安装不支持现有 Xray 配置的格式或路由结构。重新格式化 JSON 不会生成 rebuild 配置。仅对面板管理的配置按此中继卡片上的说明操作。",
+      "XRAY_PROFILE_OWNER_UNSUPPORTED": "安装不支持某个 Xray 配置文件的所有者。请与中继管理员确认该配置由谁管理。不要为了通过检查而更改文件所有者或覆盖配置。",
+      "XRAY_PROFILE_USERS_UNPROVED": "安装无法核实 Xray 用户列表，或无法确认中转入站与已应用的链路一致。重试前，请与中继所有者核对已应用的链路和运行中的 Xray 用户列表。",
+      "XRAY_RUNTIME_UNPROVED": "安装无法核实运行中的 Xray 进程或监听套接字的归属。重试前，请确认哪个服务正在使用该配置和端口。"
+    },
+    "messages": {
+      "installRefused": "L2TP 安装已拒绝。请检查中继的安装条件并刷新状态。",
+      "reconcileManualBlock": "当前中继身份不允许继续核对。未完成的记录已保留，供人工排查。请勿重试变更、重新确认授权或编辑该记录。",
+      "accountPreEffectBlocked": "此请求未在中继上启动写入。账户操作意图已记录；请重新加载 L2TP 数据核实其状态。请勿重新提交变更。",
+      "accountReconcileRequired": "先前的账户变更尚未完成。此请求未做任何更改。请重新加载 L2TP 数据，并在可用时单独执行核对操作；请勿重新提交此请求。",
+      "removeCleanupFailed": "L2TP 已移除，但无法确认清理已完成。请勿重复移除。请重新加载数据并核实当前状态。"
+    },
+    "admission": {
+      "label": "L2TP 准入",
+      "db": "面板（数据库）",
+      "env": "运维配置（ENV）",
+      "none": "未准入",
+      "envReadOnly": "此授权在面板中为只读。如中继身份发生变化，请先独立核验，再更正或删除旧的 ENV 条目。数据库授权不能覆盖该条目。",
+      "grantBlocked": "此中继目前不满足准入条件。",
+      "revokeBlocked": "只有确认未安装 L2TP 且没有未完成的操作后，才能撤销授权。",
+      "recoveryIneligible": "未完成的账户操作阻止了更改。已获准的中继不满足核对条件。",
+      "recoverAccounts": "核对未完成的账户操作",
+      "disabled": "运维配置已禁用中继准入。",
+      "grant": "核验并申请准入",
+      "reconfirm": "重新确认身份",
+      "revoke": "撤销准入",
+      "endpoint": "SSH 地址和端口",
+      "login": "SSH 用户名",
+      "fingerprint": "SSH 主机密钥 SHA-256 指纹（十六进制）",
+      "machine": "机器 ID",
+      "verifyInstructions": "第 1 步（共 2 步）：请通过独立且可信的渠道（例如服务商控制台）核对指纹。如指纹不同或无法核验，请勿确认。探测未进行身份验证；确认后，面板只会在主机密钥完全匹配时进行 SSH 身份验证。",
+      "confirmInstructions": "第 2 步（共 2 步）：请核实机器 ID 属于目标中继，再确认准入。这不会安装 L2TP，也不会转移现有安装或账户的所有权。",
+      "revokeInstructions": "要从数据库撤销此中继的授权吗？这不会卸载 L2TP。如果无法确认未安装且没有未完成的操作，面板将拒绝撤销。",
+      "approveKey": "我已独立核验密钥",
+      "confirmGrant": "确认 L2TP 准入",
+      "confirmRevoke": "撤销此授权",
+      "cancel": "关闭",
+      "granted": "已确认 L2TP 准入。请重新加载以查看最新状态。安装需单独操作。",
+      "revoked": "已撤销 L2TP 准入。请重新加载以查看最新状态。",
+      "checkUnavailable": "无法核验中继身份，未保存确认。",
+      "challengeInvalid": "此确认已过期或已使用。请关闭对话框并重新核验。",
+      "identityChanged": "服务器身份已变更，请重新核验后再继续。",
+      "reviewRelays": "查看中继身份",
+      "grantConflict": "准入与现有授权或安装状态冲突，已拒绝。请检查中继和运维配置。",
+      "legacySingletonInUse": "已保留数据库中的最后一条授权，以便继续管理通过旧版环境变量配置的中继上的账户并卸载 L2TP。请先从该中继卸载 L2TP，或显式配置中继列表，再重试。请勿删除已保存的账户目录。",
+      "conflictField": "冲突字段：{field}。",
+      "conflictSources": "冲突来源：{sources}。",
+      "conflictFields": {
+        "nodeId": "中继 ID", "machineId": "机器 ID", "sshHostKeySha256": "SSH 主机密钥指纹",
+        "endpoint": "SSH 端点", "host": "SSH 主机", "port": "SSH 端口", "username": "SSH 用户名"
+      },
+      "grantUnavailable": "无法核验准入登记。在登记恢复可用前，相关操作已锁定。",
+      "blocked": "中继准入目前受限。请检查中继状态，并等待未完成的操作结束。"
+    }
+  },
   "nodes": {
     "title": "节点",
     "addNode": "添加节点",

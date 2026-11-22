@@ -14,6 +14,7 @@ const hostChecks = new Map([
     ['IKE_ACTIVE_UNMANAGED', 'IKE_ACTIVE_UNMANAGED', 'pre-write-only'],
     ['XL2TPD_CONFIG_MISSING', 'XL2TPD_CONFIG_MISSING'],
     ['XRAY_CONFIG_WRITABLE', 'XRAY_CONFIG_WRITABLE'],
+    ['XRAY_PROFILE_OWNER_UNSUPPORTED', 'XRAY_PROFILE_OWNER_UNSUPPORTED', 'prepare-only'],
     ['XL2TPD_NATIVE_UNIT_REQUIRED', 'XL2TPD_NATIVE_UNIT_REQUIRED'],
     ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'fresh-pre-write'],
     ['RUNTIME_NATIVE_UNIT_REQUIRED', 'RUNTIME_NATIVE_UNIT_REQUIRED', 'fresh-pre-write'],
@@ -25,14 +26,23 @@ const stages = new Map([
     ['check', 'HOST_CANDIDATE'],
     ['install', 'HOST_INSTALL'],
 ]);
+// These exact codes reach classification before reservation. On the write
+// path, the coordinator instead returns a rollback or uncertain outcome.
+const profileChecks = new Map([
+    ['REBUILD_L2TP_TOPOLOGY_NOT_APPLIED', 'REBUILD_LINKS_NOT_APPLIED'],
+    ['REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED', 'XRAY_BASELINE_UNSUPPORTED'],
+    ['REBUILD_L2TP_DIRECT_PROFILE_USERS', 'XRAY_PROFILE_USERS_UNPROVED'],
+    ['REBUILD_L2TP_DIRECT_RUNTIME_UNPROVED', 'XRAY_RUNTIME_UNPROVED'],
+]);
 const checks = new Set([...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
-    'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED']);
+    ...profileChecks.values(), 'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED']);
 const installCheckIds = Object.freeze([...checks]);
 const isInstallCheck = check => checks.has(check);
 const isInstallStage = action => stages.has(action);
 function specificHostRefusal(action, suffix, noWrite) {
     const match = hostChecks.get(suffix);
     if (!isInstallStage(action) || !match) return undefined;
+    if (match.scope === 'prepare-only' && action !== 'prepare') return undefined;
     if (match.scope && match.scope !== 'fresh-pre-write' && action === 'preflight') return undefined;
     if (['pre-write-only', 'fresh-pre-write'].includes(match.scope) && action === 'install' && !noWrite) return undefined;
     return { check: match.check, prerequisitePartial: match.scope === 'shared-prerequisite'
@@ -68,7 +78,8 @@ const codeOutcomes = new Map([
     ['REBUILD_LOCK_LOST', 'unknown'],
     ['REBUILD_LOCK_RELEASE_UNCONFIRMED', 'unknown'],
     ['REBUILD_TRANSPORT_CLEANUP_FAILED', 'unknown'],
-    ...['INSTALL_DISABLED', 'INSTALL_IDENTITY_MISMATCH', 'INSTALL_INPUT_INVALID', 'INSTALL_PLAN_INVALID',
+    ...['INSTALL_DISABLED', 'INSTALL_IDENTITY_MISMATCH', 'IDENTITY_CHANGED', 'INSTALL_INPUT_INVALID', 'INSTALL_PLAN_INVALID',
+        'GRANT_CONFLICT', 'GRANT_INVALID', 'GRANT_ENV_INVALID', 'GRANT_REGISTRY_INVALID', 'GRANT_PERSISTENCE_UNAVAILABLE',
         'NOT_FRESH_RELAY', 'BINDING_MISMATCH', 'SSH_PIN_INVALID', 'SSH_ENDPOINT_INVALID', 'SSH_CONNECT_FAILED',
         'HOST_NOT_READY', 'TOPOLOGY_NOT_APPLIED', 'CREDENTIAL_KEY_INVALID', 'ADDRESS_INVENTORY_INVALID',
         'ADDRESS_SPACE_EXHAUSTED', 'ACCOUNT_INVENTORY_INVALID', 'ACCOUNT_POOL_EXHAUSTED',
@@ -104,7 +115,7 @@ function installFailure(code, outcome, check, { retryAllowed } = {}) {
         check = undefined;
     }
     const error = withInstallCheck(Object.assign(new Error(code), { code, outcome,
-        ...(outcome === 'unknown' && retryAllowed === false && { retryAllowed: false }) }), check);
+        ...(retryAllowed === false && { retryAllowed: false }) }), check);
     failures.add(error);
     return Object.freeze(error);
 }
@@ -113,7 +124,10 @@ function classifyInstallFailure(error) {
     if (failures.has(error)) return error;
     const code = error?.code;
     const outcome = codeOutcomes.get(code);
-    return outcome ? installFailure(code, outcome, checkedInstallId(error)) : installFailure(failed, 'unknown');
+    const retryAllowed = error?.retryAllowed === false ? false : undefined;
+    const check = checkedInstallId(error) ?? profileChecks.get(code);
+    return installFailure(outcome ? code : failed,
+        error?.outcome === 'unknown' ? 'unknown' : outcome ?? 'unknown', check, { retryAllowed });
 }
 
 function publicInstallFailure(error) {

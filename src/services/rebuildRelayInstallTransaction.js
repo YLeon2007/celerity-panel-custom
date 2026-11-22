@@ -51,4 +51,8 @@ async function transactOnce(State, User, work) {
     }
 }
 
-module.exports = { transactOnce, AcknowledgedCommitCleanupError };
+class ReservationOutcomeUnknownError extends Error {
+    constructor(cause) { super('Install reservation unconfirmed', { cause }); }
+}
+
+module.exports = { transactOnce, AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError };

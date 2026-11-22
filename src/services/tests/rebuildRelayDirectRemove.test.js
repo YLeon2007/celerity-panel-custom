@@ -3,6 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const attested = require('./helpers/rebuildRelayDirectWire');
 
 const nodeId = 'a'.repeat(24), machineId = 'b'.repeat(32), pin = 'c'.repeat(64);
 const backupId = 'd'.repeat(32), baseline = 'e'.repeat(64);
@@ -34,7 +35,7 @@ function fixture(handler = () => undefined, expectedCensus) {
                 ? ok({ ok: true, machineId, backupId, baseline }) : ok({ ok: true, backupId, removed: true }));
         }
     }
-    return { remote: createRelayDirect({ node, env, SSH }), calls };
+    return { remote: createRelayDirect({ node, env, SSH: attested(SSH, machineId) }), calls };
 }
 
 test('remove prepares an opaque, driver-bound single-use plan over pinned SSH', async () => {

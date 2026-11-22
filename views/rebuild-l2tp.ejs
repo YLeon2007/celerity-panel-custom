@@ -1,9 +1,14 @@
 <%
 const l = key => t(`rebuildL2tp.${key}`);
 const available = typeof loadError === 'undefined' || !loadError;
+const removalMessage = typeof removalNotice !== 'undefined' && ['uncertain', 'removeCleanupFailed'].includes(removalNotice)
+    ? l(`messages.${removalNotice}`) : '';
 const pending = available && typeof accountsPending !== 'undefined' && accountsPending === true;
-const actionableOverview = available && !pending;
-const eligible = pending && typeof canReconcileAccounts !== 'undefined' && canReconcileAccounts === true;
+const topProblem = typeof grantProblem !== 'undefined' && grantProblem;
+const manualBlock = pending && topProblem === 'REBUILD_L2TP_IDENTITY_CHANGED';
+const actionableOverview = available && !pending && !topProblem && !removalMessage;
+const mismatch = typeof changedRelayId !== 'undefined' && changedRelayId;
+const eligible = pending && !topProblem && !removalMessage && typeof canReconcileAccounts !== 'undefined' && canReconcileAccounts === true;
 const reconcile = eligible && (typeof reconcileViewOnly === 'undefined' || !reconcileViewOnly);
 const relayStatuses = new Set(['not_installed', 'queued', 'preflight', 'installing', 'installed',
     'degraded', 'drifted', 'removing', 'error', 'role_lost']);
@@ -12,9 +17,20 @@ const validLogin = login => typeof login === 'string' && /^[A-Za-z0-9._@-]{1,64}
 const relayNames = new Map(relays.map(({ id, name }) => [id, name]));
 const relayPath = id => `/panel/rebuild/relays/${id}/l2tp`;
 const accountPath = '/panel/rebuild/relays/l2tp/accounts';
+const admissionMessages = ['granted', 'revoked', 'checkUnavailable', 'recoveryIneligible',
+    'challengeInvalid', 'identityChanged', 'envReadOnly', 'grantConflict', 'grantUnavailable', 'blocked',
+    'conflictField', 'conflictSources', 'legacySingletonInUse'];
+const conflictFields = ['nodeId', 'machineId', 'sshHostKeySha256', 'endpoint', 'host', 'port', 'username'];
+const problemKeys = new Map([
+    ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged'], ['REBUILD_L2TP_INSTALL_DISABLED', 'disabled'],
+    ['REBUILD_L2TP_GRANT_CONFLICT', 'grantConflict'], ['REBUILD_L2TP_GRANT_CHANGED', 'grantConflict'],
+    ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'blocked'],
+]);
+const problemText = problem => l(`admission.${problemKeys.get(problem) ?? 'grantUnavailable'}`);
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
     'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
+    'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
     'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed'];
 function secretControl(kind, url, index, login) {
@@ -39,16 +55,29 @@ function secretControl(kind, url, index, login) {
     #rebuild-l2tp [data-secret-value] { white-space: normal; overflow-wrap: anywhere; }
     #rebuild-l2tp .rebuild-addresses { list-style: none; margin: 0; padding: 0; }
     #rebuild-l2tp [data-action-status]:not(:empty) { margin-bottom: .75rem; }
+    #rebuild-l2tp [data-admission-dialog] { position: fixed; color: inherit; overflow: auto; width: min(37rem, calc(100% - 2rem)); }
+    #rebuild-l2tp [data-admission-dialog] code { overflow-wrap: anywhere; }
+    /* The shared .btn display otherwise overrides the browser's hidden style. */
+    #rebuild-l2tp [data-admission-dialog]:not([open]),
+    #rebuild-l2tp [data-admission-dialog][hidden],
+    #rebuild-l2tp [data-admission-dialog] [hidden],
+    #rebuild-l2tp [data-review][hidden] { display: none; }
 </style>
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
      <% if (reconcile) { %>data-reconcile-url="<%= accountPath %>/reconcile"<% } %>
      data-install-checks="<%= JSON.stringify(typeof installChecks === 'undefined' ? {} : installChecks) %>"
+     data-admission-messages="<%= JSON.stringify({ ...Object.fromEntries(admissionMessages.map(key => [key, l(`admission.${key}`)])),
+         conflictFields: Object.fromEntries(conflictFields.map(key => [key, l(`admission.conflictFields.${key}`)])) }) %>"
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
     <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
+    <% if (available && topProblem) { %><p class="alert alert-error" role="alert"><%= manualBlock ? l('messages.reconcileManualBlock') : problemText(topProblem) %></p><% } %>
     <div class="card">
         <div class="card-body">
-            <p data-action-status role="status"><%= pending ? l(reconcile ? 'accountsPending' : eligible ? 'accountsPendingLocked' : 'accountsPendingListRequired') : '' %></p>
-            <a href="<%= reconcile ? '/panel/l2tp?view=only' : '/panel/l2tp' %>" data-refresh hidden><%= l('refresh') %></a>
+            <p data-action-status role="status"><%= removalMessage || (pending ? l(eligible || topProblem ? 'accountsPendingLocked' : 'admission.recoveryIneligible') : mismatch ? l('admission.identityChanged') : '') %></p>
+            <% if (reconcile) { %><button type="button" class="btn btn-sm btn-secondary" data-reconcile disabled><%= l('admission.recoverAccounts') %></button><% } %>
+            <% if (removalMessage) { %><a href="/panel/l2tp"><%= l('refresh') %></a><% } %>
+            <a href="/panel/l2tp" data-refresh hidden><%= l('refresh') %></a>
+            <a href="#rebuild-l2tp-relays" data-review hidden><%= l('admission.reviewRelays') %></a>
         </div>
         <section aria-labelledby="rebuild-l2tp-relays">
             <div class="card-header"><h2 id="rebuild-l2tp-relays"><i class="ti ti-server-2" aria-hidden="true"></i> <%= l('relays') %></h2></div>
@@ -59,29 +88,58 @@ function secretControl(kind, url, index, login) {
                             <th scope="col"><%= l('relay') %></th>
                             <th scope="col"><%= l('relayAddress') %></th>
                             <th scope="col"><%= l('state') %></th>
+                            <th scope="col"><%= l('admission.label') %></th>
                             <th scope="col"><%= l('psk.label') %></th>
                             <th scope="col"><%= l('actions') %></th>
                         </tr></thead>
                         <tbody>
                         <% relays.forEach((relay, index) => {
-                            const actionable = actionableOverview && relay.bound === true && validId(relay.id);
+                            const actionable = actionableOverview && !relay.grantProblem && relay.bound === true && validId(relay.id);
                             const status = relayStatuses.has(relay.status) ? relay.status : 'unknown';
+                            const source = relay.grantSource;
+                            const canGrant = actionableOverview && !relay.grantProblem && validId(relay.id) && source === null && relay.canGrant === true;
+                            const canReconfirm = actionableOverview && (!relay.grantProblem || relay.grantProblem === 'REBUILD_L2TP_IDENTITY_CHANGED')
+                                && validId(relay.id) && source === 'db' && relay.canReconfirm === true;
+                            const canRevoke = actionableOverview && !relay.grantProblem && validId(relay.id) && source === 'db' && relay.canRevoke === true;
+                            const changed = mismatch === relay.id;
                         %>
-                            <tr>
+                            <tr <% if (validId(relay.id)) { %>id="relay-<%= relay.id %>"<% } %>>
                                 <th scope="row"><%= relay.name %></th>
                                 <td><code><%= relay.ip %></code></td>
                                 <td>
                                     <span class="badge <%= status === 'installed' ? 'badge-success' : 'badge-secondary' %>"><%= l(`status.${status}`) %></span>
-                                    <% if (!relay.bound) { %><div class="text-muted"><%= l('missingBinding') %></div><% } %>
+                                    <% if (!relay.bound && source === undefined && !relay.grantProblem && !topProblem) { %><div class="text-muted"><%= l('missingBinding') %></div><% } %>
                                 </td>
-                                <td><% if (actionable && relay.canRevealPsk === true) { secretControl('psk', `${relayPath(relay.id)}/psk/reveal`, index); } %></td>
                                 <td>
-                                    <% if (actionable && relay.canInstall === true) { %>
-                                        <button type="button" class="btn btn-sm btn-primary" data-install-url="<%= relayPath(relay.id) %>/install"
-                                                data-node-id="<%= relay.id %>"><%= l('install') %></button>
+                                    <% if (source === 'env' || source === 'db') { %>
+                                        <span class="badge badge-secondary"><%= l(`admission.${source}`) %></span>
+                                    <% } else if (source === null && !topProblem && !relay.grantProblem) { %>
+                                        <span class="badge badge-secondary"><%= l('admission.none') %></span>
                                     <% } %>
-                                    <% if (actionable && relay.canRemove === true) { %>
-                                        <a class="btn btn-sm btn-danger" href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a>
+                                    <% if (changed) { %><div class="text-muted"><%= l('admission.identityChanged') %></div><% } %>
+                                    <% if (relay.grantProblem && !topProblem) { %><div class="text-muted"><%= problemText(relay.grantProblem) %></div><% } %>
+                                    <% if (source === 'env') { %><div class="text-muted" data-env-grant><%= l('admission.envReadOnly') %></div><% } %>
+                                    <% if (source === 'db' && !canRevoke && !relay.grantProblem && !topProblem) { %><div class="text-muted"><%= l('admission.revokeBlocked') %></div><% } %>
+                                    <% if (source === null && !canGrant && !relay.grantProblem && !topProblem) { %><div class="text-muted"><%= l('admission.grantBlocked') %></div><% } %>
+                                </td>
+                                <td><% if (actionable && !changed && relay.canRevealPsk === true) { secretControl('psk', `${relayPath(relay.id)}/psk/reveal`, index); } %></td>
+                                <td>
+                                    <% if (canGrant || canReconfirm || canRevoke) { %>
+                                        <% for (const [allowed, action] of [[canGrant, 'grant'], [canReconfirm, 'reconfirm'], [canRevoke && !changed, 'revoke']]) { if (allowed) { %>
+                                            <button type="button" class="btn btn-sm btn-secondary" disabled data-admission-action="<%= action %>"
+                                                    data-admission-url="<%= relayPath(relay.id) %>/admission" data-node-id="<%= relay.id %>"
+                                                    data-node-name="<%= relay.name %>" aria-haspopup="dialog"><%= l(`admission.${action}`) %></button>
+                                        <% } } %>
+                                    <% } %>
+                                    <% if (actionable && !changed && relay.canInstall === true) { %>
+                                        <p class="text-muted" id="install-profile-<%= relay.id %>"><%= l('installProfileHint') %>
+                                            <a href="/panel/nodes"><%= t('nodes.title') %></a>
+                                        </p>
+                                        <button type="button" class="btn btn-sm btn-primary" data-install-url="<%= relayPath(relay.id) %>/install"
+                                                data-node-id="<%= relay.id %>" aria-describedby="install-profile-<%= relay.id %>"><%= l('install') %></button>
+                                    <% } %>
+                                    <% if (actionable && !changed && relay.canRemove === true) { %>
+                                        <a class="btn btn-sm btn-danger" data-remove-link href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a>
                                     <% } %>
                                 </td>
                             </tr>
@@ -96,7 +154,7 @@ function secretControl(kind, url, index, login) {
     </div>
     <section class="card" aria-labelledby="rebuild-l2tp-accounts">
         <div class="card-header"><h2 id="rebuild-l2tp-accounts"><i class="ti ti-users" aria-hidden="true"></i> <%= l('accounts') %></h2></div>
-        <% if (actionableOverview && canManageAccounts === true) { %>
+        <% if (actionableOverview && !mismatch && canManageAccounts === true) { %>
             <div class="card-body">
                 <form method="post" autocomplete="off" data-create>
                     <div class="form-group">
@@ -122,7 +180,7 @@ function secretControl(kind, url, index, login) {
                     </tr></thead>
                     <tbody>
                     <% accounts.forEach((account, index) => {
-                        const valid = actionableOverview && account.consistent === true && validLogin(account.login);
+                        const valid = actionableOverview && !mismatch && account.consistent === true && validLogin(account.login);
                         const actionable = valid && canManageAccounts === true;
                     %>
                         <tr>
@@ -157,5 +215,29 @@ function secretControl(kind, url, index, login) {
             <p class="card-body text-muted"><%= l('noAccounts') %></p>
         <% } %>
     </section>
+    <dialog class="card" data-admission-dialog aria-labelledby="rebuild-l2tp-admission-title">
+        <div class="card-header"><h2 id="rebuild-l2tp-admission-title"><%= l('admission.label') %></h2></div>
+        <div class="card-body">
+            <dl>
+                <div><dt><%= l('relay') %></dt><dd data-admission-name></dd></div>
+                <div data-admission-identity hidden>
+                    <dt><%= l('admission.endpoint') %></dt><dd><code data-admission-endpoint></code></dd>
+                    <dt><%= l('admission.login') %></dt><dd><code data-admission-login></code></dd>
+                    <dt><%= l('admission.fingerprint') %></dt><dd><code data-admission-key></code></dd>
+                </div>
+                <div data-admission-machine-row hidden>
+                    <dt><%= l('admission.machine') %></dt><dd><code data-admission-machine></code></dd>
+                </div>
+            </dl>
+            <p data-admission-step="verify" hidden><%= l('admission.verifyInstructions') %></p>
+            <p data-admission-step="confirm" hidden><%= l('admission.confirmInstructions') %></p>
+            <p data-admission-step="revoke" hidden><%= l('admission.revokeInstructions') %></p>
+            <p data-admission-status role="status"></p>
+            <% for (const [action, key] of [['verify', 'approveKey'], ['confirm', 'confirmGrant'], ['revoke', 'confirmRevoke']]) { %>
+                <button type="button" class="btn btn-primary" data-admission-approve="<%= action %>" hidden><%= l(`admission.${key}`) %></button>
+            <% } %>
+            <button type="button" class="btn btn-secondary" data-admission-cancel><%= l('admission.cancel') %></button>
+        </div>
+    </dialog>
 </div>
 <script src="/js/rebuild-l2tp.js?v=<%= rebuildL2tpScriptVersion %>" defer></script>

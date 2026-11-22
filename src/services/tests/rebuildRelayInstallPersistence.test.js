@@ -421,7 +421,9 @@ test('Install passes the pinned source and persisted projection to real DIRECT, 
             return { code: 70, stderr: 'DIRECT_CHAP_REFUSED\n', stdout: '' };
         }
     }
-    const install = f.create({ createRelayDirect: options => createRelayDirect({ ...options, SSH }) }).installRelay;
+    const attested = require('./helpers/rebuildRelayDirectWire');
+    const install = f.create({ createRelayDirect: options => createRelayDirect({ ...options,
+        SSH: attested(SSH, state.rebuildMachineId) }) }).installRelay;
     await assert.rejects(install(id), { code: 'REBUILD_L2TP_ACCOUNT_SOURCE_PREFLIGHT_REFUSED' });
     assert.equal(sent?.action, 'check-chap');
     assert.equal(sent.machineId, state.rebuildMachineId);
@@ -703,6 +705,298 @@ function accountIntentFixture(t, f) {
 }
 
 joined({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt });
+
+function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
+    const { Client } = require('ssh2');
+    const { EventEmitter } = require('node:events');
+    const { createHash, randomUUID } = require('node:crypto');
+    const digest = value => createHash('sha256').update(value).digest('hex');
+    const f = fixture(t);
+    sessionFixture(t, f);
+    const intents = accountIntentFixture(t, f);
+    delete f.env.C3_REBUILD_L2TP_RELAY_ID;
+    delete f.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
+    if (twoRelays) f.nodes.push({ ...f.nodes[0], _id: oid('c'.repeat(24)), ip: '192.0.2.20' });
+    for (const node of f.nodes) node.ssh = { ...node.ssh, password: 'fixture-only-ssh-auth' };
+    const hosts = f.nodes.map(({ _id, ip, ssh }, index) => {
+        const key = Buffer.from(`fixture host key ${index}`);
+        const binding = { nodeId: String(_id), host: ip, port: ssh.port, username: ssh.username,
+            machineId: index ? 'd'.repeat(32) : machineId, sshHostKeySha256: digest(key) };
+        return { key, binding, machine: binding.machineId };
+    });
+    const grants = [];
+    const list = 'C3_REBUILD_L2TP_RELAYS_JSON';
+    if (twoRelays) f.env[list] = JSON.stringify([hosts[0].binding]);
+    const grant = (host = hosts.at(-1)) => grants.push({ ...host.binding, generation: randomUUID() });
+    const relayGrantStore = { async snapshot() {
+        const rows = grants.map(row => ({ ...row }));
+        const configured = JSON.parse(f.env[list] ?? '[]');
+        const merged = [...configured, ...rows.map(({ generation, ...binding }) => binding)];
+        return { env: Object.freeze({ ...f.env, [list]: JSON.stringify(merged) }), grants: rows,
+            sourceFor: nodeId => rows.some(row => row.nodeId === nodeId) ? 'db'
+                : configured.some(row => row.nodeId === nodeId) ? 'env' : null };
+    } };
+    const grantDb = { readyState: 1, collection(name) {
+        assert.equal(name, 'c3_rebuild_l2tp_relay_grants');
+        return { find(filter, options) {
+            assert.deepEqual(filter, {});
+            assert.deepEqual(options.readConcern, { level: 'majority' });
+            return { async toArray() {
+                return grants.map(row => ({ ...row, createdBy: 'fixture', confirmedBy: 'fixture',
+                    createdAt: new Date(0), confirmedAt: new Date(0) }));
+            } };
+        } };
+    } };
+    const service = f.create({ ...(useGrantDb ? { grantDb } : { relayGrantStore }),
+        createRelayDirect: require('../rebuildRelayDirect').createRelayDirect });
+    const peers = new WeakMap(), attestedPeers = new WeakSet(), frames = [], effects = [], opens = [], hooks = {};
+    const main = JSON.stringify({ inbounds: [{ tag: 'fwd-hop-a', protocol: 'vless', port: 443 }],
+        outbounds: [{ tag: 'block', protocol: 'blackhole' }], routing: { rules: [
+            { type: 'field', ruleTag: 'rebuild-policy-default', inboundTag: ['fwd-hop-a'], outboundTag: 'block' },
+        ] } });
+    t.mock.method(Client.prototype, 'connect', function (options) {
+        const host = hosts.find(row => row.binding.host === options.host);
+        assert.ok(f.lockHeld && host);
+        assert.equal(options.port, host.binding.port);
+        assert.equal(options.username, host.binding.username);
+        assert.equal(typeof options.hostVerifier, 'function');
+        opens.push(host.binding.nodeId);
+        const pinned = options.hostVerifier(host.key);
+        if (pinned) peers.set(this, host);
+        queueMicrotask(() => pinned ? this.emit('ready') : this.emit('error', Error('fixture pin rejected')));
+        return this;
+    });
+    t.mock.method(Client.prototype, 'end', function () { peers.delete(this); });
+    t.mock.method(Client.prototype, 'exec', function (command, ready) {
+        const host = peers.get(this);
+        assert.ok(f.lockHeld && host);
+        const stream = new EventEmitter(), chunks = [];
+        stream.stderr = new EventEmitter();
+        if (command === '/usr/bin/head -c 34 /etc/machine-id') {
+            stream.write = stream.end = () => assert.fail('attestation may not send stdin');
+            ready(null, stream);
+            queueMicrotask(() => {
+                hooks.beforeAttestation?.(host);
+                attestedPeers.add(this);
+                stream.emit('data', `${host.machine}\n`);
+                stream.stderr.emit('end');
+                stream.emit('close', 0);
+            });
+            return this;
+        }
+        assert.match(command, /^\/usr\/bin\/timeout -k /);
+        assert.ok(attestedPeers.delete(this), 'fresh attestation must be on this exact client before the receiver opens');
+        stream.write = chunk => { chunks.push(Buffer.from(chunk)); return true; };
+        stream.end = done => {
+            done();
+            queueMicrotask(() => {
+                const { action, backupId, machineId: expected, currentUsers, desiredUsers } = JSON.parse(Buffer.concat(chunks));
+                frames.push([host.binding.nodeId, action]);
+                hooks.atDispatch?.(action, host);
+                let value;
+                const readiness = { machineId: host.machine, ppp: true, masked: false, unitsLoaded: true };
+                if (expected !== host.machine) {
+                    stream.stderr.emit('data', action === 'install' ? 'DIRECT_NO_WRITE_IDENTITY\n' : 'DIRECT_IDENTITY\n');
+                    stream.stderr.emit('end');
+                    return stream.emit('close', 70);
+                }
+                if (action === 'preflight') value = readiness;
+                else if (action === 'prepare') value = { ...readiness, main, mainSha256: digest(main),
+                    bridge: null, bridgeSha256: null, baseline: 'e'.repeat(64) };
+                else if (action === 'session-count') value = { activeSessions: 0, activeIpsec: 0, census: 'e'.repeat(64) };
+                else if (action === 'prepare-remove') value = { ok: true, backupId, machineId: host.machine, baseline: 'e'.repeat(64) };
+                else if (action === 'check-chap') value = { ok: true, backupId, changed: !equal(currentUsers, desiredUsers) };
+                else if (['check', 'install', 'verify', 'remove', 'rollback', 'sync-chap'].includes(action)) {
+                    if (['install', 'remove', 'rollback', 'sync-chap'].includes(action)) effects.push([host.binding.nodeId, action]);
+                    value = { ok: true, backupId, ...(action === 'remove' && { removed: true }),
+                        ...(action === 'sync-chap' && { changed: true }) };
+                } else assert.fail('unexpected DIRECT request');
+                stream.emit('data', JSON.stringify(value) + '\n');
+                stream.stderr.emit('end');
+                stream.emit('close', 0);
+            });
+        };
+        stream.close = () => {};
+        hooks.beforeChannel?.(host);
+        ready(null, stream);
+        return this;
+    });
+    t.after(() => require('../sshPoolService').closeAll());
+    return { ...f, service, intents, hosts, grants, grant, frames, effects, opens, hooks };
+}
+
+async function assertGrantReachesInstall(t, useGrantDb) {
+    const f = admissionEffects(t, { useGrantDb });
+    const original = { ...f.env };
+    await assert.rejects(f.service.installRelay(id), { code: 'REBUILD_L2TP_INSTALL_DISABLED' });
+    assert.deepEqual(f.opens, []);
+    f.grant();
+    assert.deepEqual(await f.service.installRelay(id), { executionMode: 'rebuild', status: 'installed', nodeId: id });
+    assert.deepEqual(f.frames.map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
+    assert.deepEqual(f.effects, [[id, 'install']]);
+    assert.deepEqual(f.states.map(row => [row.status, row.rebuildMachineId]), [['installed', machineId]]);
+    assert.deepEqual(f.users.map(row => row.syncStatus), ['synced']);
+    assert.deepEqual(f.env, original);
+}
+
+test('admission effects: DB-only grant reaches real Install on the same service instance', async t => {
+    await assertGrantReachesInstall(t, false);
+});
+
+test('admission effects: GrantStore collection read reaches real Install on the same service instance', async t => {
+    try { require.resolve('../rebuildRelayGrantStore'); }
+    catch (error) {
+        if (error.code !== 'MODULE_NOT_FOUND') throw error;
+        return t.skip('Requires the separately owned GrantStore commit');
+    }
+    await assertGrantReachesInstall(t, true);
+});
+
+test('admission effects: changed SSH key refuses Install before commands or persistence', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    f.hosts[0].key = Buffer.from('different host key');
+    await assert.rejects(f.service.installRelay(id), { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'refused' });
+    assert.deepEqual(f.opens, [id]);
+    assert.deepEqual([f.frames, f.effects, f.states, f.users], [[], [], [], []]);
+});
+
+test('admission effects: accepted Install, shared account creation and Remove attest each receiver', async t => {
+    const f = admissionEffects(t, { twoRelays: true });
+    const [a, b] = f.hosts.map(host => host.binding.nodeId);
+    f.grant();
+    for (const nodeId of [a, b]) await f.service.installRelay(nodeId);
+    assert.deepEqual(f.effects, [[a, 'install'], [b, 'install']]);
+    f.frames.length = f.effects.length = 0;
+
+    await f.service.createRelayAccount({ login: 'new-user', password: 'local-fixture-account-value' });
+    assert.deepEqual(f.frames, [[a, 'check-chap'], [b, 'check-chap'], [a, 'sync-chap'], [b, 'sync-chap']]);
+    assert.deepEqual(f.effects, [[a, 'sync-chap'], [b, 'sync-chap']]);
+    assert.equal(f.users.filter(row => row.login === 'new-user' && row.syncStatus === 'synced').length, 2);
+    f.frames.length = f.effects.length = 0;
+
+    const estimate = await f.service.previewRemoveRelay(b);
+    assert.deepEqual(estimate, { nodeId: b, accountCount: 2, activeSessions: 0, activeIpsec: 0, confirmable: true });
+    assert.deepEqual(await f.service.confirmRemoveRelay(b, estimate), { executionMode: 'rebuild', status: 'not_installed', nodeId: b });
+    assert.deepEqual(f.frames, [[b, 'session-count'], [b, 'session-count'], [b, 'prepare-remove'], [b, 'remove']]);
+    assert.deepEqual(f.effects, [[b, 'remove']]);
+    assert.deepEqual(f.states.map(row => [String(row.node), row.status]), [[a, 'installed'], [b, 'not_installed']]);
+    assert.ok(!Object.hasOwn(f.states[1], 'backupId'));
+    assert.deepEqual(f.users.map(row => [String(row.relayNode), row.login]).sort(), [[a, 'new-user'], [a, 'relay-bootstrap']]);
+});
+
+test('admission effects: machine change on Install dispatch prevents writes and keeps the reservation', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    f.hooks.atDispatch = (action, host) => { if (action === 'install') host.machine = '8'.repeat(32); };
+    await assert.rejects(f.service.installRelay(id), { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'unknown', retryAllowed: false });
+    assert.deepEqual(f.effects, []);
+    assert.deepEqual(f.frames.map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check', 'install']);
+    assert.deepEqual(f.states.map(row => row.status), ['installing']);
+});
+
+test('admission effects: late Install attestation mismatch blocks the secret receiver and rollback', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    f.hooks.beforeAttestation = host => {
+        if (f.frames.at(-1)?.[1] === 'check') host.machine = '8'.repeat(32);
+    };
+    await assert.rejects(f.service.installRelay(id), { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'unknown', retryAllowed: false });
+    assert.deepEqual(f.frames.map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check']);
+    assert.deepEqual(f.effects, []);
+    assert.deepEqual(f.states.map(row => row.status), ['installing']);
+});
+
+test('admission effects: a same-binding grant replacement during the Install stdin handoff sends no payload', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    f.hooks.beforeChannel = () => {
+        if (f.frames.at(-1)?.[1] === 'check') {
+            f.grants.pop();
+            f.grant();
+        }
+    };
+    await assert.rejects(f.service.installRelay(id), { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'unknown', retryAllowed: false });
+    assert.deepEqual(f.frames.map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check']);
+    assert.deepEqual(f.effects, []);
+    assert.deepEqual(f.states.map(row => row.status), ['installing']);
+});
+
+test('admission effects: a foreign second machine blocks every account write in a mixed ENV/DB cohort', async t => {
+    const f = admissionEffects(t, { twoRelays: true });
+    const peer = f.hosts[1];
+    f.grant(peer);
+    for (const host of f.hosts) await f.service.installRelay(host.binding.nodeId);
+    f.frames.length = 0;
+    f.effects.length = 0;
+    peer.machine = '8'.repeat(32);
+    await assert.rejects(f.service.createRelayAccount({ login: 'new-user', password: 'local-fixture-account-value' }),
+        { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assert.deepEqual(f.frames, [[f.hosts[0].binding.nodeId, 'check-chap']], 'changed peer received no account payload');
+    assert.deepEqual([f.effects, f.intents.writes], [[], []]);
+    assert.deepEqual(f.users.map(row => row.login), ['relay-bootstrap', 'relay-bootstrap']);
+});
+
+test('admission effects: Remove rejects a changed machine after confirmation without host writes', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    await f.service.installRelay(id);
+    const estimate = await f.service.previewRemoveRelay(id);
+    assert.equal(estimate.confirmable, true);
+    f.frames.length = 0;
+    f.effects.length = 0;
+    f.hooks.atDispatch = (action, host) => { if (action === 'remove') host.machine = '8'.repeat(32); };
+    await assert.rejects(f.service.confirmRemoveRelay(id, estimate), { code: 'REBUILD_L2TP_IDENTITY_CHANGED', retryAllowed: false });
+    assert.deepEqual(f.frames.map(([, action]) => action), ['session-count', 'prepare-remove', 'remove']);
+    assert.deepEqual(f.effects, []);
+    assert.deepEqual(f.states.map(row => row.status), ['removing']);
+    assert.equal(f.users.length, 1);
+});
+
+test('admission effects: a changed machine during the Remove census is not unavailable telemetry', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    await f.service.installRelay(id);
+    const estimate = await f.service.previewRemoveRelay(id);
+    assert.equal(estimate.confirmable, true);
+    f.frames.length = 0;
+    f.effects.length = 0;
+    f.hosts[0].machine = '8'.repeat(32);
+    await assert.rejects(f.service.previewRemoveRelay(id), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    await assert.rejects(f.service.confirmRemoveRelay(id, estimate), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assert.deepEqual(f.frames, [], 'no census payload on either request');
+    assert.deepEqual(f.effects, []);
+    assert.deepEqual(f.states.map(row => row.status), ['installed']);
+    assert.equal(f.users.length, 1);
+});
+
+test('admission effects: the census stdin guard retains an identity veto while closing the pinned channel', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    await f.service.installRelay(id);
+    f.frames.length = f.effects.length = 0;
+    f.hooks.beforeChannel = () => {
+        f.grants.pop();
+        f.grant();
+    };
+    await assert.rejects(f.service.previewRemoveRelay(id), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assert.deepEqual([f.frames, f.effects], [[], []]);
+    assert.deepEqual(f.states.map(row => row.status), ['installed']);
+});
+
+test('admission effects: Remove confirmation cannot reuse an estimate from a replaced grant generation', async t => {
+    const f = admissionEffects(t);
+    f.grant();
+    await f.service.installRelay(id);
+    const estimate = await f.service.previewRemoveRelay(id);
+    assert.equal(estimate.confirmable, true);
+    f.grants.pop();
+    f.grant();
+    f.opens.length = f.frames.length = f.effects.length = 0;
+    await assert.rejects(f.service.confirmRemoveRelay(id, estimate), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assert.deepEqual([f.opens, f.frames, f.effects], [[], [], []]);
+    assert.deepEqual(f.states.map(row => row.status), ['installed']);
+});
 
 test('operator list installs two relays under Apply exclusion and records their distinct physical IDs', async t => {
     const f = fixture(t);
@@ -995,6 +1289,7 @@ test('non-relay, orphan credentials, and unapplied topology are refused before a
     f.users.pop();
     addLink(f, oid(id), oid());
     f.links[0].status = 'pending';
-    await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED' });
+    await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED',
+        outcome: 'refused', check: 'REBUILD_LINKS_NOT_APPLIED' });
     assert.deepEqual(f.events, []);
 });

@@ -14,7 +14,7 @@ const {
 } = require('../../modules/l2tpActiveHostProvider');
 const { checkIpWhitelist, requireAuth, requireOnboarding, render } = require('./helpers');
 const { issuePanelCsrfToken, requirePanelCsrf } = require('./csrf');
-const { canPreviewRemoval, submitRemoval, cancelRemoval } = require('./rebuildRelayRemove');
+const { submitRemoval, cancelRemoval } = require('./rebuildRelayRemove');
 const { accountHandler } = require('./rebuildRelayAccounts');
 
 const authRoutes = require('./auth');
@@ -50,10 +50,11 @@ function createPanelRouter({
     l2tpRateLimiter: injectedL2tpRateLimiter = l2tpRateLimiter,
     renderL2tpPage: injectedRenderL2tpPage = renderL2tpPage,
     rebuildL2tpOverview,
+    rebuildRelayAdmission,
 } = {}) {
     const router = express.Router();
     const rebuildEnabled = isRebuildEnabled();
-    const rebuildL2tp = rebuildEnabled ? require('./rebuildL2tp').createRoutes(rebuildL2tpOverview) : null;
+    const rebuildL2tp = rebuildEnabled ? require('./rebuildL2tp').createRoutes(rebuildL2tpOverview, rebuildRelayAdmission) : null;
 
     // Cache control must be set even if a guard denies the request.
     rebuildL2tp?.mountNoStore(router);
@@ -72,14 +73,17 @@ function createPanelRouter({
     router.use('/', exposePanelCsrfToken);
 
     rebuildL2tp?.mountReveals(router);
+    rebuildL2tp?.mountAdmission(router, injectedL2tpRateLimiter);
 
     // Wizard routes require auth but bypass requireOnboarding (they ARE the onboarding)
     router.use('/', requireAuth, wizardRoutes);
 
     // All other routes require authentication and completed onboarding
     if (rebuildEnabled) {
-        router.get('/nodes/:id', requireAuth, requireOnboarding, (req, res, next) =>
-            canPreviewRemoval(req) ? injectedL2tpRateLimiter(req, res, next) : next());
+        router.get('/nodes/:id', (_req, res, next) => {
+            res.locals.rebuildRemovalLimiter = injectedL2tpRateLimiter;
+            next();
+        });
     }
     router.use('/', requireAuth, requireOnboarding, nodesRoutes);
     router.use('/', requireAuth, requireOnboarding, usersRoutes);

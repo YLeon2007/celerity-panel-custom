@@ -8,6 +8,7 @@ const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
 const { join } = require('node:path');
 const { gunzipSync } = require('node:zlib');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const attested = require('./helpers/rebuildRelayDirectWire');
 const { composeRebuildRelayPair } = require('../rebuildRelayInstallSteps');
 const composeRebuildRelayMain = (...args) => composeRebuildRelayPair(...args).main;
 const { composeRebuildProfiles, syntheticTunnelSettings } = require('../../modules/relay-l2tp/tests/helpers/rebuildComposerFixture');
@@ -1071,7 +1072,7 @@ test('inspectChap uses a full pinned transport and host frame without writes or 
                     finally { rmSync(dir, { recursive: true, force: true }); }
                 }
             }
-            const remote = createRelayDirect({ node, env, SSH });
+            const remote = createRelayDirect({ node, env, SSH: attested(SSH, machineId) });
             try {
                 const result = remote.inspectChap(installation, currentUsers, desiredUsers, () => { guards.push(calls); }, revokedLogin);
                 if (projection) {

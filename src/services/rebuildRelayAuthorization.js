@@ -3,7 +3,18 @@ const { isIP } = require('node:net');
 const { validateRebuildMode } = require('./rebuildMode');
 
 const LIST = 'C3_REBUILD_L2TP_RELAYS_JSON';
+const LIST_LIMIT = 128 * 1024;
 const fields = ['nodeId', 'host', 'port', 'username', 'machineId', 'sshHostKeySha256'];
+const identityKeys = ['nodeId', 'machineId', 'sshHostKeySha256', 'endpoint'];
+
+class RelayGrantConflict extends Error {
+    constructor(field, sources) {
+        super('REBUILD_L2TP_GRANT_CONFLICT');
+        this.code = this.message;
+        this.field = field;
+        this.sources = sources;
+    }
+}
 const fail = suffix => Object.assign(new Error(`REBUILD_L2TP_${suffix}`), { code: `REBUILD_L2TP_${suffix}` });
 const disabled = () => fail('INSTALL_DISABLED');
 const hex = (value, size) => typeof value === 'string' && value.length === size && /^[a-f0-9]+$/.test(value);
@@ -27,36 +38,61 @@ function hostIdentity(host) {
         && !/^(?:\d+|0x[0-9a-f]+)$/.test(dns.split('.').at(-1))) return dns;
 }
 
-function listBinding(raw, id) {
-    if (typeof raw !== 'string' || raw.length > 128 * 1024) throw disabled();
-    let rows;
-    try { rows = JSON.parse(raw); } catch { throw disabled(); }
-    if (!Array.isArray(rows)) throw disabled();
-    const ids = new Set(), machines = new Set(), pins = new Set(), endpoints = new Set();
-    let match;
-    for (const row of rows) {
-        if (!row || typeof row !== 'object' || Object.keys(row).length !== fields.length
-            || !fields.every(key => Object.hasOwn(row, key))) throw disabled();
-        const { nodeId, host, port, username, machineId, sshHostKeySha256 } = row;
-        const address = hostIdentity(host);
-        if (!address || !validPort(port) || !validLogin(username)
-            || !hex(nodeId, 24) || !hex(machineId, 32) || !hex(sshHostKeySha256, 64)) throw disabled();
-        const endpoint = `${address}/${port}`;
-        if (ids.has(nodeId) || machines.has(machineId) || pins.has(sshHostKeySha256) || endpoints.has(endpoint)) throw disabled();
-        ids.add(nodeId); machines.add(machineId); pins.add(sshHostKeySha256); endpoints.add(endpoint);
-        if (nodeId === id) match = row;
+function normalizeRelayBinding(row, invalid = disabled) {
+    if (!row || typeof row !== 'object' || Object.keys(row).length !== fields.length
+        || !fields.every(key => Object.hasOwn(row, key))) throw invalid();
+    const { nodeId, host, port, username, machineId, sshHostKeySha256 } = row;
+    const address = hostIdentity(host);
+    if (!address || !validPort(port) || !validLogin(username)
+        || !hex(nodeId, 24) || !hex(machineId, 32) || !hex(sshHostKeySha256, 64)) throw invalid();
+    return { nodeId, host: address, port, username, machineId, sshHostKeySha256 };
+}
+
+function assertUniqueRelayBindings(entries) {
+    const seen = identityKeys.map(() => new Map());
+    for (const { binding, source } of entries) {
+        for (const [i, field] of identityKeys.entries()) {
+            const key = field === 'endpoint' ? `${hostIdentity(binding.host)}/${binding.port}` : binding[field];
+            const previous = seen[i].get(key);
+            if (previous) throw new RelayGrantConflict(field, [previous, source]);
+            seen[i].set(key, source);
+        }
     }
+}
+
+function parseRelayBindingList(raw, invalid = disabled) {
+    if (typeof raw !== 'string' || raw.length > LIST_LIMIT) throw invalid();
+    let rows;
+    try { rows = JSON.parse(raw); } catch { throw invalid(); }
+    if (!Array.isArray(rows)) throw invalid();
+    for (const row of rows) normalizeRelayBinding(row, invalid);
     // At this point the JSON is valid and its values are all flat scalars.
     // Count lexical member names too: JSON.parse silently collapses duplicate keys.
     let members = 0;
     for (const [, separator] of raw.matchAll(/"(?:[^"\\]|\\[\s\S])*"\s*(:)?/g)) if (separator) members++;
-    if (members !== rows.length * fields.length) throw disabled();
-    return match && Object.freeze(match);
+    if (members !== rows.length * fields.length) throw invalid();
+    assertUniqueRelayBindings(rows.map(binding => ({ binding, source: 'env' })));
+    return rows;
+}
+
+function listBinding(raw, id) {
+    try {
+        const match = parseRelayBindingList(raw).find(row => row.nodeId === id);
+        return match && Object.freeze(match);
+    } catch (error) {
+        // Standalone synchronous callers historically treat malformed ENV
+        // lists (including duplicates) as disabled. Registry reads instead
+        // use the parser directly and retain source/field diagnostics.
+        if (error instanceof RelayGrantConflict) throw disabled();
+        throw error;
+    }
 }
 
 function rebuildAllowed(env) {
     try { return validateRebuildMode(env) === true; } catch { return false; }
 }
+
+const relayInstallEnabled = env => rebuildAllowed(env) && env.C3_REBUILD_L2TP_INSTALL_ENABLED === 'true';
 
 function resolveRelayBinding(env, id, node, { optional = false } = {}) {
     const listMode = Object.hasOwn(env, LIST);
@@ -75,7 +111,7 @@ function resolveRelayBinding(env, id, node, { optional = false } = {}) {
             return;
         }
     }
-    if (!rebuildAllowed(env) || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== 'true' || !hex(id, 24)) throw disabled();
+    if (!relayInstallEnabled(env) || !hex(id, 24)) throw disabled();
     if (listMode) {
         binding ??= listBinding(env[LIST], id);
         if (!binding) throw disabled();
@@ -120,4 +156,6 @@ function captureRelayBinding(env, id, node, options) {
     } });
 }
 
-module.exports = { canInstallRelay, resolveRelayBinding, captureRelayBinding, sameRelayBinding };
+module.exports = { canInstallRelay, resolveRelayBinding, captureRelayBinding, sameRelayBinding, relayInstallEnabled,
+    normalizeRelayBinding, parseRelayBindingList, assertUniqueRelayBindings, RelayGrantConflict,
+    relayBindingFields: Object.freeze(fields), relayListKey: LIST, relayListLimit: LIST_LIMIT };
