@@ -1,8 +1,8 @@
 """Private-root filesystem regressions; no program is executed by the fake runner.
 
-The command formats and known xl2tpd-generated fragment are Debian-shaped.
-Solver input beyond repository-pinned versions/fragment is synthetic, not a
-claim of an exact trixie dependency lock or an authenticated apt replay.
+Includes a replay of historical Debian 13 solver action rows and the checked-in
+xl2tpd-generated fragment. Other command replies (including apt-cache/package
+metadata) are modeled, not an authenticated APT replay.
 """
 
 import fcntl
@@ -34,9 +34,27 @@ PROPS = ('Id,Names,LoadState,FragmentPath,SourcePath,UnitFileState,ActiveState,S
          'MainPID,ControlPID,Job,NeedDaemonReload,Transient,DropInPaths,TriggeredBy')
 CTL = ('/usr/bin/systemctl', '--system', '--no-pager', '--no-ask-password', '--full')
 
+# Public action rows from the sanitized Debian 13 historical solver probe
+# (historical-solver-uid0.log). The apt-cache metadata seam below is modeled.
+STOCK_INST = b'''Inst libstrongswan (6.0.1-6+deb13u7 Debian-Security:13/stable-security [amd64])
+Inst strongswan-starter (6.0.1-6+deb13u7 Debian-Security:13/stable-security [amd64])
+Inst strongswan-libcharon (6.0.1-6+deb13u7 Debian-Security:13/stable-security [amd64])
+Inst strongswan-charon (6.0.1-6+deb13u7 Debian-Security:13/stable-security [amd64])
+Inst libjansson4 (2.14-2+b3 Debian:13.7/stable [amd64])
+Inst libnftnl11 (1.2.9-1 Debian:13.7/stable [amd64])
+Inst libnftables1 (1.1.3-1 Debian:13.7/stable [amd64])
+Inst nftables (1.1.3-1 Debian:13.7/stable [amd64])
+Inst libpcap0.8t64 (1.10.5-2 Debian:13.7/stable [amd64])
+Inst ppp (2.5.2-1+1 Debian:13.7/stable [amd64])
+Inst strongswan (6.0.1-6+deb13u7 Debian-Security:13/stable-security [all])
+Inst xl2tpd (1.3.18-1+b1 Debian:13.7/stable [amd64])
+'''
+STOCK_PLAN = (b'0 upgraded, 12 newly installed, 0 to remove and 0 not upgraded.\n'
+              + STOCK_INST + STOCK_INST.replace(b'Inst ', b'Conf '))
+
 
 class Host:
-    def __init__(self, test, root):
+    def __init__(self, test, root, *, seed=True):
         self.t, self.root = test, root
         self.calls, self.effects = [], []
         self.apt_count = 0
@@ -58,13 +76,15 @@ class Host:
         self.replacement = None
         self.pin_plan_drift = False
         self.sim_extra = ''
+        self.sim_stdout: bytes | None = None
+        if not seed:
+            return
         for path in ('/usr/bin', '/usr/sbin', '/usr/lib/apt/methods', VENDOR, SYSTEM, LATE,
                      '/usr/share/keyrings', '/etc/init.d', '/etc/dpkg/dpkg.cfg.d',
                      '/var/lib/dpkg/info', '/var/lib/dpkg/updates', '/var/cache/apt/archives',
                      '/etc/apt/sources.list.d', '/var/lib/apt/lists', *(f'/etc/rc{i}.d' for i in 'S0123456')):
             self.p(path).mkdir(parents=True, exist_ok=True)
-        for path in self.root.rglob('*'):
-            path.chmod(0o755)
+
         self.link('/lib', 'usr/lib')
         self.link('/etc/os-release', '../usr/lib/os-release')
         self.put('/usr/lib/os-release', 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\n'
@@ -128,14 +148,14 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         # For both native services model helper-created enablement, even if a
         # particular Debian release uses --no-enable for nftables.
         for pkg, target in (('strongswan-starter', 'multi-user.target'), ('nftables', 'sysinit.target')):
-            if pkg not in old:
+            if pkg not in old and pkg in self.installed:
                 unit = pkg + '.service'
                 frag = self.put(f'{VENDOR}/{unit}', f'[Unit]\nDescription=fixture\n[Service]\n'
-                                f'ExecStart=/usr/bin/true\n[Install]\nWantedBy={target}\n')
+                                f'ExecStart={self.native_exec(pkg)}\n[Install]\nWantedBy={target}\n')
                 self.put(f'/var/lib/dpkg/info/{pkg}.md5sums',
                          f'{hashlib.md5(frag.read_bytes()).hexdigest()}  {VENDOR[1:]}/{unit}\n')
                 self.link(f'{SYSTEM}/{target}.wants/{unit}', VENDOR + '/' + unit)
-        if 'xl2tpd' not in old:
+        if 'xl2tpd' not in old and 'xl2tpd' in self.installed:
             self.put('/etc/init.d/xl2tpd', '#!/bin/sh\nexit 0\n', 0o755)
             for i in '2345':
                 self.link(f'/etc/rc{i}.d/S01xl2tpd', '../init.d/xl2tpd')
@@ -155,6 +175,9 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
             policy.write_bytes(body)
             policy.chmod(0o755)
             self.replacement = policy.stat().st_ino
+
+    def native_exec(self, package) -> str:
+        return '/usr/bin/true'
 
     def _show(self, unit):
         mask = self.p(f'{SYSTEM}/{unit}').is_symlink()
@@ -239,6 +262,8 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         if args[0] == '-s':
             if self.pin_plan_drift and prefs != '/dev/null':
                 return 0, b'0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n', b''
+            if self.sim_stdout is not None:
+                return 0, self.sim_stdout, b''
             intro = ('Reading package lists...\nBuilding dependency tree...\nReading state information...\n'
                      'The following NEW packages will be installed:\n  ' + ' '.join(plan) + '\n'
                      f'0 upgraded, {len(plan)} newly installed, 0 to remove and 0 not upgraded.\n')
@@ -294,18 +319,12 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
             return 0, b'      1 systemd\n    847 sshd\n' + (b'    878 charon\n' if self.process else b''), b''
         if argv == ('/usr/bin/ss', '-H', '-aun', '( sport = :500 or sport = :4500 or sport = :1701 )'):
             return 0, b'UNCONN 0 0 0.0.0.0:500 0.0.0.0:*\n' if self.listener else b'', b''
-        if argv == ('/usr/sbin/update-rc.d', 'xl2tpd', 'disable'):
-            self.effects.append('sysv-disable')
-            self.containment()
-            for leaf in self.p('/etc').glob('rc?.d/S??xl2tpd'):
-                leaf.rename(leaf.with_name('K01xl2tpd'))
-            return 0, b'', b''
         raise AssertionError(f'Unexpected modeled argv {argv!r}')
 
 
 class TestPackageGuard(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(dir=HERE, prefix='.package-fixture-')
+        tmp = tempfile.TemporaryDirectory(prefix='.package-fixture-')
         self.addCleanup(tmp.cleanup)
         self.h = Host(self, Path(tmp.name))
         # Project only the owner predicate; all mode, inode, link, fsync and
@@ -334,14 +353,15 @@ class TestPackageGuard(unittest.TestCase):
         self.no_effects()
         survivor = self.h.link(SYSTEM + '/multi-user.target.wants/operator.service', '/opt/operator.service')
         self.assertIsNone(self.prepare(proof))
-        self.assertEqual(self.h.effects, ['enter', 'reload', 'apt', 'sysv-disable', 'reload', 'reload'])
+        self.assertEqual(self.h.effects, ['enter', 'reload', 'apt', 'reload', 'reload'])
         self.assertEqual(survivor.readlink(), Path('/opt/operator.service'))
         self.assertFalse(self.h.p(POLICY).exists())
         self.assertFalse(any(self.h.p(SYSTEM).glob('*.wants/strongswan-starter.service')))
         self.assertFalse(any(self.h.p(SYSTEM).glob('*.wants/nftables.service')))
         self.assertFalse(any(self.h.p(SYSTEM).glob('*.service')))
         self.assertFalse(any(self.h.p('/etc').glob('rc?.d/S??xl2tpd')))
-        self.assertTrue(all(self.h.p(f'/etc/rc{i}.d/K01xl2tpd').is_symlink() for i in '0123456'))
+        for i in '0123456':
+            self.assertEqual(self.h.p(f'/etc/rc{i}.d/K01xl2tpd').readlink(), Path('../init.d/xl2tpd'))
         self.assertFalse(any(self.h.root.rglob('.relay-package-*')))
         ready = self.observe()
         self.assertEqual(ready['missing'], [])
@@ -361,10 +381,14 @@ class TestPackageGuard(unittest.TestCase):
         del self.h.installed['ppp']
         self.h.status()
         inode = self.h.p(VENDOR + '/strongswan-starter.service').stat().st_ino
+        stops = {leaf: (leaf.lstat().st_ino, leaf.readlink())
+                 for leaf in self.h.p('/etc').glob('rc?.d/K??xl2tpd')}
         proof = self.observe()
         self.assertEqual(proof['missing'], ['ppp'])
         self.assertIsNone(self.prepare(proof))
-        self.assertNotIn('sysv-disable', self.h.effects)
+        self.assertFalse(any(self.h.p('/etc').glob('rc?.d/S??xl2tpd')))
+        self.assertEqual({leaf: (leaf.lstat().st_ino, leaf.readlink())
+                          for leaf in self.h.p('/etc').glob('rc?.d/K??xl2tpd')}, stops)
         self.assertEqual(self.h.p(VENDOR + '/strongswan-starter.service').stat().st_ino, inode)
 
     def test_index_replacement_causes_plan_drift_without_enter(self):
@@ -457,6 +481,122 @@ class TestPackageGuard(unittest.TestCase):
             self.observe()
         self.no_effects()
         self.assertFalse(any('install' in a for a in self.h.calls))
+
+    def test_trixie_legacy_sources_list_with_stock_signed_by(self):
+        self.h.p('/etc/apt/sources.list.d/debian.sources').unlink()
+        self.h.put('/etc/apt/sources.list', '''deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian trixie main non-free-firmware
+deb http://deb.debian.org/debian trixie-updates main
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian-security trixie-security main
+''')
+        self.assertEqual(self.observe()['missing'], SIX)
+        self.no_effects()
+
+    def test_signed_by_does_not_admit_other_keys_or_extra_options(self):
+        listing = self.h.p('/etc/apt/sources.list.d/debian.sources')
+        deb822 = listing.read_text()
+        for suffix in (' ABCDEF0123456789ABCDEF0123456789ABCDEF01', ' #not-a-deb822-comment'):
+            with self.subTest(suffix=suffix):
+                self.h.calls.clear()
+                listing.write_text(deb822.replace('.gpg\n', '.gpg' + suffix + '\n'))
+                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_SOURCES'):
+                    self.observe()
+                self.no_apt()
+        listing.unlink()
+        for options in ('signed-by=/tmp/operator.gpg',
+                        'signed-by=/usr/share/keyrings/debian-archive-keyring.gpg trusted=yes',
+                        'signed-by=/usr/share/keyrings/debian-archive-keyring.gpg arch=amd64'):
+            with self.subTest(options=options):
+                self.h.calls.clear()
+                self.h.put('/etc/apt/sources.list',
+                           f'deb [{options}] http://deb.debian.org/debian trixie main\n')
+                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_SOURCES'):
+                    self.observe()
+                self.no_apt()
+
+    def test_legacy_source_only_entry_cannot_become_a_binary_source(self):
+        self.h.p('/etc/apt/sources.list.d/debian.sources').unlink()
+        self.h.put('/etc/apt/sources.list', 'deb-src http://deb.debian.org/debian trixie main\n')
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_SOURCES'):
+            self.observe()
+        self.no_apt()
+
+    def stock_solver(self):
+        deps = {
+            'libstrongswan': 'libc6 (>= 2.38)',
+            'strongswan-starter': 'libstrongswan (= 6.0.1-6+deb13u7), libc6 (>= 2.38)',
+            'strongswan-libcharon': 'libstrongswan (= 6.0.1-6+deb13u7)',
+            'strongswan-charon': 'strongswan-libcharon (= 6.0.1-6+deb13u7), libc6 (>= 2.38)',
+            'libjansson4': 'libc6', 'libnftnl11': 'libc6', 'libnftables1': 'libjansson4, libnftnl11',
+            'nftables': 'libnftables1 (= 1.1.3-1)', 'libpcap0.8t64': 'libc6', 'ppp': 'libc6',
+            'strongswan': 'strongswan-starter, strongswan-charon',
+            'xl2tpd': 'libc6 (>= 2.34), libpcap0.8t64 (>= 0.9.8), ppp, lsb-base (>= 3.0-6)',
+        }
+        self.h.candidates = {name: (version, arch, deps[name]) for name, version, arch in re.findall(
+            r'^Inst (\S+) \((\S+) \S+ \[(\S+)\]\)$', STOCK_INST.decode(), re.M)}
+        del self.h.installed['libnftnl11']
+        self.h.installed['lsb-base'] = ('11.6', 'all')
+        self.h.status()
+        self.h.sim_stdout = STOCK_PLAN
+
+    def test_trixie_solver_stock_libcharon_is_a_hard_dependency(self):
+        self.stock_solver()
+        self.assertEqual(self.observe()['missing'], SIX)
+        self.no_effects()
+
+    def test_libcharon_without_stock_charon_dependency_still_refuses(self):
+        self.stock_solver()
+        # Still reachable through a requested package, but no longer paired to
+        # its stock charon hard dependency; this must not authorize the library.
+        self.h.candidates['strongswan-charon'] = ('6.0.1-6+deb13u7', 'amd64', 'libc6')
+        self.h.candidates['strongswan'] = ('6.0.1-6+deb13u7', 'all',
+                                          'strongswan-starter, strongswan-charon, strongswan-libcharon')
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_DEPENDENCY'):
+            self.observe()
+        self.no_effects()
+
+    def test_installed_libcharon_needs_matching_stock_charon_and_no_other_ike(self):
+        self.h.installed['strongswan-libcharon'] = ('6.0.1-6+deb13u7', 'amd64')
+        for daemon, version in ((None, None), ('strongswan-charon', '6.0.1-6+deb13u6'),
+                                ('charon-systemd', '6.0.1-6+deb13u7')):
+            with self.subTest(daemon=daemon):
+                if daemon is not None and version is not None:
+                    self.h.installed[daemon] = (version, 'amd64')
+                self.h.status()
+                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_FOREIGN'):
+                    g._packages(self.h.root, self.h.run)
+                if daemon is not None:
+                    del self.h.installed[daemon]
+        self.h.installed['strongswan-charon'] = ('6.0.1-6+deb13u7', 'amd64')
+        self.h.status()
+        packages, _, _ = g._packages(self.h.root, self.h.run)
+        self.assertEqual(packages['strongswan-libcharon'], ['6.0.1-6+deb13u7', 'amd64'])
+        self.no_apt()
+
+    def test_trixie_simulation_rejects_foreign_release_even_with_debian_token(self):
+        for release in (b'OtherDebian:13/stable', b'Debian:13.7/stable, External:1/stable',
+                        b'Debian:12/oldstable'):
+            with self.subTest(release=release):
+                data = STOCK_PLAN.replace(b'Debian:13.7/stable', release)
+                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_APT_PLAN'):
+                    g._simulation((), lambda *_: (0, data, b''), SIX)
+
+    def test_dpkg_native_multiarch_query_and_stock_config(self):
+        def read(arch, suffix):
+            def run(argv, timeout):
+                rc, out, err = self.h.run(argv, timeout)
+                if argv[0] == '/usr/bin/dpkg-query':
+                    out = out.replace(b'libc6\tii \tamd64\t', f'libc6:{suffix}\tii \t{arch}\t'.encode())
+                return rc, out, err
+            return g._packages(self.h.root, run)[0]
+
+        self.assertEqual(read('amd64', 'amd64')['libc6'], ['1.0-1', 'amd64'])
+        for arch, suffix in (('amd64', 'i386'), ('all', 'amd64'), ('i386', 'amd64')):
+            with self.subTest(arch=arch, suffix=suffix), self.assertRaisesRegex(g.Refusal, 'PACKAGE_DATABASE'):
+                read(arch, suffix)
+        g._overrides(self.h.root)
+        self.h.put('/etc/dpkg/dpkg.cfg.d/99unsafe', 'force-confnew\n')
+        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_OVERRIDE'):
+            g._overrides(self.h.root)
 
     def test_upgrade_removal_or_unrelated_package_cannot_be_authorized(self):
         for action in ('Remv libc6 [1.0-1]\n', 'Inst libc6 [1.0-1] (2.0 Debian:13.1/stable [amd64])\n'):

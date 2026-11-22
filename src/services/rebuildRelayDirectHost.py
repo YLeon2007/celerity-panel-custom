@@ -155,8 +155,38 @@ def command(*args, data=None, wait=6, unit_show=False, quiet=False, negative=Non
     return result.stdout
 
 
+@contextlib.contextmanager
+def package_child_scope():
+    # This one-shot helper is single-threaded and has no other child waiters.
+    # Adopt orphaned descendants, including ones that call setsid() and close
+    # both pipes. Once the original child is reaped, ECHILD proves there is
+    # nothing left to join here; an adopted child of any status is uncertain.
+    libc = ctypes.CDLL(None, use_errno=True)
+    prior = ctypes.c_int()
+    need(libc.prctl(37, ctypes.byref(prior), 0, 0, 0) == 0, 'IN_FLIGHT')  # PR_GET_CHILD_SUBREAPER
+    need(libc.prctl(36, 1, 0, 0, 0) == 0, 'IN_FLIGHT')  # PR_SET_CHILD_SUBREAPER
+    try:
+        yield
+        try:
+            os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError as error:
+            need(error.errno == errno.ECHILD, 'IN_FLIGHT')
+        else:
+            raise Refusal('IN_FLIGHT')
+    finally:
+        need(libc.prctl(36, prior.value, 0, 0, 0) == 0, 'IN_FLIGHT')
+
+
 def bounded_status(argv, end, maximum, *, may_write=False):
-    """A status exists only after both bounded streams reach EOF and we reap the original child."""
+    """Join bounded pipe EOF and original reap, plus writer descendant settlement."""
+    with package_child_scope() if may_write else contextlib.nullcontext():
+        result = _bounded_child_status(argv, end, maximum, may_write)
+    if time.monotonic() >= end:
+        raise subprocess.TimeoutExpired((), 0)
+    return result
+
+
+def _bounded_child_status(argv, end, maximum, may_write):
     def left():
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -394,19 +424,14 @@ def require_machine(machine):
     return machine_id
 
 
-def preflight(machine, *, fresh=False, package_offer=False):
+def preflight(machine, *, fresh=False):
     machine_id = require_machine(machine)
     if fresh:
         package_no_pending()
         # A missing runtime package can start IKE/LNS in its maintainer
         # scripts. Check dpkg before interpreting unit state or preparing PPP;
         # Never change service policy or stop an existing service here.
-        try:
-            require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
-        except Refusal as error:
-            if not package_offer or str(error) != PACKAGE_AUTOSTART_UNSAFE:
-                raise
-            return package_preflight(machine_id)
+        require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
     ppp = ppp_device() is True and ppp_registered()
     xl, ike = (unit(name) for name in (XL, IKE))
     units = [xl['LoadState'], ike['LoadState']]
@@ -4603,6 +4628,7 @@ class PackageRunner:
         self.entered = False
         self.failed = False
         self.apt_dispatched = False
+        self.apt_settled = False
 
     def __call__(self, argv: tuple[str, ...], timeout: int) -> tuple[int, bytes, bytes]:
         try:
@@ -4613,9 +4639,14 @@ class PackageRunner:
                 type(arg) is str and 0 < len(arg) <= 4096 and '\0' not in arg for arg in argv)
                  and type(timeout) is int and timeout > 0, 'IN_FLIGHT')
             end = min(DEADLINE, time.monotonic() + timeout)
+            already_dispatched = self.apt_dispatched
             read_only = self.admit(argv)
             self.remaining -= 1
-            return bounded_status(argv, end, PACKAGE_MAX_OUTPUT, may_write=not read_only)
+            status = bounded_status(argv, end, PACKAGE_MAX_OUTPUT, may_write=not read_only)
+            need(time.monotonic() < end, 'IN_FLIGHT')
+            if not already_dispatched and self.apt_dispatched:
+                self.apt_settled = type(status[0]) is int and status[0] == 0
+            return status
         except Exception:
             # An ordinary nonzero status is returned to the guard and may
             # permit checked cleanup. A timeout, signal or broken status
@@ -4653,10 +4684,7 @@ class PackageRunner:
                 return True
             need(self.entered and argv[5:] == ('daemon-reload',), 'IN_FLIGHT')
             return False
-        if binary == '/usr/sbin/update-rc.d':
-            need(self.entered and len(args) == 2 and args[0] in ('xl2tpd', 'ipsec', 'strongswan-starter', 'nftables')
-                 and args[1] == 'disable', 'IN_FLIGHT')
-            return False
+
         need((binary == '/usr/bin/dpkg' and len(args) == 1 and args[0] in (
               '--print-architecture', '--print-foreign-architectures', '--audit')) or
              (binary == '/usr/bin/dpkg-query' and args[0] == '-W') or
@@ -4753,9 +4781,9 @@ def prepare_packages(request):
             write(receipt_path, None, intent)
             write(pending_path, None, intent)
 
-            def recheck():
+            def recheck(receipt=intent):
                 need(not run.failed and package_scope(machine, fd) == scope and
-                     read(receipt_path, 1024) == read(pending_path, 1024) == intent, 'IN_FLIGHT')
+                     read(receipt_path, 1024) == receipt and read(pending_path, 1024) == intent, 'IN_FLIGHT')
                 need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
 
             def enter():
@@ -4773,9 +4801,11 @@ def prepare_packages(request):
             else:
                 # Only the guard's normal post-cleanup return proves packages
                 # installed, with no owned masks/policy, and services idle.
-                need(run.entered and result is None, 'IN_FLIGHT')
+                need(run.entered and run.apt_settled and result is None, 'IN_FLIGHT')
             recheck()
-            write(receipt_path, intent, entry(encode({**binding, 'phase': 'refused' if refused else 'ready'})))
+            receipt = entry(encode({**binding, 'phase': 'refused' if refused else 'ready'}))
+            write(receipt_path, intent, receipt)
+            recheck(receipt)
             write(pending_path, intent, None)
             package_no_pending()
         need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
@@ -4812,11 +4842,13 @@ def dispatch(request: dict[str, Any]):
          + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
     NO_INSTALL_WRITES = action == 'install'
     fresh = action in ('preflight', 'prepare', 'check', 'install')
-    ready = (preflight(machine, fresh=True, package_offer=True) if action == 'preflight' else
-             preflight(machine, fresh=True) if fresh else preflight(machine))
+    try:
+        ready = preflight(machine, fresh=True) if fresh else preflight(machine)
+    except Refusal as error:
+        if action == 'preflight' and str(error) == PACKAGE_AUTOSTART_UNSAFE:
+            return package_preflight(machine)
+        raise
     if action == 'preflight':
-        if 'packagePreparation' in ready:
-            return ready
         xl = unit(XL)
         pending = pending_xl(xl)
         if pending:

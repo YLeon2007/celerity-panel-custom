@@ -28,7 +28,8 @@ assert command_line[:-1] == ['/usr/bin/timeout', '-k', *timeout, '/usr/bin/pytho
 state_path = root / 'manager.json'
 s = json.loads(state_path.read_text())
 h: dict[str, Any] = {'__name__': 'direct_fixture'}
-native_stock = scenario.startswith('native-stock-')
+package_stock = scenario.startswith('package-stock-')
+native_stock = scenario.startswith('native-stock-') or package_stock
 
 def no_host_dispatch(event, args):
     if event in {'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.exec', 'os.fork'} or event.startswith('socket.'):
@@ -106,7 +107,7 @@ class LocalOS:
     def __getattr__(self, name):
         assert name in ('O_RDONLY', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_WRONLY', 'O_CREAT', 'O_EXCL', 'O_DIRECTORY',
                         'fdopen', 'listxattr', 'mkdir', 'rmdir', 'fsync', 'close', 'fchmod', 'link',
-                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'symlink', 'uname'), name
+                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'symlink', 'uname', 'getpid'), name
         return getattr(os, name)
 
     def readlink(self, path, *, dir_fd=None):
@@ -169,7 +170,8 @@ def stock_open(path, mode='r'):
     modules = [*s['modules'], *(name for name in observers if scenario != 'ppp-network-observers' or name != 'xfrm_user')]
     facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n' +
              ('108 ppp\n' if 'ppp_generic' in s['modules'] else '') + 'Block devices:\n',
-             '/proc/net/dev': 'header\nheader\n eth0: 0\n', '/proc/sys/kernel/random/boot_id': 'fixture-boot\n',
+             '/proc/net/dev': 'header\nheader\n eth0: 0\n',
+             '/proc/sys/kernel/random/boot_id': '12345678-1234-1234-1234-123456789abc\n' if package_stock else 'fixture-boot\n',
              '/proc/999/cgroup': '0::/system.slice/foreign.service\n',
              '/proc/modules': ''.join(f'{name} 4096 0 - Live 0x0\n' for name in modules),
              '/proc/cmdline': 'root=fixture' + (' module_blacklist=l2tp_ppp' if scenario == 'ppp-boot-blacklist' else ''),
@@ -440,7 +442,7 @@ def run(argv, **kwargs):
                      ['-W', '-f=${Conffiles}', 'xl2tpd']):
                 heading = {r'-f=${Version}\n${Architecture}\n${Conffiles}': '1.3.18-1+b1\namd64\n',
                            '-f=${Conffiles}': ''}.get(v[1], 'xl2tpd\tinstall ok installed\tamd64\t1.3.18-1+b1\n')
-                return reply(heading + XL_CONFFILES)
+                return reply(heading + (package_stock_conffiles() if package_stock else XL_CONFFILES))
         assert len(v) == 3 and v[0] == '-W'
         if v[1] == '-f=${Conffiles}':
             assert v[2:] == ['xl2tpd']
@@ -448,7 +450,7 @@ def run(argv, **kwargs):
         assert v[1] == '-f=${db:Status-Abbrev}' and v[2] in s['packages']
         if scenario == 'fresh-stock-runtime':
             s.setdefault('packageChecks', []).append(v[2])
-        missing = v[2] in s.get('missingPackages', ())
+        missing = v[2] not in packages.installed if package_stock else v[2] in s.get('missingPackages', ())
         return reply('' if missing else 'ii ', int(missing))
     if prog == '/usr/bin/ss' and v == ['-H', '-lntup']:
         return reply(''.join(f'{p} LISTEN 0 0 {a}:{n} *:* users:(("fixture",pid={pid},fd=3))\n' for p, a, n, pid in sockets()))
@@ -580,6 +582,19 @@ def modeled_empty_revoke(request, blocked, chap, path, manifest, xl):
 
 h.update(os=LocalOS(), open=modeled_open,
          subprocess=SimpleNamespace(run=modeled_run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired))
+if package_stock:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import rebuildRelayInstallPackageModel as package_model
+    sys.path.pop(0)
+    packages = package_model.attach(root, s, scenario, h, request, assert_host_lock)
+
+    def package_stock_conffiles():
+        assert 'xl2tpd' in packages.installed
+        return ''.join(f' {name} {definition[2]}\n' for name, definition in h['C3_STOCK_RUNTIME']['PACKAGE_FILES'].items()) + (
+            f" /etc/xl2tpd/xl2tpd.conf {s['lnsMd5']}\n")
+elif scenario == 'fresh-stock-runtime':
+    # This legacy refusal fixture lacks a Debian package DB and never runs APT.
+    h['stock_runtime_root'] = lambda: root
 if native_stock and 'C3_STOCK_RUNTIME' in h:
     # No fallback to a locally loaded helper on the RED base.
     assert 'C3_STOCK_ENSURE' in h
@@ -609,6 +624,8 @@ s['lastRefusal'] = None
 try:
     sys.stdin = io.TextIOWrapper(io.BytesIO(wire))
     status = h['main']()
+    if package_stock and status == 0 and request['action'] == 'prepare-packages':
+        package_model.readback(packages, s)
 finally:
     s['sockets'] = sockets()
     state_path.write_text(json.dumps(s))

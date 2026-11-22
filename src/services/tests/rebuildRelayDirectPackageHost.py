@@ -107,6 +107,13 @@ class Adapter(unittest.TestCase):
         self.guard_calls.append('observe')
         return self.plan
 
+    def settled_install(self, argv, end, cap, *, may_write):
+        self.assertEqual(argv, APT_INSTALL)
+        self.assertTrue(time.monotonic() < end <= self.h['DEADLINE'])
+        self.assertEqual(cap, self.h['PACKAGE_MAX_OUTPUT'])
+        self.assertTrue(may_write)
+        return 0, b'', b''
+
     def prepare(self, root, run, expected, enter):
         self.assertEqual(root, self.root)
         self.assertEqual(expected, self.plan)
@@ -124,6 +131,8 @@ class Adapter(unittest.TestCase):
         self.assertIn(str(self.vault.parent), self.synced)
         self.assertGreaterEqual(self.synced.count(str(self.vault)), 2)
         enter()
+        with patch.dict(self.h, bounded_status=self.settled_install):
+            self.assertEqual(run(APT_INSTALL, 78), (0, b'', b''))
         self.effects.append('package guard effects')
         self.installed = True
 

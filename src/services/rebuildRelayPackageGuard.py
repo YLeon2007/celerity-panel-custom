@@ -29,7 +29,10 @@ from typing import Literal, overload
 
 
 REQUESTED = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables')
+LIBCHARON = 'strongswan-libcharon'  # Debian's version-matched charon library, not another IKE daemon.
 NATIVE = {'strongswan-starter.service': 'strongswan-starter', 'nftables.service': 'nftables'}
+IKE_ALIAS = 'ipsec.service'
+IKE_PRIMARY = 'strongswan-starter.service'
 SYSV = {'xl2tpd': 'xl2tpd', 'ipsec': 'strongswan-starter', 'strongswan-starter': 'strongswan-starter',
         'nftables': 'nftables'}
 UNITS = tuple(sorted(set(NATIVE) | {n + '.service' for n in SYSV} | {
@@ -61,6 +64,10 @@ PROPS = ('Id', 'Names', 'LoadState', 'FragmentPath', 'SourcePath', 'UnitFileStat
 NAME = r'[a-z0-9][a-z0-9+.-]+'
 VERSION = r'[0-9][A-Za-z0-9.+:~\-]*'
 ARCH = 'amd64'  # The surrounding DIRECT stock-package predicates are amd64.
+# C-locale apt-get simulation labels, not independent source authentication.
+RELEASE = r'(?:Debian:13(?:\.[0-9]+)?/stable(?:-updates)?|Debian-Security:13/stable-security)'
+LEGACY_SOURCE = re.compile(r'(deb|deb-src)[ \t]+(?:\[signed-by=' + re.escape(KEYRING) + r'\][ \t]+)?'
+                           r'(\S+)[ \t]+(\S+)[ \t]+(.+)')
 MAX_PLAN = 48
 LIMIT = 8 * 1024 * 1024
 APT_TIMEOUT = 78
@@ -203,6 +210,10 @@ def _environment(root):
     for path in (POLICY, '/usr/sbin/policy-rc.d.distrib', '/etc/alternatives/policy-rc.d'):
         parent = _dir(root, str(Path(path).parent), False)
         need(parent is None or _stat(root / path[1:]) is None, 'PACKAGE_POLICY')
+    # deb-systemd-helper unmask treats these records as its authority to unlink
+    # even a /dev/null link just created by this operation.
+    marked = _dir(root, '/var/lib/systemd/deb-systemd-helper-masked', False)
+    need(marked is None or all(_stat(marked / unit) is None for unit in UNITS), 'PACKAGE_POLICY')
     for path in ('/usr/sbin', SYSTEM):
         need(not any(file.name.startswith('.relay-package-') for file in _dir(root, path).iterdir()), 'PACKAGE_POLICY')
     _overrides(root)
@@ -249,23 +260,30 @@ def _packages(root, run):
     result = {}
     seen = set()
     for line in rows.rstrip('\n').split('\n'):
-        match = re.fullmatch(fr'({NAME})(?::{ARCH})?\t(ii |rc )\t({ARCH}|all)\t({VERSION})', line)
+        match = re.fullmatch(fr'({NAME})(?::({ARCH}))?\t(ii |rc )\t({ARCH}|all)\t({VERSION})', line)
         if match is None:
             raise Refusal('PACKAGE_DATABASE')
-        name, state, arch, version = match.groups()
+        name, qualifier, state, arch, version = match.groups()
+        need(qualifier is None or qualifier == arch, 'PACKAGE_DATABASE')
         need(name not in seen and (name in REQUESTED or not _foreign(name)), 'PACKAGE_FOREIGN')
         seen.add(name)
         if state == 'ii ':
             result[name] = [version, arch]
         else:
-            need(name not in REQUESTED, 'PACKAGE_DATABASE')
+            need(name not in REQUESTED and name != LIBCHARON, 'PACKAGE_DATABASE')
     need({'dpkg', 'apt', 'systemd', 'base-files', 'init-system-helpers'} <= result.keys(), 'PACKAGE_DATABASE')
+    need(LIBCHARON not in result or _charon_pair(result), 'PACKAGE_FOREIGN')
     need(initial == _snapshot(status.lstat()), 'PACKAGE_DATABASE')
     return result, digest, initial
 
 
 def _foreign(name):
-    return name in FOREIGN or name.startswith(('strongswan-', 'charon-', 'libreswan-', 'openswan-', 'xl2tpd-'))
+    return name != LIBCHARON and (name in FOREIGN or name.startswith(
+        ('strongswan-', 'charon-', 'libreswan-', 'openswan-', 'xl2tpd-')))
+
+
+def _charon_pair(packages):
+    return packages[LIBCHARON][1] == ARCH and packages.get('strongswan-charon') == packages[LIBCHARON]
 
 
 def _quiet(run):
@@ -326,6 +344,18 @@ def _shipped(root, run, path, package, installed):
     return hashlib.sha256(data).hexdigest()
 
 
+def _listed_alias(root, installed, path):
+    # dpkg md5sums cover the regular primary, not a shipped symlink. Bind
+    # the alias pathname separately to the same installed package's file list.
+    pkg = NATIVE[IKE_PRIMARY]
+    arch = installed[pkg][1]
+    files = [root / f'var/lib/dpkg/info/{name}.list' for name in (pkg, f'{pkg}:{arch}')]
+    lists = [file for file in files if _stat(file) is not None]
+    need(len(lists) == 1, 'PACKAGE_UNIT_OWNER')
+    rows = _text(_regular(lists[0]), 'PACKAGE_UNIT_OWNER').split('\n')
+    need(sum(row in (path, path.removeprefix('/usr')) for row in rows) == 1, 'PACKAGE_UNIT_OWNER')
+
+
 def _tracked(leaf):
     return (leaf in UNITS or leaf == 'service.d'
             or any(leaf.startswith((unit + '.', unit[:-8] + '@'))
@@ -378,6 +408,8 @@ def _layout(root, run, installed, owned=None, new=()):
                  _owner(entry.lstat()) and os.readlink(entry) == '../init.d/' + name, 'PACKAGE_SYSV')
             if entry.name.startswith('S'):
                 need(name in scripts and SYSV[name] in new, 'PACKAGE_SYSV_ENABLED')
+                need(base[-3] in 'S2345' and _stat(entry.with_name('K' + entry.name[1:])) is None,
+                     'PACKAGE_SYSV')
                 starts.append(str(entry.relative_to(root)))
             evidence[str(entry.relative_to(root))] = _snapshot(entry.lstat())
     for base in UNIT_DIRS:
@@ -393,6 +425,12 @@ def _layout(root, run, installed, owned=None, new=()):
                 owned[rel].check(root)
             elif base == VENDOR and name in vendor:
                 pass  # Verified before traversing local boot links.
+            elif base == VENDOR and name == IKE_ALIAS:
+                need(IKE_PRIMARY in vendor and _owner(info) and info.st_nlink == 1 and target in (
+                    IKE_PRIMARY, f'{VENDOR}/{IKE_PRIMARY}', f'/lib/systemd/system/{IKE_PRIMARY}'),
+                    'PACKAGE_UNIT_OWNER')
+                _listed_alias(root, installed, rel)
+                aliases[name] = IKE_PRIMARY
             elif base == LATE and name == 'l2tpd.service' and 'xl2tpd' in scripts:
                 need(base in paths and _owner(info) and target == 'xl2tpd.service', 'PACKAGE_UNIT_OWNER')
                 aliases[name] = 'xl2tpd.service'
@@ -434,7 +472,8 @@ def _layout(root, run, installed, owned=None, new=()):
     if owned is not None:
         for art in owned.values():
             art.check(root)
-    need(not (vendor.keys() & generated.keys()) and (not aliases or 'xl2tpd.service' in generated)
+    need(not (vendor.keys() & generated.keys()) and not (aliases.keys() & generated.keys())
+         and ('l2tpd.service' not in aliases or 'xl2tpd.service' in generated)
          and vendor_or_names(installed) == vendor.keys() and ('xl2tpd' not in installed or 'xl2tpd' in scripts),
          'PACKAGE_UNIT_OWNER')
     return evidence, scripts, vendor, generated, aliases, sorted(starts), paths
@@ -505,19 +544,22 @@ def _sources(root):
         files += sorted(p for p in parts.iterdir() if p.suffix in ('.list', '.sources'))
     sources = set()
 
-    def add(uri, suite, components):
+    def add(uri, suite, components, binary):
         need(re.fullmatch(r'https?://(?:deb\.debian\.org/(?:debian|debian-security)|security\.debian\.org/debian-security)/?', uri)
              and suite in {'trixie', 'trixie-updates', 'trixie-security'}
              and (suite == 'trixie-security') == ('debian-security' in uri)
              and 'main' in components and set(components) <= {'main', 'contrib', 'non-free', 'non-free-firmware'},
              'PACKAGE_SOURCES')
         # Keep main only, no source-supplied trust/targets/options.
-        sources.add((uri.rstrip('/'), suite))
+        if binary:
+            sources.add((uri.rstrip('/'), suite))
 
     for file in files:
         data = _text(_regular(file, 64 * 1024), 'PACKAGE_SOURCES')
-        lines = [line.split('#', 1)[0].rstrip() for line in data.split('\n')]
         if file.suffix == '.sources':
+            # In DEB822 a comment is a whole line. An inline suffix is part of
+            # the value (notably for Signed-By), and must not be discarded.
+            lines = [line.rstrip() for line in data.split('\n') if not line.startswith('#')]
             for f in _stanzas('\n'.join(lines), 'PACKAGE_SOURCES'):
                 need(f.keys() <= {'types', 'uris', 'suites', 'components', 'signed-by', 'architectures'}
                      and f.get('types', '').split() in (['deb'], ['deb', 'deb-src'])
@@ -526,14 +568,18 @@ def _sources(root):
                 uris, suites = f.get('uris', '').split(), f.get('suites', '').split()
                 need(len(uris) == 1 and bool(suites), 'PACKAGE_SOURCES')
                 for suite in suites:
-                    add(uris[0], suite, f.get('components', '').split())
+                    add(uris[0], suite, f.get('components', '').split(), True)
         else:
-            for line in lines:
-                if line.strip():
-                    f = line.split()
-                    need(len(f) >= 4 and f[0] in ('deb', 'deb-src'), 'PACKAGE_SOURCES')
-                    add(f[1], f[2], f[3:])
-    need(sum(suite == 'trixie' for _, suite in sources) == 1 and len(sources) <= 3, 'PACKAGE_SOURCES')
+            for raw in data.split('\n'):
+                line = raw.split('#', 1)[0].strip()
+                if line:
+                    match = LEGACY_SOURCE.fullmatch(line)
+                    if match is None:
+                        raise Refusal('PACKAGE_SOURCES')
+                    kind, uri, suite, components = match.groups()
+                    add(uri, suite, components.split(), kind == 'deb')
+    suites = {suite for _, suite in sources}
+    need('trixie' in suites and len(suites) == len(sources), 'PACKAGE_SOURCES')
     lists = _dir(root, '/var/lib/apt/lists')
     archives = _dir(root, '/var/cache/apt/archives')
     _dir(root, '/usr/lib/apt/methods')
@@ -573,8 +619,9 @@ def _memfile(stack, name, data):
 
 @contextmanager
 def _apt(sources, pins=None):
-    # APT_CONFIG is read before the default configuration snippets. Bypass all
-    # host hooks, overrides, auth and preferences; use only Debian's keyring.
+    # APT_CONFIG is read before the default configuration snippets. Isolation
+    # relies on APT honoring the empty paths before loading any snippets, and
+    # on its source/preference readers opening the live, absolute proc-fd paths.
     with ExitStack() as stack:
         def mem(name, text):
             return stack.enter_context(_memfile(stack, name, text))
@@ -629,17 +676,17 @@ def _simulation(apt, run, specs):
         if match:
             totals.append(int(match[1]))
         elif line.startswith(('Inst ', 'Conf ')):
-            m = re.fullmatch(fr'(Inst|Conf) ({NAME}) \(({VERSION}) (.+) \[({ARCH}|all)\]\)', line)
-            if m is None or not re.search(r'\bDebian(?:-Security)?:', m[4]):
+            m = re.fullmatch(fr'(Inst|Conf) ({NAME}) \(({VERSION}) ({RELEASE}(?:, {RELEASE})*) \[({ARCH}|all)\]\)', line)
+            if m is None:
                 raise Refusal('PACKAGE_APT_PLAN')
-            action, name, version, _, arch = m.groups()
+            action, name, version, release, arch = m.groups()
             target = installs if action == 'Inst' else configs
             need(name not in target and (action == 'Inst' or name in installs), 'PACKAGE_APT_PLAN')
-            target[name] = [version, arch]
+            target[name] = (version, arch, release)
         else:
             need(not re.match(r'(?:Inst|Conf|Remv|Purg)\b|\d+ upgraded|WARNING', line), 'PACKAGE_APT_PLAN')
     need(len(installs) <= MAX_PLAN and totals == [len(installs)] and installs == configs, 'PACKAGE_APT_PLAN')
-    return installs
+    return {name: [version, arch] for name, (version, arch, _) in installs.items()}
 
 
 def _metadata(apt, run, plan, installed, missing):
@@ -683,6 +730,8 @@ def _metadata(apt, run, plan, installed, missing):
                 pending.append(dep)
     need(reached == plan.keys() and not plan.keys() & installed.keys()
          and not any(n not in REQUESTED and _foreign(n) for n in plan), 'PACKAGE_DEPENDENCY')
+    if LIBCHARON in plan:
+        need(_charon_pair(plan) and {LIBCHARON} in edges['strongswan-charon'], 'PACKAGE_DEPENDENCY')
     return records
 
 
@@ -806,6 +855,20 @@ class _Artifact:
                 need(_snapshot(os.fstat(f.fileno())) == self.state and f.read(len(self.body) + 1) == self.body,
                      'PACKAGE_CONTAINMENT_RACE')
 
+    def disable_sysv(self, root):
+        self.check(root)
+        # Match Debian's Snn→Knn convention without update-rc.d's overwriting
+        # rename, systemctl disable, or optional insserv/OpenRC side effects.
+        disabled = 'K' + self.leaf[1:]
+        _move(self.parent, self.leaf, self.parent, disabled)
+        moved = _stat(disabled, self.parent)
+        if (moved is None or _snapshot(moved)[:7] != self.state[:7] or moved.st_nlink != self.state[-1]
+                or os.readlink(disabled, dir_fd=self.parent) != self.target):
+            _move(self.parent, disabled, self.parent, self.leaf)
+            raise Refusal('PACKAGE_CONTAINMENT_RACE')
+        os.fsync(self.parent)
+        need(_stat(self.leaf, self.parent) is None, 'PACKAGE_CONTAINMENT_RACE')
+
     def remove(self, root):
         self.check(root)
         # Linux has no compare-and-unlink. Move without replacement to a private
@@ -885,32 +948,35 @@ def _prepare(root, run, expected, enter):
             _quiet(run)
             now, _, _ = _packages(root, run)
             need(now == permits, 'PACKAGE_APT_READBACK')
-            layout = _layout(root, run, now, masks, plan.keys())
-            _units(run, layout, masked=True)
-            need(all(layout[1].get(n) == digest for n, digest in baseline[1].items()) and
-                 all(layout[2].get(n) == digest for n, digest in baseline[2].items()), 'PACKAGE_UNIT_OWNER')
-            for script, owner in SYSV.items():
-                if owner in plan and script in layout[1] and any(
-                        Path(link).name[3:] == script and link.startswith('etc/rc') for link in layout[5]):
-                    _command(run, ('/usr/sbin/update-rc.d', script, 'disable'), 'PACKAGE_SYSV_DISABLE')
-            for link in layout[5]:
-                if not link.startswith('etc/rc'):
-                    art = _Artifact(root, link, stack)
-                    need(art.state == layout[0][link], 'PACKAGE_CONTAINMENT_RACE')
+            postinst = _layout(root, run, now, masks, plan.keys())
+            _units(run, postinst, masked=True)
+            need(all(postinst[1].get(n) == digest for n, digest in baseline[1].items()) and
+                 all(postinst[2].get(n) == digest for n, digest in baseline[2].items()) and
+                 all(postinst[0].get(n) == state for n, state in baseline[0].items()
+                     if n.startswith('etc/rc') or n == f'{VENDOR}/{IKE_ALIAS}'), 'PACKAGE_UNIT_OWNER')
+            for link in postinst[5]:
+                art = _Artifact(root, link, stack)
+                need(art.state == postinst[0][link], 'PACKAGE_CONTAINMENT_RACE')
+                if link.startswith('etc/rc'):
+                    art.disable_sysv(root)
+                else:
                     art.remove(root)
             _reload(run)
             layout = _layout(root, run, now, masks)
             _units(run, layout, masked=True)
-            need(vendor_or_names(now) == layout[2].keys() and ('xl2tpd' not in now or 'xl2tpd' in layout[1]),
-                 'PACKAGE_APT_READBACK')
+            alias_path = f'{VENDOR}/{IKE_ALIAS}'
+            need(layout[1:3] == postinst[1:3] and layout[0].get(alias_path) == postinst[0].get(alias_path),
+                 'PACKAGE_UNIT_OWNER')
             _quiet(run)
             policy.check(root)
             _remove_owned(root, list(masks.values()))
             _reload(run)
-            layout = _layout(root, run, now)
-            _units(run, layout)
+            unmasked = _layout(root, run, now)
+            need(unmasked[1:3] == layout[1:3] and unmasked[0].get(alias_path) == layout[0].get(alias_path),
+                 'PACKAGE_UNIT_OWNER')
+            _units(run, unmasked)
             _quiet(run)
-            need(_packages(root, run)[0] == permits and ('xl2tpd' not in now or 'xl2tpd.service' in layout[3]),
+            need(_packages(root, run)[0] == permits and ('xl2tpd' not in now or 'xl2tpd.service' in unmasked[3]),
                  'PACKAGE_APT_READBACK')
             policy.remove(root)
         except BaseException as error:

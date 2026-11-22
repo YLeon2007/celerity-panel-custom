@@ -65,7 +65,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         mainUid = 65534, cohort = false } = {}) {
         const id = String(relay._id);
         const number = f.nodes.indexOf(relay);
-        const nativeStock = scenario.startsWith('native-stock-');
+        const packageStock = scenario.startsWith('package-stock-');
+        const nativeStock = scenario.startsWith('native-stock-') || packageStock;
         const root = fs.mkdtempSync(join(nativeStock ? tmpdir() : process.cwd(), '.relay-install-join-'));
         t.after(() => fs.rmSync(root, { recursive: true, force: true }));
         const put = (file, bytes, mode = 0o600) => {
@@ -81,7 +82,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const bootLink = '/etc/systemd/system/multi-user.target.wants/' + xl;
         const nativePath = '/etc/systemd/system/' + xl;
         const barePackages = scenario === 'fresh-stock-runtime';
-        const generatedStock = nativeStock && scenario !== 'native-stock-missing';
+        const generatedStock = nativeStock && !packageStock && scenario !== 'native-stock-missing';
         const freshStock = barePackages || nativeStock;
         const stock = join(__dirname, '../../../modules/relay-l2tp/node-artifacts/l2tp');
         const key = Buffer.from('synthetic SSH wire key:' + id);
@@ -156,7 +157,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         put('/etc/systemd/system/foreign.service', '[Service]\nExecStart=/bin/false\n', 0o644);
         fs.mkdirSync(join(root, 'etc/ipsec.d'), { mode: 0o755 });
         let lns;
-        if (nativeStock) {
+        if (packageStock) {
+            // No xl2tpd/IKE conffiles until modeled APT on this same root.
+            lns = '';
+        } else if (nativeStock) {
             seedNativeStock(put, root, generatedStock);
             if (scenario === 'native-stock-orphan-wrapper') {
                 fs.unlinkSync(join(root, '/usr/lib/systemd/system-generators/systemd-sysv-generator'));
@@ -208,7 +212,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             }) : freshStock ? unit('', { LoadState: 'not-found', UnitFileState: '' }) : unit(nativePath, { LoadState: scenario === 'masked' ? 'masked' : 'loaded',
                 UnitFileState: scenario === 'masked' ? 'masked' : preEnabled || scenario === 'prewrite' ? 'enabled' : 'disabled',
                 ControlGroup: '/system.slice/' + xl, ExecStart: '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }' }),
-            [ike]: unit('/usr/lib/systemd/system/' + ike, { ExecStart: '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }',
+            [ike]: unit(packageStock ? '' : '/usr/lib/systemd/system/' + ike, {
+                ...(packageStock && { LoadState: 'not-found', UnitFileState: '' }),
+                ExecStart: '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }',
                 ControlGroup: '/system.slice/' + ike, ...((idleIke || scenario.startsWith('ike-')) && { ActiveState: 'active', SubState: 'running',
                     MainPID: '200', InvocationID: 'c'.repeat(32), UnitFileState: 'enabled' }) }),
             [net]: unit('', { LoadState: 'not-found', UnitFileState: '' }),
@@ -233,7 +239,18 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             put('/usr/lib/modules-load.d/50-stock.conf', 'l2tp_ppp\n', 0o644);
             fs.symlinkSync('/dev/null', join(root, '/etc/modules-load.d/50-stock.conf'));
         }
-        const manager = put('manager.json', JSON.stringify({ packages, machine: machineId, address: relay.ip, cohort, original, units: original,
+        let packageModel;
+        if (packageStock) {
+            const init = spawnSync('/usr/bin/python3', ['-I', '-B', join(__dirname, 'rebuildRelayInstallPackageModel.py'), root, scenario],
+                { env: {}, encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 });
+            assert.equal(init.status, 0, init.stderr || init.error?.code);
+            packageModel = JSON.parse(init.stdout);
+            if (scenario === 'package-stock-active') Object.assign(original[ike], {
+                LoadState: 'loaded', UnitFileState: 'disabled', ActiveState: 'active', SubState: 'running', MainPID: '735',
+                FragmentPath: '/usr/lib/systemd/system/' + ike,
+            });
+        }
+        const manager = put('manager.json', JSON.stringify({ packages, packageModel, machine: machineId, address: relay.ip, cohort, original, units: original,
             missingPackages: barePackages ? ['strongswan-starter', 'xl2tpd'] : scenario === 'package' ? ['ppp'] : [],
             modules: barePackages || ['ppp-both', 'ppp-reservation-ack'].includes(scenario) ? []
                 : ['ppp-l2tp', 'ppp-load-failure', 'ppp-load-timeout', 'ppp-no-readback', 'ppp-lost-ack'].includes(scenario)
@@ -276,14 +293,15 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             const rows = f.users.filter(row => String(row.relayNode) === id);
             if (action === 'install') assert.ok(state?.status === 'installing' && rows.length
                 && rows.every(user => user.syncStatus === 'pending'));
-            if (nativeStock && ['preflight', 'prepare', 'check', 'install', 'verify', 'rollback'].includes(action)) {
-                const reserved = ['install', 'verify', 'rollback'].includes(action);
+            if (nativeStock && ['preflight', 'prepare-packages', 'prepare', 'check', 'install', 'verify', 'rollback'].includes(action)) {
+                const reserved = ['install', 'verify', 'rollback', 'prepare-packages'].includes(action)
+                    || (packageStock && actions.includes('prepare-packages'));
                 assert.deepEqual(f.nativeCommits, reserved ? ['commit'] : []);
                 assert.equal(f.states.length, Number(reserved));
                 assert.equal(f.users.length, Number(reserved));
                 if (reserved) {
                     assert.equal(state.status, 'installing');
-                    assert.equal(state.backupId, request.backupId);
+                    if (request.backupId !== undefined) assert.equal(state.backupId, request.backupId);
                     assert.equal(rows[0].syncStatus, 'pending');
                 } else {
                     assert.deepEqual(records().effects, []);
@@ -321,6 +339,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             if (/^DIRECT_[A-Z_]+\n$/.test(result.stderr)) refusals.push(result.stderr.trim());
             if (nativeStock && result.status === 0 && ['preflight', 'prepare'].includes(action)) {
                 const reply = JSON.parse(result.stdout);
+                if (reply.packagePreparation) assert.match(reply.packagePreparation, /^[a-f0-9]{64}$/);
                 nativeReplies.push({ action, unitsLoaded: reply.unitsLoaded, nativePreparation: reply.nativePreparation });
             }
             if (action === 'prepare-remove' && result.status === 0) removeBaseline = JSON.parse(result.stdout).baseline;
@@ -329,10 +348,11 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             }
             return result;
         };
-        const before = Object.fromEntries([mainPath, bridgePath, '/etc/ipsec.conf', '/etc/ppp/chap-secrets', '/etc/ipsec.secrets',
-            '/etc/xl2tpd/xl2tpd.conf', '/etc/ppp/options', '/etc/systemd/system/' + x, ...(!freshStock ? [nativePath] : []),
-            '/etc/systemd/system/foreign.service', '/usr/lib/systemd/system/' + ike, '/usr/local/bin/xray',
-            ...(nativeStock ? Object.keys(xlPackageFiles).slice(0, 2) : []),
+        const before = Object.fromEntries([mainPath, bridgePath, '/etc/ppp/chap-secrets', '/etc/ppp/options',
+            ...(!packageStock ? ['/etc/ipsec.conf', '/etc/ipsec.secrets', '/etc/xl2tpd/xl2tpd.conf', '/usr/lib/systemd/system/' + ike] : []),
+            '/etc/systemd/system/' + x, ...(!freshStock ? [nativePath] : []),
+            '/etc/systemd/system/foreign.service', '/usr/local/bin/xray',
+            ...(nativeStock && !packageStock ? Object.keys(xlPackageFiles).slice(0, 2) : []),
             ...(generatedStock ? [generatedPath] : []),
             ...(scenario === 'native-stock-dropin' ? [foreignDropIn] : []), ...(scenario === 'native-stock-fragment' ? [foreignFragment] : []),
             ...swanLeaves, ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
@@ -613,6 +633,78 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             { action: 'preflight', unitsLoaded: false, nativePreparation: true },
             { action: 'prepare', unitsLoaded: false, nativePreparation: undefined },
         ]);
+    }
+
+    for (const scenario of ['installed', 'cut', 'active', 'foreign', 'not-authorized']) {
+        test(`joined package Install with packed guard: ${scenario}`, async t => {
+            const f = host(t, 'package-stock-' + scenario, { cohort: true });
+            const session = sessionFixture(t, f);
+            f.nativeCommits = session.events;
+            const binding = { nodeId: id, host: f.relay.ip, port: 22, username: 'root', sshHostKeySha256: f.pin, machineId };
+            const rows = scenario === 'not-authorized' ? [] : [{ ...binding,
+                generation: 'a1f2edc4-676c-4a6e-b111-a1239fbbcd1e', createdBy: 'fixture', confirmedBy: 'fixture',
+                createdAt: new Date(0), confirmedAt: new Date(0) }];
+            const grantDb = { readyState: 1, collection(name) {
+                assert.equal(name, 'c3_rebuild_l2tp_relay_grants');
+                return { find(filter, options) {
+                    assert.deepEqual(filter, {});
+                    assert.deepEqual(options.readConcern, { level: 'majority' });
+                    return { toArray: async () => rows.map(row => ({ ...row })) };
+                } };
+            } };
+            delete f.env.C3_REBUILD_L2TP_RELAY_ID;
+            delete f.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
+            delete f.env.C3_REBUILD_L2TP_SSH_SHA256;
+            if (scenario === 'cut') session.hooks.commit = commit => { commit(); throw Error('fixture lost commit ACK'); };
+            const before = snapshotNative(f);
+            const { status, result } = await submitNative({ ...f, create: () => f.create({ grantDb }) });
+            const model = f.records(), { installed, aptReads, aptWrites, quiet, effects } = model.packageModel;
+            const vault = join(f.root, '/var/lib/celerity-rebuild-l2tp-direct');
+            if (scenario !== 'installed') {
+                assert.equal(status, 409, JSON.stringify(result.error));
+                assert.equal(result.error.code, ({ cut: 'REBUILD_L2TP_RESERVATION_FAILED',
+                    'not-authorized': 'REBUILD_L2TP_INSTALL_DISABLED' })[scenario] ?? 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                diagnostic(f));
+                assert.deepEqual(f.actions, scenario === 'not-authorized' ? [] : ['preflight']);
+                assert.deepEqual(f.nativeCommits, scenario === 'cut' ? ['commit'] : []);
+                assert.deepEqual(f.states.map(row => row.status), scenario === 'cut' ? ['installing'] : []);
+                assert.equal(f.lockHeld, scenario === 'cut');
+                assert.equal(aptWrites, 0);
+                // The read-only plan is required to offer packages. Only
+                // modeled argv is observed here, never a real APT process.
+                if (scenario === 'cut') assert.ok(aptReads.preflight > 0);
+                else assert.deepEqual(aptReads, {});
+                if (scenario === 'active' || scenario === 'foreign') {
+                    assert.equal(model.lastRefusal[0], scenario === 'active' ? 'PACKAGE_UNIT_ACTIVE' : 'PACKAGE_UNIT_OWNER', diagnostic(f));
+                    assert.deepEqual(f.refusals, ['DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE']);
+                }
+                assert.deepEqual([effects, model.effects], [[], []]);
+                assert.deepEqual(snapshotNative(f), before);
+                assert.equal(present(vault), false);
+                return;
+            }
+            assert.equal(status, 200, JSON.stringify({ ...result.error, ...JSON.parse(diagnostic(f)), actions: f.actions }));
+            assert.deepEqual(result, { executionMode: 'rebuild', status: 'installed', nodeId: id });
+            assert.deepEqual(f.actions, ['preflight', 'prepare-packages', ...installedActions.slice(1)]);
+            assert.deepEqual(f.nativeReplies.slice(1), [
+                { action: 'preflight', unitsLoaded: false, nativePreparation: true },
+                { action: 'prepare', unitsLoaded: false, nativePreparation: undefined },
+            ]);
+            assert.deepEqual(f.nativeCommits, ['commit', 'commit']);
+            assert.equal(f.lockHeld, false);
+            assert.ok(model.packages.every(name => Object.hasOwn(installed, name)));
+            assert.equal(aptWrites, 1);
+            assert.ok(aptReads.preflight > 0 && aptReads['prepare-packages'] > 0);
+            assert.deepEqual(quiet, { [f.xl]: 'generated', [f.ike]: 'disabled', 'nftables.service': 'disabled' });
+            assert.deepEqual(effects, ['enter', 'reload', 'apt', 'reload', 'reload']);
+            assert.deepEqual(model.nativeCreates, ['install']);
+            assert.equal(f.users[0].syncStatus, 'synced');
+            const [{ backupId, status: state }] = f.states;
+            assert.equal(state, 'installed');
+            assert.equal(readJson(join(vault, `packages-${backupId}.json`)).phase, 'ready');
+            assert.equal(readJson(join(vault, backupId, 'manifest.json')).phase, 'installed');
+            assert.equal(present(join(vault, 'package-preparation.pending')), false);
+        });
     }
 
     const snapshotNative = f => ['etc', 'usr', 'run', 'var'].filter(dir => present(join(f.root, dir))).flatMap(dir =>
