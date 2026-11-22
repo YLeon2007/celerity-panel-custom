@@ -20,9 +20,12 @@ type API struct {
 	onlineTracker *OnlineTracker
 	// shipper is nil when access-log collection is disabled.
 	shipper *Shipper
+	// Bound observations independently of the existing HTTP endpoints.
+	reverseObservations chan struct{}
 }
 
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
+	a.reverseObservations = make(chan struct{}, 6)
 	mux.HandleFunc("GET /health", a.auth(a.handleHealth))
 	mux.HandleFunc("GET /info", a.auth(a.handleInfo))
 	mux.HandleFunc("POST /connect", a.auth(a.handleConnect))
@@ -31,6 +34,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /users/{email}", a.auth(a.denyHTTPMutation(a.handleRemoveUser)))
 	mux.HandleFunc("GET /stats", a.auth(a.handleStats))
 	mux.HandleFunc("GET /online", a.auth(a.handleOnline))
+	mux.HandleFunc("GET /rebuild/reverse-observation/{id}", a.auth(a.handleReverseObservation))
 	mux.HandleFunc("POST /restart", a.auth(a.denyHTTPMutation(a.handleRestart)))
 }
 

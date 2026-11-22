@@ -17,6 +17,7 @@ const {
 } = require('../../services/classicScopedCascadeDeploymentService');
 const { issueClassicLifecycleGrant } = require('../../services/classicLifecycleAuthorization');
 const { isRebuildEnabled, rebuildStrictDisabled } = require('../../services/rebuildMode');
+const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -59,28 +60,33 @@ const getTopologySchema = z.object({});
 
 async function queryCascade(args) {
     const parsed = queryCascadeSchema.parse(args);
-
+    const rebuild = isRebuildEnabled();
     if (parsed.id) {
-        const link = await CascadeLink.findById(parsed.id)
+        const query = CascadeLink.findById(parsed.id);
+        if (rebuild) query.select(observationSelect).lean();
+        const link = await query
             .populate('portalNode', 'name ip status')
             .populate('bridgeNode', 'name ip status');
         if (!link) return { error: `Cascade link '${parsed.id}' not found`, code: 404 };
-        return { link };
+        return { link: rebuild ? projectReverseHealth(link) : link };
     }
 
     const filter = {};
     if (parsed.filter?.active !== undefined) filter.active = parsed.filter.active;
-    if (parsed.filter?.status) filter.status = parsed.filter.status;
+    if (!rebuild && parsed.filter?.status) filter.status = parsed.filter.status;
     if (parsed.filter?.nodeId) {
         filter.$or = [{ portalNode: parsed.filter.nodeId }, { bridgeNode: parsed.filter.nodeId }];
     }
 
-    const links = await CascadeLink.find(filter)
+    const query = CascadeLink.find(filter);
+    if (rebuild) query.select(observationSelect).lean();
+    const links = await query
         .populate('portalNode', 'name ip status')
         .populate('bridgeNode', 'name ip status')
         .sort({ createdAt: -1 });
 
-    return { links };
+    return { links: rebuild ? links.map(link => projectReverseHealth(link))
+        .filter(link => !parsed.filter?.status || parsed.filter.status === link.status) : links };
 }
 
 let draftWriteService;
@@ -293,10 +299,13 @@ async function manageCascade(args, emit) {
 }
 
 async function getTopology() {
+    const rebuild = isRebuildEnabled();
+    const query = CascadeLink.find({});
+    if (rebuild) query.select(observationSelect);
     const [state, nodes, links] = await Promise.all([
         CascadeTopologyState.findById('singleton').select('revision deployedRevision').lean(),
         HyNode.find({ active: true }).select('name ip status cascadeRole country type').lean(),
-        CascadeLink.find({})
+        query
             .populate('portalNode', 'name ip status')
             .populate('bridgeNode', 'name ip status')
             .lean(),
@@ -306,15 +315,19 @@ async function getTopology() {
         topologyRevision: state?.revision ?? 0,
         deployedRevision: state?.deployedRevision ?? 0,
         nodes,
-        links: links.map(l => ({
-            _id: l._id,
-            name: l.name,
-            status: l.status,
-            mode: l.mode,
-            tunnelPort: l.tunnelPort,
-            portal: l.portalNode ? { _id: l.portalNode._id, name: l.portalNode.name } : null,
-            bridge: l.bridgeNode ? { _id: l.bridgeNode._id, name: l.bridgeNode.name } : null,
-        })),
+        links: links.map(row => {
+            const l = rebuild ? projectReverseHealth(row) : row;
+            return {
+                _id: l._id,
+                name: l.name,
+                status: l.status,
+                ...(rebuild && l.observationExpiresAt ? { observationExpiresAt: l.observationExpiresAt } : {}),
+                mode: l.mode,
+                tunnelPort: l.tunnelPort,
+                portal: l.portalNode ? { _id: l.portalNode._id, name: l.portalNode.name } : null,
+                bridge: l.bridgeNode ? { _id: l.bridgeNode._id, name: l.bridgeNode.name } : null,
+            };
+        }),
     };
 }
 

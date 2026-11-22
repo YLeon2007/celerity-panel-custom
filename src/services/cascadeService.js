@@ -20,10 +20,14 @@ const { withClassicNodeConfigWrite, assertClassicNodeConfigWriteHeld,
 const cache = require('./cacheService');
 const logger = require('../utils/logger');
 const webhook = require('./webhookService');
+const { isRebuildEnabled } = require('./rebuildMode');
+const { clearOldReverseHealth, projectReverseHealth, observationSelect, createReverseObserver } = require('./rebuildReverseLinkHealth');
 const { trackLegacyCascadeUndeploy } = require('../modules/relay-l2tp/services/legacyCascadeUndeploy');
 
 const TOPOLOGY_CACHE_KEY = 'c3:cascade:topology';
 const TOPOLOGY_CACHE_TTL = 15;
+const reverseObserver = createReverseObserver({ Link: CascadeLink, Node: HyNode,
+    request: (...args) => require('./syncService').readRebuildReverseObservation(...args) });
 
 /**
  * Safe Redis helpers — cache module exposes .redis but may not be connected.
@@ -1281,11 +1285,26 @@ class CascadeService {
 
     /**
      * Health-check a single cascade link.
-     * Reverse: verify ESTABLISHED connections on Portal's tunnel port.
+     * Classic reverse: verify ESTABLISHED connections on Portal's tunnel port.
+     * Rebuild reverse: use only the receiving agent's scoped observation.
      * Forward: verify TCP connectivity to Bridge's tunnel port.
      */
     async healthCheckLink(link) {
         const isForward = link.mode === 'forward';
+        const rebuild = isRebuildEnabled();
+        if (rebuild && !isForward) {
+            await clearOldReverseHealth(CascadeLink, link._id);
+            return reverseObserver.manual(link._id);
+        }
+        // A rebuild forward observation must not overwrite a concurrently
+        // edited reverse draft or a retiring link. Classic is unchanged.
+        const filter = { _id: link._id };
+        if (rebuild) {
+            if (!link.active || link.rebuildDelete || link.lifecycle
+                || !['deployed', 'online', 'offline'].includes(link.status)) return false;
+            Object.assign(filter, { mode: 'forward', active: true, rebuildDelete: { $ne: true },
+                lifecycle: null, status: link.status, updatedAt: link.updatedAt ?? null });
+        }
         const checkNodeId = isForward ? link.bridgeNode : link.portalNode;
         const checkNode = await HyNode.findById(checkNodeId);
         if (!checkNode) return false;
@@ -1303,7 +1322,7 @@ class CascadeService {
             const prevStatus = link.status;
             const newStatus  = healthy ? 'online' : 'offline';
 
-            await CascadeLink.updateOne({ _id: link._id }, {
+            const result = await CascadeLink.updateOne(filter, {
                 $set: {
                     status:          newStatus,
                     lastHealthCheck: new Date(),
@@ -1312,6 +1331,7 @@ class CascadeService {
                 },
             });
 
+            if (rebuild && result.matchedCount !== 1) return false;
             if (prevStatus !== newStatus) {
                 const event = healthy ? 'cascade.online' : 'cascade.offline';
                 webhook.emit(event, { linkId: link._id, name: link.name });
@@ -1320,7 +1340,7 @@ class CascadeService {
 
             return healthy;
         } catch (error) {
-            await CascadeLink.updateOne({ _id: link._id }, {
+            await CascadeLink.updateOne(filter, {
                 $set: { status: 'error', lastError: error.message, lastHealthCheck: new Date() },
             });
             return false;
@@ -1332,9 +1352,12 @@ class CascadeService {
      * Called periodically by cron.
      */
     async healthCheckAll() {
+        const rebuild = isRebuildEnabled();
+        if (rebuild) await clearOldReverseHealth(CascadeLink);
         const links = await CascadeLink.find({
             active: true,
             status: { $in: ['deployed', 'online', 'offline'] },
+            ...(rebuild ? { mode: 'forward' } : {}),
         });
 
         if (links.length === 0) return;
@@ -1348,6 +1371,10 @@ class CascadeService {
         await this._invalidateTopologyCache();
     }
 
+    async healthCheckRebuildReverse() {
+        if (isRebuildEnabled()) await reverseObserver.sweep();
+    }
+
     /**
      * Build the full network topology graph for the visual map.
      * Returns nodes and edges formatted for cytoscape.js consumption.
@@ -1356,17 +1383,22 @@ class CascadeService {
      * @returns {Promise<{nodes: Array, edges: Array}>}
      */
     async getTopology() {
-        const cached = await cacheGet(TOPOLOGY_CACHE_KEY);
+        const rebuild = isRebuildEnabled();
+        // Current-generation, time-sensitive reverse evidence must never be
+        // sourced from a Redis map (including maps written by older panels).
+        const cached = !rebuild && await cacheGet(TOPOLOGY_CACHE_KEY);
         if (cached) {
             try { return JSON.parse(cached); } catch (_) {}
         }
 
+        const linkQuery = CascadeLink.find({ active: true });
+        if (rebuild) linkQuery.select(observationSelect);
         const [allNodes, allLinks] = await Promise.all([
             // Virtual nodes have no IP/country and don't participate in the cascade.
             HyNode.find({ active: true, type: { $ne: 'virtual' } })
                 .select('name ip domain flag type status onlineUsers cascadeRole mapPosition country port ssh')
                 .lean(),
-            CascadeLink.find({ active: true })
+            linkQuery
                 .populate('portalNode', 'name ip')
                 .populate('bridgeNode', 'name ip')
                 .lean(),
@@ -1392,7 +1424,8 @@ class CascadeService {
                 : undefined,
         }));
 
-        const edges = allLinks.map(l => ({
+        const visibleLinks = rebuild ? allLinks.map(link => projectReverseHealth(link)) : allLinks;
+        const edges = visibleLinks.map(l => ({
             data: {
                 id: `link-${l._id}`,
                 linkId: String(l._id),
@@ -1400,6 +1433,7 @@ class CascadeService {
                 target: String(l.bridgeNode?._id || l.bridgeNode),
                 label: l.name,
                 status: l.status,
+                ...(l.observationExpiresAt && rebuild ? { observationExpiresAt: l.observationExpiresAt } : {}),
                 tunnelPort: l.tunnelPort,
                 latencyMs: l.latencyMs,
                 tunnelProtocol: l.tunnelProtocol,
@@ -1465,7 +1499,7 @@ class CascadeService {
         }
 
         const topology = { nodes, edges };
-        await cacheSet(TOPOLOGY_CACHE_KEY, JSON.stringify(topology), TOPOLOGY_CACHE_TTL);
+        if (!rebuild) await cacheSet(TOPOLOGY_CACHE_KEY, JSON.stringify(topology), TOPOLOGY_CACHE_TTL);
         return topology;
     }
 
@@ -1859,7 +1893,7 @@ class CascadeService {
     }
 
     async _invalidateTopologyCache() {
-        await cacheDel(TOPOLOGY_CACHE_KEY);
+        if (!isRebuildEnabled()) await cacheDel(TOPOLOGY_CACHE_KEY);
     }
 
     /**

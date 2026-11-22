@@ -664,9 +664,17 @@ def transit_inbounds(data: dict[str, Any], transit: Any) -> dict[str, int]:
         matching = [i for i in data['inbounds'] if i.get('tag') == tag]
         need(tag not in owned and len(matching) == 1, 'PROFILE_USERS')
         row = matching[0]
+        settings, stream = row.get('settings', {}), row.get('streamSettings', {})
+        clients = settings.get('clients') if type(settings) is dict else None
+        if (reverse and type(clients) is list and len(clients) == 1 and type(clients[0]) is dict
+                and 'email' in clients[0] and type(stream) is dict and stream.get('network') == 'tcp'
+                and stream.get('security') == 'reality' and settings.get('decryption') == 'none'
+                and re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', edge['uuid'].lower())):
+            digest = hashlib.sha256(edge['uuid'].lower().encode('ascii')).hexdigest()
+            client['email'] = 'rproof-' + edge['linkId'] + '-' + digest + '@rebuild.invalid'
         need(row.get('protocol') == 'vless' and row.get('listen') == '0.0.0.0'
              and type(row.get('port')) is int and row['port'] == edge['port']
-             and row.get('settings', {}).get('clients') == [client], 'PROFILE_USERS')
+             and clients == [client], 'PROFILE_USERS')
         owned[tag] = int(row['port'])
     return owned
 
@@ -695,7 +703,10 @@ def xray_users(config, info, rows, transit=None):
             # ss prints the IPv4 wildcard as 0.0.0.0 or * on a dual-stack socket.
             need(any(address in ('0.0.0.0', '*') for address, _ in listeners)
                  and all(owners == [pid] for _, owners in listeners), 'RUNTIME_UNPROVED')
-            continue
+            if not clients[0].get('email'):
+                continue  # Legacy anonymous transit is not listed by HandlerService.
+            # A labeled native reverse account is listed: verify it just like
+            # a subscriber without giving up the transit socket/receipt checks.
         # Subscriber inventory still requires the full HandlerService list,
         # not a count. Refuse dynamic or unrecognised account shapes.
         result = json.loads(command(XRAY, 'api', 'inbounduser', '--server=127.0.0.1:' + str(port), '-tag=' + tag,

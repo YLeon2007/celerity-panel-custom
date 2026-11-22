@@ -4,6 +4,7 @@ const generator = require('../../../services/configGenerator');
 const { tunnelSettings } = require('../../../services/rebuildLinkKeys');
 const { tunnelName } = require('../../../services/rebuildTunnelTls');
 const { assertRealityFingerprint } = require('../../../services/rebuildRealityFingerprint');
+const { reverseObservationEmail } = require('../../../services/rebuildReverseIdentity');
 const { composeXrayConfig } = require('./xrayConfigComposer');
 const { compileRebuildGraph, rebuildId, requireRebuild } = require('../domain/rebuildTopologyCompiler');
 
@@ -55,6 +56,10 @@ function projectLinks(graph, options, dialerVersions) {
         // Xray creates the source-side outbound and the target-side inbound
         // from these reverse tags. There is no legacy control-domain route.
         const client = { id, ...(reverse ? { reverse: { tag: egressTag(entry) } } : {}) };
+        if (reverse && protocol === 'vless' && security === 'reality' && (link.tunnelTransport ?? 'tcp') === 'tcp') {
+            const email = reverseObservationEmail(entry.id, id);
+            if (email) client.email = email;
+        }
         const endpoint = { address: server.ip, port };
         const dialUser = protocol === 'vmess' ? { id, alterId: 0, security: 'auto' } : { id, encryption };
         const dialSettings = reverse

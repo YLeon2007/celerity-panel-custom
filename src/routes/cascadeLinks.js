@@ -19,6 +19,7 @@ const {
 const { maintainAutoL2tpPaths } = require('../modules/relay-l2tp/services/autoL2tpPathMaintenance');
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
+const { isReverse, projectReverseHealth, observationSelect } = require('../services/rebuildReverseLinkHealth');
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const {
@@ -317,33 +318,44 @@ async function readPersistedIntent(service, Link, requestKey) {
         .read('primary').readConcern('majority').maxTimeMS(5000).lean();
 }
 
-async function listLinks(Link, filter = {}) {
-    return Link.find(filter)
+async function listLinks(Link, filter = {}, rebuild = false) {
+    const query = Link.find(filter);
+    if (rebuild) query.select(observationSelect);
+    return query
         .populate('portalNode', LINK_POPULATE_SELECT)
         .populate('bridgeNode', LINK_POPULATE_SELECT)
         .sort({ createdAt: -1 })
         .lean();
 }
 
-function projectLinkLifecycle(link) {
+function projectLinkLifecycle(link, rebuild = false) {
+    const hasApplyReceipt = !!link.rebuildApplied;
+    if (rebuild) link = projectReverseHealth(link);
     const { applicationState, routeState, tunnelState, clientReadiness, pppReadiness, xrayReadiness, ...publicLink } = link;
-    const deleting = link.lifecycle?.state === 'deleting';
+    const deleting = link.lifecycle?.state === 'deleting' || (rebuild && link.rebuildDelete === true);
+    const missingApplyReceipt = rebuild && isReverse(link) && link.status === 'deployed' && !hasApplyReceipt;
     // Lifecycle status is not a fresh client/route proof. In particular, never
     // reconstruct a complete applied path from mutable desired neighbours.
     return { ...publicLink,
         desiredVersion: linkDesiredVersion({ ...link,
             portalNode: scopedLinkEntityId(link.portalNode), bridgeNode: scopedLinkEntityId(link.bridgeNode) }),
         applicationState: deleting ? 'deleting'
-            : CONFIRMED_DEPLOYED_LINK_STATUSES.has(link.status) ? 'applied'
-                : ['offline', 'error'].includes(link.status) ? 'reconcile_required' : 'not_applied',
+            : missingApplyReceipt ? 'reconcile_required'
+                : CONFIRMED_DEPLOYED_LINK_STATUSES.has(link.status) ? 'applied'
+                    : ['offline', 'error'].includes(link.status) ? 'reconcile_required' : 'not_applied',
         routeState: 'unknown',
         tunnelState: link.status === 'online' ? 'connected' : link.status === 'offline' ? 'disconnected' : 'unknown',
     };
 }
 
 async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
-    revisions, filter = {}, includeClientReadiness = false, readLinkApplicationState }) {
-    const linksPromise = listLinks(Link, filter);
+    revisions, filter = {}, includeClientReadiness = false, readLinkApplicationState, rebuild = false }) {
+    const displayStatus = rebuild ? filter.status : undefined;
+    if (displayStatus !== undefined) {
+        filter = { ...filter };
+        delete filter.status;
+    }
+    const linksPromise = listLinks(Link, filter, rebuild);
     let topologyRevision;
     let deployedRevision;
     if (revisions) {
@@ -356,7 +368,8 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
         topologyRevision = state?.revision ?? 0;
         deployedRevision = state?.deployedRevision ?? 0;
     }
-    let links = ((await linksPromise) || []).map(projectLinkLifecycle);
+    let links = ((await linksPromise) || []).map(link => projectLinkLifecycle(link, rebuild));
+    if (displayStatus !== undefined) links = links.filter(link => link.status === displayStatus);
     if (includeClientReadiness && typeof readLinkApplicationState !== 'function') {
         // Never trust a link-local/legacy ready flag. Only a durable, successful
         // client probe scoped to this exact live revision pair can paint green.
@@ -410,7 +423,8 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
         try {
             // Trusted repository seam must validate selected settled-owner/profile
             // pins. Neither request data nor a panel-wide revision can provide it.
-            const states = await readLinkApplicationState({ links: links.map(link => ({
+            const observable = rebuild ? links.filter(link => !isReverse(link)) : links;
+            const states = observable.length === 0 && rebuild ? [] : await readLinkApplicationState({ links: observable.map(link => ({
                 linkId: String(link._id), desiredVersion: link.desiredVersion,
             })) });
             const byId = new Map();
@@ -420,6 +434,7 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
                 byId.set(state?.linkId, state);
             }
             links = links.map(link => {
+                if (rebuild && isReverse(link)) return link;
                 const state = byId.get(String(link._id));
                 if (!state || duplicates.has(String(link._id)) || state.desiredVersion !== link.desiredVersion
                     || typeof state.operationId !== 'string' || !/^[a-f0-9]{24}$/.test(state.operationId)
@@ -712,6 +727,7 @@ function createCascadeLinksRouter({
     };
 
     router.get('/', requireScope('nodes:read'), async (req, res) => {
+        if (isRebuildEnabled(deploymentEnv)) res.set('Cache-Control', 'no-store');
         try {
             const filter = {};
             if (req.query.active !== undefined) filter.active = req.query.active === 'true';
@@ -724,6 +740,7 @@ function createCascadeLinksRouter({
             }
             return res.json(await readLinkSnapshot({
                 Link, TopologyState, ClientProofOperation, filter, includeClientReadiness: true,
+                rebuild: isRebuildEnabled(deploymentEnv),
                 readLinkApplicationState: readLinkApplicationState ?? l2tpActiveHostProvider.getActiveHost()?.readLinkApplicationState,
             }));
         } catch (error) {
@@ -802,8 +819,13 @@ function createCascadeLinksRouter({
                     'INVALID_LINK_ID',
                 );
             }
-            const link = await Link.findById(req.params.id)
-                .populate('portalNode', LINK_POPULATE_SELECT)
+            const rebuild = isRebuildEnabled(deploymentEnv);
+            const query = Link.findById(req.params.id);
+            if (rebuild) {
+                res.set('Cache-Control', 'no-store');
+                query.select(observationSelect);
+            }
+            const link = await query.populate('portalNode', LINK_POPULATE_SELECT)
                 .populate('bridgeNode', LINK_POPULATE_SELECT)
                 .lean();
             if (!link) {
@@ -815,12 +837,12 @@ function createCascadeLinksRouter({
             const reader = readLinkApplicationState ?? l2tpActiveHostProvider.getActiveHost()?.readLinkApplicationState;
             if (typeof reader === 'function') {
                 const snapshot = await readLinkSnapshot({ Link, TopologyState,
-                    filter: { _id: req.params.id }, readLinkApplicationState: reader });
+                    filter: { _id: req.params.id }, readLinkApplicationState: reader, rebuild });
                 const current = snapshot.links.find(candidate => String(candidate._id) === req.params.id);
                 if (!current) throw Object.assign(new Error('The cascade link was not found'), { code: 'CASCADE_LINK_NOT_FOUND' });
                 return res.json(current);
             }
-            return res.json(projectLinkLifecycle(link));
+            return res.json(projectLinkLifecycle(link, rebuild));
         } catch (error) {
             return sendError(res, error, 'Get');
         }

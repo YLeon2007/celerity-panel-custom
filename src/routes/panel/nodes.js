@@ -22,6 +22,7 @@ const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
+const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
 const { relayRoleBlock, withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
 const { canPreviewRemoval, issueRemovalTicket } = require('./rebuildRelayRemove');
@@ -536,14 +537,17 @@ router.get('/nodes/:id', async (req, res) => {
         // Pull manualKey explicitly (schema marks it select:false) so we can
         // populate the manualKeySet flag in the rendered form. The actual
         // PEM is then stripped via sanitizeXrayForRender before reaching EJS.
+        const rebuild = isRebuildEnabled();
+        const linkQuery = CascadeLink.find({
+            $or: [{ portalNode: req.params.id }, { bridgeNode: req.params.id }],
+        });
+        if (rebuild) linkQuery.select(observationSelect).lean();
         const [node, groups, cascadeLinks, settings, candidateNodes] = await Promise.all([
             HyNode.findById(req.params.id)
                 .select('+xray.manualKey')
                 .populate('groups', 'name color'),
             getActiveGroups(),
-            CascadeLink.find({
-                $or: [{ portalNode: req.params.id }, { bridgeNode: req.params.id }],
-            }).populate('portalNode', 'name ip flag')
+            linkQuery.populate('portalNode', 'name ip flag')
               .populate('bridgeNode', 'name ip flag')
               .sort({ createdAt: -1 }),
             Settings.get(),
@@ -577,7 +581,7 @@ router.get('/nodes/:id', async (req, res) => {
         const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
         renderNode.xray = sanitizeXrayForRender(node.xray);
         const preview = canPreviewRemoval(req);
-        if (preview) res.set('Cache-Control', 'no-store');
+        if (preview || rebuild) res.set('Cache-Control', 'no-store');
         const roleBlock = isRebuildEnabled() && node.cascadeRole === 'relay'
             ? await relayRoleBlock(node._id, preview ? id => require('../../services/rebuildService').createRebuildService().previewRemoveRelay(id) : null)
             : null;
@@ -599,7 +603,7 @@ router.get('/nodes/:id', async (req, res) => {
             nodeConfigPreview,
             groups,
             candidateNodes,
-            cascadeLinks: cascadeLinks || [],
+            cascadeLinks: rebuild ? (cascadeLinks || []).map(link => projectReverseHealth(link)) : (cascadeLinks || []),
             error: req.query.error || null,
             panelDomain: config.PANEL_DOMAIN || '',
             panelAcmeEmail: config.ACME_EMAIL || '',

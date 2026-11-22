@@ -67,7 +67,7 @@ func ParseXrayAcceptedLogLine(line string) (XrayAcceptedEvent, bool) {
 
 func (t *OnlineTracker) MarkAccepted(event XrayAcceptedEvent, now time.Time) {
 	userID := strings.TrimSpace(event.UserID)
-	if userID == "" {
+	if userID == "" || isReverseObservationEmail(userID) {
 		return
 	}
 	if now.IsZero() {

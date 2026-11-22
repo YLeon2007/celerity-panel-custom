@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createPrivateKey, createPublicKey, generateKeyPairSync } = require('node:crypto');
+const { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } = require('node:crypto');
 const { Types } = require('mongoose');
 const { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX, syntheticTunnelSettings } = require('./helpers/rebuildComposerFixture');
 
@@ -22,6 +22,35 @@ const route = (config, inbound, dest = '') => config.routing.rules.find(rule => 
     && (!rule.domain || rule.domain.includes(dest)) && (!rule.ip || rule.ip.includes(dest))
 ))?.outboundTag ?? config.outbounds[0].tag;
 const byNode = (profiles, nodeId, profile = 'main') => profiles.find(p => p.nodeId === nodeId && p.profile === profile).config;
+
+test('scopes reverse observation metadata to the native TCP REALITY listener, not its peers or clients', () => {
+    const { profilePreview } = require('../../../services/rebuildCoordinator');
+    const nodes = [node('p', 'portal', 1), node('b', 'bridge', 2)];
+    const key = new Types.ObjectId('0123456789abcdef12345678');
+    const link = edge(key, 'p', 'b', 1, { mode: 'reverse', tunnelSecurity: 'reality', tunnelTransport: 'tcp',
+        tunnelUuid: 'A0000000-0000-4000-8000-000000000001', realityPrivateKey: 'fixture', realityPublicKey: 'fixture' });
+    const user = { userId: 'subscriber', xrayUuid: id(201) };
+    const compose = choice => composeRebuildProfiles({ nodes, links: [choice], usersByNode: { p: [user] },
+        dialerVersions: new Map([['p', '26.11.9'], ['b', '26.11.9']]) });
+    const profiles = compose(link);
+    const main = byNode(profiles, 'p');
+    const connector = config => config.inbounds.find(i => i.tag === 'rebuild-rp-conn-12345678');
+    const account = config => connector(config).settings.clients[0];
+    const digest = createHash('sha256').update(link.tunnelUuid.toLowerCase()).digest('hex');
+    assert.deepEqual(account(main), { id: link.tunnelUuid, reverse: { tag: 'rebuild-rp-egress-12345678' },
+        email: `rproof-${key}-${digest}@rebuild.invalid` });
+    assert.equal(main.inbounds.find(i => i.tag === 'client-p').settings.clients[0].email, user.userId);
+    assert.equal(byNode(profiles, 'b', 'bridge').outbounds.find(o => o.tag === 'rebuild-rp-dial-12345678').settings.email, undefined);
+    assert.equal(account(byNode(compose({ ...link, tunnelSecurity: 'none' }), 'p')).email, undefined);
+    const forward = byNode(compose({ ...link, mode: 'forward' }), 'b', 'bridge');
+    assert.equal(forward.inbounds.find(i => i.tag === 'fwd-hop-12345678').settings.clients[0].email, undefined);
+    const before = structuredClone(main);
+    delete account(before).email;
+    assert.deepEqual(profilePreview(before, main, 'main'), { profile: 'main', change: 'replace',
+        sections: ['inbounds'], protectedChanged: false });
+    account(before).email = `rproof-${key}-${'0'.repeat(64)}@rebuild.invalid`;
+    assert.equal(profilePreview(before, main, 'main').protectedChanged, true);
+});
 
 test('explicit none composes a forward VLESS hop without keys or a protected client diff', () => {
     const { profilePreview } = require('../../../services/rebuildCoordinator');

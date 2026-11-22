@@ -42,7 +42,15 @@ Module._load = function(id, parent) {
     if (/l2tpModelIndexReadiness|l2tpMigrationBootstrap|createL2tpStartupLifecycle|productionPhysicalAuthority|createTopologyOperationRuntime|createL2tpPanelHost|topologyTestActivation|topologyTransferDrafts/.test(id)) {
         assert.fail('strict runtime imported: ' + id);
     }
-    if (id === 'node-cron') return { schedule(expr, callback) { cron.set(expr, callback); return { stop() {} }; } };
+    if (id === 'node-cron' && parent?.filename === process.argv[1]) return { schedule(expr, callback) {
+        if (expr === '15,45 * * * * *') {
+            const task = load.call(Module, id, parent).createTask(expr, callback);
+            cron.set(expr, () => task.execute());
+            return task;
+        }
+        cron.set(expr, callback);
+        return { stop() {} };
+    } };
     if (id === 'http' && parent?.filename === process.argv[1]) {
         return { createServer(app) {
             const server = new EventEmitter();
@@ -110,12 +118,17 @@ Module._load = function(id, parent) {
         value.collectXrayAgentOnlineStates = async () => { startup.push('agent-poll'); };
     }
     if (id === '../services/cascadeService') value.getTopology = async () => ({ nodes: [], edges: [] });
+    if (id === './src/services/cascadeService' && parent?.filename === process.argv[1]) {
+        value.healthCheckRebuildReverse = async () => { startup.push('reverse-poll'); };
+    }
     return value;
 };
 async function verify(app) {
     assert.deepEqual(startup, ['cache', 'homepage', 'expiry', 'listen', 'access-logs']);
     await cron.get('*/5 * * * * *')();
     assert.equal(startup.at(-1), 'agent-poll');
+    await cron.get('15,45 * * * * *')();
+    assert.equal(startup.at(-1), 'reverse-poll');
     // No real sockets: use the application's mounted Express stack.
     const assertBlocked = async (method, url) => {
         const result = await requests(app, method, url);
@@ -168,7 +181,7 @@ async function verify(app) {
     assert.equal(overviewLoads, 1);
     assert.equal((await requests(app, 'GET', '/health')).status, 200);
     assert.deepEqual(await requests(app, 'GET', '/api/cascade/topology'), {
-        status: 200, body: { nodes: [], edges: [] }, cacheControl: undefined,
+        status: 200, body: { nodes: [], edges: [] }, cacheControl: 'no-store',
     });
     const { manageCascade } = require(require('node:path').join(process.argv[1], '../src/mcp/tools/cascade'));
     await assert.rejects(manageCascade({ action: 'delete' }), { code: 'REBUILD_STRICT_DISABLED' });

@@ -43,6 +43,9 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     const ok=async(...args)=>{const r=await request(...args);assert.equal(r.status,200,r.body.error?.code);return r.body;};
     const edge=(a,b,n,other={})=>({portalNodeId:id(a),bridgeNodeId:id(b),tunnelPort:41000+n,name:`link-${n}`,priority:10*n,...other});
     const applied=async linkId=>(await Link.findById(linkId).select('+rebuildApplied').lean()).rebuildApplied;
+    const evidence=async linkId=>Link.findById(linkId).select('+rebuildApplyEpoch +rebuildReverseObservation').lean();
+    const seedEvidence=async linkId=>Link.collection.updateOne({_id:new mongoose.Types.ObjectId(linkId)},
+        {$set:{rebuildReverseObservation:{version:1,generation:'b'.repeat(64),established:true,observedAt:new Date()}}});
     const make=async(b)=>{
         const result=await ok('POST','/links',b);
         assert.equal(await applied(result.linkId),null);
@@ -69,7 +72,20 @@ test('public rebuild actions use the DB component; read-only preview, user guard
         assert.equal(stages.length,0);assert.equal(writes.length,0);assert.equal(await applied(pr.linkId),null);
     }
     versions.delete(id(relay));
-    await ok('POST',deploy,{linkId:pr.linkId,expectedPreview:pr.preview.previewId});assert.deepEqual([...new Set(writes)].sort(),[portal,relay,exit,geo].map(id).sort());
+    // Previously saved health is not evidence for the just-applied generation.
+    await Link.collection.updateOne({_id:new mongoose.Types.ObjectId(pr.linkId)},{$set:{lastHealthCheck:new Date(),latencyMs:12,lastError:'old'}});
+    await seedEvidence(pr.linkId); // Within the same Preview confirmation window.
+    const result=await ok('POST',deploy,{linkId:pr.linkId,expectedPreview:pr.preview.previewId});assert.deepEqual([...new Set(writes)].sort(),[portal,relay,exit,geo].map(id).sort());
+    assert.equal(result.previewId,pr.preview.previewId,'Apply used the same REALITY dialer candidate as Preview');
+    const dialer=files.get(id(relay)).main.outbounds.find(o=>o.tag===`rebuild-rp-dial-${pr.linkId.slice(-8)}`);
+    assert.equal(dialer.streamSettings.security,'reality');
+    assert.equal(dialer.streamSettings.realitySettings.fingerprint,'random');
+    assert.equal((await Link.findById(pr.linkId).lean()).realityFingerprint,'random','Apply does not rewrite the draft');
+    const health=await Link.findById(pr.linkId).select('status lastError lastHealthCheck latencyMs').lean();
+    assert.deepEqual(health,{_id:new mongoose.Types.ObjectId(pr.linkId),status:'deployed',lastError:'',lastHealthCheck:null,latencyMs:null});
+    const firstEpoch=(await evidence(pr.linkId)).rebuildApplyEpoch;
+    assert.match(firstEpoch,/^[a-f0-9]{32}$/);
+    assert.equal((await evidence(pr.linkId)).rebuildReverseObservation,undefined);
     assert.equal((await State.findOne({node:relay._id}).lean()).routingMode,'follow-relay');
     const r=files.get(id(relay));const socks=()=>r.main.inbounds.find(i=>i.tag==='rebuild-relay-ingress');const port=socks().port;
     const policy=()=>r.main.routing.rules.filter(i=>i.ruleTag?.startsWith('rebuild-policy-'));assert.ok(policy().every(i=>['client','second',socks().tag].every(tag=>i.inboundTag.includes(tag))));
@@ -78,7 +94,9 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     assert.equal(oldApplied.port,41001);assert.equal(String(oldApplied.listener),id(portal));
     assert.equal(Object.hasOwn((await Link.findById(pr.linkId)).toJSON(),'rebuildApplied'),false);
     assert.equal((await Link.findById(pr.linkId).lean()).rebuildApplied,undefined);
+    await seedEvidence(pr.linkId);
     const before=writes.length;await ok('PUT',`/links/${pr.linkId}`,{name:'renamed',tunnelPort:41011,rebuildApplied:null});
+    assert.equal((await evidence(pr.linkId)).rebuildReverseObservation,undefined);
     assert.equal(writes.length,before,'saved AutoDeploy metadata is not a new request');
     const edited=await Link.findById(pr.linkId).lean();assert.equal(edited.status,'pending');assert.equal(edited.tunnelPort,41011);
     assert.deepEqual(await applied(pr.linkId),oldApplied);
@@ -88,6 +106,7 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     assert.equal(await applied(newer.linkId),null);assert.deepEqual(await applied(pr.linkId),oldApplied);
     await ok('POST','/topology/deploy',{linkId:newer.linkId,expectedPreview:preview.previewId});assert.equal(socks().port,port);assert.equal(policy().at(-1).outboundTag,`rebuild-rp-egress-${newer.linkId.slice(-8)}`);
     assert.equal((await applied(pr.linkId)).port,41011);
+    assert.notEqual((await evidence(pr.linkId)).rebuildApplyEpoch,firstEpoch);
     const ticket=async(linkId,remove=false)=>({expectedPreview:(await ok('POST','/rebuild/preview',{linkId,remove})).previewId});
     const deletedPath=`/links/${b.linkId}`,priorStages=stages.length;assert.equal((await request('DELETE',deletedPath)).status,428);assert.notEqual((await Link.findById(b.linkId)).rebuildDelete,true);assert.equal(stages.length,priorStages);
     assert.equal((await request('DELETE',deletedPath,await ticket(b.linkId))).body.error.code,'REBUILD_PREVIEW_CHANGED');

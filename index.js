@@ -1120,6 +1120,15 @@ function setupWebSocketServer(server) {
 
 function setupCronJobs() {
     if (classicCronStopping) return;
+    // Independent of the legacy minute health chain: node checks must not
+    // delay reverse evidence or cause it to inherit any write/SSH fallback.
+    if (rebuildEnabled) scheduleCronJob('15,45 * * * * *', async () => {
+        try {
+            await require('./src/services/cascadeService').healthCheckRebuildReverse();
+        } catch {
+            logger.warn('[Cron] Rebuild reverse observation sweep failed');
+        }
+    });
     // Poll lightweight cc-agent /online every 5s. The agent itself applies the
     // 45s no-event timeout, so this cron only mirrors node state into Redis for UI.
     scheduleCronJob('*/5 * * * * *', async () => {
