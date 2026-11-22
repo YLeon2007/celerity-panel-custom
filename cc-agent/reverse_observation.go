@@ -112,15 +112,36 @@ type reverseRPC struct {
 }
 
 func (r *reverseRPC) matches() bool {
-	p := r.current
-	if p.Addr == nil || p.LocalAddr == nil {
+	key := counterPeer(r.current)
+	if key == "" {
 		return false
 	}
-	key := p.LocalAddr.String() + " " + p.Addr.String()
 	if r.connection == "" {
 		r.connection = key
 	}
 	return key == r.connection
+}
+
+func counterPeer(p peer.Peer) string {
+	if p.Addr == nil || p.LocalAddr == nil {
+		return ""
+	}
+	return p.LocalAddr.String() + " " + p.Addr.String()
+}
+
+// QueryStats(reset=true) returns each counter's value immediately before
+// setting it to zero. Each such read ends one interval and starts another.
+// Latch evidence of growth, not bytes: the old balance alone is not activity.
+type reverseCounterWindow struct {
+	name, connection string
+	baseline         int64
+	grew             bool
+}
+
+func (w *reverseCounterWindow) advanced(value int64) bool { return w.grew || value > w.baseline }
+func (w *reverseCounterWindow) reset(value int64) {
+	w.grew = w.advanced(value)
+	w.baseline = 0
 }
 
 func (c *XrayClient) observeReverse(ctx context.Context, s reverseObservationSubject) (bool, error) {
@@ -139,7 +160,16 @@ func (c *XrayClient) observeReverse(ctx context.Context, s reverseObservationSub
 		}
 		return resp.GetStat().GetValue(), nil
 	}
+	if err := c.lockCounters(ctx); err != nil {
+		return false, err
+	}
 	before, err := read()
+	w := &reverseCounterWindow{name: name, connection: rpc.connection, baseline: before}
+	if err == nil {
+		c.reverseWindows.Store(w, struct{}{})
+		defer c.reverseWindows.Delete(w)
+	}
+	c.unlockCounters()
 	if status.Code(err) == codes.NotFound {
 		return false, nil
 	}
@@ -156,10 +186,12 @@ func (c *XrayClient) observeReverse(ctx context.Context, s reverseObservationSub
 	if ok, err := c.reverseScope(ctx, rpc, s); !ok || err != nil {
 		return false, err
 	}
+	if err := c.lockCounters(ctx); err != nil {
+		return false, err
+	}
+	defer c.unlockCounters()
 	after, err := read()
-	// Existing billing may reset counters. A reset can mask growth, but it
-	// cannot fabricate a strictly larger value on this same counter/transport.
-	return after > before && err == nil, err
+	return err == nil && w.advanced(after), err
 }
 
 func (s reverseObservationSubject) matchesUser(u *protocol.User) bool {

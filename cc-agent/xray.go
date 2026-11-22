@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	proxyman_command "github.com/xtls/xray-core/app/proxyman/command"
 	stats_command "github.com/xtls/xray-core/app/stats/command"
@@ -14,6 +15,7 @@ import (
 	vless "github.com/xtls/xray-core/proxy/vless"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/peer"
 )
 
 // xrayConfigPath is the canonical location written by nodeSetup.installXray.
@@ -60,6 +62,10 @@ type XrayClient struct {
 	proxyman proxyman_command.HandlerServiceClient
 	stats    stats_command.StatsServiceClient
 	inbounds []InboundEntry
+	// Order destructive stats reads with the two exact counter reads, never
+	// with the 11s wait or scope checks. Waiters keep their RPC deadlines.
+	counterGate    chan struct{}
+	reverseWindows sync.Map // *reverseCounterWindow keys; cancellation can delete without waiting on an RPC
 }
 
 func NewXrayClient(cfg *Config) (*XrayClient, error) {
@@ -74,10 +80,11 @@ func NewXrayClient(cfg *Config) (*XrayClient, error) {
 	// entry from the legacy InboundTag when missing). No further fallback
 	// is needed here.
 	return &XrayClient{
-		conn:     conn,
-		proxyman: proxyman_command.NewHandlerServiceClient(conn),
-		stats:    stats_command.NewStatsServiceClient(conn),
-		inbounds: cfg.Inbounds,
+		conn:        conn,
+		proxyman:    proxyman_command.NewHandlerServiceClient(conn),
+		stats:       stats_command.NewStatsServiceClient(conn),
+		inbounds:    cfg.Inbounds,
+		counterGate: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -149,10 +156,17 @@ func isUserNotFoundErr(err error) bool {
 // An empty pattern returns all stats (users, inbounds, outbounds) in one call.
 // reset=true atomically clears the matched counters in Xray.
 func (c *XrayClient) QueryStats(ctx context.Context, pattern string, reset bool) (map[string]int64, error) {
+	var p peer.Peer
+	if reset {
+		if err := c.lockCounters(ctx); err != nil {
+			return nil, err
+		}
+		defer c.unlockCounters()
+	}
 	resp, err := c.stats.QueryStats(ctx, &stats_command.QueryStatsRequest{
 		Pattern: pattern,
 		Reset_:  reset,
-	})
+	}, grpc.Peer(&p))
 	if err != nil {
 		return nil, fmt.Errorf("QueryStats: %w", err)
 	}
@@ -161,8 +175,29 @@ func (c *XrayClient) QueryStats(ctx context.Context, pattern string, reset bool)
 	for _, stat := range resp.Stat {
 		result[stat.Name] = stat.Value
 	}
+	if reset {
+		connection := counterPeer(p)
+		c.reverseWindows.Range(func(key, _ any) bool {
+			w := key.(*reverseCounterWindow)
+			if value, ok := result[w.name]; ok && value >= 0 && connection == w.connection {
+				w.reset(value)
+			}
+			return true
+		})
+	}
 	return result, nil
 }
+
+func (c *XrayClient) lockCounters(ctx context.Context) error {
+	select {
+	case c.counterGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *XrayClient) unlockCounters() { <-c.counterGate }
 
 func (c *XrayClient) Close() {
 	if c.conn != nil {
