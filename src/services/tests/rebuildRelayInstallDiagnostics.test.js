@@ -15,7 +15,7 @@ const attested = require('./helpers/rebuildRelayDirectWire');
 const { runFreshRelayInstall } = require('../rebuildRelayInstall');
 const { installCheckIds } = require('../rebuildRelayInstallDiagnostics');
 const { AcknowledgedCommitCleanupError } = require('../rebuildRelayInstallTransaction');
-const { i18nMiddleware } = require('../../middleware/i18n');
+const { i18nMiddleware, t: translate } = require('../../middleware/i18n');
 
 const nodeId = 'a'.repeat(24), machineId = 'b'.repeat(32), marker = 'FIXTURE_PRIVATE_VALUE';
 const base = '/panel/rebuild/relays';
@@ -115,7 +115,7 @@ function localizedFrontend(html, response, headers, app) {
     });
 }
 
-test('closed diagnostics reach the authenticated API and the rendered RU/EN install control', { timeout: 15000 }, async t => {
+test('closed diagnostics reach the authenticated API and the localized install control', { timeout: 15000 }, async t => {
     const previous = process.env.C3_REBUILD_ENABLED;
     process.env.C3_REBUILD_ENABLED = 'true';
     t.after(() => { if (previous === undefined) delete process.env.C3_REBUILD_ENABLED; else process.env.C3_REBUILD_ENABLED = previous; });
@@ -163,9 +163,13 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
             }
             if (action === 'prepare') {
                 if (hostChecks.includes(scenario)) return refusal(`DIRECT_${scenario}\n`);
+                if (scenario === 'profile-owner') return refusal('DIRECT_XRAY_PROFILE_OWNER_UNSUPPORTED\n');
+                if (scenario === 'profile-users') return refusal('DIRECT_PROFILE_USERS\n');
+                if (scenario === 'profile-runtime') return refusal('DIRECT_RUNTIME_UNPROVED\n');
                 if (scenario === 'baseline') return refusal('DIRECT_PREREQUISITE\n');
                 if (scenario === 'payload') return { ...refusal('DIRECT_RULE_220_CONFLICT\n'), stdout: marker };
-                const snapshot = { ...ready, main, mainSha256: createHash('sha256').update(main).digest('hex'), bridge: null,
+                const profile = scenario === 'profile-format' ? JSON.stringify(JSON.parse(main), null, 2) : main;
+                const snapshot = { ...ready, main: profile, mainSha256: createHash('sha256').update(profile).digest('hex'), bridge: null,
                     bridgeSha256: null, baseline: 'd'.repeat(64) };
                 if (scenario === 'pending-ppp' || scenario.startsWith('snapshot-')) snapshot.ppp = false;
                 if (scenario === 'snapshot-forged-capability') snapshot.pppPreparation = true;
@@ -249,6 +253,10 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
         ['snapshot-unloaded', 'REBUILD_L2TP_HOST_NOT_READY', 'refused', 'VPN_UNITS_NOT_LOADED', 'installRefused', apply.slice(0, 3)],
         ...hostChecks.map(check => [check, 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', check, 'installRefused', apply.slice(0, 3)]),
         ['baseline', 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', 'HOST_BASELINE', 'installRefused', apply.slice(0, 3)],
+        ['profile-format', 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED', 'refused', 'XRAY_BASELINE_UNSUPPORTED', 'installRefused', apply.slice(0, 3)],
+        ['profile-owner', 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', 'XRAY_PROFILE_OWNER_UNSUPPORTED', 'installRefused', apply.slice(0, 3)],
+        ['profile-users', 'REBUILD_L2TP_DIRECT_PROFILE_USERS', 'refused', 'XRAY_PROFILE_USERS_UNPROVED', 'installRefused', apply.slice(0, 3)],
+        ['profile-runtime', 'REBUILD_L2TP_DIRECT_RUNTIME_UNPROVED', 'refused', 'XRAY_RUNTIME_UNPROVED', 'installRefused', apply.slice(0, 3)],
         ['candidate', 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', 'HOST_CANDIDATE', 'installRefused', apply.slice(0, 4)],
         ['install-prerequisite', 'REBUILD_L2TP_INSTALL_FAILED', 'refused', 'HOST_INSTALL', 'installRefused', [...apply, 'restore']],
         ['no-write', 'REBUILD_L2TP_INSTALL_FAILED', 'refused', 'PPP_MODULES_LOAD_FAILED', 'installRefused', [...apply, 'restore']],
@@ -265,9 +273,13 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
         ['raw-error', 'REBUILD_L2TP_INSTALL_FAILED', 'unknown', undefined, 'uncertain', []],
         ['forged-check', 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', undefined, 'installRefused', []],
     ];
-    for (const lang of ['ru', 'en']) {
+    for (const lang of ['ru', 'en', 'zh-CN']) {
         const words = require(`../../locales/${lang}.json`).rebuildL2tp;
-        assert.deepEqual(Object.keys(words.installChecks).sort(), [...installCheckIds].sort());
+        if (lang !== 'zh-CN') assert.deepEqual(Object.keys(words.installChecks).sort(), [...installCheckIds].sort());
+        for (const key of ['REBUILD_LINKS_NOT_APPLIED', 'XRAY_BASELINE_UNSUPPORTED', 'XRAY_PROFILE_OWNER_UNSUPPORTED',
+            'XRAY_PROFILE_USERS_UNPROVED', 'XRAY_RUNTIME_UNPROVED']) {
+            assert.ok(words.installChecks?.[key], `${lang}: ${key}`);
+        }
         const headers = { ...auth, 'accept-language': lang };
         const { status, body } = await request(app, '/panel/l2tp', { method: 'GET', headers });
         assert.equal(status, 200);
@@ -283,7 +295,8 @@ test('closed diagnostics reach the authenticated API and the rendered RU/EN inst
             assert.deepEqual(log, actions, name);
             log = [];
             const [text, disabled, hidden] = await localizedFrontend(body, expected, headers, app);
-            assert.equal(text, words.messages[message] + (check ? ` ${words.installChecks[check]}` : ''), `${name}: ${lang}`);
+            assert.equal(text, translate(`rebuildL2tp.messages.${message}`, lang)
+                + (check ? ` ${translate(`rebuildL2tp.installChecks.${check}`, lang)}` : ''), `${name}: ${lang}`);
             assert.deepEqual(log, actions, name);
             assert.equal(disabled, ['unknown', 'rolled_back', 'installed'].includes(outcome), name);
             assert.equal(hidden, !disabled, name);

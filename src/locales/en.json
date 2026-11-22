@@ -1837,6 +1837,7 @@
     "noRelays": "No L2TP relays.",
     "noAccounts": "No L2TP accounts.",
     "install": "Install",
+    "installProfileHint": "Install needs an applied, compatible Xray rebuild profile. Regular Setup writes legacy JSON. If needed, configure the intended relay link in Nodes → Network Map and save without auto-deploy. Choose Deploy to preview the changes. Apply only if you approve the changes and this panel manages all affected profiles. Do not overwrite custom or externally managed profiles.",
     "remove": "Remove",
     "accounts": "L2TP accounts",
     "accountsReadOnly": "Account management is unavailable.",
@@ -1956,6 +1957,11 @@
       "deleted": "The account was deleted. Reload to see the updated state."
     },
     "installChecks": {
+      "REBUILD_LINKS_NOT_APPLIED": "The relay has pending links or unsupported peers. On the Network Map, check that the intended links are applied and all peers are active, panel-managed Xray nodes. Do not apply unrelated links to clear this check.",
+      "XRAY_BASELINE_UNSUPPORTED": "Install does not support the existing Xray profile format or routing layout. Reformatting the JSON will not make it a rebuild profile. Follow the instructions on this relay's card only for panel-managed profiles.",
+      "XRAY_PROFILE_OWNER_UNSUPPORTED": "An Xray profile has a file owner that Install does not support. Ask the relay administrator to verify who manages it. Do not change its ownership or overwrite it just to pass this check.",
+      "XRAY_PROFILE_USERS_UNPROVED": "Install could not verify the Xray user inventory or match the transit inbounds to applied links. Check the applied links and the running Xray user inventory with the relay owner before retrying.",
+      "XRAY_RUNTIME_UNPROVED": "Install could not verify the running Xray process or listener ownership. Check which service is using the profile and ports before retrying.",
       "XRAY_DROPIN_UNSUPPORTED": "Review the Xray systemd drop-ins with the relay administrator and use a supported service configuration. Do not remove overrides blindly.",
       "PPP_MODULES_REQUIRED": "Check that the relay kernel provides PPP and PPPoL2TP support and that the PPP device is registered.",
       "PPP_MODULES_PERSISTENCE_CONFLICT": "Review conflicting PPP module startup settings with the relay administrator. Keep any settings used by other services.",

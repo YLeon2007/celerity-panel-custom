@@ -1289,6 +1289,7 @@ test('non-relay, orphan credentials, and unapplied topology are refused before a
     f.users.pop();
     addLink(f, oid(id), oid());
     f.links[0].status = 'pending';
-    await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED' });
+    await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED',
+        outcome: 'refused', check: 'REBUILD_LINKS_NOT_APPLIED' });
     assert.deepEqual(f.events, []);
 });

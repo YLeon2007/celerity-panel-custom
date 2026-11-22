@@ -29,6 +29,13 @@ test('all grant sources and permissions render in EN, RU and ZH; a registry fail
         const copy = require(`../../../locales/${lang}.json`).rebuildL2tp.admission;
         assert.deepEqual(Object.keys(copy).sort(), Object.keys(words.admission).sort());
         const html = await render(lang);
+        const hint = require(`../../../locales/${lang}.json`).rebuildL2tp.installProfileHint;
+        assert.ok(hint && html.includes(hint));
+        for (const [i, relayId] of ids.entries()) {
+            const card = html.match(new RegExp(`<tr id="relay-${relayId}"[\\s\\S]*?</tr>`))[0];
+            assert.equal(card.includes(hint), i !== 0);
+            assert.equal(card.includes('href="/panel/nodes"'), i !== 0);
+        }
         for (const text of [copy.db, copy.env, copy.none, copy.envReadOnly, copy.verifyInstructions, copy.confirmInstructions]) {
             assert.ok(html.includes(text));
         }
@@ -38,6 +45,7 @@ test('all grant sources and permissions render in EN, RU and ZH; a registry fail
         const error = await render(lang, { grantProblem: 'REBUILD_L2TP_GRANT_PERSISTENCE_UNAVAILABLE' });
         assert.ok(error.includes(copy.grantUnavailable));
         assert.doesNotMatch(error, /data-install-url=|data-admission-action=|data-create/);
+        assert.ok(!error.includes(hint));
         assert.ok(!error.includes(`>${copy.none}<`));
         for (const [grantProblem, key] of [['REBUILD_L2TP_GRANT_CONFLICT', 'grantConflict'],
             ['REBUILD_L2TP_GRANT_CHANGED', 'grantConflict'], ['REBUILD_L2TP_INSTALL_DISABLED', 'disabled'],

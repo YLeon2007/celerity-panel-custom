@@ -188,7 +188,7 @@ def directory(path, private=False):
         os.close(fd)
 
 
-def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False):
+def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False, diagnose_profile_owner=False):
     parent, name = os.path.split(path)
     try:
         with directory(parent) as fd:
@@ -197,9 +197,12 @@ def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False):
                 owner_ok = st.st_uid == 0 or (path in (MAIN, BRIDGE) and st.st_uid == pwd.getpwnam('nobody').pw_uid)
                 writable = bool(st.st_mode & 0o022)
                 diagnose_writable = diagnose_main_mode and path == MAIN
+                owner_refusal = (diagnose_profile_owner and path in (MAIN, BRIDGE)
+                                 and stat.S_ISREG(st.st_mode) and not owner_ok)
                 need(stat.S_ISREG(st.st_mode) and owner_ok and st.st_nlink == 1
                      and not st.st_mode & 0o7000 and (not writable or diagnose_writable)
-                     and not os.listxattr(handle.fileno()), 'PREREQUISITE')
+                     and not os.listxattr(handle.fileno()),
+                     'XRAY_PROFILE_OWNER_UNSUPPORTED' if owner_refusal else 'PREREQUISITE')
                 # Only install observation distinguishes this mode; do not read the payload.
                 need(not writable, XRAY_CONFIG_WRITABLE)
                 data = handle.read(maximum + 1)
@@ -1042,7 +1045,7 @@ def boot():
     return open('/proc/sys/kernel/random/boot_id').read(64).strip()
 
 
-def observe(machine, d, transit=None) -> dict[str, Any]:
+def observe(machine, d, transit=None, *, diagnose_profile_owner=False) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
     ready = preflight(machine)
@@ -1071,7 +1074,8 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
         need(directory_absent(path), 'PREREQUISITE')
     need(not any(os.path.lexists(p) for p in ('/etc/nftables.d/celerity-l2tp.nft', '/etc/ipsec.d/celerity-l2tp.conf')),
          'PREREQUISITE')
-    files = {key: read(path, diagnose_main_mode=True) if key == 'main' else read(path)
+    files = {key: read(path, diagnose_main_mode=True, diagnose_profile_owner=diagnose_profile_owner)
+             if key == 'main' else read(path)
              for key, path in NAMES.items()}
     need(all(files[k] is None for k in ('ike', 'options', 'nft', 'net', 'drop'))
          and all(files[k] is not None for k in ('main', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
@@ -1089,7 +1093,7 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     stock_starter = digest(raw(files['starter'])) == STOCK_IKE_STARTER_SHA
     need(ike_include_matches(files['starter'], [], check_tree=True) if stock_starter
          else ike_include_matches(files['starter'], []), 'PREREQUISITE')
-    bridge = read(BRIDGE)
+    bridge = read(BRIDGE, diagnose_profile_owner=diagnose_profile_owner)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
     global_paths = ('/etc/ppp/options', SWAN_CONF, XL_DEFAULT)
     for path in global_paths:
@@ -3831,11 +3835,11 @@ def install_lock_identity(lock_fd):
     return lock_id
 
 
-def observe_install(machine, network, transit, lock_fd):
+def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
     lock_id = install_lock_identity(lock_fd)
     modules = observe_ppp_preparation()
     require_network_observers()
-    before = observe(machine, network, transit)
+    before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner)
     need(install_lock_identity(lock_fd) == lock_id, 'BASELINE_CHANGED')
     return {**before, 'pppModules': modules, 'installLock': lock_id}
 
@@ -3919,7 +3923,7 @@ def dispatch(request: dict[str, Any]):
         transit = request.get('transit')
         need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
         if action == 'prepare':
-            before = observe_install(machine, d, transit, fd)
+            before = observe_install(machine, d, transit, fd, diagnose_profile_owner=True)
             if 'nativePreparation' in before:
                 ready = {**ready, 'unitsLoaded': False}
             main = raw(before['files']['main'])
