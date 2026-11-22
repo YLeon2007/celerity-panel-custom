@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +24,8 @@ type API struct {
 	shipper *Shipper
 	// Bound observations independently of the existing HTTP endpoints.
 	reverseObservations chan struct{}
+	// Hold until the recovery census, mutations, and gate publication settle.
+	recoverySync sync.Mutex
 }
 
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
@@ -118,11 +122,20 @@ func (a *API) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 // POST /sync — full user sync (replace all users)
 func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
+	// A request that starts in recovery must not fall through to the ordinary
+	// sync path if another request opens the gate while its body is being read.
+	recovering := a.userStore != nil && a.userStore.needsFullSync()
 	var req struct {
 		Users []*User `json:"users"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonErr(w, http.StatusBadRequest, "Bad request: "+err.Error())
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil || dec.Decode(new(json.RawMessage)) != io.EOF {
+		jsonErr(w, http.StatusBadRequest, "One full users snapshot required")
+		return
+	}
+	newMap, err := indexSnapshot(req.Users)
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	lease := a.userStore.admitMutation()
@@ -135,15 +148,15 @@ func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
+	if recovering || a.userStore.needsFullSync() {
+		a.handleRecoverySync(ctx, w, lease, req.Users, newMap)
+		return
+	}
+
 	current := a.userStore.List()
 	currentMap := make(map[string]*User, len(current))
 	for _, u := range current {
 		currentMap[u.Email] = u
-	}
-
-	newMap := make(map[string]*User, len(req.Users))
-	for _, u := range req.Users {
-		newMap[u.Email] = u
 	}
 
 	added, removed, errors := 0, 0, 0
@@ -170,17 +183,30 @@ func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	lease.Sync(req.Users)
+	a.finishSync(w, lease, req.Users, added, removed, errors)
+}
+
+func (a *API) finishSync(w http.ResponseWriter, lease *mutationLease, users []*User, added, removed, errors int) {
+	lease.Sync(users)
 	a.persister.MarkDirty()
 	a.userStore.SaveAsync() // Stop's final snapshot covers closed write admission.
 
-	log.Printf("[sync] Done: +%d -%d errors=%d total=%d", added, removed, errors, len(req.Users))
+	log.Printf("[sync] Done: +%d -%d errors=%d total=%d", added, removed, errors, len(users))
 	jsonOK(w, map[string]any{
 		"added":   added,
 		"removed": removed,
 		"errors":  errors,
-		"total":   len(req.Users),
+		"total":   len(users),
 	})
+}
+
+// Only a full sync can release a startup conflict.
+func (a *API) waitingForSync(w http.ResponseWriter) bool {
+	if !a.userStore.needsFullSync() {
+		return false
+	}
+	jsonErr(w, http.StatusServiceUnavailable, "Waiting for full panel /sync")
+	return true
 }
 
 // POST /users — add a single user
@@ -192,6 +218,9 @@ func (a *API) handleAddUser(w http.ResponseWriter, r *http.Request) {
 	}
 	if u.ID == "" || u.Email == "" {
 		jsonErr(w, http.StatusBadRequest, "id and email are required")
+		return
+	}
+	if a.waitingForSync(w) {
 		return
 	}
 	lease := a.userStore.admitMutation()
@@ -219,6 +248,9 @@ func (a *API) handleAddUser(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /users/{email} — remove a single user
 func (a *API) handleRemoveUser(w http.ResponseWriter, r *http.Request) {
+	if a.waitingForSync(w) {
+		return
+	}
 	lease := a.userStore.admitMutation()
 	if lease == nil {
 		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
@@ -297,10 +329,17 @@ func (a *API) handleOnline(w http.ResponseWriter, r *http.Request) {
 // the current user list (kept in sync by ConfigPersister), so Xray comes back up
 // with the correct users on its own — no gRPC replay needed.
 func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
+	if a.waitingForSync(w) {
+		return
+	}
 	// Make sure the latest user set is persisted before the restart so the
 	// reloaded Xray cannot pick up a stale snapshot.
 	if _, err := a.persister.Flush(); err != nil {
 		log.Printf("[api] Restart: config flush failed: %v", err)
+	}
+	// Flush itself can discover clients added since an empty startup load.
+	if a.waitingForSync(w) {
+		return
 	}
 
 	out, err := exec.Command("systemctl", "restart", "xray").CombinedOutput()

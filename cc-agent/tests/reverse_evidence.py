@@ -2,6 +2,8 @@
 import concurrent.futures
 import contextlib
 import hashlib
+import http.client
+import http.server
 import json
 import os
 from pathlib import Path
@@ -68,13 +70,14 @@ def ports(count):
 
 
 @contextlib.contextmanager
-def child(log, *argv, shutdown=signal.SIGKILL):
+def child(log, *argv, shutdown=signal.SIGKILL, show_failure_log=True):
     with log.open('wb') as out:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
         try:
             yield proc
             if proc.poll() is not None:
-                raise AssertionError(f'{log.name} exited early: {log.read_text()[-2000:]}')
+                detail = log.read_text()[-2000:] if show_failure_log else f'status={proc.returncode}'
+                raise AssertionError(f'{log.name} exited early: {detail}')
         finally:
             if proc.poll() is None:
                 proc.send_signal(shutdown)
@@ -119,7 +122,7 @@ def decoy(work):
 
 
 def main(work, parent, agent, xray, mongod, decoy_port, cert):
-    rp, api_port, subscriber_port, bridge_api, mongo_port = ports(5)
+    rp, api_port, subscriber_port, bridge_api, mongo_port, traffic_port = ports(6)
     keys = dict(row.split(': ', 1) for row in output(xray, 'x25519').splitlines() if ': ' in row)
     good, wrong, other, subscriber = (str(uuid.uuid4()) for _ in range(4))
     portal = dict(_id='a' * 24, name='receiver', cascadeRole='portal', active=True, ip=LO, type='xray',
@@ -166,7 +169,7 @@ def main(work, parent, agent, xray, mongod, decoy_port, cert):
     def core(name, config):
         file = work / f'{name}.json'
         file.write_text(json.dumps(config))
-        return child(work / f'{name}.log', xray, 'run', '-c', file)
+        return child(work / f'{name}.log', xray, 'run', '-c', file, show_failure_log=mongod is not None)
 
     def dial(name, choice='dial'):
         # Run the exact emitted outbound without the exit policy's geoip asset.
@@ -185,14 +188,83 @@ def main(work, parent, agent, xray, mongod, decoy_port, cert):
         stat = json.loads(api('stats', f'-name=inbound>>>{CONN}>>>traffic>>>downlink'))['stat']
         return stat.get('value', 0)
 
-    def check(phase):
+    def check(phase, *, collect=False):
         env = os.environ | dict(C3_REVERSE_PHASE=phase, C3_REVERSE_PARENT_NETNS=parent,
                                 C3_REVERSE_PORT=str(rp), C3_REVERSE_API=f'{LO}:{api_port}',
                                 C3_REVERSE_IDENTITY=hashlib.sha256(good.encode()).hexdigest(),
                                 C3_REVERSE_FIXTURE=str(fixture), C3_REVERSE_MONGO_PORT=str(mongo_port),
-                                C3_REVERSE_PANEL_HELPER=str(PANEL), C3_REVERSE_ANONYMOUS=other)
-        subprocess.run([agent, '-test.v', '-test.timeout=25s', '-test.run=^TestRealReverseObservation$'],
-                       env=env, timeout=27, check=True)
+                                C3_REVERSE_PANEL_HELPER=str(PANEL), C3_REVERSE_ANONYMOUS=other,
+                                C3_REVERSE_TRAFFIC=f'{LO}:{traffic_port}')
+        return subprocess.run([agent, '-test.v', '-test.timeout=25s', '-test.run=^TestRealReverseObservation$'],
+                              env=env, timeout=27, check=not collect).returncode
+
+    if mongod is None:
+        # Exercise real subscriber traffic, but do not open any arbitrary exit:
+        # the exact emitted dialer can reach only the fixture's echo socket.
+        class Echo(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                if self.headers.get('Content-Length') != str(64 << 10):
+                    self.send_error(400)
+                    return
+                self.connection.settimeout(2)
+                body = self.rfile.read(64 << 10)
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        def tcp_ready(port):
+            try:
+                with socket.create_connection((LO, port), timeout=.25):
+                    return True
+            except OSError:
+                return False
+
+        with http.server.ThreadingHTTPServer((LO, 0), Echo) as origin:
+            thread = threading.Thread(target=origin.serve_forever)
+            thread.start()
+            dest = origin.server_port
+            block = {'protocol': 'blackhole', 'tag': 'block'}
+            client = {'inbounds': [{'listen': LO, 'port': traffic_port, 'protocol': 'dokodemo-door',
+                                    'settings': {'address': LO, 'port': dest, 'network': 'tcp'}}],
+                      'outbounds': [{'protocol': 'vless', 'settings': {
+                          'address': LO, 'port': subscriber_port, 'id': subscriber, 'encryption': 'none'}}]}
+            transit = profiles['dial']['settings']['reverse']['tag']
+            bridge_config = {'outbounds': [block, profiles['dial'], {
+                'protocol': 'freedom', 'tag': 'echo',
+                'settings': {'finalRules': [{'action': 'allow', 'ip': [LO + '/32']}, {'action': 'block'}]}}],
+                'routing': {'rules': [{'type': 'field', 'inboundTag': [transit], 'ip': [LO + '/32'],
+                                       'port': dest, 'outboundTag': 'echo'}]}}
+            try:
+                with core('stats-receiver', profiles['receiver']), core('stats-subscriber', client):
+                    until(lambda: 'block' in tags())
+                    until(lambda: tcp_ready(traffic_port))
+                    with core('stats-dialer', bridge_config):
+                        until(lambda: TAG in tags())
+                        print('PHASE connected-with-stats', flush=True)
+                        live = check('connected-with-stats', collect=True)
+                        # Re-prime with genuine bytes before stopping the only
+                        # dialer. The cut test must not start on empty counters.
+                        payload = b'x' * (64 << 10)
+                        conn = http.client.HTTPConnection(LO, traffic_port, timeout=2)
+                        try:
+                            conn.request('POST', '/', payload)
+                            res = conn.getresponse()
+                            assert res.status == 200 and res.read() == payload
+                        finally:
+                            conn.close()
+                    time.sleep(.5)  # Drain the killed dialer's in-flight bytes.
+                    assert TAG in tags(), 'dynamic handler must survive the cut'
+                    print('PHASE cut-with-stats (dialer reaped, receiver and dynamic egress retained)', flush=True)
+                    cut = check('cut-with-stats', collect=True)
+            finally:
+                origin.shutdown()
+                thread.join()
+        print(f'RESULT connected-with-stats={live} cut-with-stats={cut}', flush=True)
+        return int(bool(live or cut))
 
     def check_decoy():
         trust = ssl.create_default_context(cafile=cert)
@@ -265,8 +337,9 @@ def main(work, parent, agent, xray, mongod, decoy_port, cert):
 
 
 if __name__ == '__main__':
-    parent, *paths = sys.argv[1:]
-    agent, xray, mongod = (Path(path).resolve(strict=True) for path in paths)
+    parent, agent, xray, mode = sys.argv[1:]
+    agent, xray = (Path(path).resolve(strict=True) for path in (agent, xray))
+    mongod = None if mode == '--stats-only' else Path(mode).resolve(strict=True)
     guard(parent, xray)
     os.umask(0o077)
 
@@ -278,6 +351,7 @@ if __name__ == '__main__':
     with tempfile.TemporaryDirectory(dir=Path.cwd(), prefix='synthetic-') as temp:
         work = Path(temp)
         with decoy(work) as (port, cert):
-            main(work, parent, agent, xray, mongod, port, cert)
+            result = main(work, parent, agent, xray, mongod, port, cert)
     assert not work.exists()
     print('COMPLETE: fixture children reaped and generated files removed', flush=True)
+    sys.exit(result)
