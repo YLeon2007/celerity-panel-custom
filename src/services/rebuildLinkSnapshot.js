@@ -6,7 +6,7 @@ const fullLinkRead = Object.freeze({ schemaLevelProjections: false });
 
 // Only top-level fields written by health checks (including Mongoose's timestamp).
 // Keep every other field, including unknown fields and nested objects, in the guard.
-function linkSnapshot({ status, lastHealthCheck, latencyMs, lastError, updatedAt, ...working }) {
+function linkSnapshot({ status, lastHealthCheck, latencyMs, lastError, updatedAt, rebuildReverseObservation, ...working }) {
     return working;
 }
 

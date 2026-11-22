@@ -71,6 +71,7 @@ function setupClassicJobs(h, services = {}) {
     } };
     h.context.syncService = services.syncService || {};
     h.context.statsService = services.statsService || {};
+    h.context.rebuildEnabled = false;
     vm.runInContext(source.slice(source.indexOf('function setupCronJobs()'), source.indexOf('/**\n * Clean logs older')), h.context);
     h.context.setupCronJobs();
     return jobs;

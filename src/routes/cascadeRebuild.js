@@ -74,7 +74,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
  router.delete('/links/:id',...write,wrap(async req=>({executionMode:'rebuild',deleted:req.params.id,...(await run(req,false,true))})));
  const save=(editing)=>async (req,outcome)=>service.locks.run(async verify=>{
     const b=req.body||{};if(editing&&!objectId(req.params.id))throw fail('REBUILD_INVALID_REQUEST');
-    const link=editing?await Link.findById(req.params.id):new Link({tunnelUuid:crypto.randomUUID(),rebuildApplied:null,tunnelEncryption:'vless-enc'});
+    const link=editing?await Link.findById(req.params.id).select('+rebuildReverseObservation'):new Link({tunnelUuid:crypto.randomUUID(),rebuildApplied:null,tunnelEncryption:'vless-enc'});
     if(!link)throw fail('REBUILD_LINK_NOT_FOUND');if(link.rebuildDelete||link.lifecycle)throw fail('REBUILD_DELETION_PENDING');
     const old=editing?[String(link.portalNode),String(link.bridgeNode)]:[];
     const source=b.portalNodeId??old[0],target=b.bridgeNodeId??old[1];
@@ -126,7 +126,13 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     if(!Number.isInteger(link.tunnelPort)||link.tunnelPort<1||link.tunnelPort>65535||!Number.isSafeInteger(link.priority)||typeof link.name!=='string'||!link.name.trim())throw fail('REBUILD_INVALID_REQUEST');
     if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject(),verify);
     if(link.tunnelSecurity==='reality')link.realityFingerprint=await service.verifyDraftRealityFingerprint(link.toObject(),verify);
-    await verify();link.status='pending';await link.save();const linkId=String(link._id);
+    await verify();link.status='pending';
+    if(editing){
+        link.rebuildReverseObservation=undefined;
+        // Unset even if an observation appeared after this draft was read.
+        link.markModified('rebuildReverseObservation');
+    }
+    await link.save();const linkId=String(link._id);
     // Latch the acknowledged draft independently of preview and lock cleanup.
     outcome.linkId=linkId;
     require('../services/cascadeService')._invalidateTopologyCache();

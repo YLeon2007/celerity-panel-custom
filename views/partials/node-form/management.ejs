@@ -139,7 +139,7 @@
                     </td>
                     <td><code><%= link.tunnelPort %></code></td>
                     <td>
-                        <span class="badge badge-<%= statusClass %>"><%= link.status %></span>
+                        <span class="badge badge-<%= statusClass %>"<% if (link.observationExpiresAt) { %> data-cascade-observation-expires="<%= link.observationExpiresAt %>"<% } %>><%= link.status %></span>
                     </td>
                     <td>
                         <div class="cascade-link-actions">
@@ -156,6 +156,22 @@
             </tbody>
         </table>
     </div>
+    <% if (cascadeLinks.some(link => link.observationExpiresAt)) { %>
+    <script>
+    for (const badge of document.querySelectorAll('[data-cascade-observation-expires]')) {
+        const expires = Number(badge.dataset.cascadeObservationExpires);
+        const expire = () => {
+            const remaining = expires - Date.now();
+            if (remaining > 0 && remaining <= 90000) return;
+            badge.classList.replace('badge-success', 'badge-info');
+            badge.textContent = 'deployed';
+        };
+        expire();
+        setTimeout(expire, Math.max(0, Math.min(90000, expires - Date.now())));
+        document.addEventListener('visibilitychange', expire);
+    }
+    </script>
+    <% } %>
     <% } else { %>
     <div class="card-body">
         <p class="hint" style="margin:0"><%= t('nodes.addCascadeLink') %> — <a href="/panel/nodes" onclick="switchNodesViewNetwork(); return false;"><%= t('nodes.goToNetworkMap') %></a></p>

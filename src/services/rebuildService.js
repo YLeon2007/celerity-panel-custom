@@ -14,7 +14,8 @@ const {createRebuildRelayAccounts}=require('./rebuildRelayAccounts');
 const {assertNoPendingRelayAccounts}=require('./rebuildRelayAccountsStore');
 const {resolveRelayBinding,captureRelayBinding}=require('./rebuildRelayAuthorization');
 const {appliedLink}=require('./rebuildAppliedLink');
-const {createPrivateKey,createPublicKey}=require('node:crypto');
+const {isReverse,unverified}=require('./rebuildReverseLinkHealth');
+const {createPrivateKey,createPublicKey,randomBytes}=require('node:crypto');
 const fail=code=>Object.assign(new Error(code),{code});
 // Subscriptions publish a separate X25519 public key. It never appears in
 // the server JSON, so comparing MAIN before/after cannot catch a DB-only edit.
@@ -213,7 +214,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     }
                     for(const link of desired){
                         const result=await Link.updateOne({_id:link._id,active:{$ne:false},rebuildDelete:{$ne:true}},
-                            {$set:{status:'deployed',lastError:'',rebuildApplied:appliedLink(link)}},{session,runValidators:true});
+                            {$set:{...(isReverse(link)?unverified:{status:'deployed',lastError:''}),rebuildApplied:appliedLink(link),
+                                rebuildApplyEpoch:randomBytes(16).toString('hex')},
+                            $unset:{rebuildReverseObservation:''}},{session,runValidators:true});
                         if(result.acknowledged!==true||result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');
                     }
                     if(removed.length){const result=await Link.deleteMany({_id:{$in:removed.map(l=>l._id)},rebuildDelete:true},{session});if(result.deletedCount!==removed.length)throw fail('REBUILD_LINK_CHANGED');}

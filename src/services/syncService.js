@@ -263,7 +263,7 @@ class SyncService {
         return this._sendAgentRequest(node, method, path, body);
     }
 
-    async _sendAgentRequest(node, method, path, body) {
+    async _sendAgentRequest(node, method, path, body, directRead) {
         const xray = node.xray || {};
         const useTls = xray.agentTls !== false;
         const port = xray.agentPort || 62080;
@@ -274,7 +274,14 @@ class SyncService {
         }
 
         const protocol = useTls ? 'https' : 'http';
-        const url = `${protocol}://${node.ip}:${port}${path}`;
+        let host = node.ip;
+        if (directRead) {
+            const ipVersion = require('node:net').isIP(host);
+            if (ipVersion === 6) host = `[${host}]`;
+            else if (typeof host !== 'string' || !/^[a-z0-9.-]+$/i.test(host)) throw new Error('Invalid agent host');
+            if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid agent port');
+        }
+        const url = `${protocol}://${host}:${port}${path}`;
 
         const options = {
             method,
@@ -296,6 +303,18 @@ class SyncService {
             options.httpsAgent = selfSignedAgent;
         }
 
+        if (directRead) {
+            // The observation challenge and bearer must stay at the configured
+            // receiving agent. This GET has a total deadline and never retries.
+            Object.assign(options, {
+                proxy: false, maxRedirects: 0, timeout: directRead.timeout,
+                signal: AbortSignal.timeout(directRead.timeout), maxContentLength: 1024,
+                responseType: 'text', transformResponse: [bytes => bytes],
+            });
+            options.headers.Accept = 'application/json';
+            options.headers['Cache-Control'] = 'no-store';
+        }
+
         const response = await axios(options);
 
         if (response.status === 401) {
@@ -313,6 +332,10 @@ class SyncService {
         }
 
         return response;
+    }
+
+    readRebuildReverseObservation(node, path, timeout) {
+        return this._sendAgentRequest(node, 'GET', path, null, { timeout });
     }
 
     // Read-only, safe to use from GET routes. Neither liveness nor legacy

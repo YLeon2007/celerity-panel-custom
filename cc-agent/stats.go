@@ -42,6 +42,9 @@ func ParseSnapshot(rawStats map[string]int64) Snapshot {
 
 		switch kind {
 		case "user":
+			if isReverseObservationEmail(id) {
+				continue
+			}
 			ut := snap.Users[id]
 			if ut == nil {
 				ut = &UserTraffic{}

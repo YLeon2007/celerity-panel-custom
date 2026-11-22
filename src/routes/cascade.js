@@ -15,6 +15,7 @@ const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
 const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
+const { isReverse, projectReverseHealth, observationSelect } = require('../services/rebuildReverseLinkHealth');
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -110,6 +111,8 @@ router.post('/chain/deploy', requireScope('nodes:write'), deployLimiter, async (
  * GET /cascade/links/:id/health — health-check a single link
  */
 router.get('/links/:id/health', requireScope('nodes:read'), async (req, res) => {
+    const rebuild = isRebuildEnabled();
+    if (rebuild) res.set('Cache-Control', 'no-store');
     try {
         if (!isValidObjectId(req.params.id)) {
             return res.status(400).json({ error: 'Invalid link ID' });
@@ -119,13 +122,18 @@ router.get('/links/:id/health', requireScope('nodes:read'), async (req, res) => 
         if (!link) return res.status(404).json({ error: 'Cascade link not found' });
 
         const healthy = await cascadeService.healthCheckLink(link);
-        const updated = await CascadeLink.findById(req.params.id);
+        const query = CascadeLink.findById(req.params.id);
+        const updated = await (rebuild ? query.select(observationSelect).lean() : query);
+        if (!updated) return res.status(404).json({ error: 'Cascade link not found' });
+        const reverse = rebuild && isReverse(updated);
+        const current = reverse ? projectReverseHealth(updated) : updated;
 
         res.json({
-            healthy,
-            status: updated.status,
-            lastHealthCheck: updated.lastHealthCheck,
-            latencyMs: updated.latencyMs,
+            healthy: reverse ? current.status === 'online' : healthy,
+            status: current.status,
+            ...(reverse && current.observationExpiresAt ? { observationExpiresAt: current.observationExpiresAt } : {}),
+            lastHealthCheck: current.lastHealthCheck,
+            latencyMs: current.latencyMs,
         });
     } catch (error) {
         logger.error(`[Cascade API] Health error: ${error.message}`);
@@ -140,6 +148,7 @@ router.get('/links/:id/health', requireScope('nodes:read'), async (req, res) => 
  */
 router.get('/topology', requireScope('nodes:read'), async (req, res) => {
     try {
+        if (isRebuildEnabled()) res.set('Cache-Control', 'no-store');
         const topology = await cascadeService.getTopology();
         res.json(topology);
     } catch (error) {

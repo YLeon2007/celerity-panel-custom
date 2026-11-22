@@ -13,6 +13,14 @@
     const CREATE_DEFAULT_FINGERPRINT = 'chrome';
     const REALITY_FINGERPRINTS_26_11 = ['chrome', 'firefox', 'safari'];
 
+    function expireReverseStatus(row, now = Date.now()) {
+        if (row.isInternetEdge || row.mode === 'forward' || row.status !== 'online') return row;
+        const until = row.observationExpiresAt;
+        if (Number.isSafeInteger(until) && now < until && until - now <= 90_000) return row;
+        return { ...row, status: 'deployed', tunnelState: 'unknown', lastHealthCheck: null,
+            latencyMs: null, observationExpiresAt: undefined };
+    }
+
     function resolveRealityFingerprint(saved, mode) {
         const value = typeof saved === 'string' ? saved : '';
         return mode === 'edit' ? value : (value.trim() || CREATE_DEFAULT_FINGERPRINT);
@@ -180,6 +188,7 @@
             clientReadinessMessage,
             deployResultMessage,
             isCompletedClassicDeploymentResult,
+            expireReverseStatus,
             describeTopologyError,
             fingerprintForLinkEdit,
             resolveRealityFingerprint,
@@ -475,6 +484,33 @@
     let deployedRevision = null;
     let _allLinks = [];
     let _allNodes = new Map();
+    let observationTimer, topologyRead = 0;
+
+    function expireReverseDisplay() {
+        clearTimeout(observationTimer);
+        const now = Date.now();
+        let next = Infinity;
+        _allLinks = _allLinks.map(link => expireReverseStatus(link, now));
+        for (const edge of cy.edges()) {
+            const current = edge.data();
+            const fresh = expireReverseStatus(current, now);
+            if (fresh !== current) {
+                edge.data({ status: fresh.status, tunnelState: fresh.tunnelState, observationExpiresAt: null });
+            } else if (fresh.status === 'online' && fresh.observationExpiresAt) {
+                next = Math.min(next, fresh.observationExpiresAt);
+            }
+        }
+        document.getElementById('nodeInfoBody')?.querySelectorAll('[data-reverse-expires]').forEach(el => {
+            const until = Number(el.dataset.reverseExpires);
+            const current = cy.getElementById('link-' + el.dataset.reverseLink);
+            if (!current.length || current.data('status') !== 'online' || !(now < until && until - now <= 90_000)) {
+                el.classList.remove('online');
+                el.classList.add('deployed');
+                el.textContent = el.dataset.reverseFallback;
+            } else next = Math.min(next, until);
+        });
+        if (Number.isFinite(next)) observationTimer = setTimeout(expireReverseDisplay, next - now);
+    }
 
     function applyLinkSnapshot(snapshot) {
         if (!snapshot || !Number.isSafeInteger(snapshot.topologyRevision)
@@ -492,7 +528,7 @@
             }
         }
         _allLinks = snapshot.links.map(link => deleteTombstones.has(link._id)
-            ? deletionLink(link, deleteTombstones.get(link._id)) : link);
+            ? deletionLink(link, deleteTombstones.get(link._id)) : (rebuild ? expireReverseStatus(link) : link));
         for (const [linkId, state] of deleteTombstones) {
             if (!listedLinkIds.has(linkId)) _allLinks.push(deletionLink(state.link, state));
         }
@@ -657,6 +693,7 @@
         }, 30);
 
         setInterval(refreshStatuses, 30000);
+        if (rebuild) document.addEventListener('visibilitychange', expireReverseDisplay);
 
         if (typeof ResizeObserver !== 'undefined') {
             new ResizeObserver(function () { if (cy) cy.resize(); })
@@ -671,6 +708,7 @@
     // ==================== DATA LOADING ====================
 
     async function loadTopology() {
+        const read = ++topologyRead;
         // A read-only diagnostic; a failed read never enables a previously
         // disabled action. Backend enrollment independently enforces the ban.
         if (!rebuild) fetch('/api/cascade/topology/activation-policy').then(async response => {
@@ -686,7 +724,9 @@
             if (!topologyRes.ok) throw new Error('HTTP ' + topologyRes.status);
             if (!linksRes.ok) throw new Error('HTTP ' + linksRes.status);
             const data = await topologyRes.json();
-            applyLinkSnapshot(await linksRes.json());
+            const links = await linksRes.json();
+            if (rebuild && read !== topologyRead) return false;
+            applyLinkSnapshot(links);
             renderGraph(data);
             return true;
         } catch (err) {
@@ -698,11 +738,14 @@
     }
 
     async function refreshStatuses() {
+        const read = ++topologyRead;
         try {
             const [res, linksRes] = await Promise.all([fetch('/api/cascade/topology'), fetch('/api/cascade/links')]);
             if (!res.ok || !linksRes.ok) return;
             const data = await res.json();
-            applyLinkSnapshot(await linksRes.json());
+            const links = await linksRes.json();
+            if (rebuild && read !== topologyRead) return;
+            applyLinkSnapshot(links);
             renderGraph(data);
         } catch (_) {}
     }
@@ -725,7 +768,11 @@
 
         const isEmpty = (!data.nodes || data.nodes.length === 0) &&
                         (!data.edges || data.edges.length === 0);
-        if (isEmpty) { setEmptyState(true); return; }
+        if (isEmpty) {
+            if (rebuild) expireReverseDisplay();
+            setEmptyState(true);
+            return;
+        }
         setEmptyState(false);
 
         const elements = [];
@@ -770,7 +817,17 @@
             const projection = {};
             if (link) for (const key of ['applicationState', 'routeState', 'tunnelState', 'pppReadiness',
                 'xrayReadiness', 'clientReadiness', 'appliedOperationId', 'desiredVersion', 'lifecycle']) projection[key] = link[key];
-            const edgeData = { ...e.data, ...projection, progress: linkProgress.get(e.data.linkId) };
+            let edgeData = { ...e.data, ...projection, progress: linkProgress.get(e.data.linkId) };
+            if (rebuild && !edgeData.isInternetEdge && edgeData.mode !== 'forward' && edgeData.status === 'online') {
+                // Two parallel reads can straddle a cut or edit. Both must
+                // still say online; use the earlier of the two deadlines.
+                edgeData.observationExpiresAt = link?.status === 'online'
+                    ? Math.min(edgeData.observationExpiresAt, link.observationExpiresAt) : undefined;
+                edgeData = expireReverseStatus(edgeData);
+            }
+            if (rebuild && !edgeData.isInternetEdge && edgeData.mode !== 'forward' && edgeData.status !== 'online') {
+                edgeData.tunnelState = 'unknown';
+            }
             elements.push({
                 group: 'edges',
                 data: { ...edgeData, edgeLabel: buildEdgeLabel(edgeData) },
@@ -778,6 +835,7 @@
         }
 
         cy.add(elements);
+        if (rebuild) expireReverseDisplay();
 
         if (hadGraph) {
             cy.zoom(previousZoom);
@@ -1224,7 +1282,7 @@
     }
 
     function onEdgeTap(evt) {
-        const d = evt.target.data();
+        const d = rebuild ? expireReverseStatus(evt.target.data()) : evt.target.data();
         const sc = d.status || 'pending';
         const lid = d.linkId;
 
@@ -1263,7 +1321,10 @@
             field('ti-shield-lock', i18n.routeEncryption || 'Tunnel encryption', escHtml(summary.encryption)) +
             '</div>' +
             field(i18n.drawerStatus || 'Status',
-                '<div class="info-status ' + sc + '">\u25CF ' + (d.status || 'pending') + '</div>') +
+                '<div class="info-status ' + sc + '"' + (rebuild && Number.isSafeInteger(d.observationExpiresAt)
+                    ? ' data-reverse-expires="' + d.observationExpiresAt + '" data-reverse-link="' + escHtml(lid)
+                        + '" data-reverse-fallback="● deployed"' : '')
+                    + '>\u25CF ' + (d.status || 'pending') + '</div>') +
             linkStateFields(d) +
             (d.xrayReadiness === undefined ? field('ti-shield-check', 'Готовность клиента',
                 escHtml(clientReadinessMessage(d.clientReadiness, topologyRevision, deployedRevision))) : '') +
@@ -1296,6 +1357,7 @@
             '<p class="info-hint">' + escHtml(syncDomainScope) + '</p>' +
             (domainSyncAnchorError(lid)
                 ? '<p class="info-hint">' + escHtml(domainSyncAnchorError(lid)) + '</p>' : ''));
+        if (rebuild) expireReverseDisplay();
     }
 
     function linkStateFields(d) {
@@ -1315,7 +1377,10 @@
             && typeof d.appliedOperationId === 'string' && /^[a-f0-9]{24}$/.test(d.appliedOperationId);
         return field(i18n.applicationStateLabel || 'Применение', escHtml(application[d.applicationState] || '—'))
             + field(i18n.routeStateLabel || 'Целостность маршрута', escHtml(routes[d.routeState] || routes.unknown))
-            + field(i18n.tunnelStateLabel || 'Туннель', escHtml(tunnels[d.tunnelState] || tunnels.unknown))
+            + field(i18n.tunnelStateLabel || 'Туннель', rebuild && Number.isSafeInteger(d.observationExpiresAt) && d.tunnelState === 'connected'
+                ? '<span data-reverse-expires="' + d.observationExpiresAt + '" data-reverse-link="' + escHtml(d.linkId)
+                    + '" data-reverse-fallback="' + escHtml(tunnels.unknown) + '">' + escHtml(tunnels.connected) + '</span>'
+                : escHtml(tunnels[d.tunnelState] || tunnels.unknown))
             + field('PPP/L2TP', escHtml(d.pppReadiness === 'verified' ? verified : unverified))
             + field('Xray/VLESS/REALITY', escHtml(xrayVerified ? verified : unverified))
             + (d.progress ? field(i18n.operationProgress || 'Задание / фаза / причина / следующее действие', escHtml(progressMessage(d.progress))) : '');

@@ -21,10 +21,19 @@ const appliedLinkSchema = new mongoose.Schema({
     uuid: { type: String, match: /^\S+$/, required: true },
 }, { _id: false, versionKey: false, strict: 'throw' });
 
+const reverseObservationSchema = new mongoose.Schema({
+    version: { type: Number, enum: [1], required: true },
+    generation: { type: String, match: /^[a-f0-9]{64}$/, required: true },
+    observedAt: { type: Date, required: true },
+    established: { type: Boolean, required: true },
+}, { _id: false, versionKey: false, strict: 'throw' });
+
 function hideRebuildSecrets(_doc, row) {
     delete row.rebuildVlessKeyEnvelope;
     delete row._rebuildVless;
     delete row.rebuildApplied;
+    delete row.rebuildApplyEpoch;
+    delete row.rebuildReverseObservation;
     return row;
 }
 
@@ -105,6 +114,8 @@ const cascadeLinkSchema = new mongoose.Schema({
     // null = a newly created Rebuild draft; absent = legacy, not proof of a
     // never-applied draft. Only successful Apply readback writes a descriptor.
     rebuildApplied: { type: appliedLinkSchema, select: false, default: undefined },
+    rebuildApplyEpoch: { type: String, select: false, match: /^[a-f0-9]{32}$/ },
+    rebuildReverseObservation: { type: reverseObservationSchema, select: false },
     // Metadata only. Startup must never infer a fresh deploy from this flag.
     autoDeploy: { type: Boolean, default: false },
     // The old descriptor remains intact until operation-owned cleanup/readback

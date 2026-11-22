@@ -78,10 +78,62 @@ test('edge readiness fails closed without current explicit client proof', () => 
     const projection = source.match(/        for \(const e of edges\) \{[\s\S]*?\n        \}/)[0];
     const elements = [];
     vm.runInNewContext(projection, { elements,
+        rebuild: false,
         edges: [{ data: { linkId: 'link', source: 'p', target: 'b', clientReadiness: scopedProof } }],
         visibleNodeIds: new Set(['p', 'b']), confirmedDeletions: new Set(), listedLinkIds: new Set(['link']),
         _allLinks: [{ _id: 'link', clientReadiness: undefined }], linkProgress: new Map(), buildEdgeLabel: () => '' });
     assert.equal(elements[0].data.clientReadiness, undefined, 'fresh inventory must override stale green edge proof');
+});
+
+test('rebuild map expires reverse evidence and rejects an old green graph after a cut', () => {
+    const projection = source.match(/        for \(const e of edges\) \{[\s\S]*?\n        \}/)[0];
+    const stamp = 100_000;
+    const edgeData = { linkId: 'link', source: 'p', target: 'b', mode: 'reverse', status: 'online',
+        observationExpiresAt: stamp + 90_000 };
+    const run = (edge, link, now = stamp, rebuild = true) => {
+        const elements = [];
+        vm.runInNewContext(projection, { elements, rebuild,
+            expireReverseStatus: row => network.expireReverseStatus(row, now),
+            edges: [{ data: edge }], visibleNodeIds: new Set(['p', 'b']), confirmedDeletions: new Set(),
+            listedLinkIds: new Set(['link']), _allLinks: [{ _id: 'link', ...link }],
+            linkProgress: new Map(), buildEdgeLabel: () => '' });
+        return elements[0].data;
+    };
+    const list = { status: 'online', tunnelState: 'connected', observationExpiresAt: stamp + 40_000 };
+    assert.equal(run(edgeData, list).status, 'online');
+    assert.equal(run(edgeData, list).observationExpiresAt, list.observationExpiresAt);
+    assert.equal(run(edgeData, list, list.observationExpiresAt).status, 'deployed');
+    assert.equal(run(edgeData, { status: 'deployed' }).status, 'deployed');
+    assert.equal(run(edgeData, { ...list, observationExpiresAt: undefined }).tunnelState, 'unknown');
+    assert.equal(run({ ...edgeData, observationExpiresAt: undefined }, list).status, 'deployed');
+    assert.equal(run({ ...edgeData, mode: 'forward' }, {}).status, 'online');
+    assert.equal(run({ ...edgeData, isInternetEdge: true }, {}).status, 'online');
+    assert.equal(run({ ...edgeData, observationExpiresAt: undefined }, {}, stamp, false).status, 'online');
+});
+
+test('an already open rebuild map and drawer expire without a refresh', () => {
+    const display = source.match(/    function expireReverseDisplay\(\) \{[\s\S]*?\n    \}/)[0];
+    let now = 100_000, scheduled;
+    const row = { status: 'online', tunnelState: 'connected', observationExpiresAt: now + 5000 };
+    const edge = { length: 1, data: key => typeof key === 'string' ? row[key] : Object.assign(row, key) };
+    const badge = { dataset: { reverseLink: 'fixture', reverseExpires: String(row.observationExpiresAt),
+        reverseFallback: '● deployed' }, classList: new Set(['online']), textContent: '● online' };
+    badge.classList.remove = badge.classList.delete.bind(badge.classList);
+    vm.runInNewContext(display + '\nexpireReverseDisplay();', {
+        Date: { now: () => now }, clearTimeout: () => {}, observationTimer: undefined, _allLinks: [{ ...row }],
+        setTimeout: (fn, ms) => { scheduled = { fn, ms }; },
+        cy: { edges: () => [edge], getElementById: id => id === 'link-fixture' ? edge : { length: 0 } },
+        document: { getElementById: () => ({ querySelectorAll: () => [badge] }) },
+        expireReverseStatus: network.expireReverseStatus,
+    });
+    assert.equal(row.status, 'online');
+    assert.equal(scheduled.ms, 5000);
+    now += scheduled.ms;
+    scheduled.fn();
+    assert.equal(row.status, 'deployed');
+    assert.equal(row.tunnelState, 'unknown');
+    assert.equal(badge.textContent, '● deployed');
+    assert.equal(badge.classList.has('online'), false);
 });
 
 test('operation polling waits for client verification after execution succeeds', () => {
