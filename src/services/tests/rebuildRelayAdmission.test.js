@@ -317,7 +317,12 @@ test('revoke rechecks footprint, endpoint and generation after the host witness'
 
 test('store conflicts disclose only the safe detail; unknown writes never replay or report success', async () => {
     for (const [input, expected, auditOutcome] of [
-        [{ code: conflict.code, field: 'endpoint' }, { ...conflict, detail: 'endpoint', outcome: 'refused' }, 'denied'],
+        [{ code: conflict.code, field: 'endpoint', sources: ['env', 'db'], keyValue: 'private fixture' },
+            { ...conflict, detail: 'endpoint', sources: ['env', 'db'], outcome: 'refused' }, 'denied'],
+        [{ code: conflict.code, field: 'endpoint', sources: ['db', 'private fixture'] },
+            { ...conflict, detail: 'endpoint', outcome: 'refused' }, 'denied'],
+        [{ code: conflict.code, field: 'private fixture', sources: ['env', 'db'] },
+            { ...conflict, outcome: 'refused' }, 'denied'],
         [{ code: 'REBUILD_L2TP_GRANT_CHANGED' }, { ...conflict, detail: 'grant-changed', outcome: 'refused' }, 'denied'],
         [{ code: 'REBUILD_L2TP_GRANT_OUTCOME_UNKNOWN', detail: 'private fixture' },
             { code: 'REBUILD_L2TP_GRANT_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false }, 'unknown'],
@@ -327,7 +332,8 @@ test('store conflicts disclose only the safe detail; unknown writes never replay
         const { challenge } = await f.approve();
         await assert.rejects(f.perform('confirm', challenge), error => {
             assert.equal(error.message, expected.code);
-            for (const [key, value] of Object.entries(expected)) assert.equal(error[key], value);
+            assert.deepEqual({ ...error }, expected);
+            if (expected.sources) assert.notEqual(error.sources, input.sources);
             assert.ok(!JSON.stringify(error).includes('private fixture'));
             return true;
         });

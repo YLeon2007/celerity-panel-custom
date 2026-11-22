@@ -207,7 +207,7 @@ test('the mounted admission service passes categorical refusals without probing 
         C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true',
     }, store: {
         async snapshot() {
-            if (duplicate) throw new RelayGrantConflict('endpoint', ['env', 'db']);
+            if (duplicate) throw Object.assign(new RelayGrantConflict('endpoint', ['env', 'db']), { keyValue: privateValue });
             return { sourceFor: () => 'env' };
         },
         async audit() {},
@@ -215,8 +215,7 @@ test('the mounted admission service passes categorical refusals without probing 
     const { send } = mount(t, undefined, admission);
     assert.deepEqual(checked(await send(url('probe')), 409), { error: { code, conflict: { sources: ['env'] } } });
     duplicate = true;
-    // The current service retains the field but not the registry source pair.
-    assert.deepEqual(checked(await send(url('probe')), 409), { error: { code, conflict: { field: 'endpoint' } } });
+    assert.deepEqual(checked(await send(url('probe')), 409), { error: { code, conflict: { field: 'endpoint', sources: ['env', 'db'] } } });
 });
 
 test('install, remove and accounts return stable grant errors without internal details', async t => {

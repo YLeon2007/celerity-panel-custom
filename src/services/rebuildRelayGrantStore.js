@@ -169,20 +169,33 @@ function createRelayGrantStore({ db, env = process.env }) {
         catch { throw unavailable(); }
     }
 
-    async function apply({ action, binding, expectedGeneration, actor }, session) {
+    function checkMutation({ action, binding, expectedGeneration }, { grants, entries }) {
+        const { nodeId } = binding;
+        const current = grants.find(row => row.nodeId === nodeId);
+        const source = entries.find(entry => entry.binding.nodeId === nodeId)?.source;
+        if (source === 'env' || (action === 'grant' && current)) throw new RelayGrantConflict('nodeId', [source, 'db']);
+        if (action !== 'grant' && (!current || current.generation !== expectedGeneration)) throw error('CHANGED');
+        if (action !== 'revoke') {
+            const kept = entries.filter(entry => !current || entry.source !== 'db' || entry.binding.nodeId !== nodeId);
+            const nextEntries = [...kept, { binding, source: 'db' }];
+            assertUniqueRelayBindings(nextEntries);
+            listOverlay(nextEntries); // Do not persist a union the synchronous resolver would refuse.
+        }
+        return current;
+    }
+
+    async function apply(changes, session) {
+        const { action, binding, expectedGeneration, actor } = changes;
         const config = { ...env };
         if (!relayInstallEnabled(config)) throw new GrantError('REBUILD_L2TP_INSTALL_DISABLED');
-        const { grants, entries } = await registry(config, session, true);
+        const view = await registry(config, session, true);
         const checkEnv = () => {
             if (!relayInstallEnabled(env) || authorityKeys.some(key => config[key] !== env[key]
                 || Object.hasOwn(config, key) !== Object.hasOwn(env, key))) throw error('CHANGED');
         };
         checkEnv();
         const { nodeId } = binding;
-        const current = grants.find(row => row.nodeId === nodeId);
-        const source = entries.find(entry => entry.binding.nodeId === nodeId)?.source;
-        if (source === 'env' || (action === 'grant' && current)) throw new RelayGrantConflict('nodeId', [source, 'db']);
-        if (action !== 'grant' && (!current || current.generation !== expectedGeneration)) throw error('CHANGED');
+        const current = checkMutation(changes, view);
         const options = write(session);
         const filter = { nodeId, generation: expectedGeneration };
         const collection = grantsCollection();
@@ -191,10 +204,6 @@ function createRelayGrantStore({ db, env = process.env }) {
             const result = await collection.deleteOne(filter, options);
             if (result?.acknowledged !== true || result.deletedCount !== 1) throw error('CHANGED');
         } else {
-            const kept = entries.filter(entry => !current || entry.source !== 'db' || entry.binding.nodeId !== nodeId);
-            const nextEntries = [...kept, { binding, source: 'db' }];
-            assertUniqueRelayBindings(nextEntries);
-            listOverlay(nextEntries); // Do not persist a union the synchronous resolver would refuse.
             const now = new Date();
             next = { ...binding, createdBy: current?.createdBy ?? actor, createdAt: current?.createdAt ?? now,
                 confirmedBy: actor, confirmedAt: now, generation: randomUUID() };
@@ -215,6 +224,17 @@ function createRelayGrantStore({ db, env = process.env }) {
         if (session?.inTransaction()) await session.abortTransaction();
     }
 
+    async function observedConflict(changes) {
+        // A simultaneous unique-index contender can surface as WriteConflict
+        // before the winner is majority-visible. Observe only, never replay the
+        // grant or its audit. Keep CHANGED unless a collision actually appears.
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            await delay(10 * attempt);
+            try { checkMutation(changes, await registry({ ...env }, undefined, true)); }
+            catch (cause) { return cause instanceof RelayGrantConflict ? cause : undefined; }
+        }
+    }
+
     async function mutate({ action, binding, expectedGeneration, actor, session } = {}) {
         try {
             if (!grantActions.has(action) || !validActor(actor) || !validId(binding?.nodeId)) throw invalid();
@@ -227,32 +247,39 @@ function createRelayGrantStore({ db, env = process.env }) {
             await ensureCollections();
             if (session) return await apply(changes, session);
 
-            // Retry only a known Mongo write conflict before commit, with a new
-            // snapshot and the original expectedGeneration. Never replay a
-            // commit whose outcome may have been lost.
-            for (let attempt = 0; ; attempt++) {
-                const own = await db.startSession();
-                let committing = false;
-                try {
-                    own.startTransaction({ readConcern: { level: 'snapshot' }, readPreference: 'primary',
-                        writeConcern: majority, maxCommitTimeMS: timeLimits.maxTimeMS });
-                    const result = await apply(changes, own);
-                    committing = true;
-                    await own.commitTransaction();
-                    return result;
-                } catch (cause) {
-                    if (committing) {
-                        if (cause?.code === 11000) throw cause;
-                        throw outcomeUnknown();
-                    }
-                    await abort(own);
-                    if (cause?.code !== 112 || attempt >= 4) throw cause;
-                } finally {
-                    // Cleanup cannot change an acknowledged commit or mask a
-                    // sanitized refusal. MongoDB sessions are single-owner here.
-                    try { await own.endSession(); } catch { /* Preserve settlement. */ }
+            const admin = db.getClient().db('admin');
+            const own = await db.startSession();
+            let commitAttempted = false;
+            try {
+                if (typeof own.transaction?.transition !== 'function' || typeof admin?.command !== 'function') throw unavailable();
+                own.startTransaction({ readConcern: { level: 'snapshot' }, readPreference: 'primary', writeConcern: majority });
+                const result = await apply(changes, own);
+                const { recoveryToken } = own.transaction;
+                // The driver's commitTransaction can retry even with retryWrites:false.
+                // Use the same one-shot command boundary as rebuildRelayInstallTransaction.
+                commitAttempted = true;
+                const reply = await admin.command({ commitTransaction: 1,
+                    ...(recoveryToken && { recoveryToken }), writeConcern: { ...majority, wtimeout: timeLimits.maxTimeMS },
+                    maxTimeMS: timeLimits.maxTimeMS }, { session: own, ...timeLimits, readPreference: 'primary' });
+                if (reply?.ok !== 1 || reply.writeConcernError || reply.writeErrors?.length || reply.errorLabels?.length) {
+                    throw outcomeUnknown();
                 }
-                await delay(10 * (attempt + 1));
+                return result;
+            } catch (cause) {
+                if (commitAttempted) throw outcomeUnknown();
+                try { await abort(own); } catch { throw cause; }
+                if (cause?.code === 112 && changes.action !== 'revoke' && !own.inTransaction()) {
+                    const conflict = await observedConflict(changes);
+                    if (conflict) throw conflict;
+                }
+                throw cause;
+            } finally {
+                try {
+                    // This is local bookkeeping, not proof that Mongo committed.
+                    // endSession would auto-abort if the transaction is still active.
+                    if (commitAttempted) own.transaction.transition('TRANSACTION_COMMITTED');
+                    if (!commitAttempted || !own.inTransaction()) await own.endSession();
+                } catch { /* Preserve known success or the original refusal/unknown outcome. */ }
             }
         } catch (cause) {
             // A caller-owned transaction must not commit a staged grant when

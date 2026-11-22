@@ -92,13 +92,28 @@ function fixture(t, { legacy = false } = {}) {
         t.mock.method(model.collection, 'findOne', async (filter, options) => get(filter, options)[0] ?? null);
     }
     const db = { readyState: 1, createCollection: async name => assert.equal(name, auditCollection) };
-    db.startSession = async () => ({
-        inTransaction() { return !!this.writes; },
-        startTransaction() { this.writes = []; },
-        async commitTransaction() { for (const apply of this.writes) apply(); this.writes = null; },
-        async abortTransaction() { this.writes = null; },
-        async endSession() {},
-    });
+    class Session {
+        transaction = { transition: state => {
+            assert.equal(state, 'TRANSACTION_COMMITTED');
+            this.writes = null;
+        } };
+        inTransaction() { return !!this.writes; }
+        startTransaction() { this.writes = []; }
+        async abortTransaction() { this.writes = null; }
+        async endSession() { assert.equal(this.inTransaction(), false); }
+    }
+    db.startSession = async () => new Session();
+    db.getClient = () => ({ db(database) {
+        assert.equal(database, 'admin');
+        return { async command(command, { session }) {
+            assert.equal(command.commitTransaction, 1);
+            assert.equal(command.writeConcern.w, 'majority');
+            assert.ok(session.inTransaction());
+            // Applying the raw command does not alter driver-local state.
+            for (const apply of session.writes) apply();
+            return { ok: 1 };
+        } };
+    } });
     db.collection = name => {
         if (name === grantCollection) return {
             find(filter, options) {

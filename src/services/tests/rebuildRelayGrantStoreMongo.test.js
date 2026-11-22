@@ -1,6 +1,7 @@
 'use strict';
 
 // Opt in with a disposable loopback-only replica set in a private netns.
+// Fault tests also require enableTestCommands=1 on that server.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
@@ -11,6 +12,8 @@ const { resolveRelayBinding } = require('../rebuildRelayAuthorization');
 
 const port = process.env.C3_GRANT_FIXTURE_PORT;
 const local = { skip: !port && 'Requires a private loopback MongoDB replica-set fixture' };
+const failpoints = port && process.env.C3_GRANT_FIXTURE_FAILPOINTS === '1' ? local
+    : { skip: 'Requires a private fixture with MongoDB test commands enabled' };
 const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true' };
 const binding = n => ({ nodeId: n.repeat(24), host: `relay-${n}.invalid`, port: 22, username: 'root',
     machineId: n.repeat(32), sshHostKeySha256: n.repeat(64) });
@@ -22,6 +25,7 @@ async function fixture(t, config = env) {
     assert.deepEqual(Object.keys(networkInterfaces()), ['lo']);
     const db = mongoose.createConnection(`mongodb://127.0.0.1:${port}/?directConnection=true`, {
         dbName: `c3_grant_fixture_${randomUUID().replaceAll('-', '')}`, serverSelectionTimeoutMS: 2000,
+        monitorCommands: true, retryWrites: false,
     });
     t.after(async () => { try { if (db.readyState === 1) await db.dropDatabase(); } finally { await db.close(); } });
     await db.asPromise();
@@ -48,6 +52,7 @@ for (const [field, duplicate] of Object.entries({
         const [{ reason }] = results.filter(result => result.status === 'rejected');
         assert.equal(reason.code, 'REBUILD_L2TP_GRANT_CONFLICT');
         assert.equal(reason.field, field);
+        assert.deepEqual(reason.sources, ['db', 'db']);
         const indexes = await f.grants.indexes();
         assert.deepEqual(indexes.filter(i => i.unique).map(i => Object.entries(i.key)).sort(), [
             [['nodeId', 1]], [['machineId', 1]], [['sshHostKeySha256', 1]], [['host', 1], ['port', 1]],
@@ -84,3 +89,43 @@ test('real MongoDB joins legacy ObjectId inventory and aborts grant changes with
     assert.deepEqual((await restored.snapshot()).grants, []);
     assert.equal(await f.audit.countDocuments(), 2);
 });
+
+for (const [fault, data] of [
+    ['write concern error', { writeConcernError: { code: 64, errmsg: 'private fixture error' } }],
+    ['connection loss', { closeConnection: true }],
+]) {
+    test(`real MongoDB sends only one commit on ${fault}`, failpoints, async t => {
+        const f = await fixture(t);
+        const admin = f.db.db.admin();
+        const commands = [];
+        f.db.getClient().on('commandStarted', ({ commandName, databaseName, command }) => {
+            if ((databaseName === f.db.name && commandName === 'insert')
+                || commandName === 'commitTransaction' || commandName === 'abortTransaction') {
+                commands.push({ name: command.insert ?? commandName, databaseName, autocommit: command.autocommit,
+                    lsid: command.lsid, txnNumber: command.txnNumber, concern: command.writeConcern });
+            }
+        });
+        await admin.command({ configureFailPoint: 'failCommand', mode: { times: 1 },
+            data: { failCommands: ['commitTransaction'], ...data } });
+        let refusal;
+        try { refusal = await f.mutate(binding('a')).catch(error => error); }
+        finally { await admin.command({ configureFailPoint: 'failCommand', mode: 'off' }); }
+        assert.deepEqual(commands.map(command => command.name), [grantsName, auditName, 'commitTransaction']);
+        const commit = commands[2];
+        assert.equal(commit.databaseName, 'admin');
+        assert.equal(commit.concern.w, 'majority');
+        assert.ok(commit.lsid && commit.txnNumber != null);
+        for (const command of commands) {
+            assert.equal(command.autocommit, false);
+            assert.deepEqual(command.lsid, commit.lsid);
+            assert.deepEqual(command.txnNumber, commit.txnNumber);
+        }
+        assert.equal(refusal.code, 'REBUILD_L2TP_GRANT_OUTCOME_UNKNOWN');
+        assert.equal(refusal.retryAllowed, false);
+        assert.equal(refusal.message, refusal.code);
+        // Independent reads, never a basis to retry or upgrade the refusal.
+        const committed = data.writeConcernError ? 1 : 0;
+        assert.equal(await f.grants.countDocuments(), committed);
+        assert.equal(await f.audit.countDocuments({ outcome: 'success' }), committed);
+    });
+}

@@ -417,7 +417,18 @@ function createRebuildRelayAdmission({ db = require('mongoose').connection, env 
             const auditCode = code === GRANT_UNAVAILABLE ? (mappedCodes.has(cause) ? cause : 'REBUILD_L2TP_GRANT_PERSISTENCE_UNAVAILABLE') : code;
             try { await audit(outcome === 'refused' ? 'denied' : 'unknown', auditCode); }
             catch { /* Do not replace a refusal or an unknown write outcome. */ }
-            throw fail(code, detail, outcome);
+            const refusal = fail(code, detail, outcome);
+            // Only registry categories accompany a source pair, never the values
+            // that collided or the underlying Mongo error.
+            if (code === CONFLICT && detail === error?.field
+                && ['nodeId', 'machineId', 'sshHostKeySha256', 'endpoint'].includes(detail)) {
+                const sources = error.sources;
+                if (Array.isArray(sources) && sources.length === 2) {
+                    const pair = [sources[0], sources[1]];
+                    if (pair.every(source => source === 'env' || source === 'db')) refusal.sources = pair;
+                }
+            }
+            throw refusal;
         }
     }
     return { perform };

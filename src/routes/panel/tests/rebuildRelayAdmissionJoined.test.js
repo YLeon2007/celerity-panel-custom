@@ -89,13 +89,15 @@ function mongoFixture(t) {
             this.modified = new Set();
         }
         inTransaction() { return Boolean(this.view); }
-        commit(kind) {
+        commit() {
             assert.ok(this.inTransaction());
+            const kind = this.modified.has(GRANTS) ? (this.grantAction ?? 'grant') : 'install';
+            if (this.modified.has(GRANTS)) assert.deepEqual([...this.modified], [GRANTS, AUDIT]);
             commits.push([kind, ...this.modified]);
             for (const name of this.modified) tables.set(name, this.view.get(name));
             return { ok: 1 };
         }
-        async commitTransaction() { this.commit(this.grantAction ?? 'grant'); this.view = null; }
+
         async abortTransaction() { this.view = null; }
         async endSession() { assert.equal(this.inTransaction(), false); }
     }
@@ -185,7 +187,7 @@ function mongoFixture(t) {
         return { async command(command, { session }) {
             assert.equal(command.commitTransaction, 1);
             assert.equal(command.writeConcern.w, 'majority');
-            return session.commit('install');
+            return session.commit();
         } };
     } }));
     return { rows: name => tables.get(name).map(copy), commits, writes: () => writes.splice(0), password };

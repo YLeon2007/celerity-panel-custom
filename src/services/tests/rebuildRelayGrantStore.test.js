@@ -19,12 +19,12 @@ const legacy = { ...enabled, C3_REBUILD_L2TP_RELAY_ID: a.nodeId, C3_REBUILD_L2TP
 const card = row => ({ _id: row.nodeId, ip: row.host, ssh: { port: row.port, username: row.username } });
 const code = suffix => ({ code: `REBUILD_L2TP_GRANT_${suffix}` });
 
-// Isolated collection/transaction model. In addition to snapshot visibility,
-// it checks unique keys and generation against committed data at commit time.
+// Model snapshot visibility, write-time unique-index checks, and the separate
+// server settlement and driver-local states of a raw commit.
 function fixture(env = { ...enabled }) {
     let state = { [GRANTS]: [], [AUDIT]: [] };
     let indexes = [];
-    const controls = {}, touches = [];
+    const controls = {}, touches = [], lifecycle = [];
     let inventory;
     const match = (row, filter) => Object.keys(filter).every(key => row[key] === filter[key]);
     function unique(rows, row) {
@@ -35,6 +35,7 @@ function fixture(env = { ...enabled }) {
         }
     }
     const requireTransaction = session => { assert.ok(session.inTransaction()); return session.view; };
+    const recoveryToken = { recoveryShardId: 'fixture' };
     const db = {
         readyState: 1,
         collection(name) {
@@ -59,6 +60,9 @@ function fixture(env = { ...enabled }) {
                     } };
                 },
                 async insertOne(row, { session }) {
+                    lifecycle.push('grant insert');
+                    await controls.beforeInsert?.();
+                    unique(state[name], row);
                     const apply = rows => { unique(rows, row); rows.push(row); };
                     apply(requireTransaction(session)[name]);
                     session.operations.push(next => apply(next[name]));
@@ -93,6 +97,7 @@ function fixture(env = { ...enabled }) {
             return { async insertOne(row, { session, writeConcern }) {
                 if (controls.auditFailure) throw new Error('fixture private audit failure');
                 if (session) {
+                    lifecycle.push('audit insert');
                     requireTransaction(session)[name].push(row);
                     session.operations.push(next => next[name].push(row));
                     controls.afterAudit?.();
@@ -103,30 +108,55 @@ function fixture(env = { ...enabled }) {
                 return { acknowledged: true };
             } };
         },
+        getClient() {
+            return { db(name) {
+                assert.equal(name, 'admin');
+                return { async command(command, { session, maxTimeMS, timeoutMS, readPreference }) {
+                    lifecycle.push('raw commit');
+                    assert.deepEqual(command, { commitTransaction: 1, recoveryToken,
+                        writeConcern: { w: 'majority', wtimeout: 5000 }, maxTimeMS: 5000 });
+                    assert.deepEqual({ maxTimeMS, timeoutMS, readPreference }, { maxTimeMS: 5000, timeoutMS: 5000, readPreference: 'primary' });
+                    requireTransaction(session);
+                    const next = structuredClone(state);
+                    for (const operation of session.operations) operation(next);
+                    state = next;
+                    if (controls.afterCommit) return controls.afterCommit();
+                    return { ok: 1 };
+                } };
+            } };
+        },
         async startSession() {
+            lifecycle.push('session');
             return {
+                transaction: { recoveryToken, transition(state) {
+                    lifecycle.push(state);
+                    controls.transitionFailure?.();
+                    if (!controls.noTransition) delete this.session.view;
+                } },
                 inTransaction() { return Boolean(this.view); },
                 startTransaction(options) {
+                    this.transaction.session = this;
                     this.view = structuredClone(state);
                     this.operations = [];
                     assert.equal(options?.writeConcern.w, 'majority');
                 },
-                async commitTransaction() {
-                    const next = structuredClone(state);
-                    for (const operation of this.operations) operation(next);
-                    state = next;
+                async abortTransaction() {
+                    lifecycle.push('abort');
                     delete this.view;
-                    controls.afterCommit?.();
                 },
-                async abortTransaction() { delete this.view; },
-                async endSession() { this.ended = true; },
+                async endSession() {
+                    lifecycle.push('end');
+                    if (this.inTransaction()) await this.abortTransaction();
+                    controls.endFailure?.();
+                    this.ended = true;
+                },
             };
         },
     };
     const store = createRelayGrantStore({ db, env });
     const mutate = (binding, action = 'grant', expectedGeneration = null, session) =>
         store.mutate({ action, binding, expectedGeneration, actor, session });
-    return { db, store, mutate, controls, touches, setCard: row => { inventory = row; },
+    return { db, store, mutate, controls, touches, lifecycle, setCard: row => { inventory = row; },
         records: () => state[GRANTS], history: () => state[AUDIT], indexes: () => indexes };
 }
 
@@ -174,6 +204,15 @@ test('ENV list + DB is a disjoint union, preserves gates, and does not project g
     assert.deepEqual(JSON.parse(env[LIST]), [a]);
     assert.equal(merged.sourceFor(a.nodeId), 'env');
     assert.equal(merged.sourceFor(b.nodeId), 'db');
+    assert.ok(Object.isFrozen(merged.env));
+    assert.throws(() => { merged.env[LIST] = '[]'; }, TypeError);
+    const original = structuredClone(merged.grants);
+    await f.mutate(b, 'revoke', original[0].generation);
+    assert.deepEqual(JSON.parse((await f.store.snapshot()).env[LIST]), [a]);
+    assert.deepEqual(merged.grants, original);
+    assert.deepEqual(JSON.parse(merged.env[LIST]), [a, b]);
+    assert.equal(merged.sourceFor(b.nodeId), 'db');
+    await f.mutate(b);
     env.C3_REBUILD_L2TP_INSTALL_ENABLED = 'false';
     const disabled = await f.store.snapshot();
     assert.throws(() => resolveRelayBinding(disabled.env, b.nodeId, card(b)), { code: 'REBUILD_L2TP_INSTALL_DISABLED' });
@@ -225,12 +264,24 @@ for (const [field, override] of collisions) {
         const env = fixture(withList(a));
         await assert.rejects(env.mutate(next), { ...code('CONFLICT'), field, sources: ['env', 'db'] });
         const f = fixture();
-        const results = await Promise.allSettled([f.mutate(a), f.mutate(next)]);
+        let inserts = 0;
+        const first = f.mutate(a);
+        f.controls.beforeInsert = async () => {
+            // Both snapshots predate publication, but one insert observes the
+            // winner at its unique-index write boundary, not during commit.
+            if (++inserts !== 2) return;
+            await first;
+            if (field === 'endpoint') throw Object.assign(new Error('write conflict'), { code: 112 });
+        };
+        const results = await Promise.allSettled([first, f.mutate(next)]);
         assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
         assert.deepEqual(results.filter(r => r.status === 'rejected').map(({ reason }) => [reason.code, reason.field, reason.sources]),
             [[code('CONFLICT').code, field, ['db', 'db']]]);
         assert.equal(f.records().length, 1);
         assert.equal(f.history().length, 1);
+        assert.equal(inserts, 2);
+        assert.equal(f.lifecycle.filter(step => step === 'session').length, 2);
+        assert.equal(f.lifecycle.filter(step => step === 'raw commit').length, 1);
     });
 }
 
@@ -310,15 +361,47 @@ test('ENV authority change before commit aborts the grant and its staged audit',
     await assert.rejects(f.mutate(a), code('CHANGED'));
     assert.deepEqual(f.records(), []);
     assert.deepEqual(f.history(), []);
+    assert.deepEqual(f.lifecycle, ['session', 'grant insert', 'audit insert', 'abort', 'end']);
     assert.equal((await f.store.snapshot()).sourceFor(a.nodeId), 'env');
 });
 
-test('lost commit acknowledgement is reported as unknown without replay', async () => {
+const commitLifecycle = ['session', 'grant insert', 'audit insert', 'raw commit', 'TRANSACTION_COMMITTED'];
+test('no replay or inferred rollback on a lost or invalid commit acknowledgement', async () => {
+    for (const afterCommit of [() => { throw Object.assign(new Error('private fixture commit error'), { code: 11000 }); },
+        () => undefined, () => ({ ok: 0 }), () => ({ ok: 1, writeConcernError: {} }),
+        () => ({ ok: 1, writeErrors: [{}] }), () => ({ ok: 1, errorLabels: ['UnknownTransactionCommitResult'] })]) {
+        const f = fixture();
+        f.controls.afterCommit = afterCommit;
+        await assert.rejects(f.mutate(a), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false });
+        assert.deepEqual(f.lifecycle, [...commitLifecycle, 'end']);
+        assert.equal(f.records().length, 1);
+        assert.equal(f.history().length, 1);
+    }
+});
+
+test('do not end an active driver session after attempting commit', async () => {
+    for (const fault of [{ transitionFailure() { throw new Error('transition failure'); } }, { noTransition: true }]) {
+        const f = fixture();
+        Object.assign(f.controls, fault, { afterCommit: () => ({ ok: 1, writeConcernError: {} }) });
+        await assert.rejects(f.mutate(a), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false });
+        assert.deepEqual(f.lifecycle, commitLifecycle);
+    }
+});
+
+test('session disposal failure does not turn an acknowledged commit into an unknown outcome', async () => {
     const f = fixture();
-    let commits = 0;
-    f.controls.afterCommit = () => { commits++; throw new Error('private fixture commit error'); };
-    await assert.rejects(f.mutate(a), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false });
-    assert.equal(commits, 1);
+    f.controls.endFailure = () => { throw new Error('cleanup failure'); };
+    assert.equal((await f.mutate(a)).nodeId, a.nodeId);
+    assert.deepEqual(f.lifecycle, [...commitLifecycle, 'end']);
     assert.equal(f.records().length, 1);
     assert.equal(f.history().length, 1);
+});
+
+test('pre-commit write conflict does not replay the mutation or manufacture a duplicate', async () => {
+    const f = fixture();
+    f.controls.beforeInsert = () => { throw Object.assign(new Error('private write conflict'), { code: 112 }); };
+    await assert.rejects(f.mutate(a), code('CHANGED'));
+    assert.deepEqual(f.lifecycle, ['session', 'grant insert', 'abort', 'end']);
+    assert.deepEqual(f.records(), []);
+    assert.deepEqual(f.history(), []);
 });
