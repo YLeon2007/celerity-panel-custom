@@ -57,8 +57,8 @@ function seedNativeStock(put, root, generated) {
     }
 }
 
-module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt }) => {
-    test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
+module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt, wireOnly = false }) => {
+    if (!wireOnly) test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
 
     function seedHost(t, f, relay, machineId, scenario, { preEnabled = false, idleIke = false, subscribers = [], lifecycle = false,
         mainUid = 65534, cohort = false } = {}) {
@@ -424,6 +424,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         });
         return frames;
     }
+
+    if (wireOnly) return wire;
 
     test('joined DIRECT wire waits for stdin EOF and completes only once', async t => {
         const command = '/usr/bin/timeout -k fixture';
