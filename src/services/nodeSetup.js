@@ -11,6 +11,8 @@ const config = require('../../config');
 const cryptoService = require('./cryptoService');
 const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
+const xraySetupRuntime = require('./xraySetupRuntime');
+const { writeExecStdin, discardLateExecStream } = require('./sshExecStdin');
 
 /**
  * Check if a node is on the same VPS as the panel
@@ -417,10 +419,38 @@ function connectSSH(node) {
     });
 }
 
-function execSSH(conn, command) {
+function execSSH(conn, command, { stdin, timeoutMs } = {}) {
     return new Promise((resolve, reject) => {
-        conn.exec(command, (err, stream) => {
-            if (err) return reject(err);
+        let settled = false;
+        let stream;
+        let writer;
+        let inputEnded = stdin === undefined;
+        let timer;
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            writer?.cancel();
+            callback(value);
+        };
+        const fail = error => {
+            if (settled) return;
+            finish(reject, error);
+            discardLateExecStream(stream);
+        };
+        if (timeoutMs) timer = setTimeout(() => fail(new Error('SSH command timed out')), timeoutMs);
+        try {
+            conn.exec(command, (err, stream) => {
+                if (settled) return discardLateExecStream(stream);
+                if (err) return finish(reject, err);
+                onChannel(stream);
+            });
+        } catch (error) {
+            fail(error);
+        }
+
+        function onChannel(channel) {
+            stream = channel;
             
             let stdout = '';
             let stderr = '';
@@ -428,16 +458,24 @@ function execSSH(conn, command) {
             stream.on('close', (code) => {
                 const output = stdout + (stderr ? '\n[STDERR]:\n' + stderr : '');
                 
-                if (code === 0) {
-                    resolve({ success: true, output, code });
+                if (code === 0 && inputEnded) {
+                    finish(resolve, { success: true, output, code });
                 } else {
-                    resolve({ success: false, output, code, error: `Exit code: ${code}` });
+                    finish(resolve, { success: false, output, code, error: code === 0 ? 'SSH stdin incomplete' : `Exit code: ${code}` });
                 }
             });
             
             stream.on('data', (data) => { stdout += data.toString(); });
             stream.stderr.on('data', (data) => { stderr += data.toString(); });
-        });
+            if (stdin !== undefined || timeoutMs) {
+                stream.on('error', fail);
+                stream.stderr.on('error', fail);
+            }
+            if (stdin !== undefined) {
+                writer = writeExecStdin(stream, stdin, { onComplete: () => { inputEnded = true; }, onError: fail });
+                if (settled) writer.cancel();
+            }
+        }
     });
 }
 
@@ -558,7 +596,7 @@ function uploadFile(conn, content, remotePath) {
  * @param {Function} log - Logging function from the parent setup context
  * @param {Array} logs - Log accumulator from the parent setup context
  */
-async function runInitScript(conn, node, log, logs) {
+async function runInitScript(conn, node, log, logs, { includeOutput = true } = {}) {
     const script = (node.initScript || '').trim();
     if (!script) return;
 
@@ -578,7 +616,7 @@ async function runInitScript(conn, node, log, logs) {
 
     try {
         const result = await execSSH(conn, wrappedScript);
-        if (result.output) logs.push(result.output);
+        if (includeOutput && result.output) logs.push(result.output);
 
         if (result.success) {
             log('Init script completed successfully');
@@ -586,7 +624,7 @@ async function runInitScript(conn, node, log, logs) {
             log(`Init script exited with code ${result.code} (non-fatal, continuing setup)`);
         }
     } catch (err) {
-        log(`Init script error: ${err.message} (non-fatal, continuing setup)`);
+        log(`Init script error${includeOutput ? `: ${err.message}` : ''} (non-fatal, continuing setup)`);
     }
 }
 
@@ -899,16 +937,20 @@ ${TCP_BBR_SNIPPET}
 // ACME (acme.sh) setup for tlsSource='acme': issue LE cert for `domain` via
 // HTTP-01 standalone, install to /usr/local/etc/xray/{cert,key}.pem, register
 // acme.sh cron for autonomous renewal. Inputs sanitized at the call-site.
-function buildAcmeSetupScript({ domain, email, nodeIp }) {
+function buildAcmeSetupScript({ domain, email, nodeIp, gid }) {
     const safe = (raw, allowed, max) => String(raw || '').replace(allowed, '').slice(0, max);
     const d = safe(domain, /[^A-Za-z0-9.\-]/g, 253);
     const e = safe(email, /[^A-Za-z0-9.\-_+@]/g, 254);
     const ip = safe(nodeIp, /[^A-Za-z0-9.:]/g, 45);
     if (!d) throw new Error('buildAcmeSetupScript: domain is required');
     if (!e) throw new Error('buildAcmeSetupScript: email is required');
+    const reloadCommand = `${xraySetupRuntime.tlsFileHelpers(gid)}
+secure_tls_file /usr/local/etc/xray/key.pem && secure_tls_file /usr/local/etc/xray/cert.pem &&
+if [ "\${CELERITY_XRAY_SETUP:-}" != 1 ]; then systemctl reload xray.service || systemctl restart xray.service; fi`;
 
-    return `#!/bin/bash
+    return xraySetupRuntime.bash(`
 set -e
+umask 077
 DOMAIN="${d}"
 EMAIL="${e}"
 NODE_IP="${ip}"
@@ -958,22 +1000,19 @@ else
     echo "Existing cert present for \${DOMAIN}; skipping --issue (renewals run via acme.sh cron)."
 fi
 
-mkdir -p /usr/local/etc/xray
-
-# Xray runs as User=nobody; acme.sh writes as root → chown is required for the
-# unprivileged service to read the key. Re-applied via --reloadcmd on renewal.
-# 'nobody' primary group differs by distro (nogroup on Debian/Ubuntu).
-NOBODY_GROUP="\$(id -gn nobody 2>/dev/null || echo nobody)"
-RELOAD_CMD="chown 'nobody:\${NOBODY_GROUP}' '\${KEY_PATH}' '\${CERT_PATH}' 2>/dev/null || true; chmod 644 '\${CERT_PATH}' 2>/dev/null || true; chmod 600 '\${KEY_PATH}' 2>/dev/null || true; systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true"
-
-"\${ACME}" --install-cert -d "\${DOMAIN}" --ecc \\
+${xraySetupRuntime.tlsFileHelpers(gid)}
+safe_tls_file "$KEY_PATH" && safe_tls_file "$CERT_PATH" || exit 36
+for file in "$KEY_PATH" "$CERT_PATH"; do
+    if [[ -e "$file" ]]; then secure_tls_file "$file" || exit 36; fi
+done
+# acme.sh runs this hook immediately and again at renewal. Only renewal
+# may reload/restart Xray; setup owns its own optional restart.
+CELERITY_XRAY_SETUP=1 "\${ACME}" --install-cert -d "\${DOMAIN}" --ecc \\
     --key-file       "\${KEY_PATH}" \\
     --fullchain-file "\${CERT_PATH}" \\
-    --reloadcmd "\${RELOAD_CMD}"
-
-chown "nobody:\${NOBODY_GROUP}" "\${KEY_PATH}" "\${CERT_PATH}" 2>/dev/null || true
-chmod 644 "\${CERT_PATH}" 2>/dev/null || true
-chmod 600 "\${KEY_PATH}"  2>/dev/null || true
+    --reloadcmd ${xraySetupRuntime.quote(xraySetupRuntime.bash(reloadCommand))}
+[[ -s "$KEY_PATH" && -s "$CERT_PATH" ]] || exit 36
+secure_tls_file "$KEY_PATH" && secure_tls_file "$CERT_PATH" || exit 36
 
 if crontab -l 2>/dev/null | grep -q '\\.acme\\.sh/acme\\.sh.*--cron'; then
     echo "Done: cert installed; acme.sh cron is active."
@@ -982,7 +1021,7 @@ else
 fi
 
 echo "ACME setup completed for \${DOMAIN}"
-`;
+`);
 }
 
 /**
@@ -994,8 +1033,8 @@ echo "ACME setup completed for \${DOMAIN}"
  * 5. Enable and restart xray service
  *
  * @param {Object} node - Node document
- * @param {Object} options - { restartService }
- * @returns {{ success, logs, realityKeys? }}
+ * @param {Object} options - { restartService, exitOnly }
+ * @returns {{ success, serviceVerified, logs, realityKeys? }}
  */
 async function setupXrayNode(node, options = {}) {
     const { restartService = true, exitOnly = false } = options;
@@ -1018,7 +1057,7 @@ async function setupXrayNode(node, options = {}) {
                 `Use a different port (e.g. 8443) for the Xray node. ` +
                 `After changing the port, save the node and run Auto Setup again.`;
             log(`ERROR: ${msg}`);
-            return { success: false, error: msg, logs, realityKeys: null };
+            return { success: false, serviceVerified: false, error: msg, logs, realityKeys: null };
         }
 
         // ACME on same-VPS is incompatible (port 80 held by panel Caddy).
@@ -1028,7 +1067,7 @@ async function setupXrayNode(node, options = {}) {
                 `port 80 is held by the panel's Caddy and cannot be used for HTTP-01. ` +
                 `Switch the node to tlsSource='panel' (panel's LE cert is reused) or move the node to a separate VPS.`;
             log(`ERROR: ${msg}`);
-            return { success: false, error: msg, logs, realityKeys: null };
+            return { success: false, serviceVerified: false, error: msg, logs, realityKeys: null };
         }
 
         if (sameVps) {
@@ -1038,29 +1077,34 @@ async function setupXrayNode(node, options = {}) {
 
     let conn;
     let generatedKeys = null;
+    const { CONFIG_PATH, XraySetupError, checkedExec, prepareAccessCommand, writeConfigCommand,
+        selfSignedCommand, restartCommand } = xraySetupRuntime;
+    const exec = (command, opts) => execSSH(conn, command, opts);
 
     try {
         log('Connecting via SSH...');
         conn = await connectSSH(node);
         log('SSH connected');
 
-        await runInitScript(conn, node, log, logs);
+        await runInitScript(conn, node, log, logs, { includeOutput: false });
 
         // Install Xray
         log('Installing Xray-core...');
-        const installResult = await execSSH(conn, XRAY_INSTALL_SCRIPT);
-        logs.push(installResult.output);
-        if (!installResult.success) {
-            throw new Error(`Xray installation failed: ${installResult.error}`);
-        }
+        await checkedExec(exec, XRAY_INSTALL_SCRIPT, 'Не удалось установить Xray-core.',
+            { timeoutMs: 0, usePhaseCodes: false });
         log('Xray-core installed');
 
-        // Exit (Bridge) nodes: skip config, Reality keys, firewall, and service start.
-        // Their actual config is deployed via cascade links.
+        const configGenerator = require('./configGenerator');
+        const prepareAccess = () => checkedExec(exec,
+            prepareAccessCommand(configGenerator.generateXraySystemdService(), { exitOnly }),
+            'Не удалось подготовить права доступа службы Xray.');
+
+        // Cascade owns the actual config and service activation on exit nodes.
+        // Prepare main Xray access for a later deploy without replacing config.
         if (exitOnly) {
-            log('Exit node setup completed (Xray binary only). Deploy a cascade link to configure.');
-            if (conn) conn.end();
-            return { success: true, logs, realityKeys: null };
+            await prepareAccess();
+            log('Exit node setup completed: xray.service config access prepared; no config deployed or service restart requested. Deploy using cascade links.');
+            return { success: true, serviceVerified: false, logs, realityKeys: null };
         }
 
         // Generate Reality keys and shortId if needed
@@ -1073,7 +1117,7 @@ async function setupXrayNode(node, options = {}) {
             if (!xrayCfg.realityPrivateKey) {
                 log('Generating x25519 Reality keys...');
                 generatedKeys = cryptoService.generateX25519KeysLocal();
-                log(`Reality keys generated. PublicKey: ${generatedKeys.publicKey}`);
+                log('Reality keys generated');
                 updates['xray.realityPrivateKey'] = generatedKeys.privateKey;
                 updates['xray.realityPublicKey'] = generatedKeys.publicKey;
                 node.xray = { ...node.xray, realityPrivateKey: generatedKeys.privateKey, realityPublicKey: generatedKeys.publicKey };
@@ -1085,7 +1129,7 @@ async function setupXrayNode(node, options = {}) {
             const hasRealShortId = currentShortIds.some(id => id && id.length > 0);
             if (!hasRealShortId) {
                 const shortId = require('crypto').randomBytes(8).toString('hex'); // 16 hex chars
-                log(`Generated shortId: ${shortId}`);
+                log('Reality shortId generated');
                 updates['xray.realityShortIds'] = ['', shortId]; // empty + random
                 node.xray = { ...node.xray, realityShortIds: ['', shortId] };
                 needsUpdate = true;
@@ -1101,7 +1145,6 @@ async function setupXrayNode(node, options = {}) {
 
         // Generate and upload config
         log('Generating Xray config...');
-        const configGenerator = require('./configGenerator');
         const syncService = require('./syncService');
         // Lazy-load manualKey for nodes using tlsSource==='manual' since the
         // private key is select:false at the schema layer.
@@ -1117,17 +1160,13 @@ async function setupXrayNode(node, options = {}) {
                 const human = genErr.code === 'PANEL_CERT_UNAVAILABLE'
                     ? `Panel certificate is not available on disk yet — issue/renew the panel cert (${config.PANEL_DOMAIN || '<PANEL_DOMAIN unset>'}) and re-run install.`
                     : 'Manual TLS PEM is missing — paste both certificate and private key in the node form before installing.';
-                throw new Error(human);
+                throw new XraySetupError(human);
             }
-            throw genErr;
+            throw new XraySetupError('Не удалось сформировать конфигурацию Xray.');
         }
-        const configPath = '/usr/local/etc/xray/config.json';
-
-        await uploadFile(conn, configContent, configPath);
-        log(`Config uploaded to ${configPath} (${users.length} users)`);
-        logs.push('--- Config preview ---');
-        logs.push(configContent.substring(0, 500) + (configContent.length > 500 ? '\n...' : ''));
-        logs.push('--- End config preview ---');
+        const access = await prepareAccess();
+        const gid = /^XRAY_GID=(0|[1-9][0-9]{0,9})\n$/.exec(access)?.[1];
+        if (!gid || Number(gid) >= 4294967295) throw new XraySetupError('Не удалось подтвердить группу доступа к конфигурации Xray.');
 
         // Self-signed TLS: openssl is only invoked when explicitly requested.
         // For tlsSource=panel/manual the certificate is inlined into config.json
@@ -1138,54 +1177,30 @@ async function setupXrayNode(node, options = {}) {
             // not strictly validated) and cap at the X.509 64-char CN limit.
             const rawCn = String(node.domain || node.sni || node.ip || 'xray');
             const cn = (rawCn.replace(/[^A-Za-z0-9.\-:]/g, '').slice(0, 64)) || 'xray';
-            const certResult = await execSSH(conn, `
-mkdir -p /usr/local/etc/xray
-if [ ! -f /usr/local/etc/xray/cert.pem ] || [ ! -s /usr/local/etc/xray/cert.pem ] \\
-   || [ ! -f /usr/local/etc/xray/key.pem ] || [ ! -s /usr/local/etc/xray/key.pem ]; then
-    if openssl ecparam -name prime256v1 -genkey -noout -out /usr/local/etc/xray/key.pem 2>/dev/null; then
-        openssl req -x509 -new -key /usr/local/etc/xray/key.pem \\
-            -out /usr/local/etc/xray/cert.pem \\
-            -subj "/CN=${cn}" -days 36500 2>&1 || true
-    fi
-    if [ ! -s /usr/local/etc/xray/cert.pem ]; then
-        # Fallback to RSA for ancient OpenSSL builds without prime256v1
-        openssl req -x509 -nodes -newkey rsa:2048 \\
-            -keyout /usr/local/etc/xray/key.pem \\
-            -out /usr/local/etc/xray/cert.pem \\
-            -subj "/CN=${cn}" -days 36500 2>&1 || true
-    fi
-    chmod 600 /usr/local/etc/xray/key.pem
-    chmod 644 /usr/local/etc/xray/cert.pem
-    echo "OK: Self-signed certificate generated for CN=${cn}"
-else
-    echo "Skipped: certificate already exists"
-fi
-`);
-            logs.push(certResult.output);
-            if (!certResult.success) {
-                log(`Self-signed cert generation warning: ${certResult.error}`);
-            }
+            await checkedExec(exec, selfSignedCommand(gid, cn), 'Не удалось подготовить самоподписанный сертификат Xray.');
         } else if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'acme') {
             const domain = String(node.domain || '').trim();
             const email = (String(xrayCfg.acmeEmail || '').trim()) ||
                           (String(config.ACME_EMAIL || '').trim());
             if (!domain) {
-                throw new Error('tlsSource=acme requires node.domain to be set in the Network section.');
+                throw new XraySetupError('tlsSource=acme requires node.domain to be set in the Network section.');
             }
             if (!email) {
-                throw new Error('tlsSource=acme requires acmeEmail (or the panel-wide ACME_EMAIL env var).');
+                throw new XraySetupError('tlsSource=acme requires acmeEmail (or the panel-wide ACME_EMAIL env var).');
             }
             log(`TLS source: acme — installing acme.sh and issuing LE cert for ${domain}...`);
-            const acmeScript = buildAcmeSetupScript({ domain, email, nodeIp: node.ip });
-            const acmeResult = await execSSH(conn, acmeScript);
-            logs.push(acmeResult.output);
-            if (!acmeResult.success) {
-                throw new Error(`ACME setup failed: ${acmeResult.error || 'see logs above'}`);
-            }
+            const acmeScript = buildAcmeSetupScript({ domain, email, nodeIp: node.ip, gid });
+            await checkedExec(exec, acmeScript, 'Не удалось настроить сертификат ACME для Xray.', { timeoutMs: 0 });
             log('ACME cert installed and auto-renewal cron registered on the node.');
         } else if (xrayCfg.security === 'tls') {
             log(`TLS source: ${xrayCfg.tlsSource || 'panel'} — certificate inlined in config.json (no on-node openssl)`);
         }
+
+        // Stream bytes into a private same-filesystem stage; publish config.json
+        // only once the complete upload and private permissions are in place.
+        await checkedExec(exec, writeConfigCommand(gid, Buffer.byteLength(configContent)),
+            'Не удалось безопасно записать config.json для Xray.', { stdin: configContent });
+        log(`Config uploaded to ${CONFIG_PATH} (${users.length} users)`);
 
         // Collect all client-facing ports: main inbound + extra inbounds.
         // apiPort is local-only (127.0.0.1) and does not need a firewall rule.
@@ -1204,7 +1219,7 @@ fi
     ufw allow ${p}/tcp 2>/dev/null || true
     ufw allow ${p}/udp 2>/dev/null || true`).join('');
 
-        const firewallResult = await execSSH(conn, `
+        await execSSH(conn, `
 echo "=== Opening firewall ports ==="
 if command -v iptables &> /dev/null; then${portRules}
     echo "Done: iptables rules added"
@@ -1215,44 +1230,28 @@ fi
 ${IPTABLES_SAVE_SNIPPET}
 echo "Done: Firewall configured"
         `);
-        logs.push(firewallResult.output);
         log('Firewall configured');
 
         if (restartService) {
-            log('Installing systemd service and starting Xray...');
-            const serviceContent = configGenerator.generateXraySystemdService();
-            await uploadFile(conn, serviceContent, '/etc/systemd/system/xray.service');
-            const restartResult = await execSSH(conn, `
-echo "=== Starting Xray service ==="
-systemctl daemon-reload
-systemctl enable xray
-systemctl restart xray
-sleep 2
-echo "Service status:"
-systemctl status xray --no-pager -l || true
-echo ""
-echo "Journal (last 15 lines):"
-journalctl -u xray -n 15 --no-pager || true
-            `);
-            logs.push(restartResult.output);
-            if (!restartResult.success) {
-                log(`Service restart warning: ${restartResult.error}`);
-            } else {
-                log('Xray service started');
-            }
+            log('Перезапуск и проверка xray.service…');
+            await checkedExec(exec, restartCommand, 'Не удалось подтвердить запуск и состояние xray.service.');
+            log('xray.service работает; новых перезапусков за время проверки не обнаружено.');
+        } else {
+            log('Конфигурация Xray подготовлена без перезапуска; состояние службы не проверялось.');
         }
 
-        log('Xray setup completed successfully!');
+        log('Xray installation and configuration steps finished');
 
         if (node.initScript) {
             await Settings.update({ lastInitScript: node.initScript }).catch(() => {});
         }
 
-        return { success: true, logs, realityKeys: generatedKeys };
+        return { success: true, serviceVerified: Boolean(restartService), logs, realityKeys: generatedKeys };
 
     } catch (error) {
-        log(`Error: ${error.message}`);
-        return { success: false, error: error.message, logs, realityKeys: generatedKeys };
+        const message = error instanceof XraySetupError ? error.message : 'Не удалось завершить настройку Xray. Проверьте SSH и настройки ноды.';
+        log(`Error: ${message}`);
+        return { success: false, serviceVerified: false, error: message, logs, realityKeys: generatedKeys };
 
     } finally {
         if (conn) conn.end();
@@ -1584,6 +1583,15 @@ async function setupXrayNodeWithAgent(node, options = {}) {
             throw new Error('CC Agent installation failed');
         }
         log(`Agent installed: ${agentResult.agentVersion}`);
+        if (result.serviceVerified) {
+            // Agent startup can reconcile on-disk users and restart Xray.
+            // Recheck the composed setup's final state; never restart a second time here.
+            result.serviceVerified = false;
+            await xraySetupRuntime.checkedExec((cmd, opts) => execSSH(conn, cmd, opts), xraySetupRuntime.verifyCommand,
+                'После установки агента не удалось проверить xray.service.');
+            result.serviceVerified = true;
+            log('После установки агента xray.service стабилен.');
+        }
 
         const HyNode = require('../models/hyNodeModel');
         const updates = {
