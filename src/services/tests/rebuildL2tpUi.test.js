@@ -464,7 +464,7 @@ async function admissionVisibility({ route, id, otherId }) {
     check(getComputedStyle(dialog).display === 'none', 'cancel did not hide the dialog');
 
     click('[data-account-action="disable"]');
-    await respond(`${route}/l2tp/accounts/disable`, { error: { code: 'REBUILD_L2TP_IDENTITY_CHANGED', nodeId: id } }, false);
+    await respond(`${route}/l2tp/accounts/disable`, { error: { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'refused', nodeId: id } }, false);
     check(visible(review) && review.getAttribute('href') === `#relay-${id}`, 'identity refusal did not expose scoped review');
     check($(`[data-node-id="${otherId}"][data-admission-action="grant"]`).disabled, 'unrelated grant became enabled');
     click('[data-admission-action="reconfirm"]');
