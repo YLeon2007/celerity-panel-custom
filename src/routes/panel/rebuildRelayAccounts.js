@@ -1,6 +1,7 @@
 'use strict';
 
 const { createRebuildService } = require('../../services/rebuildService');
+const { identityChanged, grantEffectStatus, validNodeId } = require('./rebuildRelayAdmission');
 
 const methods = Object.freeze({ create: 'createRelayAccount', disable: 'disableRelayAccount', delete: 'deleteRelayAccount' });
 const statuses = Object.freeze({ create: 'created', disable: 'disabled', delete: 'deleted' });
@@ -40,6 +41,11 @@ function accountHandler(action, service = createRebuildService) {
                 ...(revocation && { sessionsTerminated, ...(recovered && { sessionsTerminatedScope: 'request' }) }) });
         } catch (error) {
             const { code } = error ?? {};
+            const grantStatus = grantEffectStatus(code);
+            if (grantStatus) {
+                return res.status(grantStatus).json({ error: { code, retryAllowed: false,
+                    ...(code === identityChanged && validNodeId(error.nodeId) && { nodeId: error.nodeId }) } });
+            }
             if (code === invalid) return res.status(400).json({ error: { code } });
             if (blocked.has(code)) {
                 const count = error.confirmedSessionsTerminated;

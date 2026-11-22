@@ -1,6 +1,7 @@
 'use strict';
 
 const { publicInstallFailure } = require('../../services/rebuildRelayInstallDiagnostics');
+const { identityChanged, grantEffectStatus } = require('./rebuildRelayAdmission');
 
 function handler(service = () => require('../../services/rebuildService').createRebuildService()) {
     return async (req, res) => {
@@ -9,8 +10,20 @@ function handler(service = () => require('../../services/rebuildService').create
             Object.keys(req.body).some(k => k !== '_csrf')))) {
             return res.status(400).json({ error: { code: 'REBUILD_INVALID_REQUEST', outcome: 'refused' } });
         }
-        try { return res.json(await service().installRelay(req.params.id)); }
-        catch (error) {
+        try {
+            const result = await service().installRelay(req.params.id);
+            if (result?.status !== 'installed' || (result.nodeId !== undefined && result.nodeId !== req.params.id)) {
+                return res.status(503).json({ error: { outcome: 'unknown', retryAllowed: false } });
+            }
+            return res.json({ executionMode: 'rebuild', status: 'installed', nodeId: req.params.id });
+        } catch (error) {
+            const code = error?.code;
+            const status = grantEffectStatus(code);
+            if (status) {
+                const { outcome } = publicInstallFailure(error);
+                return res.status(status).json({ error: { code, retryAllowed: false,
+                    ...(code === identityChanged && { outcome: outcome === 'refused' ? 'refused' : 'unknown' }) } });
+            }
             return res.status(409).json({ error: publicInstallFailure(error) });
         }
     };

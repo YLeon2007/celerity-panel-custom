@@ -25,7 +25,8 @@ const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
 const { relayRoleBlock, withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
-const { canPreviewRemoval, issueRemovalTicket } = require('./rebuildRelayRemove');
+const { canPreviewRemoval, issueRemovalTicket, identityReviewUrl, admitPreview } = require('./rebuildRelayRemove');
+const { identityChanged } = require('./rebuildRelayAdmission');
 
 const {
     render,
@@ -582,9 +583,19 @@ router.get('/nodes/:id', async (req, res) => {
         renderNode.xray = sanitizeXrayForRender(node.xray);
         const preview = canPreviewRemoval(req);
         if (preview || rebuild) res.set('Cache-Control', 'no-store');
+        let reviewIdentity = false;
         const roleBlock = isRebuildEnabled() && node.cascadeRole === 'relay'
-            ? await relayRoleBlock(node._id, preview ? id => require('../../services/rebuildService').createRebuildService().previewRemoveRelay(id) : null)
+            ? await relayRoleBlock(node._id, preview ? async id => {
+                if (!await admitPreview(req, res)) return;
+                try { return await require('../../services/rebuildService').createRebuildService().previewRemoveRelay(id); }
+                catch (error) {
+                    reviewIdentity = error?.code === identityChanged;
+                    throw error;
+                }
+            } : null)
             : null;
+        if (res.headersSent || res.destroyed) return;
+        if (reviewIdentity) return res.redirect(303, identityReviewUrl(req.params.id));
         const removal = preview && roleBlock?.counts ? {
             summary: res.locals.t('nodes.rebuildRemoveConfirmSummary').replace('{counts}', formatRelayCounts(roleBlock.counts, res.locals.t)),
             ticket: issueRemovalTicket(req, roleBlock.estimate),
