@@ -1421,6 +1421,17 @@
     "diskThresholdsHint": "Sends host.disk_low / host.disk_critical / host.disk_recovered events."
   },
   "network": {
+    "rebuildFingerprint": {
+      "known": "Dialer: {name} · Xray {version} (last reported) · REALITY fingerprint: {fingerprint}. The server checks again before applying.",
+      "limited": "Dialer: {name} · Xray {version} (last reported) · REALITY fingerprint: {fingerprint}. Allowed: {allowed}. The server checks again before applying.",
+      "unknown": "Dialer: {name} · REALITY fingerprint: {fingerprint}. Cannot confirm compatibility before applying: the dialer’s Xray version is unknown. The server will check it independently.",
+      "mismatch": "Dialer: {name} · Xray {version} (last reported) does not support REALITY fingerprint {fingerprint}. Allowed: {allowed}. Choose one before saving. The server checks again before applying.",
+      "serverMismatch": "Dialer: {name} · Xray {version} rejected REALITY fingerprint {fingerprint}. Allowed: {allowed}. Choose one of these presets in the link form.",
+      "refused": "The server rejected the dialer’s REALITY fingerprint. Review the link’s fingerprint before trying again.",
+      "savedNotApplied": "The link was saved, but the changes were not applied.",
+      "unknownVersion": "(version unknown)",
+      "unset": "(no saved preset)"
+    },
     "rebuildPreview": {
       "deployTitle": "Apply the changes shown here?",
       "removeTitle": "Remove this cascade link and apply the changes shown here?",

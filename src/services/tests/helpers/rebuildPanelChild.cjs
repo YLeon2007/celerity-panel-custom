@@ -7,6 +7,7 @@ const path = require('node:path');
 const net = require('node:net');
 const http = require('node:http');
 const {spawnSync} = require('node:child_process');
+const {createHash} = require('node:crypto');
 const dir = fs.realpathSync(process.cwd());
 assert.ok(process.send && process.env.NODE_ENV === 'test');
 assert.ok(dir.startsWith(fs.realpathSync(process.env.TMPDIR) + '/panel-'));
@@ -37,9 +38,15 @@ const profileFixture = node => {
     const id = String(node._id); assert.match(id,/^[a-f\d]{24}$/);
     const file = profile => { assert.ok(['main','bridge'].includes(profile)); return path.join(dir,`${id}-${profile}.json`); };
     const staged = new Set();
+    const requireSupportedCore = async () => {
+        if(fs.existsSync(path.join(dir,`old-core-${id}`)))throw Object.assign(new Error('old fixture core'),{code:'REBUILD_XRAY_VERSION_TOO_OLD'});
+        return '26.3.27';
+    };
     return {
-        async requireSupportedCore() {
-            if(fs.existsSync(path.join(dir,`old-core-${id}`)))throw Object.assign(new Error('old fixture core'),{code:'REBUILD_XRAY_VERSION_TOO_OLD'});
+        requireSupportedCore,
+        async requireSupportedCoreIdentity() {
+            const version = await requireSupportedCore();
+            return { version, buildDigest: createHash('sha256').update(`Xray ${version}`).digest('hex') };
         },
         async read(profile) {
             try { return JSON.parse(fs.readFileSync(file(profile),'utf8')); }

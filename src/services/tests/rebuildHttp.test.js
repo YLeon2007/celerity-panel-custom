@@ -5,7 +5,7 @@ const {fixture}=require('../../modules/relay-l2tp/tests/helpers/installedEditMon
 const {routerForRebuild}=require('../../routes/cascadeRebuild');
 const {createRebuildService}=require('../rebuildService');
 const {generateXrayConfigWithApi}=require('../configGenerator');
-const {randomUUID}=require('node:crypto');
+const {randomUUID,createHash}=require('node:crypto');
 const {bindProfileWire,pin}=require('./helpers/rebuildBoundProfileWire');
 
 test('public rebuild actions use the DB component; read-only preview, user guard, explicit AutoDeploy, bridged DELETE retry',async t=>{
@@ -28,7 +28,10 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     files.get(id(relay)).main.inbounds.push(tproxy);
     const installed={node:relay._id,routeGroup:retainedGroup,status:'installed',desiredState:'installed',secretRevision:1,tproxyPort:tproxy.port};await State.collection.insertOne({...installed});
     let interrupt=null;
-    const connect=node=>{const key=id(node),row=files.get(key);return {requireSupportedCore:async()=>{},read:async p=>structuredClone(row[p]),close:async()=>{},stagePair:async()=>{stages.push(key)},putPair:async pair=>{if(interrupt===key)throw new Error('interrupted');for(const p of pair)row[p.profile]=structuredClone(p.config);writes.push(key);}};};
+    const versions=new Map();
+    const connect=node=>{const key=id(node),row=files.get(key),requireSupportedCore=async()=>versions.get(key)??'26.3.27';return {requireSupportedCore,
+        async requireSupportedCoreIdentity(){const version=await requireSupportedCore();return {version,buildDigest:createHash('sha256').update(version).digest('hex')};},
+        read:async p=>structuredClone(row[p]),close:async()=>{},stagePair:async()=>{stages.push(key)},putPair:async pair=>{if(interrupt===key)throw new Error('interrupted');for(const p of pair)row[p.profile]=structuredClone(p.config);writes.push(key);}};};
     const machine='b'.repeat(32);
     bindProfileWire(t.mock.method.bind(t.mock),relay.ip,machine,()=>connect(relay));
     const service=createRebuildService({env:{C3_REBUILD_ENABLED:'true',PANEL_DOMAIN:'fixture.invalid',ENCRYPTION_KEY:process.env.ENCRYPTION_KEY,
@@ -49,9 +52,23 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     assert.equal(await Link.countDocuments(),0);
     const neighbor=await make(edge(x,y,9)), g=await make(edge(relay,geo,3,{geoRouting:{enabled:true,domains:['full:geo.invalid'],geoip:['ru']}}));
     const b=await make(edge(relay,exit,2)); assert.equal(writes.length,0);
-    const pr=await make(edge(portal,relay,1,{autoDeploy:true}));assert.equal(pr.status,'awaiting_preview');assert.equal(pr.preview.allowed,true);assert.equal(stages.length,0);
+    const pr=await make(edge(portal,relay,1,{autoDeploy:true,realityFingerprint:'random'}));assert.equal(pr.status,'awaiting_preview');assert.equal(pr.preview.allowed,true);assert.equal(stages.length,0);
     const deploy='/topology/deploy';
     const blind=await request('POST',deploy,{linkId:pr.linkId});assert.equal(blind.status,428);assert.equal(blind.body.error.code,'REBUILD_PREVIEW_REQUIRED');assert.equal(stages.length,0);
+    versions.set(id(relay),'26.11.9');
+    for(const [path,body] of [['/rebuild/preview',{linkId:pr.linkId}],[deploy,{linkId:pr.linkId,expectedPreview:pr.preview.previewId}]]){
+        const start=f.commands.length;
+        const refusal=await request('POST',path,body);
+        assert.equal(refusal.status,409);
+        assert.deepEqual(Object.keys(refusal.body).sort(),['error','fingerprintIssue']);
+        assert.deepEqual(refusal.body.error,{code:'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED'});
+        const {allowed,...issue}=refusal.body.fingerprintIssue;
+        assert.deepEqual(issue,{dialerId:id(relay),version:'26.11.9',fingerprint:'random'});
+        assert.ok(allowed.includes('chrome'));assert.ok(!allowed.includes('random'));
+        assert.equal(f.commands.slice(start).some(c=>['insert','update','delete','commitTransaction'].includes(c.name)&&c.collection!=='c3_rebuild_locks'),false);
+        assert.equal(stages.length,0);assert.equal(writes.length,0);assert.equal(await applied(pr.linkId),null);
+    }
+    versions.delete(id(relay));
     await ok('POST',deploy,{linkId:pr.linkId,expectedPreview:pr.preview.previewId});assert.deepEqual([...new Set(writes)].sort(),[portal,relay,exit,geo].map(id).sort());
     assert.equal((await State.findOne({node:relay._id}).lean()).routingMode,'follow-relay');
     const r=files.get(id(relay));const socks=()=>r.main.inbounds.find(i=>i.tag==='rebuild-relay-ingress');const port=socks().port;

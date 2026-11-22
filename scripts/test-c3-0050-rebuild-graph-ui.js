@@ -34,7 +34,8 @@ const origin = 'http://127.0.0.1:3000';
 const reply = (body, status = 200, url) => ({ ok: status < 300, status, url, async json() { return body; } });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-async function graphUI(t, { rebuild = true, confirmations = [], preview = { allowed: true } } = {}) {
+async function graphUI(t, { rebuild = true, confirmations = [], preview = { allowed: true },
+    inventory = nodes, savedLink = link, responses = {} } = {}) {
     const html = render('nodes', rebuild);
     const requests = [], errors = [], unexpected = [], timers = new Map(), observers = new Map(), toasts = [];
     const elements = new Map(), taps = new Map();
@@ -58,7 +59,10 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         const listeners = new Map(), classes = new Set((attr(tag, 'class') || '').split(' '));
         const el = { tag, value: attr(tag, 'value') ?? '', checked: /\schecked(?=\s|>)/.test(tag),
             style: { display: attr(tag, 'style')?.match(/display:\s*([^;]+)/)?.[1] ?? '' },
-            innerHTML: '', textContent: '', options: [], appendChild() {}, reset() {},
+            innerHTML: '', textContent: '', options: [], appendChild(option) {
+                this.options.push(option);
+                option.remove = () => this.options.splice(this.options.indexOf(option), 1);
+            }, reset() {},
             querySelector: () => null, querySelectorAll: () => [], getAttribute: key => attr(tag, key),
             classList: { contains: value => classes.has(value),
                 add(value) { classes.add(value); changed(); }, remove(value) { classes.delete(value); changed(); },
@@ -93,7 +97,9 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         get(switcherId).querySelectorAll = selector => selector === '.mode-btn' ? modeButtons : [];
     }
     const refusals = [];
+    const confirm = () => confirmations.shift() ?? true;
     const window = { location: { origin }, alert: message => refusals.push(message),
+        confirm,
         crypto: { randomUUID: require('node:crypto').randomUUID }, showToast: (...args) => toasts.push(args) };
     const document = {
         readyState: 'complete', getElementById: get, createElement: () => element(),
@@ -110,7 +116,7 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         setTimeout(fn, delay) { timers.set(++sequence, { fn, delay }); return sequence; },
         clearTimeout: id => timers.delete(id), setInterval() {},
         MutationObserver: class { constructor(fn) { this.fn = fn; } observe(el) { observers.set(el, this.fn); } },
-        confirm() { return confirmations.shift() ?? true; },
+        confirm,
         alert(message) { errors.push(message); }, console: { error: (...args) => errors.push(args) },
         async fetch(input, options = {}) {
             const absolute = new URL(input, origin);
@@ -119,7 +125,10 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
             const method = options.method || 'GET';
             requests.push({ url, method, headers: options.headers, body: options.body && JSON.parse(options.body) });
             if (method === 'GET' && url === linksUrl) return reply(snapshot());
-            if (method === 'GET' && url === '/api/nodes') return reply(nodes);
+            const override = responses[method + ' ' + url];
+            if (override) return reply(override.body, override.status, absolute.href);
+            if (method === 'GET' && url === linksUrl + '/' + linkId) return reply(savedLink);
+            if (method === 'GET' && url === '/api/nodes') return reply(inventory, 200, absolute.href);
             if (method === 'GET' && url === '/api/cascade/topology/activation-policy') return reply({});
             if (method === 'GET' && url === '/api/cascade/topology') return reply({
                 nodes: nodes.map(n => ({ data: { id: n._id, label: n.name }, position: { x: 0, y: 0 } })),
@@ -136,6 +145,8 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
                 if (rebuild) return reply({ error: { code: 'REBUILD_STRICT_DISABLED' } }, 409);
                 return reply({ available: false, port: 10087, code: 'TUNNEL_PORT_IN_USE' });
             }
+            if (method === 'PUT' && url === linksUrl + '/' + linkId) return reply({ executionMode: 'rebuild',
+                status: 'saved', desiredSaved: true, linkId }, 200, absolute.href);
             if (method === 'POST' && url === linksUrl) return rebuild
                 ? reply({ executionMode: 'rebuild', desiredSaved: true, linkId: '000000000000000000000004',
                     status: 'awaiting_preview', preview: { allowed: false, nodes: [] } }, 201, absolute.href)
@@ -188,8 +199,8 @@ async function openCreate(ui, kind) {
         modal.classList.add('active');
     } else {
         await ui.get('btnAddLink').dispatch('click');
-        assert(form.portalNodeId.innerHTML.includes(portal._id));
-        assert(form.bridgeNodeId.innerHTML.includes(bridge._id));
+        assert(form.portalNodeId.options.some(opt => opt.value === portal._id) || form.portalNodeId.innerHTML.includes(portal._id));
+        assert(form.bridgeNodeId.options.some(opt => opt.value === bridge._id) || form.bridgeNodeId.innerHTML.includes(bridge._id));
         form.portalNodeId.value = portal._id;
         form.bridgeNodeId.value = bridge._id;
         form.name.value = 'New link';
@@ -255,3 +266,142 @@ for (const kind of ['main', 'quick']) {
         assert.equal(ui.writes()[0]?.body.autoDeploy, false, 'classic draft save remains possible');
     });
 }
+
+const inventory = [{ ...portal, name: 'Portal <node>', xrayVersion: '26.3.27' },
+    { ...bridge, xrayVersion: 'Xray 26.11.9 (Xray, Penetrates Everything.) abc1234 (go1.25.3 linux/amd64)' }];
+const fingerprintConflict = { status: 409, body: { error: { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED' },
+    fingerprintIssue: { dialerId: bridge._id, version: '26.11.9', fingerprint: 'random', allowed: ['chrome', 'firefox', 'safari'] } } };
+
+test('rebuild create blocks incompatible saves and preserves explicit random on the 26.3.27 dialer', async t => {
+    const ui = await graphUI(t, { inventory });
+    const { form, auto, mode } = await openCreate(ui, 'main');
+    const picker = form.realityFingerprint;
+    const random = picker.options.find(opt => opt.value === 'random');
+    const hint = ui.get('linkFingerprintHint');
+    assert.equal(picker.value, 'chrome');
+    assert.match(hint.textContent, /Portal <node>.*26\.3\.27/);
+    picker.value = 'random';
+    await mode('reverse');
+    assert.equal(picker.value, 'random');
+    assert.equal(random.disabled, true);
+    assert.match(hint.textContent, /Bridge.*26\.11\.9.*random.*chrome, firefox, safari/);
+    assert.equal(ui.get('linkModalSubmit').disabled, true);
+    auto.checked = false;
+    await form.dispatch('submit');
+    auto.checked = true;
+    await form.dispatch('submit');
+    assert.deepEqual(ui.writes(), []);
+    form.bridgeNodeId.value = '';
+    await form.bridgeNodeId.dispatch('change');
+    assert.doesNotMatch(hint.textContent, /26\.11\.9/);
+    form.bridgeNodeId.value = bridge._id;
+    await mode('forward');
+    assert.equal(random.disabled, false);
+    auto.checked = false;
+    await form.dispatch('submit');
+    assert.equal(ui.writes()[0].body.realityFingerprint, 'random');
+});
+
+test('rebuild edit retains the visibly incompatible saved choice until the operator replaces it', async t => {
+    const ui = await graphUI(t, { inventory, savedLink: { ...link, tunnelSecurity: 'reality', realityFingerprint: 'legacy-value' } });
+    ui.tapEdge();
+    await ui.clickAction('btnEdit');
+    const form = ui.get('addLinkForm');
+    assert.equal(form.realityFingerprint.value, 'legacy-value');
+    assert.equal(form.realityFingerprint.options.find(opt => opt.value === 'legacy-value').disabled, true);
+    assert.match(ui.get('linkFingerprintHint').textContent, /Bridge.*26\.11\.9.*legacy-value.*chrome, firefox, safari/);
+    await form.dispatch('submit');
+    assert.deepEqual(ui.writes(), []);
+    form.realityFingerprint.value = 'safari';
+    await form.realityFingerprint.dispatch('change');
+    await form.dispatch('submit');
+    assert.deepEqual(ui.writes().map(write => [write.method, write.body.realityFingerprint]), [['PUT', 'safari']]);
+    await ui.get('btnAddLink').dispatch('click');
+    assert.equal(form.realityFingerprint.value, 'chrome');
+    assert.ok(!form.realityFingerprint.options.some(opt => opt.value === 'legacy-value'));
+});
+
+test('rebuild legacy empty fingerprint stays unset instead of taking the create default', async t => {
+    const ui = await graphUI(t, { inventory, savedLink: { ...link, tunnelSecurity: 'reality', realityFingerprint: '' } });
+    ui.tapEdge();
+    await ui.clickAction('btnEdit');
+    const form = ui.get('addLinkForm');
+    assert.equal(form.realityFingerprint.value, '');
+    assert.equal(form.realityFingerprint.options.find(opt => opt.value === '').textContent, '(no saved preset)');
+    await form.dispatch('submit');
+    assert.equal(ui.writes()[0].method, 'PUT');
+    assert.ok(!Object.hasOwn(ui.writes()[0].body, 'realityFingerprint'));
+});
+
+test('rebuild quick form audits Chrome against the dialer after mode changes and swaps', async t => {
+    const ui = await graphUI(t, { inventory });
+    const { form, auto, mode } = await openCreate(ui, 'quick');
+    const hint = ui.get('quickFingerprintHint');
+    assert.match(hint.textContent, /Portal <node>.*26\.3\.27.*chrome/);
+    await ui.get('quickSwapBtn').dispatch('click');
+    assert.match(hint.textContent, /Bridge.*26\.11\.9.*chrome, firefox, safari/);
+    await mode('reverse');
+    assert.match(hint.textContent, /Portal <node>.*26\.3\.27/);
+    const security = ui.get('quickTunnelSecurity');
+    security.value = 'none';
+    await security.dispatch('change');
+    assert.equal(hint.textContent, '');
+    security.value = 'reality';
+    await security.dispatch('change');
+    auto.checked = false;
+    await form.dispatch('submit');
+    assert.equal(ui.writes()[0].body.realityFingerprint, 'chrome');
+});
+
+test('unknown hint permits submit but authoritative draft refusal does not retry or report a save', async t => {
+    const ui = await graphUI(t, { inventory: [portal, { ...bridge, xrayVersion: 'custom build 26.11.9' }],
+        responses: { ['POST ' + linksUrl]: fingerprintConflict } });
+    const { form, modal, mode } = await openCreate(ui, 'main');
+    const hint = ui.get('linkFingerprintHint');
+    assert.match(hint.textContent, /Cannot confirm.*before applying/);
+    assert.doesNotMatch(hint.textContent, /26\.11\.9/);
+    form.realityFingerprint.value = 'random';
+    await mode('reverse');
+    await form.dispatch('submit');
+    assert.equal(ui.writes().length, 1);
+    assert.equal(ui.writes()[0].headers['x-csrf-token'], csrfToken);
+    assert.equal(modal.classList.contains('active'), true);
+    assert.match(ui.toasts.at(-1)[0], /Bridge.*26\.11\.9.*random.*chrome, firefox, safari/);
+    assert.doesNotMatch(ui.toasts.at(-1)[0], /was saved/);
+    assert.equal(ui.toasts.at(-1)[1], 'error');
+});
+
+test('a draft response that confirms a save but refuses Preview cannot trigger a second write', async t => {
+    const ui = await graphUI(t, { responses: { ['POST ' + linksUrl]: { status: 409,
+        body: { ...fingerprintConflict.body, desiredSaved: true, linkId } } } });
+    const { form, modal } = await openCreate(ui, 'main');
+    await form.dispatch('submit');
+    assert.deepEqual(ui.writes().map(write => write.url), [linksUrl]);
+    assert.equal(modal.classList.contains('active'), false);
+    assert.match(ui.toasts.at(-1)[0], /The link was saved.*not applied.*Bridge.*26\.11\.9/);
+    assert.equal(ui.toasts.at(-1)[1], 'error');
+});
+
+test('Preview refusal explains the authoritative error and sends no Apply', async t => {
+    const ui = await graphUI(t, { responses: { ['POST ' + previewUrl]: fingerprintConflict } });
+    ui.tapEdge();
+    await ui.clickAction('btnDeploy');
+    assert.deepEqual(ui.writes().map(write => write.url), [previewUrl]);
+    assert.match(ui.refusals[0], /Bridge.*26\.11\.9.*random.*chrome, firefox, safari/);
+    assert.ok(ui.refusals[0].endsWith(en.network.rebuildPreview.refused));
+});
+
+test('a fingerprint refusal on Apply after the draft save never reports deployment success', async t => {
+    const deployUrl = '/api/cascade/topology/deploy';
+    const previewId = 'a'.repeat(64);
+    const ui = await graphUI(t, { inventory, responses: { ['POST ' + linksUrl]: { status: 200,
+        body: { executionMode: 'rebuild', status: 'awaiting_preview', desiredSaved: true, linkId,
+            preview: { allowed: true, previewId, nodes: [] } } }, ['POST ' + deployUrl]: fingerprintConflict } });
+    const { form, modal } = await openCreate(ui, 'main');
+    await form.dispatch('submit');
+    assert.deepEqual(ui.writes().map(write => write.url), [linksUrl, deployUrl]);
+    assert.equal(ui.writes()[1].body.expectedPreview, previewId);
+    assert.equal(modal.classList.contains('active'), false);
+    assert.match(ui.toasts.at(-1)[0], /The link was saved.*not applied.*Bridge.*26\.11\.9.*chrome, firefox, safari/);
+    assert.equal(ui.toasts.at(-1)[1], 'error');
+});

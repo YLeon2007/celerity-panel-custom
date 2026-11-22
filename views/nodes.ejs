@@ -550,13 +550,16 @@ function nodeMetaFor(node) {
                             <input type="text" name="realityShortIds" class="form-input" placeholder="Short ID (hex)">
                         </div>
                         <div class="form-group">
-                            <label><%= t('network.realityFingerprint') %></label>
-                            <select name="realityFingerprint" class="form-input">
-                                <option value="chrome">Chrome</option>
+                            <label for="linkFingerprint"><%= t('network.realityFingerprint') %></label>
+                            <select name="realityFingerprint" id="linkFingerprint" class="form-input"<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %> aria-describedby="linkFingerprintHint"<% } %>>
+                                <option value="chrome"<% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %> selected<% } %>>Chrome</option>
                                 <option value="firefox">Firefox</option>
                                 <option value="safari">Safari</option>
-                                <option value="random" selected>Random</option>
+                                <option value="random"<% if (typeof c3Rebuild === 'undefined' || !c3Rebuild) { %> selected<% } %>>Random</option>
                             </select>
+                            <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+                            <div id="linkFingerprintHint" class="form-hint" role="status" hidden></div>
+                            <% } %>
                         </div>
                     </div>
                 </div>
@@ -627,7 +630,7 @@ function nodeMetaFor(node) {
         </div>
     </div>
 
-    <!-- Quick Link Modal (opened by drag-to-create on map) -->
+    <!-- Quick Link Modal -->
     <div class="modal-overlay" id="quickLinkModal">
         <div class="modal-card modal-card-sm">
             <div class="modal-header">
@@ -684,10 +687,11 @@ function nodeMetaFor(node) {
                     <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
                     <div class="form-group">
                         <label for="quickTunnelSecurity"><%= t('network.tunnelSecurity') %></label>
-                        <select id="quickTunnelSecurity" class="form-input">
+                        <select id="quickTunnelSecurity" class="form-input" aria-describedby="quickFingerprintHint">
                             <option value="reality" selected>REALITY</option>
                             <option value="none">None</option>
                         </select>
+                        <div id="quickFingerprintHint" class="form-hint" role="status" hidden></div>
                     </div>
                     <% } %>
                 </div>
@@ -1337,7 +1341,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=a22dff59e044cf75' : '/js/network.min.js?v=8c1440573d630ba3'
+        window._c3Rebuild ? '/js/network.js?v=19dab57eb1428b97' : '/js/network.min.js?v=8c1440573d630ba3'
     ];
 
     let idx = 0;

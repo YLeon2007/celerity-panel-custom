@@ -6,6 +6,9 @@ const previewKeys = [
     'migration', 'settingsUnchanged', 'settingsChanged', 'exitLost', 'defaultExitLost', 'exitBlocked',
 ];
 const previewLabels = Object.fromEntries(previewKeys.map(key => [key, t('network.rebuildPreview.' + key)]));
+previewLabels.fingerprint = Object.fromEntries([
+    'known', 'limited', 'unknown', 'mismatch', 'serverMismatch', 'refused', 'savedNotApplied', 'unknownVersion', 'unset',
+].map(key => [key, t('network.rebuildFingerprint.' + key)]));
 previewLabels.lang = typeof lang === 'string' ? lang : 'en';
 previewLabels.cancel = t('common.cancel');
 previewLabels.close = t('common.close');

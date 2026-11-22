@@ -3,10 +3,12 @@
 // Source/loader regressions only; native hit-testing belongs to the separate
 // test-network-ui-obstructions-browser.cjs harness after the asset rebuild.
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
+const ejs = require('ejs');
 
 const root = path.resolve(__dirname, '..');
 const read = file => fs.readFileSync(path.join(root, file), 'utf8');
@@ -37,11 +39,12 @@ test('embedded map releases its modal stacking context, not the map surface or g
     assert.equal(declarations(networkStyle, '.network-page').overflow, 'hidden');
 });
 
-function runNodesLoader(failAt = -1) {
+function runNodesLoader(c3Rebuild, failAt = -1) {
     const loader = read('views/nodes.ejs').match(/function loadNetworkScripts\(\) \{[\s\S]*?\n\}/)?.[0];
     assert.ok(loader, 'exercise the actual embedded map loader, not a copied script list');
     const loaded = [];
-    vm.runInNewContext(loader + '\nloadNetworkScripts();', {
+    vm.runInNewContext(ejs.render(loader, { c3Rebuild }) + '\nloadNetworkScripts();', {
+        window: {},
         document: {
             createElement(tag) { assert.equal(tag, 'script'); return {}; },
             body: { appendChild(script) {
@@ -55,15 +58,19 @@ function runNodesLoader(failAt = -1) {
 }
 
 test('nodes loader requests only used map dependencies before the shipped network bundle', () => {
-    const loaded = runNodesLoader();
-    assert.deepEqual(loaded.slice(0, -1), [
-        'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
-        'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
-        'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-    ], 'unused edgehandles must not execute without lodash during map startup');
-    assert.match(loaded.at(-1), /^\/js\/network\.min\.js\?v=[a-f0-9]{16}$/);
-    for (let failAt = 0; failAt < loaded.length; failAt++) {
-        assert.deepEqual(runNodesLoader(failAt), loaded, 'retain the existing sequential error continuation');
+    for (const c3Rebuild of [false, true]) {
+        const loaded = runNodesLoader(c3Rebuild);
+        assert.deepEqual(loaded.slice(0, -1), [
+            'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
+            'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
+            'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
+        ], 'unused edgehandles must not execute without lodash during map startup');
+        const asset = '/js/network' + (c3Rebuild ? '.js' : '.min.js');
+        const hash = createHash('sha256').update(read('public' + asset)).digest('hex');
+        assert.equal(loaded.at(-1), asset + '?v=' + hash.slice(0, 16));
+        for (let failAt = 0; failAt < loaded.length; failAt++) {
+            assert.deepEqual(runNodesLoader(c3Rebuild, failAt), loaded, 'retain sequential error continuation');
+        }
     }
 });
 

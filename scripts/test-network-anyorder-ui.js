@@ -115,6 +115,7 @@ function harness(t, initial = snapshot(), locale = 'ru') {
         if (index !== -1) return pendingReplies.splice(index, 1)[0].respond(request);
         if (request.method === 'GET') {
             if (url === '/api/nodes') return reply(nodes);
+            if (url === '/api/cascade/topology/activation-policy') return reply({ blocked: false });
             if (url === '/api/cascade/topology') return reply(topology());
             if (url === '/api/cascade/links') return reply(state.snapshot);
             const operationId = url.split('/api/cascade/topology/operations/')[1];

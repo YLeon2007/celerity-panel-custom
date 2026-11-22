@@ -37,9 +37,10 @@ function bindProfileWire(replace, endpoint, machineId, createFixture) {
                     return ok(JSON.stringify({ ok: true, backupId: request.backupId, proof: await fixture.relayNetwork(request) }) + '\n');
                 }
                 if (command === '/usr/local/bin/xray version') {
-                    try { await fixture.requireSupportedCore(); }
+                    let version;
+                    try { version = await fixture.requireSupportedCore(); }
                     catch (error) { if (error.code === 'REBUILD_XRAY_VERSION_TOO_OLD') return ok('Xray 25.0.0'); throw error; }
-                    return ok('Xray 26.3.27');
+                    return ok(`Xray ${version ?? '26.3.27'}`);
                 }
                 for (const [profile, path] of Object.entries(paths)) {
                     const unit = profile === 'main' ? 'xray' : 'xray-bridge';

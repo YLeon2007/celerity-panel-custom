@@ -84,10 +84,14 @@ async function runRebuild(d, req) {
             if(links.some(row=>row.lifecycle)) throw fail('REBUILD_CONFLICTING_LINK_LIFECYCLE');
             const removed=links.filter(row=>row.rebuildDelete===true || req.remove && id(row)===req.linkId);
             const desired=links.filter(row=>!removed.includes(row)&&row.active!==false);
-            const candidates=await d.build(nodes,desired);
+            const {candidates,coreIdentities}=await d.build(nodes,desired);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
             const pairs=new Map(), report=[], observedMain=req.remove&&d.nodeRole?new Map():null, fingerprint=createHmac('sha256',previewKey);
             fingerprint.update(JSON.stringify([linkVersion,req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()]));
+            // Even if the newly composed profiles are byte-identical, a
+            // desired REALITY dialer must still be the same checked build.
+            if(coreIdentities?.size)fingerprint.update(JSON.stringify(nodes.filter(id=>coreIdentities.has(id))
+                .map(id=>[id,...coreIdentities.get(id)])));
             for(const nodeId of nodes){
                 const pair=candidates.filter(p=>p.nodeId===nodeId); pairs.set(nodeId,pair);
                 if(pair.length!==2||new Set(pair.map(p=>p.profile)).size!==2||!pair.every(p=>['main','bridge'].includes(p.profile)))throw fail('REBUILD_INCOMPLETE_PROFILES');

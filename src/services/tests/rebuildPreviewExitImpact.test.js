@@ -153,7 +153,7 @@ test('A confirmed Remove with a no-exit warning still applies the composed profi
     const writes = [];
     const deps = {
         global: fn => fn(), withNodes: (ids, fn) => fn(), links: () => [direct],
-        build: (ids, links) => compose(links).filter(p => ids.includes(p.nodeId)),
+        build: (ids, links) => ({ candidates: compose(links).filter(p => ids.includes(p.nodeId)) }),
         nodeRole: id => nodes.find(n => n._id === id)?.cascadeRole,
         read: (id, p) => profiles.get(`${id}:${p}`),
         stagePair: id => writes.push(`stage:${id}`), markDelete: id => writes.push(`mark:${id}`),

@@ -293,7 +293,8 @@ for (const mode of ['reverse', 'forward']) {
             realityPrivateKey: privateKey.export({ format: 'jwk' }).d, realityPublicKey: publicKey.export({ format: 'jwk' }).x,
             realityShortIds: ['aabbccddeeff1122'] };
         const link = edge('pair', 'p', 'b', 1, { ...reality, mode, tunnelSecurity: 'reality', _rebuildVless: undefined });
-        const output = composeRebuildProfiles({ nodes, links: [link] });
+        const dialerId = reverse ? 'b' : 'p';
+        const output = composeRebuildProfiles({ nodes, links: [link], dialerVersions: new Map([[dialerId, '26.11.9']]) });
         const listener = byNode(output, listenerNode._id, reverse ? 'main' : 'bridge').inbounds.find(i => i.port === link.tunnelPort);
         const dialer = byNode(output, reverse ? 'b' : 'p', reverse ? 'bridge' : 'main').outbounds
             .find(o => o.tag === (reverse ? 'rebuild-rp-dial-pair' : 'fwd-pair'));
@@ -301,6 +302,7 @@ for (const mode of ['reverse', 'forward']) {
         const { security: dialSecurity, realitySettings: client } = dialer.streamSettings;
         assert.equal(serverSecurity, 'reality');
         assert.equal(dialSecurity, 'reality');
+        assert.equal(client.fingerprint, 'chrome');
         assert.equal(server.dest, destination);
         assert.deepEqual(server.serverNames, ['cover.test', 'other.test']);
         assert.equal(client.serverName, server.serverNames[0]);
@@ -318,6 +320,11 @@ for (const mode of ['reverse', 'forward']) {
         assert.equal(dialUser.id, listener.settings.clients[0].id);
         assert.equal(dialUser.encryption, 'none');
         assert.equal(listener.settings.decryption, 'none');
+        assert.throws(() => composeRebuildProfiles({ nodes, links: [link], dialerVersions: new Map([[listenerNode._id, '26.3.27']]) }),
+            { code: 'REBUILD_XRAY_VERSION_UNKNOWN' });
+        assert.throws(() => composeRebuildProfiles({ nodes, links: [{ ...link, realityFingerprint: 'random' }],
+            dialerVersions: new Map([[dialerId, '26.11.9']]) }), { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED',
+            fingerprintIssue: { dialerId, version: '26.11.9', fingerprint: 'random', allowed: ['chrome', 'firefox', 'safari'] } });
     });
 }
 

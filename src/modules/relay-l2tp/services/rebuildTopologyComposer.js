@@ -3,6 +3,7 @@
 const generator = require('../../../services/configGenerator');
 const { tunnelSettings } = require('../../../services/rebuildLinkKeys');
 const { tunnelName } = require('../../../services/rebuildTunnelTls');
+const { assertRealityFingerprint } = require('../../../services/rebuildRealityFingerprint');
 const { composeXrayConfig } = require('./xrayConfigComposer');
 const { compileRebuildGraph, rebuildId, requireRebuild } = require('../domain/rebuildTopologyCompiler');
 
@@ -14,7 +15,7 @@ const validPort = port => Number.isSafeInteger(port) && port > 0 && port <= 6553
 const address = node => typeof node.ip === 'string' && /^\S+$/.test(node.ip);
 const encrypted = key => typeof key === 'string' && key.length > 0 && key !== 'none' && !/\s/.test(key);
 
-function projectLinks(graph, options) {
+function projectLinks(graph, options, dialerVersions) {
     const shortIds = new Set();
     const result = new Map();
     for (const entry of graph.byLinkId.values()) {
@@ -25,13 +26,17 @@ function projectLinks(graph, options) {
         const { tunnelEncryption = 'vless-enc' } = link;
         const port = link.tunnelPort;
         const id = link.tunnelUuid;
-        const wire = security === 'tls' ? { ...link, tlsServerName: tunnelName(link) } : link;
+        let wire = security === 'tls' ? { ...link, tlsServerName: tunnelName(link) } : link;
         requireRebuild(address(server), 'REBUILD_INVALID_NODE_ADDRESS');
         requireRebuild(validPort(port) && typeof id === 'string' && /^\S+$/.test(id)
             && ['none', 'tls', 'reality'].includes(security)
             && ['vless-enc', 'none'].includes(tunnelEncryption)
             && ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'].includes(link.tunnelTransport ?? 'tcp'), 'REBUILD_INVALID_TUNNEL');
         if (security === 'reality') {
+            const dialerVersion = dialerVersions?.get(reverse ? entry.target : entry.source);
+            const fingerprint = assertRealityFingerprint({ mode: entry.mode, portalNode: entry.source,
+                bridgeNode: entry.target, realityFingerprint: link.realityFingerprint }, dialerVersion);
+            wire = { ...link, realityFingerprint: fingerprint };
             requireRebuild(typeof link.realityPrivateKey === 'string' && link.realityPrivateKey.length > 0
                 && typeof link.realityPublicKey === 'string' && link.realityPublicKey.length > 0, 'REBUILD_INVALID_TUNNEL');
         }
@@ -178,12 +183,12 @@ function assertProfileOwnership(main, bridge) {
 }
 
 /** Build owned MAIN/BRIDGE replacements from an explicit desired graph. No I/O. */
-function composeRebuildProfiles({ nodes, links, usersByNode = {}, bridgesWithClientInbound = new Set(), affectedNodeIds, panelTls = {}, followRelayStates = [], controlPlaneAddresses = [] }) {
+function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}, bridgesWithClientInbound = new Set(), affectedNodeIds, panelTls = {}, followRelayStates = [], controlPlaneAddresses = [] }) {
     requireRebuild(panelTls && typeof panelTls === 'object' && !Array.isArray(panelTls)
         && (panelTls.serverName === undefined || typeof panelTls.serverName === 'string'), 'REBUILD_INVALID_PANEL_TLS');
     const options = { panelTls };
     const graph = compileRebuildGraph({ nodes, links, affectedNodeIds });
-    const projected = projectLinks(graph, options);
+    const projected = projectLinks(graph, options, dialerVersions);
     const users = collectUsers(usersByNode);
     const profiles = [];
     for (const [nodeId, entry] of graph.byNodeId) {

@@ -5,6 +5,7 @@ const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {createTransport,createBoundRelayTransport}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
+const {assertRealityFingerprint,realityDialerId}=require('./rebuildRealityFingerprint');
 const {prepareLinks}=require('./rebuildLinkKeys');
 const {fullLinkRead}=require('./rebuildLinkSnapshot');
 const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
@@ -121,6 +122,23 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             });
         }));
     }
+    async function verifyDraftRealityFingerprint(link,alreadyHeld){
+        gate();
+        if(!['forward','reverse'].includes(link.mode))throw fail('REBUILD_INVALID_REQUEST');
+        const id=String(link.mode==='reverse'?link.bridgeNode:link.portalNode);
+        return underApply(alreadyHeld,verify=>withNodes([id],async()=>{
+            const transports=new Map(),bindings=new Map();
+            return usingTransports(transports,async()=>{
+                const node=await Node.findOne({_id:id,active:true,type:'xray'}).lean();
+                if(!node||node.useCustomConfig)throw fail('REBUILD_NODE_UNSUPPORTED');
+                await openTransports([node],await installedStates([id]),transports,bindings,verify);
+                const version=await transports.get(id).requireSupportedCore();
+                await verify();
+                bindings.get(id)?.check();
+                return require('./rebuildRealityFingerprint').assertRealityFingerprint(link,version);
+            });
+        }));
+    }
     async function execute(req,alreadyHeld){
         gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock;
         const verifyApply=async()=>{
@@ -140,13 +158,26 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 if(req.remove)for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
                 states=await installedStates(ids);
                 await openTransports(nodes,states,transports,bindings,verifyLock);
+                // `links` is the complete desired component, excluding both
+                // the requested removal and any retained deletion tombstones.
+                const realityLinks=links.filter(link=>link.tunnelSecurity==='reality');
+                const dialerIds=new Set(realityLinks.map(realityDialerId));
+                const coreIdentities=new Map(), dialerVersions=new Map();
+                for(const id of ids){
+                    const transport=transports.get(id);
+                    if(!dialerIds.has(id)){await transport.requireSupportedCore();continue;}
+                    const identity=await transport.requireSupportedCoreIdentity?.();
+                    if(typeof identity?.buildDigest!=='string'||!/^[a-f0-9]{64}(?![\s\S])/.test(identity.buildDigest))throw fail('REBUILD_XRAY_VERSION_UNKNOWN');
+                    coreIdentities.set(id,[identity.version,identity.buildDigest]);
+                    dialerVersions.set(id,identity.version);
+                }
+                for(const link of realityLinks)assertRealityFingerprint(link,dialerVersions.get(realityDialerId(link)));
                 const followRelayStates=[...states.values()].map(row=>({...row,routingMode:'follow-relay',routingVersion:1}));
                 const panelTls=panelTLS();
                 const usersByNode=new Map();for(const node of nodes){
                     const users=await sync._getUsersForNode(node);usersByNode.set(String(node._id),users.filter(u=>u.xrayUuid));
                 }
                 const controlPlaneAddresses=[...new Set([env.PANEL_DOMAIN,...nodes.flatMap(n=>[n.ip,n.domain])].filter(Boolean))];
-                for(const id of ids)await transports.get(id).requireSupportedCore();
                 prepared=await prepareLinks(Link,links,{env,privateInventory:true});
                 // A bridge can still serve its managed client interface with no assigned users.
                 // Pass only its presence to the generator, never observed MAIN parameters.
@@ -157,10 +188,10 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     const main=await transports.get(id).read('main');
                     if(hasProtectedClientInbound(main,node.xray?.inboundTag||'vless-in'))bridgesWithClientInbound.add(id);
                 }
-                const candidates=compose({nodes,links:prepared,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses});
+                const candidates=compose({nodes,links:prepared,dialerVersions,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses});
                 await verifyTunnelTrust(prepared,panelTls,transports);
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
-                return candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p);
+                return {coreIdentities,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
             },
             nodeRole:id=>roles.get(id),
             async read(id,p){const current=await transports.get(id).read(p);if(p==='main'){
@@ -193,7 +224,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});
     const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,resolveRelayBinding,createRelayDirect});
-    return {execute,verifyDraftTls,locks:guardedLocks,installRelay,...relayRemoval,
+    return {execute,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,...relayRemoval,
         createRelayAccount: input=>relayAccounts().create(input),
         disableRelayAccount: input=>relayAccounts().disable(input),
         deleteRelayAccount: input=>relayAccounts().delete(input),

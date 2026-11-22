@@ -54,6 +54,7 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
                 toggle(name, active) { if (active) classes.add(name); else classes.delete(name); },
             },
             querySelectorAll: () => [],
+            appendChild() {},
             addEventListener(type, fn) { listeners.set(type, [...(listeners.get(type) || []), fn]); },
             async dispatch(type) {
                 for (const fn of listeners.get(type) || []) await fn.call(el, { target: el, preventDefault() {} });
@@ -122,13 +123,17 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
             if (livePorts) throw Error('Unsupported selector: ' + selector);
             return null;
         },
-        createElement: () => ({ value: '', textContent: '' }),
+        createElement: () => ({ value: '', textContent: '', remove() {} }),
     };
     form.realityFingerprint.options = [{ value: 'chrome' }];
     form.realityFingerprint.appendChild = () => {};
     const json = body => ({ ok: true, status: 200, async json() { return body; } });
     const probes = [];
-    const fetch = async (url, options) => {
+    const origin = 'https://graph.example.invalid';
+    const fetch = async (input, options) => {
+        const absolute = new URL(input, origin);
+        assert.equal(absolute.origin, origin);
+        const url = absolute.pathname + absolute.search;
         requests.push({ url, method: options?.method || 'GET', headers: options?.headers, body: options?.body && JSON.parse(options.body) });
         if (url.startsWith('/api/cascade/links/port-check?')) {
             return new Promise((resolve, reject) => probes.push({ url, signal: options?.signal,
@@ -151,13 +156,13 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
         });
         if (job && url === '/api/cascade/links/auto-deploy-jobs/' + job.jobId) return json({ autoDeployJob: { ...job, status: 'admitted', operationId: OP_ID, topologyRevision: 8 } });
         if (job && options?.method === 'POST' && url === '/api/cascade/links') return { ok: true, status: 202, async json() { return { autoDeployJob: job, acceptedTopologyRevision: 7 }; } };
-        if (options?.method === 'PUT' || options?.method === 'POST') return json(snapshot({
+        if (options?.method === 'PUT' || options?.method === 'POST') return { url: absolute.href, ...json(snapshot({
             ...(operation ? { autoDeployOperation: operation } : {}),
             ...(autoDeployError ? { autoDeployError, autoDeployStatus: 'blocked' } : {}),
-        }));
+        })) };
         throw Error('Unexpected request: ' + url);
     };
-    const window = { _c3Rebuild: rebuild, crypto: { randomUUID: require('node:crypto').randomUUID }, _networkI18n: { save: 'Save', saveAndDeploy: 'Save & Deploy',
+    const window = { _c3Rebuild: rebuild, location: { origin }, crypto: { randomUUID: require('node:crypto').randomUUID }, _networkI18n: { save: 'Save', saveAndDeploy: 'Save & Deploy',
         deployAfterEdit: 'Deploy this link after saving', autoDeploy: 'Auto Deploy', createLink: 'Create',
         syncChain: 'Sync Chain', syncingChain: 'Syncing entire chain...',
         confirmDeployChain: 'Deploy entire chain? This will sync all connected nodes in the correct order.' },
@@ -173,7 +178,7 @@ function browserHarness({ persistedAutoDeploy = true, operation = null, job = nu
     window.__snapshot = snapshot({ links });
     window.__reload = async () => { reloads += 1; };
     vm.runInNewContext(instrumented, {
-        window, document, fetch, cytoscape: () => {}, AbortController, URLSearchParams,
+        window, document, fetch, cytoscape: () => {}, AbortController, URL, URLSearchParams,
         MutationObserver: class {
             constructor(fn) { this.fn = fn; }
             observe(target) { observers.push({ target, fn: this.fn }); }

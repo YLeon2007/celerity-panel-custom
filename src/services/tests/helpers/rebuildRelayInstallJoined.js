@@ -105,7 +105,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 realityPrivateKey: 'fixture-private', realityPublicKey: 'fixture-public' });
         }
         const usersByNode = { [id]: subscribers };
-        const generated = composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode });
+        const dialerVersions = new Map([[String(exit._id), '26.3.27']]); // Matches the apply-wire fixture.
+        const generated = composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode, dialerVersions });
         const main = generated.find(row => row.nodeId === id && row.profile === 'main').config;
         const bridge = generated.find(row => row.nodeId === id && row.profile === 'bridge').config;
         if (scenario === 'transit-drift') {
@@ -1290,6 +1291,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
 
         const config = readJson(f.mpath);
         const expected = apply ? composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode: f.usersByNode,
+            dialerVersions: new Map(f.nodes.map(node => [String(node._id), '26.3.27'])),
             panelTls: { serverName: f.env.PANEL_DOMAIN },
             controlPlaneAddresses: [f.env.PANEL_DOMAIN, ...f.nodes.flatMap(n => [n.ip, n.domain]).filter(Boolean)],
         }).find(row => row.nodeId === id && row.profile === 'main').config : JSON.parse(f.before[f.mainPath]);

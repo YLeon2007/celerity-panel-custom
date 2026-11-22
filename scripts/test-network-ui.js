@@ -1,6 +1,8 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const { createHash } = require('crypto');
+const ejs = require('ejs');
 
 const networkJsPath = path.join(__dirname, '..', 'public', 'js', 'network.js');
 const networkJs = fs.readFileSync(networkJsPath, 'utf8');
@@ -13,12 +15,10 @@ const ui = require(networkJsPath);
 assert.strictEqual(typeof ui.resolveRealityFingerprint, 'function',
     'network.js must export resolveRealityFingerprint for tests');
 
-assert.strictEqual(ui.resolveRealityFingerprint(undefined, 'create'), 'random',
-    'a new link must default to the Random REALITY fingerprint');
-assert.strictEqual(ui.resolveRealityFingerprint(null, 'create'), 'random',
-    'a new link without a saved value must default to Random');
-assert.strictEqual(ui.resolveRealityFingerprint('', 'create'), 'random',
-    'an empty saved value in create mode must default to Random');
+assert.strictEqual(ui.resolveRealityFingerprint(undefined, 'create'), 'chrome');
+assert.strictEqual(ui.resolveRealityFingerprint(null, 'create'), 'chrome');
+assert.strictEqual(ui.resolveRealityFingerprint('', 'create'), 'chrome');
+assert.strictEqual(ui.resolveRealityFingerprint('random', 'create'), 'random');
 
 assert.strictEqual(ui.resolveRealityFingerprint(undefined, 'edit'), '',
     'an existing link without a saved fingerprint must not be given a new value');
@@ -163,16 +163,24 @@ assert(/clearTimeout\(operationPollTimer\)/.test(networkJs),
 
 const fpSelect = nodesEjs.match(/<select name="realityFingerprint"[\s\S]*?<\/select>/);
 assert(fpSelect, 'nodes.ejs must render the realityFingerprint select');
-assert(/<option value="random" selected>/.test(fpSelect[0]),
-    'the Random fingerprint option must be selected by default for new links');
-assert(!/<option value="chrome" selected>/.test(fpSelect[0]),
-    'Chrome must no longer be the preselected fingerprint');
+for (const c3Rebuild of [true, false]) {
+    const picker = ejs.render(fpSelect[0], { c3Rebuild });
+    assert.deepStrictEqual([...picker.matchAll(/<option value="([^"]+)" selected>/g)].map(x => x[1]),
+        [c3Rebuild ? 'chrome' : 'random']);
+}
 
 const minJs = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'network.min.js'), 'utf8');
 assert(minJs.includes('SCOPE_LINK_MISSING'),
     'network.min.js must be rebuilt so the cause-code map ships to the browser');
-assert(fs.statSync(path.join(__dirname, '..', 'public', 'js', 'network.min.js')).mtimeMs
-    >= fs.statSync(networkJsPath).mtimeMs - 1000,
-    'network.min.js must not be older than network.js');
+// Rebuild uses the source asset. Stock keeps the exact baseline bundle;
+// mtime or matching the current source would demand an unintended rebuild.
+const sha = content => createHash('sha256').update(content).digest('hex');
+const classic = '8c1440573d630ba3d636668dc5d7863be1fbed9452b0e428ce82eec59de056d2';
+assert.strictEqual(sha(minJs), classic);
+for (const name of ['nodes', 'network']) {
+    const view = fs.readFileSync(path.join(__dirname, '..', 'views', name + '.ejs'), 'utf8');
+    assert(view.includes('/js/network.js?v=' + sha(networkJs).slice(0, 16)));
+    assert(view.includes('/js/network.min.js?v=' + classic.slice(0, 16)));
+}
 
 console.log('test-network-ui: OK');

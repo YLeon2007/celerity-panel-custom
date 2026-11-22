@@ -7,7 +7,31 @@ const {componentFor,previewForError}=require('../services/rebuildCoordinator');
 const fail=code=>Object.assign(new Error(code),{code});
 const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
 const objectId=id=>typeof id==='string'&&/^[a-f\d]{24}$/i.test(id);
-const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelEncryption tunnelTransport tunnelDomain tcpFastOpen tcpKeepAlive tcpNoDelay wsPath wsHost grpcServiceName xhttpPath xhttpHost xhttpMode muxEnabled muxConcurrency geoRouting priority autoDeploy realityDest realitySni realityShortIds realityFingerprint').split(' ');
+// Do not echo arbitrary fingerprint input or any transport diagnostics. This
+// is the public label vocabulary, not the version-specific acceptance policy.
+const publicFingerprints=new Set(['chrome','firefox','safari','ios','android','edge','360','qq','random','randomized']);
+function fingerprintIssueForError(error,code){
+    if(code!=='REBUILD_REALITY_FINGERPRINT_UNSUPPORTED')return;
+    const ownValue=(obj,key)=>Object.getOwnPropertyDescriptor(obj,key)?.value;
+    try{
+        const issue=ownValue(error,'fingerprintIssue');
+        const dialerId=ownValue(issue,'dialerId');
+        if(!objectId(dialerId))return;
+        const version=ownValue(issue,'version'),fingerprint=ownValue(issue,'fingerprint'),choices=ownValue(issue,'allowed');
+        const allowed=[];
+        const count=Array.isArray(choices)?ownValue(choices,'length'):0;
+        if(Number.isSafeInteger(count)&&count<=publicFingerprints.size){
+            for(let i=0;i<count;i++){
+                const value=ownValue(choices,i);
+                if(publicFingerprints.has(value)&&!allowed.includes(value))allowed.push(value);
+            }
+        }
+        return {dialerId,version:typeof version==='string'&&/^\d{1,4}\.\d{1,4}\.\d{1,4}(?![\s\S])/.test(version)?version:null,
+            fingerprint:publicFingerprints.has(fingerprint)?fingerprint:'unknown',allowed};
+    }catch{return undefined;}
+}
+const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelEncryption tunnelTransport tunnelDomain tcpFastOpen tcpKeepAlive tcpNoDelay wsPath wsHost grpcServiceName xhttpPath xhttpHost xhttpMode muxEnabled muxConcurrency geoRouting priority autoDeploy realityDest realitySni realityShortIds').split(' ');
+
 // Mounted ONLY in rebuild, behind regular requireAuth. API key credentials are
 // scope checked; session writes also need the panel's actual CSRF token.
 function routerForRebuild({service=createRebuildService(),Link=require('../models/cascadeLinkModel'),Node=require('../models/hyNodeModel')}={}){
@@ -18,8 +42,9 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
         const rawCode=errorField(e,'code');
         const code=typeof rawCode==='string'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(rawCode)?rawCode:'REBUILD_FAILED';
         const preview=previewForError(e);
+        const fingerprintIssue=fingerprintIssueForError(e,code);
         res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:code==='REBUILD_INVALID_REQUEST'?400:409)
-            .json({error:{code},...(outcome.linkId?{desiredSaved:true,linkId:outcome.linkId}:{}),...(preview?{preview}:{})});
+            .json({error:{code},...(outcome.linkId?{desiredSaved:true,linkId:outcome.linkId}:{}),...(preview?{preview}:{}),...(fingerprintIssue?{fingerprintIssue}:{})});
     }
  };
  const run=async(req,preview=false,remove=false)=>{const linkId=req.params.id??req.body?.linkId??req.body?.domainLinkId;
@@ -88,11 +113,19 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     link.portalNode=source;link.bridgeNode=target;
     if(link.tunnelSecurity==='reality'){
         if(link.tunnelTransport==='ws')throw fail('REBUILD_INVALID_REQUEST');
+        const choice=Object.hasOwn(b,'realityFingerprint')?b.realityFingerprint:undefined;
+        if(choice!=null&&typeof choice!=='string')throw fail('REBUILD_INVALID_REQUEST');
+        const fingerprint=choice?.trim();
+        if(fingerprint||!editing)link.realityFingerprint=fingerprint||'chrome';
         const listener=link.mode==='reverse'?from:to;
-        Object.assign(link,require('./cascadeLinks').resolveRealitySettings({...link.toObject(),realityPrivateKey:b.realityPrivateKey||link.realityPrivateKey,realityPublicKey:b.realityPublicKey||link.realityPublicKey},listener));
-    }
+        // This helper also returns a classic fingerprint default; only inherit
+        // the listener settings, never that unrelated dialer choice.
+        const {realityFingerprint: _classicFingerprint,...settings}=require('./cascadeLinks').resolveRealitySettings({...link.toObject(),realityPrivateKey:b.realityPrivateKey||link.realityPrivateKey,realityPublicKey:b.realityPublicKey||link.realityPublicKey},listener);
+        Object.assign(link,settings);
+    }else if(Object.hasOwn(b,'realityFingerprint'))link.realityFingerprint=b.realityFingerprint;
     if(!Number.isInteger(link.tunnelPort)||link.tunnelPort<1||link.tunnelPort>65535||!Number.isSafeInteger(link.priority)||typeof link.name!=='string'||!link.name.trim())throw fail('REBUILD_INVALID_REQUEST');
     if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject(),verify);
+    if(link.tunnelSecurity==='reality')link.realityFingerprint=await service.verifyDraftRealityFingerprint(link.toObject(),verify);
     await verify();link.status='pending';await link.save();const linkId=String(link._id);
     // Latch the acknowledged draft independently of preview and lock cleanup.
     outcome.linkId=linkId;

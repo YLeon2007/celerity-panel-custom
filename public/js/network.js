@@ -8,9 +8,10 @@
 
     // ==================== PURE HELPERS (exported for tests) ====================
 
-    // Newly created links default to Random. Edits must retain even an empty
+    // Newly created rebuild links default to Chrome. Edits retain even an empty
     // legacy value unless the operator explicitly selects a fingerprint.
-    const CREATE_DEFAULT_FINGERPRINT = 'random';
+    const CREATE_DEFAULT_FINGERPRINT = 'chrome';
+    const REALITY_FINGERPRINTS_26_11 = ['chrome', 'firefox', 'safari'];
 
     function resolveRealityFingerprint(saved, mode) {
         const value = typeof saved === 'string' ? saved : '';
@@ -198,6 +199,7 @@
     let csrfToken = window._networkCsrfToken || '';
     const rebuild = window._c3Rebuild === true;
     const previewLabels = window._networkRebuildPreviewI18n;
+    const fingerprintLabels = previewLabels?.fingerprint;
     const csrfMessages = new Map([
         ['CSRF_TOKEN_INVALID', i18n.csrfTokenInvalid || 'Reload the topology page, sign in again if needed, then retry manually.'],
         ['CSRF_AUTH_REQUIRED', i18n.csrfAuthRequired || 'Sign in to the panel again, reopen the topology, then retry manually.'],
@@ -207,6 +209,44 @@
 
     class TopologyCsrfRejection extends Error {}
     class RebuildPreviewStopped extends Error {}
+    class RebuildFingerprintRefusal extends Error {}
+
+    // /api/nodes normally holds the numeric version extracted by the agent.
+    // Accept only that or an exact Xray banner, never an embedded number.
+    function xrayVersionHint(value) {
+        if (typeof value !== 'string') return '';
+        const number = /^(\d{1,4}\.\d{1,4}\.\d{1,4})$/;
+        const banner = /^Xray (\d{1,4}\.\d{1,4}\.\d{1,4})(?: \(Xray, Penetrates Everything\.\)(?: [a-f0-9]{7,64} \(go[0-9.]+ [a-z0-9]+\/[a-z0-9]+\))?)?$/;
+        const text = value.trim();
+        return (number.exec(text) || banner.exec(text))?.[1] || '';
+    }
+
+    const fingerprintInventory = { main: new Map(), quick: new Map() };
+    function readFingerprintInventory(nodes) {
+        return new Map(nodes.filter(n => typeof n?._id === 'string').map(n => [n._id, {
+            name: typeof n.name === 'string' ? n.name : '', version: xrayVersionHint(n.xrayVersion),
+        }]));
+    }
+
+    function fingerprintCopy(key, values) {
+        return fingerprintLabels[key].replace(/\{(\w+)\}/g, (_, name) => values[name] ?? '');
+    }
+
+    function fingerprintRefusal(status, payload) {
+        if (!rebuild || status !== 409 || payload?.error?.code !== 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED') return '';
+        const issue = payload.fingerprintIssue;
+        if (!fingerprintLabels) return payload.error.code;
+        if (!issue || typeof issue.dialerId !== 'string') return fingerprintLabels.refused;
+        const id = issue.dialerId;
+        const name = fingerprintInventory.main.get(id)?.name || fingerprintInventory.quick.get(id)?.name
+            || _allNodes.get(id)?.label || id;
+        const allowed = Array.isArray(issue.allowed) && issue.allowed.length > 0
+            && issue.allowed.every(fp => typeof fp === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(fp))
+            ? issue.allowed : REALITY_FINGERPRINTS_26_11;
+        return fingerprintCopy('serverMismatch', { name, version: xrayVersionHint(issue.version) || fingerprintLabels.unknownVersion,
+            fingerprint: typeof issue.fingerprint === 'string' && issue.fingerprint || fingerprintLabels.unset,
+            allowed: allowed.join(', ') });
+    }
 
     async function fetchInPanel(path, options) {
         const url = new URL(path, window.location.origin);
@@ -348,7 +388,15 @@
             const response = await fetchTopologyWrite('/api/cascade/rebuild/preview', { method: 'POST',
                 headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }, sessionToken);
             report = await response.json();
-            if (!response.ok) throw new RebuildPreviewStopped(report.error?.code || unavailable);
+            if (!response.ok) {
+                const refusal = fingerprintRefusal(response.status, report);
+                if (refusal) {
+                    await showRebuildPreview({ title: previewLabels.refused, warning: refusal, details: '', allowed: false,
+                        applyLabel: previewLabels.apply });
+                    throw new RebuildFingerprintRefusal(refusal);
+                }
+                throw new RebuildPreviewStopped(report.error?.code || unavailable);
+            }
         }
         const removing = payload.remove === true;
         const { previewId } = report;
@@ -415,6 +463,8 @@
     let cy = null;
     let linkModalMode = 'create';
     let linkModalSavedFingerprint = null;
+    let linkModalGeneration = 0;
+    let injectedFingerprintOption;
     const pendingCreateRequests = { main: null, quick: null };
     const intentPolls = new Map();
     const deleteTombstones = new Map();
@@ -480,15 +530,18 @@
 
     async function handleDraftMutationResponse(response, expectedKind, expectedLinkId) {
         const payload = await response.json().catch(() => ({}));
+        const refusal = fingerprintRefusal(response.status, payload);
         const errorMessage = (payload.desiredSaved === true
-            ? (i18n.savedApplyUnconfirmed || 'Изменения сохранены; принятие применения не подтверждено. Обновите топологию.') + ' ' : '')
-            + describeTopologyError(payload, 'HTTP ' + response.status);
-        if (!response.ok && payload.desiredSaved === true) await loadTopology();
+            ? ((refusal && fingerprintLabels?.savedNotApplied) || i18n.savedApplyUnconfirmed
+                || 'Изменения сохранены; принятие применения не подтверждено. Обновите топологию.') + ' ' : '')
+            + (refusal || describeTopologyError(payload, 'HTTP ' + response.status));
         if (response.status === 409) {
             await loadTopology();
             showToast((i18n.networkError || 'Error') + ': ' + errorMessage, 'error');
+            if (refusal && payload.desiredSaved === true) return { fingerprintApplyRefused: true };
             return null;
         }
+        if (!response.ok && payload.desiredSaved === true) await loadTopology();
         if (!response.ok) throw new Error(errorMessage);
         if (rebuild && payload.executionMode === 'rebuild') return payload;
         const job = response.status === 202 ? responseJob(payload, expectedKind, expectedLinkId) : null;
@@ -578,7 +631,8 @@
             updateLinkFormWarnings();
         });
 
-        if (!rebuild) initPortWarnings();
+        if (rebuild) initFingerprintWarnings();
+        else initPortWarnings();
 
         // Geo routing toggle
         var geoCheck = document.getElementById('geoRoutingEnabled');
@@ -1358,13 +1412,15 @@
         if (!exists) {
             const opt = document.createElement('option');
             opt.value = value;
-            opt.textContent = value || 'Сохранить прежнее значение';
+            opt.textContent = value || fingerprintLabels?.unset || 'Keep existing value';
             select.appendChild(opt);
+            injectedFingerprintOption = opt;
         }
         select.value = value;
     }
 
     async function openAddLinkModal({ editing = false } = {}) {
+        const generation = ++linkModalGeneration;
         resetPortWarning('main');
         const modal       = document.getElementById('addLinkModal');
         const portalSelect = document.getElementById('selectPortal');
@@ -1388,36 +1444,49 @@
         const realitySection = document.getElementById('realitySection');
         if (realitySection) realitySection.style.display = form.tunnelSecurity.value === 'reality' ? '' : 'none';
         updateLinkSubmitIntent();
-        // A brand-new link starts from the Random REALITY fingerprint, even if
-        // the form still carries an injected option from a previous edit.
+        // A brand-new link starts from Chrome, not an earlier edit's choice.
         var createFp = document.querySelector('#addLinkForm [name="realityFingerprint"]');
+        injectedFingerprintOption?.remove();
+        injectedFingerprintOption = undefined;
         if (createFp) {
-            Array.from(createFp.options).forEach(option => {
-                if (option.value === '') option.remove();
-            });
             createFp.value = resolveRealityFingerprint(null, 'create');
         }
+        fingerprintInventory.main = new Map();
+        renderFingerprintHint('main');
 
         try {
             const [nodesRes, linksRes] = await Promise.all([
-                fetch('/api/nodes'),
+                fetch('/api/nodes', rebuild ? { cache: 'no-store', redirect: 'error' } : undefined),
                 fetch('/api/cascade/links'),
             ]);
             if (!nodesRes.ok || !linksRes.ok) throw new Error();
-            const nodes = await nodesRes.json();
-            applyLinkSnapshot(await linksRes.json());
-            const opts  = nodes.map(n =>
-                '<option value="' + n._id + '">' + (n.flag || '') + ' ' + n.name + ' (' + n.ip + ')</option>'
-            ).join('');
-
-            portalSelect.innerHTML = '<option value="">' + (i18n.selectPortal || '— Select Portal —') + '</option>' + opts;
-            bridgeSelect.innerHTML = '<option value="">' + (i18n.selectBridge || '— Select Bridge —') + '</option>' + opts;
+            const [nodes, snapshot] = await Promise.all([nodesRes.json(), linksRes.json()]);
+            if (generation !== linkModalGeneration) return;
+            applyLinkSnapshot(snapshot);
+            if (rebuild) fingerprintInventory.main = readFingerprintInventory(nodes);
+            fillLinkNodeOptions(portalSelect, i18n.selectPortal || '— Select Portal —', nodes);
+            fillLinkNodeOptions(bridgeSelect, i18n.selectBridge || '— Select Bridge —', nodes);
         } catch (_) {
-            const err = '<option value="">' + (i18n.errorLoadingNodes || 'Error loading nodes') + '</option>';
-            portalSelect.innerHTML = bridgeSelect.innerHTML = err;
+            if (generation !== linkModalGeneration) return;
+            const message = i18n.errorLoadingNodes || 'Error loading nodes';
+            fillLinkNodeOptions(portalSelect, message, []);
+            fillLinkNodeOptions(bridgeSelect, message, []);
         }
-        updateLinkFormWarnings();
         if (!editing) modal.classList.add('active');
+        updateLinkFormWarnings();
+        return generation;
+    }
+
+    function fillLinkNodeOptions(select, placeholder, nodes) {
+        select.textContent = '';
+        const append = (value, label) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = label;
+            select.appendChild(option);
+        };
+        append('', placeholder);
+        for (const node of nodes) append(node._id, `${node.flag || ''} ${node.name} (${node.ip})`);
     }
 
     async function openEditLinkModal(linkId) {
@@ -1426,15 +1495,16 @@
         const submit = document.getElementById('linkModalSubmit');
         const linkIdInput = document.getElementById('linkIdInput');
 
-        await openAddLinkModal({ editing: true });
+        const generation = await openAddLinkModal({ editing: true });
+        if (generation !== linkModalGeneration) return;
+        const res = await fetch('/api/cascade/links/' + linkId);
+        if (!res.ok) throw new Error('Failed to load link');
+        const link = await res.json();
+        if (generation !== linkModalGeneration) return;
         linkModalMode = 'edit';
         if (title) title.textContent = (i18n.edit || 'Edit') + ' Link';
         if (submit) submit.textContent = i18n.save || 'Save';
         if (linkIdInput) linkIdInput.value = linkId;
-
-        const res = await fetch('/api/cascade/links/' + linkId);
-        if (!res.ok) throw new Error('Failed to load link');
-        const link = await res.json();
 
         form.name.value = link.name || '';
         form.mode.value = link.mode || 'reverse';
@@ -1496,6 +1566,7 @@
     }
 
     function closeModal() {
+        ++linkModalGeneration;
         resetPortWarning('main');
         document.getElementById('addLinkModal').classList.remove('active');
         document.getElementById('addLinkForm').reset();
@@ -1530,6 +1601,7 @@
         if (geoFields) geoFields.style.display = 'none';
         var domGroup = document.getElementById('tunnelDomainGroup');
         if (domGroup) domGroup.style.display = '';
+        renderFingerprintHint('main');
     }
 
     function progressMessage(progress) {
@@ -1613,6 +1685,10 @@
                 try {
                     await deployTopology(snapshot.linkId, undefined, snapshot.preview, sessionToken);
                 } catch (error) {
+                    if (error instanceof RebuildFingerprintRefusal) {
+                        showToast((fingerprintLabels?.savedNotApplied || i18n.csrfSavedDraft || 'The link was saved.') + ' ' + error.message, 'error');
+                        return;
+                    }
                     if (!(error instanceof TopologyCsrfRejection || error instanceof RebuildPreviewStopped)) throw error;
                     showToast((i18n.csrfSavedDraft || 'The link was saved. Use Deploy on that link instead of saving it again.') + ' ' + error.message, 'error');
                     return;
@@ -1686,6 +1762,7 @@
     async function onAddLinkSubmit(e) {
         e.preventDefault();
         if (portSubmissionBlocked('main')) return;
+        if (fingerprintSubmissionBlocked('main')) return;
         const form = e.target;
         const btn  = form.querySelector('[type="submit"]');
         const linkId = form.linkId?.value || '';
@@ -1751,6 +1828,7 @@
         btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>';
 
         try {
+            linkFormWrites.add('main');
             const requestScope = linkId ? 'edit:' + linkId : 'main';
             if(rebuild && data.autoDeploy===true)data.interactivePreview=true;
             const headers = createRequestHeaders(data, requestScope);
@@ -1764,15 +1842,18 @@
             if (!savedSnapshot) return;
             pendingCreateRequests[requestScope] = null;
             closeModal();
+            if (savedSnapshot.fingerprintApplyRefused === true) return;
             await loadTopology();
             await handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true, sessionToken);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
+            linkFormWrites.delete('main');
             btn.disabled = false;
             btn.innerHTML = (linkId ? '' : '<i class="ti ti-plus"></i> ') + (linkId
                 ? (data.autoDeploy === true ? (i18n.saveAndDeploy || 'Save & Deploy') : (i18n.save || 'Save'))
                 : (i18n.createLink || 'Create'));
+            renderFingerprintHint('main');
         }
     }
 
@@ -1821,6 +1902,8 @@
             await loadTopology();
         }
         if (!res.ok) {
+            const refusal = fingerprintRefusal(res.status, data);
+            if (refusal) throw new RebuildFingerprintRefusal(refusal);
             throw new Error(describeTopologyError(data, 'HTTP ' + res.status));
         }
         const job = responseJob(data, 'link.apply', linkId);
@@ -2064,6 +2147,7 @@
             closeInfoModal();
         } catch (err) {
             if (err instanceof RebuildPreviewStopped) return showToast(err.message, 'info');
+            if (err instanceof RebuildFingerprintRefusal) return showToast(err.message, 'error');
             if (!(err instanceof TopologyCsrfRejection) && (!response || response.ok || response.status >= 500)) {
                 // A lost/malformed acceptance is not proof of no accepted job.
                 // Retain the segment, but do not invent a server job or marker.
@@ -2146,7 +2230,10 @@
                 // Show/hide tunnel domain field (reverse only)
                 var domGroup = document.getElementById('tunnelDomainGroup');
                 if (domGroup) domGroup.style.display = mode === 'forward' ? 'none' : '';
-                if (inputId === 'quickLinkMode') schedulePortWarning('quick');
+                if (inputId === 'quickLinkMode') {
+                    schedulePortWarning('quick');
+                    renderFingerprintHint('quick');
+                }
                 else updateLinkFormWarnings();
             });
         });
@@ -2187,6 +2274,87 @@
         }
 
         schedulePortWarning('main');
+        renderFingerprintHint('main');
+    }
+
+    function renderFingerprintHint(kind) {
+        if (!rebuild) return false;
+        const quick = kind === 'quick';
+        const get = id => document.getElementById(id);
+        const form = get('addLinkForm');
+        const active = get(quick ? 'quickLinkModal' : 'addLinkModal')?.classList.contains('active');
+        const security = quick ? (get('quickTunnelSecurity')?.value || 'reality') : form?.tunnelSecurity?.value;
+        const mode = quick ? get('quickLinkMode')?.value : form?.mode?.value;
+        const source = quick ? get('quickPortalId') : form?.portalNodeId;
+        const target = quick ? get('quickBridgeId') : form?.bridgeNodeId;
+        // Unlike port checks, the fingerprint belongs to the outbound dialer.
+        const dialerId = (mode === 'forward' ? source : target)?.value;
+        const node = fingerprintInventory[kind].get(dialerId);
+        const version = node?.version;
+        const pick = !quick && form?.realityFingerprint;
+        const selected = resolveRealityFingerprint(pick?.value, quick ? 'create' : linkModalMode);
+        const show = active && security === 'reality' && !!dialerId;
+        const limited = security === 'reality' && /^26\.11\./.test(version);
+        // A disabled, already-selected option remains visible until changed.
+        // The submit handler rechecks so synthetic/keyboard paths cannot send it.
+        const blocked = limited && !!selected && !REALITY_FINGERPRINTS_26_11.includes(selected);
+        if (pick) for (const option of pick.options) {
+            option.disabled = show && limited && !!option.value && !REALITY_FINGERPRINTS_26_11.includes(option.value);
+        }
+        const hint = get(quick ? 'quickFingerprintHint' : 'linkFingerprintHint');
+        if (hint && fingerprintLabels) {
+            const values = { name: node?.name || _allNodes.get(dialerId)?.label || dialerId, version,
+                fingerprint: selected || fingerprintLabels.unset, allowed: REALITY_FINGERPRINTS_26_11.join(', ') };
+            hint.textContent = show ? fingerprintCopy(!version ? 'unknown' : blocked ? 'mismatch' : limited ? 'limited' : 'known', values) : '';
+            hint.hidden = !show;
+        }
+        const submit = get(quick ? 'quickLinkSubmit' : 'linkModalSubmit');
+        if (submit) submit.disabled = (show && blocked) || linkFormWrites.has(kind);
+        return blocked;
+    }
+
+    const linkFormWrites = new Set();
+
+    function fingerprintSubmissionBlocked(kind) {
+        if (rebuild && linkFormWrites.has(kind)) return true;
+        return renderFingerprintHint(kind);
+    }
+
+    let quickFingerprintRead;
+    function resetQuickFingerprintHint() {
+        quickFingerprintRead = undefined;
+        fingerprintInventory.quick = new Map();
+        renderFingerprintHint('quick');
+    }
+
+    function initFingerprintWarnings() {
+        for (const id of ['selectPortal', 'selectBridge']) {
+            document.getElementById(id)?.addEventListener('change', updateLinkFormWarnings);
+        }
+        document.querySelector('#addLinkForm [name="realityFingerprint"]')
+            ?.addEventListener('change', updateLinkFormWarnings);
+        const modal = document.getElementById('quickLinkModal');
+        if (!modal || !document.getElementById('quickFingerprintHint')) return;
+        async function updateQuick() {
+            if (!modal.classList.contains('active')) return resetQuickFingerprintHint();
+            renderFingerprintHint('quick');
+            if (quickFingerprintRead || document.getElementById('quickTunnelSecurity')?.value !== 'reality') return;
+            const read = fetch('/api/nodes', { cache: 'no-store', redirect: 'error' });
+            quickFingerprintRead = read;
+            try {
+                const response = await read;
+                if (!response.ok) return;
+                const nodes = await response.json();
+                if (read !== quickFingerprintRead || !modal.classList.contains('active')) return;
+                fingerprintInventory.quick = readFingerprintInventory(nodes);
+                renderFingerprintHint('quick');
+            } catch (_) { /* The form already shows an unknown-version hint. */ }
+        }
+        for (const id of ['quickPortalId', 'quickBridgeId', 'quickTunnelSecurity']) {
+            document.getElementById(id)?.addEventListener('change', updateQuick);
+        }
+        new MutationObserver(updateQuick).observe(modal, { attributes: true, attributeFilter: ['class'] });
+        void updateQuick();
     }
 
     const portWarnings = {
@@ -2347,6 +2515,7 @@
         if (modal) modal.classList.remove('active');
         var security = document.getElementById('quickTunnelSecurity');
         if (rebuild && security) security.value = 'reality';
+        resetQuickFingerprintHint();
     }
 
     function onQuickSwap() {
@@ -2358,11 +2527,13 @@
         var tmpId = pId.value; pId.value = bId.value; bId.value = tmpId;
         var tmpName = pName.textContent; pName.textContent = bName.textContent; bName.textContent = tmpName;
         schedulePortWarning('quick');
+        renderFingerprintHint('quick');
     }
 
     async function onQuickLinkSubmit(e) {
         e.preventDefault();
         if (portSubmissionBlocked('quick')) return;
+        if (fingerprintSubmissionBlocked('quick')) return;
         var data = {
             name: document.getElementById('quickLinkName').value,
             mode: document.getElementById('quickLinkMode').value || 'reverse',
@@ -2372,7 +2543,10 @@
             tunnelProtocol: document.getElementById('quickTunnelProtocol').value,
             autoDeploy: document.getElementById('quickAutoDeploy')?.checked || false,
         };
-        if (rebuild) data.tunnelSecurity = document.getElementById('quickTunnelSecurity')?.value || 'reality';
+        if (rebuild) {
+            data.tunnelSecurity = document.getElementById('quickTunnelSecurity')?.value || 'reality';
+            if (data.tunnelSecurity === 'reality') data.realityFingerprint = CREATE_DEFAULT_FINGERPRINT;
+        }
         if (!data.name || !data.portalNodeId || !data.bridgeNodeId) {
             alert(i18n.fillRequired || 'Please fill in all required fields');
             return;
@@ -2380,6 +2554,7 @@
         data.expectedTopologyRevision = topologyRevision;
         var btn = document.getElementById('quickLinkSubmit');
         if (btn) { btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>'; }
+        linkFormWrites.add('quick');
         try {
             if(rebuild && data.autoDeploy===true)data.interactivePreview=true;
             const sessionToken = csrfToken;
@@ -2392,12 +2567,15 @@
             if (!createdSnapshot) return;
             pendingCreateRequests.quick = null;
             closeQuickModal();
+            if (createdSnapshot.fingerprintApplyRefused === true) return;
             await loadTopology();
             await handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true, sessionToken);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
+            linkFormWrites.delete('quick');
             if (btn) { btn.disabled = false; btn.innerHTML = '<i class="ti ti-plus"></i> ' + (i18n.createLink || 'Create'); }
+            renderFingerprintHint('quick');
         }
     }
 

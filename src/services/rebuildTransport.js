@@ -1,5 +1,5 @@
 'use strict';
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { MAIN, BRIDGE, readClassicProfile }=require('./classicAppliedConfig');
 const {generateBridgeSystemdService}=require('./configGenerator');
 const {READ_CHAIN,VERIFY_CHAIN}=require('./rebuildTunnelTls');
@@ -49,16 +49,20 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         if(!Object.hasOwn(paths,profile))throw fail('REBUILD_INVALID_PROFILE');
         return readClassicProfile({exec:command=>run(command,authority?{timeout:60000}:undefined)},paths[profile],{allowAbsent:profile==='bridge'});
     }
-    async function requireSupportedCore(){
+    async function requireSupportedCoreIdentity(){
         // Probe the exact binary used by the checked units, not a cached DB
         // value or the agent's PATH. Do not include remote output in errors.
         let output;
         try {output=await check('/usr/local/bin/xray version');} catch {throw fail('REBUILD_XRAY_VERSION_UNKNOWN');}
-        const match=/^Xray (\d{1,4})\.(\d{1,4})\.(\d{1,4})(?=\s|$)/.exec(String(output));
+        const match=typeof output==='string' && /^Xray (\d{1,4}\.\d{1,4}\.\d{1,4})(?=\s|$)/.exec(output);
         if(!match)throw fail('REBUILD_XRAY_VERSION_UNKNOWN');
-        const [year,month,day]=match.slice(1).map(Number);
+        const version=match[1], [year,month,day]=version.split('.').map(Number);
         if(year<25 || year===25 && (month<9 || month===9 && day<11))throw fail('REBUILD_XRAY_VERSION_TOO_OLD');
+        // Keep revision and build metadata from this same observation without
+        // making the remote banner part of a public report or error.
+        return {version,buildDigest:createHash('sha256').update(output).digest('hex')};
     }
+    async function requireSupportedCore(){return (await requireSupportedCoreIdentity()).version;}
     async function stagePair(pair){
         for(const {profile,config} of pair){
             const path=paths[profile],file=temp(profile),dir=path.slice(0,path.lastIndexOf('/')),unit=services[profile];
@@ -114,7 +118,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         try{if(connected&&attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`);}
         finally{closed=true;if(connected||attestationStarted)ssh.disconnect();}
     }
-    return {read,requireSupportedCore,stagePair,putPair,close,
+    return {read,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,
         ...(authority&&{attest}),
         ...(authority?.installation&&{checkActivation:()=>relayNetwork('check-apply-network'),prepareActivation}),
         readTunnelCertificate:()=>check(READ_CHAIN),verifyTunnelCertificate:input=>check(VERIFY_CHAIN,input)};
