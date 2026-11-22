@@ -330,9 +330,14 @@ def require_runtime_packages(refusal):
         need(status.startswith(b'ii '), refusal)
 
 
-def preflight(machine, *, fresh=False):
+def require_machine(machine):
     machine_id = open('/etc/machine-id', 'rb').read(34).strip().decode('ascii')
     need(re.fullmatch(r'[a-f0-9]{32}', machine_id) and machine_id == machine, 'IDENTITY')
+    return machine_id
+
+
+def preflight(machine, *, fresh=False):
+    machine_id = require_machine(machine)
     if fresh:
         # A missing runtime package can start IKE/LNS in its maintainer
         # scripts. Check dpkg before interpreting unit state or preparing PPP;
@@ -3847,6 +3852,7 @@ def dispatch(request: dict[str, Any]):
     # administrative writers. No locks from the old runners are consulted.
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, (fcntl.LOCK_SH if action in ('inspect-chap', 'read-chap-generation') else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        require_machine(machine)
         if action in APPLY_NETWORK_ACTIONS:
             keys = {'action', 'machineId', 'backupId', 'network'}
             if action in ('verify-apply-network', 'restart-apply-network'):
@@ -3950,6 +3956,7 @@ def main():
         if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED):
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
+              'IDENTITY' if str(error) == 'IDENTITY' else
               'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
               'REMOVE_REFUSED' if action == 'remove' else
               'INSPECT_' + str(error) if action == 'inspect-chap' and isinstance(error, InspectUnproved)

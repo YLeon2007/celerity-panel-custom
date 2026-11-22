@@ -34,7 +34,7 @@ const query = fn => ({ select() { return this; }, sort() { return this; }, read(
     readConcern() { return this; }, session() { return this; }, async lean() { return structuredClone(fn()); } });
 const profileRead = path => `if test -f ${path}; then cat ${path}; elif test ! -e ${path}; then printf 'C3_CLASSIC_PROFILE_ABSENT'; else exit 1; fi`;
 
-function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } = {}) {
+function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false, merged = false } = {}) {
     const nodes = ['bridge', 'relay', 'relay'].slice(0, 1 + relayCount).map((role, i) => ({
         _id: objectId(i + 1), ip: `node${i}.fixture.invalid`, active: true, type: 'xray', cascadeRole: role,
         sshHostKeySha256: 'f'.repeat(64), ssh: { port: 2222 + i, username: 'root', password: 'fixture-auth',
@@ -144,8 +144,17 @@ function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } 
         effect('injected-stock');
         return require('../rebuildTransport').createTransport(node);
     } } : {};
-    const service = createRebuildService({ env, locks, ...transportOverrides, assertNoRelayAccountIntent: async () => inLock(),
-        Node: { find: ({ _id }) => query(() => nodes.filter(n => _id.$in.includes(n._id))) },
+    const grants = bindings.map(binding => ({ ...binding, generation: binding.nodeId }));
+    const relayGrantStore = merged ? { async snapshot() {
+        inLock();
+        overrides.onGrantRead?.();
+        const copy = grants.map(row => ({ ...row }));
+        return { env: { ...env, C3_REBUILD_L2TP_RELAYS_JSON: JSON.stringify(copy.map(({ generation, ...b }) => b)) },
+            grants: copy, sourceFor: id => copy.some(row => row.nodeId === id) ? 'db' : null };
+    } } : undefined;
+    const service = createRebuildService({ env, locks, relayGrantStore, ...transportOverrides, assertNoRelayAccountIntent: async () => inLock(),
+        Node: { find: ({ _id }) => query(() => nodes.filter(n => _id.$in.includes(n._id))),
+            findOne: ({ _id }) => query(() => nodes.find(n => n._id === _id)) },
         State: { find: ({ node }) => query(() => states.filter(s => node.$in.includes(s.node))),
             async updateOne() { effect('state'); return { matchedCount: 1 }; } },
         Link: { find: filter => query(() => links.filter(l => !filter._id || filter._id.$in.includes(l._id))),
@@ -158,10 +167,38 @@ function fixture(t, { injected = false, relayCount = 2, ordinaryRelay = false } 
             { nodeId, profile: 'bridge', config: blank() },
         ]),
     });
-    return { service, request, nodes, states, hosts, bindings, env, setList, effects, sessions, probes, commands, poolRequests, overrides, links };
+    return { service, request, nodes, states, hosts, bindings, grants, env, setList, effects, sessions, probes, commands, poolRequests, overrides, links };
 }
 
 const assertNoWrites = f => assert.deepEqual(f.effects.filter(([type]) => type !== 'injected-stock'), []);
+
+test('ordinary non-L2TP Apply does not read the grant database', async t => {
+    const f = fixture(t, { relayCount: 0, merged: true });
+    f.overrides.onGrantRead = () => assert.fail('ordinary bridge has no L2TP effects or admission');
+    assert.equal((await f.service.execute(f.request)).allowed, true);
+    assert.equal(f.effects.filter(([verb]) => verb === 'replace').length, 2);
+});
+
+test('ordinary Apply rechecks the DB grant before any component write', async t => {
+    const f = fixture(t, { relayCount: 1, merged: true });
+    delete f.env.C3_REBUILD_L2TP_RELAYS_JSON;
+    f.overrides.onRead = (nodeId, path) => {
+        if (nodeId === f.nodes[1]._id && path === BRIDGE) f.grants[0].generation += 'replacement';
+    };
+    await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assertNoWrites(f);
+    assert.deepEqual(f.probes.map(p => p.id), [f.nodes[1]._id]);
+});
+
+test('ordinary Apply re-attests the DB-bound relay before staging on any member', async t => {
+    const f = fixture(t, { relayCount: 1, merged: true });
+    f.overrides.onRead = (nodeId, path) => {
+        if (nodeId === f.nodes[1]._id && path === BRIDGE) f.hosts[1].machine = machine(9);
+    };
+    await assert.rejects(f.service.execute(f.request), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    assertNoWrites(f);
+    assert.deepEqual(f.probes.map(p => p.id), [f.nodes[1]._id, f.nodes[1]._id]);
+});
 
 test('ordinary Apply attests A+B under its lock and both profile pairs use the actual attested wire', async t => {
     const f = fixture(t);

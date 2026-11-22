@@ -9,6 +9,8 @@ const { encrypt, decrypt } = require('../modules/relay-l2tp/services/secretBoxSe
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { accountError: fail, RelayAccountsError, createRebuildRelayAccountsStore } = require('./rebuildRelayAccountsStore');
 const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
+const { sameRelayBinding } = require('./rebuildRelayAuthorization');
+const { readRelayAuthority, captureRelayEffect, identityChanged, isIdentityChanged, isGrantAuthorityError } = require('./rebuildRelayEffectAuthority');
 const { isInspectionReason } = require('./rebuildRelayInspection');
 
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
@@ -27,7 +29,8 @@ const ipv4 = ip => isIPv4(ip) ? ip.split('.').reduce((n, s) => n * 256 + Number(
 const address = n => [24, 16, 8, 0].map(shift => (n >>> shift) & 255).join('.');
 const by = key => (a, b) => String(a[key]).localeCompare(String(b[key]));
 const safe = e => e instanceof RelayAccountsError ? e
-    : ['REBUILD_BUSY', 'REBUILD_LOCK_LOST'].includes(e?.code) ? Object.assign(new Error(e.code), { code: e.code })
+    : ['REBUILD_BUSY', 'REBUILD_LOCK_LOST'].includes(e?.code) || isIdentityChanged(e) || isGrantAuthorityError(e)
+        ? Object.assign(new Error(e.code), { code: e.code, ...(e.retryAllowed === false && { retryAllowed: false }) })
         : fail('FAILED');
 
 function installedIds(states) {
@@ -59,21 +62,25 @@ function networkFor({ clientCidr, tproxyPort, fwmark, routeTable, poolStart, poo
     return { network: Object.freeze({ clientCidr, tproxyPort, fwmark, routeTable }), start, end, first, last };
 }
 
-async function bindingFor(resolve, env, state, node) {
+async function bindingFor(resolve, env, state, node, pinned = false) {
     const nodeId = String(state.node);
     if (!node || node.type !== 'xray' || node.active !== true || node.cascadeRole !== 'relay' || node.useCustomConfig
         || String(node._id) !== nodeId) {
         throw fail('BINDING_MISMATCH', { nodeId });
     }
     let binding;
-    try { binding = await resolve(env, nodeId, node); } catch { throw fail('BINDING_MISMATCH', { nodeId }); }
+    try { binding = await resolve(env, nodeId, node); } catch (error) {
+        if (pinned && error?.code === 'REBUILD_L2TP_BINDING_MISMATCH') throw identityChanged();
+        throw fail('BINDING_MISMATCH', { nodeId });
+    }
+    if (pinned && binding?.machineId !== state.rebuildMachineId) throw identityChanged();
     const { nodeId: resolvedId, host, port, username, machineId, sshHostKeySha256 } = binding ?? {};
     if (resolvedId !== nodeId || typeof host !== 'string' || !host || !int(port, 1, 65535) || typeof username !== 'string' || !username
         || machineId !== state.rebuildMachineId || !matches(pinPattern, sshHostKeySha256)) throw fail('BINDING_MISMATCH', { nodeId });
     return Object.freeze({ nodeId, host, port, username, machineId, sshHostKeySha256 });
 }
 
-function makePlans({ states, users, nodes, bindings }, action, login, password, key, escrow) {
+function makePlans({ states, users, nodes, bindings, grants }, action, login, password, key, escrow) {
     const cohort = new Map(states.map(s => [String(s.node), []]));
     for (const user of users) {
         const group = cohort.get(String(user.relayNode));
@@ -135,14 +142,14 @@ function makePlans({ states, users, nodes, bindings }, action, login, password, 
         const desiredUsers = action === 'disable' && !after ? currentUsers : Object.freeze([
             ...currentUsers.filter(u => u.login !== login), ...(candidate ? [candidate] : []),
         ].sort(by('login')));
-        plans.push({ node: nodes[i], binding, first, last, currentUsers, desiredUsers, before, after,
+        plans.push({ node: nodes[i], binding, grant: grants[i], first, last, currentUsers, desiredUsers, before, after,
             installation: Object.freeze({ nodeId, backupId: state.backupId, network }) });
     }
     return plans;
 }
 
-const recordRelays = plans => plans.map(({ installation, binding, before, after }) => ({ ...installation, ...binding,
-    ip: before?.ip ?? after?.ip, revision: before?.desiredRevision ?? 0 }));
+const recordRelays = plans => plans.map(({ installation, binding, grant, before, after }) => ({ ...installation, ...binding,
+    ...(grant.generation !== undefined && { grantGeneration: grant.generation }), ip: before?.ip ?? after?.ip, revision: before?.desiredRevision ?? 0 }));
 const fields = (row, names) => row !== null && typeof row === 'object' && Object.getPrototypeOf(row) === Object.prototype
     && Reflect.ownKeys(row).length === names.length && names.every(name => Object.hasOwn(row, name));
 
@@ -213,7 +220,7 @@ const revokeReceipt = result => fields(result, ['changed', 'complete', 'sessions
 const inspectionReceipt = (result, revokedLogin, sameProjection) => fields(result, ['projection', 'activeTargetSessions'])
     && (sameProjection ? result.projection === 'both' : ['original', 'desired'].includes(result.projection))
     && int(result.activeTargetSessions, 0, revokedLogin ? Number.MAX_SAFE_INTEGER : 0);
-function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = process.env, resolveRelayBinding,
+function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = process.env, relayGrantStore, resolveRelayBinding,
     createRelayDirect, store = createRebuildRelayAccountsStore({ Node, State, L2tpUser }) }) {
     const allow = () => {
         let enabled;
@@ -227,32 +234,44 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
             if (!equal(installedIds(states), ids)) throw fail('CHANGED');
             const { nodes, users, directory } = await store.inventory(ids, login, session);
             nodes.sort(by('_id')); users.sort(by('_id'));
-            if (!equal(nodes.map(n => String(n._id)), ids)) throw fail('BINDING_MISMATCH');
+            if (!equal(nodes.map(n => String(n._id)), ids)) throw relayGrantStore ? identityChanged() : fail('BINDING_MISMATCH');
             return { states, nodes, users, directory };
         };
         const load = async () => {
             await authority();
             const db = await readDatabase();
-            const bindings = [];
+            const snapshot = await readRelayAuthority(env, relayGrantStore);
+            const listMode = Object.hasOwn(snapshot.env, operatorList);
+            const bindings = [], grants = [];
             for (const [i, state] of db.states.entries()) {
-                const binding = await bindingFor(resolveRelayBinding, env, state, db.nodes[i]);
+                const node = db.nodes[i], id = String(state.node);
+                const binding = await bindingFor(resolveRelayBinding, snapshot.env, state, node, !!relayGrantStore);
+                const fence = relayGrantStore ? captureRelayEffect(env, relayGrantStore, snapshot, id, node) : undefined;
+                grants.push({ fence, generation: fence?.generation });
                 if (bindings.some(b => b.machineId === binding.machineId || b.sshHostKeySha256 === binding.sshHostKeySha256
                     || (b.host === binding.host && b.port === binding.port))) throw fail('BINDING_MISMATCH', { nodeId: binding.nodeId });
                 bindings.push(binding);
             }
             await authority();
-            return { ...db, bindings };
+            return { ...db, bindings, grants, listMode };
         };
         return { load, async check(baseline, session) {
             // All remote calls and binding resolver work are outside the
             // transaction. Its snapshot must still match the frozen DB scope.
             await authority();
-            const { bindings, ...db } = baseline;
-            if (!(session ? equal(await readDatabase(session), db) : equal(await load(), baseline))) throw fail('CHANGED');
+            const { bindings, grants, listMode, ...db } = baseline;
+            const current = await readDatabase(session);
+            if (relayGrantStore) {
+                const snapshot = await readRelayAuthority(env, relayGrantStore);
+                for (let i = 0; i < grants.length; i++) await grants[i].fence.check(current.nodes[i] ?? null, snapshot);
+            }
+            if (!equal(current, db)) throw fail('CHANGED');
+            if (!relayGrantStore && !session && !equal((await load()).bindings, bindings)) throw fail('CHANGED');
+            if (relayGrantStore) await authority();
         } };
     }
 
-    async function recover(intent, key, listMode, authority, requested) {
+    async function recover(intent, key, authority, requested) {
         const password = openIntent(intent, key);
         const { intentId, action, login } = intent;
         const revokedLogin = action === 'create' ? undefined : login;
@@ -268,15 +287,16 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
             await authority();
         };
         try {
-            // The released format was only produced by the list-mode writer.
-            if (!listMode) throw fail('OPERATOR_LIST_REQUIRED');
             await verifyAuthority();
             const ids = installedIds(await store.states());
             if (!equal(intent.relays.map(row => row?.nodeId), ids)) throw fail('CHANGED');
             return await withNodes(ids, () => withRemotes(async (track, closeAll) => {
                 const inventory = inventoryFor(ids, login, authority);
                 const baseline = await inventory.load();
+                if (!baseline.listMode) throw fail('OPERATOR_LIST_REQUIRED');
                 const plans = makePlans(baseline, action, login, password, key, intent.passwordEncrypted);
+                if (relayGrantStore && plans.some(({ binding, grant }, i) => grant.generation !== intent.relays[i]?.grantGeneration
+                    || !sameRelayBinding(binding, intent.relays[i]))) throw identityChanged();
                 if (!equal(recordRelays(plans), intent.relays)) throw fail('CHANGED');
                 validateDirectory(baseline, ids[0]);
                 const recheck = async session => {
@@ -306,8 +326,8 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                 const calls = [];
                 for (const plan of plans) {
                     await recheck();
-                    const { node, binding } = plan;
-                    const remote = track(await createRelayDirect({ node, env, binding }), 'inspectChap', 'fenceChap');
+                    const { node, binding, grant } = plan;
+                    const remote = track(await createRelayDirect({ node, env, binding, fence: grant.fence }), 'inspectChap', 'fenceChap');
                     await inspect(plan, remote);
                     calls.push({ plan, remote });
                 }
@@ -373,7 +393,8 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                 return { matching, result: { executionMode: 'rebuild', status: cancel ? 'canceled' : statuses[action], login,
                     relayCount: ids.length, recovered: true, ...(revokedLogin && { sessionsTerminated }) } };
             }));
-        } catch {
+        } catch (error) {
+            if (isIdentityChanged(error)) throw Object.assign(identityChanged(), { retryAllowed: false });
             throw fail(phase, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds].sort(),
                 ...(inspectionReason && { inspectionReason }),
                 // Do not attribute closures from a different pending action to the requested mutation.
@@ -403,14 +424,14 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                         allow();
                         if (await verifyLock() === false) throw Object.assign(new Error('REBUILD_LOCK_LOST'), { code: 'REBUILD_LOCK_LOST' });
                         allow();
-                        if (env.ENCRYPTION_KEY !== key || Object.hasOwn(env, operatorList) !== listMode
-                            || env[operatorList] !== list || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== installEnabled) throw fail('CHANGED');
+                        if (env.ENCRYPTION_KEY !== key || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== installEnabled
+                            || !relayGrantStore && (Object.hasOwn(env, operatorList) !== listMode || env[operatorList] !== list)) throw fail('CHANGED');
                     };
                     await authority();
                     const pending = await store.pending();
                     await authority();
                     if (pending !== null) {
-                        const recovered = await recover(pending, key, listMode, authority, { action, login, password });
+                        const recovered = await recover(pending, key, authority, { action, login, password });
                         completed = true;
                         if (!action || recovered.matching) return recovered.result;
                     }
@@ -428,7 +449,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
 
                         // Legacy Remove only owns the exact bootstrap row. Do
                         // not introduce account changes under that contract.
-                        if (!listMode) throw fail('OPERATOR_LIST_REQUIRED');
+                        if (!baseline.listMode) throw fail('OPERATOR_LIST_REQUIRED');
                         let intentId, intent, phase, uncertainNodeId;
                         let sessionsTerminated = 0;
                         const confirmedNodeIds = [];
@@ -446,9 +467,9 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             ...(uncertainNodeId && { uncertainNodeId }) });
                         try {
                             const calls = [];
-                            for (const { node, binding, installation, currentUsers, desiredUsers } of plans) {
+                            for (const { node, binding, grant, installation, currentUsers, desiredUsers } of plans) {
                                 await recheck();
-                                const remote = track(await createRelayDirect({ node, env, binding }), 'checkChap');
+                                const remote = track(await createRelayDirect({ node, env, binding, fence: grant.fence }), 'checkChap');
                                 calls.push([remote, installation, currentUsers, desiredUsers]);
                             }
                             for (const call of calls) {
@@ -456,7 +477,10 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                 await recheck();
                                 let checked;
                                 try { checked = await remote.checkChap(installation, currentUsers, desiredUsers, () => recheck(), revokedLogin); }
-                                catch { throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId }); }
+                                catch (error) {
+                                    if (isIdentityChanged(error) || isGrantAuthorityError(error)) throw error;
+                                    throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId });
+                                }
                                 if (!chapReceipt(checked)) throw fail('PREFLIGHT_REFUSED', { nodeId: installation.nodeId });
                                 call.push(checked.changed);
                             }
@@ -510,6 +534,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             completed = true;
                             return { ...result, relayCount: ids.length, ...(revokedLogin && { sessionsTerminated }) };
                         } catch (error) {
+                            if (isIdentityChanged(error)) throw phase ? Object.assign(identityChanged(), { retryAllowed: false }) : error;
                             if (phase) throw outcome(phase);
                             throw error;
                         }

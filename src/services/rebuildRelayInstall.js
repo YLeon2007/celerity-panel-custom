@@ -3,29 +3,32 @@
 const { AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
 const { classifyInstallFailure, installFailure, requireInstallHostReady,
     checkedInstallId } = require('./rebuildRelayInstallDiagnostics');
+const { IDENTITY_CHANGED, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 
 const fail = code => Object.assign(new Error(code), { code });
 const UNKNOWN = 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN';
 const ROLLBACK_UNKNOWN = 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN';
 
 async function runFreshRelayInstall(id, deps) {
-    if (!deps.authorize()) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
+    // The standalone gate is synchronous; enter its lock without an async
+    // yield. A grant-backed gate awaits the registry before requesting it.
+    const authorized = deps.authorize();
+    if (!(typeof authorized?.then === 'function' ? await authorized : authorized)) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
+    const identityAfterReservation = () => installFailure(IDENTITY_CHANGED, 'unknown', undefined, { retryAllowed: false });
     if (typeof id !== 'string' || !/^[a-f0-9]{24}$/.test(id)) throw fail('REBUILD_INVALID_REQUEST');
     let primary, installed = false;
     try {
         return await deps.lock(async verifyLock => {
             let inventory;
-            const checkAuthorization = () => {
-                if (!deps.authorize()) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
+            const checkAuthorization = async () => {
+                if (!await deps.authorize()) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
             };
             const checkAuthority = async () => {
-                checkAuthorization();
+                if (!deps.unifiedIdentity) await checkAuthorization();
                 if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
-                if (deps.verifyBinding) {
-                    await deps.verifyBinding(inventory);
-                    if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
-                }
-                checkAuthorization();
+                if (deps.verifyBinding) await deps.verifyBinding(inventory);
+                if (deps.verifyBinding && await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
+                await checkAuthorization();
             };
             let remote;
             try {
@@ -34,16 +37,16 @@ async function runFreshRelayInstall(id, deps) {
                 if (inventory.eligible !== true || inventory.pristine !== true) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
                 if (deps.verifyBinding) await checkAuthority();
                 if (deps.precheckSources) await deps.precheckSources(inventory, checkAuthority);
-                checkAuthorization();
+                await checkAuthorization();
                 remote = await deps.connect(inventory);
-                checkAuthorization();
+                await checkAuthorization();
                 const host = await remote.preflight();
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
-                    throw fail('REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
+                    throw fail(deps.unifiedIdentity ? IDENTITY_CHANGED : 'REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
                 }
                 requireInstallHostReady(host);
                 if (deps.verifyBinding) await checkAuthority();
-                checkAuthorization();
+                else await checkAuthorization();
                 const plan = await deps.prepare(inventory, remote);
                 const backupId = plan?.backupId;
                 if (typeof backupId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(backupId)) {
@@ -53,6 +56,7 @@ async function runFreshRelayInstall(id, deps) {
                 let reservation;
                 try { reservation = await deps.reserve(inventory, backupId, checkAuthority); }
                 catch (error) {
+                    if (isIdentityChanged(error)) throw error;
                     // No host dispatch without both a checked commit and a
                     // clean handoff, even when the reservation is durable.
                     throw fail(error instanceof AcknowledgedCommitCleanupError
@@ -71,6 +75,7 @@ async function runFreshRelayInstall(id, deps) {
                         await guard();
                         await deps.restore(reservation, checkAuthority);
                     } catch (error) {
+                        if (isIdentityChanged(error)) throw identityAfterReservation();
                         throw installFailure(error instanceof AcknowledgedCommitCleanupError
                             ? 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED' : ROLLBACK_UNKNOWN, 'unknown', check);
                     }
@@ -82,6 +87,7 @@ async function runFreshRelayInstall(id, deps) {
                     await guard();
                     installResult = await remote.install(plan, guard);
                 } catch (error) {
+                    if (isIdentityChanged(error)) throw identityAfterReservation();
                     const check = checkedInstallId(error);
                     if (error?.prerequisitePartial === true && check !== undefined) {
                         // Keep the reservation and any shared host effects.
@@ -98,7 +104,10 @@ async function runFreshRelayInstall(id, deps) {
                 if (installResult === false) await rollback('REBUILD_L2TP_INSTALL_FAILED');
                 let verified;
                 try { verified = await remote.verify(plan); }
-                catch { throw fail(UNKNOWN); }
+                catch (error) {
+                    if (isIdentityChanged(error)) throw identityAfterReservation();
+                    throw fail(UNKNOWN);
+                }
                 if (verified === false) await rollback('REBUILD_L2TP_VERIFY_FAILED');
                 if (verified !== true) throw fail(UNKNOWN);
                 try {
@@ -107,6 +116,7 @@ async function runFreshRelayInstall(id, deps) {
                     // host: the final CAS may have reached majority already.
                     await deps.finish(reservation, checkAuthority);
                 } catch (error) {
+                    if (isIdentityChanged(error)) throw identityAfterReservation();
                     throw fail(error instanceof AcknowledgedCommitCleanupError
                         ? 'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED' : 'REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN');
                 }

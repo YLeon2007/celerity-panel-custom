@@ -3,7 +3,8 @@
 const { isIP } = require('node:net');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
-const { captureRelayBinding, sameRelayBinding } = require('./rebuildRelayAuthorization');
+const { readRelayAuthority, captureRelayEffect, isIdentityChanged, identityChanged } = require('./rebuildRelayEffectAuthority');
+const { sameRelayBinding } = require('./rebuildRelayAuthorization');
 const { read, createStore } = require('./rebuildRelayBackendStore');
 const { projectRelayChap, inspectAccountSources } = require('./rebuildRelayAccountInventory');
 const { readDirectory, writeDirectory, checkDirectory, logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
@@ -91,35 +92,41 @@ function ownedAccount(rows, state, nodeId) {
     return account;
 }
 
-function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, createRelayDirect = defaultDriver }) {
+function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, relayGrantStore, createRelayDirect = defaultDriver }) {
     const run = async (id, phase, estimate) => {
         if (typeof id !== 'string' || id.length !== 24 || !/^[a-f0-9]{24}$/.test(id)) throw fail('REBUILD_INVALID_REQUEST');
         let fence;
-        try { fence = captureRelayBinding(env, id); } catch { throw fail(DISABLED); }
+        const snapshot = await readRelayAuthority(env, relayGrantStore);
+        const proof = phase === 'confirm' ? previews.get(estimate) : undefined;
+        if (relayGrantStore && proof && proof.source !== snapshot.sourceFor(id)) throw identityChanged();
+        try { fence = captureRelayEffect(env, relayGrantStore, snapshot, id); }
+        catch (error) { if (error?.code !== 'REBUILD_L2TP_INSTALL_DISABLED') throw error; throw fail(DISABLED); }
         const { machineId } = fence.binding;
         const chapKey = env.ENCRYPTION_KEY;
-        const authorize = node => {
-            try { fence.check(node); } catch (error) {
+        const authorize = async node => {
+            try { await fence.check(node); } catch (error) {
                 if (error.code === 'REBUILD_L2TP_INSTALL_DISABLED') throw fail(DISABLED);
                 throw error;
             }
         };
-        const proof = phase === 'confirm' ? previews.get(estimate) : undefined;
         const checkPreview = () => {
             if (phase === 'confirm' && (!proof || estimate.nodeId !== id || performance.now() >= proof.expires)) {
                 throw fail(CONFIRM);
             }
         };
         checkPreview();
-        if (proof && (proof.listMode !== fence.listMode || !sameRelayBinding(proof.binding, fence.binding))) throw fail(PREVIEW_CHANGED);
+        if (proof && (proof.source !== fence.source || proof.generation !== fence.generation)) throw identityChanged();
+        if (proof && (proof.listMode !== fence.listMode || !sameRelayBinding(proof.binding, fence.binding))) {
+            throw relayGrantStore ? identityChanged() : fail(PREVIEW_CHANGED);
+        }
         let primary, removed = false;
         try {
             return await locks.run(verifyLock => withNode(id, async () => {
-                let remote;
+                let remote, reserved = false;
                 const authority = async () => {
-                    authorize();
                     if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
-                    authorize();
+                    await authorize();
+                    if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                     if (fence.listMode && env.ENCRYPTION_KEY !== chapKey) throw fail(CHANGED);
                 };
                 try {
@@ -128,12 +135,21 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     const node = await getNode();
                     if (String(node?._id) !== id || node.active !== true || node.type !== 'xray' || node.cascadeRole !== 'relay'
                         || node.useCustomConfig || (!fence.listMode && !isIP(node.ip))) throw fail(NOT_OWNED);
-                    authorize(node);
+                    const authoritySnapshot = await readRelayAuthority(env, relayGrantStore);
+                    try { await fence.check(node, authoritySnapshot); }
+                    catch (error) { if (error?.code === 'REBUILD_L2TP_INSTALL_DISABLED') throw fail(DISABLED); throw error; }
+                    const bound = relayGrantStore && captureRelayEffect(env, relayGrantStore, authoritySnapshot, id, node);
+                    const open = () => createRelayDirect({ node, env, ...(bound && { fence: bound }) });
                     const checkNode = async () => {
-                        if (fence.listMode && !equal(await getNode(), node)) throw fail(CHANGED);
+                        if (fence.listMode || bound) {
+                            const current = await getNode();
+                            if (bound) await bound.check(current ?? null);
+                            if (!equal(current, node)) throw fail(CHANGED);
+                        }
                         await authority();
                     };
                     const state = await read(State.findOne({ node: id }).select(stateFields));
+                    if (relayGrantStore && state?.rebuildMachineId != null && state.rebuildMachineId !== machineId) throw identityChanged();
                     const network = installedNetwork(state, id, machineId);
                     const User = L2tpUser ?? require('../modules/relay-l2tp/models/l2tpUserModel');
                     // One overflow row is enough to refuse an inventory too
@@ -159,6 +175,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         const [currentNode, currentState, currentRows] = session
                             ? [await getNode(session), await getState(session), accounts && await users(session)]
                             : await Promise.all([getNode(), getState(), accounts && users()]);
+                        if (bound) await bound.check(currentNode ?? null);
                         if (!equal(currentNode, node) || !currentState || !equal(exact(currentState, stateKeys), exact(expected, stateKeys))
                             || (accounts && !equal(orderedAccounts(currentRows), accounts))) throw fail(CHANGED);
                         await authority();
@@ -179,10 +196,10 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         let census = null;
                         try {
                             if (!fence.listMode || approved) {
-                                remote = createRelayDirect({ node, env });
+                                remote = await open();
                                 census = await readSessionCensus(remote, input);
                             }
-                        } catch { /* Refusal or unavailable driver, not zero. */ }
+                        } catch (error) { if (isIdentityChanged(error)) throw error; /* Unavailable, not zero. */ }
                         finally {
                             if (typeof remote?.close === 'function') {
                                 try { await remote.close(); } catch { census = null; }
@@ -196,7 +213,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         await checkInventory(state, approved ? accounts : undefined);
                         const snapshot = Object.freeze({ nodeId: id, accountCount, activeSessions, activeIpsec, confirmable });
                         if (confirmable) previews.set(snapshot, { node, stateFence, accounts,
-                            binding: fence.binding, listMode: fence.listMode, census: census.census,
+                            binding: fence.binding, listMode: fence.listMode, source: fence.source, generation: fence.generation, census: census.census,
                             expires: performance.now() + PREVIEW_TTL_MS });
                         return snapshot;
                     }
@@ -230,7 +247,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         checkPreview();
                     }
                     await checkNode();
-                    remote = createRelayDirect({ node, env });
+                    remote = await open();
                     if (typeof remote?.prepareRemove !== 'function' || typeof remote.remove !== 'function' || typeof remote.close !== 'function') {
                         throw fail('REBUILD_L2TP_REMOVE_BACKEND_UNAVAILABLE');
                     }
@@ -299,6 +316,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         catch { throw fail(RESERVATION_UNKNOWN); }
                     }
 
+                    reserved = true;
                     let revoked;
                     const guard = async () => {
                         if (revoked) throw revoked;
@@ -313,6 +331,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                     try {
                         if (await remote.remove(plan, guard) !== true) throw fail(UNKNOWN);
                     } catch (error) {
+                        if (isIdentityChanged(error)) throw error;
                         if (!['REBUILD_L2TP_DIRECT_REMOVE_REFUSED', DIRECT_IPSEC_BUSY].includes(error?.code) || error.commandSettled !== true
                             || error.remoteOutcomeUncertain) throw fail(UNKNOWN);
                         // DIRECT guarantees this receipt can only precede intent.
@@ -327,7 +346,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                             const reverted = await State.updateMany(exact(reservation, stateKeys), restore, write);
                             if (reverted?.acknowledged !== true || reverted.matchedCount !== 1) throw fail(CHANGED);
                             await checkInventory(state, accounts);
-                        } catch { throw fail(UNKNOWN); }
+                        } catch (error) { if (isIdentityChanged(error)) throw error; throw fail(UNKNOWN); }
                         throw fail(error.code === DIRECT_IPSEC_BUSY ? IPSEC_BUSY : 'REBUILD_L2TP_REMOVE_REFUSED');
                     }
 
@@ -357,11 +376,12 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, cre
                         // no-list bootstrap path for standalone MongoDB.
                         if (fence.listMode) await transactOnce(State, User, settle);
                         else await settle();
-                    } catch { throw fail(FINISH_UNKNOWN); }
+                    } catch (error) { if (isIdentityChanged(error)) throw error; throw fail(FINISH_UNKNOWN); }
                     removed = true;
                     return { executionMode: 'rebuild', status: 'not_installed', nodeId: id };
                 } catch (error) {
                     primary = safe(error);
+                    if (reserved && isIdentityChanged(primary)) primary.retryAllowed = false;
                     throw primary;
                 } finally {
                     if (typeof remote?.close === 'function') {

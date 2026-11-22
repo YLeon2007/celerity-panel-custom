@@ -187,6 +187,15 @@ class NodeSSH {
                 readyTimeout: getDirectReadyTimeoutMs(),
                 ...sshPool.hostKeyConfig(this.node, this.#hostKeyOptions),
             };
+            let rejectedKey = false;
+            if (signal && config.hostVerifier) {
+                const verify = config.hostVerifier;
+                config.hostVerifier = key => {
+                    const accepted = verify(key);
+                    rejectedKey ||= !accepted;
+                    return accepted;
+                };
+            }
 
             if (this.node.ssh?.privateKey) {
                 config.privateKey = cryptoService.decryptPrivateKey(this.node.ssh.privateKey);
@@ -212,7 +221,7 @@ class NodeSSH {
                 const onError = error => {
                     if (!cleanup()) return; // Revoke readiness before destroying the pending socket.
                     discardPendingClient(client);
-                    reject(error);
+                    reject(rejectedKey ? Object.assign(new Error('SSH host key changed'), { code: 'SSH_HOST_KEY_MISMATCH' }) : error);
                 };
                 const onClosed = () => onError(new Error('SSH closed before ready'));
                 const onAbort = () => onError(signal.reason);

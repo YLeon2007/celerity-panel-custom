@@ -4,7 +4,7 @@ const { isIPv4 } = require('node:net');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 const { ipv4, occupiedRange, validLogin } = require('./rebuildRelayBackendDesired');
-const { captureRelayBinding } = require('./rebuildRelayAuthorization');
+const { captureRelayEffect, identityChanged, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 
 const fail = code => Object.assign(new Error(`REBUILD_L2TP_${code}`), { code: `REBUILD_L2TP_${code}` });
@@ -40,7 +40,7 @@ function installedSource(row) {
     return sourcePool(row);
 }
 
-async function enrollSource(env, id, state, readNode) {
+async function enrollSource(env, relayGrantStore, snapshot, id, state, readNode) {
     const getNode = async () => {
         const node = await readNode(id);
         if (String(node?._id) !== id || node.type !== 'xray' || node.active !== true || node.cascadeRole !== 'relay'
@@ -50,13 +50,20 @@ async function enrollSource(env, id, state, readNode) {
     const node = await getNode();
     const notEnrolled = () => fail('ACCOUNT_SOURCE_NOT_ENROLLED');
     let fence;
-    try { fence = captureRelayBinding(env, id, node); }
-    catch { throw notEnrolled(); }
+    try { fence = captureRelayEffect(env, relayGrantStore, snapshot, id, node); }
+    catch (error) {
+        if (isIdentityChanged(error)) throw error;
+        throw notEnrolled();
+    }
+    if (relayGrantStore && fence.binding.machineId !== state.rebuildMachineId) throw identityChanged();
     // The singleton can authorize a standalone first install, not a cohort.
     if (!fence.listMode || fence.binding.machineId !== state.rebuildMachineId) throw notEnrolled();
-    return { node, binding: fence.binding, async verifyBinding() {
+    return { node, fence, async verifyBinding() {
         const current = await getNode();
-        try { fence.check(current); } catch { throw notEnrolled(); }
+        try { await fence.check(current); } catch (error) {
+            if (relayGrantStore) throw error;
+            throw notEnrolled();
+        }
     } };
 }
 
@@ -146,7 +153,7 @@ function inspectAccountSources({ nodeId, rows, listMode }) {
     return { sources, occupied, allocations, legacy, machineIds };
 }
 
-async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMode, machineId }) {
+async function resolveAccountSources({ nodeId, rows, env, relayGrantStore, snapshot, key, readNode, listMode, machineId }) {
     const { sources, occupied, allocations, legacy, machineIds } = inspectAccountSources({ nodeId, rows, listMode });
     if (machineIds.has(machineId)) throw inventoryInvalid();
     const catalog = rows.directory?.accounts;
@@ -154,7 +161,7 @@ async function resolveAccountSources({ nodeId, rows, env, key, readNode, listMod
     if (catalog && !listMode && (catalog.length !== 1 || sources.size)) throw inventoryInvalid();
     const prechecks = [];
     for (const [id, { state, accounts }] of catalog ? [] : sources) {
-        const enrollment = await enrollSource(env, id, state, readNode);
+        const enrollment = await enrollSource(env, relayGrantStore, snapshot, id, state, readNode);
         const { backupId, clientCidr, tproxyPort, fwmark, routeTable } = state;
         const installation = { nodeId: id, backupId, network: { clientCidr, tproxyPort, fwmark, routeTable } };
         let currentUsers;

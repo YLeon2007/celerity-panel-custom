@@ -30,7 +30,10 @@ async function readSessionCensus(remote, input) {
             const { activeSessions, activeIpsec, census } = reply;
             return Object.freeze({ activeSessions, activeIpsec, census });
         }
-    } catch { /* Unavailable, not zero. */ }
+    } catch (error) {
+        if (error?.code === 'REBUILD_L2TP_IDENTITY_CHANGED') throw error;
+        // Unavailable, not zero.
+    }
     return null;
 }
 

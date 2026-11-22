@@ -12,7 +12,8 @@ const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
 const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
 const {createRebuildRelayAccounts}=require('./rebuildRelayAccounts');
 const {assertNoPendingRelayAccounts}=require('./rebuildRelayAccountsStore');
-const {resolveRelayBinding,captureRelayBinding}=require('./rebuildRelayAuthorization');
+const {resolveRelayBinding}=require('./rebuildRelayAuthorization');
+const {readRelayAuthority,captureRelayEffect,identityChanged}=require('./rebuildRelayEffectAuthority');
 const {appliedLink}=require('./rebuildAppliedLink');
 const {isReverse,unverified}=require('./rebuildReverseLinkHealth');
 const {createPrivateKey,createPublicKey,randomBytes}=require('node:crypto');
@@ -38,7 +39,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     compose=composeRebuildProfiles,env=process.env,cache=require('./cacheService'),
     L2tpUser=require('../modules/relay-l2tp/models/l2tpUserModel'),
     createRelayDirect=options=>require('./rebuildRelayDirect').createRelayDirect(options),
-    assertNoRelayAccountIntent=()=>assertNoPendingRelayAccounts(L2tpUser.db)}={}){
+    assertNoRelayAccountIntent=()=>assertNoPendingRelayAccounts(L2tpUser.db),
+    grantDb=env===process.env?L2tpUser.db:undefined,
+    relayGrantStore=grantDb&&{snapshot:()=>require('./rebuildRelayGrantStore').createRelayGrantStore({db:grantDb,env}).snapshot()}}={}){
     const gate=()=>{if(!isRebuildEnabled(env))throw fail('REBUILD_DISABLED');};
     const checked = async (verify, fn) => {
         if (typeof verify !== 'function' || await verify() === false) throw fail('REBUILD_LOCK_LOST');
@@ -78,15 +81,27 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         // Resolve the complete affected set before opening any transport. An
         // installed relay requires a binding; an explicit enrollment binds
         // even before L2TP is installed.
+        const effectStore=states.size || env.C3_REBUILD_L2TP_INSTALL_ENABLED==='true' && nodes.some(node=>node.cascadeRole==='relay')
+            ? relayGrantStore : undefined;
+        const snapshot=await readRelayAuthority(env,effectStore);
         for(const node of nodes){
             const id=String(node._id), state=states.get(id);
-            const binding=captureRelayBinding(env,id,node,{optional:!state});
+            const binding=captureRelayEffect(env,effectStore,snapshot,id,node,{optional:!state});
             if(!binding)continue;
             // Historical route-group state may predate a rebuild receipt.
             // When a receipt exists it must agree with the operator binding.
-            if(state?.rebuildMachineId!=null && state.rebuildMachineId!==binding.binding.machineId)throw fail('REBUILD_L2TP_BINDING_MISMATCH');
+            if(state?.rebuildMachineId!=null && state.rebuildMachineId!==binding.binding.machineId){
+                throw binding.merged?identityChanged():fail('REBUILD_L2TP_BINDING_MISMATCH');
+            }
             bindings.set(id,binding);
         }
+        const verifyBinding=async(id,binding,snapshot)=>{
+            if(!binding.merged)return binding.check();
+            const node=await Node.findOne({_id:id,active:true,type:'xray'}).select('ip ssh useCustomConfig cascadeRole').lean();
+            if(!node || node.useCustomConfig)throw identityChanged();
+            await binding.check(node,snapshot);
+            await verifyLock();
+        };
         for(const node of nodes){
             const id=String(node._id), binding=bindings.get(id);
             if(!binding)continue;
@@ -96,11 +111,12 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             // Old route-group rows without a DIRECT receipt are not eligible
             // for the owned-unit transition. Keep their existing Apply path.
             const direct=state?.rebuildInstallToken!=null || state?.rebuildMachineId!=null;
-            const transport=createBoundRelayTransport(node,binding,verifyLock,direct?state:undefined);
+            const transport=createBoundRelayTransport(node,binding,verifyLock,direct?state:undefined,()=>verifyBinding(id,binding));
             transports.set(id,transport);
             await transport.attest();
         }
         for(const node of nodes){const id=String(node._id);if(!bindings.has(id))transports.set(id,connect(node));}
+        return verifyBinding;
     }
     async function usingTransports(transports,fn){
         let failed=false;
@@ -132,21 +148,24 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             return usingTransports(transports,async()=>{
                 const node=await Node.findOne({_id:id,active:true,type:'xray'}).lean();
                 if(!node||node.useCustomConfig)throw fail('REBUILD_NODE_UNSUPPORTED');
-                await openTransports([node],await installedStates([id]),transports,bindings,verify);
+                const verifyBinding=await openTransports([node],await installedStates([id]),transports,bindings,verify);
                 const version=await transports.get(id).requireSupportedCore();
                 await verify();
-                bindings.get(id)?.check();
+                if(bindings.has(id))await verifyBinding(id,bindings.get(id));
                 return require('./rebuildRealityFingerprint').assertRealityFingerprint(link,version);
             });
         }));
     }
     async function execute(req,alreadyHeld){
-        gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock;
+        gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock,verifyBinding;
         const verifyApply=async()=>{
             await verifyLock();
             // Recheck all captured grants before the coordinator effects,
             // including persistence and writes to non-L2TP members.
-            for(const binding of bindings.values())binding.check();
+            if(bindings.size){
+                const snapshot=await readRelayAuthority(env,[...bindings.values()].some(binding=>binding.merged)?relayGrantStore:undefined);
+                for(const [id,binding] of bindings)await verifyBinding(id,binding,snapshot);
+            }
         };
         return runRebuild({global:fn=>underApply(alreadyHeld,verify=>{
             verifyLock=verify;
@@ -158,7 +177,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 if(nodes.length!==ids.length||nodes.some(n=>n.type!=='xray'||!n.active||n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
                 if(req.remove)for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
                 states=await installedStates(ids);
-                await openTransports(nodes,states,transports,bindings,verifyLock);
+                verifyBinding=await openTransports(nodes,states,transports,bindings,verifyLock);
                 // `links` is the complete desired component, excluding both
                 // the requested removal and any retained deletion tombstones.
                 const realityLinks=links.filter(link=>link.tunnelSecurity==='reality');
@@ -201,7 +220,10 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             }return current;},
             persistKeys:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
             markDelete:async id=>{if(bindings.size)await verifyApply();const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
-            async checkActivation(ids){for(const id of ids)await transports.get(id).checkActivation?.();},
+            async checkActivation(ids){
+                for(const id of ids)await transports.get(id).verifyIdentity?.();
+                for(const id of ids)await transports.get(id).checkActivation?.();
+            },
             async prepareActivation(ids){for(const id of ids)await transports.get(id).prepareActivation?.();},
             stagePair:(id,pair)=>transports.get(id).stagePair(pair),putPair:(id,pair)=>transports.get(id).putPair(pair),
             async finish({desired,removed}){
@@ -224,9 +246,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             }
         },req);
     }
-    const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});
-    const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks:guardedLocks,env,createRelayDirect});
-    const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,resolveRelayBinding,createRelayDirect});
+    const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks:guardedLocks,env,relayGrantStore,createRelayDirect});
+    const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks:guardedLocks,env,relayGrantStore,createRelayDirect});
+    const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
     return {execute,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,...relayRemoval,
         createRelayAccount: input=>relayAccounts().create(input),
         disableRelayAccount: input=>relayAccounts().disable(input),
