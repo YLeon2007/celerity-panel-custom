@@ -182,6 +182,9 @@ h['installed_runtime'] = installed_runtime
 d = dict(clientCidr='10.255.1.0/24', tproxyPort=12345, fwmark=77, routeTable=177)
 token = 'd' * 32
 machine = 'a' * 32
+machine_file = root / 'etc/machine-id'
+machine_file.write_text(machine + '\n', encoding='ascii')
+h['open'] = lambda path, *args, **kw: open(machine_file if path == '/etc/machine-id' else path, *args, **kw)
 baseline = h['dispatch'](dict(action='prepare', machineId=machine, network=d))['baseline']
 req = dict(machineId=machine, backupId=token, baseline=baseline, network=d)
 raw = dict(main=h['encode']({'inbounds': [{'tag':'relay-l2tp-a','port':12345},
