@@ -9,6 +9,7 @@ const { encrypt, decrypt } = require('../modules/relay-l2tp/services/secretBoxSe
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { accountError: fail, RelayAccountsError, createRebuildRelayAccountsStore } = require('./rebuildRelayAccountsStore');
 const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
+const { isInspectionReason } = require('./rebuildRelayInspection');
 
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
 const machinePattern = /^[a-f0-9]{32}(?![\s\S])/;
@@ -258,6 +259,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
         const matching = requested.action === action && requested.login === login
             && (action !== 'create' || requested.password === password);
         let phase = 'BLOCKED', uncertainNodeId;
+        let inspectionReason;
         let sessionsTerminated = 0;
         const confirmedNodeIds = new Set();
         const verifyAuthority = async () => {
@@ -286,7 +288,17 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                 const sameProjection = revokedLogin !== undefined && plans[0].before.enabled === false;
                 const inspect = async ({ installation, currentUsers, desiredUsers }, remote) => {
                     await recheck();
-                    const receipt = await remote.inspectChap(installation, currentUsers, desiredUsers, recheck, revokedLogin);
+                    let receipt;
+                    try {
+                        receipt = await remote.inspectChap(installation, currentUsers, desiredUsers, recheck, revokedLogin);
+                    } catch (error) {
+                        const reason = error?.code === 'REBUILD_L2TP_DIRECT_INSPECT_UNPROVED' && error.inspectionReason;
+                        if (isInspectionReason(reason)) {
+                            await recheck();
+                            inspectionReason = reason;
+                        }
+                        throw error;
+                    }
                     await recheck();
                     if (!inspectionReceipt(receipt, revokedLogin, sameProjection)) throw fail('CHANGED');
                     return receipt;
@@ -363,6 +375,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
             }));
         } catch {
             throw fail(phase, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds].sort(),
+                ...(inspectionReason && { inspectionReason }),
                 // Do not attribute closures from a different pending action to the requested mutation.
                 ...(revokedLogin && (!requested.action || matching) && { confirmedSessionsTerminated: sessionsTerminated,
                     ...(matching && { sessionsTerminatedScope: 'request' }) }),

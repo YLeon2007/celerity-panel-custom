@@ -9,7 +9,7 @@ function fixture(change={}) {
     const deps={
         authorize:()=>true, machineId, lock:fn=>fn(async()=>events.push('lock-verify')),
         inventory:async()=>({eligible:true,pristine:true}),
-        connect:async()=>({ preflight:async()=>({ppp:true,masked:false,machineId}), close:async()=>events.push('close'),
+        connect:async()=>({ preflight:async()=>({ppp:true,masked:false,unitsLoaded:true,machineId}), close:async()=>events.push('close'),
             install:async()=>events.push('install'), verify:async()=>true }),
         prepare:async()=>({backupId:'fixture-backup'}), reserve:async()=>events.push('reserve'),
         verifyReservation:async()=>{}, finish:async()=>events.push('finish'), ...change

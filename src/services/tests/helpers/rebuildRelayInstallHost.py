@@ -1,5 +1,6 @@
 """Local SSH endpoint for DIRECT install and removal. Never calls host commands."""
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import shlex
 import stat
+from subprocess import CompletedProcess
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -26,11 +28,22 @@ assert command_line[:-1] == ['/usr/bin/timeout', '-k', *timeout, '/usr/bin/pytho
 state_path = root / 'manager.json'
 s = json.loads(state_path.read_text())
 h: dict[str, Any] = {'__name__': 'direct_fixture'}
+native_stock = scenario.startswith('native-stock-')
 
-def no_host_dispatch(event, _):
+def no_host_dispatch(event, args):
     if event in {'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.exec', 'os.fork'} or event.startswith('socket.'):
         s.setdefault('faults', []).append(event)
         raise AssertionError('non-modeled host dispatch')
+    if native_stock and event == 'open':
+        path, _, flags = args
+        if (isinstance(path, (str, bytes)) and flags & os.O_CREAT
+                and os.fsdecode(path).endswith('/etc/systemd/system/xl2tpd.service')):
+            exclusive = os.O_WRONLY | os.O_EXCL | os.O_NOFOLLOW
+            if (path != str(backing(XL_NATIVE)) or flags & exclusive != exclusive or request['action'] != 'install'):
+                s.setdefault('faults', []).append('unscoped native create')
+                raise AssertionError('native create must be exclusive, mapped and reserved')
+            assert_host_lock()
+            s.setdefault('nativeCreates', []).append(request['action'])
 
 sys.addaudithook(no_host_dispatch)
 exec(compile(command_line[-1], '<DIRECT command>', 'exec'), h)
@@ -43,6 +56,21 @@ XL, IKE, X, B, NET = (h[k] for k in ('XL', 'IKE', 'X', 'B', 'NET_UNIT'))
 MAIN, BRIDGE, SYSTEM = (h[k] for k in ('MAIN', 'BRIDGE', 'SYSTEM'))
 STOCK_UID = 65534
 XRAY_PATHS = {X: MAIN, B: BRIDGE}
+XL_INIT = '/etc/init.d/xl2tpd'
+XL_DEFAULT = '/etc/default/xl2tpd'
+XL_GENERATED = '/run/systemd/generator.late/xl2tpd.service'
+XL_NATIVE = '/etc/systemd/system/xl2tpd.service'
+XL_ALIAS = 'l2tpd.service'
+XL_CONFFILES = (' /etc/default/xl2tpd fadc31f26078d8c3fb033d7d4516500b\n'
+                ' /etc/init.d/xl2tpd 65b9d6566a0eb3ba4078b72e08ab38a0\n'
+                ' /etc/xl2tpd/xl2tpd.conf 3c7f48565aff98751a9ef2d734b56405\n')
+STOCK_MANAGER_OPTIONS = ['--system', '--no-pager', '--no-ask-password', '--full']
+
+
+def exec_property(path, argv):
+    return (f'{{ path={path} ; argv[]={argv} ; ignore_errors=no ; start_time=[n/a] ; '
+            'stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
+
 
 def xray_path(pid):
     return next(p for n, p in XRAY_PATHS.items()
@@ -78,8 +106,20 @@ class LocalOS:
     def __getattr__(self, name):
         assert name in ('O_RDONLY', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_WRONLY', 'O_CREAT', 'O_EXCL', 'O_DIRECTORY',
                         'fdopen', 'listxattr', 'mkdir', 'rmdir', 'fsync', 'close', 'fchmod', 'link',
-                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'readlink', 'symlink', 'uname'), name
+                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'symlink', 'uname'), name
         return getattr(os, name)
+
+    def readlink(self, path, *, dir_fd=None):
+        if path == '/proc/self/ns/user':
+            return 'user:[4026532500]' if scenario == 'ppp-child-userns' else 'user:[4026531837]'
+        return os.readlink(backing(path)) if dir_fd is None else os.readlink(path, dir_fd=dir_fd)
+
+    def link(self, src, dst, **kwargs):
+        if dst == '70-celerity-rebuild-l2tp.conf':
+            assert_install_intent()
+            if scenario == 'ppp-publish-race':
+                backing('/etc/modules-load.d/' + dst).write_bytes(b'# foreign late arrival\n')
+        os.link(src, dst, **kwargs)
 
     def open(self, path, flags, mode=0o777, *, dir_fd=None):
         # Project only the initial '/' descriptor. The real production
@@ -105,6 +145,8 @@ class LocalOS:
 
     def lstat(self, path):
         if path == '/dev/ppp':
+            if scenario in ('ppp-both', 'ppp-device-missing') and ('ppp_generic' not in s['modules'] or scenario == 'ppp-device-missing'):
+                raise FileNotFoundError(path)
             return SimpleNamespace(st_mode=stat.S_IFCHR | 0o600, st_rdev=os.makedev(108, 0))
         return os.lstat(backing(path))
 
@@ -121,9 +163,18 @@ class LocalOS:
 def stock_open(path, mode='r'):
     if path == '/etc/machine-id' and s.get('cohort'):
         return backing(path).open(mode)
-    facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n108 ppp\nBlock devices:\n',
+    if native_stock and path in ('/etc/os-release', '/usr/lib/os-release'):
+        return backing(path).open(mode)
+    observers = ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user')
+    modules = [*s['modules'], *(name for name in observers if scenario != 'ppp-network-observers' or name != 'xfrm_user')]
+    facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n' +
+             ('108 ppp\n' if 'ppp_generic' in s['modules'] else '') + 'Block devices:\n',
              '/proc/net/dev': 'header\nheader\n eth0: 0\n', '/proc/sys/kernel/random/boot_id': 'fixture-boot\n',
-             '/proc/999/cgroup': '0::/system.slice/foreign.service\n'}
+             '/proc/999/cgroup': '0::/system.slice/foreign.service\n',
+             '/proc/modules': ''.join(f'{name} 4096 0 - Live 0x0\n' for name in modules),
+             '/proc/cmdline': 'root=fixture' + (' module_blacklist=l2tp_ppp' if scenario == 'ppp-boot-blacklist' else ''),
+             '/proc/self/status': 'CapEff:\t0000000000010000\n',
+             '/proc/sys/kernel/modules_disabled': '1\n' if scenario == 'ppp-disabled' else '0\n'}
     if s['units'][IKE]['ActiveState'] == 'active':
         facts[f"/proc/{s['charonPid']}/cgroup"] = '0::/system.slice/' + IKE + '\n'
     for name, config in XRAY_PATHS.items():
@@ -135,6 +186,25 @@ def stock_open(path, mode='r'):
 
 def reloaded():
     units = s['units']
+    if native_stock and units[XL]['FragmentPath'] != XL_NATIVE:
+        assert request['action'] == 'install' and s['effects'] == [['daemon-reload']]
+        assert units[XL]['ActiveState'] == 'inactive' and units[IKE]['ActiveState'] == 'inactive'
+        unitfile = backing(XL_NATIVE)
+        assert stat.S_IMODE(unitfile.stat().st_mode) == 0o644
+        assert hashlib.sha256(unitfile.read_bytes()).hexdigest() == h['NATIVE_XL_SHA']
+        assert s['running'][X] == json.loads(backing(MAIN).read_bytes())
+        assert not any(backing(path).exists() for path in (h['DROP'], h['NET'], h['NFT_FILE']))
+        # PID 1 would drop the shadowed generator output at its next reload.
+        if units[XL]['FragmentPath'] == XL_GENERATED:
+            backing(XL_GENERATED).unlink()
+            backing(str(Path(XL_GENERATED).with_name(XL_ALIAS))).unlink()
+        units[XL].update(LoadState='loaded', FragmentPath=XL_NATIVE, SourcePath='', UnitFileState='disabled',
+                         Type='simple', KillMode='control-group', Restart='on-failure', RemainAfterExit='no',
+                         ControlGroup='/system.slice/' + XL, RuntimeDirectory='xl2tpd', RuntimeDirectoryMode='0755',
+                         ExecStart=exec_property('/usr/sbin/xl2tpd', '/usr/sbin/xl2tpd -D'), ExecStop='')
+        s['nativeReload'] = {'action': request['action'], 'inode': unitfile.stat().st_ino}
+        if scenario == 'native-stock-readback-failed':
+            units[XL]['NeedDaemonReload'] = 'yes'
     if backing(h['NET']).exists():
         net = backing(h['NET']).read_text()
         legacy = f'Requires={X}\n' in net
@@ -199,22 +269,115 @@ def sockets():
     return result
 
 
+def assert_host_lock():
+    fd = os.open(backing(SYSTEM), os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # production holds a distinct, exclusive lock for this inode
+        raise AssertionError('mutation outside host lock')
+    finally:
+        os.close(fd)
+
+
+def assert_install_intent():
+    assert request['action'] == 'install'
+    manifest = json.loads(backing(h['manifest_path'](request['backupId'])).read_bytes())
+    assert manifest['phase'] == 'applying' and manifest['machineId'] == request['machineId']
+    assert h['digest'](h['encode'](manifest['before'])) == request['baseline']
+    assert_host_lock()
+
+
+def stock_unit_properties(name):
+    assert name in {XL, XL_ALIAS}
+    xl = s['units'][XL]
+    generated = xl['FragmentPath'] == XL_GENERATED
+    info = dict(Id=name, Names=name, LoadState='not-found', UnitFileState='', FragmentPath='', SourcePath='',
+                ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Job='', NeedDaemonReload='no',
+                Transient='no', DropInPaths='', TriggeredBy='', Environment='', RootDirectory='', RootImage='',
+                User='', Group='', Type='simple', KillMode='control-group', Restart='no', RemainAfterExit='no',
+                RuntimeDirectory='', RuntimeDirectoryMode='0755')
+    if generated or name == XL:
+        info.update({key: value for key, value in xl.items() if key in info})
+    if generated:
+        info.update(Id=XL, Names=XL_ALIAS + ' ' + XL,
+                    ExecStart=exec_property(XL_INIT, XL_INIT + ' start'), ExecStop=exec_property(XL_INIT, XL_INIT + ' stop'))
+    elif name == XL and xl['FragmentPath'] == XL_NATIVE:
+        info['ExecStart'] = xl['ExecStart']
+    return info
+
+
 def run(argv, **kwargs):
     prog, *v = argv
     def reply(value: bytes | str = b'', code=0):
         return SimpleNamespace(returncode=code, stdout=value if isinstance(value, bytes) else value.encode(), stderr=b'')
     def js(value):
         return reply(json.dumps(value))
+    if native_stock and prog == '/usr/bin/dpkg-divert':
+        assert v in (['--truename', XL_INIT], ['--truename', XL_DEFAULT])
+        return reply(v[1] + '\n')
+    if prog == '/usr/bin/systemd-detect-virt':
+        if v == ['--container']:
+            return reply('lxc\n', 0) if scenario in ('ppp-container', 'ppp-container-ready') else reply('none\n', 1)
+        assert v == ['--chroot']
+        return reply(code=1)
+    if prog == '/usr/sbin/modprobe':
+        if v == ['--showconfig']:
+            return reply({'ppp-blacklist': 'blacklist l2tp-ppp\n', 'ppp-dependency-blacklist': 'blacklist l2tp_core\n',
+                          'ppp-install-hook': 'install l2tp_ppp /bin/false\n'}.get(scenario, 'blacklist unrelated\n'))
+        if v[:3] == ['--show-depends', '--use-blacklist', '--']:
+            if scenario == 'ppp-network-observers' and v[3:] == ['xfrm_user']:
+                return reply('insmod /lib/modules/fixture/kernel/xfrm_user.ko\n')
+            assert v[3:] in (['ppp_generic'], ['l2tp_ppp'])
+            modules = ['slhc', 'ppp_generic'] if v[3] == 'ppp_generic' else ['l2tp_core', 'ppp_generic', 'l2tp_ppp']
+            return reply(''.join(f'insmod /lib/modules/fixture/kernel/{name}.ko\n' for name in modules))
+        assert request['action'] == 'install' and v[:2] == ['--use-blacklist', '--'] and len(v) == 3
+        assert v[2] in ('ppp_generic', 'l2tp_ppp') and v[2] not in s['modules']
+        assert_install_intent()
+        s.setdefault('moduleLoads', []).append(v[2])
+        if scenario == 'ppp-load-timeout':
+            raise h['subprocess'].TimeoutExpired(argv, 1)
+        if scenario == 'ppp-load-failure':
+            return reply(code=1)
+        if scenario != 'ppp-no-readback':
+            s['modules'].append(v[2])
+        return reply()
     if prog == '/usr/bin/systemctl':
-        assert v.pop(0) == '--no-pager'
+        stock_ctl = v[:len(STOCK_MANAGER_OPTIONS)] == STOCK_MANAGER_OPTIONS
+        if stock_ctl:
+            assert native_stock
+            v = v[len(STOCK_MANAGER_OPTIONS):]
+            s.setdefault('stockManagerCalls', []).append([request['action'], v])
+            if v == ['show', '--all', '--property=UnitPath']:
+                return reply('UnitPath=/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system '
+                             '/usr/lib/systemd/system /run/systemd/generator.late\n')
+        else:
+            assert v.pop(0) == '--no-pager'
         action, *rest = v
         if action == 'show':
             assert len(rest) == 3 and rest[0] == '--all' and rest[1].startswith('--property=')
-            info = s['units'][rest[2]]
+            if rest[2] == 'systemd-modules-load.service':
+                mask = scenario == 'ppp-service-mask'
+                info = dict(LoadState='masked' if mask else 'loaded', UnitFileState='masked' if mask else 'static',
+                            ActiveState='inactive', NeedDaemonReload='no',
+                            FragmentPath='/usr/lib/systemd/system/systemd-modules-load.service')
+            elif native_stock and rest[2] in (XL, XL_ALIAS) and (stock_ctl or s['units'][XL]['LoadState'] != 'loaded'
+                                                                  or s['units'][XL]['FragmentPath'] == XL_GENERATED):
+                info = stock_unit_properties(rest[2])
+            else:
+                info = s['units'][rest[2]]
             rows = []
             for k in rest[1].split('=', 1)[1].split(','):
+                if stock_ctl and k not in info:
+                    # systemctl 257 omits these empty struct-array properties.
+                    assert k in {'ExecCondition', 'ExecStartPre', 'ExecStart', 'ExecStartPost', 'ExecReload',
+                                 'ExecStop', 'ExecStopPost', 'EnvironmentFiles'}
+                    continue
                 value = info.get(k, '')
                 rows.extend(f'{k}={entry}\n' for entry in (value if isinstance(value, list) else [value]))
+            if native_stock and rest[2] == XL and info.get('FragmentPath') == XL_NATIVE and not info.get('DropInPaths'):
+                s.setdefault('nativeReadback', []).append(request['action'])
             return reply(''.join(rows), 1 if info['LoadState'] == 'not-found' else 0)
         if action == 'list-jobs':
             assert rest == ['--no-legend', '--plain']
@@ -222,6 +385,12 @@ def run(argv, **kwargs):
         if action == 'show-environment':
             assert not rest
             return reply(s['managerEnvironment'])
+        if native_stock:
+            assert request['action'] in ('install', 'remove')
+            assert not stock_ctl or v == ['daemon-reload']
+            assert_host_lock()
+            if v == ['start', XL]:
+                assert 'install' in s.get('nativeReadback', [])
         s['effects'].append(v)
         if v == ['daemon-reload']:
             if request['action'] == 'prepare-apply-network' and s.get('failApplyReload'):
@@ -263,12 +432,24 @@ def run(argv, **kwargs):
             raise AssertionError('unexpected manager mutation: ' + action)
         return reply()
     if prog == '/usr/bin/dpkg-query':
+        if native_stock:
+            if v in (['-S', XL_INIT], ['-S', XL_DEFAULT]):
+                return reply(f'xl2tpd: {v[1]}\n')
+            if v in (['-W', r'-f=${binary:Package}\t${Status}\t${Architecture}\t${Version}\n${Conffiles}\n', 'xl2tpd'],
+                     ['-W', r'-f=${Version}\n${Architecture}\n${Conffiles}', 'xl2tpd'],
+                     ['-W', '-f=${Conffiles}', 'xl2tpd']):
+                heading = {r'-f=${Version}\n${Architecture}\n${Conffiles}': '1.3.18-1+b1\namd64\n',
+                           '-f=${Conffiles}': ''}.get(v[1], 'xl2tpd\tinstall ok installed\tamd64\t1.3.18-1+b1\n')
+                return reply(heading + XL_CONFFILES)
         assert len(v) == 3 and v[0] == '-W'
         if v[1] == '-f=${Conffiles}':
             assert v[2:] == ['xl2tpd']
             return reply(' /etc/xl2tpd/xl2tpd.conf ' + s['lnsMd5'] + '\n')
         assert v[1] == '-f=${db:Status-Abbrev}' and v[2] in s['packages']
-        return reply('ii ' if scenario != 'package' or v[2] != 'ppp' else '', 1 if scenario == 'package' and v[2] == 'ppp' else 0)
+        if scenario == 'fresh-stock-runtime':
+            s.setdefault('packageChecks', []).append(v[2])
+        missing = v[2] in s.get('missingPackages', ())
+        return reply('' if missing else 'ii ', int(missing))
     if prog == '/usr/bin/ss' and v == ['-H', '-lntup']:
         return reply(''.join(f'{p} LISTEN 0 0 {a}:{n} *:* users:(("fixture",pid={pid},fd=3))\n' for p, a, n, pid in sockets()))
     if prog == '/usr/sbin/ip':
@@ -301,6 +482,7 @@ def run(argv, **kwargs):
         if v == ['-j', '-s', 'list', 'table', 'inet', h['TABLE']]:
             return js(dict(nftables=[table]))
         if v == ['-c', '-f', '-']:
+            assert_install_intent()
             assert h['nft_marker'](kwargs['input'], request['backupId'])
             return reply()
         if v == ['delete', 'table', 'inet', h['TABLE']]:
@@ -344,9 +526,20 @@ def run(argv, **kwargs):
 def modeled_run(argv, **kwargs):
     try:
         return run(argv, **kwargs)
+    except h['subprocess'].TimeoutExpired:
+        assert scenario == 'ppp-load-timeout' and list(argv) == ['/usr/sbin/modprobe', '--use-blacklist', '--', 'l2tp_ppp']
+        raise
     except Exception as error:
         s.setdefault('faults', []).append([type(error).__name__, list(argv)])
         raise
+
+def stock_runtime_command(*argv):
+    # Only the I/O boundary is substituted: the JS-packed stock verifier and
+    # ensure helper run unchanged with real ownership, bytes and file creation.
+    assert native_stock
+    result = modeled_run(argv)
+    return CompletedProcess(argv, result.returncode, result.stdout.decode(), result.stderr.decode())
+
 
 def modeled_open(path, mode='r'):
     try:
@@ -387,6 +580,11 @@ def modeled_empty_revoke(request, blocked, chap, path, manifest, xl):
 
 h.update(os=LocalOS(), open=modeled_open,
          subprocess=SimpleNamespace(run=modeled_run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired))
+if native_stock and 'C3_STOCK_RUNTIME' in h:
+    # No fallback to a locally loaded helper on the RED base.
+    assert 'C3_STOCK_ENSURE' in h
+    h['C3_STOCK_RUNTIME']['ROOT_OWNER'] = (os.getuid(), os.getgid())
+    h.update(stock_runtime_root=lambda: root, stock_runtime_command=stock_runtime_command)
 if s.get('cohort'):
     assert h['pwd'].getpwnam('nobody').pw_uid == h['grp'].getgrnam('nogroup').gr_gid == STOCK_UID
     assert h['pwd'].getpwuid(0).pw_dir == '/root'

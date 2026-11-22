@@ -8,6 +8,8 @@ const rateLimit = require('express-rate-limit');
 const { requireAuth, render } = require('./helpers');
 const { requirePanelCsrf } = require('./csrf');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
+const { installCheckIds } = require('../../services/rebuildRelayInstallDiagnostics');
+const { isInspectionReason } = require('../../services/rebuildRelayInspection');
 
 const pagePath = /^\/l2tp$/;
 const accountPath = /^\/rebuild\/relays\/l2tp\/accounts\/reveal$/;
@@ -71,8 +73,9 @@ function renderPage(res, model) {
     // Hash the packaged script on first use; there is no version to bump by hand.
     rebuildL2tpScriptVersion ??= createHash('sha256')
         .update(readFileSync(resolve(__dirname, '../../../public/js/rebuild-l2tp.js'))).digest('hex').slice(0, 16);
+    const installChecks = Object.fromEntries(installCheckIds.map(check => [check, t?.(`rebuildL2tp.installChecks.${check}`)]));
     return render(res, 'rebuild-l2tp', { title: title && title !== 'rebuildL2tp.title' ? title : 'L2TP', page: 'l2tp',
-        ...model, rebuildL2tpScriptVersion });
+        ...model, installChecks, rebuildL2tpScriptVersion });
 }
 
 function sendLoadError(res) {
@@ -139,9 +142,9 @@ function mountNoStore(router) {
 
 function mountOverview(router, getOverview, exposePanelCsrfToken) {
     router.get(pagePath, (req, _res, next) => req.method === 'GET' ? next() : next('route'),
-        requireAuth, exposePanelCsrfToken, requireCompletedOnboarding(sendLoadError), async (_req, res) => {
+        requireAuth, exposePanelCsrfToken, requireCompletedOnboarding(sendLoadError), async (req, res) => {
             try {
-                return renderPage(res, await getOverview().overview());
+                return renderPage(res, { ...await getOverview().overview(), reconcileViewOnly: req.query.view === 'only' });
             } catch {
                 return sendLoadError(res);
             }
@@ -196,10 +199,18 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
             // This is a scoped recovery request, not a request to mutate a
             // specific account or host. The writer rechecks under its lock.
             if (!await hasPendingAccounts()) return receipt('settled');
-            let result, failed = false;
-            try { result = await reconcile(); } catch { failed = true; }
-            // A busy/refused writer is still pending if the fence can be observed; a failed read is not.
-            if (await hasPendingAccounts()) return receipt('pending');
+            let result, failed = false, reason;
+            try { result = await reconcile(); } catch (error) {
+                failed = true;
+                const diagnostic = error?.retryAllowed === false && error.inspectionReason;
+                if (isInspectionReason(diagnostic)) reason = diagnostic;
+            }
+            // A host refusal is diagnostic only while the pending fence still
+            // exists. Busy, lost replies and unclassified outcomes stay pending.
+            if (await hasPendingAccounts()) {
+                if (reason) return res.json({ executionMode: 'rebuild', status: 'inspection-unproved', reason, retryAllowed: false });
+                return receipt('pending');
+            }
             if (failed) return reconcileUnavailable(res);
             // Publish only acknowledged closures from this settled revocation, never its account or relay metadata.
             const count = result?.sessionsTerminated;

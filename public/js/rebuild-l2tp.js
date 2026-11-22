@@ -4,6 +4,7 @@
     const page = document.getElementById('rebuild-l2tp');
     if (!page) return;
     const words = JSON.parse(page.dataset.messages);
+    const installChecks = JSON.parse(page.dataset.installChecks || '{}');
 
     async function post(url, body, signal) {
         const response = await fetch(url, {
@@ -118,11 +119,9 @@
     const refresh = page.querySelector('[data-refresh]');
     const mutations = [...installs, ...accountButtons, ...(submit ? [submit] : [])];
     const expected = { install: 'installed', create: 'created', disable: 'disabled', delete: 'deleted' };
-    const uncertainInstallCodes = new Set([
-        'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN',
-        'REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN', 'REBUILD_L2TP_RESERVATION_FAILED',
-        'REBUILD_L2TP_RESERVATION_CLEANUP_FAILED', 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED',
-        'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED',
+    const installOutcomes = new Map([
+        ['refused', 'installRefused'], ['busy', 'installBusy'], ['rolled_back', 'installRolledBack'],
+        ['unknown', 'uncertain'], ['installed', 'installCleanupFailed'],
     ]);
     let busy = false, requireRefresh = false;
 
@@ -136,6 +135,14 @@
             ? ` ${words.requestClosures.replace('{count}', String(count))}` : '';
     }
 
+    const inspectionMessages = new Map([
+        ['host-inspection-unproved', 'reconcileHostInspection'],
+        ['chap-projection-unproved', 'reconcileChapProjection'],
+        ['ppp-unproved', 'reconcilePppInspection'],
+        ['pidfd-getfd-eperm', 'reconcilePidfdGetfdEperm'],
+        ['inspect-readback-unproved', 'reconcileInspectReadback'],
+    ]);
+
     async function reconcileOnOpen() {
         busy = true;
         updateMutations();
@@ -148,12 +155,17 @@
                     note = closureNote(data, data.sessionsTerminated);
                 }
                 if (data.status === 'pending') message = 'reconcileStillPending';
+                if (data.status === 'inspection-unproved' && data.retryAllowed === false) {
+                    message = 'reconcileInspectionUnproved';
+                    const detail = inspectionMessages.get(data.reason);
+                    if (detail) note = ` ${words[detail]}`;
+                }
             }
         } catch { /* A lost response does not establish whether the fence cleared. */ }
         status.textContent = words[message] + note;
         busy = false;
-        // Never unlock controls against this stale overview or reload into
-        // another automatic POST. Any refresh is an explicit operator action.
+        // Never unlock this stale overview. Its refresh link only reads the
+        // overview; it cannot cause another automatic recovery POST.
         requireRefresh = true;
         updateMutations();
     }
@@ -177,8 +189,21 @@
                     if (revocation && data.recovered === true) note = closureNote(data, data.sessionsTerminated);
                     clearSecrets();
                 }
+            } else if (action === 'install' && response.status === 409) {
+                // Only show local copy; raw codes, exceptions and detail fields are never rendered.
+                const { outcome, check } = data?.error ?? {};
+                if ((outcome === 'unknown' || (data?.retryAllowed !== false && data?.error?.retryAllowed !== false))
+                    && installOutcomes.has(outcome)
+                    && (check === undefined || (typeof check === 'string' && Object.hasOwn(installChecks, check)))) {
+                    result = installOutcomes.get(outcome);
+                    if (check !== undefined) note = ` ${installChecks[check]}`;
+                    if (outcome === 'installed' || outcome === 'rolled_back') {
+                        requireRefresh = true;
+                        clearSecrets();
+                    }
+                }
             } else if (data?.retryAllowed !== false && data?.error?.retryAllowed !== false
-                && !uncertainInstallCodes.has(data?.error?.code) && response.status !== 408 && response.status < 500) {
+                && response.status !== 408 && response.status < 500) {
                 result = response.status === 429 ? 'rateLimited' : 'requestFailed';
             } else if (revocation && data?.error?.retryAllowed === false) {
                 note = closureNote(data.error, data.error.confirmedSessionsTerminated);

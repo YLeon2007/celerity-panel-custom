@@ -22,7 +22,6 @@ INIT = '/etc/init.d/xl2tpd'
 DEFAULTS = '/etc/default/xl2tpd'
 DAEMON = '/usr/sbin/xl2tpd'
 ROOT_OWNER = (0, 0)
-HELPER = Path(__file__).resolve().parents[1] / 'modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'
 
 # From the signed Debian trixie amd64 xl2tpd 1.3.18-1+b1 archive.
 PACKAGE_ID = 'xl2tpd\tinstall ok installed\tamd64\t1.3.18-1+b1'
@@ -34,6 +33,7 @@ PACKAGE_FILES = {
 }
 # Exact output of Debian trixie's amd64 systemd 257.13-1~deb13u1 generator
 # for the pinned script at INIT: (normal runlevels 2/3/4/5, no start links).
+SYSV_GENERATOR_SHA = '662f91830e6f76e08a47be605ba2480ae87add1eac44aa095629bc0a4484cb11'
 GENERATED_HASHES = {
     'aaca316b0955a3ba75f9909a63826d3a5ba2cc46a39ca2690b7043d68b1e8ec7': True,
     '02a7d3131dd4be414a8cc025ca4144edd904f01d644572aec4722b14182ca2a3': False,
@@ -80,10 +80,10 @@ def checked(result, code, statuses=(0,)):
     return result.stdout
 
 
-def command(*argv):
+def command(*argv, timeout=30):
     # Never inherit bus, dpkg-root, pager or locale overrides.
     return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                          encoding='utf-8', timeout=30,
+                          encoding='utf-8', timeout=timeout,
                           env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
 
 
@@ -147,7 +147,7 @@ def sha256(data):
 
 
 def verify_package(root, run):
-    result = checked(run(DPKG_QUERY, '-W', '-f=${binary:Package}\t${Status}\t${Architecture}\t${Version}\n${Conffiles}\n',
+    result = checked(run(DPKG_QUERY, '-W', r'-f=${binary:Package}\t${Status}\t${Architecture}\t${Version}\n${Conffiles}\n',
                          'xl2tpd'), 'PACKAGE_FACTS')
     identity, _, conffiles = result.partition('\n')
     need(identity == PACKAGE_ID, 'PACKAGE_FACTS')
@@ -176,7 +176,7 @@ def alias_to_stock(path):
     return path.name.endswith('.service') and path.is_symlink() and Path(os.readlink(path)).name in NAMES
 
 
-def unit_files(root, native_bytes, run):
+def unit_files(root, native_bytes, run, *, evidence=None):
     manager = props(checked(ctl(run, 'show', '--all', '--property=UnitPath'), 'UNIT_STATE'), ('UnitPath',))
     paths = set(manager['UnitPath'].split())
     need(NATIVE_DIR in paths and paths <= UNIT_DIRS, 'UNIT_STATE')
@@ -230,6 +230,11 @@ def unit_files(root, native_bytes, run):
         link = root / name[1:]
         info = link.lstat()
         need(stat.S_ISLNK(info.st_mode) and owner_ok(info) and os.readlink(link) == GENERATED_LINKS[name], 'UNIT_FILES')
+    if evidence is not None:
+        evidence['unitPath'] = manager['UnitPath']
+        evidence['layout'] = {name: generation(root / name[1:]) for name in sorted(
+            links | ({GENERATED} if generated is not None else {NATIVE} if native else set()))}
+        evidence['wrapper'] = generated
     return 'native' if native else 'generated' if generated is not None else 'missing'
 
 
@@ -271,7 +276,7 @@ def verify_manager(run, state):
     need(checked(ctl(run, 'list-jobs', '--no-legend', '--plain'), 'UNIT_STATE') == '', 'PENDING_JOBS')
 
 
-def verify_missing_route(root):
+def generator_input(root, *, missing, strict):
     # If SysV generation is possible, installing another runtime package can
     # regenerate the wrapper before install-runtime.sh checks LoadState.
     bases = ('/run/systemd/system-generators', '/etc/systemd/system-generators',
@@ -281,26 +286,86 @@ def verify_missing_route(root):
     for base in bases:
         if merged and base.startswith('/lib/'):
             continue
-        folder = directory(root, base, 'UNIT_FILES')
+        folder = directory(root, base, 'UNIT_FILES', protected=strict)
         if folder is None:
             continue
         generator = folder / 'systemd-sysv-generator'
         info = lstat(generator)
         if info is None:
             continue
-        need(stat.S_ISLNK(info.st_mode) and owner_ok(info) and os.readlink(generator) == '/dev/null', 'UNIT_STATE')
-        return
+        masked = stat.S_ISLNK(info.st_mode) and owner_ok(info) and os.readlink(generator) == '/dev/null'
+        path = '/' + str(generator.relative_to(root))
+        if masked:
+            return [path, 'masked', generation(generator)]
+        # The exact output pins authorize the generated layout, not an
+        # operator generator executable that could run on daemon-reload.
+        need(not missing and base in ('/usr/lib/systemd/system-generators', '/lib/systemd/system-generators'),
+             'UNIT_STATE')
+        digest = sha256(regular_bytes(generator, 0o755, 'UNIT_FILES', limit=1024 * 1024))
+        need(digest == SYSV_GENERATOR_SHA, 'UNIT_FILES')
+        return [path, digest, generation(generator)]
+    return None
+
+
+def generation(path):
+    info = path.lstat()
+    return [info.st_dev, info.st_ino, info.st_ctime_ns]
+
+
+def observe(root, run, helper):
+    """Strict read-only DIRECT witness; no standalone fallback/import."""
+    release_path = '/usr/lib/os-release'
+    need(directory(root, '/usr/lib', 'UNSUPPORTED_OS', protected=True) is not None, 'UNSUPPORTED_OS')
+    release = regular_bytes(root / release_path[1:], 0o644, 'UNSUPPORTED_OS')
+    rows = [line.split(b'=', 1) for line in release.splitlines() if b'=' in line]
+    for key, value in ((b'ID', b'debian'), (b'VERSION_CODENAME', b'trixie')):
+        need([row[1] for row in rows if row[0] == key] == [value], 'UNSUPPORTED_OS')
+    verify_package(root, run)
+    evidence = {}
+    state = unit_files(root, helper['UNIT'], run, evidence=evidence)
+    verify_manager(run, state)
+    evidence['state'] = state
+    # The missing route must not have an effective generator. Bind the same
+    # generator path and bytes (if present) through the later native readback.
+    generator = generator_input(root, missing=state == 'missing', strict=True)
+    need(state != 'generated' or (generator is not None and generator[1] == SYSV_GENERATOR_SHA), 'UNIT_STATE')
+    evidence['inputs'] = {
+        'release': sha256(release),
+        'generator': generator,
+        'files': {name: generation(root / name[1:]) for name in (*PACKAGE_FILES, release_path)},
+    }
+    return evidence
+
+
+def create_native(root, run, helper):
+    """Reserved DIRECT writer; the caller owns intent and full readback."""
+    try:
+        helper['ensure'](root)
+        folder = root / NATIVE_DIR[1:]
+        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        target = root / NATIVE[1:]
+        need(regular_bytes(target, 0o644, 'UNIT_FILES') == helper['UNIT'], 'UNIT_FILES')
+        created = generation(target)
+    except OSError as exc:
+        raise Refusal('CREATE_FAILED') from exc
+    checked(ctl(run, 'daemon-reload'), 'RELOAD_FAILED')
+    return created
 
 
 def prepare(root, run):
     verify_package(root, run)
-    helper = runpy.run_path(str(HELPER))
+    helper = runpy.run_path(str(Path(__file__).resolve().parents[1]
+                               / 'modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'))
     state = unit_files(root, helper['UNIT'], run)
     verify_manager(run, state)
     if state == 'native':
         return 'native-present'
     if state == 'missing':
-        verify_missing_route(root)
+        generator_input(root, missing=True, strict=False)
         return 'stock-not-found'
 
     # Only this branch writes. The existing helper opens the fixed destination

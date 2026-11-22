@@ -3,7 +3,8 @@ const l = key => t(`rebuildL2tp.${key}`);
 const available = typeof loadError === 'undefined' || !loadError;
 const pending = available && typeof accountsPending !== 'undefined' && accountsPending === true;
 const actionableOverview = available && !pending;
-const reconcile = pending && typeof canReconcileAccounts !== 'undefined' && canReconcileAccounts === true;
+const eligible = pending && typeof canReconcileAccounts !== 'undefined' && canReconcileAccounts === true;
+const reconcile = eligible && (typeof reconcileViewOnly === 'undefined' || !reconcileViewOnly);
 const relayStatuses = new Set(['not_installed', 'queued', 'preflight', 'installing', 'installed',
     'degraded', 'drifted', 'removing', 'error', 'role_lost']);
 const validId = id => typeof id === 'string' && /^[a-f0-9]{24}(?![\s\S])/.test(id);
@@ -13,7 +14,9 @@ const relayPath = id => `/panel/rebuild/relays/${id}/l2tp`;
 const accountPath = '/panel/rebuild/relays/l2tp/accounts';
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
     'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
-    'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed'];
+    'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
+    'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
+    'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed'];
 function secretControl(kind, url, index, login) {
     const valueId = `rebuild-l2tp-${kind}-${index}`;
 %>
@@ -39,12 +42,13 @@ function secretControl(kind, url, index, login) {
 </style>
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
      <% if (reconcile) { %>data-reconcile-url="<%= accountPath %>/reconcile"<% } %>
+     data-install-checks="<%= JSON.stringify(typeof installChecks === 'undefined' ? {} : installChecks) %>"
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
     <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
     <div class="card">
         <div class="card-body">
-            <p data-action-status role="status"><%= pending ? l(reconcile ? 'accountsPending' : 'accountsPendingListRequired') : '' %></p>
-            <a href="/panel/l2tp" data-refresh hidden><%= l('refresh') %></a>
+            <p data-action-status role="status"><%= pending ? l(reconcile ? 'accountsPending' : eligible ? 'accountsPendingLocked' : 'accountsPendingListRequired') : '' %></p>
+            <a href="<%= reconcile ? '/panel/l2tp?view=only' : '/panel/l2tp' %>" data-refresh hidden><%= l('refresh') %></a>
         </div>
         <section aria-labelledby="rebuild-l2tp-relays">
             <div class="card-header"><h2 id="rebuild-l2tp-relays"><i class="ti ti-server-2" aria-hidden="true"></i> <%= l('relays') %></h2></div>

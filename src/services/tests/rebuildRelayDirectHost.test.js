@@ -106,7 +106,7 @@ def directory(path, private=False):
         os.close(fd)
 h['directory'] = directory
 h['boot'] = lambda: 'boot-fixture'
-h['preflight'] = lambda machine: {'machineId': machine, 'ppp': True, 'unitsLoaded': True, 'masked': False}
+h['preflight'] = lambda machine, **kwargs: {'machineId': machine, 'ppp': True, 'unitsLoaded': True, 'masked': False}
 h['vpn_empty'] = lambda **kw: True
 h['working'] = lambda u: u['ActiveState'] == 'active'
 h['native_vpn'] = lambda info, name: True
@@ -121,7 +121,11 @@ before = dict(boot='boot-fixture', files={k: h['read'](p) for k, p in names.item
               units=original_units, bridge=None, globalFiles={}, sockets=[['tcp', '127.0.0.1', 8080]])
 h['unit'] = lambda name: dict(units[name])
 h['observe'] = lambda machine, d, transit: before
-h['validate_candidate'] = lambda after: None
+# Already-prepared PPP; the joined fixture exercises actual preparation.
+h['observe_ppp_preparation'] = lambda: dict(missing=[], persist=False, builtin=[], policy='fixture')
+h['apply_ppp_preparation'] = lambda expected: h['need'](expected == h['observe_ppp_preparation'](), 'BASELINE_CHANGED')
+h['require_network_observers'] = lambda: None
+h['validate_profiles'] = lambda after: None
 policy = dict(nft=None, rule=False, route=False)
 commands = []
 h['network_projection'] = lambda d, t: dict(policy)
@@ -160,6 +164,8 @@ def command(*args, **kw):
         policy['rule'] = False
     elif args[:3] == ('/usr/sbin/ip', '-4', 'route'):
         policy['route'] = False
+    elif args == ('/usr/sbin/nft', '-c', '-f', '-'):
+        assert pathlib.Path(h['manifest_path'](token)).is_file()
     elif args == ('/usr/sbin/nft', 'delete', 'table', 'inet', h['TABLE']):
         policy['nft'] = None
     else:
@@ -175,7 +181,9 @@ h['installed_runtime'] = installed_runtime
 
 d = dict(clientCidr='10.255.1.0/24', tproxyPort=12345, fwmark=77, routeTable=177)
 token = 'd' * 32
-req = dict(machineId='a' * 32, backupId=token, baseline=h['digest'](h['encode'](before)), network=d)
+machine = 'a' * 32
+baseline = h['dispatch'](dict(action='prepare', machineId=machine, network=d))['baseline']
+req = dict(machineId=machine, backupId=token, baseline=baseline, network=d)
 raw = dict(main=h['encode']({'inbounds': [{'tag':'relay-l2tp-a','port':12345},
     {'tag':'rebuild-relay-ingress','listen':'127.0.0.1','port':23456}]}),
     nft=('create table inet ' + h['TABLE'] + ' {\n    comment "' + token + '"\n}').encode(),

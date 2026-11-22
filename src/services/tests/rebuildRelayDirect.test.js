@@ -4,9 +4,10 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
-const { existsSync, readlinkSync } = require('node:fs');
+const { existsSync, readFileSync, readlinkSync } = require('node:fs');
 const { join } = require('node:path');
 const { createRelayDirect } = require('../rebuildRelayDirect');
+const { runFreshRelayInstall } = require('../rebuildRelayInstall');
 
 const nodeId = 'a'.repeat(24);
 const machineId = 'b'.repeat(32);
@@ -27,9 +28,12 @@ const args = { nodeId, desired, controlPlaneAddresses: ['panel.invalid'], carryD
 const ok = body => ({ code: 0, stdout: JSON.stringify(body) + '\n', stderr: '' });
 const ready = { machineId, ppp: true, masked: false, unitsLoaded: true };
 const observation = { ...ready, main, bridge: null, mainSha256: sha(main), bridgeSha256: null, baseline: 'd'.repeat(64) };
+const pending = { ...ready, ppp: false, unitsLoaded: false, pppPreparation: true, nativePreparation: true };
+const pendingSnapshot = { ...observation, ppp: false, unitsLoaded: false };
 
 function fixture(handler = () => {}) {
     const calls = [];
+    let firstCommand;
     class SSH {
         constructor(selected, options) {
             assert.equal(selected, node);
@@ -41,13 +45,15 @@ function fixture(handler = () => {}) {
         async exec(command, options) {
             const input = JSON.parse(options.stdin);
             assert.ok(options.timeout > 0 && options.timeout <= 150000);
+            assert.ok(Buffer.byteLength(command) + 1 <= 128 * 1024, 'fits Linux MAX_ARG_STRLEN');
             assert.ok(!command.includes(desired.psk) && !command.includes(desired.users[0].password));
+            firstCommand ??= command;
+            assert.equal(command === firstCommand, true, 'wire data does not influence the install command');
             calls.push(input.action);
             const result = await handler(input);
             if (result !== undefined) return result;
             if (input.action === 'preflight') return ok(ready);
             if (input.action === 'prepare') return ok(observation);
-            if (input.action === 'check') return ok({ ok: true });
             return ok({ ok: true, backupId: input.backupId });
         }
     }
@@ -83,6 +89,58 @@ test('the exact SSH command shell and Python stdin reject invalid framing locall
     await remote.close();
 });
 
+test('DIRECT bootstrap compiles the three exact repo sources without loading them from the host', async () => {
+    const fingerprints = [
+        '../rebuildRelayDirectHost.py', '../rebuildRelayStockRuntime.py',
+        '../../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py',
+    ].map(file => sha(readFileSync(join(__dirname, file))));
+    const probe = String.raw`
+import hashlib, json, os, shlex, sys
+command, request, expected = json.load(sys.stdin)
+assert os.getcwd() == '/' and '' not in sys.path and '/' not in sys.path
+argv = shlex.split(command)
+assert argv[:-1] == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c']
+assert json.loads(request)['action'] == 'preflight'
+assert json.loads(request)['machineId'] not in command
+sources, faults = [], []
+def audit(event, args):
+    if event == 'compile' and isinstance(args[0], bytes):
+        sources.append(hashlib.sha256(args[0]).hexdigest())
+    if (event in {'subprocess.Popen', 'os.system', 'os.exec', 'os.posix_spawn'} or event.startswith('socket.')
+            or event == 'open' and isinstance(args[0], str) and args[0].endswith(
+                ('rebuildRelayDirectHost.py', 'rebuildRelayStockRuntime.py', 'ensure-xl2tpd-unit.py'))):
+        faults.append(event)
+        raise AssertionError('unexpected external source or dispatch')
+sys.addaudithook(audit)
+host = {'__name__': 'fixture_host'}
+exec(compile(argv[-1], '<DIRECT command>', 'exec'), host)
+assert not faults, faults
+assert sorted(digest for digest in sources if digest in expected) == sorted(expected), 'missing or duplicated source'
+for name, function in [('C3_STOCK_RUNTIME', 'verify_package'), ('C3_STOCK_ENSURE', 'ensure')]:
+    scope = host[name]
+    assert type(scope) is dict and scope['__name__'] not in ('__main__', host['__name__'])
+    assert scope[function].__globals__ is scope
+assert host['C3_STOCK_RUNTIME']['__name__'] != host['C3_STOCK_ENSURE']['__name__']
+`;
+    class SSH {
+        connect() {}
+        disconnect() {}
+        exec(command, { stdin }) {
+            const result = spawnSync('/usr/bin/python3', ['-I', '-B', '-c', probe], {
+                input: JSON.stringify([command, stdin, fingerprints]), encoding: 'utf8', timeout: 5000, cwd: '/', env: {},
+            });
+            // Check outside the driver's exception sanitizer.
+            outcome = [result.status, result.stdout, result.stderr || result.error?.message || ''];
+            return ok(ready);
+        }
+    }
+    let outcome;
+    const remote = createRelayDirect({ node, env, SSH });
+    try { assert.deepEqual(await remote.preflight(), ready); }
+    finally { await remote.close(); }
+    assert.deepEqual(outcome, [0, '', '']);
+});
+
 test('prepare and validate before mutation, bind private desired and lock, then read back', async () => {
     const { remote, calls } = fixture(input => {
         if (input.action === 'check' || input.action === 'install') {
@@ -103,6 +161,108 @@ test('prepare and validate before mutation, bind private desired and lock, then 
     assert.equal(await remote.verify(plan), true);
     await remote.close();
     assert.deepEqual(calls.slice(5), ['lock', 'install', 'verify', 'close']);
+});
+
+// Consumer frames for the native prerequisite; the Python host decides eligibility.
+test('DIRECT admits a pending native snapshot only with a fresh matching same-peer preflight', async () => {
+    for (const ppp of [false, true]) {
+        const { remote, calls } = fixture(({ action }) => {
+            if (action === 'preflight') return ok({ ...pending, ppp });
+            if (action === 'prepare') return ok({ ...pendingSnapshot, ppp });
+        });
+        try {
+            const plan = await remote.prepare(args);
+            assert.match(plan.backupId, /^[a-f0-9]{32}$/);
+            assert.deepEqual(calls, ['connect', 'preflight', 'prepare', 'check']);
+        } finally { await remote.close(); }
+    }
+    let preflights = 0;
+    const { remote, calls } = fixture(({ action }) => action === 'preflight'
+        ? ok(++preflights === 1 ? pending : ready) : action === 'prepare' ? ok(pendingSnapshot) : undefined);
+    try {
+        assert.deepEqual(await remote.preflight(), pending);
+        await assert.rejects(remote.prepare(args), { code: 'REBUILD_L2TP_HOST_NOT_READY', check: 'VPN_UNITS_NOT_LOADED' });
+        assert.deepEqual(calls, ['connect', 'preflight', 'preflight', 'prepare']);
+    } finally { await remote.close(); }
+});
+
+test('malformed native capability, forged snapshot capability and readiness drift cannot reach candidate check', async () => {
+    const unknown = 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN';
+    const notReady = 'REBUILD_L2TP_HOST_NOT_READY';
+    const mismatch = 'REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH';
+    for (const [preflight, prepare, code] of [
+        [ok({ ...ready, unitsLoaded: false }), null, notReady],
+        [ok({ ...pending, nativePreparation: 1 }), null, unknown],
+        [ok({ ...pending, nativePreparation: false }), null, unknown],
+        [ok({ ...pending, pppPreparation: undefined }), null, unknown],
+        [ok({ ...pending, pppPreparation: 1 }), null, unknown],
+        [ok({ ...pending, unitsLoaded: true }), null, unknown],
+        [ok({ ...pending, masked: true }), null, unknown],
+        [ok({ ...pending, ppp: 0 }), null, unknown],
+        [ok({ ...pending, extra: true }), null, unknown],
+        [{ ...ok(pending), stdout: ok(pending).stdout.replace('{', '{"nativePreparation":false,') }, null, unknown],
+        [ok({ ...pending, machineId: 'e'.repeat(32) }), null, mismatch],
+        [ok(pending), ok({ ...pendingSnapshot, machineId: 'e'.repeat(32) }), mismatch],
+        [ok(pending), ok({ ...pendingSnapshot, masked: true }), notReady],
+        [ok(pending), ok({ ...pendingSnapshot, unitsLoaded: undefined }), unknown],
+        [ok(pending), ok({ ...pendingSnapshot, nativePreparation: true }), unknown],
+        [ok(pending), ok({ ...pendingSnapshot, pppPreparation: true }), unknown],
+        [ok(ready), ok({ ...pendingSnapshot, nativePreparation: true }), unknown],
+        [ok(pending), ok(observation), notReady],
+        [ok(ready), ok(pendingSnapshot), notReady],
+    ]) {
+        const { remote, calls } = fixture(({ action }) => action === 'preflight' ? preflight
+            : action === 'prepare' ? prepare : undefined);
+        try {
+            await assert.rejects(remote.prepare(args), { code });
+            assert.deepEqual(calls, ['connect', 'preflight', ...(prepare ? ['prepare'] : [])]);
+        } finally { await remote.close(); }
+    }
+});
+
+test('install checks require exact frames; the check alone never permits cleanup', async () => {
+    const partial = 'DIRECT_PPP_MODULES_LOAD_FAILED\n';
+    const noWrite = 'DIRECT_NO_WRITE_PPP_MODULES_LOAD_FAILED\n';
+    const frame = (stderr, stdout = '', code = 70) => ({ code, stdout, stderr });
+    for (const [result, trusted, unchanged, retained = false] of [
+        [frame(partial), true, false, true], [frame(noWrite), true, true],
+        [frame('DIRECT_PREREQUISITE\n'), true, false],
+        [frame(noWrite + '\n'), false, false], [frame(noWrite.trimEnd()), false, false],
+        [frame(noWrite.replace('\n', '\r\n')), false, false], [frame(noWrite, 'fixture-private'), false, false],
+        [frame(noWrite, '', 1), false, false], [frame('DIRECT_NO_WRITE_FUTURE_CHECK\n'), false, false],
+        [frame('DIRECT_NO_WRITE_PPP_MODULES_LOAD_FAILED fixture-private\n'), false, false],
+        [frame('DIRECT_IKE_ACTIVE_RULE_220\n'), false, false], [frame('', '', 75), false, false],
+    ]) {
+        const { remote, calls } = fixture(({ action }) => action === 'install' ? result : undefined);
+        const plan = await remote.prepare(args);
+        await assert.rejects(remote.install(plan, () => true), error => {
+            assert.equal(error.commandSettled === true, trusted && !retained);
+            assert.equal(error.prerequisitePartial === true, retained);
+            assert.equal(error.noHostChanges === true, unchanged);
+            assert.equal(error.remoteOutcomeUncertain === true, !trusted);
+            assert.equal(error.check, !trusted ? undefined
+                : result.stderr === 'DIRECT_PREREQUISITE\n' ? 'HOST_INSTALL' : 'PPP_MODULES_LOAD_FAILED');
+            assert.doesNotMatch(JSON.stringify(error) + error.message, /fixture-private|FUTURE_CHECK/);
+            return true;
+        });
+        assert.equal(await remote.rollback(plan, () => true), trusted && !unchanged && !retained);
+        assert.equal(calls.includes('rollback'), trusted && !unchanged && !retained);
+        await remote.close();
+    }
+});
+
+test('invalid read-only framing cannot produce an install check or prepare a write', async () => {
+    for (const result of [
+        { code: 70, stdout: '', stderr: 'DIRECT_NO_WRITE_XRAY_DROPIN_UNSUPPORTED\n' },
+        { code: 70, stdout: 'fixture-private', stderr: 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n' },
+        { code: 70, stdout: '', stderr: 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n\n' },
+        { code: 0, stdout: '{"ok":false,"ok":true}\n', stderr: '' },
+    ]) {
+        const { remote, calls } = fixture(({ action }) => action === 'check' ? result : undefined);
+        await assert.rejects(remote.prepare(args), { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' });
+        assert.deepEqual(calls, ['connect', 'preflight', 'prepare', 'check']);
+        await remote.close();
+    }
 });
 
 const nftMarkerProbe = String.raw`
@@ -217,6 +377,52 @@ test('wire receipt for settled install refusal releases the coordinator to attem
     await assert.rejects(remote.install(plan, async () => {}), { code: 'REBUILD_L2TP_DIRECT_COMMAND_FAILED', commandSettled: true });
     assert.equal(await remote.rollback(plan, async () => {}), true);
     await remote.close();
+});
+
+test('IKE admission codes survive prepare, check and settled no-write install refusals', async () => {
+    for (const reason of ['IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED']) {
+        for (const action of ['prepare', 'check', 'install']) {
+            const stderr = `DIRECT_${action === 'install' ? 'NO_WRITE_' : ''}${reason}\n`;
+            const { remote, calls } = fixture(request => request.action === action ? { code: 70, stdout: '', stderr } : undefined);
+            const db = [];
+            await assert.rejects(runFreshRelayInstall(nodeId, {
+                authorize: () => true, machineId, lock: fn => fn(async () => true),
+                inventory: async () => ({ eligible: true, pristine: true }), connect: async () => remote,
+                prepare: async () => remote.prepare(args), verifyReservation: async () => {},
+                reserve: async () => db.push('reserve'), restore: async () => db.push('restore'),
+                finish: async () => assert.fail('must not finish a refused install'),
+            }), { code: action === 'install' ? 'REBUILD_L2TP_INSTALL_FAILED' : 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                check: reason, outcome: 'refused' });
+            assert.deepEqual(db, action === 'install' ? ['reserve', 'restore'] : []);
+            assert.ok(!calls.includes('rollback') && !calls.includes('verify'));
+            assert.equal(calls.at(-2), action);
+        }
+    }
+});
+
+test('fresh runtime gate needs an exact no-write receipt after install dispatch', async () => {
+    for (const reason of ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_NATIVE_UNIT_REQUIRED']) {
+        for (const noWrite of [false, true]) {
+            const stderr = `DIRECT_${noWrite ? 'NO_WRITE_' : ''}${reason}\n`;
+            const { remote } = fixture(req => req.action === 'install' ? { code: 70, stdout: '', stderr } : undefined);
+            const plan = await remote.prepare(args);
+            await assert.rejects(remote.install(plan, async () => {}), noWrite ?
+                { code: 'REBUILD_L2TP_DIRECT_PREREQUISITE', check: reason, noHostChanges: true, commandSettled: true } :
+                { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', remoteOutcomeUncertain: true });
+            assert.equal(await remote.rollback(plan, async () => {}), false);
+            await remote.close();
+        }
+    }
+});
+
+test('IKE refusal without the exact install no-write frame leaves the outcome unknown', async () => {
+    for (const stderr of ['DIRECT_IKE_ACTIVE_RULE_220\n', 'DIRECT_NO_WRITE_IKE_ACTIVE_RULE_220\n\n']) {
+        const { remote } = fixture(request => request.action === 'install' ? { code: 70, stdout: '', stderr } : undefined);
+        const plan = await remote.prepare(args);
+        await assert.rejects(remote.install(plan, async () => {}), { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', remoteOutcomeUncertain: true });
+        assert.equal(await remote.rollback(plan, async () => {}), false);
+        await remote.close();
+    }
 });
 
 test('definite nonzero permits exact rollback, but SSH failure, signal, timeout or lost receipt never do', async () => {

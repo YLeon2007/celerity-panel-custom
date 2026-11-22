@@ -1,12 +1,12 @@
 'use strict';
 
 const { AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
+const { classifyInstallFailure, installFailure, requireInstallHostReady,
+    checkedInstallId } = require('./rebuildRelayInstallDiagnostics');
 
 const fail = code => Object.assign(new Error(code), { code });
 const UNKNOWN = 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN';
 const ROLLBACK_UNKNOWN = 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN';
-const safe = (error, fallback) => fail(typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$/.test(error.code)
-    ? error.code : fallback);
 
 async function runFreshRelayInstall(id, deps) {
     if (!deps.authorize()) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
@@ -41,7 +41,7 @@ async function runFreshRelayInstall(id, deps) {
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
                     throw fail('REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
                 }
-                if (host?.ppp !== true || host.masked !== false) throw fail('REBUILD_L2TP_HOST_NOT_READY');
+                requireInstallHostReady(host);
                 if (deps.verifyBinding) await checkAuthority();
                 checkAuthorization();
                 const plan = await deps.prepare(inventory, remote);
@@ -64,17 +64,17 @@ async function runFreshRelayInstall(id, deps) {
                     await checkAuthority();
                 };
 
-                const rollback = async (code, noHostChanges = false) => {
+                const rollback = async (code, { noHostChanges = false, check } = {}) => {
                     try {
                         await guard();
                         if (!noHostChanges && await remote.rollback(plan, guard) !== true) throw fail(ROLLBACK_UNKNOWN);
                         await guard();
                         await deps.restore(reservation, checkAuthority);
                     } catch (error) {
-                        throw fail(error instanceof AcknowledgedCommitCleanupError
-                            ? 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED' : ROLLBACK_UNKNOWN);
+                        throw installFailure(error instanceof AcknowledgedCommitCleanupError
+                            ? 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED' : ROLLBACK_UNKNOWN, 'unknown', check);
                     }
-                    throw fail(code);
+                    throw installFailure(code, noHostChanges ? 'refused' : 'rolled_back', check);
                 };
 
                 let installResult;
@@ -82,10 +82,17 @@ async function runFreshRelayInstall(id, deps) {
                     await guard();
                     installResult = await remote.install(plan, guard);
                 } catch (error) {
+                    const check = checkedInstallId(error);
+                    if (error?.prerequisitePartial === true && check !== undefined) {
+                        // Keep the reservation and any shared host effects.
+                        throw installFailure(UNKNOWN, 'unknown', check, { retryAllowed: false });
+                    }
                     // A thrown error is ambiguous unless the direct driver has
                     // explicit proof that all dispatched mutations have settled.
                     // Do not infer settlement from errno, timeout or SSH close.
-                    if (error?.commandSettled === true) await rollback('REBUILD_L2TP_INSTALL_FAILED', error.noHostChanges === true);
+                    if (error?.commandSettled === true) await rollback('REBUILD_L2TP_INSTALL_FAILED', {
+                        noHostChanges: error.noHostChanges === true, check,
+                    });
                     throw fail(UNKNOWN);
                 }
                 if (installResult === false) await rollback('REBUILD_L2TP_INSTALL_FAILED');
@@ -106,7 +113,7 @@ async function runFreshRelayInstall(id, deps) {
                 installed = true;
                 return { executionMode: 'rebuild', status: 'installed', nodeId: id };
             } catch (error) {
-                primary = safe(error, 'REBUILD_L2TP_INSTALL_FAILED');
+                primary = classifyInstallFailure(error);
                 throw primary;
             } finally {
                 if (remote) {
@@ -120,7 +127,7 @@ async function runFreshRelayInstall(id, deps) {
     } catch (error) {
         // Neither transport disposal nor global lock release can reclassify a
         // known or uncertain terminal outcome.
-        throw primary ?? (installed ? fail('REBUILD_L2TP_INSTALLED_CLEANUP_FAILED') : safe(error, 'REBUILD_L2TP_INSTALL_FAILED'));
+        throw primary ?? classifyInstallFailure(installed ? fail('REBUILD_L2TP_INSTALLED_CLEANUP_FAILED') : error);
     }
 }
 

@@ -13,6 +13,7 @@ import os
 import pwd
 import re
 import select
+import shlex
 import signal
 import socket
 import stat
@@ -21,9 +22,15 @@ import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any, cast
 
+# Injected by the DIRECT payload, not loaded from the remote disk.
+C3_STOCK_RUNTIME: dict[str, Any]
+C3_STOCK_ENSURE: dict[str, Any]
+
 MAIN = '/usr/local/etc/xray/config.json'
+XRAY_CONFIG_WRITABLE = 'XRAY_CONFIG_WRITABLE'
 BRIDGE = '/usr/local/etc/xray-bridge/config.json'
 XRAY = '/usr/local/bin/xray'
 SYSTEM = '/etc/systemd/system'
@@ -35,16 +42,24 @@ NFT_DIR = '/etc/celerity-rebuild-l2tp'
 NFT_FILE = NFT_DIR + '/ingress.nft'
 VAULT = '/var/lib/celerity-rebuild-l2tp-direct'
 XL, IKE, X, B = 'xl2tpd.service', 'strongswan-starter.service', 'xray.service', 'xray-bridge.service'
+XRAY_DROPIN_NAME = '10-donot_touch_single_conf.conf'
+XRAY_DROPIN_UNSUPPORTED = 'XRAY_DROPIN_UNSUPPORTED'
 # Exact native unit emitted by the stock prerequisite installer.
 NATIVE_XL_SHA = '20e9c67838fa8072a5378839fc729a1123d1580879fbf20f9121d558fd0fe0df'
 XL_BOOT = SYSTEM + '/multi-user.target.wants/' + XL
 XL_DEFAULT = '/etc/default/xl2tpd'
+XL2TPD_CONFIG_MISSING = 'XL2TPD_CONFIG_MISSING'
 # Extracted from signed Debian trixie/main xl2tpd_1.3.18-1+b1_amd64.deb
 # (archive SHA256 dd6fdf32b90f9f7d516f5251e1abdb65851156c80163a41aab60cf94dcff16da).
 STOCK_XL_DEFAULT_SHA = '37b5938f462ec60b4f8c179b34f70b548c09da4691c938e88ce111ce41268833'
 STOCK_XL_DEFAULT_MD5 = b'fadc31f26078d8c3fb033d7d4516500b'
 REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables')
+PACKAGE_AUTOSTART_UNSAFE = 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
+NATIVE_UNIT_REQUIRED = 'RUNTIME_NATIVE_UNIT_REQUIRED'
 STOCK_IKE_INCLUDE = b'include /etc/ipsec.d/*.conf'
+# Original Debian strongswan-starter 6.0.1-6+deb13u7 conffile, before
+# install-runtime.sh adds its wildcard. DIRECT adds only the owned include.
+STOCK_IKE_STARTER_SHA = '6a54e39267b981ca3239cd93579f26b5699983021a0d636408fdd5c70f3024d1'
 SWAN_CONF = '/etc/strongswan.conf'
 SWAN_DIR = '/etc/strongswan.d'
 SWAN_PROFILE = SWAN_DIR + '/celerity-rebuild-l2tp.conf'
@@ -86,6 +101,18 @@ REMOVE_ENTERED = False
 CHAP_ENTERED = False
 NETWORK_UPGRADE_ENTERED = False
 NO_INSTALL_WRITES = False
+PPP_PREPARING = False
+NATIVE_PREPARING = False
+PPP_MODULES = ('ppp_generic', 'l2tp_ppp')
+PPP_DIRS = ('/etc/modules-load.d', '/run/modules-load.d', '/usr/local/lib/modules-load.d',
+            '/usr/lib/modules-load.d', '/lib/modules-load.d')
+PPP_CONF = '70-celerity-rebuild-l2tp.conf'
+PPP_PATH = PPP_DIRS[0] + '/' + PPP_CONF
+PPP_REQUIRED = 'PPP_MODULES_REQUIRED'
+PPP_CONFLICT = 'PPP_MODULES_PERSISTENCE_CONFLICT'
+PPP_FAILED = 'PPP_MODULES_LOAD_FAILED'
+OBSERVATION_REQUIRED = 'NETWORK_OBSERVATION_REQUIRED'
+MODPROBE = '/usr/sbin/modprobe'
 
 
 class Refusal(Exception):
@@ -97,7 +124,7 @@ def need(condition, code):
         raise Refusal(code)
 
 
-def command(*args, data=None, wait=6, unit_show=False, quiet=False):
+def command(*args, data=None, wait=6, unit_show=False, quiet=False, negative=None, refusal=None):
     limit = min(wait, DEADLINE - time.monotonic())
     if limit <= 0:
         raise subprocess.TimeoutExpired([], 0)
@@ -105,11 +132,15 @@ def command(*args, data=None, wait=6, unit_show=False, quiet=False):
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE if quiet else subprocess.DEVNULL, timeout=limit,
                             env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}, cwd='/')
     need(result.returncode >= 0, 'IN_FLIGHT')
-    need(len(result.stdout) <= MAX_FILE, STAGE)
-    need(not quiet or not result.stderr, STAGE)
+    why = refusal or STAGE
+    need(len(result.stdout) <= MAX_FILE, why)
+    need(not quiet or not result.stderr, why)
     # Some systemd versions exit 1 for a structured not-found unit.
-    need(result.returncode == 0 or (unit_show and result.returncode == 1
-         and result.stdout.splitlines().count(b'LoadState=not-found') == 1), STAGE)
+    if negative is not None:
+        need(result.returncode == 1 and result.stdout == negative, why)
+    else:
+        need(result.returncode == 0 or (unit_show and result.returncode == 1
+             and result.stdout.splitlines().count(b'LoadState=not-found') == 1), why)
     return result.stdout
 
 
@@ -152,15 +183,20 @@ def directory(path, private=False):
         os.close(fd)
 
 
-def read(path, maximum=MAX_FILE):
+def read(path, maximum=MAX_FILE, *, diagnose_main_mode=False):
     parent, name = os.path.split(path)
     try:
         with directory(parent) as fd:
             with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), 'rb') as handle:
                 st = os.fstat(handle.fileno())
                 owner_ok = st.st_uid == 0 or (path in (MAIN, BRIDGE) and st.st_uid == pwd.getpwnam('nobody').pw_uid)
+                writable = bool(st.st_mode & 0o022)
+                diagnose_writable = diagnose_main_mode and path == MAIN
                 need(stat.S_ISREG(st.st_mode) and owner_ok and st.st_nlink == 1
-                     and not st.st_mode & 0o7022 and not os.listxattr(handle.fileno()), 'PREREQUISITE')
+                     and not st.st_mode & 0o7000 and (not writable or diagnose_writable)
+                     and not os.listxattr(handle.fileno()), 'PREREQUISITE')
+                # Only install observation distinguishes this mode; do not read the payload.
+                need(not writable, XRAY_CONFIG_WRITABLE)
                 data = handle.read(maximum + 1)
                 need(len(data) <= maximum and len(data) == st.st_size, 'PREREQUISITE')
                 return entry(data, stat.S_IMODE(st.st_mode), st.st_gid, st.st_uid)
@@ -253,7 +289,9 @@ def unit(name):
             pairs = [(key, value) for key, value in pairs if key != 'ExecStart']
             pairs.append(('ExecStart', ' '.join(starts)))
     info = dict(pairs)
-    need(len(pairs) == len(info), 'PREREQUISITE')
+    if len(pairs) != len(info):
+        raise Refusal(XRAY_DROPIN_UNSUPPORTED if name == X and
+                      any(key == 'DropInPaths' and value for key, value in pairs) else 'PREREQUISITE')
     need(info.get('LoadState') in ('loaded', 'masked', 'not-found') and
          info.get('ActiveState') in ('active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading'), 'PREREQUISITE')
     return info
@@ -266,23 +304,265 @@ def no_jobs(units):
     need(not any(set(line.split()) & set(units) for line in jobs), 'IN_FLIGHT')
 
 
-def preflight(machine):
-    machine_id = open('/etc/machine-id', 'rb').read(34).strip().decode('ascii')
-    need(re.fullmatch(r'[a-f0-9]{32}', machine_id) and machine_id == machine, 'IDENTITY')
-    ppp = False
+def ppp_device():
     try:
         dev = os.lstat('/dev/ppp')
-        registered = open('/proc/devices', 'rb').read(65536).partition(b'Block devices:')[0]
-        ppp = (stat.S_ISCHR(dev.st_mode) and os.major(dev.st_rdev) == 108 and os.minor(dev.st_rdev) == 0
-               and re.search(rb'^\s*108\s+ppp\s*$', registered, re.M) is not None)
+        return stat.S_ISCHR(dev.st_mode) and os.major(dev.st_rdev) == 108 and os.minor(dev.st_rdev) == 0
     except FileNotFoundError:
-        pass
-    units = [unit(name)['LoadState'] for name in (XL, IKE)]
-    if ppp and units == ['loaded'] * 2:
-        for package in REQUIRED_PACKAGES:
-            status = command('/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}', package)
-            need(status.startswith(b'ii '), 'PREREQUISITE')
+        return None
+
+
+def ppp_registered():
+    # Opening the device (or a PPPoX socket) could trigger kernel autoload.
+    with open('/proc/devices', 'rb') as stream:
+        registered = stream.read(65536).partition(b'Block devices:')[0]
+    return re.search(rb'^\s*108\s+ppp\s*$', registered, re.M) is not None
+
+
+def require_runtime_packages(refusal):
+    for package in REQUIRED_PACKAGES:
+        status = command('/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}', package, refusal=refusal)
+        need(status.startswith(b'ii '), refusal)
+
+
+def preflight(machine, *, fresh=False):
+    machine_id = open('/etc/machine-id', 'rb').read(34).strip().decode('ascii')
+    need(re.fullmatch(r'[a-f0-9]{32}', machine_id) and machine_id == machine, 'IDENTITY')
+    if fresh:
+        # A missing runtime package can start IKE/LNS in its maintainer
+        # scripts. Check dpkg before interpreting unit state or preparing PPP;
+        # never call apt, change service policy, or stop an existing service.
+        require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
+    ppp = ppp_device() is True and ppp_registered()
+    xl, ike = (unit(name) for name in (XL, IKE))
+    units = [xl['LoadState'], ike['LoadState']]
+    if not fresh and units == ['loaded'] * 2:
+        require_runtime_packages('PREREQUISITE')
     return dict(machineId=machine_id, ppp=ppp, masked='masked' in units, unitsLoaded=units == ['loaded'] * 2)
+
+
+def stock_runtime_root():
+    return Path('/')
+
+
+def stock_runtime_command(*argv):
+    left = DEADLINE - time.monotonic()
+    if left <= 0:
+        raise subprocess.TimeoutExpired(argv, 0)
+    return C3_STOCK_RUNTIME['command'](*argv, timeout=min(12, left))
+
+
+def pending_xl(info):
+    if info['LoadState'] == 'not-found':
+        return 'missing'
+    if (info.get('UnitFileState') == 'generated' or info.get('SourcePath')
+            or info.get('FragmentPath', '').startswith('/run/systemd/generator')):
+        return 'generated'
+    return None
+
+
+def stock_runtime_observation(expected):
+    runtime = globals().get('C3_STOCK_RUNTIME')
+    helper = globals().get('C3_STOCK_ENSURE')
+    if runtime is None or helper is None or digest(helper['UNIT']) != NATIVE_XL_SHA:
+        raise Refusal(NATIVE_UNIT_REQUIRED)
+    try:
+        observed = runtime['observe'](stock_runtime_root(), stock_runtime_command, helper)
+    except (runtime['Refusal'], OSError, ValueError):
+        raise Refusal(NATIVE_UNIT_REQUIRED) from None
+    need(observed['state'] == expected, NATIVE_UNIT_REQUIRED)
+    return observed
+
+
+def pending_native(xl, ike, state):
+    # Independent live DIRECT sample must agree with the strict stock view.
+    for info in (xl, ike):
+        need((info['ActiveState'], info['SubState'], info.get('MainPID'), info.get('Job'),
+              info.get('NeedDaemonReload'), info.get('DropInPaths')) == ('inactive', 'dead', '0', '', 'no', ''),
+             NATIVE_UNIT_REQUIRED)
+    need(ike['UnitFileState'] in ('enabled', 'disabled') and not ike.get('ExecCondition')
+         and not ike.get('PassEnvironment') and removal_native(ike, IKE, {'units': {IKE: ike}}, installed=False),
+         NATIVE_UNIT_REQUIRED)
+    if state == 'generated':
+        need((xl['LoadState'], xl.get('UnitFileState'), xl.get('FragmentPath'), xl.get('SourcePath')) == (
+            'loaded', 'generated', '/run/systemd/generator.late/' + XL, '/etc/init.d/xl2tpd'), NATIVE_UNIT_REQUIRED)
+    return stock_runtime_observation(state)
+
+
+def ppp_config():
+    return entry(b'# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n', mode=0o644)
+
+
+def module_name(name):
+    return name.replace('-', '_')
+
+
+def ppp_boot_files(dependencies):
+    # A same-name override may intentionally suppress a vendor module request.
+    # Do not circumvent it by publishing our own file with a different name.
+    def modules(path):
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) and os.readlink(path) == '/dev/null':
+            return set()
+        value = read(path, 65536)
+        need(value is not None, PPP_CONFLICT)
+        return {module_name(line.partition('#')[0].strip()) for line in raw(value).decode().splitlines()}
+
+    try:
+        selected = {}
+        own = read(PPP_PATH, 4096)
+        need(own is None or own == ppp_config(), PPP_CONFLICT)
+        for parent in PPP_DIRS:
+            if parent.startswith('/lib/') and os.path.lexists('/lib') and stat.S_ISLNK(os.lstat('/lib').st_mode):
+                need(os.readlink('/lib') in ('usr/lib', '/usr/lib'), PPP_CONFLICT)
+                continue  # merged-/usr alias
+            try:
+                with directory(parent) as fd:
+                    names = [name for name in os.listdir(fd) if name.endswith('.conf')]
+            except FileNotFoundError:
+                continue
+            for name in names:
+                path = parent + '/' + name
+                if name == PPP_CONF:
+                    need(path == PPP_PATH and own is not None, PPP_CONFLICT)
+                elif name in selected:
+                    suppressed = modules(path) & dependencies
+                    need(not suppressed or suppressed <= modules(selected[name]), PPP_CONFLICT)
+                else:
+                    selected[name] = path
+        return own is None
+    except (OSError, UnicodeError, Refusal):
+        raise Refusal(PPP_CONFLICT) from None
+
+
+def ppp_policy():
+    try:
+        with open('/proc/cmdline') as stream:
+            cmdline = stream.read(65537)
+        need(len(cmdline) <= 65536, PPP_REQUIRED)
+        boot_args = [arg.partition('=') for arg in shlex.split(cmdline)]
+        blocked = {module_name(name) for key, _, value in boot_args
+                   if key in ('module_blacklist', 'modprobe.blacklist', 'rd.driver.blacklist')
+                   for name in value.split(',')}
+        boot_unit = 'systemd-modules-load.service'
+        need(not any(key in ('systemd.mask', 'rd.systemd.mask') and value == boot_unit for key, _, value in boot_args), PPP_CONFLICT)
+        try:
+            loader = unit(boot_unit)
+            need(loader['LoadState'] == 'loaded' and loader['UnitFileState'] == 'static'
+                 and loader.get('FragmentPath') in ('/lib/systemd/system/' + boot_unit, '/usr/lib/systemd/system/' + boot_unit)
+                 and not loader.get('DropInPaths') and loader.get('NeedDaemonReload') == 'no', PPP_CONFLICT)
+        except (OSError, Refusal):
+            raise Refusal(PPP_CONFLICT) from None
+        config = command(MODPROBE, '--showconfig', quiet=True, refusal=PPP_REQUIRED)
+        for line in config.decode().splitlines():
+            words = line.split()
+            if len(words) >= 2 and words[0] in ('blacklist', 'install'):
+                blocked.add(module_name(words[1]))
+        deps, builtin, listings = set(PPP_MODULES), set(), []
+        for name in PPP_MODULES:
+            # Read-only resolution, including soft dependencies; no install hooks run.
+            listing = command(MODPROBE, '--show-depends', '--use-blacklist', '--', name,
+                              quiet=True, refusal=PPP_REQUIRED).decode()
+            found = set()
+            for fields in map(str.split, listing.splitlines()):
+                if len(fields) == 2 and fields[0] == 'builtin':
+                    found.add(module_name(fields[1]))
+                    builtin.add(module_name(fields[1]))
+                    continue
+                need(len(fields) >= 2 and fields[0] == 'insmod', PPP_REQUIRED)
+                match = re.fullmatch(r'/(?:usr/)?lib/modules/[^\s]+/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|zst|gz))?', fields[1])
+                need(match, PPP_REQUIRED)
+                found.add(module_name(cast(re.Match, match)[1]))
+            need(name in found, PPP_REQUIRED)
+            deps.update(found)
+            listings.append(listing)
+        need(not (deps & blocked), PPP_REQUIRED)
+        return deps, sorted(builtin), digest(encode(listings))
+    except (OSError, ValueError):
+        raise Refusal(PPP_REQUIRED) from None
+
+
+def live_modules(refusal):
+    with open('/proc/modules') as stream:
+        data = stream.read(262145)
+    need(len(data) <= 262144, refusal)
+    return {fields[0] for line in data.splitlines() if len(fields := line.split()) >= 6 and fields[4] == 'Live'}
+
+
+def ppp_loaded(builtin):
+    return dict(ppp_generic=ppp_registered(), l2tp_ppp='l2tp_ppp' in live_modules(PPP_REQUIRED) or 'l2tp_ppp' in builtin)
+
+
+def require_network_observers():
+    # Even read-only netlink requests can autoload protocol/subsystem modules.
+    # Insist on available providers before ss, nft or ip xfrm, without loading
+    # them as a side effect of preparing a PPP/install plan.
+    try:
+        active = live_modules(OBSERVATION_REQUIRED)
+        for name in ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user'):
+            if name not in active:
+                proof = command(MODPROBE, '--show-depends', '--use-blacklist', '--', name,
+                                quiet=True, refusal=OBSERVATION_REQUIRED)
+                need(b'builtin ' + name.encode() in proof.splitlines(), OBSERVATION_REQUIRED)
+    except (OSError, ValueError):
+        raise Refusal(OBSERVATION_REQUIRED) from None
+
+
+def ppp_host_scope():
+    detect = '/usr/bin/systemd-detect-virt'
+    # A full VM owns its kernel; a shared-kernel container does not. Require
+    # the detector's documented negative result, not an arbitrary failed probe.
+    need(command(detect, '--container', quiet=True, negative=b'none\n', refusal=PPP_REQUIRED) == b'none\n', PPP_REQUIRED)
+    need(command(detect, '--chroot', quiet=True, negative=b'', refusal=PPP_REQUIRED) == b'', PPP_REQUIRED)
+    # Linux reserves PROC_USER_INIT_INO for the initial user namespace. A
+    # child namespace with a full UID map must not pass this check.
+    need(os.readlink('/proc/self/ns/user') == 'user:[4026531837]', PPP_REQUIRED)
+    with open('/proc/self/status') as stream:
+        caps = re.search(r'^CapEff:\s*([0-9a-f]+)$', stream.read(65536), re.M)
+    need(caps is not None and int(caps[1], 16) & (1 << 16), PPP_REQUIRED)  # CAP_SYS_MODULE
+
+
+def observe_ppp_preparation():
+    """Read-only prerequisite projection included in the fresh Install baseline."""
+    try:
+        deps, builtin, policy = ppp_policy()
+        loaded, device = ppp_loaded(builtin), ppp_device()
+        need(device is not False and (not loaded['ppp_generic'] or device is True), PPP_REQUIRED)
+        persist = ppp_boot_files(deps)
+        missing = [name for name in PPP_MODULES if not loaded[name]]
+        if missing or persist:
+            ppp_host_scope()
+            with open('/proc/sys/kernel/modules_disabled') as stream:
+                need(stream.read(8).strip() == '0', PPP_REQUIRED)
+        return dict(missing=missing, persist=persist, builtin=builtin, policy=policy)
+    except (OSError, ValueError):
+        raise Refusal(PPP_REQUIRED) from None
+
+
+def apply_ppp_preparation(expected):
+    """Reserved Install only, under the same host flock and durable applying receipt."""
+    need(observe_ppp_preparation() == expected, 'BASELINE_CHANGED')
+    for name in expected['missing']:
+        if not ppp_loaded(expected['builtin'])[name]:
+            # Use ordinary kmod policy, never --ignore-install/force/insmod.
+            command(MODPROBE, '--use-blacklist', '--', name, wait=10, quiet=True, refusal=PPP_FAILED)
+            need(ppp_loaded(expected['builtin'])[name], PPP_FAILED)
+    if 'ppp_generic' in expected['missing']:
+        # Give the kernel/devtmpfs/udev time to expose the node; never mknod.
+        ready_by = min(DEADLINE, time.monotonic() + 2)
+        while ppp_device() is None and time.monotonic() < ready_by:
+            time.sleep(0.05)
+    need(all(ppp_loaded(expected['builtin']).values()) and ppp_device() is True, PPP_FAILED)
+    if expected['persist']:
+        deps, _, policy = ppp_policy()
+        need(policy == expected['policy'] and ppp_boot_files(deps), PPP_CONFLICT)
+        try:
+            mkdir(PPP_DIRS[0], 0o755, exist_ok=True)
+            write(PPP_PATH, None, ppp_config())  # fsynced and never replaces a file
+        except (FileExistsError, PermissionError):
+            raise Refusal(PPP_CONFLICT) from None
+    ready = observe_ppp_preparation()
+    need(not ready['missing'] and not ready['persist'] and ready['policy'] == expected['policy'], PPP_FAILED)
 
 
 def sock_rows():
@@ -311,11 +591,52 @@ def no_hooks(info):
                                          'RootDirectory', 'RootImage')) and info.get('PrivateNetwork') == 'no'
 
 
+def xray_dropin(info, path, argv):
+    loaded = info.get('DropInPaths')
+    if not loaded:
+        return
+    bad = XRAY_DROPIN_UNSUPPORTED
+    folder = SYSTEM + '/' + X + '.d'
+    stock = folder + '/' + XRAY_DROPIN_NAME
+    need(path == MAIN and loaded == stock and info.get('LoadState') == 'loaded'
+         and info.get('NeedDaemonReload') == 'no', bad)
+    # An exact systemctl command record, not a prefix or the first of several.
+    prefix = '{ path=' + XRAY + ' ; argv[]=' + ' '.join(argv) + ' ; '
+    need(re.fullmatch(re.escape(prefix) + r'ignore_errors=no ; start_time=\[[^\[\]{};\r\n]+\] ; '
+                      r'stop_time=\[[^\[\]{};\r\n]+\] ; pid=[0-9]+ ; code=[^ ;{}\r\n]+ ; status=[^ ;{}\r\n]+ \}',
+                      info.get('ExecStart', '')) is not None and no_hooks(info)
+         and not any(info.get(k) for k in ('ExecCondition', 'ExecReload', 'Environment', 'EnvironmentFiles',
+                                           'PassEnvironment', 'UnsetEnvironment'))
+         and info.get('WorkingDirectory') in ('', '/') and info.get('KillMode') == 'control-group', bad)
+    try:
+        with directory(folder) as fd:
+            need([n for n in os.listdir(fd) if n.endswith('.conf')] == [XRAY_DROPIN_NAME], bad)
+        record = read(stock, 16384)
+    except (OSError, Refusal):
+        raise Refusal(bad) from None
+    need(record is not None and record['mode'] == 0o644 and record['gid'] == 0, bad)
+    lines = [line.removesuffix(b'\r').strip(b' \t') for line in raw(record).split(b'\n')]
+    need(all(not any(c in line for c in (b'\0', b'\r')) and not line.endswith(b'\\') for line in lines)
+         and [line for line in lines if line and not line.startswith((b'#', b';'))]
+             == [b'[Service]', b'ExecStart=', b'ExecStart=' + ' '.join(argv).encode()], bad)
+
+
+def same_xray_dropin(info, original):
+    # This operation never owns, writes or changes the MAIN drop-in selection.
+    need((info.get('DropInPaths') or '') == (original.get('DropInPaths') or ''), XRAY_DROPIN_UNSUPPORTED)
+
+
+def retained_xray_dropin(info, original):
+    same_xray_dropin(info, original)
+    xray_dropin(info, MAIN, (XRAY, 'run', '-config', MAIN))
+
+
 def xray_argv(info, path=MAIN):
     argv = [XRAY, 'run', '-config', path]
+    xray_dropin(info, path, argv)
     prefix = '{ path=' + XRAY + ' ; argv[]=' + ' '.join(argv) + ' ;'
     need(working(info) and info.get('ExecStart', '').startswith(prefix) and no_hooks(info)
-         and not info.get('Environment') and not info.get('EnvironmentFiles') and not info.get('DropInPaths')
+         and not info.get('Environment') and not info.get('EnvironmentFiles')
          and info.get('WorkingDirectory') in ('', '/') and info.get('KillMode') == 'control-group', 'PREREQUISITE')
     pid = info['MainPID']
     with open('/proc/' + pid + '/cmdline', 'rb') as handle:
@@ -573,8 +894,8 @@ def enroll_boot(target, expected=None):
         os.fsync(fd)
 
 
-def ike_include_matches(starter, expected):
-    if STOCK_IKE_INCLUDE in uncomment(raw(starter)):
+def ike_include_matches(starter, expected, *, check_tree=False):
+    if check_tree or STOCK_IKE_INCLUDE in uncomment(raw(starter)):
         # A wildcard must never enroll or reload an unmanaged connection.
         with directory('/etc/ipsec.d') as fd:
             return sorted(name for name in os.listdir(fd) if not name.startswith('.') and name.endswith('.conf')) == expected
@@ -615,15 +936,18 @@ def swan_inputs(present, bad):
     return digest(encode(rows))
 
 
-def no_swan_rule():
-    # The existing IPv4 projector remains unchanged (including on Remove).
-    # Its removal mode allows unrelated rules; neither family may have 220/220
-    # before this operation starts or stops the managed IKE invocation.
+def swan_rule_dumps() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rules4 = ip('rule', 'show')
     rules6 = json.loads(command('/usr/sbin/ip', '-j', '-N', '-6', 'rule', 'show'))
     need(type(rules4) is list and type(rules6) is list and all(
-        isinstance(row, dict) and not (row.get('priority') == 220 and str(row.get('table')) == '220')
-        for row in (*rules4, *rules6)), 'NETWORK_CONFLICT')
+        isinstance(row, dict) for row in (*rules4, *rules6)), 'NETWORK_CONFLICT')
+    return cast(list[dict[str, Any]], rules4), cast(list[dict[str, Any]], rules6)
+
+
+def no_swan_rule():
+    # Keep the existing guard for owned startup, verification and teardown.
+    need(not any(row.get('priority') == 220 and str(row.get('table')) == '220'
+                 for rules in swan_rule_dumps() for row in rules), 'NETWORK_CONFLICT')
 
 
 def swan_default_environment(bad):
@@ -644,6 +968,36 @@ def idle_ike(info, rows):
     return sorted([p, a, n] for p, a, n, _ in sockets)
 
 
+def fresh_ike_guard(info):
+    # Diagnose before the generic IPv4 projector (and before rejecting loaded
+    # connection files). Even an exact lookalike predates our owned invocation.
+    # Charon's stop may delete an indistinguishable foreign rule. Neither the
+    # shape nor a native, idle socket owner gives us permission to stop it.
+    matches = [[row for row in rules if row.get('priority') in (220, '220') or row.get('table') in (220, '220')]
+               for rules in swan_rule_dumps()]
+    active = info['ActiveState'] == 'active'
+    if any(matches):
+        need(active and all(len(rows) <= 1 and all(
+            set(row) == {'priority', 'src', 'table'} and type(row['priority']) is int and row['priority'] == 220
+            and row['src'] == 'all' and type(row['table']) in (str, int) and row['table'] in ('220', 220)
+            for row in rows) for rows in matches), 'RULE_220_CONFLICT')
+        if (working(info) and info['SubState'] == 'running' and info['UnitFileState'] in ('enabled', 'disabled')
+                and not any(info.get(k) for k in ('DropInPaths', 'PassEnvironment', 'ExecCondition', 'SourcePath'))
+                and removal_native(info, IKE, {'units': {IKE: info}}, installed=False)):
+            try:
+                idle_ike(info, sock_rows())
+                idle = vpn_empty(allow_socket_policies=True)
+            except Refusal as error:
+                if str(error) == 'IN_FLIGHT':
+                    raise
+                idle = False
+            except OSError:
+                idle = False
+            if idle:
+                raise Refusal('IKE_ACTIVE_RULE_220')
+    need(not active, 'IKE_ACTIVE_UNMANAGED')
+
+
 def boot():
     return open('/proc/sys/kernel/random/boot_id').read(64).strip()
 
@@ -652,32 +1006,49 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
     ready = preflight(machine)
-    need(ready['ppp'] and ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
+    need(not ready['masked'], 'PREREQUISITE')
     no_jobs(UNITS)
     units = {name: unit(name) for name in UNITS}
-    for name in (XL, IKE):
+    fresh_ike_guard(units[IKE])
+    pending = pending_xl(units[XL])
+    if pending == 'missing':
+        require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
+    preparation = pending_native(units[XL], units[IKE], pending) if pending else None
+    need(preparation is not None or ready['unitsLoaded'], 'PREREQUISITE')
+    vpn = (IKE,) if preparation is not None else (XL, IKE)
+    for name in vpn:
         info = units[name]
         stopped = info['ActiveState'] == 'inactive' and info['SubState'] == 'dead' and info['MainPID'] == '0'
-        stock_idle_ike = name == IKE and working(info) and info['SubState'] == 'running'
-        need(native_vpn(info, name) and (stopped or stock_idle_ike) and not info.get('DropInPaths')
+        need(native_vpn(info, name) and stopped and not info.get('DropInPaths')
              and info['UnitFileState'] in ('enabled', 'disabled'), 'PREREQUISITE')
     # Enroll only the exact helper unit via its single WantedBy symlink.
     install_boot = units[XL]['UnitFileState'] == 'disabled'
     need(not install_boot or (units[XL]['FragmentPath'] == SYSTEM + '/' + XL and boot_link() is None), 'PREREQUISITE')
+    need(preparation is None or boot_link() is None, 'PREREQUISITE')
     need(units[NET_UNIT]['LoadState'] == 'not-found'
          and units[B]['ActiveState'] in ('active', 'inactive'), 'PREREQUISITE')
     for path in (NFT_DIR, DROP_DIR):
         need(directory_absent(path), 'PREREQUISITE')
     need(not any(os.path.lexists(p) for p in ('/etc/nftables.d/celerity-l2tp.nft', '/etc/ipsec.d/celerity-l2tp.conf')),
          'PREREQUISITE')
-    files = {key: read(path) for key, path in NAMES.items()}
+    files = {key: read(path, diagnose_main_mode=True) if key == 'main' else read(path)
+             for key, path in NAMES.items()}
     need(all(files[k] is None for k in ('ike', 'options', 'nft', 'net', 'drop'))
-         and all(files[k] is not None for k in ('main', 'lns', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
+         and all(files[k] is not None for k in ('main', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
     starter = uncomment(raw(files['starter']))
     need(starter in ([], [b'config setup'], [STOCK_IKE_INCLUDE], [b'config setup', STOCK_IKE_INCLUDE])
          and not uncomment(raw(files['secrets']))
-         and not uncomment(raw(files['chap'])) and is_stock_lns(files['lns']), 'PREREQUISITE')
-    need(ike_include_matches(files['starter'], []), 'PREREQUISITE')
+         and not uncomment(raw(files['chap'])), 'PREREQUISITE')
+    if files['lns'] is None:
+        # read() also returns None for a missing parent. Diagnose only an absent
+        # leaf under the trusted directory, without following symlinks.
+        if directory_absent(NAMES['lns']):
+            raise Refusal(XL2TPD_CONFIG_MISSING)
+        raise Refusal('PREREQUISITE')
+    need(is_stock_lns(files['lns']), 'PREREQUISITE')
+    stock_starter = digest(raw(files['starter'])) == STOCK_IKE_STARTER_SHA
+    need(ike_include_matches(files['starter'], [], check_tree=True) if stock_starter
+         else ike_include_matches(files['starter'], []), 'PREREQUISITE')
     bridge = read(BRIDGE)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
     global_paths = ('/etc/ppp/options', SWAN_CONF, XL_DEFAULT)
@@ -686,9 +1057,15 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
         if os.path.lexists(path):
             need(read(path, 262144) is not None, 'PREREQUISITE')
     globals_before = {path: read(path, 262144) for path in global_paths}
-    need(xl_defaults_admitted(globals_before[XL_DEFAULT], units[XL]), 'PREREQUISITE')
+    if preparation is None:
+        need(xl_defaults_admitted(globals_before[XL_DEFAULT], units[XL]), 'PREREQUISITE')
+    else:
+        # The strict package proof admitted exactly these SysV defaults. Only
+        # the verified native postimage may use the ordinary native predicate.
+        default = globals_before[XL_DEFAULT]
+        need(default is not None and default['mode'] == 0o644 and default['gid'] == 0
+             and default.get('uid', 0) == 0 and digest(raw(default)) == STOCK_XL_DEFAULT_SHA, 'PREREQUISITE')
     rows = sock_rows()
-    ike_sockets = idle_ike(units[IKE], rows) if units[IKE]['ActiveState'] == 'active' else []
     net = ipaddress.IPv4Network(d['clientCidr'])
     for addr in ip('addr', 'show'):
         for item in addr.get('addr_info', []):
@@ -697,18 +1074,15 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
     for route in ip('route', 'show', 'table', 'all'):
         dst = route.get('dst', 'default')
         need(dst == 'default' or not net.overlaps(ipaddress.IPv4Network(dst)), 'NETWORK_CONFLICT')
-    reserved = (1701, d['tproxyPort']) if ike_sockets else (500, 4500, 1701, d['tproxyPort'])
+    reserved = (500, 4500, 1701, d['tproxyPort'])
     need(not any(n in reserved for _, _, n, _ in rows)
-         and vpn_empty(allow_socket_policies=bool(ike_sockets)) and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
+         and vpn_empty() and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
     need(not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
     no_swan_rule()
-    # Startup must be ours: do not replace or restart a previously running IKE
-    # instance. Retain the old network refusal above for stock 220 conflicts.
-    need(units[IKE]['ActiveState'] == 'inactive' and not units[IKE].get('PassEnvironment')
-         and STOCK_IKE_INCLUDE in starter, 'PREREQUISITE')
+    need(not units[IKE].get('PassEnvironment') and (STOCK_IKE_INCLUDE in starter or stock_starter), 'PREREQUISITE')
     need(all(removal_native(units[n], n, {'units': units}, installed=False)
-             and not units[n].get('ExecCondition') for n in (XL, IKE)), 'PREREQUISITE')
-    removal_dependencies({n: units[n] for n in (XL, IKE)}, installed=False)
+             and not units[n].get('ExecCondition') for n in vpn), 'PREREQUISITE')
+    removal_dependencies({n: units[n] for n in vpn}, installed=False)
     swan_default_environment('PREREQUISITE')
     files['swan'] = read(SWAN_PROFILE, 8192)
     need(files['swan'] is None, 'PREREQUISITE')
@@ -721,7 +1095,8 @@ def observe(machine, d, transit=None) -> dict[str, Any]:
                  ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID', 'FragmentPath', 'DropInPaths')}
                  for name in UNITS}
     return dict(boot=boot(), files=files, units=unit_pins, bridge=bridge, sockets=sockets, globalFiles=globals_before,
-                installBoot=install_boot, ikeSockets=ike_sockets, swanInputs=swan,
+                installBoot=install_boot, ikeSockets=[], swanInputs=swan,
+                **({'nativePreparation': preparation} if preparation is not None else {}),
                 **({'transit': transit} if transit is not None else {}))
 
 
@@ -818,10 +1193,6 @@ def validate_profiles(after):
         command(*as_user, XRAY, 'run', '-test', '-format', 'json', '-config', 'stdin:', data=raw(after[key]), wait=8)
 
 
-def validate_candidate(after):
-    validate_profiles(after)
-    command('/usr/sbin/nft', '-c', '-f', '-', data=raw(after['nft']))
-
 
 def manifest_path(token):
     return VAULT + '/' + token + '/manifest.json'
@@ -844,6 +1215,23 @@ def bound_manifest(request):
     return path, record, value
 
 
+def runtime_before(backup):
+    before = backup['before']
+    prepared = backup.get('nativePrepared')
+    if prepared is None:
+        need('nativePreparation' not in before, 'ROLLBACK_DRIFT')
+        return before
+    # Keep the true checked baseline immutable for bound_manifest(). Existing
+    # teardown restores the proven *native* prerequisite, not the SysV view.
+    return {**before, 'units': {**before['units'], XL: prepared['unit']},
+            'installBoot': True, 'nativeGeneration': prepared['generation']}
+
+
+def check_prepared_native(before):
+    if 'nativeGeneration' in before:
+        need(remove_generation(SYSTEM + '/' + XL) == before['nativeGeneration'], 'ROLLBACK_DRIFT')
+
+
 def operation_files(records):
     return {**NAMES, **({'swan': SWAN_PROFILE} if 'swan' in records else {}),
             **({'bridge': BRIDGE} if 'bridge' in records else {})}
@@ -858,6 +1246,7 @@ def original_files(before, records):
 
 
 def neighbors(before, sidecar=False):
+    check_prepared_native(before)
     b = unit(B)
     # Verify/rollback (and owned removal below) pin the admitted bytes and
     # metadata, rather than rerunning the pristine-unit defaults admission.
@@ -904,6 +1293,7 @@ def installed_runtime(d, token, before, after):
          'RUNTIME_UNPROVED')
     rows = sock_rows()
     pid = xray_argv(x)
+    same_xray_dropin(x, before['units'][X])
     sockets = xray_users(after['main'], x, rows, before.get('transit'))
     need(set(tuple(s) for s in before['sockets']) <= set(tuple(s) for s in sockets)
          and x['InvocationID'] != before['units'][X]['InvocationID'], 'RUNTIME_UNPROVED')
@@ -967,19 +1357,62 @@ def swan_started_units(before):
     return births
 
 
-def install(request, before, after):
-    global STAGE
+def prepare_native_install(request, before, after, lock_fd):
+    created = C3_STOCK_RUNTIME['create_native'](stock_runtime_root(), stock_runtime_command, C3_STOCK_ENSURE)
+    strict = stock_runtime_observation('native')
+    old = before['nativePreparation']
+    need(strict['inputs'] == old['inputs'] and strict['unitPath'] == old['unitPath']
+         and strict['layout'] == {SYSTEM + '/' + XL: created}, 'BASELINE_CHANGED')
+    # Fresh full observation on the very same flock. Only the XL fragment,
+    # physical load/file state and eligibility for the owned boot link change.
+    live = observe_install(request['machineId'], routing(request['network']), before.get('transit'), lock_fd)
+    expected = dict(before)
+    del expected['nativePreparation']
+    native = {**before['units'][XL], 'LoadState': 'loaded', 'UnitFileState': 'disabled', 'FragmentPath': SYSTEM + '/' + XL}
+    expected.update(units={**before['units'], XL: native}, installBoot=True)
+    need(live == expected and candidate(request, live) == after
+         and stock_runtime_observation('native') == strict, 'BASELINE_CHANGED')
+    return dict(unit=live['units'][XL], generation=created)
+
+
+def install(request, before, after, lock_fd=None):
+    global STAGE, PPP_PREPARING, NATIVE_PREPARING
     STAGE = 'COMMAND_FAILED'
     token, d = request['backupId'], request['network']
+    pending = 'nativePreparation' in before
     backup: dict[str, Any] = dict(machineId=request['machineId'], backupId=token, before=before, network=d,
-                  after={k: {**r, 'data': digest(raw(r))} for k, r in after.items()}, phase='applying')
+                  after={k: {**r, 'data': digest(raw(r))} for k, r in after.items()},
+                  phase='preparing-native' if pending else 'applying')
     payload = encode(backup)
     need(len(payload) <= 2 * MAX_FILE, 'CANDIDATE_INVALID')
     mkdir(VAULT, 0o700, exist_ok=True)
     mkdir(VAULT + '/' + token, 0o700)
     path = manifest_path(token)
     old_manifest = entry(payload)
+    NATIVE_PREPARING = pending
     write(path, None, old_manifest)
+    if pending:
+        need(lock_fd is not None and observe_install(request['machineId'], routing(d), before.get('transit'), lock_fd) == before,
+             'BASELINE_CHANGED')
+        backup['nativePrepared'] = prepare_native_install(request, before, after, lock_fd)
+        confirmed = entry(encode({**backup, 'phase': 'applying'}))
+        write(path, old_manifest, confirmed)
+        old_manifest = confirmed
+        backup['phase'] = 'applying'
+        before = runtime_before(backup)
+        NATIVE_PREPARING = False
+    modules = before.get('pppModules')
+    if modules is not None:
+        # This shared host prerequisite has no automatic inverse. Any later
+        # ordinary rollback deals only with the VPN-owned files and services.
+        PPP_PREPARING = True
+        need(lock_fd is not None and install_lock_identity(lock_fd) == before['installLock']
+             and boot() == before['boot'] and preflight(request['machineId'])['masked'] is False, 'BASELINE_CHANGED')
+        apply_ppp_preparation(modules)
+        # Even check-only nft can autoload expression modules. Run it only
+        # after the durable host intent and under the reserved host lock.
+        command('/usr/sbin/nft', '-c', '-f', '-', data=raw(after['nft']))
+        PPP_PREPARING = False
     if 'swan' in after:
         old_manifest = write_swan_profile(path, old_manifest, backup, after)
     mkdir(NFT_DIR, 0o755)
@@ -1000,6 +1433,7 @@ def install(request, before, after):
     sc('daemon-reload', wait=12)
     if 'bridge' in after:
         sc('restart', B, wait=22)
+    retained_xray_dropin(unit(X), before['units'][X])
     sc('restart', X, wait=22)
     if before.get('ikeSockets'):
         sc('restart', IKE, wait=22)
@@ -1226,9 +1660,9 @@ def load_after(backup, require_all=False):
 def rollback(request, path, old_manifest, backup):
     global STAGE
     STAGE = 'COMMAND_FAILED'
-    before, d, token = backup['before'], request['network'], request['backupId']
     was_installed = installed_phase(backup['phase'])
     need(backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
+    before, d, token = runtime_before(backup), request['network'], request['backupId']
     no_jobs(UNITS)
     sidecar = 'bridge' in backup['after']
     neighbors(before, sidecar)
@@ -1281,7 +1715,8 @@ def rollback(request, path, old_manifest, backup):
         if n == NET_UNIT:
             need(info['LoadState'] == 'not-found' or info.get('FragmentPath') == NET, 'ROLLBACK_DRIFT')
         if n == X:
-            need(info['FragmentPath'] == before['units'][n]['FragmentPath'] and not info.get('DropInPaths'), 'ROLLBACK_DRIFT')
+            need(info['FragmentPath'] == before['units'][n]['FragmentPath'], 'ROLLBACK_DRIFT')
+            retained_xray_dropin(info, before['units'][n])
             if working(info):
                 original_invocation = info['InvocationID'] == before['units'][n]['InvocationID']
                 xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows(), before.get('transit'))
@@ -1365,6 +1800,7 @@ def rollback(request, path, old_manifest, backup):
     if sidecar and (current['bridge'] != originals['bridge'] or not working(unit(B))):
         sc('restart', B, wait=22)
     x = unit(X)
+    retained_xray_dropin(x, before['units'][X])
     if current['main'] != before['files']['main'] or not working(x):
         sc('restart', X, wait=22)
     if before.get('ikeSockets'):
@@ -1392,7 +1828,9 @@ def rollback(request, path, old_manifest, backup):
     if restored_ike:
         need(idle_ike(unit(IKE), rows) == restored_ike, 'RUNTIME_UNPROVED')
     reserved = (1701, d['tproxyPort']) if restored_ike else (500, 4500, 1701, d['tproxyPort'])
-    need(xray_users(before['files']['main'], unit(X), rows, before.get('transit')) == before['sockets'] and
+    x = unit(X)
+    same_xray_dropin(x, before['units'][X])
+    need(xray_users(before['files']['main'], x, rows, before.get('transit')) == before['sockets'] and
          not any(port in reserved for p, a, port, owners in rows), 'RUNTIME_UNPROVED')
     backup['phase'] = 'rolled-back'
     write(path, rolling, entry(encode(backup)))
@@ -1736,6 +2174,7 @@ def removal_units(units, before, runtime, restart_bridge, legacy):
 
 
 def removal_boot(before, backup, runtime):
+    check_prepared_native(before)
     receipt = backup.get('bootEnrollment')
     if before['units'][XL]['UnitFileState'] == 'disabled':
         target = before['units'][XL]['FragmentPath']
@@ -1905,7 +2344,7 @@ def owned_installation(request):
 
 def apply_network_snapshot(d, token, backup, record, generation, *, listeners_required=True):
     bad = 'ROLLBACK_DRIFT'
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     legacy = legacy_network(record, d, 'bridge' in backup['after'])
     need(read(NET, 65536) == record and remove_generation(NET) == generation, bad)
     for key in ('drop', 'nft'):
@@ -1923,7 +2362,8 @@ def apply_network_snapshot(d, token, backup, record, generation, *, listeners_re
         if name == B and info['LoadState'] == 'not-found':
             continue
         need(info['LoadState'] == 'loaded' and info['NeedDaemonReload'] == 'no' and no_hooks(info)
-             and not any(info.get(k) for k in ('ExecCondition', 'ExecReload', 'DropInPaths'))
+             and not any(info.get(k) for k in ('ExecCondition', 'ExecReload'))
+             and (name == X or not info.get('DropInPaths'))
              and set(info['RequiredBy'].split()) == ({NET_UNIT} if name == X and legacy else set())
              and not any(info[k] for k in ('BoundBy', 'ConsistsOf', 'PropagatesStopTo'))
              and all(set(info[k].split()) <= {'shutdown.target'} for k in ('Conflicts', 'ConflictedBy')), bad)
@@ -1999,7 +2439,7 @@ def apply_network(request, action):
 def chap_preconditions(request):
     bad = 'ROLLBACK_DRIFT'
     path, manifest, backup, intent = owned_installation(request)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     no_jobs(UNITS)
     removal_boot(before, backup, runtime)
     records = {}
@@ -2100,16 +2540,40 @@ def fence_chap(request):
     return {'ok': True, 'backupId': request['backupId'], 'fenced': True}
 
 
+class InspectUnproved(Refusal):
+    pass
+
+
+class PidfdGetfdDenied(Refusal):
+    pass
+
+
+@contextlib.contextmanager
+def inspect_stage(stage):
+    try:
+        yield
+    except (InspectUnproved, subprocess.TimeoutExpired, BlockingIOError):
+        raise
+    except Exception as error:
+        if isinstance(error, Refusal) and str(error) == 'IN_FLIGHT':
+            raise
+        if time.monotonic() >= DEADLINE:
+            raise subprocess.TimeoutExpired([], 0) from None
+        # Only identify EPERM from this exact syscall, not a security policy.
+        raise InspectUnproved('PIDFD_GETFD_EPERM' if isinstance(error, PidfdGetfdDenied) else stage) from None
+
+
 def inspect_chap(request):
     bad = 'ROLLBACK_DRIFT'
     target = NAMES['chap']
-    manifest_generation = remove_generation(manifest_path(request['backupId']))
-    path, manifest, backup, intent, xl, current_rows, desired_rows, logins = chap_preconditions(request)
-    # A failed daemon does not establish that its sessions are gone.
-    need(xl['ActiveState'] != 'failed', bad)
-    generation = remove_generation(target)
-    record = read(target)
-    original, desired = chap_projection(record, current_rows, desired_rows, logins)
+    with inspect_stage('CHAP_PROJECTION_UNPROVED'):
+        manifest_generation = remove_generation(manifest_path(request['backupId']))
+        path, manifest, backup, intent, xl, current_rows, desired_rows, logins = chap_preconditions(request)
+        # A failed daemon does not establish that its sessions are gone.
+        need(xl['ActiveState'] != 'failed', bad)
+        generation = remove_generation(target)
+        record = read(target)
+        original, desired = chap_projection(record, current_rows, desired_rows, logins)
 
     def unchanged():
         no_jobs(UNITS)
@@ -2120,30 +2584,32 @@ def inspect_chap(request):
 
     revoked = request.get('revokedLogin')
     count = 0  # No target on a non-revoke; this does not assert PPP idleness.
-    with contextlib.ExitStack() as stack:
+    with inspect_stage('READBACK_UNPROVED'), contextlib.ExitStack() as stack:
         watch = None
         if revoked is not None:
-            session_need(os.uname().machine == 'x86_64')
-            # The owner reads the live CHAP projection. Authenticated sessions
-            # are joined to the original users, including the removed login.
-            observed = {**request, 'currentUsers': request['currentUsers' if original else 'desiredUsers']}
-            if rollback_quiescent(xl):
-                quiet = quiescent_session_sample(observed)
-                session_need(quiet == quiescent_session_sample(observed))
-            else:
-                owner = session_owner(observed)
-                session_need((owner[1], str(owner[2])) == (xl['InvocationID'], xl['MainPID']))
-                users = {u['login']: u['ipAddress'] for u in request['currentUsers']}
-                sample, _, watch = stack.enter_context(revoke_ppp_view(owner))
-                before = sample()
-                peers = revoke_peer_logins(before[1], users)
-                session_need(owner == session_owner(observed) and before == sample()
-                             and peers == revoke_peer_logins(before[1], users) and before == sample())
-                count = sum(login == revoked for login in peers.values())
+            with inspect_stage('PPP_UNPROVED'):
+                session_need(os.uname().machine == 'x86_64')
+                # The owner reads the live CHAP projection. Authenticated sessions
+                # are joined to the original users, including the removed login.
+                observed = {**request, 'currentUsers': request['currentUsers' if original else 'desiredUsers']}
+                if rollback_quiescent(xl):
+                    quiet = quiescent_session_sample(observed)
+                    session_need(quiet == quiescent_session_sample(observed))
+                else:
+                    owner = session_owner(observed)
+                    session_need((owner[1], str(owner[2])) == (xl['InvocationID'], xl['MainPID']))
+                    users = {u['login']: u['ipAddress'] for u in request['currentUsers']}
+                    sample, _, watch = stack.enter_context(revoke_ppp_view(owner))
+                    before = sample()
+                    peers = revoke_peer_logins(before[1], users)
+                    session_need(owner == session_owner(observed) and before == sample()
+                                 and peers == revoke_peer_logins(before[1], users) and before == sample())
+                    count = sum(login == revoked for login in peers.values())
         unchanged()
         if watch is not None:
             watch()
-    session_need(time.monotonic() < DEADLINE)
+    if time.monotonic() >= DEADLINE:
+        raise subprocess.TimeoutExpired([], 0)
     projection = 'both' if original and desired else 'original' if original else 'desired'
     reply = {'ok': True, 'backupId': request['backupId'], 'projection': projection, 'activeTargetSessions': count}
     if (epoch := chap_generation(backup['phase'])) is not None:
@@ -2155,7 +2621,7 @@ def observe_removal(request, *, quiescent=False):
     bad = 'ROLLBACK_DRIFT'
     token, d = request['backupId'], request['network']
     path, manifest, backup, intent = owned_installation(request)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     no_jobs(UNITS)
     boot_enrollment = removal_boot(before, backup, runtime)
     original_ike = before.get('ikeSockets', [])
@@ -2231,6 +2697,7 @@ def removal_owned_dirs():
 
 
 def removal_neighbors(state):
+    check_prepared_native(state['before'])
     # BRIDGE is checked separately against the selected layout and invocation.
     need(all(read(p, 262144) == r for p, r in state['before']['globalFiles'].items())
          and read(state['path'], 2 * MAX_FILE) == state['manifest']
@@ -2577,7 +3044,7 @@ def session_owner(request):
     identity = read('/etc/machine-id', 34)
     session_need(identity is not None and raw(identity) in (machine.encode('ascii'), (machine + '\n').encode('ascii')))
     path, manifest, backup = read_manifest(token)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     session_need(installed_phase(backup['phase']) and backup['backupId'] == token and backup['machineId'] == machine
                  and encode(backup['network']) == encode(network) and before['boot'] == boot()
                  and directory_absent(os.path.dirname(path) + '/remove-attempt.json'))
@@ -2673,6 +3140,8 @@ def session_ppp_argv(argv, pool):
 def session_dup(libc, pidfd, fd):
     # Getters only; never open /dev/ppp, attach a channel, or open the control FIFO.
     dup = libc.pidfd_getfd(pidfd, fd, 0)
+    if dup < 0 and ctypes.get_errno() == errno.EPERM:
+        raise PidfdGetfdDenied(SESSION_UNKNOWN)
     session_need(dup >= 0)
     try:
         yield dup
@@ -3168,7 +3637,7 @@ def ipsec_session_sample(request):
     identity = read('/etc/machine-id', 34)
     session_need(identity is not None and raw(identity).strip() == request['machineId'].encode('ascii'))
     path, manifest, backup, _ = owned_installation(request)
-    before, runtime = backup['before'], backup['runtime']
+    before, runtime = runtime_before(backup), backup['runtime']
     # Match installed configuration and starter include, not just a connection
     # name. No IPsec secrets are needed in the census.
     generations = []
@@ -3304,6 +3773,24 @@ def read_session_count(request):
         return relay_session_census(request)
 
 
+def install_lock_identity(lock_fd):
+    st = os.fstat(lock_fd)
+    lock_id = [st.st_dev, st.st_ino]
+    with directory(SYSTEM) as current:
+        live = os.fstat(current)
+        need(lock_id == [live.st_dev, live.st_ino], 'BASELINE_CHANGED')
+    return lock_id
+
+
+def observe_install(machine, network, transit, lock_fd):
+    lock_id = install_lock_identity(lock_fd)
+    modules = observe_ppp_preparation()
+    require_network_observers()
+    before = observe(machine, network, transit)
+    need(install_lock_identity(lock_fd) == lock_id, 'BASELINE_CHANGED')
+    return {**before, 'pppModules': modules, 'installLock': lock_id}
+
+
 def dispatch(request: dict[str, Any]):
     global STAGE, NO_INSTALL_WRITES
     need(os.geteuid() == 0 and type(request) is dict, 'PREREQUISITE')
@@ -3314,9 +3801,15 @@ def dispatch(request: dict[str, Any]):
          ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove')
          + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
     NO_INSTALL_WRITES = action == 'install'
-    ready = preflight(machine)
+    ready = preflight(machine, fresh=True) if action in ('preflight', 'prepare', 'check', 'install') else preflight(machine)
     if action == 'preflight':
-        return ready
+        xl = unit(XL)
+        pending = pending_xl(xl)
+        if pending:
+            need(not ready['masked'], NATIVE_UNIT_REQUIRED)
+            pending_native(xl, unit(IKE), pending)
+            return {**ready, 'unitsLoaded': False, 'pppPreparation': True, 'nativePreparation': True}
+        return {**ready, 'pppPreparation': True}
     d = routing(request['network'])
     # Lock a stable system directory without creating a lock file in prepare.
     # This only serializes DIRECT invocations; the caller must exclude other
@@ -3376,7 +3869,9 @@ def dispatch(request: dict[str, Any]):
         transit = request.get('transit')
         need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
         if action == 'prepare':
-            before = observe(machine, d, transit)
+            before = observe_install(machine, d, transit, fd)
+            if 'nativePreparation' in before:
+                ready = {**ready, 'unitsLoaded': False}
             main = raw(before['files']['main'])
             bridge = raw(before['bridge']) if before['bridge'] is not None else None
             return {**ready, 'baseline': digest(encode(before)), 'main': main.decode(), 'mainSha256': digest(main),
@@ -3384,21 +3879,25 @@ def dispatch(request: dict[str, Any]):
         token = request['backupId']
         need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{64}', request['baseline']), 'CANDIDATE_INVALID')
         if action in ('check', 'install'):
-            before = observe(machine, d, transit)
+            before = observe_install(machine, d, transit, fd)
             need(digest(encode(before)) == request['baseline'], 'BASELINE_CHANGED')
             after = candidate(request, before)
-            validate_candidate(after)
+            validate_profiles(after)
             if action == 'install':
-                need(observe(machine, d, transit) == before, 'BASELINE_CHANGED')
+                need(observe_install(machine, d, transit, fd) == before, 'BASELINE_CHANGED')
                 NO_INSTALL_WRITES = False
-                install(request, before, after)
+                install(request, before, after, fd)
         else:
             path, record, backup = bound_manifest(request)
             if action == 'verify':
                 need(installed_phase(backup['phase']), 'RUNTIME_UNPROVED')
+                if 'pppModules' in backup['before']:
+                    modules = observe_ppp_preparation()
+                    need(not modules['missing'] and not modules['persist'], 'RUNTIME_UNPROVED')
                 files = load_after(backup, require_all=True)
-                need(installed_runtime(d, token, backup['before'], files) == backup['runtime'], 'RUNTIME_UNPROVED')
+                need(installed_runtime(d, token, runtime_before(backup), files) == backup['runtime'], 'RUNTIME_UNPROVED')
             else:
+                need(backup['phase'] != 'preparing-native', 'IN_FLIGHT')
                 rollback(request, path, record, backup)
         return {'ok': True, 'backupId': token}
 
@@ -3415,17 +3914,21 @@ def main():
     except (subprocess.TimeoutExpired, BlockingIOError):
         return 75
     except Refusal as error:
-        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or str(error) == 'IN_FLIGHT':
+        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or NATIVE_PREPARING or str(error) == 'IN_FLIGHT':
+            return 75
+        if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED):
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
               'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
               'REMOVE_REFUSED' if action == 'remove' else
+              'INSPECT_' + str(error) if action == 'inspect-chap' and isinstance(error, InspectUnproved)
+              and str(error) in ('CHAP_PROJECTION_UNPROVED', 'PPP_UNPROVED', 'PIDFD_GETFD_EPERM', 'READBACK_UNPROVED') else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
               SESSION_UNKNOWN if action == 'session-count' else str(error)), file=sys.stderr)
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
-        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED:
+        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or PPP_PREPARING or NATIVE_PREPARING:
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else

@@ -55,7 +55,7 @@ const expected = compose(...laterArgs, false);
 // Actual helper, file IO, flock, manifest, parser, and mutation sequence.
 // No subprocess can run a real systemctl, ip, nft, Xray, ss or IPsec command.
 const fixture = String.raw`
-import contextlib, copy, io, json, os, pathlib, shlex, sys, types
+import contextlib, copy, ctypes, errno, io, json, os, pathlib, shlex, subprocess, sys, types
 from pathlib import Path
 source, tmp, scenario = sys.argv[1:]
 f = json.load(sys.stdin)
@@ -96,7 +96,7 @@ if scenario.startswith('chap-unterminated-'):
     Path(P['chap']).write_bytes(b'# original comment with opaque byte \xff')
 
 def stat(value):
-    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size')})
+    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size','st_dev','st_ino')})
 class FixtureOS:
     def __getattr__(self, name): return getattr(os, name)
     def lstat(self, path):
@@ -127,10 +127,14 @@ machine_file = root / 'etc/machine-id'
 machine_file.write_text(f['machineId'] + '\n')
 h['read'] = lambda path, *args: R(str(machine_file) if path == '/etc/machine-id' else path, *args)
 
-def preflight(machine):
+def preflight(machine, *, fresh=False):
     h['need'](machine == f['machineId'], 'IDENTITY')
     return dict(machineId=machine, ppp=True, masked=False, unitsLoaded=True)
 h['preflight'] = preflight
+# Already-prepared PPP; the joined fixture exercises actual preparation.
+h['observe_ppp_preparation'] = lambda: dict(missing=[], persist=False, builtin=[], policy='fixture')
+h['apply_ppp_preparation'] = lambda expected: h['need'](expected == h['observe_ppp_preparation'](), 'BASELINE_CHANGED')
+h['require_network_observers'] = lambda: None
 h['boot'] = lambda: 'fixture-boot'
 h['ppp_empty'] = lambda: not (testing and scenario == 'active-ppp')
 h['in_cgroup'] = lambda pid, info: pid == info['MainPID']
@@ -138,6 +142,7 @@ def modeled_xray_argv(info, path=None):
     expected_unit = B if path == h['BRIDGE'] else X
     h['need'](info['MainPID'] == units[expected_unit]['MainPID'] and h['working'](info), 'RUNTIME_UNPROVED')
     return info['MainPID']
+original_xray_argv = h['xray_argv']
 h['xray_argv'] = modeled_xray_argv
 units = {}
 for n in (X, B, XL, IKE, NET):
@@ -171,6 +176,26 @@ if scenario == 'chap-inspect-active':
     h['directory'] = session_directory
 units[IKE]['ExecStart'] = '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }'
 units[X].update(ActiveState='active', SubState='running', MainPID='10', InvocationID='old-main')
+if scenario.startswith('xtls-'):
+    start = f"{h['XRAY']} run -config {h['MAIN']}"
+    xtls = Path(h['SYSTEM'], 'xray.service.d', '10-donot_touch_single_conf.conf')
+    xtls.parent.mkdir()
+    xtls_bytes = f'# Do not edit; create a separate override instead.\n\n[Service]\nExecStart=\nExecStart={start}\n'.encode()
+    xtls.write_bytes(xtls_bytes)
+    xtls.chmod(0o644)
+    xtls_inode = xtls.stat().st_ino
+    units[X].update(DropInPaths=str(xtls), ExecStart=f"{{ path={h['XRAY']} ; argv[]={start} ; ignore_errors=no ; "
+                                                   'start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
+    def proc_cmdline(path, mode):
+        assert (path, mode) == ('/proc/' + units[X]['MainPID'] + '/cmdline', 'rb')
+        return io.BytesIO(b'\0'.join(arg.encode() for arg in (h['XRAY'], 'run', '-config', h['MAIN'], '')))
+    def realpath(path):
+        assert path == '/proc/' + units[X]['MainPID'] + '/exe'
+        return h['XRAY']
+    class XtlsOS(FixtureOS):
+        path = types.SimpleNamespace(realpath=realpath, **{k: getattr(os.path, k) for k in
+                                     ('split', 'basename', 'lexists', 'join', 'dirname')})
+    h.update(xray_argv=lambda info, path=h['MAIN']: original_xray_argv(info, path), os=XtlsOS(), open=proc_cmdline)
 stock_units = copy.deepcopy(units)
 stock_rules = [{'priority': n, 'src': 'all', 'table': t} for n, t in [(0, 255), (32766, 254), (32767, 253)]]
 foreign_rule = dict(priority=10078, src='198.51.100.0/24', table=201)
@@ -378,8 +403,8 @@ if scenario == 'chap-inspect-active':
                     'require authentication = yes\npppoptfile = /etc/ppp/options.xl2tpd\nlength bit = yes\n')
     files['options'] = ('auth\nrefuse-pap\nrefuse-chap\nrefuse-mschap\nrequire-mschap-v2\nrefuse-eap\nname l2tpd\n'
                         'mtu 1400\nmru 1400\nnoipv6\nnodefaultroute\nms-dns 192.0.2.53\n')
-assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()},
-    baseline=h['digest'](h['encode'](before))))['ok']
+baseline = h['dispatch'](dict(req, action='prepare'))['baseline']
+assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()}, baseline=baseline))['ok']
 manifest = Path(h['manifest_path'](token))
 manifest_saved = manifest.read_bytes(), manifest.stat().st_ino
 intent = manifest.with_name('remove-attempt.json')
@@ -441,6 +466,7 @@ def wire(action, *, stdin=None, helper=h, **kw):
     saved = sys.stdin
     try:
         helper['CHAP_ENTERED'] = False  # one invocation per process on the host
+        helper['NETWORK_UPGRADE_ENTERED'] = False
         sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(
             stdin.encode() if stdin is not None else h['encode'](dict(req, action=action, **kw))))
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -455,6 +481,39 @@ def snapshot():
     return sorted((str(p.relative_to(root)), p.lstat().st_ino, p.lstat().st_ctime_ns,
                    p.read_bytes() if p.is_file() else None) for p in root.rglob('*'))
 
+if scenario.startswith('xtls-'):
+    def xtls_wire(action, **extra):
+        return wire(action, stdin=h['encode'](dict(
+            {k: req[k] for k in ('machineId', 'network', 'backupId')}, action=action, **extra)).decode())
+    install_baseline = h['digest'](h['encode'](before))
+    testing = False  # No foreign policy during the install-bound phases.
+    a = xtls_wire('verify', baseline=install_baseline)
+    assert a[0] == 0, a
+    units[X]['DropInPaths'] = ''
+    assert xtls_wire('verify', baseline=install_baseline) == (70, '', 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n')
+    units[X]['DropInPaths'] = str(xtls)
+    if scenario == 'xtls-rollback':
+        a = xtls_wire('rollback', baseline=install_baseline)
+        assert a[0] == 0 and json.loads(manifest.read_bytes())['phase'] == 'rolled-back', a
+        assert R(P['main']) == before['files']['main'] and not any(policy.values())
+        assert xtls.read_bytes() == xtls_bytes and xtls.stat().st_ino == xtls_inode
+        print('ok')
+        sys.exit(0)
+    testing = True
+    a = xtls_wire('check-apply-network')
+    assert a[0] == 0, a
+    apply_proof = json.loads(a[1])['proof']
+    assert xtls_wire('prepare-apply-network') == a
+    assert xtls_wire('verify-apply-network', proof=apply_proof) == a
+    xtls.write_bytes(xtls_bytes + b'Environment=FOREIGN=1\n')
+    drifted = snapshot()
+    assert xtls_wire('restart-apply-network', proof=apply_proof) == (70, '', 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n')
+    assert not changes and snapshot() == drifted
+    xtls.write_bytes(xtls_bytes)
+    assert xtls_wire('restart-apply-network', proof=apply_proof) == a
+    assert xtls_wire('verify-apply-network', proof=apply_proof) == a
+    assert changes == [('restart', X)]
+    changes.clear()
 initial = snapshot()
 if scenario == 'chap-epoch':
     # Run the exact historical helper with the same modeled system and real
@@ -565,6 +624,18 @@ if scenario == 'chap-inspect-active':
         def sample():
             global samples
             samples += 1
+            if observation in ('getfd-eperm', 'getfd-esrch'):
+                def getfd(*args):
+                    ctypes.set_errno(errno.EPERM if observation == 'getfd-eperm' else errno.ESRCH)
+                    return -1
+                with h['session_dup'](types.SimpleNamespace(pidfd_getfd=getfd), 12, 13):
+                    raise AssertionError('failed pidfd_getfd yielded a descriptor')
+            if observation == 'other-eperm':
+                raise PermissionError(errno.EPERM, 'FIXTURE_PRIVATE_DETAIL')
+            if observation == 'timeout':
+                raise subprocess.TimeoutExpired(['FIXTURE_PRIVATE_DETAIL'], 0)
+            if observation == 'in-flight':
+                raise Refusal('IN_FLIGHT')
             pids = (502,) if observation == 'desired-idle' else (501, 502, 503)
             start = 100 if observation != 'session-drift' or samples == 1 else 101
             return start, [calls[pid] for pid in pids]
@@ -599,6 +670,8 @@ if scenario == 'chap-inspect-active':
         assert samples >= 2 and identity_reads >= 2, 'did not sample PPP identities under the host frame'
     elif observation == 'session-drift':
         assert samples >= 2 and identity_reads >= 1, 'did not reach the changing session observations'
+    elif observation in ('getfd-eperm', 'getfd-esrch', 'other-eperm', 'timeout', 'in-flight'):
+        assert samples == 1 and not identity_reads
     else:
         assert not samples and not identity_reads
     print(json.dumps(result))
@@ -644,7 +717,7 @@ if scenario.startswith('chap-sync-'):
             pre = snapshot()
             assert wire('check-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
             assert wire('sync-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
-            assert wire('inspect-chap', **params) == (70, '', 'DIRECT_CHAP_REFUSED\n'), label
+            assert wire('inspect-chap', **params) == (70, '', 'DIRECT_INSPECT_CHAP_PROJECTION_UNPROVED\n'), label
             assert snapshot() == pre and not changes, label
         chap.write_bytes(stock_chap + begin + old_row + end + foreign)
         chap.chmod(0o644)
@@ -835,7 +908,7 @@ else:
         for stray_pppd in (False, True):
             code, stdout, stderr = wire('inspect-chap', **revoke)
             if stray_pppd:
-                assert (code, stdout, stderr) == (70, '', 'DIRECT_CHAP_REFUSED\n')
+                assert (code, stdout, stderr) == (70, '', 'DIRECT_INSPECT_PPP_UNPROVED\n')
             else:
                 assert (code, stderr) == (0, ''), (code, stderr)
                 assert json.loads(stdout) == dict(ok=True, backupId=token, projection='both', activeTargetSessions=0)
@@ -904,12 +977,15 @@ else:
         assert not any(policy.values()) and intent.is_file() and wire('prepare-remove')[0] != 0
         assert not Path(h['DROP_DIR']).exists() and not Path(h['NFT_DIR']).exists()
         assert all(B not in cmd for cmd in changes) and ('restart',X) in changes
+        if scenario == 'xtls-apply-remove':
+            assert xtls.read_bytes() == xtls_bytes and xtls.stat().st_ino == xtls_inode
         assert h['ip']('rule','show')[-1] == foreign_rule and h['ip']('route','show','table','all') == [foreign_route]
     if scenario != 'stale-manifest': assert (manifest.read_bytes(), manifest.stat().st_ino) == manifest_saved
 print('ok')
 `;
 
-for (const scenario of ['normal', 'apply', 'apply-quiescent-dependent', 'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation', 'chap-epoch',
+for (const scenario of ['normal', 'xtls-apply-remove', 'xtls-rollback', 'apply', 'apply-quiescent-dependent',
+    'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation', 'chap-epoch',
     'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown', 'chap-sync-revoke',
     'chap-unterminated-clean', 'chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix', 'chap-unterminated-separated',
     'chap-terminated-suffix',
@@ -954,11 +1030,13 @@ test('inspectChap uses a full pinned transport and host frame without writes or 
     const alice = { login: 'alice', password: 'test-old', ipAddress: '10.255.1.10', enabled: true };
     const bob = { login: 'bob', password: 'test-new', ipAddress: '10.255.1.11', enabled: true };
     const installation = { nodeId, backupId, network };
-    for (const [observation, projection, activeTargetSessions] of [
+    for (const [observation, projection, activeTargetSessions, inspectionReason] of [
         ['original', 'original', 2], ['fenced-original', 'original', 2], ['desired', 'desired', 2],
         ['desired-idle', 'desired', 0], ['create', 'original', 0],
-        ['failed'], ['mixed'], ['session-drift'], ['identity-drift'], ['file-drift'], ['manifest-drift'], ['watch-drift'],
-        ['exclusive-held'],
+        ...['failed', 'mixed'].map(mode => [mode, null, null, 'chap-projection-unproved']),
+        ...['session-drift', 'identity-drift', 'getfd-esrch', 'other-eperm'].map(mode => [mode, null, null, 'ppp-unproved']),
+        ...['file-drift', 'manifest-drift', 'watch-drift'].map(mode => [mode, null, null, 'inspect-readback-unproved']),
+        ['getfd-eperm', null, null, 'pidfd-getfd-eperm'], ['exclusive-held'], ['timeout'], ['in-flight'],
     ]) {
         await t.test(observation, async () => {
             const create = observation === 'create';
@@ -1000,8 +1078,13 @@ test('inspectChap uses a full pinned transport and host frame without writes or 
                     assert.deepEqual(await result, { projection, activeTargetSessions });
                     assert.deepEqual(guards, [0, 1]);
                 } else {
-                    await assert.rejects(result, { code: observation === 'exclusive-held'
-                        ? 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_DIRECT_CHAP_REFUSED' });
+                    await assert.rejects(result, error => {
+                        assert.equal(error.code, inspectionReason
+                            ? 'REBUILD_L2TP_DIRECT_INSPECT_UNPROVED' : 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN');
+                        assert.equal(error.inspectionReason, inspectionReason);
+                        assert.doesNotMatch(JSON.stringify(error), /FIXTURE_PRIVATE_DETAIL/);
+                        return true;
+                    });
                 }
                 assert.equal(calls, 1);
             } finally {

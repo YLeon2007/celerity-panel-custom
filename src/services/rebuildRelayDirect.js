@@ -10,14 +10,25 @@ const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { validCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
+const { isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, requireInstallHostReady,
+    withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
+const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
 
 const TIMEOUT = 145000;
 const SESSION_COUNT_TIMEOUT = 12000;
 const PIN = /^[a-f0-9]{64}$/;
 const TOKEN = /^[a-f0-9]{32}$/;
 const CHAP_ACTIONS = ['check-chap', 'sync-chap', 'inspect-chap', 'read-chap-generation', 'fence-chap'];
+const directRefusals = new Set(['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
+    'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED']);
+const refusalFrame = /^DIRECT_(NO_WRITE_)?([A-Z][A-Z0-9_]*)\n(?![\s\S])/;
+const exactKeys = (value, keys) => value && Object.keys(value).length === keys.length
+    && keys.every(key => Object.hasOwn(value, key));
+// Python's helper uses compact json.dumps(..., ensure_ascii=True) and LF.
+const installReplyFrame = value => `${JSON.stringify(value).replace(/[\u007f-\uffff]/g,
+    char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`)}\n`;
 const fail = (suffix, uncertain = false) => Object.assign(new Error(`REBUILD_L2TP_${suffix}`), {
     code: `REBUILD_L2TP_${suffix}`, ...(uncertain && { remoteOutcomeUncertain: true }),
 });
@@ -120,13 +131,33 @@ function buildFiles(d, profiles, backupId) {
     }).map(([name, value]) => [name, Buffer.from(value).toString('base64')]));
 }
 
-let directSource;
+let directScript;
+function bundleDirectScript() {
+    const pack = path => deflateSync(readFileSync(join(__dirname, path))).toString('base64');
+    const load = (key, path, name, filename) =>
+        `${key}={"__name__":"${name}","__file__":"${filename}"};exec(_c3_compile("${pack(path)}","${filename}"),${key})`;
+    // These are fixed repository sources, not imports from the remote working
+    // directory. Non-main namespaces keep their standalone entrypoints inert.
+    return [
+        'import base64,zlib',
+        '_c3_compile=lambda data,filename:compile(zlib.decompress(base64.b64decode(data)),filename,"exec")',
+        // Runtime's standalone path calculation needs an absolute __file__
+        // with parents; the direct host gets the ensure code as a separate dict.
+        load('C3_STOCK_RUNTIME', 'rebuildRelayStockRuntime.py', 'c3_stock_runtime',
+            '/__c3_direct__/services/rebuildRelayStockRuntime.py'),
+        load('C3_STOCK_ENSURE', '../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'c3_stock_ensure',
+            '/__c3_direct__/modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'),
+        `exec(_c3_compile("${pack('rebuildRelayDirectHost.py')}","<DIRECT host>"))`,
+    ].join(';');
+}
+
 function directCommand(limits) {
-    // Compress the static helper to fit the remote shell's per-argument limit.
-    // Only local source enters shell argv; all request data travels via stdin.
-    directSource ??= deflateSync(readFileSync(join(__dirname, 'rebuildRelayDirectHost.py'))).toString('base64');
-    const script = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode("${directSource}")),"<DIRECT host>","exec"))`;
-    return `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${script}'`;
+    // Only static local source enters shell argv; all request data uses stdin.
+    directScript ??= bundleDirectScript();
+    const command = `/usr/bin/timeout ${limits} /usr/bin/python3 -I -B -c '${directScript}'`;
+    // The whole command is also an argument to the remote shell. Count its NUL.
+    requireThat(Buffer.byteLength(command) + 1 <= 128 * 1024, 'DIRECT_COMMAND_TOO_LARGE');
+    return command;
 }
 
 function createRelayDirect({ node, env = process.env, SSH } = {}) {
@@ -175,12 +206,13 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
     async function exec(action, params = {}, write = false, validate = () => true, verifyLock) {
         const count = action === 'session-count';
         const chap = CHAP_ACTIONS.includes(action);
+        const guarded = chap || action === 'install';
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         checkBinding();
         await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
         requireThat(!closed, 'DIRECT_CLOSED');
         checkBinding();
-        if (chap) requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
+        if (guarded) requireThat(typeof verifyLock === 'function', 'DIRECT_LOCK_REQUIRED');
         const stdin = JSON.stringify({ action, machineId, ...params });
         requireThat(Buffer.byteLength(stdin) <= 25 * 1024 * 1024, 'INSTALL_INPUT_INVALID');
         const verifyBeforeStdin = async () => {
@@ -197,33 +229,40 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         let result;
         try { result = await ssh.exec(directCommand(count ? '-k 1s 9s' : '-k 4s 125s'), {
             stdin, timeout: count ? SESSION_COUNT_TIMEOUT : TIMEOUT,
-        }, ...(chap ? [verifyBeforeStdin] : [])); }
+        }, ...(guarded ? [verifyBeforeStdin] : [])); }
         catch { throw unknown(); }
         try { checkBinding(); }
         catch (error) { if (write) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
-            const refusal = typeof result.stderr === 'string' && /^DIRECT_(NO_WRITE_)?([A-Z_]+)\n$/.exec(result.stderr);
-            const raw = refusal?.[2];
-            if (count && (result.code !== 70 || result.stdout !== ''
-                || result.stderr !== 'DIRECT_SESSION_COUNT_UNPROVED\n')) throw unknown();
-            const ipsecBusy = ['prepare-remove', 'remove'].includes(action) && result.stderr === 'DIRECT_REMOVE_IPSEC_BUSY\n';
-            if ((action === 'remove' || ipsecBusy) && (result.code !== 70 || result.stdout !== ''
-                || (!ipsecBusy && result.stderr !== 'DIRECT_REMOVE_REFUSED\n'))) throw unknown();
-            if (chap && (result.code !== 70 || result.stdout !== ''
-                || result.stderr !== 'DIRECT_CHAP_REFUSED\n')) throw unknown();
-            const codes = ['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
-                'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED', 'REMOVE_REFUSED'];
-            if (count) codes.push('SESSION_COUNT_UNPROVED');
-            if (ipsecBusy) codes.push('REMOVE_IPSEC_BUSY');
-            if (chap) codes.push('CHAP_REFUSED');
+            if (action === 'inspect-chap') {
+                const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
+                if (!reason) throw unknown();
+                throw Object.assign(fail('DIRECT_INSPECT_UNPROVED'), { inspectionReason: reason });
+            }
+            const refusal = typeof result.stderr === 'string' && refusalFrame.exec(result.stderr);
+            if (result.code !== 70 || result.stdout !== '' || !refusal) throw unknown();
+            const [, noWrite, raw] = refusal;
+            if (noWrite && action !== 'install') throw unknown();
+            const specific = specificHostRefusal(action, raw, Boolean(noWrite));
+            const ipsecBusy = ['prepare-remove', 'remove'].includes(action) && raw === 'REMOVE_IPSEC_BUSY';
+            const allowed = count ? raw === 'SESSION_COUNT_UNPROVED'
+                : chap ? raw === 'CHAP_REFUSED'
+                    : action === 'remove' ? ipsecBusy || raw === 'REMOVE_REFUSED'
+                        : ipsecBusy || directRefusals.has(raw) || specific !== undefined;
+            if (!allowed) throw unknown();
             // Only the installed helper's closed refusal frame certifies a settled write.
             // A shell/transport exit alone is not authority to race a remote mutation.
-            if (write && (result.code !== 70 || result.stdout !== '' || !codes.includes(raw))) throw unknown();
-            if (refusal?.[1] && action !== 'install') throw unknown();
-            const error = fail(codes.includes(raw) ? `DIRECT_${raw}` : 'DIRECT_COMMAND_FAILED');
+            const error = fail(`DIRECT_${specific ? 'PREREQUISITE' : raw}`);
+            const check = specific?.check ?? (raw === 'PREREQUISITE' ? prerequisiteCheck(action) : undefined);
+            withInstallCheck(error, check);
+            // Shared PPP preparation may have no safe inverse.
+            if (specific?.prerequisitePartial) {
+                error.prerequisitePartial = true;
+                throw error;
+            }
             if (write) error.commandSettled = true;
-            if (refusal?.[1] || chap) error.noHostChanges = true;
+            if (noWrite || chap) error.noHostChanges = true;
             throw error;
         }
         try {
@@ -231,6 +270,8 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             if (result.stderr !== '' || Buffer.byteLength(result.stdout) > replyLimit) throw Error();
             const reply = JSON.parse(result.stdout);
             if ((count || chap) && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
+            if ((isInstallStage(action) || ['verify', 'rollback'].includes(action))
+                && (closed || result.stdout !== installReplyFrame(reply))) throw Error();
             if (!validate(reply)) throw Error();
             return reply;
         } catch { throw unknown(); }
@@ -241,17 +282,23 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         busy = true;
         try { return await fn(); } finally { busy = false; }
     };
+    const readinessKeys = ['machineId', 'ppp', 'masked', 'unitsLoaded'];
+    const preparationKeys = [...readinessKeys, 'pppPreparation'];
+    const validReadiness = value => tokenMatches(TOKEN, value.machineId) && value.machineId.length === 32
+        && ['ppp', 'masked', 'unitsLoaded'].every(key => typeof value[key] === 'boolean');
     async function preflight() {
-        const proof = await exec('preflight', {}, false, value => value && tokenMatches(TOKEN, value.machineId)
-            && ['ppp', 'masked', 'unitsLoaded'].every(key => typeof value[key] === 'boolean'));
+        const proof = await exec('preflight', {}, false, value => (exactKeys(value, readinessKeys)
+            || (exactKeys(value, preparationKeys) && value.pppPreparation === true)
+            || hasNativePreparation(value)) && validReadiness(value));
         requireThat(proof.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
-        return { machineId, ppp: proof.ppp, masked: proof.masked, unitsLoaded: proof.unitsLoaded };
+        return proof;
     }
     async function lock(check) {
         requireThat(typeof check === 'function', 'DIRECT_LOCK_REQUIRED');
         requireThat(await check() !== false, 'DIRECT_LOCK_REQUIRED');
     }
     const exactAck = backupId => value => value?.ok === true && value.backupId === backupId;
+    const installAck = backupId => value => exactKeys(value, ['ok', 'backupId']) && exactAck(backupId)(value);
     const validGeneration = value => value?.length === 32 && tokenMatches(TOKEN, value);
 
     const chapOperation = (action, installation, currentUsers, desiredUsers, verifyLock, revokedLogin) => serial(async () => {
@@ -340,16 +387,21 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             const d = makeDesired(input.desired);
             const controlPlaneAddresses = [...input.controlPlaneAddresses], carryDomain = input.carryDomain;
             const host = await preflight();
-            requireThat(host.ppp && !host.masked && host.unitsLoaded, 'HOST_NOT_READY');
+            requireInstallHostReady(host);
             const network = { clientCidr: d.clientCidr, tproxyPort: d.tproxyPort, fwmark: d.fwmark, routeTable: d.routeTable };
             const topology = input.transit === undefined ? {} : { transit: structuredClone(input.transit) };
-            const snapshot = await exec('prepare', { network, ...topology }, false, v => v && tokenMatches(PIN, v.baseline));
+            const snapshot = await exec('prepare', { network, ...topology }, false, v => exactKeys(v,
+                [...readinessKeys, 'baseline', 'main', 'mainSha256', 'bridge', 'bridgeSha256'])
+                && validReadiness(v) && tokenMatches(PIN, v.baseline) && v.baseline.length === 64);
             requireThat(snapshot.machineId === machineId, 'INSTALL_IDENTITY_MISMATCH');
+            // Prepare has no capability fields. Use only the fresh preflight
+            // proof from this serial exchange on the same pinned connection.
+            requireInstallHostReady(snapshot, host);
             const profiles = composeRebuildRelayPair(snapshot, { nodeId, tproxyPort: d.tproxyPort, controlPlaneAddresses,
                 carryDomain, mainSha256: snapshot.mainSha256, bridgeSha256: snapshot.bridgeSha256 });
             const backupId = randomBytes(16).toString('hex');
             const params = { backupId, baseline: snapshot.baseline, network, ...topology, files: buildFiles(d, profiles, backupId) };
-            await exec('check', params, false, v => v?.ok === true);
+            await exec('check', params, false, installAck(backupId));
             const plan = { nodeId, backupId };
             Object.defineProperty(plan, 'getDesired', { value: () => d });
             held = { plan: Object.freeze(plan), params, phase: 'prepared' };
@@ -361,9 +413,10 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
             requireThat(!closed, 'DIRECT_CLOSED');
             held.phase = 'failed';
             held.start = performance.now();
-            try { await exec('install', held.params, true, exactAck(plan.backupId)); }
+            try { await exec('install', held.params, true, installAck(plan.backupId), verifyLock); }
             catch (error) {
                 if (error.noHostChanges) held.phase = 'refused';
+                if (error.prerequisitePartial) held.phase = 'prerequisite-partial';
                 throw error;
             }
             held.phase = 'installed';
@@ -371,8 +424,12 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
         verify: plan => serial(async () => {
             if (held?.plan !== plan || held.phase !== 'installed') return false;
             const { backupId, baseline, network } = held.params;
-            try { await exec('verify', { backupId, baseline, network }, false, exactAck(backupId)); return true; }
-            catch { return false; }
+            try { await exec('verify', { backupId, baseline, network }, false, installAck(backupId)); return true; }
+            catch (error) {
+                // Bad or lost readback is not a checked negative receipt.
+                if (error.code === 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN') throw error;
+                return false;
+            }
         }),
         async rollback(plan, verifyLock) {
             if (poisoned || closed || busy || held?.plan !== plan || !['failed', 'installed'].includes(held.phase)
@@ -383,7 +440,7 @@ function createRelayDirect({ node, env = process.env, SSH } = {}) {
                 await lock(verifyLock);
                 if (closed || performance.now() >= deadline) return false;
                 held.phase = 'rollback-attempted';
-                try { await exec('rollback', { backupId, baseline, network }, true, exactAck(backupId)); return true; }
+                try { await exec('rollback', { backupId, baseline, network }, true, installAck(backupId)); return true; }
                 catch (err) { if (err.remoteOutcomeUncertain) throw err; return false; }
             });
         },
