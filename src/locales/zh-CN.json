@@ -282,6 +282,12 @@
       "identityChanged": "服务器身份已变更，请重新核验后再继续。",
       "reviewRelays": "查看中继身份",
       "grantConflict": "准入与现有授权或安装状态冲突，已拒绝。请检查中继和运维配置。",
+      "conflictField": "冲突字段：{field}。",
+      "conflictSources": "冲突来源：{sources}。",
+      "conflictFields": {
+        "nodeId": "中继 ID", "machineId": "机器 ID", "sshHostKeySha256": "SSH 主机密钥指纹",
+        "endpoint": "SSH 端点", "host": "SSH 主机", "port": "SSH 端口", "username": "SSH 用户名"
+      },
       "grantUnavailable": "无法核验准入登记。在登记恢复可用前，相关操作已锁定。",
       "blocked": "中继准入目前受限。请检查中继状态，并等待未完成的操作结束。"
     }

@@ -35,7 +35,7 @@ function request(app, path, { method = 'POST', session, sessionID, headers, body
     });
 }
 
-function mount(t, rebuildL2tpOverview) {
+function mount(t, rebuildL2tpOverview, rebuildRelayAdmission) {
     const config = require('../../../../config');
     const oldMode = process.env.C3_REBUILD_ENABLED, oldWhitelist = config.PANEL_IP_WHITELIST;
     process.env.C3_REBUILD_ENABLED = 'true';
@@ -64,7 +64,7 @@ function mount(t, rebuildL2tpOverview) {
     app.use(express.json());
     const panel = require('../index');
     panel.l2tpRateLimiter.resetKey('192.0.2.10');
-    app.use('/panel', panel.createPanelRouter({ rebuildRelayAdmission: admission, rebuildL2tpOverview }));
+    app.use('/panel', panel.createPanelRouter({ rebuildRelayAdmission: rebuildRelayAdmission ?? admission, rebuildL2tpOverview }));
     const session = { authenticated: true, adminUsername: 'admin.fixture' };
     const headers = { 'content-type': 'application/json', 'x-csrf-token': issuePanelCsrfToken({ session }) };
     const send = (path, options = {}) => request(app, path, { session, sessionID: 'admin-session-id', headers, ...options });
@@ -149,8 +149,14 @@ test('DB-only account reconciliation relies on the live service attestation, not
     const path = '/panel/rebuild/relays/l2tp/accounts/reconcile';
     assert.deepEqual(checked(await send(path), 409), { error: { code: 'REBUILD_L2TP_RECONCILE_DISABLED' } });
     eligible = true;
-    problem = 'REBUILD_L2TP_GRANT_PERSISTENCE_UNAVAILABLE';
-    assert.deepEqual(checked(await send(path), 503), { error: { code: problem } });
+    for (const [code, status] of [['REBUILD_L2TP_GRANT_PERSISTENCE_UNAVAILABLE', 503],
+        ['REBUILD_L2TP_GRANT_ENV_INVALID', 503], ['REBUILD_L2TP_GRANT_REGISTRY_INVALID', 503],
+        ['REBUILD_L2TP_GRANT_CONFLICT', 409], ['REBUILD_L2TP_GRANT_CHANGED', 409], ['REBUILD_L2TP_IDENTITY_CHANGED', 409]]) {
+        problem = code;
+        assert.deepEqual(checked(await send(path), status), { error: { code } });
+    }
+    problem = privateValue;
+    assert.deepEqual(checked(await send(path), 503), { error: { code: 'REBUILD_L2TP_RECONCILE_UNAVAILABLE' } });
     assert.deepEqual(calls, []);
     problem = null;
     fail = 'REBUILD_L2TP_IDENTITY_CHANGED';
@@ -160,6 +166,54 @@ test('DB-only account reconciliation relies on the live service attestation, not
     assert.equal(result.status, 200);
     assert.deepEqual(JSON.parse(result.body), { executionMode: 'rebuild', status: 'settled' });
     assert.deepEqual(calls, ['reconcile', 'reconcile']);
+});
+
+test('only admission publishes allowlisted conflict categories, not values or internal diagnostics', async t => {
+    const { send, admission } = mount(t);
+    const code = 'REBUILD_L2TP_GRANT_CONFLICT';
+    for (const [error, details] of [
+        [{ detail: 'sshHostKeySha256' }, { field: 'sshHostKeySha256' }],
+        [{ detail: 'env-read-only' }, { sources: ['env'] }],
+        [{ field: 'endpoint', sources: ['env', 'db'] }, { field: 'endpoint', sources: ['env', 'db'] }],
+        [{ field: 'endpoint', sources: ['db', 'db'] }, { field: 'endpoint', sources: ['db', 'db'] }],
+        [{ field: 'constructor', sources: ['env', privateValue] }],
+        [{ detail: privateValue, sources: ['env', 'db', 'env'] }],
+    ]) {
+        admission.error = { code, ...error, message: privateValue, host: privateValue, machineId: privateValue };
+        assert.deepEqual(checked(await send(url('probe')), 409), { error: { code, ...(details && { conflict: details }) } });
+    }
+    for (const [code, status, retryAllowed] of [
+        ['REBUILD_L2TP_IDENTITY_UNAVAILABLE', 503], ['REBUILD_LOCK_LOST', 409],
+        ['REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE', 503],
+        ['REBUILD_L2TP_GRANT_OUTCOME_UNKNOWN', 503, false], ['REBUILD_LOCK_RELEASE_UNCONFIRMED', 503, false],
+    ]) {
+        // Each route case is specifically testing translation, not the shared budget.
+        require('../index').l2tpRateLimiter.resetKey('192.0.2.10');
+        admission.error = { code, retryAllowed, field: 'endpoint', sources: ['env', 'db'], message: privateValue };
+        assert.deepEqual(checked(await send(url('confirm'), { body: { challenge } }), status),
+            { error: { code, ...(retryAllowed === false && { retryAllowed }) } });
+    }
+});
+
+test('the mounted admission service passes categorical refusals without probing a host', async t => {
+    const { createRebuildRelayAdmission } = require('../../../services/rebuildRelayAdmission');
+    const { RelayGrantConflict } = require('../../../services/rebuildRelayAuthorization');
+    const code = 'REBUILD_L2TP_GRANT_CONFLICT';
+    let duplicate = false;
+    const admission = createRebuildRelayAdmission({ db: {}, locks: {}, env: {
+        C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true',
+    }, store: {
+        async snapshot() {
+            if (duplicate) throw new RelayGrantConflict('endpoint', ['env', 'db']);
+            return { sourceFor: () => 'env' };
+        },
+        async audit() {},
+    }, probe: { probeKey() { assert.fail('unexpected SSH probe'); } }, loadNode() { assert.fail('unexpected card read'); } });
+    const { send } = mount(t, undefined, admission);
+    assert.deepEqual(checked(await send(url('probe')), 409), { error: { code, conflict: { sources: ['env'] } } });
+    duplicate = true;
+    // The current service retains the field but not the registry source pair.
+    assert.deepEqual(checked(await send(url('probe')), 409), { error: { code, conflict: { field: 'endpoint' } } });
 });
 
 test('install, remove and accounts return stable grant errors without internal details', async t => {
@@ -202,4 +256,10 @@ test('install, remove and accounts return stable grant errors without internal d
     error = refuse(registryCode);
     assert.deepEqual(checked(await send(removalPath, { body: { decision: 'confirm', ticket: preview() } }), 503),
         { error: { code: registryCode } });
+    error = Object.assign(refuse('REBUILD_L2TP_GRANT_CONFLICT'), { field: 'endpoint', sources: ['db', 'env'] });
+    const code = error.code;
+    assert.deepEqual(checked(await send(installPath), 409), { error: { code, retryAllowed: false } });
+    assert.deepEqual(checked(await send('/panel/rebuild/relays/l2tp/accounts/disable', { body: { login: 'fixture' } }), 409),
+        { error: { code, retryAllowed: false } });
+    assert.deepEqual(checked(await send(removalPath, { body: { decision: 'confirm', ticket: preview() } }), 409), { error: { code } });
 });

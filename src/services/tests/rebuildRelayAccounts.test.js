@@ -497,7 +497,7 @@ test('mounted reconcile reports only a bounded DIRECT inspection refusal while i
     const frame = 'DIRECT_INSPECT_PIDFD_GETFD_EPERM\n';
     const exact = { code: 70, stdout: '', stderr: frame };
     let f, loseReadback;
-    t.mock.method(service, 'createRebuildService', () => ({ reconcileRelayAccounts: f.service.reconcile }));
+    const writer = t.mock.method(service, 'createRebuildService', () => ({ reconcileRelayAccounts: f.service.reconcile }));
     const app = express();
     app.set('view engine', 'ejs');
     app.set('views', require('node:path').join(__dirname, '../../../views'));
@@ -515,6 +515,8 @@ test('mounted reconcile reports only a bounded DIRECT inspection refusal while i
     const url = '/panel/rebuild/relays/l2tp/accounts/reconcile';
     const post = () => request(app, url, { session, sessionID, ip: peer,
         headers: { 'content-type': 'application/json', 'content-length': '2', 'x-csrf-token': issuePanelCsrfToken({ session }) } });
+    const overview = (query = '') => request(app, `/panel/l2tp${query}`, { method: 'GET', session, sessionID, ip: peer,
+        headers: { 'accept-language': 'en' } });
     const receipt = status => ({ executionMode: 'rebuild', status });
     const blocked = reason => ({ ...receipt('inspection-unproved'), reason, retryAllowed: false });
     const pending = receipt('pending');
@@ -536,8 +538,9 @@ test('mounted reconcile reports only a bounded DIRECT inspection refusal while i
         const before = structuredClone([f.pending, f.users, f.hosts, f.sessions]);
         const createMockRelay = f.deps.createRelayDirect;
         const calls = [];
+        let connects = 0;
         class SSH {
-            async connect() {}
+            async connect() { connects++; }
             disconnect() { calls.push('close'); }
             async exec(_command, { stdin }, verifyBeforeStdin) {
                 await verifyBeforeStdin();
@@ -550,16 +553,33 @@ test('mounted reconcile reports only a bounded DIRECT inspection refusal while i
             ? createRelayDirect({ ...options, SSH }) : createMockRelay(options);
         if (mode === 'busy Apply') f.deps.locks.run = async () => { throw Object.assign(new Error(), { code: 'REBUILD_BUSY' }); };
         f.service = f.restart();
+        const previousWriters = writer.mock.callCount();
+        if (mode === 'denied') {
+            const page = await overview();
+            assert.equal(page.status, 200);
+            assert.match(page.body, /data-reconcile disabled/);
+            assert.doesNotMatch(page.body, /data-create|data-secret-url|data-account-action/);
+            assert.equal(writer.mock.callCount(), previousWriters);
+            assert.equal(connects, 0);
+            assert.deepEqual(recoveryEffects(f), []);
+        }
         const response = await post();
         assert.equal(response.status, loseReadback ? 503 : 200, mode);
         assert.equal(response.headers['cache-control'], 'no-store', mode);
         assert.deepEqual(JSON.parse(response.body), expected, mode);
+        assert.equal(writer.mock.callCount(), previousWriters + 1, mode);
+        assert.equal(connects, wire ? 1 : 0, mode);
         if (mode === 'denied') {
-            const refresh = await request(app, '/panel/l2tp?view=only', { method: 'GET', session, sessionID, ip: peer,
-                headers: { 'accept-language': 'en' } });
-            assert.equal(refresh.status, 200);
-            assert.match(refresh.body, /An unfinished operation is pending\. Controls are locked\./);
-            assert.doesNotMatch(refresh.body, /data-reconcile-url|data-create|data-secret-url/);
+            for (const query of ['?view=only', '']) {
+                const refresh = await overview(query);
+                assert.equal(refresh.status, 200);
+                assert.match(refresh.body, /An unfinished operation is pending\. Controls are locked\./);
+                assert.doesNotMatch(refresh.body, /data-create|data-secret-url|data-account-action/);
+                if (query) assert.doesNotMatch(refresh.body, /data-reconcile/);
+                else assert.match(refresh.body, /data-reconcile disabled/);
+            }
+            assert.equal(writer.mock.callCount(), previousWriters + 1);
+            assert.equal(connects, 1);
         }
         assert.deepEqual(calls, wire ? ['inspect-chap', 'close'] : [], mode);
         if (mode === 'proved') {

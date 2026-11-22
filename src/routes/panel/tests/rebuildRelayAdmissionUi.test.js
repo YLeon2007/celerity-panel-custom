@@ -39,6 +39,29 @@ test('all grant sources and permissions render in EN, RU and ZH; a registry fail
         assert.ok(error.includes(copy.grantUnavailable));
         assert.doesNotMatch(error, /data-install-url=|data-admission-action=|data-create/);
         assert.ok(!error.includes(`>${copy.none}<`));
+        for (const [grantProblem, key] of [['REBUILD_L2TP_GRANT_CONFLICT', 'grantConflict'],
+            ['REBUILD_L2TP_GRANT_CHANGED', 'grantConflict'], ['REBUILD_L2TP_INSTALL_DISABLED', 'disabled'],
+            ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged'], ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'blocked'],
+            ['<unknown grant problem>', 'grantUnavailable']]) {
+            const blocked = await render(lang, { grantProblem, accountsPending: true, canReconcileAccounts: true });
+            assert.ok(blocked.includes(`role="alert">${copy[key]}</p>`), `${lang}: ${grantProblem}`);
+            assert.doesNotMatch(blocked, /data-install-url=|data-admission-action=|data-create|data-reconcile|<unknown grant problem>/);
+        }
+    }
+});
+
+test('a conflicting DB row cannot reconfirm; identity-change review remains service-gated', async () => {
+    const relay = { id, name: 'Relay', ip: receipt.host, status: 'not_installed', grantSource: 'db', bound: true,
+        canReconfirm: true, canRevoke: true, canInstall: true, canRemove: true, canRevealPsk: true };
+    for (const [grantProblem, key, canReconfirm] of [
+        ['REBUILD_L2TP_GRANT_CONFLICT', 'grantConflict', true],
+        ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged', true],
+        ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged', false],
+    ]) {
+        const html = await render('en', { relays: [{ ...relay, grantProblem, canReconfirm }] });
+        assert.ok(html.includes(`>${words.admission[key]}<`));
+        assert.doesNotMatch(html, /data-install-url=|data-secret-url=|data-remove-link|data-admission-action="revoke"/);
+        assert.equal(html.includes('data-admission-action="reconfirm"'), key === 'identityChanged' && canReconfirm);
     }
 });
 
@@ -156,4 +179,34 @@ test('even with a pending account operation, the page takes no action until the 
     assert.equal(f.recover.disabled, true);
     f.recover.click(); await flush();
     assert.deepEqual(f.calls.map(({ url }) => url), ['/accounts/reconcile']);
+});
+
+test('grant dialog shows only localized conflict fields/sources and never follows up automatically', async () => {
+    for (const [conflict, suffix] of [
+        [{ field: 'endpoint', sources: ['env', 'db'], value: '<untrusted>' },
+            ' Conflicting field: SSH endpoint. Conflicting sources: ENV, DB.'],
+        [{ field: 'constructor', sources: ['env', '<untrusted>'] }, ''],
+    ]) {
+        const f = launch();
+        f.replies.push({ status: 409, data: { error: { code: 'REBUILD_L2TP_GRANT_CONFLICT', conflict, message: '<untrusted>' } } });
+        f.selected.click(); await flush();
+        assert.equal(f.field('status').textContent, words.admission.grantConflict + suffix);
+        assert.ok(Object.values(f.approvals).every(button => button.hidden));
+        assert.deepEqual(f.calls.map(({ url }) => url), [`${baseUrl(id)}/probe`]);
+    }
+});
+
+test('admission blocked by a pending operation requires refresh and cannot reuse its challenge', async () => {
+    const f = launch();
+    f.replies.push({ data: { ...receipt, challenge: first } }, { data: { ...receipt, machineId, challenge: second } },
+        { status: 409, data: { error: { code: 'REBUILD_L2TP_ACCOUNTS_BLOCKED' } } });
+    f.selected.click(); await flush();
+    f.approvals.verify.click(); await flush();
+    f.approvals.confirm.click(); await flush();
+    assert.equal(f.status.textContent, words.admission.blocked);
+    assert.equal(f.refresh.hidden, false);
+    f.field('cancel').click();
+    assert.ok(f.selected.disabled && f.other.disabled && f.install.disabled && f.account.disabled);
+    f.selected.click(); f.approvals.confirm.click(); await flush();
+    assert.equal(f.calls.length, 3);
 });

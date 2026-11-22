@@ -21,11 +21,15 @@ const unavailableGrantCodes = new Set([grantUnavailable, 'REBUILD_L2TP_GRANT_PER
 const grantEffectStatus = code => code === identityChanged || code === grantConflict || code === 'REBUILD_L2TP_GRANT_CHANGED' ? 409
     : unavailableGrantCodes.has(code) ? 503 : undefined;
 const errorStatuses = new Map([
+    [invalid, 400],
     ['REBUILD_L2TP_ADMISSION_CHALLENGE_INVALID', 409],
     ['REBUILD_L2TP_INSTALL_DISABLED', 409], ['REBUILD_L2TP_GRANT_OUTCOME_UNKNOWN', 503],
-    ['REBUILD_LOCK_RELEASE_UNCONFIRMED', 503],
-    ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 409], ['REBUILD_BUSY', 409],
+    ['REBUILD_LOCK_RELEASE_UNCONFIRMED', 503], ['REBUILD_L2TP_IDENTITY_UNAVAILABLE', 503],
+    ['REBUILD_L2TP_ACCOUNTS_PERSISTENCE_UNAVAILABLE', 503],
+    ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 409], ['REBUILD_BUSY', 409], ['REBUILD_LOCK_LOST', 409],
 ]);
+const refreshCodes = new Set(['REBUILD_L2TP_GRANT_OUTCOME_UNKNOWN', 'REBUILD_LOCK_RELEASE_UNCONFIRMED']);
+const conflictFields = new Set(['nodeId', 'machineId', 'sshHostKeySha256', 'endpoint', 'host', 'port', 'username']);
 const validNodeId = value => typeof value === 'string' && nodeIdPattern.test(value);
 const matches = (pattern, value) => typeof value === 'string' && pattern.test(value);
 const validHost = value => matches(/^[A-Za-z0-9.:[\]_-]{1,253}(?![\s\S])/, value);
@@ -57,6 +61,18 @@ function publicReceipt(action, nodeId, value) {
     return result;
 }
 
+function publicConflict(error) {
+    // Admission projects the service's categorical detail; registry conflicts
+    // may also carry a field and two source labels. Never copy values.
+    const field = error.detail ?? error.field;
+    const sources = error.sources;
+    const pair = Array.isArray(sources) && sources.length === 2
+        && (sources[0] === 'env' || sources[0] === 'db') && (sources[1] === 'env' || sources[1] === 'db');
+    const detail = { ...(conflictFields.has(field) && { field }),
+        ...(pair ? { sources: [sources[0], sources[1]] } : field === 'env-read-only' ? { sources: ['env'] } : {}) };
+    return Object.keys(detail).length ? detail : undefined;
+}
+
 function mountAdmission(router, service, { requireSessionId, checkCsrf, requireCompletedOnboarding }, limiter) {
     const getService = () => service ??= require('../../services/rebuildRelayAdmission').createRebuildRelayAdmission();
     router.post(admissionPath, requireAuth, requireSessionId, (req, res, next) => {
@@ -84,7 +100,10 @@ function mountAdmission(router, service, { requireSessionId, checkCsrf, requireC
         } catch (error) {
             const code = error?.code;
             const status = grantEffectStatus(code) ?? errorStatuses.get(code);
-            return status ? errorResponse(res, status, code) : errorResponse(res, 503, unavailable);
+            if (!status) return errorResponse(res, 503, unavailable);
+            const conflict = code === grantConflict ? publicConflict(error) : undefined;
+            return res.status(status).json({ error: { code, ...(conflict && { conflict }),
+                ...(refreshCodes.has(code) && { retryAllowed: false }) } });
         }
     });
     router.all(admissionPath, (_req, res) => errorResponse(res.set('Allow', 'POST'), 405, 'METHOD_NOT_ALLOWED'));

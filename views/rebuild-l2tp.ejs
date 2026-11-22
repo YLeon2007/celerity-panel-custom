@@ -14,11 +14,16 @@ const validLogin = login => typeof login === 'string' && /^[A-Za-z0-9._@-]{1,64}
 const relayNames = new Map(relays.map(({ id, name }) => [id, name]));
 const relayPath = id => `/panel/rebuild/relays/${id}/l2tp`;
 const accountPath = '/panel/rebuild/relays/l2tp/accounts';
-const admissionMessages = ['granted', 'revoked', 'checkUnavailable',
-    'challengeInvalid', 'identityChanged', 'envReadOnly', 'grantConflict', 'grantUnavailable', 'blocked'];
-const problemText = problem => l(`admission.${problem === 'REBUILD_L2TP_IDENTITY_CHANGED' ? 'identityChanged'
-    : ['REBUILD_L2TP_GRANT_CONFLICT', 'REBUILD_L2TP_GRANT_CHANGED'].includes(problem) ? 'grantConflict'
-        : problem === 'REBUILD_L2TP_INSTALL_DISABLED' ? 'disabled' : 'grantUnavailable'}`);
+const admissionMessages = ['granted', 'revoked', 'checkUnavailable', 'recoveryIneligible',
+    'challengeInvalid', 'identityChanged', 'envReadOnly', 'grantConflict', 'grantUnavailable', 'blocked',
+    'conflictField', 'conflictSources'];
+const conflictFields = ['nodeId', 'machineId', 'sshHostKeySha256', 'endpoint', 'host', 'port', 'username'];
+const problemKeys = new Map([
+    ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged'], ['REBUILD_L2TP_INSTALL_DISABLED', 'disabled'],
+    ['REBUILD_L2TP_GRANT_CONFLICT', 'grantConflict'], ['REBUILD_L2TP_GRANT_CHANGED', 'grantConflict'],
+    ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'blocked'],
+]);
+const problemText = problem => l(`admission.${problemKeys.get(problem) ?? 'grantUnavailable'}`);
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
     'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
@@ -52,7 +57,8 @@ function secretControl(kind, url, index, login) {
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
      <% if (reconcile) { %>data-reconcile-url="<%= accountPath %>/reconcile"<% } %>
      data-install-checks="<%= JSON.stringify(typeof installChecks === 'undefined' ? {} : installChecks) %>"
-     data-admission-messages="<%= JSON.stringify(Object.fromEntries(admissionMessages.map(key => [key, l(`admission.${key}`)]))) %>"
+     data-admission-messages="<%= JSON.stringify({ ...Object.fromEntries(admissionMessages.map(key => [key, l(`admission.${key}`)])),
+         conflictFields: Object.fromEntries(conflictFields.map(key => [key, l(`admission.conflictFields.${key}`)])) }) %>"
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
     <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
     <% if (available && topProblem) { %><p class="alert alert-error" role="alert"><%= problemText(topProblem) %></p><% } %>
@@ -82,7 +88,8 @@ function secretControl(kind, url, index, login) {
                             const status = relayStatuses.has(relay.status) ? relay.status : 'unknown';
                             const source = relay.grantSource;
                             const canGrant = actionableOverview && !relay.grantProblem && validId(relay.id) && source === null && relay.canGrant === true;
-                            const canReconfirm = actionableOverview && validId(relay.id) && source === 'db' && relay.canReconfirm === true;
+                            const canReconfirm = actionableOverview && (!relay.grantProblem || relay.grantProblem === 'REBUILD_L2TP_IDENTITY_CHANGED')
+                                && validId(relay.id) && source === 'db' && relay.canReconfirm === true;
                             const canRevoke = actionableOverview && !relay.grantProblem && validId(relay.id) && source === 'db' && relay.canRevoke === true;
                             const changed = mismatch === relay.id;
                         %>

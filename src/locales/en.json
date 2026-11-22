@@ -1886,6 +1886,12 @@
       "identityChanged": "The server changed. Verify its identity again before continuing.",
       "reviewRelays": "Review relay identity",
       "grantConflict": "Relay admission was refused because it conflicts with an existing grant or installation state. Check the relay and operator settings.",
+      "conflictField": "Conflicting field: {field}.",
+      "conflictSources": "Conflicting sources: {sources}.",
+      "conflictFields": {
+        "nodeId": "relay ID", "machineId": "machine ID", "sshHostKeySha256": "SSH host key fingerprint",
+        "endpoint": "SSH endpoint", "host": "SSH host", "port": "SSH port", "username": "SSH login"
+      },
       "grantUnavailable": "Could not verify the relay admission registry. Controls are locked until the registry is available.",
       "blocked": "Relay admission is currently blocked. Check the relay status and wait for unfinished operations to settle."
     },

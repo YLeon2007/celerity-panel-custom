@@ -61,14 +61,16 @@ test('a read-only singleton exposes password reveal but no account mutation cont
     assert.doesNotMatch(content, /data-create|data-account-action|SERVER-ONLY-PASSWORD/);
 });
 
-test('pending supersedes generic conflict/unavailable text and hides mutation and reveal controls in RU and EN', async () => {
-    for (const [lang, message] of [['ru', 'Незавершённая операция, выполняется сверка'], ['en', 'Unfinished operation, reconciliation in progress']]) {
+test('pending offers manual recovery and hides mutation and reveal controls in RU and EN', async () => {
+    for (const [lang, message] of [['ru', 'Есть незавершённая операция. Действия заблокированы.'],
+        ['en', 'An unfinished operation is pending. Controls are locked.']]) {
         const { content } = await render(lang, { accountsPending: true, canReconcileAccounts: true });
-        assert.match(content, new RegExp(`>${message}<`));
+        assert.ok(content.includes(`>${message}<`));
         assert.ok(content.includes(`data-reconcile-url="${route}/l2tp/accounts/reconcile"`));
-        assert.match(content, /href="\/panel\/l2tp\?view=only" data-refresh/);
+        assert.ok(content.includes(`data-reconcile disabled>${t('rebuildL2tp.admission.recoverAccounts', lang)}<`));
+        assert.match(content, /href="\/panel\/l2tp" data-refresh hidden/);
         for (const key of ['inconsistent', 'accountsReadOnly', 'loadError']) assert.ok(!content.includes(t(`rebuildL2tp.${key}`, lang)));
-        assert.doesNotMatch(content, /data-create|data-account-action|data-secret-url|data-install-url|#rebuild-l2tp-remove|SERVER-ONLY-/);
+        assert.doesNotMatch(content, /data-create|data-account-action|data-secret-url|data-install-url|#rebuild-l2tp-remove|data-admission-action|SERVER-ONLY-/);
     }
     const singleton = await render('ru', { accountsPending: true, canReconcileAccounts: false });
     assert.doesNotMatch(singleton.content, /data-reconcile-url|data-secret-url/);
@@ -79,7 +81,13 @@ test('pending supersedes generic conflict/unavailable text and hides mutation an
     assert.doesNotMatch(refreshed.content, /data-reconcile-url|data-install-url|data-secret-url|data-account-action|data-create/);
 });
 
-test('opening a pending section POSTs once, then shows settled, pending or unconfirmed without retry/reload', async () => {
+function clickControl(disabled = false) {
+    let click;
+    return { disabled, addEventListener(name, handler) { if (name === 'click') click = handler; },
+        click() { if (!this.disabled) click?.(); } };
+}
+
+test('pending page does not POST until click; each outcome requires a fresh view before retry', async () => {
     const script = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
     for (const [outcome, responseStatus, receipt, messageKey, count] of [
         ['settled', 200, { executionMode: 'rebuild', status: 'settled' }, 'reconcileSettled'],
@@ -89,32 +97,54 @@ test('opening a pending section POSTs once, then shows settled, pending or uncon
         ['pending', 200, { executionMode: 'rebuild', status: 'pending', sessionsTerminated: 2,
             sessionsTerminatedScope: 'request' }, 'reconcileStillPending'],
         ['refused', 503, { error: { message: 'PRIVATE_FIXTURE' } }, 'reconcileUnconfirmed'],
+        ['rate limited', 429, { error: { code: 'REBUILD_RATE_LIMITED' } }, 'rateLimited'],
+        ['ineligible', 409, { error: { code: 'REBUILD_L2TP_RECONCILE_DISABLED' } }, 'recoveryIneligible'],
         ['unexpected', 200, { executionMode: 'classic', status: 'settled' }, 'reconcileUnconfirmed'],
         ['lost', null, null, 'reconcileUnconfirmed'],
         ['disabled', null, null, null],
     ]) {
         const url = `${route}/l2tp/accounts/reconcile`;
         const words = require('../../locales/ru.json').rebuildL2tp;
-        const status = { textContent: words.accountsPending }, refresh = { hidden: true };
+        const status = { textContent: words.accountsPendingLocked }, refresh = { hidden: true };
+        const recover = messageKey ? clickControl(true) : null;
         const page = {
-            dataset: { csrf, messages: JSON.stringify(words.messages), ...(messageKey && { reconcileUrl: url }) },
-            querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh })[key] ?? null,
+            dataset: { csrf, messages: JSON.stringify(words.messages), admissionMessages: JSON.stringify(words.admission),
+                ...(messageKey && { reconcileUrl: url }) },
+            querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': recover })[key] ?? null,
             querySelectorAll: () => [],
         };
         const calls = [];
+        let complete;
         runInNewContext(script, {
             document: { getElementById: () => page },
             window: { addEventListener() {}, location: { reload: () => calls.push('reload') } },
             async fetch(path, options) {
                 calls.push({ path, options });
+                await new Promise(resolve => { complete = resolve; });
                 if (responseStatus === null) throw new Error('PRIVATE_FIXTURE');
                 return { ok: responseStatus === 200, status: responseStatus, json: async () => receipt };
             },
         });
         await new Promise(resolve => setImmediate(resolve));
-        assert.equal(calls.length, messageKey ? 1 : 0, outcome);
+        assert.deepEqual(calls, [], outcome);
+        assert.equal(status.textContent, words.accountsPendingLocked, outcome);
+        assert.equal(refresh.hidden, true, outcome);
+        if (recover) {
+            assert.equal(recover.disabled, false, outcome);
+            recover.click();
+            assert.equal(status.textContent, words.messages.working, outcome);
+            assert.ok(recover.disabled && refresh.hidden, outcome);
+            recover.click();
+            assert.equal(calls.length, 1, outcome);
+            complete();
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(recover.disabled, true, outcome);
+            recover.click();
+            await new Promise(resolve => setImmediate(resolve));
+        }
+        assert.equal(calls.length, recover ? 1 : 0, outcome);
         assert.equal(refresh.hidden, !messageKey, outcome);
-        const message = messageKey ? words.messages[messageKey] : words.accountsPending;
+        const message = messageKey ? words.messages[messageKey] ?? words.admission[messageKey] : words.accountsPendingLocked;
         assert.equal(status.textContent, count === undefined ? message : `${message} Подтверждено завершение сеансов этим запросом: ${count}.`, outcome);
         if (messageKey) {
             assert.equal(calls[0].path, url);
@@ -143,10 +173,10 @@ test('unproved inspection replaces the working status with localized, allowliste
             ['inspect-readback-unproved', 'reconcileInspectReadback'], ['FIXTURE_PRIVATE_DETAIL', null], ['constructor', null],
         ]) {
             const status = { textContent: /data-action-status role="status">([^<]+)</.exec(content)[1] };
-            const refresh = { hidden: true }, staleControl = { disabled: false, addEventListener() {} };
+            const refresh = { hidden: true }, staleControl = clickControl(), recover = clickControl(true);
             const url = /data-reconcile-url="([^"]+)"/.exec(content)[1];
             const page = { dataset: { csrf, messages, reconcileUrl: url },
-                querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh })[selector] ?? null,
+                querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': recover })[selector] ?? null,
                 querySelectorAll: selector => selector === '[data-install-url]' ? [staleControl] : [] };
             const calls = [];
             runInNewContext(script, {
@@ -158,11 +188,17 @@ test('unproved inspection replaces the working status with localized, allowliste
                         reason, retryAllowed: false, message: 'FIXTURE_PRIVATE_DETAIL', sessionsTerminated: 2, sessionsTerminatedScope: 'request' }) };
                 },
             });
-            assert.equal(staleControl.disabled, true);
+            await new Promise(resolve => setImmediate(resolve));
+            assert.deepEqual(calls, []);
+            recover.click();
+            assert.equal(status.textContent, text.working);
+            assert.ok(staleControl.disabled && recover.disabled);
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(refresh.hidden, false);
+            assert.ok(staleControl.disabled && recover.disabled);
+            recover.click(); staleControl.click();
             await new Promise(resolve => setImmediate(resolve));
             assert.deepEqual(calls, [url]);
-            assert.equal(refresh.hidden, false);
-            assert.equal(staleControl.disabled, true);
             assert.equal(status.textContent, text.reconcileInspectionUnproved + (key ? ` ${text[key]}` : ''));
             assert.ok(status.textContent.includes(guidance));
             assert.doesNotMatch(status.textContent, /FIXTURE_PRIVATE_DETAIL|undefined|seccomp/i);
