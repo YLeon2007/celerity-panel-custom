@@ -64,7 +64,13 @@ REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'x
 PACKAGE_AUTOSTART_UNSAFE = 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
 PACKAGE_PENDING = 'package-preparation.pending'
 PACKAGE_MAX_OUTPUT = 256 * 1024  # per stream
-PACKAGE_MAX_COMMANDS = 256      # two observations (up to 48 dependencies each), plus readbacks
+# Per runner; preflight has its own runner. Prepare uses three complete guard
+# observations, a pinned simulation, then containment/install/readback.
+# Each observation: 2 quiet sweeps (3 each), 4 dpkg, layout (1 + up to 4 SysV
+# conffiles), 21 unit shows, 2 APT simulations/checks and up to 48 metadata reads.
+# After the pinned simulation: 4 layouts/unit sweeps, 3 dpkg reads (4 each),
+# 4 quiet sweeps, 3 reloads and 1 install. Early cleanup replaces later phases.
+PACKAGE_MAX_COMMANDS = 391      # 3*86 + 1 + 4*26 + 3*4 + 4*3 + 3 + 1
 NATIVE_MAX_OUTPUT = 128 * 1024
 NATIVE_UNIT_REQUIRED = 'RUNTIME_NATIVE_UNIT_REQUIRED'
 STOCK_IKE_INCLUDE = b'include /etc/ipsec.d/*.conf'

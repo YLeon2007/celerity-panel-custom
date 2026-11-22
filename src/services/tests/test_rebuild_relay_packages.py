@@ -128,6 +128,24 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         self.put('/var/lib/dpkg/status', ''.join(f'Package: {n}\nStatus: install ok installed\n'
                  f'Version: {v}\nArchitecture: {a}\n\n' for n, (v, a) in sorted(self.installed.items())))
 
+    def stock_solver(self):
+        deps = {
+            'libstrongswan': 'libc6 (>= 2.38)',
+            'strongswan-starter': 'libstrongswan (= 6.0.1-6+deb13u7), libc6 (>= 2.38)',
+            'strongswan-libcharon': 'libstrongswan (= 6.0.1-6+deb13u7)',
+            'strongswan-charon': 'strongswan-libcharon (= 6.0.1-6+deb13u7), libc6 (>= 2.38)',
+            'libjansson4': 'libc6', 'libnftnl11': 'libc6', 'libnftables1': 'libjansson4, libnftnl11',
+            'nftables': 'libnftables1 (= 1.1.3-1)', 'libpcap0.8t64': 'libc6', 'ppp': 'libc6',
+            'strongswan': 'strongswan-starter, strongswan-charon',
+            'xl2tpd': 'libc6 (>= 2.34), libpcap0.8t64 (>= 0.9.8), ppp, lsb-base (>= 3.0-6)',
+        }
+        self.candidates = {name: (version, arch, deps[name]) for name, version, arch in re.findall(
+            r'^Inst (\S+) \((\S+) \S+ \[(\S+)\]\)$', STOCK_INST.decode(), re.M)}
+        del self.installed['libnftnl11']
+        self.installed['lsb-base'] = ('11.6', 'all')
+        self.status()
+        self.sim_stdout = STOCK_PLAN
+
     def containment(self):
         self.t.assertEqual(0o755, self.p(POLICY).stat().st_mode & 0o777)
         self.t.assertRegex(self.p(POLICY).read_text(), r'^#!/bin/sh\n# c3 relay package containment [a-f0-9]{32}\nexit 101\n$')
@@ -301,9 +319,12 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
             return 0, b'Packages have been unpacked but not configured.\n' if self.bad_audit else b'', b''
         if argv == ('/usr/bin/dpkg-query', '-W', '-f=${binary:Package}\\t${db:Status-Abbrev}\\t${Architecture}\\t${Version}\\n'):
             return 0, ''.join(f'{n}\tii \t{a}\t{v}\n' for n, (v, a) in sorted(self.installed.items())).encode(), b''
-        if argv == ('/usr/bin/dpkg-query', '-W', '-f=${Conffiles}\\n', 'xl2tpd'):
-            md5 = hashlib.md5(self.p('/etc/init.d/xl2tpd').read_bytes()).hexdigest()
-            return 0, f' /etc/init.d/xl2tpd {md5}\n'.encode(), b''
+        if argv[:3] == ('/usr/bin/dpkg-query', '-W', '-f=${Conffiles}\\n') and len(argv) == 4:
+            scripts = {'xl2tpd': ('xl2tpd',), 'strongswan-starter': ('ipsec', 'strongswan-starter'),
+                       'nftables': ('nftables',)}[argv[3]]
+            paths = [f'/etc/init.d/{name}' for name in scripts]
+            return 0, ''.join(f' {p} {hashlib.md5(self.p(p).read_bytes()).hexdigest()}\n'
+                              for p in paths).encode(), b''
         if argv[:5] == CTL:
             args = argv[5:]
             if args == ('show', '--all', '--property=UnitPath'):
@@ -520,31 +541,13 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian
             self.observe()
         self.no_apt()
 
-    def stock_solver(self):
-        deps = {
-            'libstrongswan': 'libc6 (>= 2.38)',
-            'strongswan-starter': 'libstrongswan (= 6.0.1-6+deb13u7), libc6 (>= 2.38)',
-            'strongswan-libcharon': 'libstrongswan (= 6.0.1-6+deb13u7)',
-            'strongswan-charon': 'strongswan-libcharon (= 6.0.1-6+deb13u7), libc6 (>= 2.38)',
-            'libjansson4': 'libc6', 'libnftnl11': 'libc6', 'libnftables1': 'libjansson4, libnftnl11',
-            'nftables': 'libnftables1 (= 1.1.3-1)', 'libpcap0.8t64': 'libc6', 'ppp': 'libc6',
-            'strongswan': 'strongswan-starter, strongswan-charon',
-            'xl2tpd': 'libc6 (>= 2.34), libpcap0.8t64 (>= 0.9.8), ppp, lsb-base (>= 3.0-6)',
-        }
-        self.h.candidates = {name: (version, arch, deps[name]) for name, version, arch in re.findall(
-            r'^Inst (\S+) \((\S+) \S+ \[(\S+)\]\)$', STOCK_INST.decode(), re.M)}
-        del self.h.installed['libnftnl11']
-        self.h.installed['lsb-base'] = ('11.6', 'all')
-        self.h.status()
-        self.h.sim_stdout = STOCK_PLAN
-
     def test_trixie_solver_stock_libcharon_is_a_hard_dependency(self):
-        self.stock_solver()
+        self.h.stock_solver()
         self.assertEqual(self.observe()['missing'], SIX)
         self.no_effects()
 
     def test_libcharon_without_stock_charon_dependency_still_refuses(self):
-        self.stock_solver()
+        self.h.stock_solver()
         # Still reachable through a requested package, but no longer paired to
         # its stock charon hard dependency; this must not authorize the library.
         self.h.candidates['strongswan-charon'] = ('6.0.1-6+deb13u7', 'amd64', 'libc6')

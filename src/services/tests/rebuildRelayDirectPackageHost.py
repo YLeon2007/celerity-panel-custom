@@ -13,6 +13,8 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
+from test_rebuild_relay_packages import HERE, Host, LATE, POLICY, SYSTEM, g
+
 
 HOST = Path(__file__).resolve().parents[1] / 'rebuildRelayDirectHost.py'
 MACHINE = '1' * 32
@@ -32,6 +34,7 @@ class GuardRefusal(Exception):
 
 class Adapter(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(os.umask, os.umask(0o022))  # Debian fixture dirs must not be group-writable.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
@@ -87,6 +90,7 @@ class Adapter(unittest.TestCase):
             return self.machine
 
         self.machine = MACHINE
+        self.host_command = self.h['command']
         self.h.update(SYSTEM=str(self.system), VAULT=str(self.vault), os=FixtureOS(),
                       directory=directory, boot=lambda: BOOT, require_machine=machine,
                       ppp_device=lambda: None, unit=lambda name: {'LoadState': 'loaded'},
@@ -332,6 +336,147 @@ class Adapter(unittest.TestCase):
         self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', ''))
         self.assertEqual(len(calls), 2)
         self.assertFalse(self.effects)
+
+    def prepare_with_real_guard(self, host, *, preflight_calls):
+        self.system = host.p(SYSTEM)
+        pending = self.vault / self.h['PACKAGE_PENDING']
+        receipt = self.vault / f'packages-{TOKEN}.json'
+        configured_limit = self.h['PACKAGE_MAX_COMMANDS']
+        runners, writes, probes = [], [], []
+        runner_type = self.h['PackageRunner']
+        deadline = self.h['DEADLINE']
+
+        def new_runner():
+            run = runner_type()
+            runners.append(run)
+            return run
+
+        def child_status(argv, end, maximum, *, may_write):
+            self.assertEqual(maximum, 256 * 1024)
+            self.assertTrue(time.monotonic() < end <= deadline)
+            apt = argv[7:9] == ('/usr/bin/apt-get', '-y')
+            self.assertEqual(may_write, apt or argv == CTL + ('daemon-reload',))
+            if may_write:
+                self.assertTrue(runners[-1].entered)
+                if not writes:
+                    intent = json.loads(pending.read_bytes())
+                    self.assertEqual(intent, json.loads(receipt.read_bytes()))
+                    self.assertEqual((intent['phase'], intent['packagePreparation']), ('preparing', proof))
+                    with self.h['directory'](str(self.system)) as fd, self.assertRaises(BlockingIOError):
+                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    # The actual guard has already created its owned artifacts.
+                    # Record the verified grant for the command model's ordering assertions.
+                    host.effects.append('enter')
+                writes.append('apt' if apt else 'reload')
+            if apt:
+                self.assertTrue(77 < end - time.monotonic() <= 78)
+            return host.run(argv, 78 if apt else 6)
+
+        def child_run(argv, **_):
+            self.assertEqual(argv[:3], ('/usr/bin/dpkg-query', '-W', '-f=${db:Status-Abbrev}'))
+            self.assertEqual(len(argv), 4)
+            name = argv[3]
+            probes.append(name)
+            return (subprocess.CompletedProcess(argv, 0, b'ii ', b'') if name in host.installed else
+                    subprocess.CompletedProcess(argv, 1, b'', b''))
+
+        required = self.h['REQUIRED_PACKAGES']
+        until_missing = required[:next(i for i, n in enumerate(required) if n not in host.installed) + 1]
+        self.h.update(SYSTEM=str(self.system), stock_runtime_root=lambda: self.root,
+                      PackageRunner=new_runner, command=self.host_command, bounded_status=child_status,
+                      C3_PACKAGE_GUARD={'Refusal': g.Refusal, 'observe': g.observe, 'prepare': g.prepare})
+        with patch.object(subprocess, 'run', side_effect=child_run), patch.object(
+                g, '_owner', side_effect=lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid())):
+            proof = self.offered()
+            self.assertEqual(len(runners), 1)
+            self.assertEqual(configured_limit - runners[0].remaining, preflight_calls)
+            self.assertEqual(len(host.calls), preflight_calls)
+            self.assertEqual(host.effects, [])
+            result = self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof)
+        # The initial missing-package probes are outside both counters.
+        self.assertEqual(probes, list(until_missing) * 2)
+        self.assertEqual(len(runners), 2)
+        self.assertEqual(writes, ['reload', 'apt', 'reload', 'reload'])
+        self.assertEqual(host.effects, ['enter', *writes])
+        self.assertEqual(host.apt_count, 1)
+        self.assertFalse(runners[0].failed)
+        run = runners[1]
+        self.assertTrue(run.entered and run.apt_dispatched and run.apt_settled)
+        self.assertEqual(configured_limit - run.remaining, len(host.calls) - preflight_calls)
+        return result, run, receipt, pending
+
+    def assert_real_guard_ready(self, host, attempt, *, prepare_calls):
+        result, run, receipt, pending = attempt
+        self.assertEqual((result, self.h['PACKAGE_MAX_COMMANDS'] - run.remaining, run.failed),
+                         ((0, f'{{"ok":true,"backupId":"{TOKEN}","packagesReady":true}}\n', ''), prepare_calls, False))
+        self.assertEqual(json.loads(receipt.read_bytes())['phase'], 'ready')
+        self.assertFalse(pending.exists())
+        self.assertFalse((self.vault / TOKEN).exists())
+        self.assertFalse(os.path.lexists(host.p(POLICY)))
+        self.assertFalse(any(self.system.glob('*.service')))
+        self.assertFalse(any(self.root.rglob('.relay-package-*')))
+
+    def test_real_guard_historical_clean_plan_fits_runner_budget(self):
+        host = Host(self, self.root)
+        host.stock_solver()
+        self.assertEqual(len(host.candidates), 12)
+        survivor = host.link(SYSTEM + '/multi-user.target.wants/operator.service', '/opt/operator.service')
+        expected = host.installed | {n: (v, a) for n, (v, a, _) in host.candidates.items()}
+        self.assert_real_guard_ready(host, self.prepare_with_real_guard(host, preflight_calls=46), prepare_calls=258)
+        self.assertEqual(host.installed, expected)
+        self.assertEqual(survivor.readlink(), Path('/opt/operator.service'))
+        for name in ('strongswan-starter.service', 'nftables.service'):
+            self.assertFalse(any(self.system.glob(f'*.wants/{name}')))
+        self.assertFalse(any(host.p('/etc').glob('rc?.d/S??xl2tpd')))
+        for i in '0123456':
+            self.assertEqual(host.p(f'/etc/rc{i}.d/K01xl2tpd').readlink(), Path('../init.d/xl2tpd'))
+
+    def max_plan_host(self):
+        host = Host(self, self.root)
+        version, arch, depends = host.candidates.pop('strongswan')
+        host._install()  # Seed the already-installed, disabled service owners.
+        for link in host.p(SYSTEM).glob('*.wants/*.service'):
+            link.unlink()
+        for link in host.p('/etc').glob('rc?.d/S??xl2tpd'):
+            link.rename(link.with_name('K' + link.name[1:]))
+        host.p(LATE + '/xl2tpd.service').write_bytes((HERE / 'helpers/trixie-xl2tpd-generated.fixture').read_bytes())
+        host.link(LATE + '/l2tpd.service', 'xl2tpd.service')
+        for name in ('ipsec', 'strongswan-starter', 'nftables'):
+            host.put(f'/etc/init.d/{name}', '#!/bin/sh\nexit 0\n', 0o755)
+        # One missing metapackage with 47 hard dependencies. The four SysV
+        # scripts are present in every layout, so all seven query their md5sums.
+        deps = [f'libfixture{i:02}' for i in range(1, g.MAX_PLAN)]
+        host.candidates = {'strongswan': (version, arch, ', '.join([depends, *deps])),
+                           **{name: ('1.0-1', 'amd64', 'libc6') for name in deps}}
+        self.assertEqual(len(host.candidates), 48)
+        return host
+
+    def test_real_guard_max_plan_fits_exact_runner_budget(self):
+        host = self.max_plan_host()
+        self.assertEqual(self.h['PACKAGE_MAX_COMMANDS'], 391)
+        attempt = self.prepare_with_real_guard(host, preflight_calls=86)
+        self.assert_real_guard_ready(host, attempt, prepare_calls=391)
+        self.assertEqual(attempt[1].remaining, 0)
+
+    def test_real_guard_exhausted_budget_retains_pending(self):
+        host = self.max_plan_host()
+        self.h['PACKAGE_MAX_COMMANDS'] -= 1  # Deny the very last readback in the same full path.
+        result, run, receipt, pending = self.prepare_with_real_guard(host, preflight_calls=86)
+        self.assertEqual((result, run.remaining, run.failed), ((75, '', ''), 0, True))
+        self.assertEqual(len(host.calls) - 86, 390)
+        self.assertEqual(host.calls[-1], ('/usr/bin/dpkg', '--audit'))
+        self.assertEqual(receipt.read_bytes(), pending.read_bytes())
+        intent = json.loads(pending.read_bytes())
+        self.assertEqual(intent['phase'], 'preparing')
+        self.assertTrue(host.p(POLICY).is_file())
+        calls = len(host.calls)
+        # No replay or additional admitted children even though APT settled.
+        self.assertEqual(self.wire('preflight'), (75, '', ''))
+        self.assertEqual(self.wire('prepare-packages', backupId=TOKEN,
+                                   packagePreparation=intent['packagePreparation']), (75, '', ''))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run(('/usr/bin/dpkg', '--audit'), 6)
+        self.assertEqual(len(host.calls), calls)
 
     def test_bounded_runner_joins_local_synthetic_child_and_caps_native_pipes(self):
         self.popen_patch.stop()
