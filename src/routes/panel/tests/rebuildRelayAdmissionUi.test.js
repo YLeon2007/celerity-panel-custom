@@ -54,6 +54,18 @@ test('all grant sources and permissions render in EN, RU and ZH; a registry fail
     }
 });
 
+test('HTML Remove notice suppresses review and mutations even with eligible inputs', async () => {
+    for (const lang of ['en', 'ru', 'zh-CN']) {
+        const { messages } = require(`../../../locales/${lang}.json`).rebuildL2tp;
+        for (const removalNotice of ['uncertain', 'removeCleanupFailed']) {
+            const html = await render(lang, { removalNotice, changedRelayId: ids[1] });
+            assert.ok(html.includes(`role="status">${ejs.escapeXML(messages[removalNotice])}</p>`), `${lang}: ${removalNotice}`);
+            assert.match(html, /href="\/panel\/l2tp"[^>]*>/);
+            assert.doesNotMatch(html, /data-install-url=|data-admission-action=|data-create|data-remove-link/);
+        }
+    }
+});
+
 test('a conflicting DB row cannot reconfirm; identity-change review remains service-gated', async () => {
     const relay = { id, name: 'Relay', ip: receipt.host, status: 'not_installed', grantSource: 'db', bound: true,
         canReconfirm: true, canRevoke: true, canInstall: true, canRemove: true, canRevealPsk: true };
@@ -143,7 +155,7 @@ for (const action of ['grant', 'reconfirm']) {
 
 test('an account identity refusal does not replay or redirect; explicit reconfirm starts a new probe', async () => {
     const f = launch('reconfirm');
-    f.replies.push({ status: 409, data: { error: { code: 'REBUILD_L2TP_IDENTITY_CHANGED', nodeId: id, private: 'private' } } });
+    f.replies.push({ status: 409, data: { error: { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'refused', nodeId: id, private: 'private' } } });
     f.account.click(); await flush();
     assert.equal(f.status.textContent, words.admission.identityChanged);
     assert.equal(f.review.href, `#relay-${id}`);
@@ -151,6 +163,52 @@ test('an account identity refusal does not replay or redirect; explicit reconfir
     assert.deepEqual(f.calls.map(({ url }) => url), ['/accounts/disable']);
     f.selected.click(); await flush();
     assert.equal(f.calls[1].url, `${baseUrl(id)}/probe`);
+});
+
+test('Install offers identity review only for a positive pre-effect refusal', async () => {
+    const code = 'REBUILD_L2TP_IDENTITY_CHANGED';
+    for (const [data, review] of [
+        [{ error: { code, outcome: 'refused' } }, true],
+        [{ error: { code, outcome: 'unknown' } }, false],
+        [{ error: { code, outcome: 'unknown', retryAllowed: false } }, false],
+        [{ error: { code, outcome: 'refused', retryAllowed: false } }, false],
+        [{ retryAllowed: false, error: { code, outcome: 'refused' } }, false],
+        [{ error: { code } }, false],
+    ]) {
+        const f = launch('reconfirm');
+        f.replies.push({ status: 409, data });
+        f.install.click(); await flush();
+        assert.equal(f.status.textContent, review ? words.admission.identityChanged : words.messages.uncertain);
+        assert.equal(f.review.hidden, !review);
+        assert.equal(f.selected.disabled, !review);
+        assert.ok(f.install.disabled && f.other.disabled && f.account.disabled && !f.refresh.hidden);
+        assert.deepEqual(f.calls.map(({ url }) => url), ['/install']);
+    }
+});
+
+test('admission identity errors unlock only a targeted review and only on an explicit refusal', async () => {
+    const code = 'REBUILD_L2TP_IDENTITY_CHANGED';
+    for (const [phase, review] of [[{ outcome: 'refused' }, true], [{}, false],
+        [{ outcome: 'unknown' }, false], [{ outcome: 'refused', retryAllowed: false }, false]]) {
+        const f = launch('reconfirm');
+        f.replies.push({ status: 409, data: { error: { code, ...phase } } });
+        f.selected.click(); await flush();
+        assert.equal(f.field('status').textContent, review ? words.admission.identityChanged : words.messages.uncertain);
+        f.field('cancel').click();
+        assert.equal(f.review.hidden, !review);
+        assert.equal(f.selected.disabled, !review);
+        assert.ok(f.other.disabled && f.account.disabled && f.install.disabled);
+        assert.equal(f.calls.length, 1);
+    }
+});
+
+test('an ordinary blocked account POST directs the operator to refresh for explicit reconciliation', async () => {
+    const f = launch('reconfirm');
+    f.replies.push({ status: 409, data: { error: { code: 'REBUILD_L2TP_ACCOUNTS_BLOCKED', retryAllowed: false } } });
+    f.account.click(); await flush();
+    assert.equal(f.status.textContent, words.messages.accountReconcileRequired);
+    assert.ok(f.install.disabled && f.selected.disabled && f.account.disabled && f.review.hidden && !f.refresh.hidden);
+    assert.deepEqual(f.calls.map(({ url }) => url), ['/accounts/disable']);
 });
 
 test('revoke needs explicit approval, and a failed verification cannot advance or reuse its challenge', async () => {

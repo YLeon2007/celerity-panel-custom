@@ -52,12 +52,12 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     // Reentry must use the active verifier issued by this service, not an
     // arbitrary callback passed to execute().
     const heldVerifiers=new WeakSet();
-    const guardedLocks = { ...locks, run: fn => locks.run(raw=>checked(raw,async()=>{
+    const guardedLocks = { ...locks, run: fn => locks.run((raw,retain)=>checked(raw,async()=>{
         const verify=async()=>{
             if(!heldVerifiers.has(verify)||await raw()===false||!heldVerifiers.has(verify))throw fail('REBUILD_LOCK_LOST');
         };
         heldVerifiers.add(verify);
-        try{return await fn(verify);}finally{heldVerifiers.delete(verify);}
+        try{return await fn(verify,retain);}finally{heldVerifiers.delete(verify);}
     })) };
     const underApply=(alreadyHeld,fn)=>alreadyHeld===undefined?guardedLocks.run(fn):
         checked(heldVerifiers.has(alreadyHeld)?alreadyHeld:undefined,fn);

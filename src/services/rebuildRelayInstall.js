@@ -1,6 +1,6 @@
 'use strict';
 
-const { AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
+const { AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError } = require('./rebuildRelayInstallTransaction');
 const { classifyInstallFailure, installFailure, requireInstallHostReady,
     checkedInstallId } = require('./rebuildRelayInstallDiagnostics');
 const { IDENTITY_CHANGED, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
@@ -18,7 +18,7 @@ async function runFreshRelayInstall(id, deps) {
     if (typeof id !== 'string' || !/^[a-f0-9]{24}$/.test(id)) throw fail('REBUILD_INVALID_REQUEST');
     let primary, installed = false;
     try {
-        return await deps.lock(async verifyLock => {
+        return await deps.lock(async (verifyLock, retainLock) => {
             let inventory;
             const checkAuthorization = async () => {
                 if (!await deps.authorize()) throw fail('REBUILD_L2TP_INSTALL_DISABLED');
@@ -30,7 +30,7 @@ async function runFreshRelayInstall(id, deps) {
                 if (deps.verifyBinding && await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                 await checkAuthorization();
             };
-            let remote;
+            let remote, unsettled = false;
             try {
                 await checkAuthority();
                 inventory = await deps.inventory(id);
@@ -56,12 +56,14 @@ async function runFreshRelayInstall(id, deps) {
                 let reservation;
                 try { reservation = await deps.reserve(inventory, backupId, checkAuthority); }
                 catch (error) {
+                    unsettled = error instanceof ReservationOutcomeUnknownError || error instanceof AcknowledgedCommitCleanupError;
                     if (isIdentityChanged(error)) throw error;
                     // No host dispatch without both a checked commit and a
                     // clean handoff, even when the reservation is durable.
                     throw fail(error instanceof AcknowledgedCommitCleanupError
                         ? 'REBUILD_L2TP_RESERVATION_CLEANUP_FAILED' : 'REBUILD_L2TP_RESERVATION_FAILED');
                 }
+                unsettled = true;
                 const guard = async () => {
                     await checkAuthority();
                     await deps.verifyReservation(reservation);
@@ -74,6 +76,7 @@ async function runFreshRelayInstall(id, deps) {
                         if (!noHostChanges && await remote.rollback(plan, guard) !== true) throw fail(ROLLBACK_UNKNOWN);
                         await guard();
                         await deps.restore(reservation, checkAuthority);
+                        unsettled = false;
                     } catch (error) {
                         if (isIdentityChanged(error)) throw identityAfterReservation();
                         throw installFailure(error instanceof AcknowledgedCommitCleanupError
@@ -117,13 +120,21 @@ async function runFreshRelayInstall(id, deps) {
                     await deps.finish(reservation, checkAuthority);
                 } catch (error) {
                     if (isIdentityChanged(error)) throw identityAfterReservation();
+                    if (error instanceof AcknowledgedCommitCleanupError) unsettled = false;
                     throw fail(error instanceof AcknowledgedCommitCleanupError
                         ? 'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED' : 'REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN');
                 }
+                unsettled = false;
                 installed = true;
                 return { executionMode: 'rebuild', status: 'installed', nodeId: id };
             } catch (error) {
                 primary = classifyInstallFailure(error);
+                if (deps.unifiedIdentity && unsettled) {
+                    retainLock?.();
+                    primary = installFailure(primary.code, 'unknown', checkedInstallId(primary), { retryAllowed: false });
+                } else if (deps.unifiedIdentity && primary.outcome === 'installed') {
+                    primary = installFailure(primary.code, 'installed', undefined, { retryAllowed: false });
+                }
                 throw primary;
             } finally {
                 if (remote) {
@@ -137,7 +148,9 @@ async function runFreshRelayInstall(id, deps) {
     } catch (error) {
         // Neither transport disposal nor global lock release can reclassify a
         // known or uncertain terminal outcome.
-        throw primary ?? classifyInstallFailure(installed ? fail('REBUILD_L2TP_INSTALLED_CLEANUP_FAILED') : error);
+        throw primary ?? (installed && deps.unifiedIdentity
+            ? installFailure('REBUILD_L2TP_INSTALLED_CLEANUP_FAILED', 'installed', undefined, { retryAllowed: false })
+            : classifyInstallFailure(installed ? fail('REBUILD_L2TP_INSTALLED_CLEANUP_FAILED') : error));
     }
 }
 

@@ -105,7 +105,7 @@ function installFailure(code, outcome, check, { retryAllowed } = {}) {
         check = undefined;
     }
     const error = withInstallCheck(Object.assign(new Error(code), { code, outcome,
-        ...(outcome === 'unknown' && retryAllowed === false && { retryAllowed: false }) }), check);
+        ...(retryAllowed === false && { retryAllowed: false }) }), check);
     failures.add(error);
     return Object.freeze(error);
 }
@@ -114,7 +114,9 @@ function classifyInstallFailure(error) {
     if (failures.has(error)) return error;
     const code = error?.code;
     const outcome = codeOutcomes.get(code);
-    return outcome ? installFailure(code, outcome, checkedInstallId(error)) : installFailure(failed, 'unknown');
+    const retryAllowed = error?.retryAllowed === false ? false : undefined;
+    return installFailure(outcome ? code : failed,
+        error?.outcome === 'unknown' ? 'unknown' : outcome ?? 'unknown', checkedInstallId(error), { retryAllowed });
 }
 
 function publicInstallFailure(error) {

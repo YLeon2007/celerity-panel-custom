@@ -154,6 +154,9 @@ function mountOverview(router, getOverview, exposePanelCsrfToken) {
     router.get(pagePath, (req, _res, next) => req.method === 'GET' ? next() : next('route'),
         requireAuth, exposePanelCsrfToken, requireCompletedOnboarding(sendLoadError), async (req, res) => {
             try {
+                const removalNotice = req.query.view === 'remove-unconfirmed' ? 'uncertain'
+                    : req.query.view === 'remove-cleanup' ? 'removeCleanupFailed' : null;
+                if (removalNotice) return renderPage(res, { removalNotice, relays: [], accounts: [], canManageAccounts: false });
                 const changedRelayId = validNodeId(req.query.identityChanged) ? req.query.identityChanged : null;
                 return renderPage(res, { ...await getOverview().overview(), changedRelayId,
                     reconcileViewOnly: req.query.view === 'only' || changedRelayId !== null });

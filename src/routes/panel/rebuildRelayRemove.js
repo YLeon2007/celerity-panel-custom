@@ -10,6 +10,9 @@ const tickets = new Map();
 const ttl = 120_000;
 const max = 256;
 const required = 'REBUILD_L2TP_REMOVE_CONFIRMATION_REQUIRED';
+const uncertainCodes = new Set(['OUTCOME_UNKNOWN', 'FINISH_OUTCOME_UNKNOWN', 'RESERVATION_OUTCOME_UNKNOWN',
+    'RESERVATION_CLEANUP_FAILED'].map(code => `REBUILD_L2TP_REMOVE_${code}`));
+const removedCleanup = 'REBUILD_L2TP_REMOVED_CLEANUP_FAILED';
 
 function canPreviewRemoval(req) {
     return req.method === 'GET' && !!req.session?.authenticated && !!req.sessionID
@@ -53,6 +56,7 @@ const localizedErrors = Object.freeze({
     REBUILD_L2TP_REMOVE_COUNT_UNAVAILABLE: 'nodes.rebuildRemoveCountUnavailable',
     REBUILD_L2TP_REMOVE_SESSIONS_BUSY: 'nodes.rebuildRemoveBusy',
     REBUILD_L2TP_REMOVE_IPSEC_BUSY: 'nodes.rebuildRemoveIpsecBusy',
+    REBUILD_L2TP_ACCOUNTS_BLOCKED: 'rebuildL2tp.admission.blocked',
     [grantConflict]: 'rebuildL2tp.admission.grantConflict',
     [grantUnavailable]: 'rebuildL2tp.admission.grantUnavailable',
 });
@@ -68,14 +72,22 @@ async function handleRemoval(req, res, decision) {
     const invalid = () => res.status(400).json({ error: { code: 'REBUILD_INVALID_REQUEST' } });
     const nodeUrl = `/panel/nodes/${id}`;
     const html = req.accepts(['json', 'html']) === 'html';
-    const conflict = code => {
+    const conflict = (code, error) => {
+        const status = grantEffectStatus(code) ?? 409;
+        const outcome = uncertainCodes.has(code) || error?.outcome === 'unknown' ? 'unknown'
+            : code === removedCleanup ? 'removed' : code === identityChanged && error?.retryAllowed === false ? 'unknown' : undefined;
+        if (outcome) {
+            if (html) return res.redirect(303, `/panel/l2tp?view=${outcome === 'unknown' ? 'remove-unconfirmed' : 'remove-cleanup'}`);
+            return res.status(status).json({ error: { code, outcome, retryAllowed: false } });
+        }
         if (html && code === identityChanged) return res.redirect(303, identityReviewUrl(id));
         if (html && res.locals.t) {
             const key = localizedErrors[code] ?? (grantEffectStatus(code) === 503 ? localizedErrors[grantUnavailable]
                 : grantEffectStatus(code) === 409 ? localizedErrors[grantConflict] : 'nodes.rebuildRemoveFailed');
             return res.redirect(303, `${nodeUrl}?error=${encodeURIComponent(`${res.locals.t(key)} (${code})`)}`);
         }
-        return res.status(grantEffectStatus(code) ?? 409).json({ error: { code } });
+        return res.status(status).json({ error: { code, ...(code === identityChanged && { outcome: 'refused' }),
+            ...(error?.retryAllowed === false && { retryAllowed: false }) } });
     };
     res.set('Cache-Control', 'no-store');
     if (!validNodeId(id) || Object.keys(req.query || {}).length
@@ -95,7 +107,7 @@ async function handleRemoval(req, res, decision) {
         return html ? res.redirect(303, nodeUrl) : res.json({ executionMode: 'rebuild', status: 'not_installed', nodeId: id });
     } catch (error) {
         const code = publicCodes.has(error?.code) || grantEffectStatus(error?.code) ? error.code : 'REBUILD_L2TP_REMOVE_FAILED';
-        return conflict(code);
+        return conflict(code, error);
     }
 }
 

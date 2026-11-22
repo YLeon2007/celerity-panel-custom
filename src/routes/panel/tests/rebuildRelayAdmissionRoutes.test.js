@@ -246,7 +246,7 @@ test('install, remove and accounts return stable grant errors without internal d
     error = refuse(identityCode);
     assert.equal(checked(await send(installPath), 409).error.code, identityCode);
     assert.deepEqual(checked(await send('/panel/rebuild/relays/l2tp/accounts/disable', { body: { login: 'fixture' } }), 409),
-        { error: { code: identityCode, retryAllowed: false, nodeId: id } });
+        { error: { code: identityCode, outcome: 'refused', nodeId: id } });
     const mode = process.env.C3_REBUILD_ENABLED;
     process.env.C3_REBUILD_ENABLED = 'true';
     t.after(() => { if (mode === undefined) delete process.env.C3_REBUILD_ENABLED; else process.env.C3_REBUILD_ENABLED = mode; });
@@ -255,6 +255,17 @@ test('install, remove and accounts return stable grant errors without internal d
         body: { decision: 'confirm', ticket: preview() } });
     assert.equal(html.status, 303);
     assert.equal(html.headers.location, `/panel/l2tp?identityChanged=${id}#relay-${id}`);
+    for (const phase of [{ outcome: 'unknown' }, { outcome: 'refused', retryAllowed: false }]) {
+        error = Object.assign(refuse(identityCode), phase);
+        const envelope = { error: { code: identityCode, outcome: 'unknown', retryAllowed: false } };
+        assert.deepEqual(checked(await send(installPath), 409), envelope);
+        assert.deepEqual(checked(await send('/panel/rebuild/relays/l2tp/accounts/disable', { body: { login: 'fixture' } }), 409), envelope);
+        assert.deepEqual(checked(await send(removalPath, { body: { decision: 'confirm', ticket: preview() } }), 409), envelope);
+        const blocked = await send(removalPath, { headers: { 'content-type': 'application/json', accept: 'text/html' },
+            body: { decision: 'confirm', ticket: preview() } });
+        assert.equal(blocked.status, 303);
+        assert.equal(blocked.headers.location, '/panel/l2tp?view=remove-unconfirmed');
+    }
     error = refuse(registryCode);
     assert.deepEqual(checked(await send(removalPath, { body: { decision: 'confirm', ticket: preview() } }), 503),
         { error: { code: registryCode } });

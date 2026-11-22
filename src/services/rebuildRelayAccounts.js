@@ -30,7 +30,9 @@ const address = n => [24, 16, 8, 0].map(shift => (n >>> shift) & 255).join('.');
 const by = key => (a, b) => String(a[key]).localeCompare(String(b[key]));
 const safe = e => e instanceof RelayAccountsError ? e
     : ['REBUILD_BUSY', 'REBUILD_LOCK_LOST'].includes(e?.code) || isIdentityChanged(e) || isGrantAuthorityError(e)
-        ? Object.assign(new Error(e.code), { code: e.code, ...(e.retryAllowed === false && { retryAllowed: false }) })
+        ? Object.assign(new Error(e.code), { code: e.code, ...(e.retryAllowed === false && { retryAllowed: false }),
+            ...(e.outcome === 'unknown' && { outcome: 'unknown' }),
+            ...(isIdentityChanged(e) && matches(idPattern, e.nodeId) && { nodeId: e.nodeId }) })
         : fail('FAILED');
 
 function installedIds(states) {
@@ -368,6 +370,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                             const total = sessionsTerminated + synced.sessionsTerminated;
                             if (!Number.isSafeInteger(total)) throw fail(phase);
                             sessionsTerminated = total;
+                            if (!synced.complete && relayGrantStore) throw fail(phase);
                             if (!synced.complete) incompleteNodeId ??= uncertainNodeId;
                         }
                         if (!revokedLogin || synced.complete) confirmedNodeIds.add(uncertainNodeId);
@@ -441,6 +444,10 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                     const pending = await store.pending();
                     await authority();
                     if (pending !== null) {
+                        // Registry-backed writers cannot adopt old work on an
+                        // ordinary POST. Current grants may no longer name the
+                        // cohort recorded in the pending intent.
+                        if (action && relayGrantStore) throw fail('BLOCKED', { retryAllowed: false });
                         const recovered = await recover(pending, key, authority, { action, login, password });
                         completed = true;
                         if (!action || recovered.matching) return recovered.result;
@@ -527,8 +534,9 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                                     if (!Number.isSafeInteger(total)) throw fail(phase);
                                     sessionsTerminated = total;
                                     if (!synced.complete) {
-                                        // The command reached a checked terminal frame, but this relay is not settled.
-                                        // Keep its intent and still revoke on the other independently pinned relays.
+                                        if (relayGrantStore) throw fail(phase);
+                                        // Preserve the standalone ENV fan-out
+                                        // of terminal-but-incomplete revocations.
                                         incompleteNodeId ??= uncertainNodeId;
                                         uncertainNodeId = undefined;
                                         continue;

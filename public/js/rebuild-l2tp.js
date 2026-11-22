@@ -146,9 +146,12 @@
         ['REBUILD_BUSY', 'blocked'], ['REBUILD_LOCK_LOST', 'blocked'],
     ]);
     const accountBlocks = new Map([
+        ['REBUILD_L2TP_ACCOUNTS_BLOCKED', 'accountReconcileRequired'],
         ['REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK', 'reconcileManualBlock'],
         ['REBUILD_L2TP_ACCOUNTS_PRE_EFFECT_BLOCKED', 'accountPreEffectBlocked'],
     ]);
+    const unknownOutcome = data => data?.outcome === 'unknown' || data?.error?.outcome === 'unknown';
+    const noRetry = data => unknownOutcome(data) || data?.retryAllowed === false || data?.error?.retryAllowed === false;
     function conflictNote(conflict) {
         const { field, sources } = conflict ?? {};
         const labels = admissionWords.conflictFields;
@@ -159,8 +162,8 @@
             ? ` ${admissionWords.conflictSources.replace('{sources}', sources.map(source => source.toUpperCase()).join(', '))}` : '';
         return fieldNote + sourceNote;
     }
-    const canReview = button => identityReview && button.dataset.admissionAction === 'reconfirm'
-        && (reviewId === null || button.dataset.nodeId === reviewId);
+    const canReview = button => identityReview && reviewId !== null && button.dataset.admissionAction === 'reconfirm'
+        && button.dataset.nodeId === reviewId;
 
     function updateMutations() {
         const locked = busy || !!flow || requireRefresh;
@@ -241,7 +244,8 @@
                 const body = action === 'verify' || action === 'confirm' ? { challenge: current.identity.challenge } : {};
                 const { response, data } = await post(`${current.url}/${action}`, body);
                 if (current !== flow) return;
-                if (response.ok && matchesReceipt(current, action, data)) {
+                const blocked = noRetry(data);
+                if (response.ok && !blocked && matchesReceipt(current, action, data)) {
                     if (mutating) {
                         requireRefresh = true;
                         identityReview = false;
@@ -255,15 +259,20 @@
                     }
                     return;
                 }
-                if (!response.ok) {
+                if (response.ok && blocked) {
+                    errorText = words.uncertain;
+                    stale = true;
+                } else if (!response.ok) {
                     const code = data?.error?.code, key = admissionErrors.get(code);
-                    stale = data?.error?.retryAllowed === false || code === 'REBUILD_L2TP_ACCOUNTS_BLOCKED'
+                    const reviewable = key === 'identityChanged' && response.status === 409 && data.error.outcome === 'refused';
+                    stale = blocked || (key === 'identityChanged' && !reviewable) || code === 'REBUILD_L2TP_ACCOUNTS_BLOCKED'
                         || code === 'REBUILD_LOCK_LOST' || (mutating && (response.status >= 500 || response.status === 408));
-                    if (response.status === 429) errorText = words.rateLimited;
+                    if (unknownOutcome(data) || (key === 'identityChanged' && stale)) errorText = words.uncertain;
+                    else if (response.status === 429) errorText = words.rateLimited;
                     else if (key) {
                         errorText = admissionWords[key];
                         if (code === 'REBUILD_L2TP_GRANT_CONFLICT') errorText += conflictNote(data.error.conflict);
-                        if (key === 'identityChanged') {
+                        if (reviewable) {
                             errorText += markIdentityReview(current.nodeId);
                             status.textContent = errorText;
                         }
@@ -367,7 +376,9 @@
         const revocation = action === 'disable' || action === 'delete';
         try {
             const { response, data } = await post(url, body);
-            if (response.ok) {
+            const { code, outcome, check } = data?.error ?? {};
+            const blocked = noRetry(data);
+            if (response.ok && !blocked) {
                 const canceled = action !== 'install' && data?.status === 'canceled' && data.recovered === true
                     && (!revocation || (data.sessionsTerminated === 0 && data.sessionsTerminatedScope === 'request'));
                 if (data?.executionMode === 'rebuild' && (data.status === expected[action] || canceled) && match(data)) {
@@ -377,20 +388,22 @@
                     if (revocation && data.recovered === true) note = closureNote(data, data.sessionsTerminated);
                     clearSecrets();
                 }
-            } else if (action !== 'install' && response.status === 409 && data?.error?.retryAllowed === false
-                && accountBlocks.has(data.error.code)) {
-                result = accountBlocks.get(data.error.code);
+            } else if (response.status === 409 && blocked && !unknownOutcome(data) && accountBlocks.has(code)) {
+                result = accountBlocks.get(code);
                 requireRefresh = true;
                 clearSecrets();
-            } else if (effectErrors.has(data?.error?.code)) {
-                result = effectErrors.get(data.error.code);
+            } else if (code === 'REBUILD_L2TP_IDENTITY_CHANGED') {
+                if (response.status === 409 && !blocked && outcome === 'refused') {
+                    result = 'identityChanged';
+                    note = markIdentityReview(nodeId ?? data.error.nodeId);
+                }
+            } else if (!unknownOutcome(data) && effectErrors.has(code)) {
+                result = effectErrors.get(code);
                 requireRefresh = true;
-                if (result === 'identityChanged') note = markIdentityReview(nodeId ?? data.error.nodeId);
-                else clearSecrets();
+                clearSecrets();
             } else if (action === 'install' && response.status === 409) {
                 // Only show local copy; raw codes, exceptions and detail fields are never rendered.
-                const { outcome, check } = data?.error ?? {};
-                if ((outcome === 'unknown' || (data?.retryAllowed !== false && data?.error?.retryAllowed !== false))
+                if ((!blocked || outcome === 'unknown' || (outcome === 'installed' && !unknownOutcome(data)))
                     && installOutcomes.has(outcome)
                     && (check === undefined || (typeof check === 'string' && Object.hasOwn(installChecks, check)))) {
                     result = installOutcomes.get(outcome);
@@ -400,8 +413,7 @@
                         clearSecrets();
                     }
                 }
-            } else if (data?.retryAllowed !== false && data?.error?.retryAllowed !== false
-                && response.status !== 408 && response.status < 500) {
+            } else if (!blocked && response.status !== 408 && response.status < 500) {
                 result = response.status === 429 ? 'rateLimited' : 'requestFailed';
             } else if (revocation && data?.error?.retryAllowed === false) {
                 note = closureNote(data.error, data.error.confirmedSessionsTerminated);
@@ -409,6 +421,7 @@
         } catch { /* A lost response is not proof that the mutation failed. */ }
         if (result === 'uncertain') {
             requireRefresh = true;
+            identityReview = false;
             clearSecrets();
         }
         status.textContent = (words[result] ?? admissionWords[result]) + note;

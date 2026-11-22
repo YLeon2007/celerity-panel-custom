@@ -103,8 +103,11 @@ function mountAdmission(router, service, { requireSessionId, checkCsrf, requireC
             const status = grantEffectStatus(code) ?? errorStatuses.get(code);
             if (!status) return errorResponse(res, 503, unavailable);
             const conflict = code === grantConflict ? publicConflict(error) : undefined;
+            const identityRefused = code === identityChanged && error.outcome === 'refused' && error.retryAllowed !== false;
             return res.status(status).json({ error: { code, ...(conflict && { conflict }),
-                ...(refreshCodes.has(code) && { retryAllowed: false }) } });
+                ...(identityRefused && { outcome: 'refused' }),
+                ...(error?.outcome === 'unknown' && { outcome: 'unknown' }),
+                ...((refreshCodes.has(code) || error?.retryAllowed === false || error?.outcome === 'unknown') && { retryAllowed: false }) } });
         }
     });
     router.all(admissionPath, (_req, res) => errorResponse(res.set('Allow', 'POST'), 405, 'METHOD_NOT_ALLOWED'));

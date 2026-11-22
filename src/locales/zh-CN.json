@@ -252,7 +252,9 @@
   "rebuildL2tp": {
     "messages": {
       "reconcileManualBlock": "当前中继身份不允许继续核对。未完成的记录已保留，供人工排查。请勿重试变更、重新确认授权或编辑该记录。",
-      "accountPreEffectBlocked": "此请求未在中继上启动写入。账户操作意图已记录；请重新加载 L2TP 数据核实其状态。请勿重新提交变更。"
+      "accountPreEffectBlocked": "此请求未在中继上启动写入。账户操作意图已记录；请重新加载 L2TP 数据核实其状态。请勿重新提交变更。",
+      "accountReconcileRequired": "先前的账户变更尚未完成。此请求未做任何更改。请重新加载 L2TP 数据，并在可用时单独执行核对操作；请勿重新提交此请求。",
+      "removeCleanupFailed": "L2TP 已移除，但无法确认清理已完成。请勿重复移除。请重新加载数据并核实当前状态。"
     },
     "admission": {
       "label": "L2TP 准入",

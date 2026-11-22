@@ -481,6 +481,40 @@ function withDbGrants(f) {
     return grants;
 }
 
+test('admitted ordinary account mutations cannot settle a pending write, even with the original credentials', async () => {
+    let loseAcknowledgement = true;
+    const f = fixture({ fault(step, id) {
+        if (loseAcknowledgement && step === 'sync' && id === B) throw Error('lost acknowledgement');
+    } });
+    withDbGrants(f);
+    await assert.rejects(f.restart().create(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false });
+    loseAcknowledgement = false;
+    const pending = structuredClone(f.pending), users = structuredClone(f.users), hosts = structuredClone(f.hosts);
+    f.events.length = 0;
+    for (const [action, input] of [['create', credentials], ['create', { ...credentials, login: neighbor }],
+        ['disable', { login: credentials.login }], ['delete', { login: neighbor }]]) {
+        await assert.rejects(f.restart()[action](input), { ...code('BLOCKED'), retryAllowed: false });
+    }
+    assert.ok(f.events.every(event => ['lock', 'pending'].includes(event)), 'nothing beyond the locked pending read');
+    assert.deepEqual([f.pending, f.users, f.hosts], [pending, users, hosts]);
+    f.events.length = 0;
+    assert.equal((await f.restart().reconcile()).status, 'created');
+    assert.deepEqual(recoveryEffects(f), [...fencePass, `sync:${B}`, ...reads, 'publish']);
+    assert.equal(f.pending, undefined);
+    assert.equal((await f.restart().create({ ...credentials, login: neighbor })).status, 'created');
+});
+
+test('admitted account revocation stops dispatch on a checked but incomplete relay', async () => {
+    const f = fixture({ shared: true, fault(step, id) {
+        if (step === 'sync' && id === A) return { changed: true, complete: false, sessionsTerminated: 1 };
+    } });
+    withDbGrants(f);
+    await assert.rejects(f.restart().disable(credentials), { ...code('OUTCOME_UNKNOWN'), retryAllowed: false,
+        confirmedNodeIds: [], confirmedSessionsTerminated: 1, uncertainNodeId: A });
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`]);
+    assert.ok(f.pending);
+});
+
 test('identity loss after A blocks B, retains the exact intent and reports uncertainty; manual recovery only converges B', async () => {
     let grants, originalIntent;
     const f = fixture({ fault(step, id, state) {

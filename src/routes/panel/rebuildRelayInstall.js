@@ -17,14 +17,19 @@ function handler(service = () => require('../../services/rebuildService').create
             }
             return res.json({ executionMode: 'rebuild', status: 'installed', nodeId: req.params.id });
         } catch (error) {
+            const failure = publicInstallFailure(error);
             const code = error?.code;
             const status = grantEffectStatus(code);
             if (status) {
-                const { outcome } = publicInstallFailure(error);
+                if (code === identityChanged) {
+                    const refusal = failure.outcome === 'refused' && failure.retryAllowed !== false;
+                    return res.status(status).json({ error: { code, outcome: refusal ? 'refused' : 'unknown',
+                        ...(!refusal && { retryAllowed: false }) } });
+                }
                 return res.status(status).json({ error: { code, retryAllowed: false,
-                    ...(code === identityChanged && { outcome: outcome === 'refused' ? 'refused' : 'unknown' }) } });
+                    ...(error?.outcome === 'unknown' && { outcome: 'unknown' }) } });
             }
-            return res.status(409).json({ error: publicInstallFailure(error) });
+            return res.status(409).json({ error: failure });
         }
     };
 }

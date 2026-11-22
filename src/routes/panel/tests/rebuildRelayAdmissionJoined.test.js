@@ -84,6 +84,7 @@ function mongoFixture(t) {
         }
         return copy(result);
     };
+    const faults = {};
     class Session {
         transaction = { transition: state => {
             assert.equal(state, 'TRANSACTION_COMMITTED');
@@ -102,11 +103,16 @@ function mongoFixture(t) {
             if (this.modified.has(GRANTS)) assert.deepEqual([...this.modified], [GRANTS, AUDIT]);
             commits.push([kind, ...this.modified]);
             for (const name of this.modified) tables.set(name, this.view.get(name));
+            faults.afterCommit?.(this.modified);
+            this.committed = true;
             return { ok: 1 };
         }
 
         async abortTransaction() { this.view = null; }
-        async endSession() { assert.equal(this.inTransaction(), false); }
+        async endSession() {
+            assert.equal(this.inTransaction(), false);
+            if (this.committed) faults.afterAcknowledgedCommit?.(this.modified);
+        }
     }
     const collection = name => {
         assert.ok(tables.has(name), `Unexpected fixture collection: ${name}`);
@@ -142,11 +148,15 @@ function mongoFixture(t) {
                 const row = rows(session).find(candidate => match(candidate, where));
                 return row ? project(row, projection) : null;
             },
+            async countDocuments(where) { return rows().filter(row => match(row, where)).length; },
             async insertOne(row, options) {
                 return write(data => {
                     if (name === GRANTS) {
                         assert.ok(options.session);
                         assert.deepEqual(grantIndexes, [['nodeId'], ['machineId'], ['sshHostKeySha256'], ['host', 'port']]);
+                    }
+                    if (name === LOCK && data.some(other => other._id === row._id)) {
+                        throw Object.assign(new Error('duplicate fixture lock'), { code: 11000 });
                     }
                     assert.ok(row._id === undefined || !data.some(other => equal(other._id, row._id)));
                     data.push(copy(row));
@@ -179,8 +189,11 @@ function mongoFixture(t) {
                     if (selected.length) {
                         if (update.$set) Object.assign(selected[0], copy(update.$set));
                         for (const key of Object.keys(update.$unset ?? {})) delete selected[0][key];
-                    } else if (options.upsert) data.push(copy({ ...where, ...update.$setOnInsert }));
-                    return { acknowledged: true, matchedCount: selected.length, upsertedCount: Number(!selected.length && options.upsert) };
+                    } else if (options.upsert) {
+                        const equality = Object.fromEntries(Object.entries(where).filter(([k, v]) => !k.startsWith('$') && (v === null || typeof v !== 'object')));
+                        data.push(copy({ ...equality, ...update.$setOnInsert }));
+                    }
+                    return { acknowledged: true, matchedCount: selected.length, upsertedCount: Number(!selected.length && !!options.upsert) };
                 }, options);
             },
             async deleteOne(where, options) {
@@ -216,7 +229,7 @@ function mongoFixture(t) {
             return session.commit();
         } };
     } }));
-    return { rows: name => tables.get(name).map(copy), commits, writes: () => writes.splice(0), password };
+    return { rows: name => tables.get(name).map(copy), commits, writes: () => writes.splice(0), password, faults };
 }
 
 function hostFixture(t, mongo) {
@@ -255,11 +268,25 @@ function hostFixture(t, mongo) {
             installedId = req.backupId;
             chapLogins = ['relay-bootstrap'];
             remote.effects.push(req.action);
+            if (remote.loseInstallReply) return { status: 255, stdout: '', stderr: '' };
             break;
         case 'verify':
             assert.equal(req.backupId, installedId);
             assert.equal(mongo.rows(STATES)[0].status, 'installing');
             break;
+        case 'session-count': return ok({ activeSessions: 0, activeIpsec: 0, census: 'd'.repeat(64) });
+        case 'prepare-remove': return ok({ ok: true, backupId: installedId, machineId, baseline: 'd'.repeat(64) });
+        case 'remove':
+            assert.equal(mongo.rows(STATES)[0].status, 'removing');
+            assert.equal(req.backupId, installedId);
+            remote.effects.push(req.action);
+            return remote.loseRemoveReply ? { status: 255, stdout: '', stderr: '' }
+                : ok({ ok: true, backupId: installedId, removed: true });
+        case 'check-chap': return ok({ ok: true, backupId: installedId, changed: true });
+        case 'sync-chap':
+            assert.ok(mongo.rows(DIRECTORY).some(row => row._id === 'pending'));
+            remote.effects.push(req.action);
+            return { status: 255, stdout: '', stderr: '' };
         case 'check-apply-network': {
             const [state] = mongo.rows(STATES);
             assert.equal(state.status, 'installed');
@@ -388,14 +415,16 @@ function mount(panel, mongo) {
     app.use('/panel', panel.createPanelRouter());
     const session = { authenticated: true, adminUsername: actor };
     const csrf = issuePanelCsrfToken({ session });
-    const send = (action, body = {}, { csrfToken = csrf, expected = 200, id = nodeId } = {}) => new Promise((resolve, reject) => {
+    const send = (action, body = {}, { csrfToken = csrf, expected = 200, id = nodeId, html = false } = {}) => new Promise((resolve, reject) => {
         const payload = Buffer.from(JSON.stringify(body)), wire = [];
         const socket = new Duplex({ read() {}, write(chunk, _, done) { wire.push(chunk.toString()); done(); } });
         socket.remoteAddress = '192.0.2.10';
         const req = new IncomingMessage(socket);
         const path = action.startsWith('accounts/') ? 'l2tp' : `${id}/l2tp`;
-        Object.assign(req, { method: 'POST', url: `/panel/rebuild/relays/${path}/${action}`, session, sessionID, complete: true, headers: {
+        const url = action.startsWith('/') ? action : `/panel/rebuild/relays/${path}/${action}`;
+        Object.assign(req, { method: 'POST', url, session, sessionID, complete: true, headers: {
             host: 'panel.fixture.invalid', 'content-type': 'application/json', 'content-length': String(payload.length), 'x-csrf-token': csrfToken,
+            ...(html && { accept: 'text/html' }),
         } });
         req.push(payload);
         req.push(null);
@@ -408,14 +437,20 @@ function mount(panel, mongo) {
                 const raw = wire.join('');
                 assert.ok([sshPassword, mongo.password, privateError, sessionID, csrf].every(secret => !raw.includes(secret)), 'redacted HTTP response');
                 assert.equal(res.getHeader('cache-control'), 'no-store');
-                const result = JSON.parse(raw.slice(raw.indexOf('\r\n\r\n') + 4));
-                assert.equal(res.statusCode, expected, `${action}: ${result.error?.code ?? 'unexpected response'}`);
+                const result = html ? res.getHeader('location') : JSON.parse(raw.slice(raw.indexOf('\r\n\r\n') + 4));
+                assert.equal(res.statusCode, expected, `${action}: ${result?.error?.code ?? 'unexpected response'}`);
                 resolve(result);
             } catch (error) { reject(error); }
         });
         app(req, res);
     });
-    return { send, session, admission: (action, ...args) => send(`admission/${action}`, ...args) };
+    const preview = async () => {
+        const estimate = await require('../../../services/rebuildService').createRebuildService().previewRemoveRelay(nodeId);
+        assert.equal(estimate.confirmable, true);
+        return require('../rebuildRelayRemove').issueRemovalTicket({ method: 'GET', headers: {}, session, sessionID,
+            params: { id: nodeId } }, estimate);
+    };
+    return { send, session, preview, admission: (action, ...args) => send(`admission/${action}`, ...args) };
 }
 
 function audit(mongo, expected) {
@@ -490,7 +525,7 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
     // Install must recheck the confirmed machine, not just trust the saved grant.
     f.remote.machineId = 'c'.repeat(32);
     assert.deepEqual(await f.send('install', {}, { expected: 409 }), {
-        error: { code: CHANGED, outcome: 'refused', retryAllowed: false },
+        error: { code: CHANGED, outcome: 'refused' },
     });
     assert.deepEqual(f.frames, [], 'changed machine received no DIRECT payload');
     assert.deepEqual(f.mongo.writes(), [LOCK, LOCK]);
@@ -522,6 +557,123 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
     assert.deepEqual(f.remote.effects, ['install']);
     assert.deepEqual(f.remote.checks, checks);
     audit(f.mongo, [ok('probe'), ok('verify'), ok('grant'), ['confirm', 'denied', CHALLENGE], ['revoke', 'denied', CONFLICT]]);
+});
+
+for (const cut of ['lost reservation acknowledgement', 'identity after reservation', 'lost host reply', 'lost finish acknowledgement',
+    'reservation cleanup failure', 'finish cleanup failure']) {
+    test(`admitted Install reports its phase without replay: ${cut}`, { timeout: 5000 }, async t => {
+        const f = joined(t);
+        await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+        const identity = cut === 'identity after reservation';
+        const lostReservation = cut === 'lost reservation acknowledgement';
+        const lostFinish = cut === 'lost finish acknowledgement';
+        const reservationCleanup = cut === 'reservation cleanup failure', finishCleanup = cut === 'finish cleanup failure';
+        const noDispatch = identity || lostReservation || reservationCleanup;
+        const finished = lostFinish || finishCleanup;
+        f.mongo.faults.afterCommit = modified => {
+            if (modified.has(STATES) && modified.has(USERS) && !modified.has(DIRECTORY)) {
+                if (identity) f.remote.machineId = 'c'.repeat(32);
+                if (lostReservation) throw Error(privateError);
+            }
+            if (lostFinish && modified.has(DIRECTORY)) throw Error(privateError);
+        };
+        f.mongo.faults.afterAcknowledgedCommit = modified => {
+            if ((reservationCleanup && modified.has(STATES) && !modified.has(DIRECTORY))
+                || (finishCleanup && modified.has(DIRECTORY))) throw Error(privateError);
+        };
+        f.remote.loseInstallReply = cut === 'lost host reply';
+        const code = identity ? CHANGED : lostReservation ? 'REBUILD_L2TP_RESERVATION_FAILED'
+            : lostFinish ? 'REBUILD_L2TP_FINISH_OUTCOME_UNKNOWN' : reservationCleanup ? 'REBUILD_L2TP_RESERVATION_CLEANUP_FAILED'
+                : finishCleanup ? 'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED' : 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN';
+        assert.deepEqual(await f.send('install', {}, { expected: 409 }), {
+            error: { code, outcome: finishCleanup ? 'installed' : 'unknown', retryAllowed: false },
+        });
+        assert.deepEqual(f.remote.effects, noDispatch ? [] : ['install']);
+        assert.equal(f.mongo.rows(STATES)[0].status, finished ? 'installed' : 'installing');
+        assert.equal(f.mongo.rows(USERS)[0].syncStatus, finished ? 'synced' : 'pending');
+        const names = [LOCK, STATES, USERS, DIRECTORY];
+        const before = names.map(f.mongo.rows), frames = [...f.frames];
+        assert.equal(before[0].length, finishCleanup ? 0 : 1);
+        assert.equal((await f.send('install', {}, { expected: 409 })).error.code,
+            finishCleanup ? 'REBUILD_L2TP_NOT_FRESH_RELAY' : 'REBUILD_BUSY');
+        assert.deepEqual(names.map(f.mongo.rows), before);
+        assert.deepEqual(f.frames, frames);
+    });
+}
+
+for (const cut of ['identity before reservation', 'identity after reservation', 'lost host reply', 'lost reservation acknowledgement',
+    'lost finish acknowledgement', 'reservation cleanup failure', 'finish cleanup failure', 'success']) {
+    test(`admitted Remove reports its phase without replay: ${cut}`, { timeout: 5000 }, async t => {
+        const f = joined(t);
+        await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+        await f.send('install');
+        const ticket = await f.preview(), secondTicket = await f.preview();
+        const beforeAccounts = f.mongo.rows(USERS);
+        const pre = cut === 'identity before reservation', identity = cut === 'identity after reservation';
+        const lostReservation = cut === 'lost reservation acknowledgement', lostFinish = cut === 'lost finish acknowledgement';
+        const reservationCleanup = cut === 'reservation cleanup failure', finishCleanup = cut === 'finish cleanup failure';
+        const success = cut === 'success', finished = success || lostFinish || finishCleanup;
+        if (pre) f.remote.machineId = 'c'.repeat(32);
+        f.mongo.faults.afterCommit = modified => {
+            const state = f.mongo.rows(STATES)[0].status;
+            if (modified.has(STATES) && state === 'removing') {
+                if (identity) f.remote.machineId = 'c'.repeat(32);
+                if (lostReservation) throw Error(privateError);
+            }
+            if (lostFinish && modified.has(STATES) && state === 'not_installed') throw Error(privateError);
+        };
+        f.mongo.faults.afterAcknowledgedCommit = modified => {
+            const state = f.mongo.rows(STATES)[0].status;
+            if (modified.has(STATES) && ((reservationCleanup && state === 'removing')
+                || (finishCleanup && state === 'not_installed'))) throw Error(privateError);
+        };
+        f.remote.loseRemoveReply = cut === 'lost host reply';
+        if (lostReservation || lostFinish || reservationCleanup) {
+            const code = reservationCleanup ? 'RESERVATION_CLEANUP_FAILED'
+                : lostReservation ? 'RESERVATION_OUTCOME_UNKNOWN' : 'FINISH_OUTCOME_UNKNOWN';
+            assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket }, { expected: 409 }), {
+                error: { code: `REBUILD_L2TP_REMOVE_${code}`, outcome: 'unknown', retryAllowed: false },
+            });
+        } else {
+            assert.equal(await f.send('remove', { decision: 'confirm', ticket }, { expected: 303, html: true }), pre
+                ? `/panel/l2tp?identityChanged=${nodeId}#relay-${nodeId}` : success ? `/panel/nodes/${nodeId}`
+                    : finishCleanup ? '/panel/l2tp?view=remove-cleanup' : '/panel/l2tp?view=remove-unconfirmed');
+        }
+        assert.deepEqual(f.remote.effects, pre || identity || lostReservation || reservationCleanup ? ['install'] : ['install', 'remove']);
+        assert.deepEqual(f.mongo.rows(USERS), finished ? [] : beforeAccounts);
+        assert.equal(f.mongo.rows(STATES)[0].status, pre ? 'installed' : finished ? 'not_installed' : 'removing');
+        assert.equal(f.mongo.rows(LOCK).length, pre || success || finishCleanup ? 0 : 1);
+        if (!pre && !success && !finishCleanup) {
+            const saved = f.mongo.rows(LOCK), frames = [...f.frames];
+            assert.equal((await f.send('remove', { decision: 'confirm', ticket: secondTicket }, { expected: 409 })).error.code, 'REBUILD_BUSY');
+            assert.deepEqual(f.mongo.rows(LOCK), saved);
+            assert.deepEqual(f.frames, frames);
+        }
+    });
+}
+
+test('admitted account POSTs leave a prior uncertain intent untouched', { timeout: 5000 }, async t => {
+    const f = joined(t);
+    await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+    await f.send('install');
+    const path = '/panel/rebuild/relays/l2tp/accounts';
+    const credentials = { login: 'fixture-new', password: 'fixture-password' };
+    assert.deepEqual(await f.send(`${path}/create`, credentials, { expected: 409 }), {
+        error: { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', retryAllowed: false },
+    });
+    assert.deepEqual(f.remote.effects, ['install', 'sync-chap']);
+    const read = () => [DIRECTORY, STATES, USERS, LOCK].map(f.mongo.rows);
+    const before = read(), frames = [...f.frames], commits = [...f.mongo.commits];
+    assert.equal(before[0].filter(row => row._id === 'pending').length, 1);
+    assert.deepEqual(before.at(-1), []);
+    for (const [action, input] of [['create', credentials], ['disable', { login: 'another-fixture' }]]) {
+        assert.deepEqual(await f.send(`${path}/${action}`, input, { expected: 409 }), {
+            error: { code: 'REBUILD_L2TP_ACCOUNTS_BLOCKED', retryAllowed: false },
+        });
+        assert.deepEqual(read(), before);
+        assert.deepEqual(f.frames, frames);
+        assert.deepEqual(f.mongo.commits, commits);
+    }
 });
 
 test('installed pin rotation checks the original receipt, commits only grant and audit, and leaves host state alone', { timeout: 5000 }, async t => {
@@ -568,7 +720,7 @@ for (const mismatch of ['key', 'machineId', 'error']) {
         const expected = mismatch === 'error' ? 503 : 409;
         const result = await f.confirm(verified, expected);
         const code = mismatch === 'error' ? 'REBUILD_L2TP_IDENTITY_UNAVAILABLE' : CHANGED;
-        assert.deepEqual(result, refused(code));
+        assert.deepEqual(result, mismatch === 'error' ? refused(code) : { error: { code, outcome: 'refused' } });
         assert.deepEqual(await f.confirm(verified, 409), refused(CHALLENGE));
         assert.deepEqual(f.remote.checks.slice(3), mismatch === 'key' ? ['key-only'] : ['pinned', 'machine']);
         assert.deepEqual(f.mongo.writes(), [LOCK, LOCK, AUDIT, AUDIT]);

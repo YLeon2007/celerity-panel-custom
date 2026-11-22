@@ -1927,6 +1927,8 @@
       "reconcileStillPending": "The operation is still pending. No automatic retry will be made.",
       "reconcileManualBlock": "Reconciliation cannot proceed with the current relay identity. The pending record is retained for manual investigation. Do not retry the change, reconfirm the grant, or edit the pending record.",
       "accountPreEffectBlocked": "This request did not start any relay writes. An account intent was recorded; reload L2TP data to verify its status. Do not resubmit the change.",
+      "accountReconcileRequired": "A previous account change is pending. This request made no changes. Reload L2TP data and use the separate reconciliation action if available; do not resubmit this request.",
+      "removeCleanupFailed": "L2TP removal completed, but cleanup could not be confirmed. Do not repeat removal. Reload the data and verify the current state.",
       "reconcileInspectionUnproved": "Inspection did not establish a safe outcome. The operation remains pending and controls stay locked. Do not retry blindly or edit the database.",
       "reconcileHostInspection": "The relay could not complete the inspection.",
       "reconcileChapProjection": "Could not verify the relay installation and managed CHAP state.",

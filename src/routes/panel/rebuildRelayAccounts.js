@@ -44,8 +44,12 @@ function accountHandler(action, service = createRebuildService) {
             const { code } = error ?? {};
             const grantStatus = grantEffectStatus(code);
             if (grantStatus) {
+                if (code === identityChanged && error.retryAllowed !== false && error.outcome !== 'unknown') {
+                    return res.status(grantStatus).json({ error: { code, outcome: 'refused',
+                        ...(validNodeId(error.nodeId) && { nodeId: error.nodeId }) } });
+                }
                 return res.status(grantStatus).json({ error: { code, retryAllowed: false,
-                    ...(code === identityChanged && validNodeId(error.nodeId) && { nodeId: error.nodeId }) } });
+                    ...((code === identityChanged || error.outcome === 'unknown') && { outcome: 'unknown' }) } });
             }
             if (code === invalid) return res.status(400).json({ error: { code } });
             if (blocked.has(code)) {

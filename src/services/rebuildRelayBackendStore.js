@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { Types } = require('mongoose');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
-const { transactOnce } = require('./rebuildRelayInstallTransaction');
+const { transactOnce, AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError } = require('./rebuildRelayInstallTransaction');
 const { readDirectory, checkDirectory, writeDirectory, logicalAccount } = require('./rebuildRelayDirectory');
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -69,11 +69,13 @@ function createStore(State, User, listMode) {
         const replicas = accounts.map(account => ({ _id: new Types.ObjectId(), relayNode: new Types.ObjectId(nodeId),
             ...account, appliedRevision: 0, syncStatus: 'pending', createdAt: now, updatedAt: now }));
         const reservation = { nodeId, fence, fields, prior, replicas, directory: sourceSnapshot.directory, inherited };
-        return mutate(async session => {
+        let reservationMayPersist = false;
+        const reserveRows = async session => {
             // Prepare can take time. Recheck the source and absence of target
             // accounts before making any row durable.
             if (!equal(await sourceRows(nodeId, session), sourceSnapshot)) throw fail(STATE_CHANGED);
             await verifyLock();
+            if (!session) reservationMayPersist = true;
             const options = writeIn(session);
             if (prior) {
                 const before = exact(prior, [...Object.keys(fields), ...zeroFields, ...emptyFields]);
@@ -89,8 +91,16 @@ function createStore(State, User, listMode) {
                     { ...options, upsert: true }), 'upsertedCount');
             }
             await verifyLock();
+            reservationMayPersist = true; // Next step in list mode: one-shot commit.
             return reservation;
-        });
+        };
+        try { return await mutate(reserveRows); }
+        catch (error) {
+            if (reservationMayPersist && !(error instanceof AcknowledgedCommitCleanupError)) {
+                throw new ReservationOutcomeUnknownError(error);
+            }
+            throw error;
+        }
     }
 
     async function verifyReservation({ nodeId, fence, replicas, directory }, session) {

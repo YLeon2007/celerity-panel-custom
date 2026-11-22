@@ -14,6 +14,7 @@ const { readAppliedTransit } = require('./rebuildAppliedLink');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
 const fail = code => Object.assign(new Error(code), { code });
+const phaseError = (error, outcome) => Object.assign(error, { outcome, retryAllowed: false });
 const DISABLED = 'REBUILD_L2TP_REMOVE_DISABLED';
 const NOT_OWNED = 'REBUILD_L2TP_REMOVE_NOT_OWNED';
 const CHANGED = 'REBUILD_L2TP_REMOVE_CHANGED';
@@ -32,8 +33,11 @@ const PREVIEW_TTL_MS = 120_000;
 // Private proof accompanying the immutable public estimate. Neither the
 // installation receipt nor the host census is sent to the browser.
 const previews = new WeakMap();
-const safe = (error, fallback = 'REBUILD_L2TP_REMOVE_FAILED') => fail(
-    typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$(?!\n)/.test(error.code) ? error.code : fallback);
+const safe = (error, fallback = 'REBUILD_L2TP_REMOVE_FAILED') => Object.assign(fail(
+    typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$(?!\n)/.test(error.code) ? error.code : fallback), {
+    ...(error?.outcome === 'unknown' && { outcome: 'unknown' }),
+    ...(error?.retryAllowed === false && { retryAllowed: false }),
+});
 const write = { writeConcern: { w: 'majority' }, timestamps: false };
 const defaultDriver = options => require('./rebuildRelayDirect').createRelayDirect(options);
 const nodeFields = 'ip domain active type cascadeRole useCustomConfig ssh';
@@ -121,7 +125,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
         }
         let primary, removed = false;
         try {
-            return await locks.run(verifyLock => withNode(id, async () => {
+            return await locks.run((verifyLock, retainLock) => withNode(id, async () => {
                 let remote, reserved = false;
                 const authority = async () => {
                     if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
@@ -298,10 +302,12 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                             });
                         } catch (error) {
                             if (error instanceof AcknowledgedCommitCleanupError) {
+                                reserved = true;
                                 throw fail('REBUILD_L2TP_REMOVE_RESERVATION_CLEANUP_FAILED');
                             }
                             // A later observation of `removing` cannot replace
                             // the missing commit ACK or permit a retry/restore.
+                            reserved = readyToCommit;
                             throw readyToCommit ? fail(RESERVATION_UNKNOWN) : safe(error, RESERVATION_FAILED);
                         }
                     } else {
@@ -347,6 +353,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                             if (reverted?.acknowledged !== true || reverted.matchedCount !== 1) throw fail(CHANGED);
                             await checkInventory(state, accounts);
                         } catch (error) { if (isIdentityChanged(error)) throw error; throw fail(UNKNOWN); }
+                        reserved = false;
                         throw fail(error.code === DIRECT_IPSEC_BUSY ? IPSEC_BUSY : 'REBUILD_L2TP_REMOVE_REFUSED');
                     }
 
@@ -376,12 +383,27 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
                         // no-list bootstrap path for standalone MongoDB.
                         if (fence.listMode) await transactOnce(State, User, settle);
                         else await settle();
-                    } catch (error) { if (isIdentityChanged(error)) throw error; throw fail(FINISH_UNKNOWN); }
+                    } catch (error) {
+                        if (isIdentityChanged(error)) throw error;
+                        if (relayGrantStore && error instanceof AcknowledgedCommitCleanupError) {
+                            reserved = false;
+                            removed = true;
+                            throw fail(CLEANUP);
+                        }
+                        throw fail(FINISH_UNKNOWN);
+                    }
                     removed = true;
                     return { executionMode: 'rebuild', status: 'not_installed', nodeId: id };
                 } catch (error) {
                     primary = safe(error);
-                    if (reserved && isIdentityChanged(primary)) primary.retryAllowed = false;
+                    if (relayGrantStore && (reserved || primary.code === RESERVATION_UNKNOWN)) {
+                        retainLock?.();
+                        phaseError(primary, 'unknown');
+                    } else if (removed) {
+                        phaseError(primary, 'removed');
+                    } else if (reserved && isIdentityChanged(primary)) {
+                        primary.retryAllowed = false;
+                    }
                     throw primary;
                 } finally {
                     if (typeof remote?.close === 'function') {
@@ -392,7 +414,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, env, rel
             }));
         } catch (error) {
             // Do not allow lock/transport teardown to reclassify settlement.
-            throw primary ?? (removed ? fail(CLEANUP) : safe(error));
+            throw primary ?? (removed ? (relayGrantStore ? phaseError(fail(CLEANUP), 'removed') : fail(CLEANUP)) : safe(error));
         }
     };
     return {
