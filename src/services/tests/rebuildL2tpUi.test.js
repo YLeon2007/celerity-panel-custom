@@ -416,12 +416,86 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
 const firefox = process.env.REBUILD_L2TP_FIREFOX || 'firefox';
 const browserAvailable = spawnSync(firefox, ['--version'], { timeout: 3000 }).status === 0;
 
+async function admissionVisibility({ route, id, otherId }) {
+    const $ = selector => document.querySelector(selector);
+    const click = selector => $(selector).click();
+    const check = (ok, message) => { if (!ok) throw new Error(message); };
+    const approvals = ['verify', 'confirm', 'revoke'];
+    const dialog = $('[data-admission-dialog]');
+    const review = $('[data-review]');
+    const visible = el => getComputedStyle(el).display !== 'none' && el.getClientRects().length > 0;
+    function buttons(step) {
+        for (const action of approvals) {
+            const button = $(`[data-admission-approve="${action}"]`);
+            const display = getComputedStyle(button).display;
+            check(display === (action === step ? 'inline-flex' : 'none'), `${step ?? 'no approval'}: ${action} has display ${display}`);
+            check(visible(button) === (action === step), `${action} has wrong layout visibility`);
+            const instruction = $(`[data-admission-step="${action}"]`);
+            check(visible(instruction) === (action === step), `${action} instructions have wrong visibility`);
+        }
+    }
+    const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+    const requests = [];
+    window.fetch = (url, options) => new Promise(resolve => requests.push({ url, options, resolve }));
+    const respond = async (path, data, ok = true) => {
+        const request = requests.shift();
+        check(request?.url === path && request.options.method === 'POST', `expected ${path}`);
+        request.resolve({ ok, status: ok ? 200 : 409, json: async () => data });
+        await flush();
+        check(requests.length === 0, 'a later step was dispatched automatically');
+    };
+
+    await flush(); // allow the shipped script to bind the real rendered DOM
+    check(getComputedStyle(dialog).display === 'none' && !visible(review), 'closed dialog or review is visible');
+    buttons(null);
+    click('[data-admission-action="grant"]');
+    check(dialog.open && visible(dialog), 'grant dialog did not open');
+    buttons(null);
+    const binding = { nodeId: id, host: '192.0.2.42', port: 22, username: 'root', sshHostKeySha256: 'b'.repeat(64) };
+    await respond(`${route}/${otherId}/l2tp/admission/probe`, { ...binding, nodeId: otherId, challenge: 'c'.repeat(64) });
+    buttons('verify');
+    click('[data-admission-cancel]');
+
+    click('[data-admission-action="revoke"]');
+    check(dialog.open && visible(dialog), 'revoke dialog did not open');
+    buttons('revoke');
+    check(requests.length === 0, 'opening revoke dispatched a request');
+    click('[data-admission-cancel]');
+    check(getComputedStyle(dialog).display === 'none', 'cancel did not hide the dialog');
+
+    click('[data-account-action="disable"]');
+    await respond(`${route}/l2tp/accounts/disable`, { error: { code: 'REBUILD_L2TP_IDENTITY_CHANGED', nodeId: id } }, false);
+    check(visible(review) && review.getAttribute('href') === `#relay-${id}`, 'identity refusal did not expose scoped review');
+    check($(`[data-node-id="${otherId}"][data-admission-action="grant"]`).disabled, 'unrelated grant became enabled');
+    click('[data-admission-action="reconfirm"]');
+    check(dialog.open && visible(dialog), 'reconfirm dialog did not open');
+    buttons(null);
+    const url = `${route}/${id}/l2tp/admission`;
+    const identified = { ...binding, machineId: 'e'.repeat(32) };
+    await respond(`${url}/probe`, { ...binding, challenge: 'c'.repeat(64) });
+    buttons('verify');
+    check(!visible($('[data-admission-machine-row]')), 'probe exposed the machine field before verification');
+    click('[data-admission-approve="verify"]');
+    await respond(`${url}/verify`, { ...identified, challenge: 'd'.repeat(64) });
+    buttons('confirm');
+    check(visible($('[data-admission-machine-row]')), 'verification did not expose the machine field');
+    click('[data-admission-approve="confirm"]');
+    await respond(`${url}/confirm`, identified);
+    check(getComputedStyle(dialog).display === 'none' && !visible(review) && visible($('[data-refresh]')),
+        'confirmation did not close the dialog and replace review with refresh');
+}
+
 for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainInstall'], ['en', 'created'],
-    ...['canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial'].map(terminal => ['en', terminal])]) {
-    test(`Firefox: clicks, secret lifecycle and account/relay requests (${lang}, ${terminal})`, {
+    ...['canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial', 'admissionVisibility'].map(terminal => ['en', terminal])]) {
+    const admission = terminal === 'admissionVisibility';
+    test(admission ? 'Firefox: only the current admission/reconfirm approval is displayed'
+        : `Firefox: clicks, secret lifecycle and account/relay requests (${lang}, ${terminal})`, {
         skip: browserAvailable ? false : 'requires local Firefox (or REBUILD_L2TP_FIREFOX)',
     }, async () => {
-        const { content } = await render(lang);
+        const { content } = await render(lang, admission ? { relays: [
+            { ...installed, grantSource: 'db', canReconfirm: true, canRevoke: true },
+            { ...fresh, grantSource: null, canGrant: true },
+        ] } : undefined);
         const client = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
         const words = require(`../../locales/${lang}.json`).rebuildL2tp;
         const input = JSON.stringify({ route, id, otherId, csrf, words, terminal }).replaceAll('<', '\\u003c');
@@ -445,12 +519,14 @@ for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainIns
             writeFileSync(join(home, 'user.js'), Object.entries(settings)
                 .map(([key, value]) => `user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`).join('\n'));
             const file = join(home, 'fixture.html');
-            const inline = `<script>(${browserScenario})(${input}).then(() => dump('L2TP_UI:OK\\n'),
+            const scenario = admission ? admissionVisibility : browserScenario;
+            const stylesheet = admission ? `<style>${readFileSync(join(root, 'public/css/style.min.css'), 'utf8')}</style>` : '';
+            const inline = `<script>(${scenario})(${input}).then(() => dump('L2TP_UI:OK\\n'),
                 error => dump('L2TP_UI:FAIL ' + error.message + '\\n'));</script><script>${client}</script>`;
             assert.ok(content.includes(scriptTag));
             writeFileSync(file, '<!doctype html><meta charset="UTF-8">' +
                 '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; style-src \'unsafe-inline\'">' +
-                content.replace(scriptTag, () => inline));
+                stylesheet + content.replace(scriptTag, () => inline));
             await new Promise((resolve, reject) => {
                 const child = spawn(firefox, ['--no-remote', '--headless', '--profile', home, pathToFileURL(file).href], {
                     env: { PATH: process.env.PATH, HOME: home, TMPDIR: home, MOZ_CRASHREPORTER_DISABLE: '1' },

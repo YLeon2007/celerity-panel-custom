@@ -55,6 +55,11 @@ function secretControl(kind, url, index, login) {
     #rebuild-l2tp [data-action-status]:not(:empty) { margin-bottom: .75rem; }
     #rebuild-l2tp [data-admission-dialog] { position: fixed; color: inherit; overflow: auto; width: min(37rem, calc(100% - 2rem)); }
     #rebuild-l2tp [data-admission-dialog] code { overflow-wrap: anywhere; }
+    /* The shared .btn display otherwise overrides the browser's hidden style. */
+    #rebuild-l2tp [data-admission-dialog]:not([open]),
+    #rebuild-l2tp [data-admission-dialog][hidden],
+    #rebuild-l2tp [data-admission-dialog] [hidden],
+    #rebuild-l2tp [data-review][hidden] { display: none; }
 </style>
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
      <% if (reconcile) { %>data-reconcile-url="<%= accountPath %>/reconcile"<% } %>

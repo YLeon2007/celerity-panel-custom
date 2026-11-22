@@ -74,7 +74,7 @@ async function loadFootprint(db, id, machineIds) {
 // created and no package, unit, PPP, firewall or routing change is attempted.
 // A retained Remove attempt only qualifies alongside a persisted absence row
 // AND the live absence checks below. It is not a terminal host receipt alone.
-const ABSENCE_CHECK = String.raw`import fcntl, json, os, re, stat, subprocess, sys
+const ABSENCE_CHECK = String.raw`import fcntl, json, os, pwd, re, stat, subprocess, sys
 
 def need(ok):
     if not ok:
@@ -96,6 +96,39 @@ def read(path, limit):
         need(len(data) <= limit)
         return data
 
+def read_xray(path, limit):
+    # Match the DIRECT reader for MAIN and BRIDGE only. In particular,
+    # allowing the stock service owner does not allow it to own the directory.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", flags)
+    try:
+        *parents, name = path.strip("/").split("/")
+        try:
+            for component in parents:
+                child = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child
+                st = os.fstat(fd)
+                need(st.st_uid == 0 and not st.st_mode & 0o022)
+            profile = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(profile, "rb") as f:
+            st = os.fstat(profile)
+            need(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and not st.st_mode & 0o7022)
+            need(st.st_uid == 0 or st.st_uid == pwd.getpwnam("nobody").pw_uid)
+            need(not os.listxattr(profile))
+            data = f.read(limit + 1)
+            need(len(data) <= limit and len(data) == st.st_size)
+            return data
+    finally:
+        os.close(fd)
+
+def no_managed_markers(data):
+    value = data.lower()
+    need(not any(tag in value for tag in (b"celerity managed l2tp", b"celerity-rebuild-l2tp",
+                                           b"rebuild-relay-ingress", b"rebuild-l2tp-", b"relay-l2tp-")))
+
 def command(*args, codes=(0,)):
     r = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=3,
                        env={"PATH": "/usr/bin:/usr/sbin", "LC_ALL": "C"})
@@ -116,12 +149,13 @@ def observe():
                      "/etc/strongswan.d/celerity-rebuild-l2tp.conf"):
             need(missing(path))
         for path in ("/etc/ppp/chap-secrets", "/etc/ipsec.secrets", "/etc/ipsec.conf", "/etc/xl2tpd/xl2tpd.conf",
-                     "/etc/ppp/options.xl2tpd", "/usr/local/etc/xray/config.json",
-                     "/usr/local/etc/xray-bridge/config.json"):
+                     "/etc/ppp/options.xl2tpd"):
             if not missing(path):
-                value = read(path, 16 * 1024 * 1024).lower()
-                need(not any(tag in value for tag in (b"celerity managed l2tp", b"celerity-rebuild-l2tp",
-                                                       b"rebuild-relay-ingress", b"rebuild-l2tp-", b"relay-l2tp-")))
+                no_managed_markers(read(path, 16 * 1024 * 1024))
+        for path in ("/usr/local/etc/xray/config.json", "/usr/local/etc/xray-bridge/config.json"):
+            data = read_xray(path, 16 * 1024 * 1024)
+            if data is not None:
+                no_managed_markers(data)
         vault = "/var/lib/celerity-rebuild-l2tp-direct"
         if not missing(vault):
             st = os.lstat(vault)

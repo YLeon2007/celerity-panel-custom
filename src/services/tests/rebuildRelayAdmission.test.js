@@ -345,7 +345,8 @@ test('store conflicts disclose only the safe detail; unknown writes never replay
 
 // Run the emitted Python observer with all external observations replaced.
 // No fixture invokes systemctl, ip, nft, SSH, or reads real host state.
-const hostModel = String.raw`import contextlib, io, json, stat, sys, types
+const hostModel = String.raw`import contextlib, io, json, os, sys, tempfile, types
+from pathlib import Path
 code = sys.stdin.read()
 body, tail = code.rsplit("\ntry:\n    observe()", 1)
 assert tail == "\nexcept Exception:\n    sys.exit(1)\n"
@@ -359,6 +360,9 @@ fixture = {
     "/proc/net/dev": b"header\nheader\nlo: 0\n",
 }
 system = "/etc/systemd/system"
+main = "/usr/local/etc/xray/config.json"
+bridge = "/usr/local/etc/xray-bridge/config.json"
+chap = "/etc/ppp/chap-secrets"
 vault = "/var/lib/celerity-rebuild-l2tp-direct"
 token = "e" * 32
 prefix = vault + "/" + token
@@ -371,49 +375,114 @@ clean_outputs = {
     ("xfrm", "policy", "list"): b"",
     ("xfrm", "state", "list", "nokeys"): b"",
 }
-inode = types.SimpleNamespace(st_ino=11, st_dev=7, st_uid=0, st_mode=stat.S_IFDIR | 0o700)
-def exercise(good, files=None, outputs=None, record=False, unavailable=False, active=False):
-    data = fixture | (files or {})
+def exercise(good, files=None, **kwargs):
+    with tempfile.TemporaryDirectory() as tmp:
+        return observe(Path(tmp), good, fixture | (files or {}), **kwargs)
+
+def observe(root, good, data, outputs=None, record=False, unavailable=False, active=False,
+            owners=None, modes=None, link=None, xattr=None, changed=False, nobody=4242, case="baseline"):
     values = clean_outputs | (outputs or {})
-    released = []
-    def lstat(path):
-        if path == vault and prefix + "/manifest.json" in data:
-            return inode
-        if path in data:
-            return object()
-        raise FileNotFoundError()
-    def open_dir(path, flags):
-        assert path == system and not flags & (1 | 2 | 64)
-        return 88
-    def read(path, limit):
-        assert len(data[path]) <= limit
-        return data[path]
+    def local(path):
+        assert path.startswith("/") and ".." not in path.split("/")
+        return root / path.lstrip("/")
+    os.umask(0o022)
+    local(system).mkdir(parents=True, mode=0o700)
+    for path, value in data.items():
+        target = local(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if value is not None:
+            target.write_bytes(value)
+    if local(vault).exists():
+        local(vault).chmod(0o700)
+    if link:
+        kind, path = link
+        target = local(path)
+        moved = root / "moved"
+        target.rename(moved)
+        (target.symlink_to if kind == "symlink" else target.hardlink_to)(moved)
+    for path, mode in (modes or {}).items():
+        local(path).chmod(mode)
+    uids = {local(path).stat().st_ino: uid for path, uid in (owners or {}).items()}
+    attrs = {local(xattr).stat().st_ino: ["user.fixture"]} if xattr else {}
+    directories = set()
+    def metadata(st):
+        return types.SimpleNamespace(st_uid=uids.get(st.st_ino, 0), st_mode=st.st_mode, st_dev=st.st_dev,
+            st_ino=st.st_ino, st_nlink=st.st_nlink, st_size=st.st_size)
+    def open_path(path, flags, *, dir_fd=None):
+        assert (flags & os.O_ACCMODE) == os.O_RDONLY and not flags & (os.O_CREAT | os.O_TRUNC)
+        if dir_fd is not None:
+            assert dir_fd in directories and "/" not in path and path not in (".", "..")
+        fd = os.open(local(path) if dir_fd is None else path, flags, dir_fd=dir_fd)
+        if flags & os.O_DIRECTORY:
+            directories.add(fd)
+        return fd
+    def close(fd):
+        directories.remove(fd)
+        os.close(fd)
+    def getpwnam(name):
+        assert name == "nobody"
+        if nobody is None:
+            raise KeyError(name)
+        return types.SimpleNamespace(pw_uid=nobody)
     def command(program, *args, codes=(0,)):
         if program == "/usr/bin/systemctl":
             state = b"active" if active else b"inactive"
             return 1, b"LoadState=not-found\nActiveState=" + state + b"\nSubState=dead\nJob=\n"
         if unavailable and args == ("-j", "list", "tables"):
             raise OSError()
+        if changed and args == ("xfrm", "state", "list", "nokeys"):
+            local("/etc/machine-id").write_bytes(b"d" * 32 + b"\n")
         return 0, values[args]
-    g["os"] = types.SimpleNamespace(geteuid=lambda: 0, open=open_dir, O_RDONLY=0, O_DIRECTORY=65536,
-        O_NOFOLLOW=131072, lstat=lstat, scandir=lambda path: contextlib.nullcontext([
+    # Exercise the real reader and Linux open/link/mode semantics on fixture files;
+    # UID and xattr observations are modeled so the suite needs no privilege.
+    g["os"] = types.SimpleNamespace(geteuid=lambda: 0, open=open_path, fdopen=os.fdopen, close=close,
+        O_RDONLY=os.O_RDONLY, O_DIRECTORY=os.O_DIRECTORY, O_NOFOLLOW=os.O_NOFOLLOW, O_NONBLOCK=os.O_NONBLOCK,
+        lstat=lambda path: metadata(local(path).lstat()),
+        scandir=lambda path: contextlib.nullcontext([
             types.SimpleNamespace(name=token, path=prefix, is_dir=lambda **kw: not kw["follow_symlinks"])]),
-        stat=lambda path, **kw: inode, fstat=lambda fd: inode, close=released.append)
+        stat=lambda path, **kw: metadata(os.stat(local(path), **kw)), fstat=lambda fd: metadata(os.fstat(fd)),
+        listxattr=lambda fd: attrs.get(os.fstat(fd).st_ino, []))
     g["fcntl"] = types.SimpleNamespace(flock=lambda fd, flags: None, LOCK_SH=1, LOCK_NB=4)
     g["sys"] = types.SimpleNamespace(argv=["-c", "recorded-absent" if record else "no-record"])
-    g.update(read=read, command=command)
+    g.update(command=command, pwd=types.SimpleNamespace(getpwnam=getpwnam))
     result = io.StringIO()
     with contextlib.redirect_stdout(result):
         try:
             g["observe"]()
-        except (ValueError, KeyError, OSError):
-            assert not good
+        except (ValueError, KeyError, OSError) as error:
+            assert not good, case + ": " + repr(error)
         else:
-            assert good
-    assert released == [88]
-    assert result.getvalue() == ("absent:" + machine.decode() if good else "")
+            assert good, case + ": unexpected absence receipt"
+    assert not directories, case + ": leaked directory descriptor"
+    assert result.getvalue() == ("absent:" + machine.decode() if good else ""), case
+    return result.getvalue()
 exercise(True)
-exercise(True, {prefix + "/manifest.json": receipt, prefix + "/remove-attempt.json": attempt}, record=True)
+exercise(True, {main: b"{}", bridge: b"{}"}, nobody=None, case="root profiles do not need an account lookup")
+for profile in (main, bridge):
+    clean = {profile: b"{}"}
+    parent = str(Path(profile).parent)
+    exercise(True, clean, owners={profile: 4242}, modes={profile: 0o640}, case="clean nobody-owned " + profile)
+    exercise(False, clean, owners={profile: 65534}, case="unexpected owner despite typical nobody uid")
+    exercise(False, clean, owners={profile: 4242}, nobody=None, case="expected owner unavailable")
+    for owner in (0, 4242):
+        for mode in (0o660, 0o642, 0o4640, 0o2640, 0o1640):
+            exercise(False, clean, owners={profile: owner}, modes={profile: mode}, case="unsafe mode " + oct(mode))
+        exercise(False, clean, owners={profile: owner}, xattr=profile, case="extended attributes")
+        for kind in ("symlink", "hardlink"):
+            exercise(False, clean, owners={profile: owner}, link=(kind, profile), case=kind)
+    exercise(False, {profile: None, profile + "/child": b""}, case="nonregular profile")
+    exercise(False, clean, owners={parent: 4242}, case="non-root Xray directory")
+    exercise(False, clean, modes={parent: 0o775}, case="writable Xray directory")
+    exercise(False, clean, link=("symlink", parent), case="symlink Xray directory")
+    exercise(False, {profile: b"rebuild-relay-ingress"}, owners={profile: 4242}, case="managed ingress retained")
+exercise(False, {chap: b""}, owners={chap: 4242}, case="PPP file remains root-only")
+exercise(False, owners={"/etc/machine-id": 4242}, case="machine-id remains root-only")
+exercise(False, {"/proc/net/udp6": None}, case="missing required witness")
+exercise(False, changed=True, case="machine changed during observation")
+removed = {prefix + "/manifest.json": receipt, prefix + "/remove-attempt.json": attempt}
+success = exercise(True, removed | {main: b"{}", bridge: b"{}"}, record=True, owners={main: 4242}, case="recorded Remove")
+exercise(False, removed, record=True, owners={prefix + "/manifest.json": 4242}, case="manifest remains root-only")
+exercise(False, removed, record=True, owners={prefix + "/remove-attempt.json": 4242}, case="Remove attempt remains root-only")
 exercise(False, {prefix + "/manifest.json": receipt, prefix + "/remove-attempt.json": attempt})
 exercise(False, {prefix + "/manifest.json": receipt}, record=True)
 exercise(False, {system + "/xl2tpd.service.d": b""})
@@ -424,10 +493,11 @@ exercise(False, outputs={("-j", "-4", "route", "show", "table", "all"): b'[{"typ
 exercise(False, outputs={("xfrm", "policy", "list"): b"nonempty"})
 exercise(False, unavailable=True)
 exercise(False, active=True)
+sys.stdout.write(success)
 `;
 
 test('the default revoke witness uses one pinned read-only SSH command and demands an exact receipt', async () => {
-    let response, closes = 0;
+    let response, observer, closes = 0;
     const commands = [];
     class SSH {
         constructor(node, options) {
@@ -442,9 +512,8 @@ test('the default revoke witness uses one pinned read-only SSH command and deman
             assert.ok(!command.includes(endpoint.host) && !command.includes(pin) && !command.includes('fixture-only'));
             commands.push(match[2]);
             if (commands.length === 1) {
-                const result = spawnSync('python3', ['-I', '-B', '-c', hostModel],
+                observer = spawnSync('python3', ['-I', '-B', '-c', hostModel],
                     { input: match[1], encoding: 'utf8', timeout: 5000 });
-                assert.equal(result.status, 0, result.stderr);
             }
             return response;
         }
@@ -453,18 +522,20 @@ test('the default revoke witness uses one pinned read-only SSH command and deman
     const f = fixture({ witnessAbsent: undefined, SSH });
     f.row = { ...binding, generation: 'previous' };
     const receipt = { code: 0, stderr: '', stdout: `absent:${machine}\n` };
-    for (const overrides of [{ code: 1 }, { stderr: 'private fixture' }, { stdout: `absent:${machine}\n\n` }]) {
+    for (const overrides of [{ code: 1 }, { stderr: 'private fixture' }, { stdout: '' }, { stdout: `absent:${machine}\n\n` }]) {
         response = { ...receipt, ...overrides };
-        await assert.rejects(f.perform('revoke'), conflict);
+        await assert.rejects(f.perform('revoke'), { ...conflict, detail: 'host-absence-unproved' });
+        assert.equal(observer?.status, 0, observer?.stderr || observer?.error?.message);
     }
     response = { ...receipt, stdout: `absent:${'d'.repeat(32)}\n` };
     await assert.rejects(f.perform('revoke'), changed);
+    assert.deepEqual(f.writes, []);
     f.footprint = { ...clear, states: [{ node: nodeId, status: 'not_installed', desiredState: 'absent', replacementFence: 2 }] };
-    response = receipt;
-    await f.perform('revoke');
-    assert.deepEqual(commands, ['no-record', 'no-record', 'no-record', 'no-record', 'recorded-absent']);
+    response = { code: observer.status, stdout: observer.stdout, stderr: observer.stderr };
+    assert.deepEqual(await f.perform('revoke'), { nodeId, source: null });
+    assert.deepEqual(commands, [...Array(5).fill('no-record'), 'recorded-absent']);
     assert.equal(closes, commands.length);
-    assert.equal(f.writes.length, 1);
+    assert.deepEqual(f.writes, [{ action: 'revoke', binding, expectedGeneration: 'previous', actor: 'operator' }]);
 });
 
 test('lock-release uncertainty after acknowledged mutation is not reported as refusal or replayed', async () => {
