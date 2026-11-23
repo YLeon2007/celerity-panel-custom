@@ -57,6 +57,7 @@ function secretControl(kind, url, index, login) {
     #rebuild-l2tp [data-action-status]:not(:empty) { margin-bottom: .75rem; }
     #rebuild-l2tp [data-admission-dialog] { position: fixed; color: inherit; overflow: auto; width: min(37rem, calc(100% - 2rem)); }
     #rebuild-l2tp [data-admission-dialog] code { overflow-wrap: anywhere; }
+    #rebuild-l2tp [data-admission-console] pre { white-space: pre-wrap; }
     /* The shared .btn display otherwise overrides the browser's hidden style. */
     #rebuild-l2tp [data-admission-dialog]:not([open]),
     #rebuild-l2tp [data-admission-dialog][hidden],
@@ -241,6 +242,7 @@ function secretControl(kind, url, index, login) {
                 <div data-admission-identity hidden>
                     <dt><%= l('admission.endpoint') %></dt><dd><code data-admission-endpoint></code></dd>
                     <dt><%= l('admission.login') %></dt><dd><code data-admission-login></code></dd>
+                    <dt><%= l('admission.keyType') %></dt><dd><code data-admission-key-type></code></dd>
                     <dt><%= l('admission.fingerprint') %></dt><dd><code data-admission-key></code></dd>
                 </div>
                 <div data-admission-machine-row hidden>
@@ -249,6 +251,12 @@ function secretControl(kind, url, index, login) {
             </dl>
             <p data-admission-step="verify" hidden><%= l('admission.verifyInstructions') %></p>
             <p data-admission-step="confirm" hidden><%= l('admission.confirmInstructions') %></p>
+            <div data-admission-console hidden>
+                <p data-admission-console-label><%= l('admission.consoleLabel') %></p>
+                <pre><code data-admission-command>for f in /etc/ssh/ssh_host_*_key.pub; do printf "%-22s %s\n" "$(cut -d" " -f1 "$f")" "$(cut -d" " -f2 "$f" | base64 -d | sha256sum | cut -d" " -f1)"; done; echo; cat /etc/machine-id</code></pre>
+                <button type="button" class="btn btn-sm btn-secondary" data-admission-copy-command><%= l('admission.copyCommand') %></button>
+                <span data-admission-copy-status role="status"></span>
+            </div>
             <p data-admission-step="revoke" hidden><%= l('admission.revokeInstructions') %></p>
             <p data-admission-status role="status"></p>
             <% for (const [action, key] of [['verify', 'approveKey'], ['confirm', 'confirmGrant'], ['revoke', 'confirmRevoke']]) { %>

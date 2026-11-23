@@ -12,6 +12,20 @@ const safeError = code => Object.assign(new Error(code), { code });
 const isHex = (value, length) => typeof value === 'string' && value.length === length && /^[0-9a-f]+$/.test(value);
 const ignore = () => {};
 
+// Public key blob formats supported by ssh2 (DSA is opt-in). RSA SHA-2
+// signature algorithms still carry an ssh-rsa public key blob (RFC 8332).
+const hostKeyTypes = new Set(['ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-rsa', 'ssh-dss']);
+const isSshHostKeyType = value => hostKeyTypes.has(value);
+
+function publicKeyType(blob) {
+    if (blob.length < 4) return null;
+    const length = blob.readUInt32BE(0);
+    // The blob starts with a length-prefixed type string followed by key material.
+    if (length < 1 || length > 'ecdsa-sha2-nistp521'.length || 4 + length >= blob.length) return null;
+    const type = blob.toString('latin1', 4, 4 + length);
+    return isSshHostKeyType(type) ? type : null;
+}
+
 function destroy(resource) {
     try { resource?.destroy(); return true; } catch { return false; }
 }
@@ -135,7 +149,9 @@ function createRelayIdentityProbe({ Client = require('ssh2').Client, createSocke
                         if (!Buffer.isBuffer(key) || !key.length) { unavailable(); return false; }
                         const digest = createHash('sha256').update(key).digest();
                         if (!expected) {
-                            finish(null, digest.toString('hex'));
+                            const sshHostKeyType = publicKeyType(key);
+                            if (sshHostKeyType) finish(null, { sshHostKeySha256: digest.toString('hex'), sshHostKeyType });
+                            else unavailable();
                             return false; // Stop before user authentication (even 'none').
                         }
                         if (!live()) return false;
@@ -168,4 +184,4 @@ function createRelayIdentityProbe({ Client = require('ssh2').Client, createSocke
     };
 }
 
-module.exports = { createRelayIdentityProbe };
+module.exports = { createRelayIdentityProbe, isSshHostKeyType };

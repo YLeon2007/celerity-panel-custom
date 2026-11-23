@@ -14,7 +14,10 @@ Object.assign(process.env, {
     ENCRYPTION_KEY: 'fixture-only-encryption-key-do-not-use', SESSION_SECRET: 'fixture-session',
 });
 const cryptoService = require('../cryptoService');
-const RAW_KEY = Buffer.from([0, 0, 0, 3, 0, 128, 255, 10]);
+function syntheticBlob(type) {
+    return Buffer.concat([Buffer.from([0, 0, 0, type.length]), Buffer.from(type, 'latin1'), Buffer.from([0, 128, 255, 10])]);
+}
+const RAW_KEY = syntheticBlob('ssh-ed25519');
 const PIN = sha256(RAW_KEY);
 const MACHINE = '1234567890abcdef'.repeat(2);
 const CHANGED = 'REBUILD_L2TP_IDENTITY_CHANGED';
@@ -100,7 +103,8 @@ test('key-only probe never inspects credentials, declines KEX, and starts fresh 
     for (const field of ['privateKey', 'password', 'agent']) {
         Object.defineProperty(card.ssh, field, { get() { assert.fail(`read ${field}`); } });
     }
-    for (const key of [RAW_KEY, Buffer.from([1, 2, 3])]) {
+    for (const type of ['ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-rsa', 'ssh-dss']) {
+        const key = syntheticBlob(type);
         const result = probe.probeKey(card);
         const { config } = clients.at(-1);
         assert.deepEqual(sockets.at(-1).endpoint, { host: 'relay.invalid', port: 2222 });
@@ -112,11 +116,23 @@ test('key-only probe never inspects credentials, declines KEX, and starts fresh 
         assert.equal(config.authHandler(), false);
         clients.at(-1).emit('ready');
         clients.at(-1).emit('error', DIAGNOSTIC);
-        assert.equal(await result, sha256(key));
+        assert.deepEqual(await result, { sshHostKeySha256: sha256(key), sshHostKeyType: type });
         assert.equal(sockets.at(-1).destroyed, true);
         assert.deepEqual(clients.at(-1).commands, []);
     }
-    assert.equal(clients.length, 2);
+    assert.equal(clients.length, 6);
+});
+
+test('probe refuses malformed or non-public-key type fields without exposing bytes', async () => {
+    for (const key of [Buffer.from([0, 0, 0]), Buffer.from([0, 0, 0, 20, 1]),
+        syntheticBlob('rsa-sha2-512'), syntheticBlob('ssh-rsa\n'), syntheticBlob('\xf3sh-rsa'),
+        syntheticBlob('unrecognized-fixture')]) {
+        const { probe, clients, sockets } = fixture();
+        const pending = probe.probeKey(node());
+        assert.equal(clients[0].config.hostVerifier(key), false);
+        await assert.rejects(pending, safeError(UNAVAILABLE));
+        assert.equal(sockets[0].destroyed, true);
+    }
 });
 
 test('a fresh mismatched key never reaches auth or exec and is not an outage', async t => {
@@ -333,8 +349,9 @@ test('real ssh2 wire over simulated streams sends no auth before pin and reads o
         const { client, server } = memoryPair();
         const record = { closed: once(server, 'close'), auth: [], commands: [], signed: false };
         peers.push(record);
-        const peer = new Server({ hostKeys: [hostKey] }, connection => {
+        const peer = new Server({ hostKeys: [hostKey], algorithms: { serverHostKey: ['rsa-sha2-512'] } }, connection => {
             connection.on('error', () => {});
+            connection.on('handshake', negotiated => { record.hostKeyAlgorithm = negotiated.serverHostKey; });
             connection.on('authentication', ctx => {
                 record.auth.push(ctx.method);
                 if (ctx.username === 'relay-admin') {
@@ -359,12 +376,13 @@ test('real ssh2 wire over simulated streams sends no auth before pin and reads o
         peer.injectSocket(server);
         return client;
     } });
-    assert.equal(await probe.probeKey(node()), pin);
+    assert.deepEqual(await probe.probeKey(node()), { sshHostKeySha256: pin, sshHostKeyType: 'ssh-rsa' });
     await assert.rejects(probe.readMachine(node(), PIN), safeError(CHANGED));
     assert.equal(await probe.readMachine(node(), pin), MACHINE);
     assert.equal(await probe.readMachine(node({ privateKey: cryptoService.encrypt(hostKey), password: 'not-used' }), pin), MACHINE);
     await Promise.all(peers.map(peer => peer.closed));
     assert.deepEqual(peers.map(peer => peer.auth), [[], [], ['password'], ['publickey', 'publickey']]);
     assert.equal(peers[3].signed, true);
+    assert.equal(peers[2].hostKeyAlgorithm, 'rsa-sha2-512');
     assert.deepEqual(peers.map(peer => peer.commands), [[], [], [COMMAND], [COMMAND]]);
 });

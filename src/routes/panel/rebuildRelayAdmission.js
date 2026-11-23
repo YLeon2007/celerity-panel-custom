@@ -3,6 +3,7 @@
 const { observe } = require('./rebuildL2tpObservation');
 
 const { requireAuth } = require('./helpers');
+const { isSshHostKeyType } = require('../../services/rebuildRelayIdentityProbe');
 
 // Match the raw URL; don't let Express decode an alternate spelling of a node ID.
 const admissionPath = /^\/rebuild\/relays\/[^/]+\/l2tp\/admission\/[^/]+$/;
@@ -49,7 +50,7 @@ function validAdmissionJson(path, bytes) {
 function publicReceipt(action, nodeId, value) {
     if (value?.nodeId !== nodeId) return null;
     if (action === 'revoke') return { nodeId };
-    const { host, port, username, sshHostKeySha256, machineId, challenge } = value;
+    const { host, port, username, sshHostKeySha256, machineId, challenge, sshHostKeyType } = value;
     if (!validHost(host) || !Number.isInteger(port) || port < 1 || port > 65535 || !validUsername(username)
         || !matches(pinPattern, sshHostKeySha256)) return null;
     const result = { nodeId, host, port, username, sshHostKeySha256 };
@@ -58,7 +59,8 @@ function publicReceipt(action, nodeId, value) {
         result.machineId = machineId;
     }
     if (action === 'probe' || action === 'verify') {
-        if (!matches(pinPattern, challenge)) return null;
+        if (!matches(pinPattern, challenge) || !isSshHostKeyType(sshHostKeyType)) return null;
+        result.sshHostKeyType = sshHostKeyType;
         result.challenge = challenge;
     }
     return result;

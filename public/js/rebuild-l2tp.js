@@ -384,17 +384,22 @@
         const field = name => dialog.querySelector(`[data-admission-${name}]`);
         const approvals = dialog.querySelectorAll('[data-admission-approve]');
         const cancel = field('cancel'), notice = field('status');
-        const fields = ['name', 'endpoint', 'login', 'key', 'machine'];
+        const consoleCheck = field('console'), copyStatus = field('copy-status');
+        const fields = ['name', 'endpoint', 'login', 'key-type', 'key', 'machine'];
+        const hostKeyTypes = new Set(['ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-rsa', 'ssh-dss']);
 
         function draw(step, data) {
             flow.step = step;
             for (const item of dialog.querySelectorAll('[data-admission-step]')) item.hidden = item.dataset.admissionStep !== step;
             field('identity').hidden = !data;
             field('machine-row').hidden = step !== 'confirm';
+            consoleCheck.hidden = !data;
+            copyStatus.textContent = '';
             if (data) {
                 const host = data.host.includes(':') && !data.host.startsWith('[') ? `[${data.host}]` : data.host;
                 field('endpoint').textContent = `${host}:${data.port}`;
                 field('login').textContent = data.username;
+                field('key-type').textContent = data.sshHostKeyType;
                 field('key').textContent = data.sshHostKeySha256;
                 field('machine').textContent = step === 'confirm' ? data.machineId : '';
             }
@@ -405,6 +410,8 @@
             flow = null;
             for (const name of fields) field(name).textContent = '';
             notice.textContent = '';
+            copyStatus.textContent = '';
+            consoleCheck.hidden = true;
             if (dialog.open) dialog.close();
             updateMutations();
         }
@@ -417,6 +424,7 @@
             if (action !== 'probe' && (!hex(data.machineId, 32) || ['host', 'port', 'username', 'sshHostKeySha256']
                 .some(key => data[key] !== current.identity?.[key]))) return false;
             if (action === 'confirm') return data.machineId === current.identity.machineId;
+            if (!hostKeyTypes.has(data.sshHostKeyType) || (action === 'verify' && data.sshHostKeyType !== current.identity?.sshHostKeyType)) return false;
             return hex(data.challenge, 64) && data.challenge !== current.identity?.challenge;
         }
 
@@ -527,6 +535,14 @@
         };
         for (const button of approvals) button.addEventListener('click', event => {
             if (event.detail <= 1 && button.dataset.admissionApprove === flow?.step) void advance(flow.step);
+        });
+        field('copy-command').addEventListener('click', async () => {
+            const identity = flow?.identity;
+            if (!identity || consoleCheck.hidden) return;
+            let message = words.copied;
+            try { await navigator.clipboard.writeText(field('command').textContent); }
+            catch { message = words.copyFailed; }
+            if (flow?.identity === identity) copyStatus.textContent = message;
         });
         cancel.addEventListener('click', () => { if (!busy) dismiss(); });
         dialog.addEventListener('cancel', event => { event.preventDefault(); if (!busy) dismiss(); });

@@ -420,7 +420,7 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
 const firefox = process.env.REBUILD_L2TP_FIREFOX || 'firefox';
 const browserAvailable = spawnSync(firefox, ['--version'], { timeout: 3000 }).status === 0;
 
-async function admissionVisibility({ route, id, otherId }) {
+async function admissionVisibility({ route, id, otherId, words, lang }) {
     const $ = selector => document.querySelector(selector);
     const click = selector => $(selector).click();
     const check = (ok, message) => { if (!ok) throw new Error(message); };
@@ -428,6 +428,11 @@ async function admissionVisibility({ route, id, otherId }) {
     const dialog = $('[data-admission-dialog]');
     const review = $('[data-review]');
     const visible = el => getComputedStyle(el).display !== 'none' && el.getClientRects().length > 0;
+    const consoleCheck = $('[data-admission-console]');
+    const command = String.raw`for f in /etc/ssh/ssh_host_*_key.pub; do printf "%-22s %s\n" "$(cut -d" " -f1 "$f")" "$(cut -d" " -f2 "$f" | base64 -d | sha256sum | cut -d" " -f1)"; done; echo; cat /etc/machine-id`;
+    const consoleLabel = lang === 'ru'
+        ? 'Выполните в консоли провайдера (не через SSH панели) и сравните строку того же типа ключа'
+        : 'Run in the provider console (not via panel SSH) and compare the line for the same key type';
     function buttons(step) {
         for (const action of approvals) {
             const button = $(`[data-admission-approve="${action}"]`);
@@ -437,6 +442,7 @@ async function admissionVisibility({ route, id, otherId }) {
             const instruction = $(`[data-admission-step="${action}"]`);
             check(visible(instruction) === (action === step), `${action} instructions have wrong visibility`);
         }
+        check(visible(consoleCheck) === (step === 'verify' || step === 'confirm'), 'console command has wrong visibility');
     }
     const flush = () => new Promise(resolve => setTimeout(resolve, 0));
     const requests = [];
@@ -450,7 +456,23 @@ async function admissionVisibility({ route, id, otherId }) {
         request.resolve({ ok, status: ok ? 200 : 409, json: async () => data });
         await flush();
         check(requests.length === 0, 'a later step was dispatched automatically');
+        return JSON.parse(request.options.body);
     };
+    async function copyConsole(binding) {
+        check($('[data-admission-console-label]').textContent === consoleLabel, 'wrong console label');
+        check($('[data-admission-key-type]').textContent === 'ssh-rsa', 'wrong published key type');
+        check($('[data-admission-key]').textContent === binding.sshHostKeySha256, 'wrong published pin');
+        check($('[data-admission-command]').textContent === command, 'literal command changed');
+        check(visible($('[data-admission-command]')) && visible($('[data-admission-copy-command]')), 'command is not copyable');
+        await navigator.clipboard.writeText('synthetic clipboard sentinel');
+        click('[data-admission-copy-command]');
+        for (let i = 0; i < 50 && !$('[data-admission-copy-status]').textContent; i++) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        check(await navigator.clipboard.readText() === command, 'clipboard did not receive the exact command');
+        check($('[data-admission-copy-status]').textContent === words.messages.copied, 'no copy feedback');
+        check(requests.length === 0, 'copy dispatched a request');
+    }
 
     await flush(); // allow the shipped script to bind the real rendered DOM
     check(getComputedStyle(dialog).display === 'none' && !visible(review), 'closed dialog or review is visible');
@@ -459,8 +481,10 @@ async function admissionVisibility({ route, id, otherId }) {
     check(dialog.open && visible(dialog), 'grant dialog did not open');
     buttons(null);
     const binding = { nodeId: id, host: '192.0.2.42', port: 22, username: 'root', sshHostKeySha256: 'b'.repeat(64) };
-    await respond(`${route}/${otherId}/l2tp/admission/probe`, { ...binding, nodeId: otherId, challenge: 'c'.repeat(64) });
+    const discovery = { ...binding, sshHostKeyType: 'ssh-rsa' };
+    await respond(`${route}/${otherId}/l2tp/admission/probe`, { ...discovery, nodeId: otherId, challenge: 'c'.repeat(64) });
     buttons('verify');
+    await copyConsole(binding);
     click('[data-admission-cancel]');
 
     click('[data-admission-action="revoke"]');
@@ -479,15 +503,20 @@ async function admissionVisibility({ route, id, otherId }) {
     buttons(null);
     const url = `${route}/${id}/l2tp/admission`;
     const identified = { ...binding, machineId: 'e'.repeat(32) };
-    await respond(`${url}/probe`, { ...binding, challenge: 'c'.repeat(64) });
+    await respond(`${url}/probe`, { ...discovery, challenge: 'c'.repeat(64) });
     buttons('verify');
+    await copyConsole(binding);
     check(!visible($('[data-admission-machine-row]')), 'probe exposed the machine field before verification');
     click('[data-admission-approve="verify"]');
-    await respond(`${url}/verify`, { ...identified, challenge: 'd'.repeat(64) });
+    const verified = await respond(`${url}/verify`, { ...identified, sshHostKeyType: discovery.sshHostKeyType, challenge: 'd'.repeat(64) });
+    check(JSON.stringify(verified) === JSON.stringify({ challenge: 'c'.repeat(64) }), 'verify changed its challenge-only payload');
     buttons('confirm');
     check(visible($('[data-admission-machine-row]')), 'verification did not expose the machine field');
+    check($('[data-admission-machine]').textContent === identified.machineId, 'verification displayed the wrong identity');
+    await copyConsole(binding);
     click('[data-admission-approve="confirm"]');
-    await respond(`${url}/confirm`, identified);
+    const confirmed = await respond(`${url}/confirm`, identified);
+    check(JSON.stringify(confirmed) === JSON.stringify({ challenge: 'd'.repeat(64) }), 'confirm changed its challenge-only payload');
     check(getComputedStyle(dialog).display === 'none' && !visible(review) && !visible($('[data-refresh]')),
         'confirmation did not close the dialog and adopt fresh controls');
     const beforeRevoke = $('[data-l2tp-view]');
@@ -644,12 +673,12 @@ async function refreshMatrix({ terminal, route, id, otherId, csrf, words, snapsh
     check(calls.length === 2 && JSON.parse(calls[1].options.body).login === 'fixture.after', 'fresh control did not handle an explicit click');
 }
 
-for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainInstall'], ['en', 'created'],
+for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainInstall'], ['en', 'created'], ['ru', 'admissionVisibility'],
     ...['secretPagehide', 'canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial', 'admissionVisibility',
         'matrixInstall', 'matrixInstallLost', 'matrixTimeout', 'matrixRemove', 'matrixRemoveLost', 'matrixRecover',
         'matrixCreate', 'matrixDisable', 'matrixDisableLost', 'matrixDelete', 'matrixReconcile'].map(terminal => ['en', terminal])]) {
     const admission = terminal === 'admissionVisibility', matrix = terminal.startsWith('matrix');
-    test(matrix ? `Firefox: refresh regression ${terminal}` : admission ? 'Firefox: only the current admission/reconfirm approval is displayed'
+    test(matrix ? `Firefox: refresh regression ${terminal}` : admission ? `Firefox: current admission approval, identity and console command copy (${lang})`
         : `Firefox: clicks, secret lifecycle and account/relay requests (${lang}, ${terminal})`, {
         skip: browserAvailable ? false : 'requires local Firefox (or REBUILD_L2TP_FIREFOX)',
     }, async () => {
@@ -674,11 +703,13 @@ for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainIns
             });
             content = card.match(/<details class="form-section" id="rebuild-l2tp-remove"[\s\S]*?<\/details>/)[0];
         }
-        const input = JSON.stringify({ route, id, otherId, csrf, words, terminal, snapshots }).replaceAll('<', '\\u003c');
+        const input = JSON.stringify({ route, id, otherId, csrf, words, terminal, lang, snapshots }).replaceAll('<', '\\u003c');
         const home = mkdtempSync(join(tmpdir(), 'rebuild-l2tp-ui-'));
         try {
             const settings = {
                 'browser.dom.window.dump.enabled': true,
+                // Use Firefox's actual headless clipboard without user permission prompts.
+                ...(admission && { 'dom.events.testing.asyncClipboard': true, 'dom.events.asyncClipboard.readText': true }),
                 'browser.shell.checkDefaultBrowser': false,
                 'browser.startup.page': 0,
                 'network.proxy.type': 1,

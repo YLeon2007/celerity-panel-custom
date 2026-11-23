@@ -13,7 +13,7 @@ const script = readFileSync(resolve(root, 'public/js/rebuild-l2tp.js'), 'utf8');
 const ids = ['a', 'b', 'c'].map(value => value.repeat(24));
 const key = '1'.repeat(64), first = '2'.repeat(64), second = '3'.repeat(64), machineId = '4'.repeat(32);
 const id = ids[0];
-const receipt = { nodeId: id, host: '2001:db8::1', port: 2222, username: 'root', sshHostKeySha256: key };
+const receipt = { nodeId: id, host: '2001:db8::1', port: 2222, username: 'root', sshHostKeySha256: key, sshHostKeyType: 'ssh-ed25519' };
 const baseUrl = nodeId => `/panel/rebuild/relays/${nodeId}/l2tp/admission`;
 
 function render(lang, overrides = {}) {
@@ -151,6 +151,7 @@ for (const action of ['grant', 'reconfirm']) {
         f.selected.click(); await flush();
         assert.deepEqual(f.calls.map(({ url }) => url), [`${baseUrl(id)}/probe`]);
         assert.equal(f.field('key').textContent, key);
+        assert.equal(f.field('key-type').textContent, receipt.sshHostKeyType);
         assert.equal(f.field('name').textContent, '<untrusted relay>');
         assert.equal(f.field('endpoint').textContent, '[2001:db8::1]:2222');
         assert.equal(f.approvals.verify.hidden, false);
@@ -159,6 +160,8 @@ for (const action of ['grant', 'reconfirm']) {
         f.approvals.verify.click(); await flush();
         assert.equal(f.calls.length, 2);
         assert.equal(f.field('machine').textContent, machineId);
+        assert.equal(f.field('key-type').textContent, receipt.sshHostKeyType);
+        assert.equal(f.field('key').textContent, key);
         assert.equal(f.approvals.verify.hidden, true);
         assert.equal(f.approvals.confirm.hidden, false);
         f.approvals.verify.click(2); f.approvals.confirm.click(2); await flush();
@@ -168,6 +171,7 @@ for (const action of ['grant', 'reconfirm']) {
             body: i ? { challenge: i === 1 ? first : second } : {}, csrf: 'fixture', method: 'POST' })));
         assert.equal(f.dialog.open, false);
         assert.equal(f.field('key').textContent, '');
+        assert.equal(f.field('key-type').textContent, '');
         assert.equal(f.refresh.hidden, true);
         assert.ok(!f.install.disabled && !f.account.disabled && !f.selected.disabled);
         assert.deepEqual(f.reads, Array(3).fill('/panel/l2tp'));
@@ -239,14 +243,17 @@ test('revoke needs explicit approval, and a failed verification cannot advance o
     revoke.replies.push({ data: { nodeId: id } });
     revoke.approvals.revoke.click(); await flush();
     assert.deepEqual(revoke.calls.map(({ url }) => url), [`${baseUrl(id)}/revoke`]);
-    const f = launch();
-    f.replies.push({ data: { ...receipt, challenge: first } }, { data: { ...receipt, machineId, challenge: second, sshHostKeySha256: first } });
-    f.selected.click(); await flush();
-    f.approvals.verify.click(); await flush();
-    assert.ok(Object.values(f.approvals).every(button => button.hidden));
-    assert.equal(f.field('status').textContent, words.admission.checkUnavailable);
-    f.approvals.verify.click(); await flush();
-    assert.equal(f.calls.length, 2);
+    for (const drift of [{ sshHostKeySha256: first }, { sshHostKeyType: 'ssh-rsa' }, { sshHostKeyType: undefined }]) {
+        const f = launch();
+        f.replies.push({ data: { ...receipt, challenge: first } }, { data: { ...receipt, machineId, challenge: second, ...drift } });
+        f.selected.click(); await flush();
+        f.approvals.verify.click(); await flush();
+        assert.ok(Object.values(f.approvals).every(button => button.hidden));
+        assert.equal(f.field('console').hidden, true);
+        assert.equal(f.field('status').textContent, words.admission.checkUnavailable);
+        f.approvals.verify.click(); await flush();
+        assert.equal(f.calls.length, 2);
+    }
 });
 
 test('last-grant refusal shows localized recovery guidance and leaves account controls usable', async () => {

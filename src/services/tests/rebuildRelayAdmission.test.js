@@ -14,6 +14,7 @@ const changed = { code: 'REBUILD_L2TP_IDENTITY_CHANGED' };
 const invalid = { code: 'REBUILD_L2TP_ADMISSION_CHALLENGE_INVALID' };
 const endpoint = { nodeId, host: 'relay.example', port: 2222, username: 'root' };
 const binding = { ...endpoint, machineId: machine, sshHostKeySha256: pin };
+const sshHostKeyType = 'ssh-ed25519';
 const card = { _id: nodeId, active: true, type: 'xray', cascadeRole: 'relay', ip: 'Relay.Example.',
     ssh: { port: 2222, username: 'root', password: 'fixture-only' }, privateValue: 'never public' };
 const clear = { states: [], accounts: null, operation: null, admission: null, operationLock: null };
@@ -60,7 +61,7 @@ function fixture(options = {}) {
             assert.equal(node.ip, endpoint.host);
             assert.ok(!Object.hasOwn(node.ssh, 'password'));
             f.calls.push('key');
-            return f.pin ?? pin;
+            return { sshHostKeySha256: f.pin ?? pin, sshHostKeyType };
         },
         async readMachine(node, expectedPin) {
             assert.equal(node.ip, endpoint.host);
@@ -98,10 +99,10 @@ function fixture(options = {}) {
 test('probe is credential-free; verify and confirm both read pinned identity and only confirm writes', async () => {
     const f = fixture();
     const first = await f.perform('probe');
-    assert.deepEqual(first, { ...endpoint, sshHostKeySha256: pin, challenge: first.challenge });
+    assert.deepEqual(first, { ...endpoint, sshHostKeySha256: pin, sshHostKeyType, challenge: first.challenge });
     assert.deepEqual(f.calls, ['key']);
     const verified = await f.perform('verify', first.challenge);
-    assert.deepEqual(verified, { ...binding, challenge: verified.challenge });
+    assert.deepEqual(verified, { ...binding, sshHostKeyType, challenge: verified.challenge });
     assert.notEqual(verified.challenge, first.challenge);
     assert.deepEqual(f.writes, []);
     assert.deepEqual(await f.perform('confirm', verified.challenge, { ...binding, machineId: 'f'.repeat(32) }),

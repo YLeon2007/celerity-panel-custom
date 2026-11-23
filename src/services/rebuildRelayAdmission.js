@@ -6,6 +6,7 @@ const { makeLocks, withNode } = require('./rebuildLocks');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 const { validateRebuildMode } = require('./rebuildMode');
 const { normalizeRelayBinding } = require('./rebuildRelayAuthorization');
+const { createRelayIdentityProbe, isSshHostKeyType } = require('./rebuildRelayIdentityProbe');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
 const INVALID = 'REBUILD_L2TP_ADMISSION_INVALID_REQUEST';
@@ -261,7 +262,7 @@ function createRebuildRelayAdmission({ db = require('mongoose').connection, env 
     store, probe, loadNode, readFootprint, assertNoPending, witnessAbsent, witnessInstalled, locks, SSH, normalizeBinding = normalizeRelayBinding,
     clock = () => performance.now(), ttlMs = 120_000, maxChallenges = 1024 } = {}) {
     store ??= require('./rebuildRelayGrantStore').createRelayGrantStore({ db, env });
-    probe ??= require('./rebuildRelayIdentityProbe').createRelayIdentityProbe();
+    probe ??= createRelayIdentityProbe();
     locks ??= makeLocks(db.collection('c3_rebuild_locks'));
     loadNode ??= (nodeId, authenticated) => {
         const { Types } = require('mongoose');
@@ -380,19 +381,23 @@ function createRebuildRelayAdmission({ db = require('mongoose').connection, env 
                 if (ticket) await recheckPrior(nodeId, previous);
                 const { endpoint, transport } = await card(nodeId, !!ticket, ticket?.proof.endpoint);
                 if (ticket) fresh(ticket);
-                const pin = ticket ? ticket.proof.pin : await probe.probeKey(transport);
-                if (!hex(pin, 64)) throw fail(UNAVAILABLE);
+                // Verify reads only after matching the digest of the entire blob,
+                // which already binds its type. Neither value comes from the client.
+                const { sshHostKeySha256: pin, sshHostKeyType } = ticket
+                    ? { sshHostKeySha256: ticket.proof.pin, sshHostKeyType: ticket.proof.sshHostKeyType }
+                    : (await probe.probeKey(transport)) ?? {};
+                if (!hex(pin, 64) || !isSshHostKeyType(sshHostKeyType)) throw fail(UNAVAILABLE);
                 const machineId = ticket ? await pinnedMachine(transport, pin) : undefined;
                 await card(nodeId, false, endpoint);
                 await recheckPrior(nodeId, previous);
                 if (ticket) fresh(ticket);
-                issued = issue(next, scope, { endpoint, previous, pin, machineId });
+                issued = issue(next, scope, { endpoint, previous, pin, machineId, ...(!ticket && { sshHostKeyType }) });
                 await audit('success', 'OK');
                 if (ticket) fresh(ticket);
                 const ready = challenges.get(issued);
                 if (!ready) throw fail(CHALLENGE);
                 fresh(ready);
-                return { ...endpoint, sshHostKeySha256: pin, ...(ticket && { machineId }), challenge: issued };
+                return { ...endpoint, sshHostKeySha256: pin, sshHostKeyType, ...(ticket && { machineId }), challenge: issued };
             }
             // Capture revoke generation before lock acquisition too: a queued
             // revoke must not silently target a successor grant.

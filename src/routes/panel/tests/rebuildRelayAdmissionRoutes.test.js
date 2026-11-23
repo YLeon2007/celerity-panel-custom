@@ -10,6 +10,7 @@ const { issuePanelCsrfToken } = require('../csrf');
 const id = 'a'.repeat(24);
 const challenge = 'b'.repeat(64);
 const identity = { nodeId: id, host: 'relay.fixture.invalid', port: 22, username: 'root', sshHostKeySha256: 'c'.repeat(64) };
+const sshHostKeyType = 'ssh-rsa';
 const privateValue = 'PRIVATE_FIXTURE_NOT_FOR_HTTP';
 const url = action => `/panel/rebuild/relays/${id}/l2tp/admission/${action}`;
 test.after(() => require('../../../services/sshPoolService').closeAll());
@@ -54,7 +55,7 @@ function mount(t, rebuildL2tpOverview, rebuildRelayAdmission) {
     const admission = { async perform(input) {
         calls.push(input);
         if (admission.error) throw admission.error;
-        return { ...identity, password: privateValue, sessionId: privateValue, generation: privateValue,
+        return { ...identity, sshHostKeyType, publicKey: privateValue, password: privateValue, sessionId: privateValue, generation: privateValue,
             ...(input.action !== 'probe' && { machineId: 'd'.repeat(32) }),
             ...(input.action === 'probe' || input.action === 'verify' ? { challenge } : {}), ...admission.override };
     } };
@@ -85,9 +86,22 @@ test('admission actions are mounted and only publish stage-scoped fields', async
         const followup = action === 'verify' || action === 'confirm';
         const result = checked(await send(url(action), { body: followup ? { challenge } : {} }), 200);
         assert.deepEqual(result, action === 'revoke' ? { nodeId: id } : { ...identity,
-            ...(action !== 'probe' && { machineId: 'd'.repeat(32) }), ...(action === 'probe' || action === 'verify' ? { challenge } : {}) });
+            ...(action !== 'probe' && { machineId: 'd'.repeat(32) }),
+            ...(action === 'probe' || action === 'verify' ? { challenge, sshHostKeyType } : {}) });
         assert.deepEqual(calls.at(-1), { action, nodeId: id, actor: 'admin.fixture', sessionId: 'admin-session-id',
             challenge: followup ? challenge : undefined });
+    }
+});
+
+test('probe and verify require a recognized blob type and never accept it as input', async t => {
+    const { send, admission } = mount(t);
+    for (const action of ['probe', 'verify']) {
+        const body = action === 'verify' ? { challenge } : {};
+        for (const value of [undefined, 'rsa-sha2-256', `${sshHostKeyType}\n`, privateValue, { type: sshHostKeyType }]) {
+            admission.override = { sshHostKeyType: value };
+            checked(await send(url(action), { body }), 503);
+        }
+        checked(await send(url(action), { body: { ...body, sshHostKeyType } }), 400);
     }
 });
 
