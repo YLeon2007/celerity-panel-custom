@@ -11,7 +11,7 @@ const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { validCensus, validRetirementCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
-const { isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
+const { isInstallStage, specificHostRefusal, packageWriteCheck, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
     withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
@@ -272,6 +272,9 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         catch { throw identityRefusal ?? unknown(); }
         try { await checkBinding(); }
         catch (error) { if (write && !isIdentityChanged(error)) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
+        // A verified diagnostic on rc75 is informational only. Missing or
+        // tainted frames take the very same unknown/poison path without a hint.
+        if (packageWrite && result?.code === 75) throw withInstallCheck(unknown(), packageWriteCheck(result));
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
             if (result.code === 70 && result.stdout === ''
@@ -281,13 +284,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             }
             // A package-phase refusal isn't an Install no-write certificate.
             // Whatever stopped the helper, do not infer package settlement.
-            if (packageWrite) {
-                const error = unknown();
-                if (result.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n') {
-                    withInstallCheck(error, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
-                }
-                throw error;
-            }
+            if (packageWrite) throw withInstallCheck(unknown(), packageWriteCheck(result));
             if (action === 'inspect-chap') {
                 const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
                 if (!reason) throw unknown();

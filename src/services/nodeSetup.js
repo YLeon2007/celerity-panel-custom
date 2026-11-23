@@ -12,6 +12,7 @@ const cryptoService = require('./cryptoService');
 const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
 const xraySetupRuntime = require('./xraySetupRuntime');
+const offlineAgentKit = require('./offlineAgentKit');
 const { writeExecStdin, discardLateExecStream } = require('./sshExecStdin');
 
 /**
@@ -1362,7 +1363,7 @@ async function ensureXrayAgentToken(node) {
  * Install and configure cc-agent on an Xray node via SSH.
  *
  * Flow:
- *  1. Download binary from GitHub releases (or fallback URL)
+ *  1. Install the explicitly configured MAIN kit, or use the original GitHub download
  *  2. Write /etc/cc-agent/config.json with token + TLS settings
  *  3. If TLS: generate self-signed cert with openssl
  *  4. Open port in firewall for the panel source or local Docker networks
@@ -1377,6 +1378,13 @@ async function ensureXrayAgentToken(node) {
  * @returns {{ success, agentVersion }}
  */
 async function installCCAgent(conn, node, token, panelSource, sameVps, log) {
+    let kit;
+    try { kit = await offlineAgentKit.loadSelectedKit(); }
+    catch (error) { return { success: false, agentVersion: '', output: error.message }; }
+    return installCCAgentFromSource(conn, node, token, panelSource, sameVps, log, kit);
+}
+
+async function installCCAgentFromSource(conn, node, token, panelSource, sameVps, log, kit) {
     const agentPort = (node.xray || {}).agentPort || 62080;
     const useTls = (node.xray || {}).agentTls !== false;
     const apiPort = (node.xray || {}).apiPort || 61000;
@@ -1421,9 +1429,11 @@ fi`;
         firewallRules += '\n' + IPTABLES_SAVE_SNIPPET;
     }
 
-    // Step 1: Download binary
-    log('Downloading cc-agent binary...');
-    const downloadResult = await execSSH(conn, `
+    // Step 1: The offline branch cannot enter the GitHub downloader, even on failure.
+    log(kit ? 'Installing cc-agent from verified MAIN kit...' : 'Downloading cc-agent binary...');
+    const downloadResult = kit
+        ? await offlineAgentKit.installSelectedKit(kit, (cmd, opts) => execSSH(conn, cmd, opts))
+        : await execSSH(conn, `
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
     BIN="cc-agent-linux-arm64"
@@ -1466,10 +1476,10 @@ ls -la /usr/local/bin/cc-agent
 `);
 
     if (!downloadResult.success) {
-        log(`Binary download failed: ${downloadResult.output}`);
+        log(`${kit ? 'Offline agent installation failed' : 'Binary download failed'}: ${downloadResult.output}`);
         return { success: false, agentVersion: '', output: downloadResult.output };
     }
-    log('Binary downloaded');
+    log(kit ? 'Verified offline binary installed' : 'Binary downloaded');
 
     // Step 2: Write config
     log('Writing agent config...');
@@ -1530,7 +1540,7 @@ fi
 `);
 
     const allOutput = [downloadResult.output, startResult.output].join('\n');
-    const agentVersion = allOutput.match(/cc-agent[:\s]+(v[\d.]+)/)?.[1] || 'installed';
+    const agentVersion = kit ? offlineAgentKit.VERSION : (allOutput.match(/cc-agent[:\s]+(v[\d.]+)/)?.[1] || 'installed');
     const isRunning = startResult.output.includes('OK: cc-agent running');
 
     return { success: isRunning, agentVersion, output: allOutput };
@@ -1543,6 +1553,10 @@ fi
 async function setupXrayNodeWithAgent(node, options = {}) {
     let preparedNode = node;
     let agentToken = '';
+    // Validate the whole selected kit before even provisioning a token or starting Xray setup.
+    let kit;
+    try { kit = await offlineAgentKit.loadSelectedKit(); }
+    catch (error) { return { success: false, error: error.message, logs: [error.message] }; }
 
     try {
         const ensured = await ensureXrayAgentToken(node);
@@ -1585,7 +1599,7 @@ async function setupXrayNodeWithAgent(node, options = {}) {
         }
 
         log('Installing CC Agent...');
-        const agentResult = await installCCAgent(conn, preparedNode, agentToken, panelSource, sameVps, log);
+        const agentResult = await installCCAgentFromSource(conn, preparedNode, agentToken, panelSource, sameVps, log, kit);
         if (agentResult.output) {
             result.logs.push(agentResult.output);
         }

@@ -445,7 +445,9 @@ class TestPackageGuard(unittest.TestCase):
                 self.empty_indexes()
                 proof = self.observe()
                 self.h.update_mode = mode
-                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_APT_(UPDATE|INDEXES)'):
+                reason = {'timeout': 'UPDATE', 'bad-signature': 'UPDATE_REJECTED',
+                          'warning': 'UPDATE_REJECTED'}.get(mode, 'INDEXES')
+                with self.assertRaisesRegex(g.Refusal, rf'^PACKAGE_APT_{reason}$'):
                     self.prepare(proof)
                 self.assertEqual(self.h.effects, ['enter', 'update'])
                 self.assertEqual([a[-1] for a in self.h.calls if a[0] == '/usr/bin/env'], ['update'])
@@ -596,7 +598,7 @@ class TestPackageGuard(unittest.TestCase):
         cache.unlink()
         file = self.h.p('/etc/apt/sources.list.d/debian.sources')
         file.write_text(file.read_text() + 'Trusted: yes\n')
-        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_SOURCES'):
+        with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
             self.observe()
         self.no_apt()
 
@@ -641,7 +643,7 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian
             with self.subTest(suffix=suffix):
                 self.h.calls.clear()
                 listing.write_text(deb822.replace('.gpg\n', '.gpg' + suffix + '\n'))
-                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_SOURCES'):
+                with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
                     self.observe()
                 self.no_apt()
         listing.unlink()
@@ -652,14 +654,14 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian
                 self.h.calls.clear()
                 self.h.put('/etc/apt/sources.list',
                            f'deb [{options}] http://deb.debian.org/debian trixie main\n')
-                with self.assertRaisesRegex(g.Refusal, 'PACKAGE_SOURCES'):
+                with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
                     self.observe()
                 self.no_apt()
 
     def test_legacy_source_only_entry_cannot_become_a_binary_source(self):
         self.h.p('/etc/apt/sources.list.d/debian.sources').unlink()
         self.h.put('/etc/apt/sources.list', 'deb-src http://deb.debian.org/debian trixie main\n')
-        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_SOURCES'):
+        with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
             self.observe()
         self.no_apt()
 

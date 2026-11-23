@@ -34,12 +34,22 @@ const profileChecks = new Map([
     ['REBUILD_L2TP_DIRECT_PROFILE_USERS', 'XRAY_PROFILE_USERS_UNPROVED'],
     ['REBUILD_L2TP_DIRECT_RUNTIME_UNPROVED', 'XRAY_RUNTIME_UNPROVED'],
 ]);
-const checks = new Set([...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
+const packageChecks = new Set(['PACKAGE_SOURCES_UNSUPPORTED', 'PACKAGE_INDEXES_UNVERIFIED', 'PACKAGE_SERVICES_UNSAFE']);
+const packageRefusals = new Map([...packageChecks, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'].map(id => [`DIRECT_${id}\n`, id]));
+const packageUncertain = new Map([...packageChecks].map(id => [`DIRECT_UNCERTAIN_${id}\n`, id]));
+// Only called for prepare-packages. Neither form certifies settlement of a write.
+function packageWriteCheck(result) {
+    if (result?.stdout !== '') return undefined;
+    if (result.code === 70) return packageRefusals.get(result.stderr);
+    if (result.code === 75) return packageUncertain.get(result.stderr);
+}
+const checks = new Set([...packageChecks, ...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
     ...profileChecks.values(), 'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED']);
 const installCheckIds = Object.freeze([...checks]);
 const isInstallCheck = check => checks.has(check);
 const isInstallStage = action => stages.has(action);
 function specificHostRefusal(action, suffix, noWrite) {
+    if (action === 'preflight' && !noWrite && packageChecks.has(suffix)) return { check: suffix, prerequisitePartial: false };
     const match = hostChecks.get(suffix);
     if (!isInstallStage(action) || !match) return undefined;
     if (match.scope === 'prepare-only' && action !== 'prepare') return undefined;
@@ -142,5 +152,5 @@ function publicInstallFailure(error) {
     return { code, outcome, ...(check !== undefined && { check }), ...(retryAllowed === false && { retryAllowed }) };
 }
 
-module.exports = { installCheckIds, isInstallStage, specificHostRefusal, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
+module.exports = { installCheckIds, isInstallStage, specificHostRefusal, packageWriteCheck, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
     withInstallCheck, checkedInstallId, installFailure, classifyInstallFailure, publicInstallFailure };

@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -453,6 +454,194 @@ class Adapter(unittest.TestCase):
         self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', ''))
         self.assertEqual(len(calls), 2)
         self.assertFalse(self.effects)
+
+    def model_real_guard(self, *, empty_indexes=False):
+        host = Host(self, self.root)
+        self.system = host.p(SYSTEM)
+        pending = self.vault / self.h['PACKAGE_PENDING']
+        receipt = self.vault / f'packages-{TOKEN}.json'
+        if empty_indexes:
+            host.p('/var/lib/apt/lists/deb.debian.org_debian_dists_trixie_InRelease').unlink()
+
+        def child_status(argv, end, cap, *, may_write):
+            if may_write and not host.effects:
+                self.assertEqual(receipt.read_bytes(), pending.read_bytes())
+                self.assertEqual(json.loads(pending.read_bytes())['phase'], 'preparing')
+                host.effects.append('enter')
+            return host.run(argv, 78)
+
+        self.h.update(SYSTEM=str(self.system), bounded_status=child_status,
+                      C3_PACKAGE_GUARD={'Refusal': g.Refusal, 'observe': g.observe, 'prepare': g.prepare})
+        ownership = patch.object(g, '_owner', side_effect=lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid()))
+        ownership.start()
+        self.addCleanup(ownership.stop)
+        return host, receipt, pending
+
+    def test_bad_configured_source_and_busy_apt_lock_have_different_frames(self):
+        host, _, _ = self.model_real_guard()
+        with host.p('/var/lib/apt/lists/lock').open('r+b') as lock:
+            request = struct.pack('=hh4xqqi4x', fcntl.F_WRLCK, os.SEEK_SET, 0, 0, 0)
+            fcntl.fcntl(lock.fileno(), fcntl.F_OFD_SETLK, request)
+            self.assertEqual(self.wire('preflight'), (70, '', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n'))
+        proof = self.offered()
+        host.put('/etc/apt/sources.list.d/operator.list', 'deb https://private-fixture.invalid/vendor trixie main\n')
+        frame = (70, '', 'DIRECT_PACKAGE_SOURCES_UNSUPPORTED\n')
+        self.assertEqual(self.wire('preflight'), frame)
+        self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), frame)
+        self.assertFalse(self.vault.exists())
+        self.assertEqual(host.effects, [])
+
+    def test_foreign_unit_is_diagnostic_but_failed_service_observation_is_not(self):
+        host, _, _ = self.model_real_guard()
+        host.link('/run/systemd/system/strongswan-starter.service', '/opt/private-fixture.service')
+        self.assertEqual(self.wire('preflight'), (70, '', 'DIRECT_PACKAGE_SERVICES_UNSAFE\n'))
+        run = host.run
+        with patch.object(host, 'run', side_effect=lambda argv, timeout:
+                          (1, b'', b'private fixture') if argv[:5] == CTL else run(argv, timeout)):
+            self.assertEqual(self.wire('preflight'), (70, '', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n'))
+        self.assertEqual(host.effects, [])
+        self.assertFalse(self.vault.exists())
+
+    def test_unrecognized_service_properties_do_not_certify_unsafe_service_diagnostic(self):
+        host, _, _ = self.model_real_guard()
+        show = host._show
+
+        def unrecognized(unit):
+            rc, out, err = show(unit)
+            return rc, out.replace(b'ActiveState=inactive\n', b'ActiveState=private-fixture\n'), err
+
+        with patch.object(host, '_show', side_effect=unrecognized):
+            self.assertEqual(self.wire('preflight'), (70, '', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n'))
+        self.assertFalse(self.vault.exists())
+
+    def test_scope_change_during_preflight_suppresses_source_diagnostic(self):
+        host, _, _ = self.model_real_guard()
+        host.put('/etc/apt/sources.list.d/operator.list', 'deb https://private-fixture.invalid/vendor trixie main\n')
+        observe = g.observe
+
+        def observe_then_drift(*args):
+            try:
+                return observe(*args)
+            finally:
+                self.machine = '3' * 32
+
+        with patch.dict(self.h['C3_PACKAGE_GUARD'], observe=observe_then_drift):
+            self.assertEqual(self.wire('preflight'), (75, '', ''))
+        self.assertFalse(self.vault.exists())
+
+    def test_update_exec_failure_is_not_an_index_diagnostic(self):
+        host, receipt, pending = self.model_real_guard(empty_indexes=True)
+        proof = self.offered()
+        run = host.run
+        with patch.object(host, 'run', side_effect=lambda argv, timeout:
+                          (127, b'', b'private fixture') if argv[-3:] == g.UPDATE else run(argv, timeout)):
+            self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', ''))
+        self.assertEqual(receipt.read_bytes(), pending.read_bytes())
+        self.assertEqual(json.loads(pending.read_bytes())['phase'], 'preparing')
+
+    def test_guard_pre_enter_service_refusal_publishes_only_refused_receipt(self):
+        host, receipt, pending = self.model_real_guard()
+        proof = self.offered()
+        run = host.run
+
+        def service_changes_after_intent(argv, timeout):
+            host.active = pending.exists()
+            return run(argv, timeout)
+
+        with patch.object(host, 'run', side_effect=service_changes_after_intent):
+            self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof),
+                             (70, '', 'DIRECT_PACKAGE_SERVICES_UNSAFE\n'))
+        self.assertEqual(json.loads(receipt.read_bytes())['phase'], 'refused')
+        self.assertFalse(pending.exists())
+        self.assertEqual(host.effects, [])
+
+    def assert_update_diagnostic(self, mode, stderr, *, after_update=None):
+        host, receipt, pending = self.model_real_guard(empty_indexes=True)
+        proof = self.offered()
+        intent = []
+
+        def capture_intent():
+            intent.append(pending.read_bytes())
+            if after_update is not None:
+                after_update(host)
+
+        host.update_mode = mode
+        host.after_update = capture_intent
+        self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', stderr))
+        self.assertEqual(host.effects, ['enter', 'update'])
+        self.assertEqual(host.apt_count, 0)
+        self.assertFalse((self.vault / TOKEN).exists())
+        self.assertEqual(pending.read_bytes(), receipt.read_bytes())
+        if intent:
+            self.assertEqual(pending.read_bytes(), intent[0])
+        self.assertEqual(json.loads(pending.read_bytes())['phase'], 'preparing')
+        self.machine = MACHINE
+        self.assertEqual(self.wire('preflight'), (75, '', ''))
+
+    def test_failed_strict_signed_update_keeps_pending_with_index_diagnostic(self):
+        self.assert_update_diagnostic('bad-signature', 'DIRECT_UNCERTAIN_PACKAGE_INDEXES_UNVERIFIED\n')
+
+    def test_failed_signed_index_hash_join_keeps_pending_with_index_diagnostic(self):
+        self.assert_update_diagnostic('tampered', 'DIRECT_UNCERTAIN_PACKAGE_INDEXES_UNVERIFIED\n')
+
+    def test_observed_unsafe_service_after_update_keeps_pending_with_service_diagnostic(self):
+        self.assert_update_diagnostic('ok', 'DIRECT_UNCERTAIN_PACKAGE_SERVICES_UNSAFE\n',
+                                      after_update=lambda host: setattr(host, 'active', True))
+
+    def test_observed_unsupported_source_after_update_keeps_pending_with_source_diagnostic(self):
+        def change_source(host):
+            host.put('/etc/apt/sources.list.d/operator.list', 'deb https://private-fixture.invalid/vendor trixie main\n')
+
+        self.assert_update_diagnostic('ok', 'DIRECT_UNCERTAIN_PACKAGE_SOURCES_UNSUPPORTED\n',
+                                      after_update=change_source)
+
+    def test_update_timeout_does_not_carry_index_diagnostic(self):
+        self.assert_update_diagnostic('timeout', '')
+
+    def test_update_child_loss_does_not_carry_index_diagnostic(self):
+        def lost_child(_):
+            raise ChildProcessError('no status witness')
+
+        self.assert_update_diagnostic('bad-signature', '', after_update=lost_child)
+
+    def test_index_failure_at_deadline_does_not_carry_diagnostic(self):
+        clock = SimpleNamespace(monotonic=time.monotonic)
+        self.h['time'] = clock
+        fetched = g._fetched_indexes
+
+        def expire_after_check(*args):
+            try:
+                fetched(*args)
+            except g.Refusal:
+                end = self.h['DEADLINE']
+                clock.monotonic = lambda: end
+                raise
+
+        with patch.object(g, '_fetched_indexes', side_effect=expire_after_check):
+            self.assert_update_diagnostic('tampered', '')
+
+    def test_observed_index_failure_is_not_attributed_after_machine_drift(self):
+        self.assert_update_diagnostic('bad-signature', '', after_update=lambda _: setattr(self, 'machine', '3' * 32))
+
+    def test_unsafe_service_with_lost_containment_cleanup_has_no_diagnostic(self):
+        host, receipt, pending = self.model_real_guard()
+        proof = self.offered()
+        reload = host._reload
+
+        def activate_after_reload():
+            result = reload()
+            host.active = True
+            return result
+
+        with patch.object(host, '_reload', side_effect=activate_after_reload), patch.object(
+                g, '_remove_owned', side_effect=OSError('cleanup unconfirmed')) as cleanup:
+            self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), (75, '', ''))
+            cleanup.assert_called_once()
+        self.assertEqual(host.effects, ['enter', 'reload'])
+        self.assertEqual(host.apt_count, 0)
+        self.assertEqual(pending.read_bytes(), receipt.read_bytes())
+        self.assertEqual(json.loads(pending.read_bytes())['phase'], 'preparing')
+        self.assertTrue(host.p(POLICY).is_file())
 
     def prepare_with_real_guard(self, host, *, preflight_calls, empty_indexes=False):
         if empty_indexes:

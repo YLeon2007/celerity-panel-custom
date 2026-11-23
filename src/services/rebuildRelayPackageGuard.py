@@ -162,17 +162,18 @@ def _idle_lock(path, code):
         os.close(fd)
 
 
-def _command(run, argv, code, statuses=(0,), timeout=6, quiet=True):
+def _command(run, argv, code, statuses=(0,), timeout=6, quiet=True, rejected=None):
     try:
         reply = run(tuple(argv), timeout)
         need(type(reply) is tuple and len(reply) == 3, code)
         rc, out, err = reply
-        if (type(rc) is not int or type(out) is not bytes or type(err) is not bytes or rc not in statuses
-                or len(out) + len(err) > LIMIT or (quiet and err)):
-            raise Refusal(code)
-        return rc, out
+        need(type(rc) is int and type(out) is bytes and type(err) is bytes and len(out) + len(err) <= LIMIT, code)
     except Exception:
         raise Refusal(code) from None
+    # Only a well-formed, joined command result can report a domain refusal.
+    if rc not in statuses or (quiet and err):
+        raise Refusal(rejected.get(rc, code) if rejected else code)
+    return rc, out
 
 
 def _text(data, code):
@@ -470,7 +471,7 @@ def _layout(root, run, installed, owned=None, new=()):
                     evidence[str(link.relative_to(root))] = _snapshot(link.lstat())
             else:
                 need(not _tracked(name) and not (name.endswith('.service') and _tracked(Path(target).name)),
-                     'PACKAGE_UNIT_OWNER')
+                     'PACKAGE_UNIT_OWNER_FOREIGN')
             if _tracked(name):
                 evidence[rel] = _snapshot(info)
     if owned is not None:
@@ -492,13 +493,22 @@ def _units(run, layout, masked=False):
     evidence = {}
     for unit in UNITS:
         rc, p = _properties(run, (unit,), PROPS, (0, 1))
+        name = aliases.get(unit, unit) if not masked else unit
+        identified = p['Id'] == name and unit in p['Names'].split()
+        # Unknown property values still fail the same predicate. Only an
+        # affirmative state of the queried unit gets a service-specific hint.
+        known_active = identified and (p['ActiveState'] in {
+            'active', 'activating', 'deactivating', 'reloading', 'refreshing', 'failed', 'maintenance'} or
+            any(re.fullmatch(r'[1-9][0-9]*', p[k]) for k in ('MainPID', 'ControlPID')) or
+            p['NeedDaemonReload'] == 'yes' or p['Transient'] == 'yes')
         need(all(p[k] == v for k, v in {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0',
                  'ControlPID': '0', 'Job': '', 'NeedDaemonReload': 'no', 'Transient': 'no', 'DropInPaths': '',
-                 'TriggeredBy': ''}.items()), 'PACKAGE_UNIT_ACTIVE')
-        name = aliases.get(unit, unit) if not masked else unit
+                 'TriggeredBy': ''}.items()), 'PACKAGE_UNIT_ACTIVE' if known_active else 'PACKAGE_UNIT_STATE')
         names = {name} | {n for n, primary in aliases.items() if primary == name and not masked}
         shown_names = p['Names'].split()
         need(p['Id'] == name and set(shown_names) == names and len(shown_names) == len(names), 'PACKAGE_UNIT_OWNER')
+        enabled_code = ('PACKAGE_UNIT_ENABLED' if rc == 0 and p['UnitFileState'] in ('enabled', 'enabled-runtime')
+                        else 'PACKAGE_UNIT_STATE')
         if masked:
             need(rc == 0 and p['LoadState'] == 'masked' and p['UnitFileState'] == 'masked'
                  and p['FragmentPath'] in (SYSTEM + '/' + unit, '/dev/null')
@@ -506,10 +516,10 @@ def _units(run, layout, masked=False):
         elif name in vendor:
             need(rc == 0 and p['LoadState'] == 'loaded' and p['UnitFileState'] == 'disabled'
                  and p['FragmentPath'] in (VENDOR + '/' + name, '/lib/systemd/system/' + name)
-                 and not p['SourcePath'], 'PACKAGE_UNIT_ENABLED')
+                 and not p['SourcePath'], enabled_code)
         elif name in gen:
             need(rc == 0 and p['LoadState'] == 'loaded' and p['UnitFileState'] == 'generated'
-                 and p['FragmentPath'] == f'{LATE}/{name}' and p['SourcePath'] == gen[name], 'PACKAGE_UNIT_ENABLED')
+                 and p['FragmentPath'] == f'{LATE}/{name}' and p['SourcePath'] == gen[name], enabled_code)
         else:
             need(p['LoadState'] == 'not-found' and p['UnitFileState'] in ('', 'not-found')
                  and not p['FragmentPath'] and not p['SourcePath'], 'PACKAGE_UNIT_OWNER')
@@ -576,25 +586,25 @@ def _sources(root):
              and suite in {'trixie', 'trixie-updates', 'trixie-security'}
              and (suite == 'trixie-security') == ('debian-security' in uri)
              and 'main' in components and set(components) <= {'main', 'contrib', 'non-free', 'non-free-firmware'},
-             'PACKAGE_SOURCES')
+             'PACKAGE_SOURCES_CONFIG')
         # Keep main only, no source-supplied trust/targets/options.
         if binary:
             sources.add((uri.rstrip('/'), suite))
 
     for file in files:
         raw, evidence[str(file.relative_to(root))] = bound(file, 64 * 1024)
-        data = _text(raw, 'PACKAGE_SOURCES')
+        data = _text(raw, 'PACKAGE_SOURCES_CONFIG')
         if file.suffix == '.sources':
             # In DEB822 a comment is a whole line. An inline suffix is part of
             # the value (notably for Signed-By), and must not be discarded.
             lines = [line.rstrip() for line in data.split('\n') if not line.startswith('#')]
-            for f in _stanzas('\n'.join(lines), 'PACKAGE_SOURCES'):
+            for f in _stanzas('\n'.join(lines), 'PACKAGE_SOURCES_CONFIG'):
                 need(f.keys() <= {'types', 'uris', 'suites', 'components', 'signed-by', 'architectures'}
                      and f.get('types', '').split() in (['deb'], ['deb', 'deb-src'])
                      and f.get('signed-by', KEYRING) == KEYRING
-                     and f.get('architectures', ARCH) == ARCH, 'PACKAGE_SOURCES')
+                     and f.get('architectures', ARCH) == ARCH, 'PACKAGE_SOURCES_CONFIG')
                 uris, suites = f.get('uris', '').split(), f.get('suites', '').split()
-                need(len(uris) == 1 and bool(suites), 'PACKAGE_SOURCES')
+                need(len(uris) == 1 and bool(suites), 'PACKAGE_SOURCES_CONFIG')
                 for suite in suites:
                     add(uris[0], suite, f.get('components', '').split(), True)
         else:
@@ -603,11 +613,11 @@ def _sources(root):
                 if line:
                     match = LEGACY_SOURCE.fullmatch(line)
                     if match is None:
-                        raise Refusal('PACKAGE_SOURCES')
+                        raise Refusal('PACKAGE_SOURCES_CONFIG')
                     kind, uri, suite, components = match.groups()
                     add(uri, suite, components.split(), kind == 'deb')
     suites = {suite for _, suite in sources}
-    need('trixie' in suites and len(suites) == len(sources), 'PACKAGE_SOURCES')
+    need('trixie' in suites and len(suites) == len(sources), 'PACKAGE_SOURCES_CONFIG')
     lists = _dir(root, LISTS)
     archives = _dir(root, '/var/cache/apt/archives')
     _dir(root, '/usr/lib/apt/methods')
@@ -628,7 +638,7 @@ def _sources(root):
         if file.name in ('partial', 'auxfiles', 'lock'):
             continue
         info = file.lstat()
-        need(stat.S_ISREG(info.st_mode) and _trusted(info) and info.st_nlink == 1, 'PACKAGE_SOURCES')
+        need(stat.S_ISREG(info.st_mode) and _trusted(info) and info.st_nlink == 1, 'PACKAGE_APT_INDEXES')
         indexes[file.name] = _snapshot(info)
     return sorted(sources), indexes, ((link, keyring), evidence, _id(etc.lstat()),
                                      _id(parts.lstat()) if parts is not None else None,
@@ -1067,7 +1077,8 @@ def _prepare(root, run, expected, enter):
         with _apt(sources[0], bootstrap=True, update=True) as apt:
             enter()
             need(_sources(root) == sources and _index_staging(root) == staging, 'PACKAGE_PLAN_CHANGED')
-            _command(run, apt + UPDATE, 'PACKAGE_APT_UPDATE', timeout=APT_TIMEOUT)
+            _command(run, apt + UPDATE, 'PACKAGE_APT_UPDATE', timeout=APT_TIMEOUT,
+                     rejected={0: 'PACKAGE_APT_UPDATE_REJECTED', 100: 'PACKAGE_APT_UPDATE_REJECTED'})
         # Check everything except the index set before even asking the solver
         # for a plan. Re-observing a now-populated host directly would plan
         # before detecting drift from the bound empty-index preflight.

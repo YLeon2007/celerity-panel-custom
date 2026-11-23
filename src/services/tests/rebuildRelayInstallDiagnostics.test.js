@@ -97,6 +97,7 @@ function localizedFrontend(html, response, headers, app) {
     const page = { dataset,
         querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh })[key] ?? null,
         querySelectorAll: key => key === '[data-install-url]' ? [install] : [] };
+    assert.match(html, /<script src="\/js\/rebuild-l2tp\.js\?v=[a-f0-9]+" defer><\/script>/);
     const script = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
     runInNewContext(script, { document: { getElementById: () => page },
         window: { addEventListener() {}, location: { reload: () => assert.fail('no automatic reload') } },
@@ -116,13 +117,16 @@ function localizedFrontend(html, response, headers, app) {
     click();
     return task.then(async result => {
         await new Promise(resolve => setImmediate(resolve));
+        // Even if the click handler is reached again, a refresh-required
+        // outcome must not cause a second request from the stale page.
+        if (install.disabled) click();
         assert.equal(calls, 1);
         assert.deepEqual(JSON.parse(result.body), response);
         return [status.textContent, install.disabled, refresh.hidden];
     });
 }
 
-test('closed diagnostics reach the authenticated API and the localized install control', { timeout: 15000 }, async t => {
+async function diagnosticPanel(t, installRelay) {
     const previous = process.env.C3_REBUILD_ENABLED;
     process.env.C3_REBUILD_ENABLED = 'true';
     t.after(() => { if (previous === undefined) delete process.env.C3_REBUILD_ENABLED; else process.env.C3_REBUILD_ENABLED = previous; });
@@ -143,7 +147,25 @@ test('closed diagnostics reach the authenticated API and the localized install c
         req.session.authenticated = true;
         res.json({ csrf: issuePanelCsrfToken(req) });
     });
-    let scenario, log;
+    t.mock.method(require('../rebuildService'), 'createRebuildService', () => ({ installRelay }));
+    app.use('/panel', createPanelRouter({ rebuildL2tpOverview: { overview: async () => ({
+        relays: [{ id: nodeId, name: 'fixture', ip: node.ip, status: 'not_installed', bound: true, canInstall: true }],
+        accounts: [], canManageAccounts: false,
+    }) }, l2tpRateLimiter: (_req, _res, next) => next() }));
+    app.use((_req, res) => res.status(404).json({ error: 'not found' }));
+    const signed = await request(app, '/fixture/session', { method: 'GET' });
+    const cookie = signed.headers['set-cookie'][0].split(';')[0];
+    const csrf = JSON.parse(signed.body).csrf;
+    const auth = { cookie, 'content-type': 'application/json' };
+    assert.equal((await request(app, installUrl, { headers: { 'x-csrf-token': csrf } })).status, 302);
+    assert.equal((await request(app, installUrl, { headers: auth })).status, 403);
+    assert.equal((await request(app, `/api/cascade${installUrl.slice('/panel'.length)}`, { headers: auth })).status, 404);
+    assert.equal((await request(app, installUrl, { headers: { ...auth, 'x-csrf-token': csrf }, body: { check: 'anything' } })).status, 400);
+    return { app, auth, csrf };
+}
+
+test('closed diagnostics reach the authenticated API and the localized install control', { timeout: 15000 }, async t => {
+    let scenario, log = [];
     class SSH {
         connect() {}
         disconnect() {}
@@ -226,21 +248,7 @@ test('closed diagnostics reach the authenticated API and the localized install c
             },
         });
     };
-    t.mock.method(require('../rebuildService'), 'createRebuildService', () => ({ installRelay }));
-    app.use('/panel', createPanelRouter({ rebuildL2tpOverview: { overview: async () => ({
-        relays: [{ id: nodeId, name: 'fixture', ip: node.ip, status: 'not_installed', bound: true, canInstall: true }],
-        accounts: [], canManageAccounts: false,
-    }) }, l2tpRateLimiter: (_req, _res, next) => next() }));
-    app.use((_req, res) => res.status(404).json({ error: 'not found' }));
-    const signed = await request(app, '/fixture/session', { method: 'GET' });
-    const cookie = signed.headers['set-cookie'][0].split(';')[0];
-    const csrf = JSON.parse(signed.body).csrf;
-    const auth = { cookie, 'content-type': 'application/json' };
-    log = [];
-    assert.equal((await request(app, installUrl, { headers: { 'x-csrf-token': csrf } })).status, 302);
-    assert.equal((await request(app, installUrl, { headers: auth })).status, 403);
-    assert.equal((await request(app, `/api/cascade${installUrl.slice('/panel'.length)}`, { headers: auth })).status, 404);
-    assert.equal((await request(app, installUrl, { headers: { ...auth, 'x-csrf-token': csrf }, body: { check: 'anything' } })).status, 400);
+    const { app, auth, csrf } = await diagnosticPanel(t, installRelay);
     assert.deepEqual(log, []);
 
     const apply = ['preflight', 'preflight', 'prepare', 'check', 'reserve', 'install'];
@@ -307,6 +315,143 @@ test('closed diagnostics reach the authenticated API and the localized install c
             assert.deepEqual(log, actions, name);
             assert.equal(disabled, ['unknown', 'rolled_back', 'installed'].includes(outcome), name);
             assert.equal(hidden, !disabled, name);
+        }
+    }
+});
+
+const packageChecks = ['PACKAGE_SOURCES_UNSUPPORTED', 'PACKAGE_INDEXES_UNVERIFIED', 'PACKAGE_SERVICES_UNSAFE'];
+const packageLanguages = ['ru', 'en'];
+
+test('package diagnostics have explicit Russian and English operator copy', () => {
+    const [ru, en] = packageLanguages.map(lang => require(`../../locales/${lang}.json`).rebuildL2tp.installChecks);
+    for (const check of packageChecks) {
+        for (const strings of [ru, en]) {
+            assert.ok(Object.hasOwn(strings, check), `missing explicit translation: ${check}`);
+            assert.ok(strings[check].trim());
+            assert.ok(!strings[check].includes(check));
+        }
+        assert.notEqual(ru[check], en[check], check);
+    }
+    assert.match(ru.PACKAGE_SOURCES_UNSUPPORTED, /Debian 13.*trixie.*main.*ключ/);
+    assert.match(en.PACKAGE_SOURCES_UNSUPPORTED, /Debian 13.*trixie.*main.*keyring/);
+    assert.match(ru.PACKAGE_INDEXES_UNVERIFIED, /подписанн.*индекс.*доступност.*время/i);
+    assert.match(en.PACKAGE_INDEXES_UNVERIFIED, /signed.*indexes.*reach.*time/i);
+    assert.match(ru.PACKAGE_SERVICES_UNSAFE, /IKE.*xl2tpd.*неактивн.*автозапуск/i);
+    assert.match(en.PACKAGE_SERVICES_UNSAFE, /IKE.*xl2tpd.*inactive.*autostart/i);
+});
+
+test('package diagnostics reach the authenticated route and localized Install control only in scope', { timeout: 15000 }, async t => {
+    const packagePreparation = 'e'.repeat(64);
+    const fence = { merged: true, listMode: true, source: 'db', check() {},
+        binding: { host: node.ip, port: 22, username: 'root', machineId, sshHostKeySha256: 'c'.repeat(64) } };
+    const preflight = ['preflight'];
+    const packageWrite = 'prepare-packages';
+    const reserved = [...preflight, 'reserve', packageWrite, 'retain'];
+    const baseline = ['preflight', 'preflight', 'prepare'];
+    const candidate = [...baseline, 'check'];
+    const installing = [...candidate, 'reserve', 'install', 'retain'];
+    const wireFrame = (code, check, prefix = '') => ({ code, stdout: '', stderr: `DIRECT_${prefix}${check}\n` });
+    const source = packageChecks[0];
+    const source70 = wireFrame(70, source), source75 = wireFrame(75, source, 'UNCERTAIN_');
+    const noHint = undefined;
+    // SSH, host replies, grant and persistence are modeled. We exercise the
+    // real DIRECT parser, installer, authenticated route/SSR and browser script
+    // (with a DOM seam), not the host's diagnostic production.
+    const matrix = [
+        ...packageChecks.flatMap(check => [
+            [`preflight: ${check}`, 'preflight', wireFrame(70, check), check, preflight],
+            [`reserved rc70: ${check}`, packageWrite, wireFrame(70, check), check, reserved],
+            [`reserved rc75: ${check}`, packageWrite, wireFrame(75, check, 'UNCERTAIN_'), check, reserved],
+        ]),
+        ['future check', packageWrite, wireFrame(75, `PACKAGE_${marker}`, 'UNCERTAIN_'), noHint, reserved],
+        ['naked rc75', packageWrite, { code: 75, stdout: '', stderr: '' }, noHint, reserved],
+        ['lost SSH ACK', packageWrite, null, noHint, reserved],
+        ['private stdout', packageWrite, { ...source70, stdout: marker }, noHint, reserved],
+        ['private stderr after valid line', packageWrite, { ...source75, stderr: source75.stderr + `/fixture/${marker}\n` }, noHint, reserved],
+        ['missing LF', packageWrite, { ...source75, stderr: source75.stderr.trimEnd() }, noHint, reserved],
+        ['extra LF', packageWrite, { ...source70, stderr: `${source70.stderr}\n` }, noHint, reserved],
+        ['CRLF', 'preflight', { ...source70, stderr: source70.stderr.replace('\n', '\r\n') }, noHint, preflight],
+        ['private stdout at preflight', 'preflight', { ...source70, stdout: marker }, noHint, preflight],
+        ['preflight rc75 is not package entry', 'preflight', source75, noHint, preflight],
+        ['rc75 needs uncertainty prefix', packageWrite, { ...source70, code: 75 }, noHint, reserved],
+        ['rc70 cannot carry uncertainty prefix', packageWrite, { ...source75, code: 70 }, noHint, reserved],
+        ...packageChecks.map(check => [`wrong action prepare: ${check}`, 'prepare', wireFrame(70, check), noHint, baseline]),
+        ['wrong action check', 'check', source70, noHint, candidate],
+        ['wrong action install', 'install', source70, noHint, installing],
+        ['wrong action install no-write alias', 'install', wireFrame(70, source, 'NO_WRITE_'), noHint, installing],
+    ];
+    const snapshot = { ...ready, main, mainSha256: createHash('sha256').update(main).digest('hex'),
+        bridge: null, bridgeSha256: null, baseline: 'd'.repeat(64) };
+    let failingAction, frame, log = [], reservation;
+    class SSH {
+        connect() {}
+        disconnect() {}
+        async exec(_command, { stdin }, verify) {
+            await verify();
+            const input = JSON.parse(stdin);
+            const { action, backupId } = input;
+            if (action === packageWrite) {
+                assert.match(reservation.backupId, /^[a-f0-9]{32}$/);
+                assert.deepEqual(input, { action, machineId, backupId: reservation.backupId, packagePreparation });
+            }
+            log.push(action);
+            if (action === failingAction) {
+                if (frame === null) throw Error(`lost reply: /fixture/${marker}`);
+                return frame;
+            }
+            if (action === 'preflight') return ok(failingAction === packageWrite ? { machineId, packagePreparation } : ready);
+            if (action === 'prepare') return ok(snapshot);
+            return ok({ ok: true, backupId });
+        }
+    }
+    const { app, auth, csrf } = await diagnosticPanel(t, id => runFreshRelayInstall(id, {
+        authorize: () => true, machineId, inventory: async () => ({ eligible: true, pristine: true }),
+        unifiedIdentity: true, allowPackagePreparation: true,
+        lock: fn => fn(() => true, () => log.push('retain')),
+        connect: async () => createRelayDirect({ node, fence, SSH: attested(SSH, machineId) }),
+        prepare: (_, remote) => remote.prepare({ nodeId, desired, carryDomain: false, controlPlaneAddresses: ['panel.fixture.invalid'] }),
+        reserve: async (_, backupId) => {
+            log.push('reserve');
+            reservation = { backupId };
+            return reservation;
+        },
+        verifyReservation: async value => assert.equal(value, reservation),
+        restore: async () => { log.push('restore'); },
+        finish: async () => { log.push('finish'); },
+    }));
+    assert.deepEqual(log, []);
+
+    for (const lang of packageLanguages) {
+        const { installChecks, messages } = require(`../../locales/${lang}.json`).rebuildL2tp;
+        const headers = { ...auth, 'accept-language': lang };
+        const page = await request(app, '/panel/l2tp', { method: 'GET', headers });
+        assert.equal(page.status, 200);
+        for (const [name, action, reply, check, actions] of matrix) {
+            await t.test(`${lang}: ${name}`, async () => {
+                [failingAction, frame] = [action, reply];
+                const refused = action === 'preflight' && check !== undefined;
+                const expected = { error: {
+                    code: refused ? 'REBUILD_L2TP_DIRECT_PREREQUISITE' : action === 'install'
+                        ? 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN',
+                    outcome: refused ? 'refused' : 'unknown',
+                    ...(check && { check }),
+                    ...(actions.includes('retain') && { retryAllowed: false }),
+                } };
+                log = [];
+                const result = await request(app, installUrl, { headers: { ...headers, 'x-csrf-token': csrf } });
+                assert.equal(result.status, 409);
+                assert.deepEqual(JSON.parse(result.body), expected);
+                assert.doesNotMatch(result.body, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|DIRECT_(?:UNCERTAIN_)?PACKAGE_/);
+                assert.deepEqual(log, actions);
+                log = [];
+                const [text, disabled, refreshHidden] = await localizedFrontend(page.body, expected, headers, app);
+                assert.equal(text, (refused ? messages.installRefused : messages.uncertain)
+                    + (check ? ` ${installChecks[check]}` : ''));
+                assert.doesNotMatch(text, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|PACKAGE_(SOURCES|INDEXES|SERVICES)|REBUILD_L2TP_/);
+                assert.deepEqual(log, actions);
+                assert.equal(disabled, !refused);
+                assert.equal(refreshHidden, refused);
+            });
         }
     }
 });

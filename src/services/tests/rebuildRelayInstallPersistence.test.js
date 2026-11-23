@@ -872,7 +872,7 @@ for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered
         assert.deepEqual(host.aptConfig(), config);
         if (outcome === 'foreign-source') {
             assert.equal(status, 409);
-            assert.equal(result.error.check, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE');
+            assert.equal(result.error.check, 'PACKAGE_SOURCES_UNSUPPORTED');
             assert.deepEqual(frames, [[id, 'preflight']]);
             assert.deepEqual([events, f.states, f.users, model.updates], [[], [], [], []]);
             assert.equal(host.exists(vault), false);
@@ -889,7 +889,8 @@ for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered
             assert.equal(result.error.outcome, 'unknown');
             assert.equal(result.error.retryAllowed, false);
             assert.deepEqual(frames, [[id, 'preflight'], [id, 'prepare-packages']]);
-            assert.ok(replies[1].status !== 0 && !replies[1].hasOutput);
+            assert.deepEqual(replies[1], { status: 75, hasOutput: false });
+            assert.equal(result.error.check, 'PACKAGE_INDEXES_UNVERIFIED');
             assert.equal(update.status, ['incomplete', 'tampered'].includes(outcome) ? 0 : 100);
             assert.equal(update.indexes.length, ({ untrusted: 0, tampered: 6 })[outcome] ?? 5);
             assert.deepEqual([model.afterUpdate, model.quiet, model.aptWrites, model.installed], [[], {}, 0, initialPackages]);

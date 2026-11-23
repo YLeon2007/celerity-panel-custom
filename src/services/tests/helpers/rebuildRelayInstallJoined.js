@@ -675,8 +675,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 if (scenario === 'cut') assert.ok(aptReads.preflight > 0);
                 else assert.deepEqual(aptReads, {});
                 if (scenario === 'active' || scenario === 'foreign') {
-                    assert.equal(model.lastRefusal[0], scenario === 'active' ? 'PACKAGE_UNIT_ACTIVE' : 'PACKAGE_UNIT_OWNER', diagnostic(f));
-                    assert.deepEqual(f.refusals, ['DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE']);
+                    assert.equal(model.lastRefusal[0], scenario === 'active' ? 'PACKAGE_UNIT_ACTIVE' : 'PACKAGE_UNIT_OWNER_FOREIGN', diagnostic(f));
+                    assert.deepEqual(f.refusals, ['DIRECT_PACKAGE_SERVICES_UNSAFE']);
+                    assert.equal(result.error.check, 'PACKAGE_SERVICES_UNSAFE');
                 }
                 assert.deepEqual([effects, model.effects], [[], []]);
                 assert.deepEqual(snapshotNative(f), before);

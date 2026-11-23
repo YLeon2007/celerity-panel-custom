@@ -142,6 +142,13 @@ class Refusal(Exception):
     pass
 
 
+class PackageDiagnostic(Refusal):
+    def __init__(self, suffix, *, uncertain=False):
+        super().__init__(suffix)
+        self.suffix = suffix
+        self.uncertain = uncertain
+
+
 def need(condition, code):
     if not condition:
         raise Refusal(code)
@@ -4738,12 +4745,35 @@ def package_scope(machine, fd):
     return {'machineId': machine_id, 'boot': boot_id, 'installLock': install_lock_identity(fd)}
 
 
+def package_diagnostic(error):
+    # Only the bundled guard's exact domain checks qualify. A cleanup note,
+    # even on an otherwise known refusal, makes the diagnostic ambiguous.
+    if getattr(error, '__notes__', None) or len(error.args) != 1 or type(error.args[0]) is not str:
+        return None
+    return {
+        'PACKAGE_SOURCES_CONFIG': 'PACKAGE_SOURCES_UNSUPPORTED',
+        'PACKAGE_APT_UPDATE_REJECTED': 'PACKAGE_INDEXES_UNVERIFIED',
+        'PACKAGE_APT_INDEXES': 'PACKAGE_INDEXES_UNVERIFIED',
+        'PACKAGE_UNIT_OWNER_FOREIGN': 'PACKAGE_SERVICES_UNSAFE',
+        'PACKAGE_UNIT_ACTIVE': 'PACKAGE_SERVICES_UNSAFE',
+        'PACKAGE_UNIT_ENABLED': 'PACKAGE_SERVICES_UNSAFE',
+        'PACKAGE_SYSV_ENABLED': 'PACKAGE_SERVICES_UNSAFE',
+    }.get(error.args[0])
+
+
 def package_observation(guard, machine, fd, run):
     scope = package_scope(machine, fd)
     try:
         plan = guard['observe'](stock_runtime_root(), run)
-    except guard['Refusal']:
+    except guard['Refusal'] as error:
         need(not run.failed, 'IN_FLIGHT')
+        diagnostic = package_diagnostic(error)
+        if diagnostic is not None:
+            try:
+                need(package_scope(machine, fd) == scope, 'IN_FLIGHT')
+            except Exception:
+                raise Refusal('IN_FLIGHT') from None
+            raise PackageDiagnostic(diagnostic) from None
         raise Refusal(PACKAGE_AUTOSTART_UNSAFE) from None
     need(not run.failed, 'IN_FLIGHT')
     need(type(plan) is dict and type(plan.get('missing')) is list and bool(plan['missing']), PACKAGE_AUTOSTART_UNSAFE)
@@ -4776,6 +4806,7 @@ def prepare_packages(request):
     receipt_name = 'packages-' + token + '.json'
     receipt_path, pending_path = VAULT + '/' + receipt_name, VAULT + '/' + PACKAGE_PENDING
     journaling = refused = False
+    diagnostic = None
     try:
         with directory(SYSTEM) as fd:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4816,26 +4847,31 @@ def prepare_packages(request):
 
             try:
                 result = guard['prepare'](stock_runtime_root(), run, plan, enter)
-            except guard['Refusal']:
-                # No effect grant, no unsettled command, and exact ownership
-                # below: this refusal is definitive, but still not replayable.
-                need(not run.entered and not run.failed, 'IN_FLIGHT')
-                refused = True
+            except guard['Refusal'] as error:
+                need(not run.failed, 'IN_FLIGHT')
+                diagnostic = package_diagnostic(error)
+                need(not run.entered or diagnostic is not None, 'IN_FLIGHT')
+                refused = not run.entered
             else:
                 # Only the guard's normal post-cleanup return proves packages
                 # installed, with no owned masks/policy, and services idle.
                 need(run.entered and run.apt_settled and result is None, 'IN_FLIGHT')
             recheck()
-            receipt = entry(encode({**binding, 'phase': 'refused' if refused else 'ready'}))
-            write(receipt_path, intent, receipt)
-            recheck(receipt)
-            write(pending_path, intent, None)
-            package_no_pending()
+            # Even an authenticated refusal after entry is only a diagnostic;
+            # do not advance the operation receipt or touch the pending fence.
+            if refused or diagnostic is None:
+                receipt = entry(encode({**binding, 'phase': 'refused' if refused else 'ready'}))
+                write(receipt_path, intent, receipt)
+                recheck(receipt)
+                write(pending_path, intent, None)
+                package_no_pending()
         need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
     except Exception:
         if journaling:
             raise Refusal('IN_FLIGHT') from None
         raise
+    if diagnostic is not None:
+        raise PackageDiagnostic(diagnostic, uncertain=not refused)
     if refused:
         raise Refusal(PACKAGE_AUTOSTART_UNSAFE)
     return {'ok': True, 'backupId': token, 'packagesReady': True}
@@ -5013,6 +5049,16 @@ def main():
             return 75
         if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED):
             return 75
+        if isinstance(error, PackageDiagnostic):
+            if time.monotonic() >= DEADLINE:
+                return 75
+            if error.uncertain:
+                if action == 'prepare-packages':
+                    print('DIRECT_UNCERTAIN_' + error.suffix, file=sys.stderr)
+                return 75
+            suffix = error.suffix if action in ('preflight', 'prepare-packages') else PACKAGE_AUTOSTART_UNSAFE
+            print('DIRECT_' + suffix, file=sys.stderr)
+            return 70
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
               'IDENTITY' if str(error) == 'IDENTITY' else
               RETIRE_CHANGED if action in ('prepare-remove', 'remove') and str(error) == RETIRE_CHANGED else
