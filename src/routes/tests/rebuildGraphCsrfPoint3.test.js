@@ -25,7 +25,7 @@ const previewId = 'b'.repeat(64);
 const csrf = code => ({ error: 'CSRF validation failed', code });
 
 // Real Express dispatch and auth/CSRF guards, no sockets listening or connecting.
-function makeApp(previewFailure) {
+function makeApp(previewFailure, deployFailure) {
     const browser = { authenticated: true }, other = { authenticated: true };
     const stale = issuePanelCsrfToken({ session: browser });
     const fresh = issuePanelCsrfToken({ session: other });
@@ -34,6 +34,7 @@ function makeApp(previewFailure) {
         calls.push(input);
         if (input.preview && previewFailure) throw previewFailure;
         if (input.preview) return { allowed: true, previewId, nodes: [] };
+        if (deployFailure) throw deployFailure;
         return {};
     } };
     const app = express();
@@ -417,6 +418,21 @@ test('delete refusal after preview never resends DELETE or marks it accepted', a
     assert.equal(ui.confirmations.length, 1);
 });
 
+test('bridge placeholder refusal: actual Deploy toast uses localized guidance only for the dedicated code', async () => {
+    const bridge = 'REBUILD_L2TP_APPLY_BRIDGE_PLACEHOLDER_UNPROVED';
+    for (const lang of ['en', 'ru', 'zh-CN']) {
+        for (const code of [bridge, 'REBUILD_L2TP_APPLY_NETWORK_REFUSED']) {
+            const app = makeApp(undefined, Object.assign(new Error('private fixture detail'), { code }));
+            const ui = mount('nodes', lang, app.stale, true, call => dispatch(app, call));
+            await ui.context._cascadeDeploy(linkId);
+            assert.ok(ui.toast().includes(code));
+            assert.equal(ui.toast().includes(t('network.bridgePlaceholderUnproved', lang)), code === bridge);
+            assert.doesNotMatch(ui.toast(), /private fixture detail/);
+            assert.deepEqual(app.calls.map(call => call.preview), [true, false]);
+        }
+    }
+});
+
 const portalId = 'c'.repeat(24), gatewayId = 'd'.repeat(24), relayId = 'e'.repeat(24), unknownId = 'f'.repeat(24);
 const portalLabel = 'North <b>Harbor</b>\n$& {name}', cleanPortalLabel = 'North <b>Harbor</b> $& {name}';
 const removePath = '/api/cascade/links/' + linkId;
@@ -487,10 +503,8 @@ for (const view of ['nodes', 'network']) for (const [lang, expected] of Object.e
         const action = ui.context._cascadeDelete(linkId);
         const dialog = await openedBy(ui, action);
         const currentAsset = require('node:crypto').createHash('sha256').update(readFileSync(path.join(root, 'public/js/network.js'))).digest('hex').slice(0, 16);
-        // The standalone template is a render fixture; /panel/network
-        // redirects to the Nodes loader, which owns the active digest pin.
         assert.deepEqual(ui.resources.filter(src => src.startsWith('/js/network')),
-            ['/js/network.js?v=' + (view === 'nodes' ? currentAsset : 'b4ff107132c65fd7')]);
+            ['/js/network.js?v=' + currentAsset]);
         assert.ok(dialog.open);
         assert.match(ui.html, /<dialog[^>]*id="rebuildPreview"[^>]*aria-labelledby="rebuildPreviewTitle"[^>]*>/);
         assert.match(ui.html, /id="rebuildPreviewWarning"[\s\S]*id="rebuildPreviewDetails"[\s\S]*id="rebuildPreviewCancel"[^>]*autofocus/);

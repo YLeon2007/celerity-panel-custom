@@ -241,7 +241,7 @@ function addSource(f, { source = sourceId, machine = sourceMachineId, prefix = '
 }
 
 // Model only the local collection/session boundary, never a host or stand.
-function sessionFixture(t, f) {
+function sessionFixture(t, f, { graph = false } = {}) {
     const events = [], hooks = {};
     class Session {
         transaction = { transition: state => {
@@ -268,7 +268,9 @@ function sessionFixture(t, f) {
         }
     }
     function commit(session) {
-        for (const rows of [f.states, f.users, f.locks]) rows.splice(0, rows.length, ...session.rows.get(rows));
+        for (const rows of [f.states, f.users, f.locks, ...(graph ? [f.links, f.nodes] : [])]) {
+            rows.splice(0, rows.length, ...session.rows.get(rows));
+        }
         session.commitAccountIntent?.();
         session.commitDirectory?.();
         return { ok: 1 };

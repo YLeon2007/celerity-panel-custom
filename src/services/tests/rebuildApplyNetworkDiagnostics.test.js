@@ -92,6 +92,13 @@ test('local guard rejection is not a lost SSH result', t => exercise(t, 0, lost,
 test('logging failure cannot replace the unknown outcome', t => exercise(t, 4, lost, 'ssh_no_reply', unknown, { brokenLogger: true }));
 test('acknowledged Apply emits no failure event', t => exercise(t, -1, null));
 
+test('only publication recognizes the exact empty-bridge refusal, not generic drift or a late frame', async t => {
+    const bridge = { ...frame, stderr: 'DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n' };
+    await t.test('publish', t => exercise(t, 3, () => bridge, 'direct_refusal', 'REBUILD_L2TP_APPLY_BRIDGE_PLACEHOLDER_UNPROVED'));
+    await t.test('generic rollback drift', t => exercise(t, 3, () => ({ ...frame, stderr: 'DIRECT_ROLLBACK_DRIFT\n' }), 'direct_refusal', refused));
+    await t.test('late frame', t => exercise(t, 5, () => bridge, 'unrecognized_exit_70', unknown));
+    await t.test('extra bytes', t => exercise(t, 3, () => ({ ...bridge, stderr: bridge.stderr + 'foreign\n' }), 'unrecognized_exit_70', unknown));
+});
 test('preview checks project an exact runtime refusal without ever sending reattestation', async t => {
     const nodeId = '4'.repeat(24);
     const actions = [];

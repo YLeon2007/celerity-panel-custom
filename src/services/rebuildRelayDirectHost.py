@@ -1398,8 +1398,12 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
     stock_starter = digest(raw(files['starter'])) == STOCK_IKE_STARTER_SHA
     need(ike_include_matches(files['starter'], [], check_tree=True) if stock_starter
          else ike_include_matches(files['starter'], []), 'PREREQUISITE')
+    bridge_generation = remove_generation(BRIDGE)
     bridge = read(BRIDGE, diagnose_profile_owner=diagnose_profile_owner)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
+    placeholder = canonical_empty_bridge(bridge) and bridge_unit_absent(units[B])
+    if placeholder:
+        need(bridge_generation is not None and remove_generation(BRIDGE) == bridge_generation, 'BASELINE_CHANGED')
     global_paths = ('/etc/ppp/options', SWAN_CONF, XL_DEFAULT)
     for path in global_paths:
         # Fingerprint stock/default inputs that this installer never edits.
@@ -1444,7 +1448,8 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
     return dict(boot=boot(), files=files, units=install_unit_pins(units), bridge=bridge, sockets=sockets, globalFiles=globals_before,
                 installBoot=install_boot, ikeSockets=[], swanInputs=swan,
                 **({'nativePreparation': preparation} if preparation is not None else {}),
-                **({'transit': transit} if transit is not None else {}))
+                **({'transit': transit} if transit is not None else {}),
+                **({'emptyBridgeGeneration': bridge_generation} if placeholder else {}))
 
 
 def candidate(request, before, *, active_probe=False):
@@ -1865,6 +1870,8 @@ def neighbors(before, sidecar=False):
              and b.get('User') == 'nobody' and xray_accounts_match(b, before['units'][B]), 'ROLLBACK_DRIFT')
     else:
         need(read(BRIDGE) == before['bridge'] and all(b.get(k) == v for k, v in before['units'][B].items()), 'ROLLBACK_DRIFT')
+        if 'emptyBridgeGeneration' in before:
+            need(bridge_unit_absent(b) and remove_generation(BRIDGE) == before['emptyBridgeGeneration'], 'ROLLBACK_DRIFT')
 
 
 def file_generations(records=None, *, include_chap=True):
@@ -3393,6 +3400,39 @@ def apply_profile_read(path):
     return record, generation
 
 
+# The compact JSON.stringify bytes of rebuildTopologyComposer.blackholeProfile
+# after composeXrayConfig (the non-exit BRIDGE). Do not admit equivalent JSON.
+EMPTY_BRIDGE_BYTES = (b'{"log":{"loglevel":"warning","access":"none"},"inbounds":[],"outbounds":'
+                      b'[{"tag":"block","protocol":"blackhole"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[]}}')
+BRIDGE_PLACEHOLDER_UNPROVED = 'BRIDGE_PLACEHOLDER_UNPROVED'
+
+
+def canonical_empty_bridge(record):
+    if record is None:
+        return False
+    try:
+        group = grp.getgrnam('nogroup').gr_gid
+        # Ordinary putPair uses the primary group of nobody on creation.
+        return group == pwd.getpwnam('nobody').pw_gid and record == entry(EMPTY_BRIDGE_BYTES, 0o640, group)
+    except KeyError:
+        return False
+
+
+def bridge_unit_absent_pin(info):
+    # Only the stable systemd projection was recorded at Install.
+    return (type(info) is dict and info.get('LoadState') == 'not-found'
+            and tuple(info.get(key) for key in ('ActiveState', 'SubState', 'MainPID')) == ('inactive', 'dead', '0')
+            and all(info.get(key) == '' for key in ('FragmentPath', 'DropInPaths', 'UnitFileState'))
+            and info.get('InvocationID') in ('', '0' * 32))
+
+
+def bridge_unit_absent(info):
+    return (bridge_unit_absent_pin(info) and info.get('NeedDaemonReload') == 'no'
+            and not any(info.get(key) for key in ('Job', 'ControlGroup', 'SourcePath', 'ExecCondition', 'ExecStart',
+                                                  'ExecStartPre', 'ExecStartPost', 'ExecReload', 'ExecStop', 'ExecStopPost'))
+            and directory_absent(SYSTEM + '/' + B))
+
+
 def apply_bridge_state(info, active):
     bad = 'RUNTIME_UNPROVED'
     if info['LoadState'] == 'not-found':
@@ -3462,15 +3502,32 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     after, runtime = backup['after'], backup['runtime']
     installed = backup.get('currentApply')
     before, replacements, plan = {}, {}, {}
+    placeholder = False
     for key, target in (('main', MAIN), ('bridge', BRIDGE)):
-        record, generation = apply_profile_read(target)
-        if installed is not None or key in after:
+        unpinned = installed is None and key not in after
+        try:
+            record, generation = apply_profile_read(target)
+        except (Refusal, OSError):
+            if not unpinned or key != 'bridge':
+                raise
+            raise Refusal(BRIDGE_PLACEHOLDER_UNPROVED) from None
+        if not unpinned:
             expected = installed['files'][key] if installed is not None else [after[key], runtime['files'][key]]
             need(encode(file_pin(record, generation)) == encode(expected), bad)
+        elif key == 'bridge':
+            original = backup['before']
+            pinned = 'emptyBridgeGeneration' in original
+            if record is not None or original['bridge'] is not None or pinned:
+                need(generation is not None and record == original['bridge'] and canonical_empty_bridge(record),
+                     BRIDGE_PLACEHOLDER_UNPROVED)
+                # v1.4.1 recorded the canonical file and the absent unit, but
+                # not the original inode. Attest the live generation only for
+                # this publication; never add a historical generation pin.
+                need(generation == original['emptyBridgeGeneration'] if pinned
+                     else bridge_unit_absent_pin(original['units'].get(B)), BRIDGE_PLACEHOLDER_UNPROVED)
+                placeholder = True
         else:
-            # A pre-existing unpinned BRIDGE (including a byte-identical
-            # replacement) is not an owned Apply target.
-            need(record is None and backup['before']['bridge'] is None, bad)
+            raise Refusal(bad)
         stage = read(target + '.rebuild-' + request['stageId'] + '.json')
         if stage is None:
             raise Refusal(bad)
@@ -3487,6 +3544,8 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     active = bool(side['inbounds'] or any(o.get('protocol') == 'vless' and o.get('settings', {}).get('reverse', {}).get('tag')
                                          for o in side['outbounds']))
     info = unit(B)
+    if placeholder:
+        need(bridge_unit_absent(info), BRIDGE_PLACEHOLDER_UNPROVED)
     need(xray_accounts_match(info, backup['before']['units'][B]), bad)
     old_unit = apply_bridge_state(info, installed is not None and installed['bridgeActive'])
     need(old_unit == (None if installed is None else installed['bridgeUnit']), bad)
@@ -3500,11 +3559,15 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     journal = {**backup, 'phase': APPLY_PROFILES_PHASE, 'applyPending': pending}
     proof = entry(encode(journal))
     generation = remove_generation(path)
+    if placeholder:
+        need(bridge_unit_absent(unit(B)) and apply_profile_read(BRIDGE) == before['bridge'], BRIDGE_PLACEHOLDER_UNPROVED)
     need(generation is not None and len(raw(proof)) <= 2 * MAX_FILE and time.monotonic() < DEADLINE, bad)
     NETWORK_UPGRADE_ENTERED = True
     journal_generation = write(path, manifest, proof, generation=generation, witness=True)
     for key, target in (('bridge', BRIDGE), ('main', MAIN)):
         record, generation = before[key]
+        if placeholder and key == 'bridge':
+            need(bridge_unit_absent(unit(B)) and time.monotonic() < DEADLINE, bad)
         observed = write(target, record, replacements[key], generation=generation, witness=True)
         pending['files'][key] = file_pin(replacements[key], observed)
     if new_unit is not None:
@@ -6083,7 +6146,7 @@ def recovery_manifest(request, scope):
                                       'preparedSockets', 'modulePersistence'}
          and record == entry(encode(backup)) and backup['backupId'] == request['backupId']
          and backup['machineId'] == scope['machineId'] and encode(backup['network']) == encode(request['network'])
-         and baseline_keys <= set(before) <= baseline_keys | {'transit', 'nativePreparation'}
+         and baseline_keys <= set(before) <= baseline_keys | {'transit', 'nativePreparation', 'emptyBridgeGeneration'}
          and before['boot'] == scope['boot'] and before['installLock'] == scope['installLock']
          and type(before['installBoot']) is bool and type(before['ikeSockets']) is list
          and ((type(before['sockets']) is list and 'preparedSockets' not in backup)

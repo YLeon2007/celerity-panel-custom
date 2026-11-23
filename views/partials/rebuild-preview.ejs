@@ -11,6 +11,7 @@ previewLabels.fingerprint = Object.fromEntries([
 ].map(key => [key, t('network.rebuildFingerprint.' + key)]));
 previewLabels.neighbor = Object.fromEntries(['neighborRefused', 'neighborUnknown', 'neighborRuntimeForeignChange', 'neighborNetworkNotReady']
     .map(key => [key, t('nodes.retireRelay.' + key)]));
+previewLabels.bridgePlaceholderUnproved = t('network.bridgePlaceholderUnproved');
 previewLabels.lang = typeof lang === 'string' ? lang : 'en';
 previewLabels.cancel = t('common.cancel');
 previewLabels.close = t('common.close');

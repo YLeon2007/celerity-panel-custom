@@ -769,6 +769,9 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
     } : undefined;
     const result = await readWithRuntimeReattestation(read, reattest);
     if (merged && result?.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_IDENTITY\n') throw identityChanged();
+    if (publishing && result?.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n') {
+        throw fail('APPLY_BRIDGE_PLACEHOLDER_UNPROVED');
+    }
     if (result?.code === 70 && result.stdout === '' && /^DIRECT_(?:ROLLBACK_DRIFT|IDENTITY|PREREQUISITE|RUNTIME_UNPROVED|CANDIDATE_INVALID|COMMAND_FAILED)\n$(?![\s\S])/.test(result.stderr)) {
         if (finalizing) throw unknown();
         throw fail('APPLY_NETWORK_REFUSED');

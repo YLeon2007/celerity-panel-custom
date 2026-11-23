@@ -1522,6 +1522,7 @@
     "diskThresholdsHint": "发送 host.disk_low / host.disk_critical / host.disk_recovered 事件。"
   },
   "network": {
+    "bridgePlaceholderUnproved": "部署时无法验证中继上的空 Xray Bridge 配置。请检查该中继上的 xray-bridge.service 和 /usr/local/etc/xray-bridge/config.json。请勿覆盖或删除来源不明的配置。如果这是旧版 L2TP 安装中面板生成且未被修改的占位配置，请安排维护：通过面板卸载 L2TP，部署待生效的线路，然后重新安装 L2TP。",
     "title": "网络地图",
     "nodes": "节点",
     "links": "链路",

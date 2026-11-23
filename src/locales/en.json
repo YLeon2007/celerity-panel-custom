@@ -1450,6 +1450,7 @@
     "diskThresholdsHint": "Sends host.disk_low / host.disk_critical / host.disk_recovered events."
   },
   "network": {
+    "bridgePlaceholderUnproved": "Deploy could not verify the relay’s empty Xray bridge config. Check xray-bridge.service and /usr/local/etc/xray-bridge/config.json on the relay. Don’t overwrite or delete an unknown config. If this is the panel’s untouched placeholder from an older L2TP install, schedule maintenance: remove L2TP in the panel, deploy the pending links, then reinstall L2TP.",
     "rebuildFingerprint": {
       "known": "Dialer: {name} · Xray {version} (last reported) · REALITY fingerprint: {fingerprint}. The server checks again before applying.",
       "limited": "Dialer: {name} · Xray {version} (last reported) · REALITY fingerprint: {fingerprint}. Allowed: {allowed}. The server checks again before applying.",

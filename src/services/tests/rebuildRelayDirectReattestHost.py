@@ -10,6 +10,7 @@ import runpy
 import stat
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 from typing import Any
 import unittest
@@ -151,7 +152,7 @@ class RuntimeReattest(unittest.TestCase):
         class OwnerStat:
             def __init__(self, value):
                 self.value = value
-                self.st_uid = 0
+                self.st_uid = fixture_uids.get(value.st_ino, 0)
                 self.st_gid = fixture_gids.get(value.st_ino, 0)
 
             def __getattr__(self, name):
@@ -173,13 +174,14 @@ class RuntimeReattest(unittest.TestCase):
                 return OwnerStat(real_os.stat(path, **kw))
 
             def fchown(self, fd, uid, gid):
-                assert uid == 0 and gid in (0, 65534)
-                fixture_gids[real_os.fstat(fd).st_ino] = gid
+                assert uid in (0, 65534) and gid in (0, 65534)
+                inode = real_os.fstat(fd).st_ino
+                fixture_uids[inode], fixture_gids[inode] = uid, gid
 
             def geteuid(self):
                 return 0
 
-        fixture_gids = {}
+        fixture_uids, fixture_gids = {}, {}
         self.has_ppp_link = False
         self.xray_users = h['xray_users']
         self.xray_argv = h['xray_argv']
@@ -737,6 +739,163 @@ class RuntimeReattest(unittest.TestCase):
         before = self.image()
         self.assertEqual(self.call('publish-apply-profiles', **params), (70, '', 'DIRECT_ROLLBACK_DRIFT\n'))
         self.assertEqual(before, self.image())
+
+    def test_apply_refuses_unproved_empty_bridge_preimage(self):
+        params, _ = self.apply_fixture()
+        h, target = self.h, self.h['BRIDGE']
+        original_unit = self.units[h['B']].copy()
+        absent_unit = dict(original_unit, FragmentPath='', UnitFileState='', ExecStart='', ControlGroup='', InvocationID='0' * 32)
+        empty = h['EMPTY_BRIDGE_BYTES']
+        group = h['grp'].getgrnam('nogroup').gr_gid
+        legacy_cases = ('noncanonical bytes', 'nonempty', 'wrong mode', 'wrong group', 'wrong owner', 'missing file',
+                        'unrecorded file', 'noncanonical receipt', 'original loaded', 'original unknown',
+                        'original pid', 'original invocation', 'original fragment',
+                        'loaded', 'fragment on disk', 'job', 'cgroup', 'reload pending', 'unknown observation')
+        for case in (*legacy_cases, 'replaced inode', 'changed ctime', 'null pin', 'pinned file missing'):
+            with self.subTest(case=case):
+                self.units[h['B']] = absent_unit.copy()
+                self.manifest['before']['units'][h['B']] = h['install_unit_pins'](self.units)[h['B']]
+                path = self.physical(target)
+                path.unlink(missing_ok=True)
+                self.put(target, empty, 0o640)
+                with path.open('rb') as stream:
+                    h['os'].fchown(stream.fileno(), 0, group)
+                original = self.manifest['before']
+                original['bridge'] = h['read'](target)
+                original.pop('emptyBridgeGeneration', None)
+                if case not in legacy_cases:
+                    original['emptyBridgeGeneration'] = h['remove_generation'](target)
+                if case in ('noncanonical bytes', 'nonempty'):
+                    path.write_bytes(empty + b'\n' if case == 'noncanonical bytes' else b'{"inbounds":[{}]}')
+                elif case == 'wrong mode':
+                    path.chmod(0o644)
+                elif case in ('wrong owner', 'wrong group'):
+                    with path.open('rb') as stream:
+                        h['os'].fchown(stream.fileno(), h['pwd'].getpwnam('nobody').pw_uid if case == 'wrong owner' else 0,
+                                       0 if case == 'wrong group' else group)
+                elif case in ('missing file', 'pinned file missing'):
+                    path.unlink()
+                    if case == 'pinned file missing':
+                        original['bridge'] = None  # A contradictory newer pin is not a legacy absence.
+                elif case == 'unrecorded file':
+                    original['bridge'] = None
+                elif case == 'noncanonical receipt':
+                    original['bridge'] = h['entry'](empty + b'\n', 0o640, group)
+                    path.write_bytes(empty + b'\n')  # Agreement alone is insufficient.
+                elif case.startswith('original '):
+                    name, value = {'original loaded': ('LoadState', 'loaded'), 'original unknown': ('LoadState', None),
+                                   'original pid': ('MainPID', '22'), 'original invocation': ('InvocationID', '1' * 32),
+                                   'original fragment': ('FragmentPath', original_unit['FragmentPath'])}[case]
+                    original['units'][h['B']][name] = value
+                elif case == 'replaced inode':
+                    self.put(target + '.foreign', empty, 0o640)
+                    self.physical(target + '.foreign').replace(path)
+                    with path.open('rb') as stream:
+                        h['os'].fchown(stream.fileno(), 0, group)
+                elif case == 'changed ctime':
+                    time.sleep(0.02)  # Allow the filesystem ctime clock to tick.
+                    path.chmod(0o600)
+                    path.chmod(0o640)
+                    self.assertNotEqual(h['remove_generation'](target), self.manifest['before']['emptyBridgeGeneration'])
+                elif case == 'null pin':
+                    original['emptyBridgeGeneration'] = None
+                elif case == 'loaded':
+                    self.units[h['B']].update(LoadState='loaded', FragmentPath=original_unit['FragmentPath'], UnitFileState='disabled')
+                elif case == 'fragment on disk':
+                    self.put(h['SYSTEM'] + '/' + h['B'], b'[Service]\n', 0o644)
+                elif case == 'job':
+                    self.units[h['B']]['Job'] = '7'
+                elif case == 'cgroup':
+                    self.units[h['B']]['ControlGroup'] = '/system.slice/' + h['B']
+                elif case == 'reload pending':
+                    self.units[h['B']]['NeedDaemonReload'] = 'yes'
+                elif case == 'unknown observation':
+                    del self.units[h['B']]['InvocationID']
+                self.save_manifest()
+                rc, reply, err = self.call('prepare-apply-network')
+                self.assertEqual((rc, err), (0, ''))
+                before = self.image()
+                self.assertEqual(self.call('publish-apply-profiles', **{**params, 'proof': json.loads(reply)['proof']}),
+                                 (70, '', 'DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n'))
+                self.assertEqual(before, self.image())
+                if case == 'fragment on disk':
+                    self.physical(h['SYSTEM'] + '/' + h['B']).unlink()
+
+    def check_apply_empty_bridge_collision(self, *, legacy, after_entry, unit_appears=False):
+        params, _ = self.apply_fixture()
+        h, target = self.h, self.h['BRIDGE']
+        self.units[h['B']].update(FragmentPath='', UnitFileState='', ExecStart='', ControlGroup='', InvocationID='0' * 32)
+        self.put(target, h['EMPTY_BRIDGE_BYTES'], 0o640)
+        group = h['grp'].getgrnam('nogroup').gr_gid
+        with self.physical(target).open('rb') as stream:
+            h['os'].fchown(stream.fileno(), 0, group)
+        original = self.manifest['before']
+        original['bridge'] = h['read'](target)
+        original['units'][h['B']] = h['install_unit_pins'](self.units)[h['B']]
+        generation = h['remove_generation'](target)
+        if not legacy:
+            original['emptyBridgeGeneration'] = generation
+        self.save_manifest()
+        rc, reply, err = self.call('prepare-apply-network')
+        self.assertEqual((rc, err), (0, ''))
+
+        write, remove_generation = h['write'], h['remove_generation']
+        collisions = []
+
+        def collide():
+            collisions.append(True)
+            if unit_appears:
+                self.units[h['B']]['Job'] = '8'
+                return
+            self.put(target + '.foreign', h['EMPTY_BRIDGE_BYTES'], 0o640)
+            self.physical(target + '.foreign').replace(self.physical(target))
+            with self.physical(target).open('rb') as stream:
+                h['os'].fchown(stream.fileno(), 0, group)
+
+        def replace_after_entry(path, *args, **kwargs):
+            result = write(path, *args, **kwargs)
+            if path == self.manifest_path:
+                collide()
+            return result
+
+        def replace_before_entry(path):
+            if path == self.manifest_path:
+                collide()
+            return remove_generation(path)
+
+        main = h['apply_profile_read'](h['MAIN'])
+        receipt = self.physical(self.manifest_path).read_bytes()
+        if after_entry:
+            h['write'] = replace_after_entry
+        else:
+            h['remove_generation'] = replace_before_entry
+        expected = (75, '', '') if after_entry else (70, '', 'DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n')
+        self.assertEqual(self.call('publish-apply-profiles', **{**params, 'proof': json.loads(reply)['proof']}), expected)
+        self.assertEqual(collisions, [True])
+        h.update(write=write, remove_generation=remove_generation)
+        self.assertEqual(h['apply_profile_read'](h['MAIN']), main)
+        self.assertEqual(h['read'](target), original['bridge'])
+        self.assertEqual(h['remove_generation'](target) == generation, unit_appears)
+        manifest = h['read_manifest'](self.token)[2]
+        self.assertEqual(manifest['before'], original)
+        if after_entry:
+            self.assertEqual(manifest['phase'], 'apply-profiles-pending')
+            self.assertNotIn('currentApply', manifest)
+            self.assertEqual(self.call('prepare-apply-network'), (70, '', 'DIRECT_ROLLBACK_DRIFT\n'))
+        else:
+            self.assertEqual(self.physical(self.manifest_path).read_bytes(), receipt)
+
+    def test_apply_legacy_empty_bridge_generation_is_checked_before_journal(self):
+        self.check_apply_empty_bridge_collision(legacy=True, after_entry=False)
+
+    def test_apply_legacy_empty_bridge_generation_is_checked_at_write(self):
+        self.check_apply_empty_bridge_collision(legacy=True, after_entry=True)
+
+    def test_apply_legacy_empty_bridge_unit_is_checked_at_write(self):
+        self.check_apply_empty_bridge_collision(legacy=True, after_entry=True, unit_appears=True)
+
+    def test_apply_pinned_empty_bridge_generation_is_checked_at_write(self):
+        self.check_apply_empty_bridge_collision(legacy=False, after_entry=True)
 
     def test_reattest_refuses_changed_or_replaced_owned_bytes(self):
         for key in ('chap', 'nft'):

@@ -69,7 +69,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
     if (!wireOnly) test.after(() => require.cache[require.resolve('../../sshPoolService')]?.exports.closeAll());
 
     function seedHost(t, f, relay, machineId, scenario, { preEnabled = false, idleIke = false, subscribers = [], lifecycle = false,
-        mainUid = 65534, cohort = false } = {}) {
+        mainUid = 65534, cohort = false, freshDeploy = false } = {}) {
         const id = String(relay._id);
         const number = f.nodes.indexOf(relay);
         const packageStock = scenario.startsWith('package-stock-');
@@ -153,7 +153,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         }
         const bridgeActive = bridge.inbounds.length > 0;
         const mainMode = 0o640, bridgeMode = lifecycle && bridgeActive ? 0o644 : 0o640;
-        const mpath = put(mainPath, setupMain ?? JSON.stringify(main), mainMode), bpath = put(bridgePath, JSON.stringify(bridge), bridgeMode);
+        const mpath = put(mainPath, setupMain ?? JSON.stringify(main), mainMode), bpath = join(root, bridgePath);
+        if (!freshDeploy) put(bridgePath, JSON.stringify(bridge), bridgeMode);
         put('/usr/local/bin/xray', 'modeled executable\n', 0o755);
         put('/etc/systemd/system/' + x, generateXraySystemdService(), 0o644);
         if (bridgeActive) put('/etc/systemd/system/' + b, generateBridgeSystemdService(), 0o644);
@@ -276,7 +277,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             rules6: [[0, 255], [32766, 254], ...(scenario === 'foreign-rpdb6' ? [[220, 220]] : [])]
                 .map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
             managerEnvironment: scenario === 'manager-override' ? 'STRONGSWAN_CONF=/fixture-foreign.conf\n' : 'LANG=C\n',
-            owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534], [fs.statSync(bpath).ino]: [0, 65534] } }));
+            owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534],
+                ...(!freshDeploy && { [fs.statSync(bpath).ino]: [0, 65534] }) } }));
         const actions = [], refusals = [], nativeReplies = [];
         let removeBaseline, expectedRemoveTransit, beforeDirectAction;
         const records = () => JSON.parse(fs.readFileSync(manager, 'utf8'));
@@ -290,15 +292,31 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             pool.config = { ...config, enabled: false };
             t.after(() => Object.assign(pool, { settingsLoaded, config }));
             applyHandlers.set(relay.ip, applyWire({ root, records, writeRecords, mainPath, bridgePath }));
-            const peerRoot = join(root, 'peer');
-            const peer = { units: {}, effects: [], running: {}, owners: {}, nextPid: 600 };
-            for (const { profile, config: cfg } of generated.filter(row => row.nodeId === String(exit._id))) {
-                const [name, path] = profile === 'main' ? [x, mainPath] : [b, bridgePath];
-                put(join('peer', path), JSON.stringify(cfg), 0o640);
-                peer.running[name] = cfg;
-                peer.units[name] = stockX(name, path, true, String(++peer.nextPid));
+            function addPeer(node, folder, mainConfig, bridgeConfig) {
+                const peerRoot = join(root, folder);
+                const peer = { units: {}, effects: [], running: {}, owners: {}, nextPid: 600 };
+                put(join(folder, mainPath), JSON.stringify(mainConfig), 0o640);
+                peer.running[x] = mainConfig;
+                peer.units[x] = stockX(x, mainPath, true, String(++peer.nextPid));
+                if (bridgeConfig) {
+                    put(join(folder, bridgePath), JSON.stringify(bridgeConfig), 0o640);
+                    peer.running[b] = bridgeConfig;
+                    peer.units[b] = stockX(b, bridgePath, true, String(++peer.nextPid));
+                } else peer.units[b] = unit('', { LoadState: 'not-found', UnitFileState: '' });
+                applyHandlers.set(node.ip, applyWire({ root: peerRoot, records: () => peer, writeRecords: () => {}, mainPath, bridgePath }));
+                return peer;
             }
-            applyHandlers.set(exit.ip, applyWire({ root: peerRoot, records: () => peer, writeRecords: () => {}, mainPath, bridgePath }));
+            const exitMain = generated.find(row => row.nodeId === String(exit._id) && row.profile === 'main').config;
+            const exitBridge = generated.find(row => row.nodeId === String(exit._id) && row.profile === 'bridge').config;
+            const firstPeer = addPeer(exit, 'peer', exitMain, freshDeploy ? null : exitBridge);
+            if (freshDeploy) {
+                f.firstExit = { peer: firstPeer, path: join(root, 'peer', bridgePath) };
+                const nextExit = { ...exit, _id: oid('f'.repeat(24)), ip: '192.0.2.100' };
+                f.nodes.push(nextExit);
+                const peer = addPeer(nextExit, 'peer2', exitMain);
+                f.nextExit = { node: nextExit, peer, path: join(root, 'peer2', bridgePath) };
+                f.links[0].status = 'pending';
+            }
         }
         const execute = (command, stdin) => {
             const request = JSON.parse(stdin);
@@ -364,7 +382,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             }
             return result;
         };
-        const before = Object.fromEntries([mainPath, bridgePath, '/etc/ppp/chap-secrets', '/etc/ppp/options',
+        const before = Object.fromEntries([mainPath, ...(!freshDeploy ? [bridgePath] : []), '/etc/ppp/chap-secrets', '/etc/ppp/options',
             ...(!packageStock ? ['/etc/ipsec.conf', '/etc/ipsec.secrets', '/etc/xl2tpd/xl2tpd.conf', '/usr/lib/systemd/system/' + ike] : []),
             '/etc/systemd/system/' + x, ...(!freshStock ? [nativePath] : []),
             '/etc/systemd/system/foreign.service', '/usr/local/bin/xray',
@@ -431,7 +449,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 const host = routes.get(peer.ip);
                 assert.ok(peer.pinned && host);
                 const { action } = JSON.parse(stdin);
-                if (!action.endsWith('-apply-network')) {
+                if (!action.endsWith('-apply-network') && !action.endsWith('-apply-profiles')) {
                     assert.equal(peer.observed, true, 'DIRECT payload requires attestation on this client');
                     peer.observed = false;
                 }
@@ -1364,6 +1382,109 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
     }
 
     const applyActions = ['check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network', 'verify-apply-network'];
+    for (const historical of [false, true]) test(`joined DIRECT: first deploy → Install → different bridge deploy → Remove → retire graph${historical ? ' (existing v1.4.1 Install)' : ''}`, async t => {
+        const f = host(t, 'main', { lifecycle: true, freshDeploy: true });
+        const service = f.create(applyOptions(t, f));
+        const deploy = async link => {
+            const input = { linkId: String(link._id) };
+            const preview = await service.execute({ ...input, preview: true });
+            assert.equal(preview.allowed, true, JSON.stringify(preview));
+            return service.execute({ ...input, expectedPreview: preview.previewId });
+        };
+        const [first] = f.links;
+        assert.ok(!present(f.bpath));
+        assert.ok(!present(f.firstExit.path));
+        await deploy(first);
+        assert.equal(first.status, 'deployed');
+        assert.equal(f.firstExit.peer.units[f.b].ActiveState, 'active');
+        assert.equal(f.records().units[f.b].LoadState, 'not-found');
+        const empty = fs.readFileSync(f.bpath, 'utf8');
+        assert.equal(empty, '{"log":{"loglevel":"warning","access":"none"},"inbounds":[],"outbounds":[{"tag":"block","protocol":"blackhole"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[]}}');
+        const side = fingerprint(f, f.bridgePath);
+        assert.deepEqual([side.owner, side.mode], [[0, 65534], 0o640]);
+        const st = fs.lstatSync(f.bpath, { bigint: true });
+
+        const installed = await service.installRelay(id).catch(error => error);
+        assert.equal(status(installed), 'installed', diagnostic(f));
+        const manifest = () => join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${f.states[0].backupId}/manifest.json`);
+        assert.deepEqual(readJson(manifest()).before.emptyBridgeGeneration, [st.dev, st.ino, st.ctimeNs].map(Number));
+        if (historical) {
+            // Model the v1.4.1 Install schema on the real Install-written files.
+            // Remove only the new key; don't round or recreate any receipt pins.
+            const text = fs.readFileSync(manifest(), 'utf8');
+            const legacy = text.replace(/"emptyBridgeGeneration":\[\d+,\d+,\d+\],/, '');
+            assert.notEqual(legacy, text);
+            fs.writeFileSync(manifest(), legacy);
+        }
+        const m = readJson(manifest());
+        assert.equal(Buffer.from(m.before.bridge.data, 'base64').toString(), empty);
+        assert.equal(Object.hasOwn(m.before, 'emptyBridgeGeneration'), !historical);
+        assert.equal(m.before.units[f.b].LoadState, 'not-found');
+        assert.ok(!m.after.bridge && !m.currentApply);
+        assert.deepEqual(fingerprint(f, f.bridgePath), side);
+        const footprint = () => {
+            const state = f.records();
+            return { vpnUnits: [f.xl, f.ike, f.net].map(n => state.units[n]),
+                ppp: state.ppp, policy: [state.rule, state.route, state.nft], owner: ownerReceipt(f.states[0]), accounts: f.users.map(digestAccount),
+                files: [f.bootLink, stockSwan.profile, '/etc/ppp/chap-secrets', '/etc/ppp/options.xl2tpd',
+                    '/etc/celerity-rebuild-l2tp/ingress.nft'].map(path => fingerprint(f, path)) };
+        };
+        const second = { ...first, _id: oid('b'.repeat(24)), bridgeNode: f.nextExit.node._id,
+            tunnelPort: first.tunnelPort + 1, tunnelUuid: '0e5f37c9-ca32-4fb4-9db3-d3841db9b2cb', status: 'pending', rebuildApplied: null };
+        assert.notEqual(String(second.bridgeNode), String(first.bridgeNode));
+        assert.ok(!present(f.nextExit.path));
+        f.links.push(second);
+        const ppp = { interface: 'ppp0', pid: 710, start: 810, l2tpId: 7 };
+        f.writeRecords({ ...f.records(), ppp });
+        const before = footprint();
+        const applyAt = f.actions.length;
+        const applied = await deploy(second).catch(error => error);
+        assert.equal(applied.allowed, true, JSON.stringify({ code: applied.code, ...JSON.parse(diagnostic(f)) }));
+        assert.equal(first.status, 'deployed');
+        assert.equal(second.status, 'deployed');
+        assert.equal(f.firstExit.peer.units[f.b].ActiveState, 'active');
+        assert.ok(f.firstExit.peer.running[f.b].inbounds.some(i => i.port === first.tunnelPort));
+        assert.equal(f.nextExit.peer.units[f.b].ActiveState, 'active');
+        assert.deepEqual(f.nextExit.peer.running[f.b], readJson(f.nextExit.path));
+        assert.ok(f.nextExit.peer.running[f.b].inbounds.some(i => i.port === second.tunnelPort));
+        const settled = readJson(manifest());
+        assert.deepEqual(settled.before, m.before);
+        assert.ok(settled.currentApply && !settled.applyPending);
+        assert.equal(settled.currentApply.bridgeActive, false, 'the relay itself still has no BRIDGE service');
+        assert.deepEqual(f.actions.slice(applyAt), ['check-apply-network', 'check-apply-network',
+            'prepare-apply-network', 'verify-apply-network', 'publish-apply-profiles', 'restart-apply-network', 'finalize-apply-profiles']);
+        assert.deepEqual(footprint(), before);
+        // The modeled client disconnects before the real guarded Remove.
+        const { ppp: _ended, ...idle } = f.records();
+        f.writeRecords(idle);
+        assert.equal((await service.removeRelay(id)).status, 'not_installed');
+        assert.deepEqual(f.users, []);
+        assert.ok(!present(join(f.root, f.bootLink)));
+        assert.deepEqual([f.records().rule, f.records().route, f.records().nft], [null, null, null]);
+        assert.ok(!readJson(f.mpath).inbounds.some(i => /^relay-l2tp-|^rebuild-relay-ingress$/.test(i.tag)));
+        assert.equal(fs.readFileSync(f.bpath, 'utf8'), empty);
+
+        const { events } = sessionFixture(t, f, { graph: true });
+        const Link = require('../../../models/cascadeLinkModel');
+        t.mock.method(Link.collection, 'deleteMany', async (where, { session }) => {
+            const links = session.rows.get(f.links);
+            assert.deepEqual(where._id.$in.map(String).sort(), [first, second].map(row => String(row._id)).sort());
+            return { acknowledged: true, deletedCount: links.splice(0, links.length).length };
+        });
+        await service.locks.run(async verify => {
+            const input = { nodeId: id, mode: 'online' };
+            const preview = await service.retireGraph({ ...input, preview: true }, verify);
+            assert.equal(preview.allowed, true);
+            await service.retireGraph({ ...input, preview: false, expectedPreview: preview.previewId }, verify);
+        });
+        assert.deepEqual(events, ['commit']);
+        assert.deepEqual(f.links, []);
+        for (const { peer, path } of [f.firstExit, f.nextExit]) {
+            assert.equal(peer.units[f.b].ActiveState, 'inactive');
+            assert.equal(peer.units[f.b].UnitFileState, 'disabled');
+            assert.deepEqual(readJson(path).inbounds, []);
+        }
+    });
     for (const legacy of [false, true]) test(`joined DIRECT: switching the default tunnel keeps PPP (${legacy ? 'published unit' : 'new install'})`, async t => {
         const f = host(t, 'sidecar', { lifecycle: true });
         if (legacy) f.writeRecords({ ...f.records(), legacyNetwork: true });

@@ -79,6 +79,9 @@
 
     function topologyCauseText(code) {
         if (typeof code !== 'string' || !code) return null;
+        if (code === 'REBUILD_L2TP_APPLY_BRIDGE_PLACEHOLDER_UNPROVED') {
+            return (typeof window !== 'undefined' && window._networkRebuildPreviewI18n?.bridgePlaceholderUnproved) || null;
+        }
         if (code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
             return (typeof window !== 'undefined' && window._networkI18n?.classicTunnelUnconfirmed)
                 || TOPOLOGY_CAUSE_TEXT_RU[code];

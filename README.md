@@ -177,6 +177,15 @@ C3_REBUILD_L2TP_RELAYS_JSON='[{"nodeId":"<NODE_ID>","host":"relay.example.invali
   mismatched identity is denied. There is no fallback to the legacy single-relay
   settings unless `C3_REBUILD_L2TP_RELAYS_JSON` is entirely unset.
 
+An existing v1.4.1 DIRECT relay can deploy a second link with the usual
+Preview → Apply, without Remove, reinstall, re-enrollment, or an extra Apply.
+For a relay with no BRIDGE unit, this requires the original Install receipt to
+record the absent unit and canonical empty BRIDGE config. The live unit must
+still be absent and the live file must match those exact bytes as `0640`
+`root:nogroup`, with a stable file generation through publication. Newer
+receipts with a file generation must match that generation too. Unknown unit
+state or different config is refused; Apply does not backfill Install history.
+
 ---
 
 ## 🐳 Dokploy / Traefik (optional, not the primary path)

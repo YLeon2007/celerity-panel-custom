@@ -182,7 +182,8 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             if(runtime&&(error?.remoteOutcomeUncertain||isIdentityChanged(error)))runtimeUnsafe=true;
             // Only the existing decoder can confirm a refusal. A guard error or an
             // unframed exit 70 cannot vouch for it, nor for any earlier Apply step.
-            if(failureClass==='unrecognized_exit_70' && (error?.code==='REBUILD_L2TP_APPLY_NETWORK_REFUSED'||isIdentityChanged(error)))failureClass='direct_refusal';
+            if(failureClass==='unrecognized_exit_70' && (['REBUILD_L2TP_APPLY_NETWORK_REFUSED',
+                'REBUILD_L2TP_APPLY_BRIDGE_PLACEHOLDER_UNPROVED'].includes(error?.code)||isIdentityChanged(error)))failureClass='direct_refusal';
             try { require('../utils/logger').warn(JSON.stringify({event:'rebuild.apply_network.failure',phase,failureClass})); }
             catch { /* Logging must never replace the original outcome. */ }
             throw error;

@@ -58,7 +58,8 @@ module.exports = ({ root, records, writeRecords, mainPath, bridgePath }) => {
             if (stdin === undefined && command === `systemctl enable ${unit} && systemctl restart ${unit} && systemctl is-active --quiet ${unit}`) {
                 assert.equal(units[unit].LoadState, 'loaded');
                 const pid = String(++manager.nextPid);
-                Object.assign(units[unit], { UnitFileState: 'enabled', ActiveState: 'active', SubState: 'running', MainPID: pid, InvocationID: 'apply-' + pid });
+                Object.assign(units[unit], { UnitFileState: 'enabled', ActiveState: 'active', SubState: 'running', MainPID: pid,
+                    InvocationID: Number(pid).toString(16).padStart(32, '0'), ControlGroup: '/system.slice/' + unit });
                 running[unit] = JSON.parse(fs.readFileSync(at(path), 'utf8'));
                 // A restart of a required unit can stop xl2tpd and leave its
                 // oneshot failed on the existing kernel objects. They remain
@@ -92,7 +93,7 @@ module.exports = ({ root, records, writeRecords, mainPath, bridgePath }) => {
             fs.mkdirSync(dirname(at(unitFile)), { recursive: true });
             fs.writeFileSync(at(unitFile), stdin, { flag: 'wx', mode: 0o644 });
             Object.assign(units[b], { ...inactive, LoadState: 'loaded', UnitFileState: 'disabled', FragmentPath: unitFile,
-                ExecStart: `{ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${bridgePath} ; }` });
+                User: 'nobody', ExecStart: `{ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${bridgePath} ; }` });
             return change('create', b);
         }
         if (stdin === undefined && ids.length && command === `rm -f -- ${temp(mainPath)} ${temp(bridgePath)}`) {
@@ -100,6 +101,7 @@ module.exports = ({ root, records, writeRecords, mainPath, bridgePath }) => {
                 staged.delete(temp(path));
                 fs.rmSync(at(temp(path)), { force: true });
             }
+            token = undefined;
             return change('cleanup');
         }
         assert.fail('unexpected Apply SSH command');
