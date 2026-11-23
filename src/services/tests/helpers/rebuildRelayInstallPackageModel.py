@@ -145,13 +145,18 @@ def attach(root, state, scenario, h, request, assert_host_lock):
     h['STOCK_XL_DEFAULT_MD5'] = md5.encode()
     state['lnsMd5'] = sums(LNS)[1]
 
-    def run(argv, end, maximum, *, may_write=False):
+    def run(argv, end, maximum, *, may_write=False, progress=None):
         try:
             assert maximum == h['PACKAGE_MAX_OUTPUT'] and time.monotonic() < end <= h['DEADLINE']
             assert request['action'] in ('preflight', 'prepare-packages')
             suffix = argv[7:] if argv[0] == '/usr/bin/env' else ()
             update = suffix == APT_UPDATE
             mode = suffix[1] if suffix else ''
+            reports_progress = request.get('progress') is True and mode == '-y'
+            if reports_progress:
+                assert may_write and isinstance(progress, h['AptProgress'])
+            else:
+                assert progress is None
             if suffix:
                 assert may_write == (update or mode == '-y')
                 if not may_write:

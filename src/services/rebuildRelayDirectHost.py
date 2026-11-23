@@ -2868,7 +2868,21 @@ def removal_profiles(main, side, node_id, tproxy, backup, units, main_generation
     # Current MAIN owns the handoff after canonical Apply, even with a split
     # install receipt. Do not use that receipt to restore BRIDGE in this case.
     if any(i.get('tag') == FOLLOW_RELAY_SOCKS for i in current['inbounds']):
-        return subtract_follow_relay(main, current, bridge, node_id, tproxy)
+        profiles, port, owner = subtract_follow_relay(main, current, bridge, node_id, tproxy)
+        if (backup.get('currentApply') is None and main_generation == backup['runtime']['files']['main']
+                and after_match(main, backup['after']['main'])):
+            # The subtraction edits current in place. Only when it is exactly
+            # the saved preimage modulo JSON serialization, reuse those bytes
+            # (not its metadata) to preserve the panel's exact Apply digest.
+            original = backup['before']['files']['main']
+            try:
+                preimage = unique_profile(original)
+            except (Refusal, ValueError, KeyError, TypeError):
+                pass  # An ambiguous preimage cannot prove byte reuse.
+            else:
+                if encode(current) == encode(preimage):
+                    profiles['main']['data'] = original['data']
+        return profiles, port, owner
 
     after, runtime = backup['after'], backup['runtime']
     if side is None:
@@ -4233,7 +4247,7 @@ def remove_installation(request, state, *, drain=None):
         if current[k] != restored:
             if k == 'swan':
                 check_swan_profile(state['swanBackup'], read(SWAN_PROFILE))
-            write(paths[k], current[k], restored)
+            write(paths[k], current[k], restored, generation=state['generations'][k] if k == 'main' else None)
     if boot_enrollment is not None:
         enroll_boot(before['units'][XL]['FragmentPath'], boot_enrollment)
     main_generation = remove_generation(MAIN)

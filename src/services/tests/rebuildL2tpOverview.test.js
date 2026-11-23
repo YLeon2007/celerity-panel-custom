@@ -205,13 +205,21 @@ function fixture(t, { legacy = false } = {}) {
         } };
     };
     f.probes = [];
-    const probeField = field => async card => {
-        f.probes.push(field);
-        return f.bindings.find(b => b.nodeId === card._id)[field];
-    };
+    const observedIdentity = card => f.bindings.find(b => b.nodeId === card._id);
     f.admission = () => createRebuildRelayAdmission({ db, env,
         locks: { run: fn => fn(async () => true) },
-        probe: { probeKey: probeField('sshHostKeySha256'), readMachine: probeField('machineId') },
+        probe: {
+            async probeKey(card) {
+                f.probes.push('sshHostKeySha256');
+                return { sshHostKeySha256: observedIdentity(card).sshHostKeySha256, sshHostKeyType: 'ssh-ed25519' };
+            },
+            async readMachine(card, expectedPin) {
+                f.probes.push('machineId');
+                const { sshHostKeySha256, machineId } = observedIdentity(card);
+                assert.equal(expectedPin, sshHostKeySha256);
+                return machineId;
+            },
+        },
     });
     f.decipher = t.mock.method(crypto, 'createDecipheriv');
     const resolver = require('../rebuildRelayAuthorization').resolveRelayBinding;

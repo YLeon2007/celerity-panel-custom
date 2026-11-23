@@ -284,8 +284,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             managerEnvironment: scenario === 'manager-override' ? 'STRONGSWAN_CONF=/fixture-foreign.conf\n' : 'LANG=C\n',
             owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534],
                 ...(!freshDeploy && { [fs.statSync(bpath).ino]: [0, 65534] }) } }));
-        const actions = [], refusals = [], nativeReplies = [];
-        let removeBaseline, expectedRemoveTransit, beforeDirectAction;
+        const actions = [], proofActions = [], refusals = [], nativeReplies = [];
+        let removeBaseline, expectedRemoveTransit, beforeDirectAction, lastDirectAction;
         const records = () => JSON.parse(fs.readFileSync(manager, 'utf8'));
         const writeRecords = value => fs.writeFileSync(manager, JSON.stringify(value));
         const applyHandlers = new Map();
@@ -326,7 +326,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const execute = (command, stdin) => {
             const request = JSON.parse(stdin);
             const { action } = request;
-            if (action !== 'prove-applied-main') actions.push(action);
+            lastDirectAction = action;
+            if (action === 'prove-applied-main') proofActions.push(action);
+            else actions.push(action);
             const state = f.states.find(row => String(row.node) === id);
             const rows = f.users.filter(row => String(row.relayNode) === id);
             if (action === 'install') assert.ok(state?.status === 'installing' && rows.length
@@ -375,7 +377,11 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 { input: JSON.stringify(command) + '\n' + stdin, env: {}, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
             assert.ok(!result.error && [0, 70, 75].includes(result.status), 'local DIRECT harness exit: ' + (result.error?.code ?? result.status));
             assert.deepEqual(records().faults ?? [], [], 'closed DIRECT command model');
-            if (/^DIRECT_[A-Z_]+\n$/.test(result.stderr)) refusals.push(result.stderr.trim());
+            // Observe the decline separately from the Install-only progress
+            // prefix; the real wire consumer still receives the original stderr.
+            const stderr = action === 'install' && request.progress === true
+                ? result.stderr.replace(/^DIRECT_PROGRESS restart\n/, '') : result.stderr;
+            if (/^DIRECT_[A-Z_]+\n$/.test(stderr)) refusals.push(stderr.trim());
             if (nativeStock && result.status === 0 && ['preflight', 'prepare'].includes(action)) {
                 const reply = JSON.parse(result.stdout);
                 if (reply.packagePreparation) assert.match(reply.packagePreparation, /^[a-f0-9]{64}$/);
@@ -396,10 +402,20 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             ...(scenario === 'native-stock-dropin' ? [foreignDropIn] : []), ...(scenario === 'native-stock-fragment' ? [foreignFragment] : []),
             ...swanLeaves, ...(bridgeActive ? ['/etc/systemd/system/' + b] : [])]
             .map(path => [path, fs.readFileSync(join(root, path))]));
-        const beforeChannel = () => {
-            if (scenario === 'ppp-lock-lost' && actions.at(-1) === 'check') f.loseLock();
+        let cutInstallStdin = false;
+        const beforeChannel = chunks => {
+            // A second read-only MAIN proof now follows CHECK. Cut the
+            // Install receiver after that proof and the local reservation.
+            if (scenario !== 'ppp-lock-lost' || cutInstallStdin || proofActions.length !== 2 || actions.at(-1) !== 'check') return;
+            assert.equal(f.states[0]?.status, 'installing');
+            assert.equal(f.users[0]?.syncStatus, 'pending');
+            cutInstallStdin = true;
+            t.after(() => assert.equal(chunks.length, 0, 'no Install stdin bytes submitted'));
+            f.loseLock();
         };
-        return { id, relay, machineId, key, pin, execute, beforeChannel, applyHandlers, actions, refusals, root, before, mainPath, bridgePath,
+        return { id, relay, machineId, key, pin, execute, beforeChannel, applyHandlers, actions, proofActions, refusals, root, before, mainPath, bridgePath,
+            didCutInstallStdin: () => cutInstallStdin,
+            lastDirectAction: () => lastDirectAction,
             mpath, bpath, bridge, bootLink, nativePath, nativeReplies, generated, usersByNode, x, b, xl, ike, net, records, writeRecords, removeBaseline: () => removeBaseline,
             expectRemoveTransit: value => { expectedRemoveTransit = value; },
             beforeDirectAction: fn => { beforeDirectAction = fn; },
@@ -480,7 +496,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 done();
                 queueMicrotask(() => finish(Buffer.concat(chunks).toString('utf8')));
             };
-            if (direct) routes.get(peer.ip)?.beforeChannel?.();
+            if (direct) routes.get(peer.ip)?.beforeChannel?.(chunks);
             ready(null, stream);
             // Stdin receivers wait for EOF, even if async authorization delays the first write.
             // Control-only execs never call channel.end().
@@ -745,6 +761,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
     test('joined module persistence: reinstall with resident modules and Remove with legacy receipts', async t => {
         const f = host(t, 'ppp-network-observers');
         const file = join(f.root, modulesPath);
+        const { profileBytes } = require('../../rebuildTransport');
+        const original = profileBytes(f.generated.find(row => row.nodeId === id && row.profile === 'main').config);
+        assert.deepEqual(f.before[f.mainPath], Buffer.from(original));
+        assert.equal(f.links[0].rebuildAppliedMainSha256, sha256(original));
         let lastId;
         for (const legacy of ['subset', null, 'unowned']) {
             const installed = await f.create().installRelay(id).catch(error => error);
@@ -788,6 +808,61 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             assert.deepEqual(f.records().moduleLoads, ['xfrm_user']);
             lastId = backupId;
         }
+        assert.equal(fs.readFileSync(f.mpath, 'utf8'), original);
+    });
+
+    test('joined module persistence: real deploy preserves exact MAIN through Install, Remove and reinstall', async t => {
+        const f = host(t, 'ppp-network-observers', { lifecycle: true, freshDeploy: true });
+        const service = f.create(applyOptions(t, f));
+        const [link] = f.links;
+        assert.equal(link.rebuildAppliedMainSha256, undefined);
+        const input = { linkId: String(link._id) };
+        const preview = await service.execute({ ...input, preview: true });
+        assert.equal(preview.allowed, true);
+        assert.equal((await service.execute({ ...input, expectedPreview: preview.previewId })).allowed, true);
+
+        const original = fs.readFileSync(f.mpath, 'utf8');
+        const { profileBytes } = require('../../rebuildTransport');
+        assert.equal(original, profileBytes(JSON.parse(original)));
+        const applied = link.rebuildAppliedMainSha256;
+        const epoch = link.rebuildApplyEpoch;
+        assert.equal(applied, sha256(original));
+
+        // Semantic equality is not Install admission, even with a real Apply receipt.
+        const effects = f.records().effects;
+        fs.appendFileSync(f.mpath, '\n');
+        await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED' });
+        assert.deepEqual(f.proofActions, ['prove-applied-main']);
+        assert.deepEqual([f.states, f.users, f.records().effects], [[], [], effects]);
+        fs.writeFileSync(f.mpath, original);
+
+        assert.equal((await service.installRelay(id)).status, 'installed');
+        const firstBackup = f.states[0].backupId;
+        const receipt = readJson(join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${firstBackup}/manifest.json`));
+        assert.equal(Buffer.from(receipt.before.files.main.data, 'base64').toString(), original);
+        assert.equal(receipt.currentApply, undefined);
+        assert.equal((await service.removeRelay(id)).status, 'not_installed');
+        const removed = fs.readFileSync(f.mpath, 'utf8');
+        assert.deepEqual(JSON.parse(removed), JSON.parse(original));
+        assert.deepEqual([link.rebuildAppliedMainSha256, link.rebuildApplyEpoch], [applied, epoch]);
+
+        const reinstalled = await service.installRelay(id).catch(error => error);
+        assert.equal(reinstalled.status, 'installed', JSON.stringify({ code: reinstalled.code, ...JSON.parse(diagnostic(f)),
+            applied, afterRemove: sha256(removed), lengths: [Buffer.byteLength(original), Buffer.byteLength(removed)],
+            onlyAddedLF: removed === original + '\n' }));
+        assert.equal(removed, original);
+        assert.notEqual(f.states[0].backupId, firstBackup);
+        assert.deepEqual(f.records().moduleLoads, ['xfrm_user']);
+
+        // The forward link's listener is on the bridge. Losing its row
+        // removes all fresh-Install evidence, not this relay's ownership.
+        assert.deepEqual(f.links.splice(0), [link]);
+        const teardown = [];
+        f.beforeDirectAction(action => teardown.push(action));
+        assert.equal((await service.removeRelay(id)).status, 'not_installed');
+        assert.deepEqual(teardown, ['prepare-remove', 'remove']);
+        assert.equal(fs.readFileSync(f.mpath, 'utf8'), original);
+        assert.equal(f.users.length, 0);
     });
 
     test('joined Install from unprepared Debian refuses unsafe package autostart before any effects', async t => {
@@ -1049,9 +1124,11 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
     test('joined Install PPP preparation cannot dispatch after lock is lost at stdin', async t => {
         const f = host(t, 'ppp-lock-lost');
         await assert.rejects(f.create().installRelay(id), { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' });
+        assert.equal(f.didCutInstallStdin(), true);
+        assert.deepEqual(f.proofActions, ['prove-applied-main', 'prove-applied-main']);
         assert.equal(f.states[0].status, 'installing');
         assert.equal(f.users[0].syncStatus, 'pending');
-        assert.equal(f.actions.at(-1), 'check');
+        assert.deepEqual(f.actions, installedActions.slice(0, 4));
         assert.deepEqual(f.records().moduleLoads ?? [], []);
         assert.equal(fs.existsSync(join(f.root, '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf')), false);
     });
@@ -1120,7 +1197,11 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 assert.equal(outcome.outcome, 'refused');
                 assert.equal(outcome.check, scenario === 'foreign-profile-owner'
                     ? 'XRAY_PROFILE_OWNER_UNSUPPORTED' : 'XRAY_BASELINE_UNSUPPORTED');
-                assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
+                if (scenario === 'foreign-profile-owner') {
+                    assert.deepEqual(f.proofActions, ['prove-applied-main']);
+                    assert.deepEqual(f.actions, []);
+                    assert.deepEqual(f.refusals, ['DIRECT_XRAY_PROFILE_OWNER_UNSUPPORTED']);
+                } else assert.deepEqual(f.actions, ['preflight', 'preflight', 'prepare']);
                 assert.deepEqual(f.events, []); // No installation-state or account writes.
             }
             if (scenario === 'ike-active' || scenario === 'foreign-rpdb6') {
@@ -1234,7 +1315,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
     const digestAccount = row => createHash('sha256').update(JSON.stringify(row)).digest('hex');
     const installedActions = ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify'];
     const status = outcome => outcome.code ?? outcome.status;
-    const diagnostic = f => JSON.stringify({ action: f.actions.at(-1), wire: f.refusals.at(-1), guard: f.records().lastRefusal });
+    const diagnostic = f => JSON.stringify({ action: f.lastDirectAction(), wire: f.refusals.at(-1), guard: f.records().lastRefusal });
 
     test('joined two-relay DIRECT: install, inherit, mutate shared accounts and confirm selected removal', async t => {
         const f = fixture(t);
@@ -1385,6 +1466,84 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             && rule.outboundTag === 'block' && rule.inboundTag.includes('rebuild-relay-ingress')));
         assert.ok(main.inbounds.some(row => row.tag === `relay-l2tp-${id}` && row.port === f.states[0].tproxyPort));
     }
+
+    test('joined Remove uses installed ownership, not the fresh Install MAIN pin', async t => {
+        const f = host(t, 'main', { cohort: true });
+        const { events: commits } = sessionFixture(t, f);
+        f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([{ nodeId: id, host: f.relay.ip, port: 22,
+            username: 'root', sshHostKeySha256: f.pin, machineId }]);
+        const [link] = f.links;
+        const appliedMain = link.rebuildAppliedMainSha256;
+        const service = f.create();
+        const frames = [];
+        // Capture the action from decoded stdin, including MAIN proofs
+        // intentionally omitted by the older joined fixture's action lists.
+        f.beforeDirectAction(action => frames.push([action, commits.length]));
+
+        delete link.rebuildAppliedMainSha256;
+        await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED',
+            outcome: 'refused', check: 'REBUILD_LINKS_NOT_APPLIED' });
+        assert.deepEqual([frames, commits, f.states, f.users, f.records().effects], [[], [], [], [], []]);
+
+        link.rebuildAppliedMainSha256 = appliedMain;
+        assert.equal((await service.installRelay(id)).status, 'installed');
+        assert.deepEqual(frames.splice(0), [
+            ['prove-applied-main', 0], ['preflight', 0], ['preflight', 0], ['prepare', 0], ['check', 0],
+            ['prove-applied-main', 0], ['install', 1], ['verify', 1],
+        ]);
+        assert.equal(f.states[0].status, 'installed');
+        assert.equal(f.users[0].syncStatus, 'synced');
+        const { backupId, tproxyPort } = f.states[0];
+        const manifest = join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${backupId}/manifest.json`);
+        assert.equal(readJson(manifest).phase, 'installed');
+        assert.equal(f.records().nft, backupId);
+        const installedMain = fs.readFileSync(f.mpath);
+
+        // A pending desired edit does not change the applied listener receipt
+        // or the installed host. No Install hash is available to Remove.
+        delete link.rebuildAppliedMainSha256;
+        Object.assign(link, { status: 'pending', tunnelPort: link.tunnelPort + 1 });
+        const desired = JSON.stringify(link);
+        const effects = f.records().effects;
+        const unchanged = () => {
+            assert.deepEqual(f.records().effects, effects);
+            assert.deepEqual(commits, ['commit', 'commit']);
+            assert.equal(f.states[0].status, 'installed');
+            assert.equal(f.users[0].syncStatus, 'synced');
+        };
+
+        const preview = await service.previewRemoveRelay(id);
+        assert.equal(preview.confirmable, true, diagnostic(f));
+        f.writeRecords({ ...f.records(), activeSessions: 1 });
+        await assert.rejects(service.confirmRemoveRelay(id, preview), { code: 'REBUILD_L2TP_REMOVE_SESSIONS_BUSY' });
+        assert.deepEqual(frames.splice(0), [['session-count', 2], ['session-count', 2]]);
+        unchanged();
+        f.writeRecords({ ...f.records(), activeSessions: 0 });
+
+        const foreign = JSON.parse(installedMain);
+        const owned = foreign.inbounds.find(row => row.tag === `relay-l2tp-${id}`);
+        assert.equal(owned.port, tproxyPort);
+        owned.port++;
+        const foreignBytes = JSON.stringify(foreign);
+        fs.writeFileSync(f.mpath, foreignBytes);
+        await assert.rejects(service.removeRelay(id), { code: 'REBUILD_L2TP_DIRECT_CANDIDATE_INVALID' });
+        assert.deepEqual(frames.splice(0), [['session-count', 2], ['prepare-remove', 2]]);
+        assert.equal(f.refusals.at(-1), 'DIRECT_CANDIDATE_INVALID');
+        assert.equal(fs.readFileSync(f.mpath, 'utf8'), foreignBytes);
+        unchanged();
+        fs.writeFileSync(f.mpath, installedMain);
+
+        const idle = await service.previewRemoveRelay(id);
+        assert.equal(idle.confirmable, true, diagnostic(f));
+        assert.deepEqual(await service.confirmRemoveRelay(id, idle), { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
+        assert.deepEqual(frames, [['session-count', 2], ['session-count', 2], ['prepare-remove', 2], ['remove', 3]]);
+        assert.deepEqual(commits, ['commit', 'commit', 'commit', 'commit']);
+        assert.equal(f.states[0].status, 'not_installed');
+        assert.deepEqual(f.users, []);
+        assert.equal(JSON.stringify(link), desired);
+        assert.deepEqual([f.records().rule, f.records().route, f.records().nft], [null, null, null]);
+        assert.deepEqual(readJson(f.mpath), JSON.parse(f.before[f.mainPath]));
+    });
 
     const applyActions = ['check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network', 'verify-apply-network'];
     for (const historical of [false, true]) test(`joined DIRECT: first deploy → Install → different bridge deploy → Remove → retire graph${historical ? ' (existing v1.4.1 Install)' : ''}`, async t => {
@@ -1609,7 +1768,13 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const f = host(t, 'transit-ok', { lifecycle: true });
         const service = f.create(applyOptions(t, f));
         assert.equal((await service.installRelay(id)).status, 'installed');
-        Object.assign(f.links[0], { status: 'pending', tunnelPort: f.links[0].tunnelPort + 1 });
+        const [link] = f.links;
+        // Install setup needs a proved link; model the historical row only
+        // after that succeeds. Missing is distinct from an explicit draft null.
+        delete link.rebuildApplied;
+        delete link.rebuildApplyEpoch;
+        delete link.rebuildAppliedMainSha256;
+        Object.assign(link, { status: 'pending', tunnelPort: link.tunnelPort + 1 });
         const before = JSON.stringify([f.states, f.users, f.links, f.records().effects]);
         const main = fingerprint(f, f.mainPath);
         await assert.rejects(service.removeRelay(id), { code: 'REBUILD_L2TP_APPLIED_LINK_UNPROVED' });
@@ -1687,11 +1852,26 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         for (const path of ownedFiles) assert.ok(fs.lstatSync(join(f.root, path)).isFile(), path);
         const vault = `/var/lib/celerity-rebuild-l2tp-direct/${state.backupId}`;
         const manifestPath = vault + '/manifest.json';
+        const manifestFile = join(f.root, manifestPath);
+        const installReceipt = fs.readFileSync(manifestFile, 'utf8');
         const manifest = fingerprint(f, manifestPath);
-        assert.equal(readJson(join(f.root, manifestPath)).phase, 'installed');
+        assert.equal(JSON.parse(installReceipt).phase, 'installed');
 
         const ownedSwan = fingerprint(f, stockSwan.profile);
-        if (apply) await laterApply(f, service);
+        if (apply) {
+            await laterApply(f, service);
+            const appliedReceipt = fs.readFileSync(manifestFile, 'utf8');
+            const { currentApply } = JSON.parse(appliedReceipt);
+            assert.equal(currentApply.nodeId, id);
+            assert.deepEqual(Object.keys(currentApply.files).sort(), ['bridge', 'main']);
+            for (const [profile, path] of [['main', f.mainPath], ['bridge', f.bridgePath]]) {
+                assert.equal(currentApply.files[profile][0].data, fingerprint(f, path).digest);
+            }
+            // The host serializes sorted JSON. Remove only the new currentApply
+            // member without rounding the original nanosecond generation pins.
+            assert.equal(appliedReceipt.replace(/,"currentApply":\{.*?\},"machineId":/, ',"machineId":'), installReceipt);
+        }
+        const retainedManifest = apply ? fingerprint(f, manifestPath) : manifest;
         assert.deepEqual(fingerprint(f, stockSwan.profile), ownedSwan);
         const beforeRemove = f.records();
         const currentHandoff = handoffIn(readJson(f.mpath))?.port;
@@ -1722,7 +1902,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         }
         assert.equal(status(outcome), 'not_installed', diagnostic(f));
         assert.deepEqual(outcome, { executionMode: 'rebuild', status: 'not_installed', nodeId: id });
-        assert.deepEqual(f.actions, [...installedActions, ...(apply ? applyActions : []), 'prepare-remove', 'remove']);
+        const publishedApplyActions = ['check-apply-network', 'prepare-apply-network', 'verify-apply-network',
+            'publish-apply-profiles', 'restart-apply-network', 'finalize-apply-profiles'];
+        assert.deepEqual(f.actions, [...installedActions, ...(apply ? publishedApplyActions : []), 'prepare-remove', 'remove']);
 
         const current = f.records();
         assert.deepEqual([current.rule, current.route, current.nft, current.ikeConnection], [null, null, null, false]);
@@ -1756,7 +1938,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 assert.equal(attrs.inode, before[path].inode, path);
             }
         }
-        assert.deepEqual(fingerprint(f, manifestPath), manifest, 'original install receipt is retained, not a live artifact');
+        assert.deepEqual(fingerprint(f, manifestPath), retainedManifest, 'Remove preserves the settled receipt');
         assert.match(f.removeBaseline(), /^[a-f0-9]{64}$/);
         assert.deepEqual(readJson(join(f.root, vault, 'remove-attempt.json')), { baseline: f.removeBaseline() });
         assert.deepEqual(fs.readdirSync(join(f.root, vault)).sort(), ['manifest.json', 'remove-attempt.json']);

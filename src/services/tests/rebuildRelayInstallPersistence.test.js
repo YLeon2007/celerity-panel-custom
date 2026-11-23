@@ -1160,7 +1160,8 @@ for (const outcome of ['ok', 'foreign-source', 'bad-keyring', 'untrusted', 'acqu
         const listsBefore = host.capture('/var/lib/apt/lists');
         const initialPackages = host.read('manager.json').packageModel.installed;
         const vault = '/var/lib/celerity-rebuild-l2tp-direct', pending = `${vault}/package-preparation.pending`;
-        const execute = host.execute, replies = [];
+        const execute = host.execute, replies = [], mainProofs = [];
+        const appliedMain = f.links[0].rebuildAppliedMainSha256;
         let reserved, proof;
         assert.deepEqual(host.indexes(), []);
         if (outcome === 'foreign-source') {
@@ -1172,6 +1173,15 @@ for (const outcome of ['ok', 'foreign-source', 'bad-keyring', 'untrusted', 'acqu
         host.execute = (command, stdin) => {
             assert.ok(f.lockHeld);
             const request = JSON.parse(stdin);
+            if (request.action === 'prove-applied-main') {
+                assert.deepEqual(request, { action: 'prove-applied-main', machineId, appliedMain });
+                assert.deepEqual([events, f.states, f.users], [[], [], []]);
+                const result = execute(command, stdin);
+                assert.equal(result.status, 0);
+                assert.deepEqual(JSON.parse(result.stdout), { applied: true });
+                mainProofs.push(replies.length);
+                return result;
+            }
             if (!replies.length) assert.deepEqual([events, f.states, f.users], [[], [], []]);
             else {
                 assert.deepEqual(events, ['commit']);
@@ -1184,7 +1194,8 @@ for (const outcome of ['ok', 'foreign-source', 'bad-keyring', 'untrusted', 'acqu
                 if (request.backupId) assert.equal(request.backupId, reserved);
             }
             if (request.action === 'prepare-packages') {
-                assert.deepEqual(request, { action: 'prepare-packages', machineId, backupId: reserved, packagePreparation: proof });
+                assert.deepEqual(request, { action: 'prepare-packages', machineId, backupId: reserved,
+                    packagePreparation: proof, appliedMain, progress: true });
                 assert.deepEqual(host.indexes(), []);
             }
             const result = execute(command, stdin);
@@ -1245,6 +1256,7 @@ for (const outcome of ['ok', 'foreign-source', 'bad-keyring', 'untrusted', 'acqu
                 outcome: 'refused', check: 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE' });
             assert.deepEqual(manager.lastRefusal?.slice(0, 2), ['PACKAGE_FILE', '_regular']);
             assert.deepEqual(frames, [[id, 'preflight']]);
+            assert.deepEqual(mainProofs, [0]);
             assert.deepEqual(replies, [{ status: 70, hasOutput: false }]);
             assert.deepEqual([events, f.states, f.users, model.updates], [[], [], [], []]);
             assert.deepEqual([model.afterUpdate, model.aptWrites, model.installed], [[], 0, initialPackages]);
@@ -1253,6 +1265,7 @@ for (const outcome of ['ok', 'foreign-source', 'bad-keyring', 'untrusted', 'acqu
         }
         const [update] = model.updates;
         assert.equal(model.updates.length, 1, JSON.stringify({ error: result.error, refusal: manager.lastRefusal, frames }));
+        assert.deepEqual(mainProofs, [0, 1]);
         assert.deepEqual([update.action, update.backupId, update.argv], ['prepare-packages', reserved, ['/usr/bin/apt-get', '--error-on=any', 'update']]);
         assert.match(update.configDigest, /^[a-f0-9]{64}$/);
         assert.deepEqual(host.indexes(), update.indexes);

@@ -655,13 +655,13 @@ def model_package_timing(package_model):
     child_status = h['bounded_status']
     apt_calls = []
 
-    def timed_child(argv, end, maximum, *, may_write=False):
+    def timed_child(argv, end, maximum, *, may_write=False, progress=None):
         nonlocal now
         suffix = argv[7:] if argv[0] == '/usr/bin/env' and may_write else ()
         if suffix:
             assert end - now == 78, 'APT child ceiling was clipped'
             apt_calls.append(suffix[1])
-        result = child_status(argv, end, maximum, may_write=may_write)
+        result = child_status(argv, end, maximum, may_write=may_write, progress=progress)
         now += 77.75 if suffix else 0.125
         return result
 
