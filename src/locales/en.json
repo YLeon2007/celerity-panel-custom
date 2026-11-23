@@ -1861,6 +1861,12 @@
     "noRelays": "No L2TP relays.",
     "noAccounts": "No L2TP accounts.",
     "install": "Install",
+    "installBlocked": {
+      "pending": "Installation is unavailable: the panel is waiting for an operation to finish.",
+      "protected": "Installation is unavailable: a protective lock is in place.",
+      "unspecified": "Installation is unavailable: a lock is in place, but its purpose is unclear.",
+      "unreadable": "Installation is unavailable: the panel could not read the lock status."
+    },
     "installProfileHint": "Install needs an applied, compatible Xray rebuild profile. Regular Setup writes legacy JSON. If needed, configure the intended relay link in Nodes → Network Map and save without auto-deploy. Choose Deploy to preview the changes. Apply only if you approve the changes and this panel manages all affected profiles. Do not overwrite custom or externally managed profiles.",
     "installPackageHint": "Install can prepare missing VPN packages on supported Debian 13 relays with a database grant. Use a maintenance window. Packages are not rolled back if L2TP installation fails. If the result is uncertain, do not retry; have the relay administrator verify the package and L2TP state.",
     "remove": "Remove",

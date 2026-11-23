@@ -108,6 +108,9 @@ function secretControl(kind, url, index, login) {
                                 <td><code><%= relay.ip %></code></td>
                                 <td>
                                     <span class="badge <%= status === 'installed' ? 'badge-success' : 'badge-secondary' %>"><%= l(`status.${status}`) %></span>
+                                    <% if (actionable && !changed && ['pending', 'protected', 'unspecified', 'unreadable'].includes(relay.installBlockedReason)) { %>
+                                        <p class="text-muted" data-install-blocked><%= l(`installBlocked.${relay.installBlockedReason}`) %></p>
+                                    <% } %>
                                     <% if (!relay.bound && source === undefined && !relay.grantProblem && !topProblem) { %><div class="text-muted"><%= l('missingBinding') %></div><% } %>
                                 </td>
                                 <td>

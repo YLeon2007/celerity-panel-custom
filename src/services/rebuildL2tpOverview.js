@@ -358,10 +358,20 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 canRemove: clear && owned.has(id), canRevealPsk: clear && owned.has(id) && hasKey() };
         });
         if (relays.some(relay => relay.canInstall)) {
-            // An unacknowledged Install can retain the global writer lock even when the card is pristine.
-            const lock = await db.collection('c3_rebuild_locks').findOne({ _id: 'apply' },
-                { ...nativeRead, projection: { _id: 1 } }).catch(() => undefined);
-            if (lock !== null) for (const relay of relays) relay.canInstall = false;
+            // A shared lock says nothing about the outcome of Install on this relay.
+            let lock;
+            try {
+                lock = await db.collection('c3_rebuild_locks').findOne({ _id: 'apply' },
+                    { ...nativeRead, projection: { _id: 1, allowStaleUnlock: 1 } });
+            } catch { /* Only a confirmed absence permits the button. */ }
+            if (lock !== null) {
+                const reason = lock === undefined ? 'unreadable' : lock.allowStaleUnlock === true ? 'pending'
+                    : lock.allowStaleUnlock === false ? 'protected' : 'unspecified';
+                for (const relay of relays) if (relay.canInstall) {
+                    relay.canInstall = false;
+                    relay.installBlockedReason = reason;
+                }
+            }
         }
         const cohort = list ? ownedCohort(states.filter(row => !isAbsent(row)), owned, list)
             : owned.size === 1 ? owned : null;

@@ -785,4 +785,81 @@ test('last DB grant cannot strand a legacy singleton, but is revocable after Rem
     assert.deepEqual(f.mongo.rows(LOCK), []);
 });
 
+const lockNotes = {
+    pending: ['Installation is unavailable: the panel is waiting for an operation to finish.', 'Установка недоступна: панель ожидает завершения операции.'],
+    protected: ['Installation is unavailable: a protective lock is in place.', 'Установка недоступна: действует защитная блокировка.'],
+    unspecified: ['Installation is unavailable: a lock is in place, but its purpose is unclear.', 'Установка недоступна: сохранена блокировка, но её назначение не подтверждено.'],
+    unreadable: ['Installation is unavailable: the panel could not read the lock status.', 'Установка недоступна: панели не удалось прочитать состояние блокировки.'],
+};
+for (const [cut, reason] of [['ordinary Apply', 'pending'], ['protected', 'protected'], ['legacy', 'unspecified'],
+    ['malformed', 'unspecified'], ['read failure', 'unreadable'], ['confirmed prewrite refusal', null]]) {
+    test(`Install availability note on fresh GET: ${cut}`, async t => {
+        const panel = configure(t), mongo = mongoFixture(t), db = mongoose.connection;
+        process.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([{ nodeId, host, port: 22, username: 'root', machineId, sshHostKeySha256: pin }]);
+        const State = require('../../../modules/relay-l2tp/models/relayL2tpStateModel');
+        const pristine = new State({ node: nodeId, routingVersion: null, rebuildMachineId: '', rebuildInstallToken: '' }).toObject();
+        await db.collection(STATES).insertOne(pristine);
+        const expressApp = express();
+        expressApp.set('views', require('node:path').resolve(__dirname, '../../../../views'));
+        expressApp.set('view engine', 'ejs');
+        expressApp.use(require('../../../middleware/i18n').i18nMiddleware);
+        expressApp.use('/panel', panel.createPanelRouter());
+        const request = require('../../../services/tests/helpers/rebuildPanelRequest').request;
+        const first = { authenticated: true }, other = { authenticated: true };
+        let token = 'fixture-private-lock-token';
+        const page = async (lang, session, note) => {
+            const p = await request(expressApp, '/panel/l2tp', { method: 'GET', session, sessionID: session === first ? 'first' : 'other',
+                headers: { 'accept-language': lang } });
+            assert.equal(p.status, 200); assert.equal(p.headers['cache-control'], 'no-store');
+            assert.ok(!p.body.includes(token) && !p.body.includes(privateError));
+            const card = id => p.body.match(new RegExp(`<tr id="relay-${id}">[\\s\\S]*?</tr>`))?.[0];
+            const row = card(nodeId), unrelated = card(unusedId); assert.ok(row && unrelated);
+            const locale = require(`../../../locales/${lang}.json`).rebuildL2tp;
+            assert.ok(row.includes(`>${locale.status.not_installed}</span>`));
+            assert.equal(row.includes(`data-install-url="/panel/rebuild/relays/${nodeId}/l2tp/install"`), !note);
+            assert.deepEqual([...row.matchAll(/data-install-blocked>([^<]*)<\/p>/g)].map(m => m[1]), note ? [lockNotes[note][lang === 'en' ? 0 : 1]] : []);
+            assert.ok(!unrelated.includes('data-install-blocked') && !unrelated.includes('data-install-url'));
+        };
+        await page('ru', first, null);
+        const store = db.collection(LOCK);
+        async function checkPages() {
+            const saved = mongo.rows(LOCK); mongo.writes();
+            if (saved.length) token = saved[0].token;
+            const read = store.findOne.bind(store), reads = [];
+            t.mock.method(store, 'findOne', async (filter, options) => {
+                reads.push([filter, options]);
+                if (cut === 'read failure') throw Error(privateError);
+                return read(filter, options);
+            });
+            for (const lang of ['ru', 'en']) for (const session of [first, other]) await page(lang, session, reason);
+            assert.equal(reads.length, 4);
+            for (const [filter, options] of reads) {
+                assert.deepEqual(filter, { _id: 'apply' });
+                assert.deepEqual(options.projection, { _id: 1, allowStaleUnlock: 1 });
+                assert.equal(options.readConcern.level, 'majority');
+                assert.equal(options.readPreference, 'primary');
+            }
+            assert.deepEqual(mongo.rows(LOCK), saved); assert.deepEqual(mongo.writes(), []);
+        }
+        if (cut === 'ordinary Apply') {
+            return require('../../../services/rebuildService').createRebuildService().locks.run(async verify => {
+                await verify(); await checkPages();
+            });
+        }
+        if (!reason) {
+            let checks = 0;
+            const service = require('../../../services/rebuildService').createRebuildService({ createRelayDirect: () => ({
+                preflight: async () => { checks++; return { machineId, ppp: false, masked: false, unitsLoaded: true }; }, close: async () => {},
+            }) });
+            mongo.writes();
+            await assert.rejects(service.installRelay(nodeId), { code: 'REBUILD_L2TP_HOST_NOT_READY', outcome: 'refused' });
+            assert.equal(checks, 1); assert.deepEqual(mongo.writes(), [LOCK, LOCK]); assert.deepEqual(mongo.rows(LOCK), []);
+        } else if (cut !== 'read failure') {
+            const marker = { protected: false, malformed: [true] };
+            await store.insertOne({ _id: 'apply', token, heartbeat: new Date(0), ...(cut !== 'legacy' && { allowStaleUnlock: marker[cut] }) });
+        }
+        await checkPages();
+    });
+}
+
 test.after(() => require('../../../services/sshPoolService').closeAll());
