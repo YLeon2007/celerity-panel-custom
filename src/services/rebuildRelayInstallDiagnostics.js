@@ -34,7 +34,9 @@ const profileChecks = new Map([
     ['REBUILD_L2TP_DIRECT_PROFILE_USERS', 'XRAY_PROFILE_USERS_UNPROVED'],
     ['REBUILD_L2TP_DIRECT_RUNTIME_UNPROVED', 'XRAY_RUNTIME_UNPROVED'],
 ]);
-const packageChecks = new Set(['PACKAGE_SOURCES_UNSUPPORTED', 'PACKAGE_INDEXES_UNVERIFIED', 'PACKAGE_SERVICES_UNSAFE']);
+const packageChecks = new Set([
+    'PACKAGE_SOURCES_UNSUPPORTED', 'PACKAGE_INDEXES_UNVERIFIED', 'PACKAGE_SERVICES_UNSAFE', 'PACKAGE_APT_PLAN',
+]);
 const packageRefusals = new Map([...packageChecks, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'].map(id => [`DIRECT_${id}\n`, id]));
 const packageUncertain = new Map([...packageChecks].map(id => [`DIRECT_UNCERTAIN_${id}\n`, id]));
 // Only called for prepare-packages. Neither form certifies settlement of a write.

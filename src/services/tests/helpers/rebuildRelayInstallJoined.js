@@ -178,7 +178,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         }
         // The refusal-only variant cannot reach settings-tree observation.
         // Use the authenticated fixture when supplied; do not invent its bytes.
-        const swanLeaves = !barePackages || process.env.C3_FIXTURE_SWAN_ETC ? stockSwan.seed(root) : [];
+        // Plan refusals cannot reach stock Install's settings validator.
+        const needsSwan = !scenario.startsWith('package-stock-plan-') && (!barePackages || process.env.C3_FIXTURE_SWAN_ETC);
+        const swanLeaves = needsSwan ? stockSwan.seed(root) : [];
         const packages = ['strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables'];
         if (!freshStock) {
             // One absolute path projected; the shipped ensure helper is used unchanged.
@@ -635,7 +637,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         ]);
     }
 
-    for (const scenario of ['installed', 'cut', 'active', 'foreign', 'not-authorized']) {
+    for (const scenario of ['installed', 'cut', 'active', 'foreign', 'not-authorized', 'plan-preflight', 'plan-prepare']) {
         test(`joined package Install with packed guard: ${scenario}`, async t => {
             const f = host(t, 'package-stock-' + scenario, { cohort: true });
             const session = sessionFixture(t, f);
@@ -660,6 +662,30 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             const { status, result } = await submitNative({ ...f, create: () => f.create({ grantDb }) });
             const model = f.records(), { installed, aptReads, aptWrites, quiet, effects } = model.packageModel;
             const vault = join(f.root, '/var/lib/celerity-rebuild-l2tp-direct');
+            if (scenario.startsWith('plan-')) {
+                const preparing = scenario === 'plan-prepare';
+                assert.equal(status, 409);
+                assert.deepEqual(model.lastRefusal?.slice(0, 2), ['PACKAGE_APT_PLAN', '_simulation']);
+                assert.deepEqual(f.refusals, ['DIRECT_PACKAGE_APT_PLAN']);
+                assert.deepEqual(result, { error: {
+                    code: preparing ? 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                    check: 'PACKAGE_APT_PLAN', outcome: preparing ? 'unknown' : 'refused',
+                    ...(preparing && { retryAllowed: false }),
+                } });
+                assert.deepEqual(f.actions, preparing ? ['preflight', 'prepare-packages'] : ['preflight']);
+                assert.deepEqual(f.nativeCommits, preparing ? ['commit'] : []);
+                assert.deepEqual(f.states.map(row => row.status), preparing ? ['installing'] : []);
+                assert.deepEqual(f.users.map(row => row.syncStatus), preparing ? ['pending'] : []);
+                assert.equal(f.lockHeld, preparing);
+                assert.deepEqual([aptWrites, effects, model.effects], [0, [], []]);
+                if (preparing) {
+                    const [{ backupId }] = f.states;
+                    assert.deepEqual(fs.readdirSync(vault), [`packages-${backupId}.json`]);
+                    assert.equal(readJson(join(vault, `packages-${backupId}.json`)).phase, 'refused');
+                } else assert.equal(present(vault), false);
+                assert.deepEqual(snapshotNative(f).filter(([path]) => !path.startsWith('/var/lib/celerity-rebuild-l2tp-direct')), before);
+                return;
+            }
             if (scenario !== 'installed') {
                 assert.equal(status, 409, JSON.stringify(result.error));
                 assert.equal(result.error.code, ({ cut: 'REBUILD_L2TP_RESERVATION_FAILED',

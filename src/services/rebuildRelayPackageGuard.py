@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import struct
@@ -68,12 +69,15 @@ VERSION = r'[0-9][A-Za-z0-9.+:~\-]*'
 ARCH = 'amd64'  # The surrounding DIRECT stock-package predicates are amd64.
 # C-locale apt-get simulation labels, not independent source authentication.
 RELEASE = r'(?:Debian:13(?:\.[0-9]+)?/stable(?:-updates)?|Debian:13-updates/stable-updates|Debian-Security:13/stable-security)'
-LEGACY_SOURCE = re.compile(r'(deb|deb-src)[ \t]+(?:\[signed-by=' + re.escape(KEYRING) + r'\][ \t]+)?'
-                           r'(\S+)[ \t]+(\S+)[ \t]+(.+)')
+SOURCES = (('http://deb.debian.org/debian', 'trixie'),
+           ('http://deb.debian.org/debian', 'trixie-updates'),
+           ('http://security.debian.org/debian-security', 'trixie-security'))
 MAX_PLAN = 48
 LIMIT = 8 * 1024 * 1024
 APT_TIMEOUT = 78
 LISTS = '/var/lib/apt/lists/'
+ARCHIVE_PARENT = '/var/lib/apt'
+ARCHIVE_PREFIX = '.relay-package-archives-'
 UPDATE = ('/usr/bin/apt-get', '--error-on=any', 'update')
 XL_GENERATED = {
     # Also pinned by rebuildRelayStockRuntime.py, from the Debian 257 generator.
@@ -553,8 +557,7 @@ def _apt_staging_dir(info, forbidden):
 
 
 def _sources(root):
-    etc = _dir(root, '/etc/apt')
-    parts = _dir(root, '/etc/apt/sources.list.d', False)
+    # Bind the keyring and local list state, never the operator's APT sources.
     _dir(root, str(Path(KEYRING).parent))
 
     def bound(file, limit):
@@ -576,63 +579,11 @@ def _sources(root):
     need(keys, 'PACKAGE_SOURCES')
     if link is not None:
         need(_snapshot(keyfile.lstat()) == link and os.readlink(keyfile) == KEYRING_TARGET, 'PACKAGE_SOURCES')
-    files = [etc / 'sources.list'] if _stat(etc / 'sources.list') else []
-    if parts is not None:
-        files += sorted(p for p in parts.iterdir() if p.suffix in ('.list', '.sources'))
-    sources, evidence = set(), {}
-
-    def add(uri, suite, components, binary):
-        need(re.fullmatch(r'https?://(?:deb\.debian\.org/(?:debian|debian-security)|security\.debian\.org/debian-security)/?', uri)
-             and suite in {'trixie', 'trixie-updates', 'trixie-security'}
-             and (suite == 'trixie-security') == ('debian-security' in uri)
-             and 'main' in components and set(components) <= {'main', 'contrib', 'non-free', 'non-free-firmware'},
-             'PACKAGE_SOURCES_CONFIG')
-        # Keep main only, no source-supplied trust/targets/options.
-        if binary:
-            sources.add((uri.rstrip('/'), suite))
-
-    for file in files:
-        raw, evidence[str(file.relative_to(root))] = bound(file, 64 * 1024)
-        data = _text(raw, 'PACKAGE_SOURCES_CONFIG')
-        if file.suffix == '.sources':
-            # In DEB822 a comment is a whole line. An inline suffix is part of
-            # the value (notably for Signed-By), and must not be discarded.
-            lines = [line.rstrip() for line in data.split('\n') if not line.startswith('#')]
-            for f in _stanzas('\n'.join(lines), 'PACKAGE_SOURCES_CONFIG'):
-                need(f.keys() <= {'types', 'uris', 'suites', 'components', 'signed-by', 'architectures'}
-                     and f.get('types', '').split() in (['deb'], ['deb', 'deb-src'])
-                     and f.get('signed-by', KEYRING) == KEYRING
-                     and f.get('architectures', ARCH) == ARCH, 'PACKAGE_SOURCES_CONFIG')
-                uris, suites = f.get('uris', '').split(), f.get('suites', '').split()
-                need(len(uris) == 1 and bool(suites), 'PACKAGE_SOURCES_CONFIG')
-                for suite in suites:
-                    add(uris[0], suite, f.get('components', '').split(), True)
-        else:
-            for raw in data.split('\n'):
-                line = raw.split('#', 1)[0].strip()
-                if line:
-                    match = LEGACY_SOURCE.fullmatch(line)
-                    if match is None:
-                        raise Refusal('PACKAGE_SOURCES_CONFIG')
-                    kind, uri, suite, components = match.groups()
-                    add(uri, suite, components.split(), kind == 'deb')
-    suites = {suite for _, suite in sources}
-    need('trixie' in suites and len(suites) == len(sources), 'PACKAGE_SOURCES_CONFIG')
     lists = _dir(root, LISTS)
-    archives = _dir(root, '/var/cache/apt/archives')
     _dir(root, '/usr/lib/apt/methods')
-    # Do not let this path reuse pre-existing .debs or partial downloads.
-    need(all(p.name in {'lock', 'partial'} for p in archives.iterdir()), 'PACKAGE_ARCHIVE_CACHE')
-    for lock in (archives / 'lock', lists / 'lock'):
-        _idle_lock(lock, 'PACKAGE_SOURCES')
-    for dirname in ('/var/lib/apt/lists/partial', '/var/cache/apt/archives/partial'):
-        # Stock APT sandboxes acquisition in _apt-owned partial dirs; their
-        # parents, not their sandbox owner, are the trust boundary.
-        info = _stat(root / dirname[1:])
-        need(info is None or _apt_staging_dir(info, 0o077),
-             'PACKAGE_DIRECTORY')
-        if dirname.startswith('/var/cache/') and info is not None:
-            need(not any((root / dirname[1:]).iterdir()), 'PACKAGE_ARCHIVE_CACHE')
+    _idle_lock(lists / 'lock', 'PACKAGE_SOURCES')
+    partial = _stat(lists / 'partial')
+    need(partial is None or _apt_staging_dir(partial, 0o077), 'PACKAGE_DIRECTORY')
     indexes = {}
     for file in sorted(lists.iterdir()):
         if file.name in ('partial', 'auxfiles', 'lock'):
@@ -640,9 +591,15 @@ def _sources(root):
         info = file.lstat()
         need(stat.S_ISREG(info.st_mode) and _trusted(info) and info.st_nlink == 1, 'PACKAGE_APT_INDEXES')
         indexes[file.name] = _snapshot(info)
-    return sorted(sources), indexes, ((link, keyring), evidence, _id(etc.lstat()),
-                                     _id(parts.lstat()) if parts is not None else None,
-                                     _id(lists.lstat()), _id(archives.lstat()))
+    # Nonempty unrelated lists are not a bootstrap license. APT resolves
+    # index targets only from SOURCES, not by enumerating this inventory.
+    need(not indexes or any(_index_stem(uri, suite) + '_InRelease' in indexes for uri, suite in SOURCES),
+         'PACKAGE_APT_INDEXES')
+    return SOURCES, indexes, ((link, keyring), _id(lists.lstat()))
+
+
+def _index_stem(uri, suite):
+    return uri.split('://', 1)[1].replace('/', '_') + '_dists_' + suite
 
 
 def _index_staging(root):
@@ -668,7 +625,7 @@ def _fetched_indexes(root, sources):
     _index_staging(root)
     wanted = set()
     for uri, suite in rows:
-        stem = uri.split('://', 1)[1].replace('/', '_') + '_dists_' + suite
+        stem = _index_stem(uri, suite)
         release_name = stem + '_InRelease'
         wanted.add(release_name)
         need(release_name in indexes, code)
@@ -733,21 +690,22 @@ def _memfile(stack, name, data):
 
 
 @contextmanager
-def _apt(sources, pins=None, *, bootstrap=False, update=False):
+def _apt(pins=None, *, bootstrap=False, update=False, archives='/dev/null'):
     # APT_CONFIG is read before the default configuration snippets. Isolation
     # uses APT's explicit /dev/null sentinel, not an empty setting that can
     # resolve to a default. Main sources use the one-line parser (no suffix).
+    need(archives == '/dev/null' or (not update and pins is not None and re.fullmatch(
+        re.escape(f'{ARCHIVE_PARENT}/{ARCHIVE_PREFIX}') + '[0-9a-f]{32}/', archives)), 'PACKAGE_APT_CONFIG')
     with ExitStack() as stack:
         def mem(name, text):
             return stack.enter_context(_memfile(stack, name, text))
-        options = ' inrelease-path=InRelease' if bootstrap else ''
-        source = mem('relay-debian-sources', ''.join(f'deb [signed-by={KEYRING}{options}] {uri} {suite} main\n'
-                                                   for uri, suite in sources))
+        source = mem('relay-debian-sources', ''.join(
+            f'deb [signed-by={KEYRING} inrelease-path=InRelease] {uri} {suite} main\n' for uri, suite in SOURCES))
         prefs = '/dev/null'
         if pins is not None:
             rules = ''.join(f'Package: {name}\nPin: version {version}\nPin-Priority: 990\n\n'
                             for name, (version, _) in sorted(pins.items()))
-            prefs = mem('relay-package-versions', rules + 'Package: *\nPin: version *\nPin-Priority: -1\n')
+            prefs = mem('relay-package-versions', rules + 'Package: *\nPin: release *\nPin-Priority: -1\n')
         config = mem('relay-apt-config', f'''
 Dir::Etc::Parts "/dev/null";
 Dir::Etc::Main "/dev/null";
@@ -762,8 +720,10 @@ Dir::Etc::trustedparts "/dev/null";
 Dir::State::lists "{LISTS}";
 Dir::Cache::pkgcache "";
 Dir::Cache::srcpkgcache "";
+Dir::Cache::archives "{archives}";
 APT::Architecture "{ARCH}";
 APT::Architectures {{ "{ARCH}"; }};
+APT::Sandbox::User "_apt";
 APT::Install-Recommends "false";
 APT::Install-Suggests "false";
 APT::Get::AllowUnauthenticated "false";
@@ -774,6 +734,11 @@ Acquire::Check-Valid-Until "true";
 Acquire::Retries "0";
 Acquire::http::Timeout "12";
 Acquire::https::Timeout "12";
+Acquire::EnableSrvRecords "false";
+Acquire::http::AllowRedirect "false";
+Acquire::https::AllowRedirect "false";
+Acquire::http::Proxy "DIRECT";
+Acquire::https::Proxy "DIRECT";
 DPkg::Lock::Timeout "0";
 Dpkg::Use-Pty "false";
 ''' + ('''
@@ -789,11 +754,6 @@ Acquire::IndexTargets::deb::Packages {
 };
 Acquire::Languages "none";
 Acquire::PDiffs "false";
-Acquire::EnableSrvRecords "false";
-Acquire::http::AllowRedirect "false";
-Acquire::https::AllowRedirect "false";
-Acquire::http::Proxy "DIRECT";
-Acquire::https::Proxy "DIRECT";
 ''' if bootstrap else '') + ('Dir::Bin::dpkg "/dev/null";\n' if update else ''))
         yield ('/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL=C',
                'DEBIAN_FRONTEND=noninteractive', 'UCF_FORCE_CONFFOLD=1', 'APT_CONFIG=' + config)
@@ -890,7 +850,7 @@ def _facts(root, run):
 def _plan(root, run, facts, sources, missing, *, bootstrap=False):
     installed, status = facts[:2]
     need(bool(sources[1]), 'PACKAGE_APT_INDEXES')
-    with _apt(sources[0], bootstrap=bootstrap) as apt:
+    with _apt(bootstrap=bootstrap) as apt:
         _command(run, apt + ('/usr/bin/apt-get', '-s', 'check'), 'PACKAGE_APT_CHECK')
         plan = _simulation(apt, run, missing)
         need(set(missing) <= plan.keys() and not plan.keys() & installed.keys(), 'PACKAGE_APT_PLAN')
@@ -1051,6 +1011,104 @@ def _move(src, name, dst, leaf):
         raise OSError(ctypes.get_errno(), 'renameat2')
 
 
+def _apt_identity():
+    try:
+        account = pwd.getpwnam('_apt')
+    except KeyError:
+        raise Refusal('PACKAGE_ARCHIVE_CACHE') from None
+    return account.pw_uid, account.pw_gid
+
+
+def _archive_parent(root):
+    path = _dir(root, ARCHIVE_PARENT)
+    # Test the complete host-relative chain, not just the cache's own mode.
+    # The modeled root itself is a namespace boundary, not an APT pathname.
+    for directory in (path, *path.parents):
+        if directory == root and root != Path('/'):
+            break
+        need(directory.lstat().st_mode & stat.S_IXOTH, 'PACKAGE_ARCHIVE_CACHE')
+        if directory == root:
+            break
+    return path
+
+
+class _Archives:
+    """One install's cache. Pin the parent, cache and sandbox subdirectory."""
+    code = 'PACKAGE_ARCHIVE_CACHE'
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    def __init__(self, root, stack):
+        self.root, self.stack = root, stack
+        directory = _archive_parent(root)
+        self.parent = os.open(directory, self.flags)
+        stack.callback(os.close, self.parent)
+        self.parent_id = _id(os.fstat(self.parent))
+        need(self.parent_id == _id(directory.lstat()), self.code)
+        self.name = ARCHIVE_PREFIX + uuid.uuid4().hex
+        self.path = f'{ARCHIVE_PARENT}/{self.name}/'
+        self.created = self.partial_created = False
+        self.fd = self.partial = None
+
+    def _pin(self, name, parent):
+        fd = os.open(name, self.flags, dir_fd=parent)
+        self.stack.callback(os.close, fd)
+        self._check_pin(fd, name, parent)
+        return fd
+
+    def _check_pin(self, fd, name, parent):
+        current = _stat(name, parent)
+        need(fd is not None and current is not None and _id(current) == _id(os.fstat(fd)), self.code)
+        return current
+
+    def check(self):
+        need(self.parent_id == _id(_archive_parent(self.root).lstat()), self.code)
+        info = self._check_pin(self.fd, self.name, self.parent)
+        need(_trusted(info), self.code)
+        if self.partial_created:
+            self._check_pin(self.partial, 'partial', self.fd)
+
+    def create(self, uid, gid):
+        os.mkdir(self.name, 0o700, dir_fd=self.parent)
+        self.created = True
+        self.fd = self._pin(self.name, self.parent)
+        os.mkdir('partial', 0o700, dir_fd=self.fd)
+        self.partial_created = True
+        self.partial = self._pin('partial', self.fd)
+        os.fchown(self.partial, uid, gid)
+        os.fchmod(self.partial, 0o700)
+        info = os.fstat(self.partial)
+        need((info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (uid, gid, 0o700), self.code)
+        # APT starts as root, but acquisition workers walk this path as _apt.
+        os.fchmod(self.fd, 0o711)
+        self.check()
+        need(stat.S_IMODE(os.fstat(self.fd).st_mode) == 0o711, self.code)
+
+    def remove(self):
+        if not self.created:
+            return
+        self.check()
+        fd = self.fd
+        if fd is None:
+            raise Refusal(self.code)
+        os.fchmod(fd, 0o700)
+        # APT leaves regular files (and may leave symlinks) here. Unlink using
+        # held directory FDs; never follow links or recurse into unexpected dirs.
+        if self.partial_created:
+            partial = self.partial
+            if partial is None:
+                raise Refusal(self.code)
+            for file in os.listdir(partial):
+                os.unlink(file, dir_fd=partial)
+            self._check_pin(partial, 'partial', fd)
+            os.rmdir('partial', dir_fd=fd)
+        for file in os.listdir(fd):
+            os.unlink(file, dir_fd=fd)
+        self._check_pin(fd, self.name, self.parent)
+        os.rmdir(self.name, dir_fd=self.parent)
+        os.fsync(self.parent)
+        need(_stat(self.name, self.parent) is None, self.code)
+
+
 def _reload(run):
     need(not _command(run, CTL + ('daemon-reload',), 'PACKAGE_RELOAD', timeout=12)[1], 'PACKAGE_RELOAD')
 
@@ -1070,11 +1128,14 @@ def _prepare(root, run, expected, enter):
         return None
     if sources is None:
         raise Refusal('PACKAGE_PLAN_CHANGED')
+    uid, gid = _apt_identity()
+    need(type(uid) is int and uid > 0 and type(gid) is int and gid >= 0, 'PACKAGE_ARCHIVE_CACHE')
+    _archive_parent(root)  # Fail a known non-traversable ancestry before entry.
     bootstrap = not sources[1]
     if bootstrap:
         staging = _index_staging(root)
         need(_proof(missing, facts, sources, {}, {}, staging) == observed, 'PACKAGE_PLAN_CHANGED')
-        with _apt(sources[0], bootstrap=True, update=True) as apt:
+        with _apt(bootstrap=True, update=True) as apt:
             enter()
             need(_sources(root) == sources and _index_staging(root) == staging, 'PACKAGE_PLAN_CHANGED')
             _command(run, apt + UPDATE, 'PACKAGE_APT_UPDATE', timeout=APT_TIMEOUT,
@@ -1098,12 +1159,12 @@ def _prepare(root, run, expected, enter):
     # so Debian retains automatic dependency markings.
     specs = [f'{name}={plan[name][0]}' for name in missing]
     with ExitStack() as stack:
-        apt = stack.enter_context(_apt(sources[0], permits, bootstrap=bootstrap))
-        need(_simulation(apt, run, specs) == plan
-             and _observe(root, run, fetched=sources if bootstrap else None)[0] == observed, 'PACKAGE_PLAN_CHANGED')
+        with _apt(permits, bootstrap=bootstrap) as apt:
+            need(_simulation(apt, run, specs) == plan, 'PACKAGE_PLAN_CHANGED')
+        need(_observe(root, run, fetched=sources if bootstrap else None)[0] == observed, 'PACKAGE_PLAN_CHANGED')
         if not bootstrap:
             enter()
-        arts, masks = [], {}
+        arts, masks, archives = [], {}, None
         dispatched = False
         try:
             # Policy is installed first and removed last, including on a setup failure.
@@ -1124,10 +1185,14 @@ def _prepare(root, run, expected, enter):
             policy.check(root)
             for mask in masks.values():
                 mask.check(root)
-            dispatched = True
-            _command(run, apt + ('/usr/bin/apt-get', '-y') + _apt_args(specs), 'PACKAGE_APT_UNSETTLED',
-                     timeout=APT_TIMEOUT, quiet=False)
+            archives = _Archives(root, stack)
+            archives.create(uid, gid)
+            with _apt(permits, bootstrap=bootstrap, archives=archives.path) as apt:
+                dispatched = True
+                _command(run, apt + ('/usr/bin/apt-get', '-y') + _apt_args(specs), 'PACKAGE_APT_UNSETTLED',
+                         timeout=APT_TIMEOUT, quiet=False)
             _quiet(run)
+            archives.check()
             now, _, _ = _packages(root, run)
             need(now == permits, 'PACKAGE_APT_READBACK')
             postinst = _layout(root, run, now, masks, plan.keys())
@@ -1160,12 +1225,18 @@ def _prepare(root, run, expected, enter):
             _quiet(run)
             need(_packages(root, run)[0] == permits and ('xl2tpd' not in now or 'xl2tpd.service' in unmasked[3]),
                  'PACKAGE_APT_READBACK')
+            archives.remove()
             policy.remove(root)
         except BaseException as error:
             # APT may have left an unpacked or half-configured package, or a
             # maintainer child that outlived its parent. Never infer settlement
             # from a timeout, a nonzero exit, or disappearance from ps alone.
             if not dispatched:
+                try:
+                    if archives is not None:
+                        archives.remove()
+                except Exception:
+                    error.add_note('PACKAGE_ARCHIVE_CLEANUP_UNCERTAIN')
                 try:
                     _remove_owned(root, arts[1:])
                     if masks:

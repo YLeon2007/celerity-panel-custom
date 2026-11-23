@@ -11,12 +11,15 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -34,6 +37,157 @@ POLICY = '/usr/sbin/policy-rc.d'
 PROPS = ('Id,Names,LoadState,FragmentPath,SourcePath,UnitFileState,ActiveState,SubState,'
          'MainPID,ControlPID,Job,NeedDaemonReload,Transient,DropInPaths,TriggeredBy')
 CTL = ('/usr/bin/systemctl', '--system', '--no-pager', '--no-ask-password', '--full')
+KEYRING = '/usr/share/keyrings/debian-archive-keyring.gpg'
+LISTS = '/var/lib/apt/lists'
+SHARED_ARCHIVES = '/var/cache/apt/archives'
+PRIVATE_ARCHIVE_PARENT = '/var/lib/apt'
+PRIVATE_ARCHIVE_NAME = r'\.relay-package-archives-[a-f0-9]{32}'
+APT_UID, APT_GID = 61888, 0
+REPOSITORIES = (('deb.debian.org/debian', 'trixie'),
+                ('deb.debian.org/debian', 'trixie-updates'),
+                ('security.debian.org/debian-security', 'trixie-security'))
+INDEXES = [f'{uri.replace("/", "_")}_dists_{suite}_{target}' for uri, suite in REPOSITORIES
+           for target in ('InRelease', 'main_binary-amd64_Packages')]
+LIVE_45 = '''deb http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+deb-src http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian/ trixie-backports main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian/ trixie-backports main contrib non-free non-free-firmware
+'''
+HETZNER = '''Types: deb
+URIs: http://mirror.hetzner.com/debian/packages
+Suites: trixie trixie-updates trixie-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://mirror.hetzner.com/debian/security
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+'''
+THIRD_PARTY = 'deb [trusted=yes signed-by=/etc/apt/keyrings/operator.gpg] https://fixture.invalid/vendor trixie main\n'
+
+
+def file_generation(path):
+    info = path.lstat()
+    return (path.read_bytes(), info.st_dev, info.st_ino, info.st_mode,
+            info.st_uid, info.st_gid, info.st_nlink, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def sealed_sources():
+    return ''.join(f'deb [signed-by={KEYRING} inrelease-path=InRelease] http://{uri} {suite} main\n'
+                   for uri, suite in REPOSITORIES)
+
+
+def sealed_text(path):
+    # Do not follow a fixture-controlled path to a host configuration file.
+    if not re.fullmatch(rf'/proc/{os.getpid()}/fd/[0-9]+', path):
+        raise AssertionError(f'expected a live same-process memfd, got {path!r}')
+    with Path(path).open() as stream:
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        if fcntl.fcntl(stream, fcntl.F_GET_SEALS) & seals != seals:
+            raise AssertionError(f'unsealed APT carrier {path!r}')
+        return stream.read()
+
+
+def apt_option(config, key):
+    values = re.findall(rf'^\s*{re.escape(key)} "([^"\n]*)";$', config, re.M)
+    if len(values) != 1:
+        raise AssertionError(f'expected exactly one sealed {key} option, got {values!r}')
+    return values[0]
+
+
+def read_apt_config(argv):
+    prefix = ('/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL=C',
+              'DEBIAN_FRONTEND=noninteractive', 'UCF_FORCE_CONFFOLD=1')
+    if argv[:6] != prefix or not argv[6].startswith('APT_CONFIG='):
+        raise AssertionError(f'unexpected APT environment {argv[:7]!r}')
+    config = sealed_text(argv[6].split('=', 1)[1])
+    expected = {
+        **dict.fromkeys(('Dir::Etc::Parts', 'Dir::Etc::Main', 'Dir::Etc::sourceparts', 'Dir::Etc::preferencesparts',
+                         'Dir::Etc::netrc', 'Dir::Etc::netrcparts', 'Dir::Etc::trustedparts'), '/dev/null'),
+        'Dir::Etc::trusted': KEYRING, 'Dir::State::lists': LISTS + '/',
+        'Dir::Cache::pkgcache': '', 'Dir::Cache::srcpkgcache': '', 'APT::Architecture': 'amd64',
+        'APT::Sandbox::User': '_apt',
+        'APT::Get::AllowUnauthenticated': 'false', 'Acquire::AllowInsecureRepositories': 'false',
+        'Acquire::AllowWeakRepositories': 'false', 'Acquire::AllowDowngradeToInsecureRepositories': 'false',
+        'Acquire::Check-Valid-Until': 'true',
+        'Acquire::http::AllowRedirect': 'false', 'Acquire::https::AllowRedirect': 'false',
+        'Acquire::http::Proxy': 'DIRECT', 'Acquire::https::Proxy': 'DIRECT',
+    }
+    actual = {key: apt_option(config, key) for key in expected}
+    if actual != expected:
+        raise AssertionError(f'unexpected sealed APT options {actual!r}')
+    return config
+
+
+def package_ownership(root, archive_owners):
+    """Limit the uid/gid projection to this guard's fixture filesystem."""
+    parent = root / PRIVATE_ARCHIVE_PARENT[1:]
+
+    class FixtureOS:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def fchown(self, fd, uid, gid):
+            path = Path(os.readlink(f'/proc/self/fd/{fd}'))
+            assert path.parent.parent == parent and path.name == 'partial'
+            assert re.fullmatch(PRIVATE_ARCHIVE_NAME, path.parent.name)
+            assert (uid, gid) == (APT_UID, APT_GID)
+            st = os.fstat(fd)
+            archive_owners[(st.st_dev, st.st_ino)] = uid, gid
+
+        def fstat(self, fd):
+            st = os.fstat(fd)
+            owner = archive_owners.get((st.st_dev, st.st_ino))
+            if owner is None:
+                return st
+            fields = list(st)
+            fields[4:6] = owner
+            return os.stat_result(fields)
+
+    def apt_account(name):
+        assert name == '_apt'
+        return SimpleNamespace(pw_uid=APT_UID, pw_gid=APT_GID)
+
+    return dict(_owner=lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid()),
+                os=FixtureOS(), pwd=SimpleNamespace(getpwnam=apt_account))
+
+
+@contextmanager
+def deny_shared_archive_reads(root):
+    """Trip on traversal, stat or open of the shared cache, not just writes."""
+    import builtins
+    import io
+
+    forbidden = (root / SHARED_ARCHIVES[1:], Path(SHARED_ARCHIVES))
+
+    def guard(call):
+        def check(path, *args, **kwargs):
+            base = kwargs.get('dir_fd')
+            if isinstance(path, int):
+                name = os.readlink(f'/proc/self/fd/{path}')
+            else:
+                name = os.fsdecode(path)
+                if not name.startswith('/') and base is not None:
+                    name = os.path.join(os.readlink(f'/proc/self/fd/{base}'), name)
+            absolute = Path(os.path.abspath(name))
+            if any(absolute.is_relative_to(cache) for cache in forbidden):
+                raise AssertionError(f'guard looked at shared APT cache: {absolute}')
+            return call(path, *args, **kwargs)
+        return check
+
+    with ExitStack() as stack:
+        for obj, attrs in ((os, ('stat', 'lstat', 'open', 'scandir', 'listdir')),
+                           (io, ('open',)), (builtins, ('open',))):
+            for attr in attrs:
+                stack.enter_context(patch.object(obj, attr, guard(getattr(obj, attr))))
+        yield
+
 
 # Public action rows from the sanitized Debian 13 historical solver probe
 # (historical-solver-uid0.log). The apt-cache metadata seam below is modeled.
@@ -61,6 +215,8 @@ class Host:
         self.apt_count = 0
         self.apt_mode = 'ok'
         self.update_mode = 'ok'
+        self.archive_owners = {}
+        self.archive_used = None
         self.after_update = lambda: None
         self.error_stage: str | None = None
         self.active = self.enabled = self.listener = self.job = self.process = self.bad_audit = False
@@ -78,6 +234,7 @@ class Host:
         }
         self.replacement = None
         self.pin_plan_drift = False
+        self.pinned_calls = []
         self.sim_extra = ''
         self.sim_stdout: bytes | None = None
         if not seed:
@@ -160,7 +317,11 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         self.t.assertEqual(self.effects, [])
         self.t.assertFalse(self.p(POLICY).exists())
         self.t.assertTrue(all(not self.p(f'{SYSTEM}/{unit}').is_symlink() for unit in g.UNITS))
+        self.no_private_cache()
         self.effects.append('enter')
+
+    def no_private_cache(self):
+        self.t.assertEqual(list(self.p(PRIVATE_ARCHIVE_PARENT).glob('.relay-package-archives-*')), [])
 
     def _install(self):
         old = self.installed.copy()
@@ -238,20 +399,17 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         return 0, b'', b''
 
     def _apt(self, argv, timeout):
-        self.t.assertEqual(argv[:6], ('/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL=C',
-                                     'DEBIAN_FRONTEND=noninteractive', 'UCF_FORCE_CONFFOLD=1'))
-        self.t.assertTrue(argv[6].startswith('APT_CONFIG=/proc/'))
-        config = Path(argv[6].split('=', 1)[1]).read_text()
-        self.t.assertIn('APT::Get::AllowUnauthenticated "false";', config)
-        self.t.assertIn('Acquire::AllowInsecureRepositories "false";', config)
-        self.t.assertIn('Dir::Cache::pkgcache "";', config)
-        self.t.assertIn('Dir::Etc::Parts "/dev/null";', config)
-        source_match = re.search(r'Dir::Etc::sourcelist "([^"]+)";', config)
-        assert source_match is not None
-        src = Path(source_match[1]).read_text()
-        self.t.assertRegex(src, r'deb \[signed-by=/usr/share/keyrings/debian-archive-keyring.gpg[^\n]*\] '
-                           r'http://deb\.debian\.org/debian trixie main\n')
+        config = read_apt_config(argv)
+        src = sealed_text(apt_option(config, 'Dir::Etc::sourcelist'))
         program, *args = argv[7:]
+
+        # A call with a foreign mirror, extra suite/component, source-pass-through
+        # option, or unsealed config is rejected at the actual argv boundary.
+        self.t.assertEqual(src, sealed_sources())
+        archives = apt_option(config, 'Dir::Cache::archives')
+        if args[:1] != ['-y']:
+            self.t.assertEqual(archives, '/dev/null')
+            self.no_private_cache()
         if program == '/usr/bin/apt-cache':
             self.t.assertEqual(len(args), 2)
             self.t.assertEqual(args[0], 'show')
@@ -271,43 +429,71 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
                                         '--no-upgrade', 'install'])
         names = [n for n in SIX if n not in self.installed]
         plan = {n: (v, a) for n, (v, a, _) in self.candidates.items() if n not in self.installed}
-        prefs_match = re.search(r'Dir::Etc::preferences "([^"]+)";', config)
-        assert prefs_match is not None
-        prefs = prefs_match[1]
+        prefs = apt_option(config, 'Dir::Etc::preferences')
+        pin_stderr = b''
         if prefs == '/dev/null':
             self.t.assertEqual(args[6:], names)
         else:
             self.t.assertEqual(args[6:], [f'{name}={plan[name][0]}' for name in names])
-            pin = Path(prefs).read_text()
-            self.t.assertTrue(pin.endswith('Package: *\nPin: version *\nPin-Priority: -1\n'))
-            for name, (v, _) in (self.installed | plan).items():
-                self.t.assertIn(f'Package: {name}\nPin: version {v}\nPin-Priority: 990\n', pin)
+            pin = sealed_text(prefs)
+            exact = ''.join(f'Package: {name}\nPin: version {v}\nPin-Priority: 990\n\n'
+                            for name, (v, _) in sorted((self.installed | plan).items()))
+            if pin == exact + 'Package: *\nPin: version *\nPin-Priority: -1\n':
+                # Reported APT 3.0.3 behavior: rc 0, but the generic pin warns.
+                pin_stderr = b'W: Did not understand pin type version\n'
+            else:
+                self.t.assertEqual(pin, exact + 'Package: *\nPin: release *\nPin-Priority: -1\n')
+            self.pinned_calls.append((args[0], pin_stderr))
         if args[0] == '-s':
             if self.pin_plan_drift and prefs != '/dev/null':
-                return 0, b'0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n', b''
+                return 0, b'0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n', pin_stderr
             if self.sim_stdout is not None:
-                return 0, self.sim_stdout, b''
+                return 0, self.sim_stdout, pin_stderr
             intro = ('Reading package lists...\nBuilding dependency tree...\nReading state information...\n'
                      'The following NEW packages will be installed:\n  ' + ' '.join(plan) + '\n'
                      f'0 upgraded, {len(plan)} newly installed, 0 to remove and 0 not upgraded.\n')
             lines = [f'{verb} {n} ({v} Debian:13.1/stable [{a}])\n'
                      for verb in ('Inst', 'Conf') for n, (v, a) in plan.items()]
-            return 0, (intro + ''.join(lines) + self.sim_extra).encode(), b''
+            return 0, (intro + ''.join(lines) + self.sim_extra).encode(), pin_stderr
         self.t.assertEqual(args[0], '-y')
         self.t.assertEqual(timeout, 78)
         self.t.assertNotEqual(prefs, '/dev/null')
         self.t.assertEqual([effect for effect in self.effects if effect != 'update'][:2], ['enter', 'reload'])
+        self.consume_archives(archives)
         self.effects.append('apt')
         self.apt_count += 1
         self.containment()
         if self.apt_mode == 'timeout':
             raise subprocess.TimeoutExpired(argv, timeout)
         if self.apt_mode == 'nonzero':
-            return 100, b'Unpacking...', b'Sub-process /usr/bin/dpkg returned an error code (1)'
+            return 100, b'Unpacking...', pin_stderr + b'Sub-process /usr/bin/dpkg returned an error code (1)'
         if self.apt_mode == 'signal':
             return -15, b'', b''
         self._install()
-        return 0, b'Setting up xl2tpd ...\n', b'invoke-rc.d: policy-rc.d denied execution of start.\n'
+        return 0, b'Setting up xl2tpd ...\n', pin_stderr + b'invoke-rc.d: policy-rc.d denied execution of start.\n'
+
+    def consume_archives(self, archives):
+        # Reopen the selected path from the actual modeled install argv. Seed
+        # both phases so an empty-only rmdir cannot masquerade as cleanup.
+        self.t.assertRegex(archives, rf'^{PRIVATE_ARCHIVE_PARENT}/{PRIVATE_ARCHIVE_NAME}/$')
+        cache = self.p(archives)
+        partial = cache / 'partial'
+        self.t.assertEqual({p.name for p in cache.iterdir()}, {'partial'})
+        self.t.assertEqual(list(partial.iterdir()), [])
+        st = cache.lstat()
+        self.t.assertEqual(stat.S_IMODE(st.st_mode), 0o711)
+        self.t.assertEqual((st.st_uid, st.st_gid), (os.getuid(), os.getgid()))
+        self.t.assertEqual(stat.S_IMODE(partial.lstat().st_mode), 0o700)
+        for ancestor in (cache.parent, *cache.parent.parents):
+            if ancestor == self.root:
+                break
+            self.t.assertTrue(ancestor.lstat().st_mode & stat.S_IXOTH)
+        st = partial.lstat()
+        self.t.assertEqual(self.archive_owners.get((st.st_dev, st.st_ino)), (APT_UID, APT_GID))
+        self.t.assertIsNone(self.archive_used)
+        self.archive_used = cache
+        (partial / 'incomplete.deb').write_bytes(b'modeled partial download')
+        (cache / 'xl2tpd_1.3.18-1+b1_amd64.deb').write_bytes(b'modeled committed download')
 
     def _update(self, config, src):
         self.t.assertEqual(self.effects, ['enter'])
@@ -323,7 +509,7 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
             raise subprocess.TimeoutExpired((), 1)
         self.p('/var/lib/apt/lists/auxfiles').mkdir(exist_ok=True)
         self.p('/var/lib/apt/lists/auxfiles').chmod(0o755)
-        for uri, suite in re.findall(r'\] https?://([^ ]+) ([a-z-]+) main\n', src):
+        for uri, suite in REPOSITORIES:
             base = '/var/lib/apt/lists/' + uri.replace('/', '_') + '_dists_' + suite
             payload = 'Package: fixture\nVersion: 1\nArchitecture: amd64\n\n'
             checksum = hashlib.sha256(payload.encode()).hexdigest()
@@ -385,20 +571,21 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 
 class TestPackageGuard(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(os.umask, os.umask(0o022))
         tmp = tempfile.TemporaryDirectory(prefix='.package-fixture-')
         self.addCleanup(tmp.cleanup)
         self.h = Host(self, Path(tmp.name))
-        # Project only the owner predicate; all mode, inode, link, fsync and
-        # rename operations are real and confined to the private tree.
         ownership = patch.object(g, '_owner', side_effect=lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid()))
         ownership.start()
         self.addCleanup(ownership.stop)
 
     def observe(self):
-        return json.loads(json.dumps(g.observe(self.h.root, self.h.run)))
+        with patch.dict(vars(g), package_ownership(self.h.root, self.h.archive_owners)):
+            return json.loads(json.dumps(g.observe(self.h.root, self.h.run)))
 
     def prepare(self, proof):
-        return g.prepare(self.h.root, self.h.run, proof, self.h.enter)
+        with patch.dict(vars(g), package_ownership(self.h.root, self.h.archive_owners)):
+            return g.prepare(self.h.root, self.h.run, proof, self.h.enter)
 
     def no_effects(self):
         self.assertEqual(self.h.effects, [])
@@ -411,10 +598,46 @@ class TestPackageGuard(unittest.TestCase):
     def empty_indexes(self):
         self.h.p('/var/lib/apt/lists/deb.debian.org_debian_dists_trixie_InRelease').unlink()
 
+    def test_exact_eight_live_lines_do_not_supply_sealed_sources(self):
+        self.h.p('/etc/apt/sources.list.d/debian.sources').unlink()
+        live = self.h.put('/etc/apt/sources.list', LIVE_45)
+        self.assertEqual(len(live.read_bytes().splitlines()), 8)
+        before = file_generation(live)
+        self.assertEqual(self.observe()['missing'], SIX)
+        self.no_effects()
+        self.assertEqual(file_generation(live), before)
+
+    def test_hetzner_and_third_party_do_not_supply_sealed_sources(self):
+        live = self.h.put('/etc/apt/sources.list.d/debian.sources', HETZNER)
+        third_party = self.h.put('/etc/apt/sources.list.d/operator.list', THIRD_PARTY)
+        before = [file_generation(path) for path in (live, third_party)]
+        self.assertEqual(self.observe()['missing'], SIX)
+        self.no_effects()
+        self.assertEqual([file_generation(path) for path in (live, third_party)], before)
+
+    def test_shared_cache_is_never_consulted_and_private_downloads_are_cleaned(self):
+        root = self.h.root
+        for bootstrap in (False, True):
+            with self.subTest(bootstrap=bootstrap):
+                self.h = Host(self, root / str(bootstrap))
+                if bootstrap:
+                    self.empty_indexes()
+                paths = (self.h.put(SHARED_ARCHIVES + '/xl2tpd_1.3.18-1+b1_amd64.deb', 'foreign bytes'),
+                         self.h.put(SHARED_ARCHIVES + '/partial/operator.deb', 'foreign download'))
+                before = [file_generation(path) for path in paths]
+                with deny_shared_archive_reads(self.h.root):
+                    proof = self.observe()
+                    self.no_effects()
+                    self.assertIsNone(self.prepare(proof))
+                self.assertEqual(self.h.apt_count, 1)
+                assert self.h.archive_used is not None
+                self.assertFalse(os.path.lexists(self.h.archive_used))
+                self.assertEqual([file_generation(path) for path in paths], before)
+
     def test_empty_lists_only_update_after_enter_then_use_normal_plan_and_readback(self):
         self.empty_indexes()
         source = self.h.p('/etc/apt/sources.list.d/debian.sources')
-        before = source.read_bytes(), source.stat().st_mtime_ns
+        before = file_generation(source)
         proof = self.observe()
         self.assertEqual(proof['missing'], SIX)
         self.no_apt()
@@ -425,18 +648,21 @@ class TestPackageGuard(unittest.TestCase):
         self.assertEqual(apt[0], ('/usr/bin/apt-get', '--error-on=any', 'update'))
         self.assertEqual(apt[1], ('/usr/bin/apt-get', '-s', 'check'))
         self.assertEqual(apt.count(apt[0]), 1)
-        self.assertEqual((source.read_bytes(), source.stat().st_mtime_ns), before)
+        self.assertEqual(sorted(p.name for p in self.h.p(LISTS).iterdir()
+                                if p.name not in {'lock', 'partial', 'auxfiles'}), sorted(INDEXES))
+        self.assertEqual(file_generation(source), before)
         self.assertFalse(self.h.p(POLICY).exists())
         self.assertEqual(self.observe()['missing'], [])
 
-    def test_empty_lists_bootstrap_proof_binds_source_bytes_before_enter(self):
+    def test_empty_lists_bootstrap_proof_does_not_depend_on_live_source_bytes(self):
         self.empty_indexes()
         proof = self.observe()
-        source = self.h.p('/etc/apt/sources.list.d/debian.sources')
-        source.write_text(source.read_text() + '\n# another comment\n')
-        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_PLAN_CHANGED'):
-            self.prepare(proof)
+        source = self.h.put('/etc/apt/sources.list.d/debian.sources', HETZNER)
+        before = file_generation(source)
+        self.assertEqual(self.observe(), proof)
         self.no_apt()
+        self.assertIsNone(self.prepare(proof))
+        self.assertEqual(file_generation(source), before)
 
     def test_empty_lists_bad_or_incomplete_update_never_plans(self):
         for mode in ('timeout', 'bad-signature', 'warning', 'unsigned', 'partial', 'empty', 'tampered', 'staged'):
@@ -460,19 +686,29 @@ class TestPackageGuard(unittest.TestCase):
             self.observe()
         self.no_apt()
 
+    def test_bootstrap_requires_release_and_packages_from_each_fixed_repo(self):
+        root = self.h.root
+        for name in INDEXES:
+            with self.subTest(missing=name):
+                self.h = Host(self, root / name)
+                self.empty_indexes()
+                proof = self.observe()
+                self.h.after_update = self.h.p(f'{LISTS}/{name}').unlink
+                with self.assertRaisesRegex(g.Refusal, '^PACKAGE_APT_INDEXES$'):
+                    self.prepare(proof)
+                self.assertEqual(self.h.effects, ['enter', 'update'])
+                self.assertEqual([a[7:] for a in self.h.calls if a[0] == '/usr/bin/env'],
+                                 [('/usr/bin/apt-get', '--error-on=any', 'update')])
+
     def test_empty_lists_non_index_state_is_rechecked_before_solver(self):
-        for change, code in (('sources', 'PLAN_CHANGED'), ('keyring', 'PLAN_CHANGED'),
-                             ('active', 'UNIT_ACTIVE'), ('installed', 'PLAN_CHANGED')):
+        for change, code in (('keyring', 'PLAN_CHANGED'), ('active', 'UNIT_ACTIVE'), ('installed', 'PLAN_CHANGED')):
             with self.subTest(change=change):
                 self.h = Host(self, self.h.root / change)
                 self.empty_indexes()
                 proof = self.observe()
                 def drift():
-                    if change == 'sources':
-                        source = self.h.p('/etc/apt/sources.list.d/debian.sources')
-                        source.write_text(source.read_text() + '\n# changed\n')
-                    elif change == 'keyring':
-                        self.h.put('/usr/share/keyrings/debian-archive-keyring.gpg', 'changed')
+                    if change == 'keyring':
+                        self.h.put(KEYRING, 'changed')
                     elif change == 'installed':
                         self.h.installed['libc6'] = ('2.0-1', 'amd64')
                         self.h.status()
@@ -550,6 +786,18 @@ class TestPackageGuard(unittest.TestCase):
             self.prepare(proof)
         self.no_effects()
 
+    def test_trixie_pinned_plan_and_install_use_release_catch_all(self):
+        self.h.stock_solver()
+        proof = self.observe()
+        self.assertEqual(proof['missing'], SIX)
+        self.assertNotIn('libpcap0.8t64', proof['missing'])
+        self.assertNotIn('libpcap0.8t64', self.h.installed)
+        self.assertIsNone(self.prepare(proof))
+        # Both actual argv paths checked the full pinset, including libpcap,
+        # while passing only the six explicit requests to APT.
+        self.assertEqual(self.h.pinned_calls, [('-s', b''), ('-y', b'')])
+        self.assertEqual(self.h.installed['libpcap0.8t64'], ('1.10.5-2', 'amd64'))
+
     def test_preexisting_policy_is_not_even_read(self):
         policy = self.h.link(POLICY, '/nonexistent-operator-policy')
         with self.assertRaisesRegex(g.Refusal, 'PACKAGE_POLICY'):
@@ -590,17 +838,6 @@ class TestPackageGuard(unittest.TestCase):
             self.no_apt()
         self.assertEqual(self.observe()['missing'], SIX)
 
-    def test_trust_override_and_cached_archive_refused_without_apt(self):
-        cache = self.h.put('/var/cache/apt/archives/operator.deb', 'not a real archive')
-        with self.assertRaisesRegex(g.Refusal, 'PACKAGE_ARCHIVE_CACHE'):
-            self.observe()
-        self.no_apt()
-        cache.unlink()
-        file = self.h.p('/etc/apt/sources.list.d/debian.sources')
-        file.write_text(file.read_text() + 'Trusted: yes\n')
-        with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
-            self.observe()
-        self.no_apt()
 
     def test_preexisting_live_unit_jobs_listeners_and_processes(self):
         for attr, code in (('active', 'UNIT_ACTIVE'), ('job', 'JOBS'), ('listener', 'LISTENERS'),
@@ -636,34 +873,30 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian
         self.assertEqual(self.observe()['missing'], SIX)
         self.no_effects()
 
-    def test_signed_by_does_not_admit_other_keys_or_extra_options(self):
+    def test_sealed_signed_by_does_not_copy_live_keys_or_extra_options(self):
         listing = self.h.p('/etc/apt/sources.list.d/debian.sources')
         deb822 = listing.read_text()
-        for suffix in (' ABCDEF0123456789ABCDEF0123456789ABCDEF01', ' #not-a-deb822-comment'):
+        proof = self.observe()
+        for suffix in (' ABCDEF0123456789ABCDEF0123456789ABCDEF01', ' #not-a-deb822-comment', '\nTrusted: yes'):
             with self.subTest(suffix=suffix):
-                self.h.calls.clear()
                 listing.write_text(deb822.replace('.gpg\n', '.gpg' + suffix + '\n'))
-                with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
-                    self.observe()
-                self.no_apt()
+                self.assertEqual(self.observe(), proof)
+                self.no_effects()
         listing.unlink()
         for options in ('signed-by=/tmp/operator.gpg',
                         'signed-by=/usr/share/keyrings/debian-archive-keyring.gpg trusted=yes',
                         'signed-by=/usr/share/keyrings/debian-archive-keyring.gpg arch=amd64'):
             with self.subTest(options=options):
-                self.h.calls.clear()
                 self.h.put('/etc/apt/sources.list',
                            f'deb [{options}] http://deb.debian.org/debian trixie main\n')
-                with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
-                    self.observe()
-                self.no_apt()
+                self.assertEqual(self.observe(), proof)
+                self.no_effects()
 
     def test_legacy_source_only_entry_cannot_become_a_binary_source(self):
         self.h.p('/etc/apt/sources.list.d/debian.sources').unlink()
         self.h.put('/etc/apt/sources.list', 'deb-src http://deb.debian.org/debian trixie main\n')
-        with self.assertRaisesRegex(g.Refusal, '^PACKAGE_SOURCES_CONFIG$'):
-            self.observe()
-        self.no_apt()
+        self.assertEqual(self.observe()['missing'], SIX)
+        self.no_effects()  # The asserted binary rows in _apt come from the fixed repos, not this line.
 
     def test_trixie_solver_stock_libcharon_is_a_hard_dependency(self):
         self.h.stock_solver()
@@ -817,7 +1050,7 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian
             self.h.enter()
             mask.symlink_to('/opt/operator.service')
 
-        with self.assertRaises(g.Refusal):
+        with patch.dict(vars(g), package_ownership(self.h.root, self.h.archive_owners)), self.assertRaises(g.Refusal):
             g.prepare(self.h.root, self.h.run, proof, enter)
         self.assertEqual(str(mask.readlink()), '/opt/operator.service')
         self.assertFalse(self.h.p(POLICY).exists())
@@ -826,7 +1059,6 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian
 
 
     def test_bootstrap_apt_config_and_sealed_source_readable_by_exec_child(self):
-        rows, _, _ = g._sources(self.h.root)
         # Same credentials, separate exec, no inherited descriptors. This
         # verifies the proc carrier, not APT parsing or privilege dropping.
         reader = '''
@@ -844,13 +1076,12 @@ assert 'KeepCompressed "false";' in config and '#clear Acquire::IndexTargets;' i
 for key in ('sourcelist', 'preferences'):
     print(sealed(re.search(rf'Dir::Etc::{key} "([^"]+)";', config)[1]), end='')
 '''
-        with g._apt(rows, {'ppp': ('2.5.2-1+1', 'amd64')}, bootstrap=True) as apt:
+        with g._apt({'ppp': ('2.5.2-1+1', 'amd64')}, bootstrap=True) as apt:
             result = subprocess.run(apt + (sys.executable, '-I', '-B', '-c', reader),
                                     check=True, capture_output=True, close_fds=True, timeout=5)
-        self.assertTrue(result.stdout.startswith(b''.join(
-            f'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg inrelease-path=InRelease] '
-            f'{uri} {suite} main\n'.encode() for uri, suite in rows)))
-        self.assertIn(b'Package: ppp\nPin: version 2.5.2-1+1\n', result.stdout)
+        sources, _, prefs = result.stdout.partition(b'Package: ')
+        self.assertEqual(sources, sealed_sources().encode())
+        self.assertTrue(prefs.startswith(b'ppp\nPin: version 2.5.2-1+1\n'))
 
     def test_trixie_updates_solver_uses_signed_version_and_suite(self):
         row = b'tzdata (2026f-0+deb13u1 Debian:13-updates/stable-updates [all])\n'

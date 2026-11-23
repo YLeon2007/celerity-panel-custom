@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from test_rebuild_relay_packages import HERE, Host, LATE, POLICY, SYSTEM, g
+from test_rebuild_relay_packages import HERE, Host, KEYRING, LATE, POLICY, SYSTEM, THIRD_PARTY, g, package_ownership
 
 
 HOST = Path(__file__).resolve().parents[1] / 'rebuildRelayDirectHost.py'
@@ -226,6 +226,28 @@ class Adapter(unittest.TestCase):
         self.assertEqual(self.wire('install'), (75, '', ''))
         self.assertEqual(self.wire('prepare-packages', backupId='4' * 32, packagePreparation=proof), (75, '', ''))
         self.assertEqual(len(self.effects), 1)
+
+    def test_package_plan_lookalikes_and_details_are_redacted_at_both_guard_boundaries(self):
+        proof = self.offered()
+        guard = self.h['C3_PACKAGE_GUARD']
+        generic = (70, '', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n')
+        for index, args in enumerate((('PACKAGE_APT_PLAN_FIXTURE_PRIVATE',),
+                                      ('PACKAGE_APT_PLAN\n/fixture/private',),
+                                      ('PACKAGE_APT_PLAN', '/fixture/private'), ('PACKAGE_APT_PLAN',))):
+            with self.subTest(args=args):
+                def refuse(*_):
+                    error = GuardRefusal(*args)
+                    if args == ('PACKAGE_APT_PLAN',):
+                        error.add_note('/fixture/private cleanup status')
+                    raise error
+
+                with patch.dict(guard, observe=refuse):
+                    self.assertEqual(self.wire('preflight'), generic)
+                with patch.dict(guard, prepare=refuse):
+                    self.assertEqual(self.wire('prepare-packages', backupId=f'{index:032x}', packagePreparation=proof),
+                                     generic)
+        self.assertFalse(self.effects)
+        self.assertFalse((self.vault / self.h['PACKAGE_PENDING']).exists())
 
     def test_identity_drift_after_intent_blocks_enter(self):
         proof = self.offered()
@@ -472,20 +494,22 @@ class Adapter(unittest.TestCase):
 
         self.h.update(SYSTEM=str(self.system), bounded_status=child_status,
                       C3_PACKAGE_GUARD={'Refusal': g.Refusal, 'observe': g.observe, 'prepare': g.prepare})
-        ownership = patch.object(g, '_owner', side_effect=lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid()))
+        ownership = patch.dict(vars(g), package_ownership(host.root, host.archive_owners))
         ownership.start()
         self.addCleanup(ownership.stop)
         return host, receipt, pending
 
-    def test_bad_configured_source_and_busy_apt_lock_have_different_frames(self):
+    def test_live_source_ignored_but_busy_apt_lock_and_bad_keyring_refuse(self):
         host, _, _ = self.model_real_guard()
+        host.put('/etc/apt/sources.list.d/operator.list', THIRD_PARTY)
+        proof = self.offered()
         with host.p('/var/lib/apt/lists/lock').open('r+b') as lock:
             request = struct.pack('=hh4xqqi4x', fcntl.F_WRLCK, os.SEEK_SET, 0, 0, 0)
             fcntl.fcntl(lock.fileno(), fcntl.F_OFD_SETLK, request)
             self.assertEqual(self.wire('preflight'), (70, '', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n'))
-        proof = self.offered()
-        host.put('/etc/apt/sources.list.d/operator.list', 'deb https://private-fixture.invalid/vendor trixie main\n')
-        frame = (70, '', 'DIRECT_PACKAGE_SOURCES_UNSUPPORTED\n')
+        self.assertEqual(self.offered(), proof)
+        host.p(KEYRING).chmod(0o666)
+        frame = (70, '', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n')
         self.assertEqual(self.wire('preflight'), frame)
         self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=proof), frame)
         self.assertFalse(self.vault.exists())
@@ -514,9 +538,13 @@ class Adapter(unittest.TestCase):
             self.assertEqual(self.wire('preflight'), (70, '', 'DIRECT_RUNTIME_PACKAGE_AUTOSTART_UNSAFE\n'))
         self.assertFalse(self.vault.exists())
 
-    def test_scope_change_during_preflight_suppresses_source_diagnostic(self):
+    def test_scope_change_during_preflight_suppresses_index_diagnostic(self):
         host, _, _ = self.model_real_guard()
-        host.put('/etc/apt/sources.list.d/operator.list', 'deb https://private-fixture.invalid/vendor trixie main\n')
+        # Keep a real diagnostic producer, now the lists observer rather than
+        # the deleted live-source parser.
+        host.p('/var/lib/apt/lists/deb.debian.org_debian_dists_trixie_InRelease').rename(
+            host.p('/var/lib/apt/lists/foreign_InRelease'))
+        self.assertEqual(self.wire('preflight'), (70, '', 'DIRECT_PACKAGE_INDEXES_UNVERIFIED\n'))
         observe = g.observe
 
         def observe_then_drift(*args):
@@ -588,12 +616,8 @@ class Adapter(unittest.TestCase):
         self.assert_update_diagnostic('ok', 'DIRECT_UNCERTAIN_PACKAGE_SERVICES_UNSAFE\n',
                                       after_update=lambda host: setattr(host, 'active', True))
 
-    def test_observed_unsupported_source_after_update_keeps_pending_with_source_diagnostic(self):
-        def change_source(host):
-            host.put('/etc/apt/sources.list.d/operator.list', 'deb https://private-fixture.invalid/vendor trixie main\n')
-
-        self.assert_update_diagnostic('ok', 'DIRECT_UNCERTAIN_PACKAGE_SOURCES_UNSUPPORTED\n',
-                                      after_update=change_source)
+    def test_keyring_change_after_update_keeps_pending(self):
+        self.assert_update_diagnostic('ok', '', after_update=lambda host: host.put(KEYRING, 'different keyring bytes'))
 
     def test_update_timeout_does_not_carry_index_diagnostic(self):
         self.assert_update_diagnostic('timeout', '')
@@ -698,8 +722,8 @@ class Adapter(unittest.TestCase):
         self.h.update(SYSTEM=str(self.system), stock_runtime_root=lambda: self.root,
                       PackageRunner=new_runner, command=self.host_command, bounded_status=child_status,
                       C3_PACKAGE_GUARD={'Refusal': g.Refusal, 'observe': g.observe, 'prepare': g.prepare})
-        with patch.object(subprocess, 'run', side_effect=child_run), patch.object(
-                g, '_owner', side_effect=lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid())):
+        with patch.object(subprocess, 'run', side_effect=child_run), patch.dict(
+                vars(g), package_ownership(host.root, host.archive_owners)):
             proof = self.offered()
             self.assertEqual(len(runners), 1)
             self.assertEqual(configured_limit - runners[0].remaining, preflight_calls)

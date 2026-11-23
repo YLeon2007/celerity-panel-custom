@@ -180,7 +180,7 @@ class Settlement(unittest.TestCase):
 
         self.h.update(C3_PACKAGE_GUARD={'Refusal': g.Refusal, 'observe': g.observe, 'prepare': prepare},
                       bounded_status=status)
-        owner = patch.object(g, '_owner', side_effect=lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid()))
+        owner = patch.dict(vars(g), package.package_ownership(root, model.archive_owners))
         owner.start()
         self.addCleanup(owner.stop)
         return model
@@ -192,6 +192,8 @@ class Settlement(unittest.TestCase):
         model.containment()
         self.assertTrue((self.vault / self.h['PACKAGE_PENDING']).is_file())
         self.assertEqual(model.apt_count, 1)
+        assert model.archive_used is not None
+        self.assertTrue((model.archive_used / 'partial/incomplete.deb').is_file())
 
     def test_joined_guard_retires_only_attributed_sysv_and_native_links(self):
         model = self.joined_package()
@@ -204,6 +206,8 @@ class Settlement(unittest.TestCase):
         self.assertFalse(any(model.p(SYSTEM).glob('*.wants/*.service')))
         self.assertFalse(model.p(POLICY).exists())
         self.assertFalse((self.vault / self.h['PACKAGE_PENDING']).exists())
+        assert model.archive_used is not None
+        self.assertFalse(os.path.lexists(model.archive_used))
 
     def test_expiry_during_ready_write_retains_pending(self):
         self.stub_guard(0)

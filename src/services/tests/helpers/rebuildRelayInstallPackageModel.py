@@ -6,18 +6,20 @@ Install. Synthetic init/defaults/generator bytes have test-only stock pins;
 manager properties, file generations, manifests and frame checks are not
 bypassed. The checked-in generated wrapper is used byte-for-byte.
 """
-import fcntl
+
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import sys
 import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from test_rebuild_relay_packages import Host, SIX, POLICY, SYSTEM  # noqa: E402
+from test_rebuild_relay_packages import (  # noqa: E402
+    Host, SIX, POLICY, SYSTEM, INDEXES, LISTS, REPOSITORIES, THIRD_PARTY,
+    apt_option, package_ownership, read_apt_config, sealed_sources, sealed_text,
+)
 sys.path.pop(0)
 
 DEFAULTS = '# synthetic xl2tpd defaults\n'
@@ -25,43 +27,18 @@ INIT = '#!/bin/sh\nexit 0\n'
 GENERATOR = 'synthetic generator identity; never executed\n'
 GENERATOR_PATH = '/usr/lib/systemd/system-generators/systemd-sysv-generator'
 LNS = '; synthetic package conffile\n[global]\n'
-LISTS = '/var/lib/apt/lists'
-KEYRING = '/usr/share/keyrings/debian-archive-keyring.gpg'
 APT_UPDATE = ('/usr/bin/apt-get', '--error-on=any', 'update')
-REPOSITORIES = (('deb.debian.org/debian', 'trixie'), ('deb.debian.org/debian', 'trixie-updates'),
-                ('deb.debian.org/debian-security', 'trixie-security'))
-INDEXES = [f'{uri.replace("/", "_")}_dists_{suite}_{target}' for uri, suite in REPOSITORIES
-           for target in ('InRelease', 'main_binary-amd64_Packages')]
 
 
 def isolated_apt_config(argv, *, update):
-    # Read only this process's live memfds, never the host's APT files.
-    def sealed_text(path):
-        assert re.fullmatch(rf'/proc/{os.getpid()}/fd/[0-9]+', path), path
-        with Path(path).open() as stream:
-            seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
-            assert fcntl.fcntl(stream, fcntl.F_GET_SEALS) & seals == seals
-            return stream.read()
-
-    assert argv[:6] == ('/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL=C',
-                         'DEBIAN_FRONTEND=noninteractive', 'UCF_FORCE_CONFFOLD=1')
-    assert argv[6].startswith('APT_CONFIG=')
-    config = sealed_text(argv[6].split('=', 1)[1])
+    config = read_apt_config(argv)
     expected = {
-        **dict.fromkeys(('Dir::Etc::Parts', 'Dir::Etc::Main', 'Dir::Etc::sourceparts', 'Dir::Etc::preferencesparts',
-                         'Dir::Etc::netrc', 'Dir::Etc::netrcparts', 'Dir::Etc::trustedparts'), '/dev/null'),
-        'Dir::Etc::trusted': KEYRING, 'Dir::State::lists': LISTS + '/',
-        'Dir::Cache::pkgcache': '', 'Dir::Cache::srcpkgcache': '', 'APT::Architecture': 'amd64',
-        'APT::Get::AllowUnauthenticated': 'false', 'Acquire::AllowInsecureRepositories': 'false',
-        'Acquire::AllowWeakRepositories': 'false', 'Acquire::AllowDowngradeToInsecureRepositories': 'false',
-        'Acquire::Check-Valid-Until': 'true', 'Acquire::Languages': 'none', 'KeepCompressed': 'false',
+        'Acquire::Languages': 'none', 'KeepCompressed': 'false',
         'Acquire::http::AllowRedirect': 'false', 'Acquire::https::AllowRedirect': 'false',
     }
 
     def option(key):
-        values = re.findall(rf'^\s*{re.escape(key)} "([^"\n]*)";$', config, re.M)
-        assert len(values) == 1, key
-        return values[0]
+        return apt_option(config, key)
 
     assert {key: option(key) for key in expected} == expected
     assert '#clear APT::Update;\n' in config
@@ -69,14 +46,15 @@ def isolated_apt_config(argv, *, update):
     sources = sealed_text(source_path)
     if prefs != '/dev/null':
         sealed_text(prefs)  # The stock plan model below may read only this validated carrier.
-    assert sources == ''.join(f'deb [signed-by={KEYRING} inrelease-path=InRelease] http://{uri} {suite} main\n'
-                              for uri, suite in REPOSITORIES)
+    assert sources == sealed_sources()
     no_dpkg = 'Dir::Bin::dpkg "/dev/null";\n'
     assert config.count(no_dpkg) == int(update)
-    # Ignore only the live descriptor names, version pins and update's dpkg
-    # prohibition. All other settings plus the complete sources must match.
+    archives = option('Dir::Cache::archives')
+    # Descriptor names, the pin carrier, the reservation-only archive path
+    # and update's dpkg prohibition are checked separately from this digest.
     normalized = config.replace(no_dpkg, '').replace(source_path, '<sources>').replace(
-        f'Dir::Etc::preferences "{prefs}";', 'Dir::Etc::preferences "<pins>";')
+        f'Dir::Etc::preferences "{prefs}";', 'Dir::Etc::preferences "<pins>";').replace(
+        f'Dir::Cache::archives "{archives}";', 'Dir::Cache::archives "<archives>";')
     return hashlib.sha256((normalized + sources).encode()).hexdigest(), prefs
 
 
@@ -105,7 +83,8 @@ class JoinedPackages(Host):
                      f'Codename: {suite}\nArchitectures: amd64\nSHA256:\n'
                      f' {checksum} {len(payload)} main/binary-amd64/Packages\n'
                      '-----BEGIN PGP SIGNATURE-----\nmocked APT authentication\n-----END PGP SIGNATURE-----\n')
-            if suite != 'trixie-security' or scenario in ('package-stock-empty-ok', 'package-stock-empty-tampered'):
+            if suite != 'trixie-security' or scenario in ('package-stock-empty-ok', 'package-stock-empty-foreign-source',
+                                                         'package-stock-empty-tampered', 'package-stock-empty-plan'):
                 # KeepCompressed=false: unlike stock .lz4 lists, this is the
                 # exact uncompressed target named in the signed checksum.
                 if suite == 'trixie-security' and scenario == 'package-stock-empty-tampered':
@@ -113,7 +92,8 @@ class JoinedPackages(Host):
                 self.put(f'{LISTS}/{packages}', payload)
         if scenario == 'package-stock-empty-acquisition':
             return 100, b'', b'E: Failed to fetch trixie-security Packages\n'
-        assert scenario in ('package-stock-empty-ok', 'package-stock-empty-incomplete', 'package-stock-empty-tampered')
+        assert scenario in ('package-stock-empty-ok', 'package-stock-empty-foreign-source',
+                            'package-stock-empty-incomplete', 'package-stock-empty-tampered', 'package-stock-empty-plan')
         return 0, b'Reading package lists...\n', b''
 
     def native_exec(self, package):
@@ -144,7 +124,7 @@ def attach(root, state, scenario, h, request, assert_host_lock):
     model.active = scenario == 'package-stock-active'
     guard = h['C3_PACKAGE_GUARD']
     assert guard['observe'].__globals__ is guard is guard['prepare'].__globals__
-    guard['_owner'] = lambda st: (st.st_uid, st.st_gid) == (os.getuid(), os.getgid())
+    guard.update(package_ownership(root, model.archive_owners))
     stock = h['C3_STOCK_RUNTIME']
     def trace_need(scope):
         original = scope['need']
@@ -212,6 +192,13 @@ def attach(root, state, scenario, h, request, assert_host_lock):
             response = model.run(argv, round(end - time.monotonic()))
             ledger['aptWrites'] = model.apt_count
             ledger['installed'] = model.installed
+            if suffix[:2] == ('/usr/bin/apt-get', '-s') and suffix[2:] != ('check',):
+                invalid_plan = (scenario == 'package-stock-plan-preflight' or scenario == 'package-stock-empty-plan'
+                                or (scenario == 'package-stock-plan-prepare' and any('=' in arg for arg in suffix[2:])))
+                if invalid_plan:
+                    # Keep the real guard parser and runner. Only change the modeled APT result.
+                    assert response[0] == 0 and not response[2]
+                    return 0, response[1].rstrip(b'\n') + b'\nRemv fixture-private-apt-package [1]\n', b''
             return response
         except Exception as error:
             state.setdefault('faults', []).append([type(error).__name__, list(argv), str(error)])
@@ -224,6 +211,7 @@ def attach(root, state, scenario, h, request, assert_host_lock):
 def readback(model, state):
     """Independently project idle/disabled state at the real package ACK."""
     assert all(n in model.installed for n in SIX)
+    assert model.archive_used is not None and not os.path.lexists(model.archive_used)
     assert not model.p(POLICY).exists()
     assert not any(p.is_symlink() for p in model.p(SYSTEM).glob('*.service'))
     assert not any(model.p('/etc').glob('rc?.d/S??xl2tpd'))
@@ -271,6 +259,6 @@ if __name__ == '__main__':
         model.put('/etc/apt/apt.conf.d/99-operator', 'APT::Get::AllowUnauthenticated "true";\n')
         model.put('/etc/apt/sources.list', '# operator comment, not an active source\n')
         suffix = '.list' if scenario == 'package-stock-empty-foreign-source' else '.list.disabled'
-        model.put('/etc/apt/sources.list.d/operator' + suffix, 'deb https://fixture.invalid/vendor trixie main\n')
+        model.put('/etc/apt/sources.list.d/operator' + suffix, THIRD_PARTY)
         ledger.update(updates=[], afterUpdate=[])
     print(json.dumps(ledger))

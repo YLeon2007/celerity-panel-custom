@@ -255,7 +255,7 @@ test('closed diagnostics reach the authenticated API and the localized install c
     const hostChecks = ['XRAY_DROPIN_UNSUPPORTED', 'PPP_MODULES_REQUIRED', 'PPP_MODULES_PERSISTENCE_CONFLICT',
         'PPP_MODULES_LOAD_FAILED', 'NETWORK_OBSERVATION_REQUIRED', 'IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED',
         'XL2TPD_CONFIG_MISSING', 'XRAY_CONFIG_WRITABLE', 'XL2TPD_NATIVE_UNIT_REQUIRED', 'XL2TPD_NATIVE_UNIT_CONFLICT'];
-    const freshChecks = ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_NATIVE_UNIT_REQUIRED'];
+    const freshChecks = ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_NATIVE_UNIT_REQUIRED', 'PACKAGE_APT_PLAN'];
     const matrix = [
         ...freshChecks.map(check => [check, 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', check, 'installRefused', ['preflight']]),
         ['host-preflight', 'REBUILD_L2TP_DIRECT_PREREQUISITE', 'refused', 'HOST_PREFLIGHT', 'installRefused', ['preflight']],
@@ -319,7 +319,7 @@ test('closed diagnostics reach the authenticated API and the localized install c
     }
 });
 
-const packageChecks = ['PACKAGE_SOURCES_UNSUPPORTED', 'PACKAGE_INDEXES_UNVERIFIED', 'PACKAGE_SERVICES_UNSAFE'];
+const packageChecks = ['PACKAGE_SOURCES_UNSUPPORTED', 'PACKAGE_INDEXES_UNVERIFIED', 'PACKAGE_SERVICES_UNSAFE', 'PACKAGE_APT_PLAN'];
 const packageLanguages = ['ru', 'en'];
 
 test('package diagnostics have explicit Russian and English operator copy', () => {
@@ -338,6 +338,9 @@ test('package diagnostics have explicit Russian and English operator copy', () =
     assert.match(en.PACKAGE_INDEXES_UNVERIFIED, /signed.*indexes.*reach.*time/i);
     assert.match(ru.PACKAGE_SERVICES_UNSAFE, /IKE.*xl2tpd.*неактивн.*автозапуск/i);
     assert.match(en.PACKAGE_SERVICES_UNSAFE, /IKE.*xl2tpd.*inactive.*autostart/i);
+    assert.match(ru.PACKAGE_APT_PLAN, /APT.*план/i);
+    assert.match(en.PACKAGE_APT_PLAN, /APT.*plan/i);
+    assert.match(require('../../locales/zh-CN.json').rebuildL2tp.installChecks.PACKAGE_APT_PLAN, /APT.*计划/);
 });
 
 test('package diagnostics reach the authenticated route and localized Install control only in scope', { timeout: 15000 }, async t => {
@@ -351,8 +354,8 @@ test('package diagnostics reach the authenticated route and localized Install co
     const candidate = [...baseline, 'check'];
     const installing = [...candidate, 'reserve', 'install', 'retain'];
     const wireFrame = (code, check, prefix = '') => ({ code, stdout: '', stderr: `DIRECT_${prefix}${check}\n` });
-    const source = packageChecks[0];
-    const source70 = wireFrame(70, source), source75 = wireFrame(75, source, 'UNCERTAIN_');
+    const plan = 'PACKAGE_APT_PLAN';
+    const plan70 = wireFrame(70, plan), plan75 = wireFrame(75, plan, 'UNCERTAIN_');
     const noHint = undefined;
     // SSH, host replies, grant and persistence are modeled. We exercise the
     // real DIRECT parser, installer, authenticated route/SSR and browser script
@@ -363,22 +366,24 @@ test('package diagnostics reach the authenticated route and localized Install co
             [`reserved rc70: ${check}`, packageWrite, wireFrame(70, check), check, reserved],
             [`reserved rc75: ${check}`, packageWrite, wireFrame(75, check, 'UNCERTAIN_'), check, reserved],
         ]),
+        ['unknown plan lookalike at preflight', 'preflight', wireFrame(70, `PACKAGE_APT_PLAN_${marker}`), noHint, preflight],
+        ['unknown plan lookalike after reservation', packageWrite, wireFrame(70, `PACKAGE_APT_PLAN_${marker}`), noHint, reserved],
         ['future check', packageWrite, wireFrame(75, `PACKAGE_${marker}`, 'UNCERTAIN_'), noHint, reserved],
         ['naked rc75', packageWrite, { code: 75, stdout: '', stderr: '' }, noHint, reserved],
         ['lost SSH ACK', packageWrite, null, noHint, reserved],
-        ['private stdout', packageWrite, { ...source70, stdout: marker }, noHint, reserved],
-        ['private stderr after valid line', packageWrite, { ...source75, stderr: source75.stderr + `/fixture/${marker}\n` }, noHint, reserved],
-        ['missing LF', packageWrite, { ...source75, stderr: source75.stderr.trimEnd() }, noHint, reserved],
-        ['extra LF', packageWrite, { ...source70, stderr: `${source70.stderr}\n` }, noHint, reserved],
-        ['CRLF', 'preflight', { ...source70, stderr: source70.stderr.replace('\n', '\r\n') }, noHint, preflight],
-        ['private stdout at preflight', 'preflight', { ...source70, stdout: marker }, noHint, preflight],
-        ['preflight rc75 is not package entry', 'preflight', source75, noHint, preflight],
-        ['rc75 needs uncertainty prefix', packageWrite, { ...source70, code: 75 }, noHint, reserved],
-        ['rc70 cannot carry uncertainty prefix', packageWrite, { ...source75, code: 70 }, noHint, reserved],
+        ['private stdout', packageWrite, { ...plan70, stdout: marker }, noHint, reserved],
+        ['private stderr after valid line', packageWrite, { ...plan75, stderr: plan75.stderr + `/fixture/${marker}\n` }, noHint, reserved],
+        ['missing LF', packageWrite, { ...plan75, stderr: plan75.stderr.trimEnd() }, noHint, reserved],
+        ['extra LF', packageWrite, { ...plan70, stderr: `${plan70.stderr}\n` }, noHint, reserved],
+        ['CRLF', 'preflight', { ...plan70, stderr: plan70.stderr.replace('\n', '\r\n') }, noHint, preflight],
+        ['private stdout at preflight', 'preflight', { ...plan70, stdout: marker }, noHint, preflight],
+        ['preflight rc75 is not package entry', 'preflight', plan75, noHint, preflight],
+        ['rc75 needs uncertainty prefix', packageWrite, { ...plan70, code: 75 }, noHint, reserved],
+        ['rc70 cannot carry uncertainty prefix', packageWrite, { ...plan75, code: 70 }, noHint, reserved],
         ...packageChecks.map(check => [`wrong action prepare: ${check}`, 'prepare', wireFrame(70, check), noHint, baseline]),
-        ['wrong action check', 'check', source70, noHint, candidate],
-        ['wrong action install', 'install', source70, noHint, installing],
-        ['wrong action install no-write alias', 'install', wireFrame(70, source, 'NO_WRITE_'), noHint, installing],
+        ['wrong action check', 'check', plan70, noHint, candidate],
+        ['wrong action install', 'install', plan70, noHint, installing],
+        ['wrong action install no-write alias', 'install', wireFrame(70, plan, 'NO_WRITE_'), noHint, installing],
     ];
     const snapshot = { ...ready, main, mainSha256: createHash('sha256').update(main).digest('hex'),
         bridge: null, bridgeSha256: null, baseline: 'd'.repeat(64) };
@@ -447,7 +452,7 @@ test('package diagnostics reach the authenticated route and localized Install co
                 const [text, disabled, refreshHidden] = await localizedFrontend(page.body, expected, headers, app);
                 assert.equal(text, (refused ? messages.installRefused : messages.uncertain)
                     + (check ? ` ${installChecks[check]}` : ''));
-                assert.doesNotMatch(text, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|PACKAGE_(SOURCES|INDEXES|SERVICES)|REBUILD_L2TP_/);
+                assert.doesNotMatch(text, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|PACKAGE_(SOURCES|INDEXES|SERVICES|APT_PLAN)|REBUILD_L2TP_/);
                 assert.deepEqual(log, actions);
                 assert.equal(disabled, !refused);
                 assert.equal(refreshHidden, refused);

@@ -707,8 +707,15 @@ function accountIntentFixture(t, f) {
 
 joined({ fixture, sessionFixture, accountIntentFixture, id, oid, machineId, decrypt });
 
-// Reuse the joined wire, Python host and Debian model. This adapter only seeds
-// the companion Xray/manager state needed for an ordinary Install readback.
+// Reuse the joined wire, Python host and Debian model. This adapter seeds
+// the companion Xray/manager state and disposable host-side test inputs.
+const debianArchiveKeyring = '/usr/share/keyrings/debian-archive-keyring.gpg';
+const fixedDebianIndexes = [
+    'deb.debian.org_debian_dists_trixie',
+    'deb.debian.org_debian_dists_trixie-updates',
+    'security.debian.org_debian-security_dists_trixie-security',
+].flatMap(stem => [`${stem}_InRelease`, `${stem}_main_binary-amd64_Packages`]).sort();
+
 function emptyIndexHost(t, f, scenario) {
     const fs = require('node:fs');
     const { join, dirname } = require('node:path');
@@ -735,6 +742,17 @@ function emptyIndexHost(t, f, scenario) {
     const initialized = python('rebuildRelayInstallPackageModel.py');
     assert.equal(initialized.status, 0, initialized.stderr);
     const packageModel = JSON.parse(initialized.stdout);
+    if (scenario === 'package-stock-empty-foreign-source') {
+        // Deliberately unrelated to the fixed source config consumed by APT.
+        put('/etc/apt/sources.list.d/fixture-backports.sources', 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie-backports\nComponents: main\n');
+        put('/var/cache/apt/archives/fixture-cached.deb', 'shared archive sentinel; never use\n');
+        put('/var/cache/apt/archives/partial/fixture-partial.deb', 'shared partial sentinel; never use\n');
+    }
+    if (scenario === 'package-stock-empty-bad-keyring') {
+        const keyring = fs.realpathSync(path(debianArchiveKeyring));
+        assert.equal(dirname(keyring), path('/usr/share/keyrings'));
+        fs.chmodSync(keyring, 0o666);
+    }
     const relay = f.nodes[0];
     Object.assign(relay, { port: 21443, xray: { apiPort: 61001, security: 'none' },
         aclRules: ['reject(denied.invalid)'], ssh: { ...relay.ssh, password: 'local-fixture-only' } });
@@ -755,7 +773,7 @@ function emptyIndexHost(t, f, scenario) {
     put('/etc/ppp/options', '# stock options\n', 0o600);
     fs.mkdirSync(path('/etc/ipsec.d'));
     fs.mkdirSync(path('/etc/systemd/system/multi-user.target.wants'));
-    require('./helpers/rebuildRelayStockSwan').seed(root);
+    if (scenario !== 'package-stock-empty-plan') require('./helpers/rebuildRelayStockSwan').seed(root);
 
     const absent = { LoadState: 'not-found', UnitFileState: '', ActiveState: 'inactive', SubState: 'dead', FragmentPath: '',
         MainPID: '0', InvocationID: '', DropInPaths: '', NeedDaemonReload: 'no', PrivateNetwork: 'no', KillMode: 'control-group', User: '' };
@@ -781,27 +799,37 @@ function emptyIndexHost(t, f, scenario) {
     const sha256 = data => createHash('sha256').update(data).digest('hex');
     const capture = name => {
         const st = fs.lstatSync(path(name), { bigint: true });
-        return [name, st.ino, st.mode, st.ctimeNs, st.mtimeNs, st.isFile() ? sha256(fs.readFileSync(path(name))) : null];
+        const contents = st.isSymbolicLink() ? fs.readlinkSync(path(name)) : st.isFile() ? sha256(fs.readFileSync(path(name))) : null;
+        return [name, st.ino, st.mode, st.ctimeNs, st.mtimeNs, contents];
     };
-    const aptConfig = () => ['/etc/apt', ...fs.readdirSync(path('/etc/apt'), { recursive: true }).sort().map(name => join('/etc/apt', name)),
-        '/usr/share/keyrings/debian-archive-keyring.gpg'].map(capture);
+    const tree = base => fs.existsSync(path(base)) ? [base, ...fs.readdirSync(path(base), { recursive: true })
+        .sort().map(name => join(base, name))].map(capture) : [];
+    const aptConfig = () => [...tree('/etc/apt'), ...tree('/usr/share/keyrings')];
+    const sharedArchives = () => tree('/var/cache/apt/archives');
     const indexes = () => fs.readdirSync(path('/var/lib/apt/lists')).filter(name => !['lock', 'partial', 'auxfiles'].includes(name)).sort();
-    return { id, relay, key, pin: sha256(key), machineId, applyHandlers: new Map(), read, packages, aptConfig, indexes, capture,
+    return { id, relay, key, pin: sha256(key), machineId, applyHandlers: new Map(), read, packages, aptConfig, indexes, capture, sharedArchives,
         exists: name => fs.existsSync(path(name)), execute: (command, stdin) => python('rebuildRelayInstallHost.py', `${JSON.stringify(command)}\n${stdin}`) };
 }
 
-for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered', 'foreign-source']) {
+for (const outcome of ['ok', 'foreign-source', 'bad-keyring', 'untrusted', 'acquisition', 'incomplete', 'tampered', 'plan']) {
     test(`joined empty-index Install with packed guard: ${outcome}`, async t => {
+        const installs = outcome === 'ok' || outcome === 'foreign-source';
         const f = fixture(t);
         const { events } = sessionFixture(t, f);
         const host = emptyIndexHost(t, f, `package-stock-empty-${outcome}`);
-        const config = host.aptConfig(), statusBefore = host.capture('/var/lib/dpkg/status');
+        const config = host.aptConfig(), archives = host.sharedArchives(), statusBefore = host.capture('/var/lib/dpkg/status');
         const listsBefore = host.capture('/var/lib/apt/lists');
         const initialPackages = host.read('manager.json').packageModel.installed;
         const vault = '/var/lib/celerity-rebuild-l2tp-direct', pending = `${vault}/package-preparation.pending`;
         const execute = host.execute, replies = [];
         let reserved, proof;
         assert.deepEqual(host.indexes(), []);
+        if (outcome === 'foreign-source') {
+            assert.ok(host.exists('/etc/apt/sources.list.d/operator.list'));
+            assert.ok(host.exists('/etc/apt/sources.list.d/fixture-backports.sources'));
+            assert.ok(host.exists('/var/cache/apt/archives/fixture-cached.deb'));
+            assert.ok(host.exists('/var/cache/apt/archives/partial/fixture-partial.deb'));
+        }
         host.execute = (command, stdin) => {
             assert.ok(f.lockHeld);
             const request = JSON.parse(stdin);
@@ -824,6 +852,7 @@ for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered
             const model = host.read('manager.json');
             assert.deepEqual(model.faults ?? [], [], 'closed DIRECT command model');
             assert.deepEqual(host.aptConfig(), config, 'APT source/config generations must not change');
+            assert.deepEqual(host.sharedArchives(), archives, 'shared archives and partial downloads must not change');
             if (!replies.length) {
                 assert.deepEqual(host.indexes(), []);
                 assert.deepEqual(host.capture('/var/lib/apt/lists'), listsBefore);
@@ -831,7 +860,7 @@ for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered
                 assert.deepEqual([model.effects, model.packageModel.effects, model.packageModel.updates], [[], [], []]);
                 assert.deepEqual(model.packageModel.aptReads, {}, 'empty-cache preflight does not consult APT');
                 assert.equal(host.exists(vault), false);
-                if (outcome !== 'foreign-source') {
+                if (outcome !== 'bad-keyring') {
                     assert.equal(result.status, 0, JSON.stringify(model.lastRefusal));
                     const frame = JSON.parse(result.stdout);
                     assert.match(frame.packagePreparation, /^[a-f0-9]{64}$/);
@@ -839,7 +868,7 @@ for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered
                     assert.deepEqual(frame, { machineId, packagePreparation: proof });
                 }
             }
-            if (request.action === 'prepare-packages' && outcome === 'ok') {
+            if (request.action === 'prepare-packages' && installs) {
                 assert.equal(result.status, 0, JSON.stringify(model.lastRefusal));
                 assert.deepEqual(JSON.parse(result.stdout), { ok: true, backupId: reserved, packagesReady: true });
             }
@@ -871,30 +900,41 @@ for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered
         const model = manager.packageModel;
         assert.deepEqual(manager.faults ?? [], []);
         assert.deepEqual(host.aptConfig(), config);
-        if (outcome === 'foreign-source') {
+        if (outcome === 'bad-keyring') {
             assert.equal(status, 409);
-            assert.equal(result.error.check, 'PACKAGE_SOURCES_UNSUPPORTED');
+            assert.deepEqual(result.error, { code: 'REBUILD_L2TP_DIRECT_PREREQUISITE',
+                outcome: 'refused', check: 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE' });
+            assert.deepEqual(manager.lastRefusal?.slice(0, 2), ['PACKAGE_FILE', '_regular']);
             assert.deepEqual(frames, [[id, 'preflight']]);
+            assert.deepEqual(replies, [{ status: 70, hasOutput: false }]);
             assert.deepEqual([events, f.states, f.users, model.updates], [[], [], [], []]);
+            assert.deepEqual([model.afterUpdate, model.aptWrites, model.installed], [[], 0, initialPackages]);
             assert.equal(host.exists(vault), false);
             return;
         }
         const [update] = model.updates;
-        assert.equal(model.updates.length, 1);
+        assert.equal(model.updates.length, 1, JSON.stringify({ error: result.error, refusal: manager.lastRefusal, frames }));
         assert.deepEqual([update.action, update.backupId, update.argv], ['prepare-packages', reserved, ['/usr/bin/apt-get', '--error-on=any', 'update']]);
         assert.match(update.configDigest, /^[a-f0-9]{64}$/);
         assert.deepEqual(host.indexes(), update.indexes);
         const receipt = `${vault}/packages-${reserved}.json`;
-        if (outcome !== 'ok') {
+        if (!installs) {
+            const invalidPlan = outcome === 'plan';
             assert.equal(status, 409);
             assert.equal(result.error.outcome, 'unknown');
             assert.equal(result.error.retryAllowed, false);
             assert.deepEqual(frames, [[id, 'preflight'], [id, 'prepare-packages']]);
             assert.deepEqual(replies[1], { status: 75, hasOutput: false });
-            assert.equal(result.error.check, 'PACKAGE_INDEXES_UNVERIFIED');
-            assert.equal(update.status, ['incomplete', 'tampered'].includes(outcome) ? 0 : 100);
-            assert.equal(update.indexes.length, ({ untrusted: 0, tampered: 6 })[outcome] ?? 5);
-            assert.deepEqual([model.afterUpdate, model.quiet, model.aptWrites, model.installed], [[], {}, 0, initialPackages]);
+            assert.equal(result.error.check, invalidPlan ? 'PACKAGE_APT_PLAN' : 'PACKAGE_INDEXES_UNVERIFIED');
+            if (invalidPlan) {
+                assert.deepEqual(manager.lastRefusal?.slice(0, 2), ['PACKAGE_APT_PLAN', '_simulation']);
+                assert.deepEqual(result.error, { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', outcome: 'unknown',
+                    check: 'PACKAGE_APT_PLAN', retryAllowed: false });
+            }
+            assert.equal(update.status, ['incomplete', 'tampered', 'plan'].includes(outcome) ? 0 : 100);
+            assert.equal(update.indexes.length, ({ untrusted: 0, tampered: 6, plan: 6 })[outcome] ?? 5);
+            assert.deepEqual([model.afterUpdate, model.quiet, model.aptWrites, model.installed],
+                [invalidPlan ? ['check', 'simulate'] : [], {}, 0, initialPackages]);
             assert.deepEqual(model.effects, ['enter', 'update']);
             assert.deepEqual(host.capture('/var/lib/dpkg/status'), statusBefore);
             assert.deepEqual([events, f.states.map(row => row.status), f.users.map(row => row.syncStatus)], [['commit'], ['installing'], ['pending']]);
@@ -908,7 +948,7 @@ for (const outcome of ['ok', 'untrusted', 'acquisition', 'incomplete', 'tampered
         assert.equal(status, 200, JSON.stringify({ error: result.error, refusal: manager.lastRefusal, frames }));
         assert.deepEqual(result, { executionMode: 'rebuild', status: 'installed', nodeId: id });
         assert.deepEqual(frames.map(([, action]) => action), ['preflight', 'prepare-packages', 'preflight', 'prepare', 'check', 'install', 'verify']);
-        assert.deepEqual([update.status, update.indexes.length, model.aptWrites], [0, 6, 1]);
+        assert.deepEqual([update.status, update.indexes, model.aptWrites], [0, fixedDebianIndexes, 1]);
         assert.deepEqual(model.effects, ['enter', 'update', 'reload', 'apt', 'reload', 'reload']);
         assert.deepEqual(model.afterUpdate.filter(step => step === 'install'), ['install']);
         assert.ok(host.packages.every(name => Object.hasOwn(model.installed, name)));
