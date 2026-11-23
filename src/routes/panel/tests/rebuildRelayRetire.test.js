@@ -62,7 +62,8 @@ function mount(t, enabled = true) {
                     mode: state.mode, allowed: state.allowed, unavailableSince: state.unavailableSince,
                     ...state.extra, unprojected: privateValue });
                 calls.push({ action: 'preview', nodeId, estimate, generation });
-                if (state.previewError) throw state.previewError;
+                const error = state.previewErrors?.shift() ?? state.previewError;
+                if (error) throw error;
                 return estimate;
             },
             async confirmRetireRelay(nodeId, estimate, decision) {
@@ -180,7 +181,7 @@ test('wrong node or session never consumes a matching ticket; wrong or missing f
     assert.deepEqual(f.calls.map(call => call.action), ['preview', 'preview', 'preview']);
 });
 
-test('neighbor refusal is a sanitized 409 with no ticket, including an online replacement preview', async t => {
+test('neighbor refusal is a sanitized 409 with no ticket, including on replacement previews', async t => {
     const f = mount(t);
     const { checkNeighborRefusal } = require('../../../services/rebuildNeighborRefusal');
     const code = 'REBUILD_RETIRE_NEIGHBOR_REFUSED';
@@ -192,12 +193,91 @@ test('neighbor refusal is a sanitized 409 with no ticket, including an online re
     f.state.previewError = refusal;
     const expected = { error: { code, neighborName: '212 East', reason: 'RUNTIME_FOREIGN_CHANGE' } };
     assert.deepEqual(checked(await f.send(url('preview')), 409), expected);
+    f.state.previewErrors = [{ code: 'PREVIEW_CHANGED' }];
+    assert.deepEqual(checked(await f.send(url('preview')), 409), expected);
     f.state.previewError = undefined;
     const preview = await getPreview(f);
     f.state.confirmError = Object.assign(new Error(privateValue), { code: 'PREVIEW_CHANGED' });
     f.state.previewError = refusal;
     assert.deepEqual(checked(await submit(f, preview.ticket, 'delete'), 409), expected);
-    assert.deepEqual(f.calls.map(c => c.action), ['preview', 'preview', 'preview', 'confirm', 'preview']);
+    assert.deepEqual(f.calls.map(c => c.action), ['preview', 'preview', 'preview', 'preview', 'preview', 'confirm', 'preview']);
+});
+
+test('initial preview drift returns 409 with a ticket for the fresh same-node estimate only', async t => {
+    const f = mount(t);
+    const errorTicket = '5'.repeat(64);
+    f.state.previewErrors = [{ code: 'PREVIEW_CHANGED', message: privateValue, preview: { ticket: errorTicket } }];
+    f.state.activeClients = 9;
+    const { error, preview } = checked(await f.send(url('preview')), 409);
+    assert.deepEqual(error, { code: 'PREVIEW_CHANGED' });
+    assert.match(preview.ticket, /^[a-f0-9]{64}$/);
+    assert.notEqual(preview.ticket, errorTicket);
+    assert.deepEqual(preview, { nodeId: id, mode: 'online', activeClients: 9, accountCount: 2,
+        unavailableSince: null, allowed: true, ticket: preview.ticket });
+    assert.deepEqual(f.calls.map(({ action, nodeId }) => [action, nodeId]), [['preview', id], ['preview', id]]);
+    assert.deepEqual(checked(await submit(f, preview.ticket, 'force'), 200), { nodeId: id, status: 'deleted' });
+    assert.equal(f.calls[2].estimate, f.calls[1].estimate);
+    assert.notEqual(f.calls[2].estimate, f.calls[0].estimate);
+    checked(await submit(f, preview.ticket, 'force'), 409);
+    assert.deepEqual(f.calls.map(c => c.action), ['preview', 'preview', 'confirm']);
+});
+
+test('a fresh but disallowed replacement preview carries no ticket', async t => {
+    const f = mount(t);
+    f.state.previewErrors = [{ code: 'PREVIEW_CHANGED' }];
+    f.state.allowed = false;
+    f.state.extra = { code: 'REBUILD_CLIENT_CHANGE' };
+    assert.deepEqual(checked(await f.send(url('preview')), 409), {
+        error: { code: 'PREVIEW_CHANGED' },
+        preview: { nodeId: id, mode: 'online', activeClients: 0, accountCount: 2, unavailableSince: null,
+            allowed: false, code: 'REBUILD_RETIRE_PROTECTED_CHANGE' },
+    });
+    assert.deepEqual(f.calls.map(c => c.action), ['preview', 'preview']);
+});
+
+test('renewed drift stops at one read-only replacement for preview and confirm; abandon confirm does not probe', async t => {
+    const f = mount(t);
+    const drift = { code: 'PREVIEW_CHANGED', message: privateValue };
+    const expected = { error: { code: 'PREVIEW_CHANGED' } };
+    f.state.previewErrors = [drift, drift];
+    assert.deepEqual(checked(await f.send(url('preview')), 409), expected);
+    assert.deepEqual(f.calls.map(c => c.action), ['preview', 'preview']);
+
+    const online = await getPreview(f);
+    f.state.confirmError = drift;
+    f.state.previewErrors = [drift];
+    assert.deepEqual(checked(await submit(f, online.ticket, 'delete'), 409), expected);
+    assert.deepEqual(checked(await submit(f, online.ticket, 'delete'), 409), { error: { code: 'REBUILD_RETIRE_CONFIRMATION_REQUIRED' } });
+    assert.deepEqual(f.calls.slice(2).map(c => c.action), ['preview', 'confirm', 'preview']);
+
+    Object.assign(f.state, { mode: 'abandon', activeClients: null });
+    const abandon = await getPreview(f);
+    assert.deepEqual(checked(await submit(f, abandon.ticket, 'abandon'), 409), expected);
+    assert.deepEqual(f.calls.slice(5).map(c => c.action), ['preview', 'confirm']);
+});
+
+test('after definite drift a now-ineligible card has no replacement ticket', async t => {
+    const f = mount(t);
+    const drift = { code: 'PREVIEW_CHANGED' };
+    for (const code of ['REBUILD_NODE_RETIRE_STATE_CONFLICT', 'REBUILD_L2TP_IDENTITY_CHANGED', 'REBUILD_RETIRE_PREVIEW_UNAVAILABLE']) {
+        f.state.previewErrors = [drift, { code }];
+        assert.deepEqual(checked(await f.send(url('preview')), 409), { error: drift });
+    }
+});
+
+test('unknown or non-retryable preview failures do not qualify as drift, even during replacement', async t => {
+    const f = mount(t);
+    const drift = { code: 'PREVIEW_CHANGED', message: privateValue };
+    const expected = { error: { code: 'REBUILD_RETIRE_PREVIEW_UNAVAILABLE' } };
+    for (const failure of [{ ...drift, outcome: 'unknown' }, { ...drift, retryAllowed: false }]) {
+        const start = f.calls.length;
+        f.state.previewErrors = [failure];
+        assert.deepEqual(checked(await f.send(url('preview')), 503), expected);
+        assert.deepEqual(f.calls.slice(start).map(c => c.action), ['preview']);
+        f.state.previewErrors = [drift, failure];
+        assert.deepEqual(checked(await f.send(url('preview')), 503), expected);
+        assert.deepEqual(f.calls.slice(start + 1).map(c => c.action), ['preview', 'preview']);
+    }
 });
 
 test('census change re-previews the same node but does not retry confirm; positive protected/neighbor refusals carry no ticket', async t => {

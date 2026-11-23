@@ -5,7 +5,7 @@ const { createHash } = require('node:crypto');
 const { isIP } = require('node:net');
 const { performance } = require('node:perf_hooks');
 const { mongo: { BSON }, Types: { ObjectId } } = require('mongoose');
-const { createRetireStore } = require('./rebuildRelayRetireStore');
+const { createRetireStore, readNode, probeCard } = require('./rebuildRelayRetireStore');
 const { isPristine, createStore } = require('./rebuildRelayBackendStore');
 const { inspectAccountSources } = require('./rebuildRelayAccountInventory');
 const { collectionName: DIRECTORY, logicalAccount, readDirectory } = require('./rebuildRelayDirectory');
@@ -34,7 +34,7 @@ const sameFixedImage = (a, b) => ['node', 'grants', 'config'].every(key => equal
 
 // Exact inverse of the DB publication in rebuildRelayRemove, not a generic
 // exemption for a freshly observed absent state. Other fields (even hidden or
-// unknown ones), the node card and grant must remain byte-for-byte unchanged.
+// unknown ones), the projected node authority and grant must remain byte-for-byte unchanged.
 const removedFields = ['clientCidr', 'tproxyPort', 'fwmark', 'routeTable', 'pskEncrypted', 'pskHint', 'secretRevision',
     'localAddress', 'poolStart', 'poolEnd', 'dnsServers', 'mtu', 'mru', 'backupId', 'routingMode', 'routingVersion',
     'rebuildInstallToken', 'rebuildMachineId', 'installedAt', 'lastVerifiedAt', 'lastSyncAt'];
@@ -161,7 +161,7 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
 
     async function fixedImage(id) {
         const config = Object.fromEntries(envKeys.filter(key => Object.hasOwn(env, key)).map(key => [key, env[key]]));
-        const node = await Node.collection.findOne({ _id: new ObjectId(id) }, read);
+        const node = await readNode(Node.collection, new ObjectId(id));
         const grants = await all(Node.db.collection(GRANTS), { nodeId: id }, 1);
         if (!node || grants.length > 1) throw unavailable();
         return { node, grants, config };
@@ -177,15 +177,16 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
     }
     async function initial(id) {
         const snapshot = await target().capture(id), before = await image(id);
-        const node = decode(before.node), state = decode(before.state);
+        if (!target().matchesNode(snapshot, before.node)) throw changed();
+        const node = probeCard(before.node), state = decode(before.state);
         if (String(node._id) !== id || node.type !== 'xray' || node.cascadeRole !== 'relay'
             || (node.role ?? 'relay') !== 'relay' || node.useCustomConfig) throw unavailable();
         const installed = state?.status === 'installed' && state.desiredState === 'installed';
         if (!installed && (!isPristine(state) || before.accounts.length)) throw unavailable();
         return { snapshot, before, node, state, installed };
     }
-    async function snapshotStill(id, snapshot) {
-        if (!target().sameSnapshot(snapshot, await target().capture(id))) throw changed();
+    async function snapshotStill(snapshot) {
+        if (!await target().isCurrent(snapshot)) throw changed();
     }
     async function classify(id, data) {
         const { node } = data;
@@ -222,7 +223,7 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
         }
         // Do not recapture authority until the Remove-only delta is proved.
         const snapshot = await target().capture(id);
-        if (!equal(after, await image(id))) throw changed();
+        if (!target().matchesNode(snapshot, after.node) || !equal(after, await image(id))) throw changed();
         return snapshot;
     }
     async function previewRetireRelay(nodeId) {
@@ -239,7 +240,7 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
             const activeClients = mode === 'abandon' ? null : data.installed ? l2tp?.activeClients ?? null : 0;
             const allowed = graph.allowed && (mode === 'abandon' || !data.installed ||
                 (l2tp?.nodeId === nodeId && l2tp.confirmable === true && l2tp.accountCount === accountCount && count(activeClients)));
-            await snapshotStill(nodeId, data.snapshot);
+            await snapshotStill(data.snapshot);
             if (!equal(await image(nodeId), data.before)) throw changed();
             await verifyLinks(nodeId, graph.previewId);
             await verify();
@@ -260,7 +261,7 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
                 if (typeof retain !== 'function') throw fail('REBUILD_LOCK_LOST');
                 try {
                     fresh();
-                    await snapshotStill(nodeId, data.snapshot);
+                    await snapshotStill(data.snapshot);
                     await verifyLinks(nodeId, original.previewId);
                     // Abandon is an explicit relinquishment, even if the
                     // target is back. Only local evidence and survivors apply.
@@ -275,7 +276,7 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
                     if (graph.previewId !== original.previewId) throw changed();
                     let snapshot = data.snapshot;
                     const check = async () => {
-                        await snapshotStill(nodeId, snapshot);
+                        await snapshotStill(snapshot);
                         await verifyLinks(nodeId, graph.previewId);
                         await verify();
                     };

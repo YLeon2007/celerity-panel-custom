@@ -82,6 +82,8 @@ async function launch(lang) {
 
 const preview = (override = {}) => ({ nodeId: id, mode: 'online', activeClients: 0, accountCount: 2,
     unavailableSince: null, allowed: true, ticket, ...override });
+const drift = replacement => ({ status: 409, data: { error: { code: 'PREVIEW_CHANGED' },
+    ...(replacement !== undefined && { preview: replacement }) } });
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
 test('localized neighbor refusal never enables confirmation or prints unknown details', async () => {
@@ -164,6 +166,48 @@ test('a changed census renders the new count and requires an independent explici
     assert.deepEqual(f.calls[2].body, { ticket: freshTicket, decision: 'force' });
 });
 
+test('a changed initial preview offers the replacement ticket only for an explicit click', async () => {
+    const f = await launch('ru');
+    f.replies.push(drift(preview({ activeClients: 12, ticket: freshTicket })));
+    await f.buttons[0].click();
+    assert.equal(f.target.textContent, `${nodeName} (${id})`);
+    assert.equal(f.message.textContent, expected.ru.force);
+    assert.equal(f.status.textContent, words('ru').changed);
+    assert.equal(f.confirm.textContent, words('ru').confirmForce.replace('{count}', '12'));
+    assert.equal(f.confirm.disabled, false);
+    assert.equal(f.calls.length, 1);
+    f.replies.push({ data: { nodeId: id, status: 'deleted' } });
+    await f.confirm.click();
+    assert.deepEqual(f.calls.map(({ path, body }) => ({ path, body })), [
+        { path: url(id, 'preview'), body: {} },
+        { path: url(id, 'confirm'), body: { ticket: freshTicket, decision: 'force' } },
+    ]);
+});
+
+test('renewed drift clears approval and asks for a new preview from either dialog state', async () => {
+    for (const afterConfirm of [false, true]) {
+        const f = await launch('en');
+        if (afterConfirm) f.replies.push({ data: { preview: preview() } });
+        f.replies.push(drift());
+        await f.buttons[0].click();
+        if (afterConfirm) await f.confirm.click();
+        assert.equal(f.status.textContent, words('en').newPreviewRequired);
+        assert.equal(f.message.textContent, '');
+        assert.equal(f.confirm.hidden, true);
+        assert.equal(f.confirm.disabled, true);
+        await f.confirm.click();
+        assert.deepEqual(f.calls.map(c => c.path), [url(id, 'preview'), ...(afterConfirm ? [url(id, 'confirm')] : [])]);
+        assert.deepEqual(f.reloads, []);
+
+        f.close.click();
+        f.replies.push(drift(preview({ ticket: freshTicket })));
+        await f.buttons[0].click();
+        assert.equal(f.status.textContent, words('en').changed);
+        assert.equal(f.confirm.disabled, false);
+        assert.equal(f.calls.at(-1).path, url(id, 'preview'));
+    }
+});
+
 test('RU and EN render ordinary and force questions with the live census, not the account count', async () => {
     for (const lang of ['ru', 'en']) for (const activeClients of [0, 12]) {
         const f = await launch(lang);
@@ -208,6 +252,9 @@ test('neighbor/protected refusal and a wrong-node preview do not offer confirmat
         [{ status: 409, data: { error: { code: 'REBUILD_NEIGHBOR_UNAVAILABLE' } } }, 'neighborUnavailable'],
         [{ data: { preview: preview({ allowed: false, ticket: undefined }) } }, 'protectedChange'],
         [{ data: { preview: preview({ nodeId: ids[1] }) } }, 'previewUnavailable'],
+        [drift(preview({ nodeId: ids[1] })), 'previewUnavailable'],
+        [drift(preview({ allowed: false, ticket: undefined })), 'protectedChange'],
+        [{ ...drift(preview()), status: 503 }, 'previewUnavailable'],
     ]) {
         const f = await launch('ru');
         f.replies.push(reply);

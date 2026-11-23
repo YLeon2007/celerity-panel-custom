@@ -66,16 +66,31 @@ function safeRefusal(error) {
     return null;
 }
 
-async function sendPreview(req, res, nodeId, stale) {
+const isRefreshableChange = error => error?.code === changed && error.outcome !== 'unknown' && error.retryAllowed !== false;
+
+async function sendPreview(req, res, nodeId, replacing = false) {
     try {
-        const preview = await freshPreview(req, nodeId);
-        const body = stale ? { error: { code: changed }, preview } : { preview };
-        return res.status(stale ? 409 : 200).type('application/json').end(JSON.stringify(body));
+        const preview = await freshPreview(req, nodeId).catch(error => {
+            // The replacement itself is the last read, including after stale confirm.
+            if (replacing || !isRefreshableChange(error)) throw error;
+            replacing = true;
+            return freshPreview(req, nodeId);
+        });
+        const body = replacing ? { error: { code: changed }, preview } : { preview };
+        return res.status(replacing ? 409 : 200).type('application/json').end(JSON.stringify(body));
     } catch (error) {
+        if (isRefreshableChange(error)) return respondError(res, 409, changed);
         const refusal = neighborRefusalForError(error);
         if (refusal) return res.status(409).json({ error: refusal });
         const code = safeRefusal(error);
-        return code ? respondError(res, 409, code) : respondError(res, 503, unavailable);
+        if (code) return respondError(res, 409, code);
+        // For example, the target has become a bridge or changed its endpoint:
+        // keep the original definite conflict, never mint an unusable ticket.
+        if (replacing && error?.outcome == null && error?.retryAllowed !== false &&
+            ['REBUILD_NODE_RETIRE_STATE_CONFLICT', 'REBUILD_L2TP_IDENTITY_CHANGED', unavailable].includes(error?.code)) {
+            return respondError(res, 409, changed);
+        }
+        return respondError(res, 503, unavailable);
     }
 }
 
@@ -96,7 +111,7 @@ async function confirm(req, res, nodeId) {
     } catch (error) {
         // Abandon confirmation must not probe the target, even on refusal.
         // A replacement online preview never retries confirm.
-        if (error?.code === changed && error.outcome !== 'unknown' && error.retryAllowed !== false) {
+        if (isRefreshableChange(error)) {
             return entry.decision === 'abandon' ? respondError(res, 409, changed) : sendPreview(req, res, nodeId, true);
         }
         const refusal = neighborRefusalForError(error);
@@ -124,7 +139,7 @@ function mountRetire(router, { requireSessionId, checkCsrf, requireCompletedOnbo
         next();
     }, limiter, requireCompletedOnboarding(res => respondError(res, 503, unavailable)), (req, res) => {
         const nodeId = req.path.split('/')[3];
-        return isConfirm(req.path) ? confirm(req, res, nodeId) : sendPreview(req, res, nodeId, false);
+        return isConfirm(req.path) ? confirm(req, res, nodeId) : sendPreview(req, res, nodeId);
     });
     router.all(retirePath, (_req, res) => respondError(res.set('Allow', 'POST'), 405, 'METHOD_NOT_ALLOWED'));
     router.all(retirePath, (_err, _req, res, _next) => respondError(res, 503, unconfirmed));

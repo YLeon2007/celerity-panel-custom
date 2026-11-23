@@ -42,6 +42,20 @@ function immutablePin(value) {
     };
     return JSON.stringify(stable(value));
 }
+function independentXrayPin(xray) {
+    if (!xray || Object.getPrototypeOf(xray) !== Object.prototype) return xray;
+    const config = { ...xray };
+    if (config.accessLogs && Object.getPrototypeOf(config.accessLogs) === Object.prototype) {
+        const logs = { ...config.accessLogs };
+        // Ignore observation-only leaves, not the effective config, credentials
+        // or applied-config receipt written by the same reconciler.
+        for (const key of ['status', 'lastError', 'lastBatchAt', 'spoolBytes', 'droppedEvents', 'lastReconcileAt']) delete logs[key];
+        if (Object.keys(logs).length) config.accessLogs = logs;
+        else delete config.accessLogs;
+    }
+    // A dotted telemetry write can create both parent objects on old rows.
+    return Object.keys(config).length ? config : undefined;
+}
 function independentPins(links, nodes, nodeIds) {
     const pinnedLinks = links.filter(link => nodeIds.includes(entityId(link.portalNode)) || nodeIds.includes(entityId(link.bridgeNode)))
         .map(link => {
@@ -51,7 +65,7 @@ function independentPins(links, nodes, nodeIds) {
         }).sort((a, b) => a._id.localeCompare(b._id));
     const pinnedNodes = nodes.filter(node => nodeIds.includes(entityId(node._id))).map(node => ({
         _id: entityId(node._id), ip: node.ip, active: node.active, type: node.type, cascadeRole: node.cascadeRole,
-        ssh: node.ssh, xray: node.xray,
+        ssh: node.ssh, xray: independentXrayPin(node.xray),
     })).sort((a, b) => a._id.localeCompare(b._id));
     return immutablePin({ links: pinnedLinks, nodes: pinnedNodes });
 }

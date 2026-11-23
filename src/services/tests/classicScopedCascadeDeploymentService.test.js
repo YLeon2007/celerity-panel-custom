@@ -79,7 +79,10 @@ function harness(overrides = {}) {
         calls.transactionActive = true;
         const session = { fixture: true };
         calls.session = session;
-        try { return await work(session); } finally { calls.transactionActive = false; calls.session = null; }
+        try {
+            overrides.onTransactionStart?.({ rows, calls });
+            return await work(session);
+        } finally { calls.transactionActive = false; calls.session = null; }
     } };
     const models = {};
     for (const [name, records] of Object.entries(rows)) models[name] = { db: connection,
@@ -617,6 +620,48 @@ function removed(coreInput = { linkId: LINK, expectedTopologyRevision: 7, baseli
     return result;
 }
 const deletion = () => ({ expectedTopologyRevision: 7, linkId: LINK });
+
+test('independent DELETE ignores access-log telemetry across service and transaction checks', async () => {
+    let serviceUpdate = false, transactionUpdate = false;
+    const h = harness({
+        removeWork({ rows, result }) {
+            Object.assign(rows.HyNode[0].xray.accessLogs, { status: 'active', lastError: '',
+                lastBatchAt: new Date(1), spoolBytes: 123, droppedEvents: 4, lastReconcileAt: new Date(2) });
+            rows.HyNode[0].updatedAt = new Date(2);
+            rows.HyNode[1].xray = { accessLogs: { lastBatchAt: new Date(1) } }; // old row without either parent
+            serviceUpdate = true;
+            return result;
+        },
+        onTransactionStart({ rows, calls }) {
+            if (!calls.remote.length) return;
+            rows.HyNode[0].xray.accessLogs.lastBatchAt = new Date(3);
+            transactionUpdate = true;
+        },
+    });
+    h.rows.HyNode[0].cascadeRole = 'portal';
+    h.rows.HyNode[0].xray = { inboundTag: 'fixture-in', accessLogs: { enabled: true } };
+    assert.equal((await h.service.deleteLink(deletion())).revision, 8);
+    assert.ok(serviceUpdate && transactionUpdate);
+    assert.deepEqual(h.rows.CascadeLink, []);
+    assert.deepEqual(h.rows.NodeOperationLock, []);
+    assert.deepEqual(h.rows.HyNode[0].xray.accessLogs.lastBatchAt, new Date(3));
+});
+
+test('independent DELETE still fences access-log config drift in settlement', async () => {
+    let transactionUpdate = false;
+    const h = harness({ onTransactionStart({ rows, calls }) {
+        if (!calls.remote.length) return;
+        rows.HyNode[0].xray.accessLogs.enabled = false;
+        transactionUpdate = true;
+    } });
+    h.rows.HyNode[0].cascadeRole = 'portal';
+    h.rows.HyNode[0].xray = { inboundTag: 'fixture-in', accessLogs: { enabled: true } };
+    await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_SCOPE_CHANGED' });
+    assert.ok(transactionUpdate);
+    assert.equal(h.calls.remote.length, 1);
+    assert.equal(h.rows.CascadeLink.length, 1);
+    assert.equal(h.state().revision, 7);
+});
 
 test('DELETE settlement re-reads the accepted delete marker instead of bypassing the repository lifecycle guard', async t => {
     // The durable-intent change added findById(...).session(session).lean()

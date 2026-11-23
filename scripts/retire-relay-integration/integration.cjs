@@ -153,6 +153,7 @@ async function fixture(t, { orphan = false, linkOnly = false, publicProbe = fals
     t.mock.method(sync, 'readRebuildReverseObservation', async (node, path) => {
         if (online && String(node._id) === relay && path === '/info') {
             probes.push('agent-info');
+            await online.probeBarrier?.();
             return { status: 200, data: '{"agent_version":"fixture"}' };
         }
         if (publicProbe && String(node._id) === relay && path === '/info') {
@@ -198,7 +199,7 @@ async function fixture(t, { orphan = false, linkOnly = false, publicProbe = fals
     const real = service();
     const graph = fn => real.locks.run(verify => fn(req => real.retireGraph({ nodeId: relay, mode: 'abandon', ...req }, verify), verify));
     const reset = () => { trace.length = 0; commands.length = 0; probes.length = 0; secondNeighborChecks = 0; };
-    return { snapshot, profiles, trace, commands, probes, reset, graph, service,
+    return { independent, snapshot, profiles, trace, commands, probes, reset, graph, service,
         failActivation(check = 1) { failCheckAt = check; }, corruptReadback() { corruptReadback = true; },
         unlocked: async () => assert.equal(await independent.collection(lockCollection).countDocuments(), 0) };
 }

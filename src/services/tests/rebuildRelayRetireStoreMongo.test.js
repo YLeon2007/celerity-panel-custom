@@ -7,6 +7,7 @@ const { networkInterfaces } = require('node:os');
 const { randomUUID } = require('node:crypto');
 const mongoose = require('mongoose');
 const { ObjectId } = mongoose.Types;
+const { BSON } = mongoose.mongo;
 const { createRetireStore } = require('../rebuildRelayRetireStore');
 const { createRelayGrantStore, GRANTS, RETIRED } = require('../rebuildRelayGrantStore');
 const { resolveRelayBinding, relayListKey } = require('../rebuildRelayAuthorization');
@@ -44,8 +45,11 @@ async function fixture(t, authority = 'db') {
     const grantStore = createRelayGrantStore({ db, env });
     const grant = value => grantStore.mutate({ action: 'grant', binding: value, actor: 'fixture-operator' });
     const directory = db.collection(DIRECTORY), grants = db.collection(GRANTS), retired = db.collection(RETIRED);
+    await db.createCollection(Node.collection.name, { collation: { locale: 'en', strength: 2 } });
     await Node.collection.insertMany([1, 2, 3].map(n => ({ _id: id(n), ip: binding(n).host, type: 'xray',
-        active: true, cascadeRole: 'relay', ssh: { port: 22, username: 'root' }, hiddenFixture: { marker: 1 } })));
+        active: true, cascadeRole: 'relay', groups: [b, x], ssh: { port: new BSON.Int32(22), username: 'root' },
+        xray: { agentToken: 'fixture-agent', extraInbounds: [{ port: 443, inboundTag: 'fixture-extra' }] },
+        hiddenFixture: { marker: 1 } })));
     await grant(binding(2));
     if (authority === 'db') await grant(binding(1));
     await Link.collection.insertMany([
@@ -80,6 +84,93 @@ async function fixture(t, authority = 'db') {
 }
 
 const run = (name, fn, authority) => test(name, { skip: !port }, async t => fn(await fixture(t, authority), t));
+
+run('node capture and delete ignore health and non-authority siblings', async f => {
+    const telemetry = { updatedAt: new Date(2), lastSync: new Date(3), agentLastSeen: new Date(4),
+        status: 'offline', agentStatus: 'offline', xrayVersion: 'fixture-version', agentVersion: 'fixture-version',
+        onlineUsers: 5, maxOnlineUsers: 5, healthFailures: 2, lastError: 'fixture-health', 'traffic.tx': 5,
+        'xray.accessLogs.lastBatchAt': new Date(5), 'xray.accessLogs.spoolBytes': 5,
+        'xray.accessLogs.status': 'degraded', 'xray.accessLogs.lastError': 'fixture-log',
+        'hiddenFixture.marker': 2, 'ssh.unrelated': 2, 'xray.unrelated': 2, 'xray.extraInbounds.0.unrelated': 2 };
+    await Node.collection.updateOne({ _id: a }, { $set: { 'ssh.password': '$fixture-literal', 'xray.manualKey': { $ne: 'fixture' } } });
+    await f.underLock(async verify => {
+        const snap = await f.store.capture(a);
+        await Node.collection.updateOne({ _id: a }, { $set: telemetry });
+        assert.equal(f.store.sameSnapshot(snap, await f.store.capture(a)), true);
+        await transactOnce(State, L2tpUser, async session => {
+            await f.removeLinks(session);
+            await f.store.finish(snap, session, verify);
+        });
+    });
+    assert.equal(await Node.collection.findOne({ _id: a }), null);
+});
+
+run('node snapshot binds authority leaves, not merely the SSH and agent endpoints', async f => {
+    const fields = {
+        name: 'renamed', role: 'bridge', active: false, ip: '192.0.2.90', domain: 'fixture.invalid', sni: 'fixture.invalid', port: 444,
+        useCustomConfig: true, groups: [x, b], aclRules: ['reject(fixture.invalid)'],
+        'ssh.port': 23, 'ssh.username': 'fixture', 'ssh.password': 'fixture-pw', 'ssh.privateKey': 'fixture-key',
+        'xray.agentToken': 'fixture-other', 'xray.agentPort': 62081, 'xray.agentTls': false, 'xray.apiPort': 61001,
+        'xray.accessLogs.enabled': true, 'xray.accessLogs.ingestTokenEncrypted': 'fixture-envelope',
+        'xray.accessLogs.appliedFingerprint': 'fixture-config', 'xray.accessLogs.ingestTokenHash': 'fixture-hash', 'xray.inboundTag': 'fixture-in',
+        'xray.transport': 'grpc', 'xray.security': 'tls', 'xray.flow': 'fixture-flow', 'xray.alpn': ['h2'],
+        'xray.tlsSource': 'manual', 'xray.manualCert': 'fixture-cert', 'xray.manualKey': 'fixture-pem',
+        'xray.realityPrivateKey': 'fixture-private', 'xray.realityPublicKey': 'fixture-public',
+        'xray.realityShortIds': ['01'], 'xray.wsPath': '/fixture', 'xray.xhttpMode': 'auto',
+        'xray.extraInbounds.0.port': 445, 'xray.extraInbounds.0.inboundTag': 'fixture-edit',
+        'xray.extraInbounds.0.realityPublicKey': 'fixture-extra-public',
+    };
+    await f.underLock(async () => {
+        await Node.collection.updateOne({ _id: a }, { $set: { 'xray.accessLogs.status': 'active' } });
+        const original = await Node.collection.findOne({ _id: a }, { promoteValues: false });
+        const snap = await f.store.capture(a);
+        for (const [path, value] of Object.entries(fields)) {
+            await Node.collection.updateOne({ _id: a }, { $set: { [path]: value } });
+            assert.equal(f.store.sameSnapshot(snap, await f.store.capture(a)), false, path);
+            await Node.collection.replaceOne({ _id: a }, original);
+        }
+        await Node.collection.updateOne({ _id: a }, { $set: { 'ssh.password': null } });
+        assert.equal(f.store.sameSnapshot(snap, await f.store.capture(a)), false, 'missing is not null');
+    });
+});
+
+run('the actual node delete predicate refuses late BSON and collation drift, aborting all writes', async (f, t) => {
+    const cases = {
+        arrayInsteadOfScalar: { 'ssh.username': ['root'] },
+        wrongElementOrder: { groups: [x, b] },
+        missingToNull: { 'ssh.password': null },
+        equalNumericValue: { 'ssh.port': new BSON.Double(22) },
+        equalNestedNumericValue: { 'xray.extraInbounds.0.port': new BSON.Double(443) },
+        sameCaseFold: { 'xray.agentToken': 'FIXTURE-AGENT' },
+        operatorLookingValue: { 'ssh.username': { $ne: 'fixture' } },
+    };
+    const original = await f.snapshotAll();
+    const deleteOne = Node.collection.deleteOne.bind(Node.collection);
+    for (const [kind, fields] of Object.entries(cases)) {
+        let entered = false, missed = false;
+        const mock = t.mock.method(Node.collection, 'deleteOne', async (filter, { session, ...opts }) => {
+            entered = true;
+            // Mutate only this fixture's own staged node after the final projected
+            // read, so the real Mongo predicate (not an earlier compare) must miss.
+            await Node.collection.updateOne({ _id: a }, { $unset: Object.fromEntries(Object.keys(fields).map(key => [key, ''])) }, { session });
+            await Node.collection.updateOne({ _id: a }, { $set: fields }, { session });
+            const deleted = await deleteOne(filter, { session, ...opts });
+            missed = deleted.acknowledged === true && deleted.deletedCount === 0;
+            return deleted;
+        });
+        try {
+            await f.underLock(async verify => {
+                const snap = await f.store.capture(a);
+                await assert.rejects(transactOnce(State, L2tpUser, async session => {
+                    await f.removeLinks(session);
+                    await f.store.finish(snap, session, verify);
+                }), { code: 'REBUILD_NODE_RETIRE_CHANGED' });
+            });
+            assert.ok(entered && missed, kind);
+            assert.deepEqual(await f.snapshotAll(), original, kind);
+        } finally { mock.mock.restore(); }
+    }
+});
 
 run('real Mongo atomically retires graph and relay rows and backfills the agreeing directory', async f => {
     const outside = await f.snapshotAll();

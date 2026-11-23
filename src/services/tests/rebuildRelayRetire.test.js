@@ -6,7 +6,7 @@ const { IncomingMessage, ServerResponse } = require('node:http');
 const { Duplex } = require('node:stream');
 const { EventEmitter } = require('node:events');
 const { performance } = require('node:perf_hooks');
-const { mongo: { BSON } } = require('mongoose');
+const { mongo: { BSON }, Types: { ObjectId } } = require('mongoose');
 const { createRebuildService } = require('../rebuildService');
 const { createRebuildRelayRetire } = require('../rebuildRelayRetire');
 const { fingerprintLinks, retirementScope } = require('../rebuildCoordinator');
@@ -22,10 +22,72 @@ const { rebuildApplyMachineGuard } = require('./helpers/rebuildApplyMachineGuard
 const id = 'a'.repeat(24), portal = 'b'.repeat(24), exit = 'c'.repeat(24);
 const machineId = '1'.repeat(32), backupId = '2'.repeat(32), census = '3'.repeat(64);
 const fault = (code, extra) => Object.assign(new Error('untrusted transport text: ECONNREFUSED'), { code, ...extra });
+const sameBson = (a, b) => BSON.serialize({ value: a }).equals(BSON.serialize({ value: b }));
+const nativeNode = row => ({ ...row, _id: new ObjectId(row._id) });
+const at = (row, path) => path.reduce((parent, key) => parent?.[key], row);
+// Only the Mongo expression subset emitted by the retirement projection and
+// CAS. Missing paths are omitted in computed objects, not materialized as null.
+function expression(input, vars) {
+    const evaluate = value => expression(value, vars);
+    if (typeof input === 'string' && input.startsWith('$$')) return at(vars, input.slice(2).split('.'));
+    if (Array.isArray(input)) return input.map(evaluate);
+    if (!input || Object.getPrototypeOf(input) !== Object.prototype) return input;
+    const [operator] = Object.keys(input);
+    switch (operator) {
+    case '$literal': return input.$literal;
+    case '$cond': return evaluate(input.$cond[evaluate(input.$cond[0]) ? 1 : 2]);
+    case '$in': return evaluate(input.$in[1]).some(value => sameBson(value, evaluate(input.$in[0])));
+    case '$isArray': return Array.isArray(evaluate(input.$isArray));
+    case '$map': {
+        const { input: array, as, in: mapping } = input.$map;
+        return evaluate(array).map(item => expression(mapping, { ...vars, [as]: item }));
+    }
+    case '$type': {
+        const value = evaluate(input.$type);
+        if (value === undefined) return 'missing';
+        if (value === null) return 'null';
+        if (value instanceof ObjectId) return 'objectId';
+        if (value instanceof Date) return 'date';
+        if (Array.isArray(value)) return 'array';
+        if (typeof value === 'boolean') return 'bool';
+        if (typeof value === 'number') {
+            return Number.isInteger(value) && value >= -2147483648 && value <= 2147483647 ? 'int' : 'double';
+        }
+        return typeof value;
+    }
+    case '$eq': return sameBson(...input.$eq.map(evaluate));
+    default:
+        assert.ok(!operator?.startsWith('$'), `unmodeled Mongo expression: ${operator}`);
+        return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, evaluate(value)])
+            .filter(([, value]) => value !== undefined));
+    }
+}
+const fields = (row, projection) => {
+    if (!projection || !Object.keys(projection).length) return row;
+    const entries = Object.entries(projection);
+    const inclusion = entries.some(([key, flag]) => key !== '_id' && flag !== 0) || projection._id === 1 && entries.length === 1;
+    function pick(value, spec) {
+        return Object.fromEntries(Object.entries(value).flatMap(([key, field]) => {
+            const rule = spec[key];
+            const descendants = Object.fromEntries(Object.entries(spec).filter(([path]) => path.startsWith(`${key}.`))
+                .map(([path, flag]) => [path.slice(key.length + 1), flag]));
+            if (Object.keys(descendants).length && field && Object.getPrototypeOf(field) === Object.prototype) {
+                return [[key, pick(field, descendants)]];
+            }
+            return (inclusion ? rule === 1 : rule !== 0) ? [[key, field]] : [];
+        }));
+    }
+    return Object.assign(pick(row, { ...(inclusion && { _id: 1 }), ...projection }),
+        Object.fromEntries(entries.filter(([, flag]) => typeof flag === 'object')
+            .map(([key, value]) => [key, expression(value, { ROOT: row })]).filter(([, value]) => value !== undefined)));
+};
 const matches = (row, filter) => Object.entries(filter).every(([key, value]) => {
     if (key === '$or') return value.some(item => matches(row, item));
-    if (key === '$expr') return BSON.serialize(row).equals(BSON.serialize(value.$eq[1].$literal));
-    const actual = key.split('.').reduce((a, k) => a?.[k], row);
+    if (key === '$expr') {
+        assert.ok(Object.hasOwn(value.$eq?.[1] ?? {}, '$literal'), 'CAS must treat the expected image as data');
+        return expression(value, { ROOT: row });
+    }
+    const actual = at(row, key.split('.'));
     if (Array.isArray(value?.$in)) return [actual].flat().some(item => value.$in.some(term => String(item) === String(term)));
     if (Object.hasOwn(value ?? {}, '$eq')) return require('node:util').isDeepStrictEqual(actual, value.$eq) && (!value.$exists || actual !== undefined);
     if (Object.hasOwn(value ?? {}, '$exists')) return (actual !== undefined) === value.$exists;
@@ -77,27 +139,70 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
     const withoutL2tp = compose([]).find(p => p.nodeId === id && p.profile === 'main').config;
     for (const { nodeId, profile, config } of compose(data.states)) f.profiles.set(`${nodeId}:${profile}`, config);
     const mark = (...event) => { assert.ok(f.lock, 'all observations and effects need the global guard'); f.trace.push(event); };
-    const query = getter => {
-        let session;
-        const q = { lean: async () => structuredClone(getter(session)), session: value => { session = value; return q; } };
-        for (const method of ['select', 'read', 'readConcern', 'limit', 'maxTimeMS']) q[method] = () => q;
+    const query = (getter, name) => {
+        let session, selection;
+        const q = { lean: async () => {
+            const docs = structuredClone(getter(session));
+            if (!docs || !selection) return docs;
+            return Array.isArray(docs) ? docs.map(row => fields(row, selection)) : fields(docs, selection);
+        }, session: value => { session = value; return q; }, select: value => {
+            // An ordinary positive Node projection (in particular standalone
+            // Remove) is not equivalent to the full card returned by lean().
+            if (name === 'nodes' && typeof value === 'string') {
+                const keys = value.split(/\s+/).filter(key => key && !/^[+-]/.test(key));
+                if (keys.length) selection = Object.fromEntries(keys.map(key => [key, 1]));
+            }
+            return q;
+        } };
+        for (const method of ['read', 'readConcern', 'limit', 'maxTimeMS']) q[method] = () => q;
         return q;
     };
-    const table = (name, session) => session ? session.staged[name] : data[name];
+    let activeSession;
+    const table = (name, session) => {
+        if (!session) return data[name];
+        // Mongo pins the snapshot at the first operation, not startTransaction.
+        if (!session.base) {
+            f.beforeTransactionSnapshot?.();
+            session.base = structuredClone(data);
+            session.staged = structuredClone(session.base);
+        }
+        return session.staged[name];
+    };
+    const readRow = (name, row, opts) => {
+        const projected = fields(name === 'nodes' ? nativeNode(row) : row, opts.projection);
+        const raw = BSON.serialize(projected);
+        if (name === 'nodes' && opts.raw) f.onRawNodeRead?.(projected, opts);
+        return opts.raw ? raw : BSON.deserialize(raw);
+    };
+    // Only the ODM facade accepts string node IDs as a proxy for a cast.
+    const selectRow = (name, row, filter) => name !== 'nodes' ? matches(row, filter)
+        : filter._id instanceof ObjectId && matches(nativeNode(row), filter);
     const collection = name => ({
         async findOne(filter, opts = {}) {
             if (name === 'nodes' && f.dbError) throw f.dbError;
-            const row = table(name, opts.session).find(row => matches(row, filter));
-            return row ? opts.raw ? BSON.serialize(row) : structuredClone(row) : null;
+            const row = table(name, opts.session).find(row => selectRow(name, row, filter));
+            return row ? readRow(name, row, opts) : null;
         },
         find(filter, opts = {}) {
-            return { toArray: async () => table(name, opts.session).filter(row => matches(row, filter)).slice(0, opts.limit)
-                .map(row => opts.raw ? BSON.serialize(row) : structuredClone(row)) };
+            return { toArray: async () => {
+                const rows = table(name, opts.session).filter(row => selectRow(name, row, filter));
+                if (opts.sort?._id === 1) rows.sort((a, b) => String(a._id).localeCompare(String(b._id)));
+                return rows.slice(0, opts.limit).map(row => readRow(name, row, opts));
+            } };
+        },
+        async updateOne(filter, update, opts = {}) {
+            // Same-row independent writer waits once a delete has been staged.
+            // On commit it re-evaluates the filter against the now-absent row.
+            const session = activeSession;
+            if (!opts.session && name === 'nodes' && session?.deletedNodeIds.has(String(filter._id))) {
+                await session.finished.promise;
+            }
+            return this.updateMany(filter, update, opts);
         },
         async updateMany(filter, update, opts = {}) {
             const rows = table(name, opts.session);
             if (update.$setOnInsert) { rows.push(structuredClone(update.$setOnInsert)); return { acknowledged: true, upsertedCount: 1 }; }
-            const picked = rows.filter(row => matches(row, filter));
+            const picked = rows.filter(row => selectRow(name, row, filter));
             for (const row of picked) {
                 Object.assign(row, update.$set);
                 for (const field of Object.keys(update.$unset ?? {})) delete row[field];
@@ -108,9 +213,20 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
             return { acknowledged: true, matchedCount: picked.length };
         },
         async insertOne(row, { session }) { table(name, session).push(structuredClone(row)); return { acknowledged: true }; },
-        async deleteOne(filter, opts) { return this.deleteMany(filter, opts); },
+        async deleteOne(filter, opts = {}) {
+            const result = await this.deleteMany(filter, opts);
+            if (name === 'nodes' && result.deletedCount === 1 && opts.session) {
+                opts.session.deletedNodeIds.add(String(filter._id));
+                f.onStagedNodeDelete?.(filter, opts);
+            }
+            return result;
+        },
         async deleteMany(filter, opts = {}) {
-            const rows = table(name, opts.session), kept = rows.filter(row => !matches(row, filter));
+            const rows = table(name, opts.session), kept = rows.filter(row => !selectRow(name, row, filter));
+            if (name === 'nodes' && opts.session && rows.length !== kept.length) {
+                const removed = rows.filter(row => !kept.includes(row));
+                if (removed.some(row => !sameBson(row, data.nodes.find(other => other._id === row._id)))) throw fault(112);
+            }
             const deletedCount = rows.length - kept.length;
             rows.splice(0, rows.length, ...kept);
             mark('delete', name);
@@ -120,21 +236,33 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
     const client = { db: () => ({ async command(cmd, { session }) {
         assert.equal(cmd.commitTransaction, 1); mark('commit');
         if (f.commitError) throw f.commitError;
-        Object.assign(data, session.staged);
+        for (const [name, staged] of Object.entries(session.staged)) {
+            const base = new Map(session.base[name].map(row => [row._id, row]));
+            for (const row of staged) {
+                if (!sameBson(row, base.get(row._id))) {
+                    const i = data[name].findIndex(other => other._id === row._id);
+                    if (i < 0) data[name].push(row);
+                    else data[name][i] = row;
+                }
+                base.delete(row._id);
+            }
+            data[name] = data[name].filter(row => !base.has(row._id));
+        }
         return { ok: 1 };
     } }) };
     const db = { collection, getClient: () => client, async startSession() {
-        return { client, transaction: { transition() { /* internal state below */ } }, inTransaction() { return this.active; },
-            startTransaction() { mark('begin'); this.staged = structuredClone(data); this.active = true;
-                this.transaction.transition = () => { this.active = false; }; },
-            async abortTransaction() { mark('abort'); this.active = false; },
+        function settle() { activeSession.active = false; activeSession.finished.resolve(); activeSession = undefined; }
+        return { client, transaction: { transition: settle }, inTransaction() { return this.active; },
+            startTransaction() { mark('begin'); assert.equal(activeSession, undefined);
+                this.active = true; this.finished = Promise.withResolvers(); this.deletedNodeIds = new Set(); activeSession = this; },
+            async abortTransaction() { mark('abort'); settle(); },
             async endSession() { assert.equal(this.active, false); },
         };
     }, models: {} };
     const model = name => {
         const col = collection(name);
-        const find = filter => query(session => table(name, session).filter(row => matches(row, filter)));
-        const findOne = filter => query(session => table(name, session).find(row => matches(row, filter)) ?? null);
+        const find = filter => query(session => table(name, session).filter(row => matches(row, filter)), name);
+        const findOne = filter => query(session => table(name, session).find(row => matches(row, filter)) ?? null, name);
         return { db, collection: col, find, findOne, findById: _id => findOne({ _id }), updateMany: col.updateMany,
             deleteMany: col.deleteMany, countDocuments: filter => ({ read() { return this; }, readConcern() { return this; },
                 maxTimeMS: async () => { if (f.countDbError) throw f.countDbError; return data[name].filter(row => matches(row, filter)).length; } }),
@@ -146,7 +274,7 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
         async findOne({ token }) { return f.lock?.token === token ? f.lock : null; },
         async deleteMany({ token }) { assert.equal(f.lock?.token, token); f.lock = undefined; return { acknowledged: true, deletedCount: 1 }; },
     });
-    const sshReach = node => { assert.equal(node._id, id); mark('ssh', id); if (f.sshError) throw f.sshError; };
+    const sshReach = node => { assert.equal(String(node._id), id); mark('ssh', id); if (f.sshError) throw f.sshError; };
     if (!realSshAdmission) {
         t.mock.method(NodeSSH.prototype, 'connectDirectOnce', async function () { sshReach(this.node); });
         t.mock.method(NodeSSH, 'probeDirectKex', async (host, port) => {
@@ -155,10 +283,10 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
             sshReach(target);
         });
     }
-    t.mock.method(NodeSSH.prototype, 'disconnect', function () { mark('ssh-close', this.node._id); });
+    t.mock.method(NodeSSH.prototype, 'disconnect', function () { mark('ssh-close', String(this.node._id)); });
     const staged = new Map();
     t.mock.method(NodeSSH.prototype, 'exec', async function (frame, options) {
-        assert.equal(this.node._id, id);
+        assert.equal(String(this.node._id), id);
         const { command, accepts } = rebuildApplyMachineGuard(frame);
         if (accepts) assert.ok(accepts(machineId));
         if (command === '/usr/bin/head -c 34 /etc/machine-id') { mark('machine', id); return ok(`${f.observedMachine ?? machineId}\n`); }
@@ -168,7 +296,8 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
             return ok(JSON.stringify(f.profiles.get(`${id}:${profile}`)));
         }
         if (options?.stdin?.startsWith('{"action":"check-apply-network"')) {
-            mark('activation', id); return ok(`${JSON.stringify({ ok: true, backupId, proof: census })}\n`);
+            mark('activation', id);
+            return f.activationFrame ?? ok(`${JSON.stringify({ ok: true, backupId, proof: census })}\n`);
         }
         if (command.startsWith('systemctl show -p LoadState')) return ok('loaded');
         const profile = command.includes(BRIDGE) || command.includes('xray-bridge') ? 'bridge' : 'main';
@@ -180,7 +309,7 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
     });
     const defaults = { env, locks, grantDb: db, Link: model('links'), Node: model('nodes'), State: model('states'), L2tpUser: model('accounts'),
         sync: { async _getUsersForNode() { return []; }, async readRebuildReverseObservation(node, path, timeout) {
-            assert.equal(node._id, id); assert.equal(path, '/info'); assert.equal(timeout, 5000); mark('agent');
+            assert.equal(String(node._id), id); assert.equal(path, '/info'); assert.equal(timeout, 5000); mark('agent');
             if (f.agentProbe) return f.agentProbe(node, path, timeout);
             if (f.agentError) throw f.agentError;
             return { status: 200, data: '{"agent_version":"fixture"}' };
@@ -208,6 +337,7 @@ function fixture(t, { installed = true, realSshAdmission = false } = {}) {
             async putPair(pair) { mark('put', node._id); pair.forEach(put); }, async close() {} };
         },
     };
+    f.nodeCollection = defaults.Node.collection;
     f.factory = () => { f.factories++; return createRebuildService(defaults); };
     f.first = f.factory();
     f.controllerWithRemove = removal => createRebuildRelayRetire({ ...defaults, removal, locks: f.first.locks,
@@ -286,6 +416,89 @@ test('mounted route joins the originating store and Remove proof across factorie
     assert.equal(steps(f).filter(step => step === 'remove').length, 1);
 });
 
+for (const full of [true, false]) test(`joined online retirement tolerates periodic telemetry ${full ? 'from preview through settlement' : 'at settlement alone'}`, async t => {
+    const f = fixture(t);
+    const target = { _id: new ObjectId(id) }, survivor = { _id: new ObjectId(portal) };
+    const samples = [], projections = [];
+    let phase = 'preview', cas;
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const timer = setInterval(() => {
+        const n = samples.length + 1, now = new Date(2000 + n);
+        const sample = { phase, n, now };
+        const $set = { agentLastSeen: now, updatedAt: now, lastSync: now, agentStatus: 'online',
+            traffic: { tx: n, rx: n * 2, lastUpdate: now }, status: n % 2 ? 'online' : 'offline',
+            healthFailures: n % 2, onlineUsers: n % 2 ? n : 0 };
+        sample.target = f.nodeCollection.updateOne(target, { $set });
+        if (phase === 'finalizer') sample.survivor = f.nodeCollection.updateOne(survivor, { $set });
+        samples.push(sample);
+    }, 10);
+    t.after(() => clearInterval(timer));
+    const tick = name => {
+        phase = name;
+        const count = samples.length;
+        t.mock.timers.tick(10);
+        assert.equal(samples.length, count + 1, `${name}: one scheduled writer tick`);
+        return samples.at(-1);
+    };
+    f.onRawNodeRead = (row, options) => {
+        if (options.projection) projections.push({ row, session: options.session });
+    };
+    if (full) {
+        f.agentProbe = async () => {
+            const sample = tick(phase === 'preview' ? 'preview' : 'confirm');
+            assert.equal((await sample.target).matchedCount, 1);
+            assert.deepEqual(f.data.nodes[1].agentLastSeen, sample.now);
+            return { status: 200, data: '{"agent_version":"fixture"}' };
+        };
+        f.duringRemovePlan = () => tick('remove preparation');
+        f.afterRemove = () => tick('remove publication');
+    }
+    f.beforeTransactionSnapshot = () => {
+        if (!steps(f).includes('stage')) return;
+        const sample = tick('settlement admission');
+        assert.deepEqual(f.data.nodes[1].agentLastSeen, sample.now);
+    };
+    f.onStagedNodeDelete = (filter, opts) => {
+        cas = { filter, opts, preimage: nativeNode(f.data.nodes[1]) };
+        const sample = tick('finalizer');
+        // The independent writer still sees the target. Its update must wait
+        // for the staged delete and then find no row; other rows can advance.
+        assert.equal(f.data.nodes[1].traffic.tx, sample.n - 1);
+        assert.equal(f.data.nodes[0].traffic.tx, sample.n);
+    };
+    const estimate = await f.preview();
+    assert.deepEqual(estimate, { nodeId: id, mode: 'online', allowed: true, accountCount: 1, activeClients: 0, unavailableSince: null });
+    noEffects(f);
+    if (full) assert.equal((await tick('between requests').target).matchedCount, 1);
+    assert.deepEqual(await f.confirm(estimate), { nodeId: id, status: 'deleted' });
+    assert.deepEqual(samples.map(sample => sample.phase), [
+        ...(full ? ['preview', 'between requests', 'confirm', 'remove preparation', 'remove publication'] : []),
+        'settlement admission', 'finalizer',
+    ]);
+    assert.deepEqual(await Promise.all(samples.map(async ({ target }) => (await target).matchedCount)),
+        [...Array(samples.length - 1).fill(1), 0]);
+    assert.equal((await samples.at(-1).survivor).matchedCount, 1);
+    assert.equal(f.data.nodes[0].traffic.tx, samples.at(-1).n, 'commit must not overwrite independent telemetry');
+    assert.equal(await f.nodeCollection.findOne(target), null);
+    assert.deepEqual(f.data.nodes.map(node => node._id), [portal, exit]);
+    assert.deepEqual(f.data.states, []);
+    assert.deepEqual(f.data.accounts, []);
+    assert.deepEqual(f.data.links, []);
+    assert.deepEqual(f.data[RETIRED], [{ _id: id }]);
+    assert.equal(steps(f).filter(step => step === 'remove').length, 1);
+    assert.equal(f.lock, undefined);
+
+    const reads = projections.filter(read => read.session === cas.opts.session);
+    assert.ok(reads.length > 0, 'settlement must read the projected card in its own transaction');
+    assert.deepEqual(cas.opts.collation, { locale: 'simple' });
+    const projected = reads.at(-1).row;
+    assert.ok(projected._id.equals(target._id));
+    assert.deepEqual(projected.image.value.xray.value.agentToken, { type: 'string', value: 'fixture-private-value' });
+    for (const key of ['agentLastSeen', 'updatedAt', 'traffic', 'status']) assert.ok(!Object.hasOwn(projected.image.value, key));
+    assert.ok(sameBson(projected.image, cas.filter.$expr.$eq[1].$literal));
+    assert.ok(!matches({ ...cas.preimage, ip: '192.0.2.99' }, cas.filter), 'the real CAS rejects endpoint drift');
+});
+
 test('both network refusals permit abandon; only survivors are observed by the graph', async t => {
     const f = fixture(t);
     f.data.nodes[1].active = false;
@@ -318,7 +531,7 @@ test('abandon with changed local evidence refuses without probing, even via the 
     f.agentError = fault('ECONNREFUSED'); f.sshError = fault('EHOSTUNREACH');
     const [, { preview }] = await send('preview');
     assert.equal(preview.mode, 'abandon');
-    f.data.nodes[1].unknownField = 1;
+    f.data.nodes[1].ssh.password = 'changed-fixture-password';
     f.trace.length = 0;
     assert.deepEqual(await send('confirm', { ticket: preview.ticket, decision: 'abandon' }), [409, { error: { code: 'PREVIEW_CHANGED' } }]);
     noTarget(f); noEffects(f);
@@ -599,16 +812,56 @@ test('a confirmable positive census requires force and delegates the exact priva
 for (const [name, setup, code] of [
     ['neighbor fails preflight', f => { f.neighborError = fault('ECONNREFUSED'); }, 'REBUILD_NEIGHBOR_UNAVAILABLE'],
     ['incident links differ', f => { f.data.links[0].unknownField = 1; }, 'PREVIEW_CHANGED'],
-    ['raw node snapshot differs', f => { f.data.nodes[1].unknownField = 1; }, 'PREVIEW_CHANGED'],
+    ['node SSH credentials differ', f => { f.data.nodes[1].ssh.password = 'changed-fixture-password'; }, 'PREVIEW_CHANGED'],
     ['network classification changes', f => { f.agentError = fault('ECONNREFUSED'); f.sshError = fault('ENETUNREACH'); }, 'PREVIEW_CHANGED'],
     ['same count, changed generation', f => { f.census.census = '4'.repeat(64); }, 'PREVIEW_CHANGED'],
     ['graph drift inside Remove preparation', f => { f.duringRemovePlan = () => { f.data.links[0].unknownField = 1; }; }, 'PREVIEW_CHANGED'],
-    ['card drift inside Remove preparation', f => { f.duringRemovePlan = () => { f.data.nodes[1].unknownField = 1; }; }, 'PREVIEW_CHANGED'],
+    ['card drift inside Remove preparation', f => { f.duringRemovePlan = () => { f.data.nodes[1].ssh.password = 'changed-fixture-password'; }; }, 'PREVIEW_CHANGED'],
 ]) test(`${name}: no host or DB effects`, async t => {
     const f = fixture(t), estimate = await f.preview();
     setup(f);
     await assert.rejects(f.confirm(estimate), { code });
     noEffects(f); assert.equal(f.lock, undefined);
+});
+
+for (const [field, change] of [
+    ['ip', node => { node.ip = '192.0.2.99'; }],
+    ['cascadeRole', node => { node.cascadeRole = 'bridge'; }],
+    ['xray.agentToken', node => { node.xray.agentToken = 'rotated-fixture-token'; }],
+]) test(`joined online confirmation refuses stale ${field} before effects`, async t => {
+    const f = fixture(t), estimate = await f.preview();
+    assert.equal(estimate.mode, 'online');
+    assert.equal(estimate.allowed, true);
+    change(f.data.nodes[1]);
+    const before = BSON.serialize(f.data);
+    f.trace.length = 0;
+    await assert.rejects(f.confirm(estimate), { code: 'PREVIEW_CHANGED' });
+    noTarget(f);
+    noEffects(f);
+    assert.equal(f.lock, undefined);
+    assert.deepEqual(BSON.serialize(f.data), before);
+});
+
+for (const [name, setup, reset, expected, step] of [
+    ['machine identity', f => { f.observedMachine = '0'.repeat(32); }, f => { f.observedMachine = machineId; },
+        { code: 'REBUILD_L2TP_IDENTITY_CHANGED' }, 'machine'],
+    ['runtime attestation', f => { f.activationFrame = { code: 70, stdout: '', stderr: 'DIRECT_RUNTIME_FOREIGN_CHANGE\n' }; },
+        f => { delete f.activationFrame; }, { code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason: 'RUNTIME_FOREIGN_CHANGE' }, 'activation'],
+]) test(`online confirmation does not replay a ${name} refusal`, async t => {
+    const f = fixture(t), estimate = await f.preview();
+    assert.equal(estimate.mode, 'online');
+    assert.equal(estimate.allowed, true);
+    f.trace.length = 0;
+    setup(f);
+    await assert.rejects(f.confirm(estimate), expected);
+    assert.equal(f.trace.filter(([name, node]) => name === step && node === id).length, 1);
+    noEffects(f);
+    assert.equal(f.lock, undefined);
+    reset(f);
+    const trace = f.trace.slice();
+    await assert.rejects(f.confirm(estimate), { code: 'REBUILD_RETIRE_CONFIRMATION_REQUIRED' });
+    assert.deepEqual(f.trace, trace);
+    assert.equal(f.data.nodes[1]._id, id);
 });
 
 for (const [name, setup, outcome] of [
@@ -625,7 +878,9 @@ for (const [name, setup, outcome] of [
     setup(f);
     await assert.rejects(f.confirm(estimate), { outcome, retryAllowed: false,
         ...((outcome !== 'unknown' || f.commitError) && { l2tpRemoved: true }) });
+    const trace = f.trace.slice();
     await assert.rejects(f.confirm(estimate), { code: 'REBUILD_RETIRE_CONFIRMATION_REQUIRED' });
+    assert.deepEqual(f.trace, trace, 'replay must not even reacquire the lock or observe the target');
     assert.equal(steps(f).filter(step => step === 'remove').length, 1);
     if (outcome === 'partial') assert.ok(!steps(f).includes('stage'));
     if (outcome === 'deleted') assert.equal(f.data.nodes.some(node => node._id === id), false);
@@ -635,7 +890,7 @@ for (const [name, setup, outcome] of [
 test('late store drift after graph activation checks still blocks the first graph stage', async t => {
     const f = fixture(t, { installed: false }), estimate = await f.preview();
     let checks = 0;
-    f.onActivation = node => { if (node._id === exit && ++checks === 2) f.data.nodes[1].unknownField = 1; };
+    f.onActivation = node => { if (node._id === exit && ++checks === 2) f.data.nodes[1].ssh.password = 'changed-fixture-password'; };
     await assert.rejects(f.confirm(estimate), { code: 'PREVIEW_CHANGED' });
     assert.equal(checks, 2);
     noEffects(f);
@@ -643,7 +898,7 @@ test('late store drift after graph activation checks still blocks the first grap
 
 test('store drift during graph staging blocks live activation without authorizing retry', async t => {
     const f = fixture(t, { installed: false }), estimate = await f.preview();
-    f.onStage = () => { f.data.nodes[1].unknownField = 1; };
+    f.onStage = () => { f.data.nodes[1].ssh.password = 'changed-fixture-password'; };
     await assert.rejects(f.confirm(estimate), { outcome: 'unknown', retryAllowed: false });
     assert.ok(steps(f).includes('stage'));
     assert.ok(!steps(f).some(step => ['put', 'begin', 'commit'].includes(step)));

@@ -328,6 +328,40 @@ module.exports = function onlineTests(ctx) {
         assert.deepEqual(f.trace, []);
     });
 
+    test('installed ONLINE can retire through the panel while its card is being sampled', async t => {
+        const host = installedPeer(ctx, 0), f = await fixture(t, { online: host });
+        const app = await mountOnline(t, f), before = await f.snapshot(false), profiles = new Map(f.profiles);
+        const cards = f.independent.collection(C.nodes), target = { _id: before[C.nodes].find(n => String(n._id) === relay)._id };
+        // An independent Mongo client really commits during each HTTP request.
+        // The timer keeps running until confirm returns (including settlement).
+        const stop = new AbortController(), phases = [];
+        let next = Promise.withResolvers(), n = 0;
+        const pump = (async () => {
+            const ticks = require('node:timers/promises').setInterval(2000, null, { signal: stop.signal });
+            try {
+                for await (const _ of ticks) {
+                    const now = new Date(); n++;
+                    const ack = await cards.updateOne(target, { $set: { agentLastSeen: now, updatedAt: now,
+                        'traffic.tx': n, 'traffic.rx': 2*n, 'traffic.lastUpdate': now, status: n % 2 ? 'offline' : 'online',
+                        'xray.accessLogs.lastBatchAt': now } }, { writeConcern: { w: 'majority' } });
+                    const tick = next; next = Promise.withResolvers(); tick.resolve(ack.matchedCount);
+                }
+            } catch (err) { if (err.name !== 'AbortError') { next.resolve(-1); throw err; } }
+        })();
+        pump.catch(() => {}); // joined in finally, including DB errors before the barrier
+        let phase = 'preview';
+        host.probeBarrier = async () => { assert.equal(await next.promise, 1); phases.push(phase); };
+        try {
+            const ticket = previewIs(await app.preview(), 0);
+            phase = 'confirm';
+            const result = await confirm(app, ticket, 'delete');
+            assert.equal(result.status, 200); assert.deepEqual(result.json, { nodeId: relay, status: 'deleted' });
+            assert.deepEqual(phases, ['preview', 'confirm']);
+            assert.equal(await cards.findOne(target), null);
+            await retired(f, host, before, profiles, 0);
+        } finally { stop.abort(); await pump; }
+    });
+
     test('installed ONLINE retirement cannot confirm an unjoined or over-limit census', async t => {
         const host = installedPeer(ctx, 2);
         const f = await fixture(t, { online: host });

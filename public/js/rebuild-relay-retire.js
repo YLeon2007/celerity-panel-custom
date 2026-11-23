@@ -74,6 +74,17 @@
         status.textContent = copy[key];
     }
 
+    function showChangedPreview(context, response, data, allowReplacement = true) {
+        if (response.status !== 409 || data?.error?.code !== 'PREVIEW_CHANGED') return false;
+        if (!allowReplacement || data.preview === undefined) {
+            showError('newPreviewRequired');
+        } else {
+            status.textContent = copy.changed;
+            if (!applyPreview(context, data.preview)) showError('previewUnavailable');
+        }
+        return true;
+    }
+
     function showNeighborRefusal(response, error) {
         if (response.status !== 409 || error?.code !== 'REBUILD_RETIRE_NEIGHBOR_REFUSED') return false;
         const name = typeof error.neighborName === 'string' && error.neighborName.length <= 160
@@ -113,6 +124,7 @@
                 if (selected !== context) return;
                 status.textContent = '';
                 if (showNeighborRefusal(response, data?.error)) return;
+                if (showChangedPreview(context, response, data)) return;
                 if (!response.ok || !applyPreview(context, data?.preview)) {
                     showError(refusal(data?.error?.code) ?? 'previewUnavailable');
                 }
@@ -139,13 +151,8 @@
                 return;
             }
             if (showNeighborRefusal(response, data?.error)) return;
+            if (showChangedPreview(context, response, data, decision !== 'abandon')) return;
             const code = data?.error?.code;
-            if (response.status === 409 && code === 'PREVIEW_CHANGED') {
-                if (decision === 'abandon') { showError('newPreviewRequired'); return; }
-                status.textContent = copy.changed;
-                if (!applyPreview(context, data.preview)) showError('previewUnavailable');
-                return;
-            }
             if (response.status === 409 && code === 'REBUILD_RETIRE_DECISION_REQUIRED' && validCount(data.error.activeClients)
                 && data.error.activeClients > 0) {
                 status.textContent = put('forceRequired', 'count', data.error.activeClients);

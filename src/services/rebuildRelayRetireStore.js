@@ -21,7 +21,7 @@ const read = session => ({ maxTimeMS: 5000, ...(session ? { session } : {
 }) });
 const unpack = (raw, options) => raw == null ? null : BSON.deserialize(Buffer.from(raw, 'base64'), options);
 const pack = raw => raw == null ? null : raw.toString('base64');
-const one = async (collection, filter, session) => pack(await collection.findOne(filter, { ...read(session), raw: true }));
+const one = async (collection, filter, session, options) => pack(await collection.findOne(filter, { ...read(session), raw: true, ...options }));
 async function many(collection, filter, session, limit) {
     const rows = await collection.find(filter, { ...read(session), raw: true, sort: { _id: 1 }, limit: limit + 1 }).toArray();
     if (rows.length > limit) throw stateConflict();
@@ -36,6 +36,68 @@ async function deleteExact(collection, raw, session) {
         { session, collation: { locale: 'simple' } }));
 }
 
+const simple = { locale: 'simple' };
+const exactBson = { promoteValues: false, bsonRegExp: true };
+const leaf = path => ({ type: { $type: path }, value: path });
+const list = (path, item) => ({ type: { $type: path }, value: { $cond: [
+    { $isArray: path }, { $map: { input: path, as: 'item', in: item('$$item') } }, path,
+] } });
+// A telemetry-only object (e.g. freshly created accessLogs) adds no authority
+// leaves. Explicit null and malformed non-object containers remain distinct.
+const section = (path, keys, children = {}) => ({ $cond: [
+    { $in: [{ $type: path }, ['object', 'missing']] }, { type: 'object', value: {
+        ...Object.fromEntries(keys.map(key => [key, leaf(`${path}.${key}`)])),
+        ...Object.fromEntries(Object.entries(children).map(([key, build]) => [key, build(`${path}.${key}`)])),
+    } }, leaf(path),
+] });
+
+// HyNode authority for Retire/Remove and the Rebuild graph: legacy and current
+// roles, endpoint (including both SSH credentials), group user selection and
+// the client MAIN profile. Include published/provisioned Xray credentials and
+// access-log auth and its applied config receipt. Timer/callback writers:
+// syncService: status, healthFailures, lastError, lastSync, onlineUsers,
+// traffic.{tx,rx,lastUpdate}, agentStatus/LastSeen/Version, xrayVersion;
+// accessLogs: status, lastError, lastReconcileAt, lastBatchAt (spoolBytes /
+// droppedEvents are also observations). Mongoose adds updatedAt. The 5s Xray
+// poll updates the online cache; cascade health / chart jobs write other rows.
+// L2TP routing, install identity and account authority live in separate rows;
+// those still use full BSON, not this card projection.
+const inboundFields = [
+    'inboundTag', 'transport', 'security', 'flow', 'fingerprint',
+    'realityDest', 'realityPrivateKey', 'realityPublicKey', 'realitySpiderX',
+    'wsPath', 'wsHost', 'grpcServiceName', 'xhttpPath', 'xhttpHost', 'xhttpMode', 'fallbackDest',
+];
+const values = path => list(path, leaf);
+const inboundLists = { alpn: values, fingerprintPool: values, realitySni: values, realityShortIds: values };
+const nodeImage = section('$$ROOT', [
+    '_id', 'name', 'type', 'active', 'cascadeRole', 'role', 'ip', 'domain', 'sni', 'port', 'useCustomConfig',
+], {
+    groups: values, aclRules: values,
+    ssh: path => section(path, ['port', 'username', 'privateKey', 'password']),
+    xray: path => section(path, [...inboundFields, 'tlsSource', 'acmeEmail', 'manualCert', 'manualKey',
+        'apiPort', 'agentPort', 'agentToken', 'agentTls'], {
+        ...inboundLists,
+        extraInbounds: path => list(path, entry => section(entry, [...inboundFields, 'id', 'label', 'uniqueName', 'port'], inboundLists)),
+        accessLogs: path => section(path, ['enabled', 'ingestTokenEncrypted', 'ingestTokenHash', 'appliedFingerprint']),
+    }),
+});
+// Computed inclusion projection: no Mongoose defaults/casting, no implicit
+// array traversal, and a missing value has its own type (not BSON null).
+const readNode = (collection, _id, session) => one(collection, { _id }, session, {
+    projection: { _id: 1, image: nodeImage }, collation: simple,
+});
+async function deleteNode(collection, _id, raw, session) {
+    // Re-read at the write boundary in the same transaction. Raw equality also
+    // checks wire distinctions Mongo's value comparator can equate (e.g. -0).
+    // A concurrent write to this document after the snapshot conflicts on delete.
+    if (await readNode(collection, _id, session) !== raw) throw changed();
+    const expected = unpack(raw, exactBson);
+    // Do not use a lossy decoded image as a query operand (e.g. BSON undefined).
+    if (pack(BSON.serialize(expected)) !== raw) throw unavailable();
+    requireOne(await collection.deleteOne({ _id, $expr: { $eq: [nodeImage, { $literal: expected.image }] } },
+        { session, collation: simple }));
+}
+
 // Internal graph finalizer only. The caller owns the Rebuild writer/node locks,
 // remote proofs, graph link CAS, session/transaction, and cache publication.
 function createRetireStore({ Link, Node, State, L2tpUser, env = process.env }) {
@@ -46,13 +108,16 @@ function createRetireStore({ Link, Node, State, L2tpUser, env = process.env }) {
     const readEnv = () => Object.fromEntries([...authorityKeys, 'C3_REBUILD_L2TP_INSTALL_ENABLED', 'C3_REBUILD_ENABLED', 'ENCRYPTION_KEY']
         .filter(key => Object.hasOwn(env, key)).map(key => [key, env[key]]));
 
-    async function view(id, session) {
+    async function view(id, session, expectedNode) {
         await assertNoPendingRelayAccounts(db, session);
         const config = readEnv();
         const _id = new ObjectId(id), refs = { $in: [_id, id] };
-        const node = await one(Node.collection, { _id }, session);
-        const card = unpack(node);
-        if (!card || card.type !== 'xray' || card.cascadeRole !== 'relay') throw stateConflict();
+        const node = await readNode(Node.collection, _id, session);
+        // A former relay changing role (or disappearing) is definite drift
+        // on recheck; on the first preview it simply is not an eligible target.
+        if (expectedNode !== undefined && node !== expectedNode) return null;
+        const card = unpack(node)?.image?.value;
+        if (card?.type?.value !== 'xray' || card.cascadeRole?.value !== 'relay') throw stateConflict();
         const states = await many(State.collection, { node: refs }, session, 1);
         const accounts = await many(L2tpUser.collection, { relayNode: refs }, session, 2048);
         const grants = db.collection(GRANTS), retired = db.collection(RETIRED);
@@ -113,12 +178,20 @@ function createRetireStore({ Link, Node, State, L2tpUser, env = process.env }) {
         } catch (cause) { throw safe(cause); }
     }
 
-    // Full BSON bytes, including hidden/unknown fields, encoded as immutable
-    // strings. Field order is deliberately significant. Query row order is
-    // normalized by _id. Only same-store tokens are comparable; no raw data or
-    // fingerprint leaves the store. Links are owned/fenced by the graph caller.
+    // Immutable BSON images: only the node card uses the authority projection.
+    // Other rows include hidden/unknown fields and preserve field order. Query
+    // row order is normalized by _id. The graph caller owns/fences links.
+    // Only same-store tokens compare; neither raw data nor fingerprints escape.
     function sameSnapshot(a, b) {
         return images.has(a) && images.has(b) && equal(images.get(a), images.get(b));
+    }
+
+    const matchesNode = (snapshot, raw) => images.has(snapshot) && images.get(snapshot).node === raw;
+    async function isCurrent(snapshot) {
+        try {
+            const before = images.get(snapshot);
+            return !!before && equal(await view(before.id, undefined, before.node), before);
+        } catch (cause) { throw safe(cause); }
     }
 
     async function finish(snapshot, session, verify) {
@@ -135,7 +208,7 @@ function createRetireStore({ Link, Node, State, L2tpUser, env = process.env }) {
             };
             await check();
             await assertNoIncidentLinks(Link, before.id, session);
-            if (!equal(await view(before.id, session), before)) throw changed();
+            if (!equal(await view(before.id, session, before.node), before)) throw changed();
             await check();
             if (before.backfill) await writeDirectory(db, null, before.backfill, session);
             for (const raw of before.accounts) await deleteExact(L2tpUser.collection, raw, session);
@@ -147,7 +220,7 @@ function createRetireStore({ Link, Node, State, L2tpUser, env = process.env }) {
             if (retired?.acknowledged !== true) throw unavailable();
             const node = { $in: [new ObjectId(before.id), before.id] };
             if ((await HyUser.collection.updateMany({ nodes: node }, { $pull: { nodes: node } }, { session }))?.acknowledged !== true) throw unavailable();
-            await deleteExact(Node.collection, before.node, session);
+            await deleteNode(Node.collection, new ObjectId(before.id), before.node, session);
             await check();
         } catch (cause) {
             // A consumed finalizer failure also cancels the staged graph
@@ -158,7 +231,19 @@ function createRetireStore({ Link, Node, State, L2tpUser, env = process.env }) {
         }
     }
 
-    return Object.freeze({ capture, sameSnapshot, finish });
+    return Object.freeze({ capture, sameSnapshot, matchesNode, isCurrent, finish });
 }
 
-module.exports = { createRetireStore };
+// Build transport input from the very same observation we compare. No second
+// endpoint query and no raw card or health sample can select the target.
+function probeCard(raw) {
+    const card = unpack(raw)?.image?.value;
+    if (!card || card.ssh?.type !== 'object' || card.xray?.type !== 'object') throw unavailable();
+    const pick = (section, keys) => Object.fromEntries(keys.filter(key => Object.hasOwn(section[key], 'value'))
+        .map(key => [key, section[key].value]));
+    return { ...pick(card, ['_id', 'name', 'ip', 'type', 'role', 'cascadeRole', 'useCustomConfig']),
+        ssh: pick(card.ssh.value, ['port', 'username', 'password', 'privateKey']),
+        xray: pick(card.xray.value, ['agentTls', 'agentPort', 'agentToken']) };
+}
+
+module.exports = { createRetireStore, readNode, probeCard };
