@@ -13,6 +13,7 @@ const { requireScope } = require('../middleware/auth');
 const { invalidateNodesCache } = require('../utils/helpers');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
+const { isXrayBridge, setupXrayForRole } = require('../services/xrayNodeAutoSetup');
 const { withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../services/rebuildRelayRoleGuard');
 
 function sendNodeWriteConflict(res, error) {
@@ -822,7 +823,7 @@ router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
 
             let result;
             if (node.type === 'xray') {
-                result = await nodeSetup.setupXrayNode(node, { restartService });
+                result = await setupXrayForRole(node, { restartService });
             } else {
                 result = await nodeSetup.setupNode(node, {
                     installHysteria,
@@ -832,14 +833,18 @@ router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
             }
 
             if (result.success) {
-                if (node.type === 'xray') {
-                    const completion = await syncService.finishXraySetup(node, result.logs, { restartService, writeOptions: options, verify });
+                if (node.type === 'xray' && !isXrayBridge(node)) {
+                    const completion = await syncService.finishXraySetup(node, result.logs, {
+                        restartService, agentToken: result.agentToken, writeOptions: options, verify,
+                    });
                     await invalidateNodesCache();
                     return reply(completion.success ? 200 : 502, completion);
                 } else {
                     await verify();
                     await HyNode.findByIdAndUpdate(req.params.id, { $set: {
-                        status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0, useTlsFiles: result.useTlsFiles,
+                        status: isXrayBridge(node) ? 'offline' : 'online',
+                        lastSync: new Date(), lastError: '', healthFailures: 0,
+                        ...(node.type !== 'xray' && { useTlsFiles: result.useTlsFiles }),
                     } }, options);
                 }
                 await invalidateNodesCache();

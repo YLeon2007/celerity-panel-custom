@@ -11,6 +11,7 @@ const syncService = require('../../services/syncService');
 const configGenerator = require('../../services/configGenerator');
 const nodeSetup = require('../../services/nodeSetup');
 const { isSameVpsAsPanel } = nodeSetup;
+const { isXrayBridge, setupXrayForRole } = require('../../services/xrayNodeAutoSetup');
 const NodeSSH = require('../../services/nodeSSH');
 const sshKeyService = require('../../services/sshKeyService');
 const cache = require('../../services/cacheService');
@@ -826,14 +827,8 @@ router.post('/nodes/:id/setup', async (req, res) => {
             logger.info(`[Panel] Starting setup for node ${node.name} (type: ${node.type || 'hysteria'}, role: ${node.cascadeRole || 'standalone'})`);
 
             let result;
-            if (node.type === 'xray' && node.cascadeRole === 'bridge') {
-                result = await nodeSetup.setupXrayNode(node, { restartService: false, exitOnly: true });
-                if (result.success) {
-                    result.logs = result.logs || [];
-                    result.logs.push('[Bridge] Xray installed. Create a cascade link to deploy bridge config.');
-                }
-            } else if (node.type === 'xray') {
-                result = await nodeSetup.setupXrayNodeWithAgent(node, { restartService: true });
+            if (node.type === 'xray') {
+                result = await setupXrayForRole(node);
             } else {
                 const skipHopping = isSameVpsAsPanel(node);
                 result = await nodeSetup.setupNode(node, {
@@ -845,7 +840,7 @@ router.post('/nodes/:id/setup', async (req, res) => {
 
             if (result.success) {
                 let completion;
-                if (node.type === 'xray' && node.cascadeRole !== 'bridge') {
+                if (node.type === 'xray' && !isXrayBridge(node)) {
                     completion = await syncService.finishXraySetup(node, result.logs, {
                         agentToken: result.agentToken, writeOptions: options, verify,
                     });

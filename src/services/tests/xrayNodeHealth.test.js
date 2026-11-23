@@ -283,7 +283,9 @@ test('classic sync with successful restart and empty user reconciliation cannot 
 
 test('REST and MCP setup distinguish down, deferred activation, unavailable verification and healthy Xray', async t => {
     const f = await fixture(t, { ssh: true });
-    const setupCall = t.mock.method(nodeSetup, 'setupXrayNode', async () => ({ success: true, logs: ['systemd verified active'] }));
+    const setupCall = t.mock.method(nodeSetup, 'setupXrayNodeWithAgent', async () => ({
+        success: true, logs: ['systemd verified active'], agentToken: TOKEN,
+    }));
     const request = await mountedApi(t, f);
     const mcp = (setupOptions) => manageNode({ action: 'setup', id: f.id, setupOptions }, () => {});
     for (const [health, restartService, status, xrayStatus] of [

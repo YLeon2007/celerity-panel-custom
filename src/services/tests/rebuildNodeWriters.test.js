@@ -226,11 +226,11 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     assert.deepEqual(effects, ['edit', 'siblings', 'schedule push']);
     effects.length = 0;
     assert.equal((await api('POST', relayId, '/setup')).status, 200);
-    assert.deepEqual(effects, ['setupXrayNode', 'edit']);
+    assert.deepEqual(effects, ['setupXrayNodeWithAgent', 'edit']);
     effects.length = 0;
     assert.equal((await panel(relayId, '/setup')).status, 200);
     assert.equal((await mcp('setup', relayId)).success, true);
-    assert.deepEqual(effects, ['setupXrayNodeWithAgent', 'edit', 'setupXrayNode', 'edit']);
+    assert.deepEqual(effects, ['setupXrayNodeWithAgent', 'edit', 'setupXrayNodeWithAgent', 'edit']);
     effects.length = 0;
     incident = { _id: rows[0]._id, active: false, rebuildDelete: true };
     await writers['REST delete']('REBUILD_NODE_HAS_LINKS');
@@ -290,5 +290,5 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     effects.length = 0;
     assert.equal((await api('POST', relayId, '/setup')).status, 200);
     assert.equal((await mcp('delete', relayId)).success, true);
-    assert.deepEqual(effects, ['setupXrayNode', 'edit', 'delete', 'user unlink']);
+    assert.deepEqual(effects, ['setupXrayNodeWithAgent', 'edit', 'delete', 'user unlink']);
 });
