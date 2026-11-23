@@ -63,6 +63,7 @@ STOCK_XL_DEFAULT_MD5 = b'fadc31f26078d8c3fb033d7d4516500b'
 REQUIRED_PACKAGES = ('strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables')
 PACKAGE_AUTOSTART_UNSAFE = 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'
 PACKAGE_PENDING = 'package-preparation.pending'
+INSTALL_ABSENT = 'reconciled-absent.json'
 PACKAGE_MAX_OUTPUT = 256 * 1024  # per stream
 # Per runner; preflight has its own runner. A host observation takes up to 36
 # commands: 2 quiet sweeps (3 each), 4 dpkg, layout (1 + up to 4 SysV conffiles)
@@ -127,6 +128,9 @@ NO_INSTALL_WRITES = False
 PPP_PREPARING = False
 NATIVE_PREPARING = False
 PPP_MODULES = ('ppp_generic', 'l2tp_ppp')
+SOCKET_OBSERVERS = ('inet_diag', 'tcp_diag', 'udp_diag')
+NFT_OBSERVERS = ('nfnetlink', 'nf_tables')
+OBSERVERS = (*SOCKET_OBSERVERS, *NFT_OBSERVERS, 'xfrm_user')
 PPP_DIRS = ('/etc/modules-load.d', '/run/modules-load.d', '/usr/local/lib/modules-load.d',
             '/usr/lib/modules-load.d', '/lib/modules-load.d')
 PPP_CONF = '70-celerity-rebuild-l2tp.conf'
@@ -135,6 +139,7 @@ PPP_REQUIRED = 'PPP_MODULES_REQUIRED'
 PPP_CONFLICT = 'PPP_MODULES_PERSISTENCE_CONFLICT'
 PPP_FAILED = 'PPP_MODULES_LOAD_FAILED'
 OBSERVATION_REQUIRED = 'NETWORK_OBSERVATION_REQUIRED'
+MODULE_BLACKLISTED = 'KERNEL_MODULE_BLACKLISTED'
 MODPROBE = '/usr/sbin/modprobe'
 
 
@@ -342,11 +347,21 @@ def rmdir(path):
         os.fsync(fd)
 
 
-def write(path, before, after):
+def write(path, before, after, *, generation=None):
     need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
     parent, name = os.path.split(path)
+
+    def check_generation(fd):
+        if generation is not None:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            need([st.st_dev, st.st_ino, st.st_ctime_ns] == generation, 'ROLLBACK_DRIFT')
+
+    published = None
     with directory(parent) as fd:
         if after is None:
+            if generation is not None:
+                need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
+                check_generation(fd)
             os.unlink(name, dir_fd=fd)
         else:
             scratch = '.direct-' + uuid.uuid4().hex
@@ -360,7 +375,11 @@ def write(path, before, after):
                     os.fchown(output.fileno(), uid, after['gid'])
                     os.fchmod(output.fileno(), after['mode'])
                     os.fsync(output.fileno())
+                    if path == PPP_PATH:
+                        st = os.fstat(output.fileno())
+                        published = [st.st_dev, st.st_ino]
                 need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
+                check_generation(fd)
                 if before is None:
                     os.link(scratch, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
                 else:
@@ -369,7 +388,15 @@ def write(path, before, after):
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(scratch, dir_fd=fd)
         os.fsync(fd)
+        installed = None
+        if published is not None:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            need([st.st_dev, st.st_ino] == published, 'ROLLBACK_DRIFT')
+            installed = [*published, st.st_ctime_ns]
     need(read(path, 2 * MAX_FILE) == after, 'RUNTIME_UNPROVED')
+    if installed is not None:
+        need(remove_generation(path) == installed, 'ROLLBACK_DRIFT')
+    return installed
 
 
 def unit(name):
@@ -505,15 +532,15 @@ def pending_native(xl, ike, state):
     return stock_runtime_observation(state)
 
 
-def ppp_config():
-    return entry(b'# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n', mode=0o644)
+def ppp_config(observers=()):
+    return entry(('# Managed by Celerity rebuild L2TP\n' + '\n'.join((*PPP_MODULES, *observers)) + '\n').encode(), mode=0o644)
 
 
 def module_name(name):
     return name.replace('-', '_')
 
 
-def ppp_boot_files(dependencies):
+def ppp_boot_file(dependencies, installed=None):
     # A same-name override may intentionally suppress a vendor module request.
     # Do not circumvent it by publishing our own file with a different name.
     def modules(path):
@@ -526,8 +553,10 @@ def ppp_boot_files(dependencies):
 
     try:
         selected = {}
+        generation = remove_generation(PPP_PATH)
         own = read(PPP_PATH, 4096)
-        need(own is None or own == ppp_config(), PPP_CONFLICT)
+        need((own is None) == (generation is None) and generation == remove_generation(PPP_PATH), PPP_CONFLICT)
+        need(own == installed if installed is not None else own in (None, ppp_config()), PPP_CONFLICT)
         for parent in PPP_DIRS:
             if parent.startswith('/lib/') and os.path.lexists('/lib') and stat.S_ISLNK(os.lstat('/lib').st_mode):
                 need(os.readlink('/lib') in ('usr/lib', '/usr/lib'), PPP_CONFLICT)
@@ -541,17 +570,20 @@ def ppp_boot_files(dependencies):
                 path = parent + '/' + name
                 if name == PPP_CONF:
                     need(path == PPP_PATH and own is not None, PPP_CONFLICT)
+                elif name in {PPP_CONF[:-5] + '-' + observer + '.conf' for observer in OBSERVERS}:
+                    # Never adopt or remove unreceipted files from an older attempt.
+                    raise Refusal(PPP_CONFLICT)
                 elif name in selected:
                     suppressed = modules(path) & dependencies
                     need(not suppressed or suppressed <= modules(selected[name]), PPP_CONFLICT)
                 else:
                     selected[name] = path
-        return own is None
+        return {'record': own, 'generation': generation}
     except (OSError, UnicodeError, Refusal):
         raise Refusal(PPP_CONFLICT) from None
 
 
-def ppp_policy():
+def ppp_policy(observers=(), *, include_ppp=True):
     try:
         with open('/proc/cmdline') as stream:
             cmdline = stream.read(65537)
@@ -570,30 +602,45 @@ def ppp_policy():
         except (OSError, Refusal):
             raise Refusal(PPP_CONFLICT) from None
         config = command(MODPROBE, '--showconfig', quiet=True, refusal=PPP_REQUIRED)
+        hooks = set()
         for line in config.decode().splitlines():
             words = line.split()
-            if len(words) >= 2 and words[0] in ('blacklist', 'install'):
+            if len(words) >= 2 and words[0] == 'blacklist':
                 blocked.add(module_name(words[1]))
-        deps, builtin, listings = set(PPP_MODULES), set(), []
-        for name in PPP_MODULES:
+            if len(words) >= 2 and words[0] == 'install':
+                hooks.add(module_name(words[1]))
+        ppp = PPP_MODULES if include_ppp else ()
+        deps, builtin, listings, observer_policy = set(ppp), set(), [], {}
+        for name in (*ppp, *observers):
+            observer = name in OBSERVERS
+            need(name not in blocked, MODULE_BLACKLISTED if observer else PPP_REQUIRED)
+            need(name not in hooks, OBSERVATION_REQUIRED if observer else PPP_REQUIRED)
             # Read-only resolution, including soft dependencies; no install hooks run.
-            listing = command(MODPROBE, '--show-depends', '--use-blacklist', '--', name,
-                              quiet=True, refusal=PPP_REQUIRED).decode()
+            # For observers resolve even blacklisted dependencies so we can reject
+            # them explicitly; only the dry-run is unfiltered. Real loads use -b.
+            bad = OBSERVATION_REQUIRED if observer else PPP_REQUIRED
+            flags = () if observer else ('--use-blacklist',)
+            listing = command(MODPROBE, '--show-depends', *flags, '--', name, quiet=True, refusal=bad).decode()
             found = set()
             for fields in map(str.split, listing.splitlines()):
                 if len(fields) == 2 and fields[0] == 'builtin':
                     found.add(module_name(fields[1]))
-                    builtin.add(module_name(fields[1]))
+                    if not observer:
+                        builtin.add(module_name(fields[1]))
                     continue
-                need(len(fields) >= 2 and fields[0] == 'insmod', PPP_REQUIRED)
+                need(len(fields) >= 2 and fields[0] == 'insmod', bad)
                 match = re.fullmatch(r'/(?:usr/)?lib/modules/[^\s]+/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|zst|gz))?', fields[1])
-                need(match, PPP_REQUIRED)
+                need(match, bad)
                 found.add(module_name(cast(re.Match, match)[1]))
-            need(name in found, PPP_REQUIRED)
+            need(name in found, bad)
+            need(not (found & blocked), MODULE_BLACKLISTED if observer else PPP_REQUIRED)
+            need(not (found & hooks), bad)
             deps.update(found)
-            listings.append(listing)
-        need(not (deps & blocked), PPP_REQUIRED)
-        return deps, sorted(builtin), digest(encode(listings))
+            if observer:
+                observer_policy[name] = digest(encode(listing))
+            else:
+                listings.append(listing)
+        return deps, sorted(builtin), digest(encode(listings)), observer_policy
     except (OSError, ValueError):
         raise Refusal(PPP_REQUIRED) from None
 
@@ -609,19 +656,35 @@ def ppp_loaded(builtin):
     return dict(ppp_generic=ppp_registered(), l2tp_ppp='l2tp_ppp' in live_modules(PPP_REQUIRED) or 'l2tp_ppp' in builtin)
 
 
-def require_network_observers():
+def missing_network_observers():
     # Even read-only netlink requests can autoload protocol/subsystem modules.
     # Insist on available providers before ss, nft or ip xfrm, without loading
     # them as a side effect of preparing a PPP/install plan.
     try:
         active = live_modules(OBSERVATION_REQUIRED)
-        for name in ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user'):
+        missing = []
+        for name in OBSERVERS:
             if name not in active:
-                proof = command(MODPROBE, '--show-depends', '--use-blacklist', '--', name,
+                proof = command(MODPROBE, '--show-depends', '--', name,
                                 quiet=True, refusal=OBSERVATION_REQUIRED)
-                need(b'builtin ' + name.encode() in proof.splitlines(), OBSERVATION_REQUIRED)
+                if b'builtin ' + name.encode() not in proof.splitlines():
+                    missing.append(name)
+        return missing
     except (OSError, ValueError):
         raise Refusal(OBSERVATION_REQUIRED) from None
+
+
+def require_network_observers():
+    need(not missing_network_observers(), OBSERVATION_REQUIRED)
+
+
+def check_package_observer_policy():
+    # Package preparation can precede the normal Install baseline. Reject a
+    # known observer blacklist before publishing even the package intent.
+    # PPP itself may not be ready until the runtime packages are installed.
+    missing = missing_network_observers()
+    if missing:
+        ppp_policy(missing, include_ppp=False)
 
 
 def ppp_host_scope():
@@ -638,19 +701,27 @@ def ppp_host_scope():
     need(caps is not None and int(caps[1], 16) & (1 << 16), PPP_REQUIRED)  # CAP_SYS_MODULE
 
 
-def observe_ppp_preparation():
+def observe_ppp_preparation(required_observers=(), *, installed=None):
     """Read-only prerequisite projection included in the fresh Install baseline."""
     try:
-        deps, builtin, policy = ppp_policy()
+        absent = missing_network_observers()
+        observers = [name for name in OBSERVERS if name in absent or name in required_observers]
+        deps, builtin, policy, observer_policy = ppp_policy(observers)
         loaded, device = ppp_loaded(builtin), ppp_device()
         need(device is not False and (not loaded['ppp_generic'] or device is True), PPP_REQUIRED)
-        persist = ppp_boot_files(deps)
-        missing = [name for name in PPP_MODULES if not loaded[name]]
+        before = ppp_boot_file(deps, installed)
+        persist = installed is None and (before['record'] is None or bool(absent))
+        missing = [name for name in PPP_MODULES if not loaded[name]] + absent
         if missing or persist:
             ppp_host_scope()
             with open('/proc/sys/kernel/modules_disabled') as stream:
                 need(stream.read(8).strip() == '0', PPP_REQUIRED)
-        return dict(missing=missing, persist=persist, builtin=builtin, policy=policy)
+        plan: dict[str, Any] = dict(missing=missing, persist=persist, builtin=builtin, policy=policy)
+        if observers:
+            plan['observers'] = observer_policy
+        if persist:
+            plan['bootFile'] = {'before': before, 'after': ppp_config(absent)}
+        return plan
     except (OSError, ValueError):
         raise Refusal(PPP_REQUIRED) from None
 
@@ -658,27 +729,70 @@ def observe_ppp_preparation():
 def apply_ppp_preparation(expected):
     """Reserved Install only, under the same host flock and durable applying receipt."""
     need(observe_ppp_preparation() == expected, 'BASELINE_CHANGED')
+    observers = expected.get('observers', {})
+
+    def loaded(name):
+        if name in OBSERVERS:
+            return name in live_modules(PPP_FAILED)
+        return ppp_loaded(expected['builtin'])[name]
+
     for name in expected['missing']:
-        if not ppp_loaded(expected['builtin'])[name]:
+        if not loaded(name):
             # Use ordinary kmod policy, never --ignore-install/force/insmod.
             command(MODPROBE, '--use-blacklist', '--', name, wait=10, quiet=True, refusal=PPP_FAILED)
-            need(ppp_loaded(expected['builtin'])[name], PPP_FAILED)
+            need(loaded(name), PPP_FAILED)
     if 'ppp_generic' in expected['missing']:
         # Give the kernel/devtmpfs/udev time to expose the node; never mknod.
         ready_by = min(DEADLINE, time.monotonic() + 2)
         while ppp_device() is None and time.monotonic() < ready_by:
             time.sleep(0.05)
     need(all(ppp_loaded(expected['builtin']).values()) and ppp_device() is True, PPP_FAILED)
-    if expected['persist']:
-        deps, _, policy = ppp_policy()
-        need(policy == expected['policy'] and ppp_boot_files(deps), PPP_CONFLICT)
+    planned = expected.get('bootFile')
+    generation = None
+    if planned:
+        deps, _, policy, observer_policy = ppp_policy(observers)
+        previous = planned['before']
+        need(policy == expected['policy'] and observer_policy == observers and ppp_boot_file(deps) == previous, PPP_CONFLICT)
         try:
             mkdir(PPP_DIRS[0], 0o755, exist_ok=True)
-            write(PPP_PATH, None, ppp_config())  # fsynced and never replaces a file
+            generation = write(PPP_PATH, previous['record'], planned['after'], generation=previous['generation'])
         except (FileExistsError, PermissionError):
             raise Refusal(PPP_CONFLICT) from None
-    ready = observe_ppp_preparation()
-    need(not ready['missing'] and not ready['persist'] and ready['policy'] == expected['policy'], PPP_FAILED)
+    ready = observe_ppp_preparation(observers, installed=planned['after'] if planned else None)
+    need(not ready['missing'] and not ready['persist'] and ready['policy'] == expected['policy']
+         and ready.get('observers', {}) == observers, PPP_FAILED)
+    return generation
+
+
+def module_boot_owner(backup):
+    """The private manifest binds one canonical file to this install generation."""
+    plan = backup['before'].get('pppModules', {})
+    if 'bootFile' not in plan:
+        # Legacy PPP-only receipts never claimed ownership of persistence.
+        need('modulePersistence' not in backup and not plan.get('observers'), 'ROLLBACK_DRIFT')
+        return None
+    images, generation = plan['bootFile'], backup.get('modulePersistence')
+    names = [name for name in OBSERVERS if name in plan['missing']]
+    need(plan['persist'] is True and set(images) == {'before', 'after'}
+         and set(images['before']) == {'record', 'generation'} and images['after'] == ppp_config(names)
+         and type(generation) is list and len(generation) == 3 and all(type(v) is int and v > 0 for v in generation),
+         'ROLLBACK_DRIFT')
+    previous = images['before']['record']
+    need(previous is None or (previous == ppp_config() and bool(names)), 'ROLLBACK_DRIFT')
+    return previous, images['after'], generation
+
+
+def check_module_boot_owner(owner):
+    if owner is not None:
+        _, after, generation = owner
+        need(read(PPP_PATH, 4096) == after and remove_generation(PPP_PATH) == generation, 'ROLLBACK_DRIFT')
+
+
+def release_module_boot(owner):
+    if owner is not None:
+        before, after, generation = owner
+        # The caller holds the DIRECT flock; do not adopt byte-identical replacements.
+        write(PPP_PATH, after, before, generation=generation)
 
 
 def sock_rows():
@@ -694,6 +808,58 @@ def sock_rows():
 
 def owned_sockets(rows, pid):
     return sorted([p, a, n] for p, a, n, owners in rows if pid in owners and pid != '0')
+
+
+def verify_socks_handoff(rows, port, handoff_pid, *, active=True):
+    bad = 'RUNTIME_UNPROVED'
+    need(type(port) is int and 1 <= port <= 65535 and type(handoff_pid) is str
+         and re.fullmatch(r'[1-9][0-9]*', handoff_pid), bad)
+    loopback = '127.0.0.1'
+    protocols = []
+    for proto, address, number, owners in rows:
+        if number == port:
+            need(proto in ('tcp', 'udp') and address == loopback and owners == [handoff_pid], bad)
+            protocols.append(proto)
+    layout = sorted(protocols)
+    need(layout in (['tcp'], ['tcp', 'udp']), bad)
+    if not active or layout == ['tcp', 'udp']:
+        return  # An exact fixed bind is the legacy proof. Invalid rows are not absence.
+
+    # Newer cores allocate UDP per association. Use the observed layout, not
+    # panel version metadata. One deadline covers connect, writes and every
+    # partial read. Never send a UDP datagram or connect to the returned BND.
+    until = min(DEADLINE, time.monotonic() + 1)
+
+    def remaining():
+        seconds = until - time.monotonic()
+        need(seconds > 0, bad)
+        return seconds
+
+    def receive(sock, size):
+        data = bytearray()
+        while len(data) < size:
+            sock.settimeout(remaining())
+            chunk = sock.recv(size - len(data))
+            need(bool(chunk), bad)
+            data.extend(chunk)
+        return bytes(data)
+
+    try:
+        remaining()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(remaining())
+            sock.connect((loopback, port))
+            sock.settimeout(remaining())
+            sock.sendall(b'\x05\x01\x00')  # SOCKS5, offer only no authentication.
+            need(receive(sock, 2) == b'\x05\x00', bad)
+            sock.settimeout(remaining())
+            sock.sendall(b'\x05\x03\x00\x01' + bytes(6))  # UDP ASSOCIATE, no client UDP endpoint yet.
+            need(receive(sock, 4) == b'\x05\x00\x00\x01', bad)
+            bound = receive(sock, 6)
+            need(bound[:4] == b'\x7f\x00\x00\x01' and bound[4:] != b'\x00\x00', bad)
+        remaining()
+    except OSError:
+        raise Refusal(bad) from None
 
 
 def working(info):
@@ -891,7 +1057,7 @@ def number(value):
     return int(value, 0) if isinstance(value, str) and value.isdecimal() is False else int(value)
 
 
-def network_projection(d, token, removing=False):
+def network_projection(d, token, removing=False, *, inspect_nft=True):
     rules = ip('rule', 'show')
     routes = ip('route', 'show', 'table', 'all')
     # The narrow first-install profile supports only the stock all-source rules
@@ -923,7 +1089,7 @@ def network_projection(d, token, removing=False):
     need(len(own_routes) <= 1 and all(r.get('type') in ('local', 2, '2') and r.get('dst') in ('default', '0.0.0.0/0') and r.get('dev') == 'lo'
          and r.get('scope') in ('host', 254, '254') and not (set(r) - {'type', 'dst', 'dev', 'table', 'scope', 'flags', 'protocol'})
          for r in own_routes), 'NETWORK_CONFLICT')
-    return dict(rule=bool(own_rules), route=bool(own_routes), nft=nft_projection(token))
+    return dict(rule=bool(own_rules), route=bool(own_routes), nft=nft_projection(token) if inspect_nft else None)
 
 
 def ppp_empty():
@@ -1110,7 +1276,7 @@ def idle_ike(info, rows):
     return sorted([p, a, n] for p, a, n, _ in sockets)
 
 
-def fresh_ike_guard(info):
+def fresh_ike_guard(info, *, inspect_runtime=True):
     # Diagnose before the generic IPv4 projector (and before rejecting loaded
     # connection files). Even an exact lookalike predates our owned invocation.
     # Charon's stop may delete an indistinguishable foreign rule. Neither the
@@ -1123,7 +1289,7 @@ def fresh_ike_guard(info):
             set(row) == {'priority', 'src', 'table'} and type(row['priority']) is int and row['priority'] == 220
             and row['src'] == 'all' and type(row['table']) in (str, int) and row['table'] in ('220', 220)
             for row in rows) for rows in matches), 'RULE_220_CONFLICT')
-        if (working(info) and info['SubState'] == 'running' and info['UnitFileState'] in ('enabled', 'disabled')
+        if (inspect_runtime and working(info) and info['SubState'] == 'running' and info['UnitFileState'] in ('enabled', 'disabled')
                 and not any(info.get(k) for k in ('DropInPaths', 'PassEnvironment', 'ExecCondition', 'SourcePath'))
                 and removal_native(info, IKE, {'units': {IKE: info}}, installed=False)):
             try:
@@ -1144,14 +1310,17 @@ def boot():
     return open('/proc/sys/kernel/random/boot_id').read(64).strip()
 
 
-def observe(machine, d, transit=None, *, diagnose_profile_owner=False) -> dict[str, Any]:
+def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=()) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
     ready = preflight(machine)
     need(not ready['masked'], 'PREREQUISITE')
     no_jobs(UNITS)
     units = {name: unit(name) for name in UNITS}
-    fresh_ike_guard(units[IKE])
+    inspect_sockets = not any(name in deferred for name in SOCKET_OBSERVERS)
+    inspect_nft = not any(name in deferred for name in NFT_OBSERVERS)
+    inspect_xfrm = 'xfrm_user' not in deferred
+    fresh_ike_guard(units[IKE], inspect_runtime=inspect_sockets and inspect_xfrm)
     pending = pending_xl(units[XL])
     if pending == 'missing':
         require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
@@ -1208,7 +1377,7 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False) -> dict[s
         default = globals_before[XL_DEFAULT]
         need(default is not None and default['mode'] == 0o644 and default['gid'] == 0
              and default.get('uid', 0) == 0 and digest(raw(default)) == STOCK_XL_DEFAULT_SHA, 'PREREQUISITE')
-    rows = sock_rows()
+    rows = sock_rows() if inspect_sockets else None
     net = ipaddress.IPv4Network(d['clientCidr'])
     for addr in ip('addr', 'show'):
         for item in addr.get('addr_info', []):
@@ -1218,9 +1387,11 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False) -> dict[s
         dst = route.get('dst', 'default')
         need(dst == 'default' or not net.overlaps(ipaddress.IPv4Network(dst)), 'NETWORK_CONFLICT')
     reserved = (500, 4500, 1701, d['tproxyPort'])
-    need(not any(n in reserved for _, _, n, _ in rows)
-         and vpn_empty() and network_projection(d, '') == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
-    need(not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
+    need((rows is None or not any(n in reserved for _, _, n, _ in rows))
+         and (vpn_empty() if inspect_xfrm else ppp_empty())
+         and network_projection(d, '', **({} if inspect_nft else {'inspect_nft': False}))
+         == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
+    need(not inspect_nft or not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
     no_swan_rule()
     need(not units[IKE].get('PassEnvironment') and (STOCK_IKE_INCLUDE in starter or stock_starter), 'PREREQUISITE')
     need(all(removal_native(units[n], n, {'units': units}, installed=False)
@@ -1231,8 +1402,8 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False) -> dict[s
     need(files['swan'] is None, 'PREREQUISITE')
     swan = swan_inputs(False, 'PREREQUISITE')
     STAGE = 'PROFILE_USERS'
-    sockets = xray_users(files['main'], units[X], rows, transit)
-    need(sockets, 'RUNTIME_UNPROVED')
+    sockets = xray_users(files['main'], units[X], rows, transit) if rows is not None else None
+    need(rows is None or sockets, 'RUNTIME_UNPROVED')
     # Project stable unit fields only; systemctl ExecStart includes runtime timestamps.
     unit_pins = {name: {key: units[name].get(key) for key in
                  ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID', 'FragmentPath', 'DropInPaths')}
@@ -1243,7 +1414,7 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False) -> dict[s
                 **({'transit': transit} if transit is not None else {}))
 
 
-def candidate(request, before):
+def candidate(request, before, *, active_probe=False):
     files = request['files']
     sidecar = 'bridge' in files
     need(set(files) - {'bridge'} == {'main', 'nft', 'ike', 'lns', 'options', 'secrets', 'chap'}, 'CANDIDATE_INVALID')
@@ -1261,7 +1432,7 @@ def candidate(request, before):
     handoff = [i for i in owner['inbounds'] if i.get('tag') == 'rebuild-relay-ingress']
     need(len(ppp) == 1 and ppp[0].get('port') == d['tproxyPort'] and len(handoff) == 1
          and handoff[0].get('listen') == '127.0.0.1' and type(handoff[0].get('port')) is int, 'CANDIDATE_INVALID')
-    rows = sock_rows()
+    rows = sock_rows() if before.get('sockets', []) is not None else None
     if sidecar:
         need(before['bridge'] is not None and not any(i.get('tag') == handoff[0]['tag'] for i in main['inbounds']), 'CANDIDATE_INVALID')
         side = unit(B)
@@ -1270,10 +1441,12 @@ def candidate(request, before):
         need(not original_side.get('api') and not owner.get('api') and side.get('User') == 'nobody'
              and side.get('UnitFileState') == 'enabled', 'PREREQUISITE')
         pid = xray_argv(side, BRIDGE)
-        listeners = [r for r in rows if r[2] == handoff[0]['port']]
-        need({p for p, *_ in listeners} == {'tcp', 'udp'} and all(a == '127.0.0.1' and owners == [pid]
-             for _, a, _, owners in listeners), 'NETWORK_CONFLICT')
-    else:
+        if rows is not None:
+            try:
+                verify_socks_handoff(rows, handoff[0]['port'], pid, active=active_probe)
+            except Refusal:
+                raise Refusal('NETWORK_CONFLICT') from None
+    elif rows is not None:
         need(not any(n == handoff[0]['port'] for _, _, n, _ in rows), 'NETWORK_CONFLICT')
     drop = f'[Unit]\nRequires={NET_UNIT} {IKE}\nAfter={NET_UNIT} {IKE}\n'.encode()
     original = before['files']
@@ -1358,8 +1531,12 @@ def bound_manifest(request):
     return path, record, value
 
 
-def runtime_before(backup):
+def runtime_before(backup, *, preparing_modules=False):
     before = backup['before']
+    if not preparing_modules and before.get('sockets', []) is None:
+        sockets = backup.get('preparedSockets')
+        need(type(sockets) is list and bool(sockets), 'ROLLBACK_DRIFT')
+        before = {**before, 'sockets': sockets}
     prepared = backup.get('nativePrepared')
     if prepared is None:
         need('nativePreparation' not in before, 'ROLLBACK_DRIFT')
@@ -1445,11 +1622,9 @@ def installed_runtime(d, token, before, after):
     need(bridge_info is None or bridge_info['InvocationID'] != before['units'][B]['InvocationID'], 'RUNTIME_UNPROVED')
     config = json.loads(raw(after['bridge' if sidecar else 'main']))
     handoff = next(i['port'] for i in config['inbounds'] if i['tag'] == 'rebuild-relay-ingress')
-    need(all(any(p == proto and n == port and owners == [owner] and (address is None or a == address)
-                 for p, a, n, owners in rows)
-             for proto, port, address, owner in [('tcp', d['tproxyPort'], None, pid), ('udp', d['tproxyPort'], None, pid),
-                 ('tcp', handoff, '127.0.0.1', handoff_pid), ('udp', handoff, '127.0.0.1', handoff_pid)]),
-         'RUNTIME_UNPROVED')
+    need(all(any(p == proto and n == d['tproxyPort'] and owners == [pid] for p, _, n, owners in rows)
+             for proto in ('tcp', 'udp')), 'RUNTIME_UNPROVED')
+    verify_socks_handoff(rows, handoff, handoff_pid)
     l2tp_sockets = [owners for p, a, n, owners in rows if p == 'udp' and n == 1701]
     need(l2tp_sockets and all(owners == [lns['MainPID']] for owners in l2tp_sockets), 'RUNTIME_UNPROVED')
     for port in (500, 4500):
@@ -1542,16 +1717,43 @@ def install(request, before, after, lock_fd=None):
         write(path, old_manifest, confirmed)
         old_manifest = confirmed
         backup['phase'] = 'applying'
-        before = runtime_before(backup)
+        before = runtime_before(backup, preparing_modules=True)
         NATIVE_PREPARING = False
     modules = before.get('pppModules')
     if modules is not None:
-        # This shared host prerequisite has no automatic inverse. Any later
-        # ordinary rollback deals only with the VPN-owned files and services.
+        # The live kernel loads are shared and irreversible. Only the exact
+        # boot-file generation published here can be released later.
         PPP_PREPARING = True
         need(lock_fd is not None and install_lock_identity(lock_fd) == before['installLock']
              and boot() == before['boot'] and preflight(request['machineId'])['masked'] is False, 'BASELINE_CHANGED')
-        apply_ppp_preparation(modules)
+        generation = apply_ppp_preparation(modules)
+        if 'bootFile' in modules:
+            backup['modulePersistence'] = generation
+            check_module_boot_owner(module_boot_owner(backup))
+            current = entry(encode(backup))
+            write(path, old_manifest, current)
+            old_manifest = current
+        if modules.get('observers'):
+            # Re-run the full baseline and candidate under the reservation,
+            # before any VPN config, policy or service changes.
+            require_network_observers()
+            live = observe(request['machineId'], routing(d), before.get('transit'))
+            expected = {k: v for k, v in before.items() if k not in
+                        ('installLock', 'pppModules', 'nativeGeneration', 'nativePreparation')}
+            if expected['sockets'] is None:
+                expected['sockets'] = live['sockets']
+            need(live == expected and candidate(request, live, active_probe=True) == after
+                 and install_lock_identity(lock_fd) == before['installLock'], 'BASELINE_CHANGED')
+            if before['sockets'] is None:
+                backup['preparedSockets'] = live['sockets']
+                current = entry(encode(backup))
+                write(path, old_manifest, current)
+                old_manifest = current
+                before = runtime_before(backup)
+        elif 'bridge' in after:
+            # TCP-only SOCKS handoff may allocate a UDP association on the
+            # existing daemon. The read-only candidate checks only its bind.
+            need(candidate(request, before, active_probe=True) == after, 'BASELINE_CHANGED')
         # Even check-only nft can autoload expression modules. Run it only
         # after the durable host intent and under the reserved host lock.
         command('/usr/sbin/nft', '-c', '-f', '-', data=raw(after['nft']))
@@ -1805,6 +2007,8 @@ def rollback(request, path, old_manifest, backup):
     STAGE = 'COMMAND_FAILED'
     was_installed = installed_phase(backup['phase'])
     need(backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
+    module_owner = module_boot_owner(backup)
+    check_module_boot_owner(module_owner)
     before, d, token = runtime_before(backup), request['network'], request['backupId']
     no_jobs(UNITS)
     sidecar = 'bridge' in backup['after']
@@ -1948,16 +2152,28 @@ def rollback(request, path, old_manifest, backup):
         sc('restart', X, wait=22)
     if before.get('ikeSockets'):
         sc('start', IKE, wait=22)
+    verify_rollback(d, token, backup)
+    need(read(path, 2 * MAX_FILE) == rolling, 'ROLLBACK_DRIFT')
+    release_module_boot(module_owner)
+    backup['phase'] = 'rolled-back'
+    write(path, rolling, entry(encode(backup)))
+
+
+def verify_rollback(d, token, backup):
+    before = runtime_before(backup)
+    paths = operation_files(backup['after'])
+    originals = original_files(before, paths)
+    sidecar = 'bridge' in paths
     no_jobs(UNITS)
     neighbors(before, sidecar)
-    if 'swan' in current:
+    if 'swan' in paths:
         need(swan_inputs(False, STAGE) == before['swanInputs'], STAGE)
     if sidecar:
         bpid = xray_argv(unit(B), BRIDGE)
         handoff = next(i['port'] for i in json.loads(raw(originals['bridge']))['inbounds'] if i['tag'] == 'rebuild-relay-ingress')
-        listeners = owned_sockets(sock_rows(), bpid)
-        need(all([proto, '127.0.0.1', handoff] in listeners for proto in ('tcp', 'udp')), 'RUNTIME_UNPROVED')
-    need({key: read(p) for key, p in paths.items()} == originals and
+        verify_socks_handoff(sock_rows(), handoff, bpid)
+    need(all(directory_absent(p) for p in (DROP_DIR, NFT_DIR)) and
+         {key: read(p) for key, p in paths.items()} == originals and
          (not before.get('installBoot') or boot_link() is None) and
          network_projection(d, token) == {'nft': None, 'rule': False, 'route': False}
          and vpn_empty(allow_socket_policies=bool(before.get('ikeSockets'))), 'RUNTIME_UNPROVED')
@@ -1975,8 +2191,7 @@ def rollback(request, path, old_manifest, backup):
     same_xray_dropin(x, before['units'][X])
     need(xray_users(before['files']['main'], x, rows, before.get('transit')) == before['sockets'] and
          not any(port in reserved for p, a, port, owners in rows), 'RUNTIME_UNPROVED')
-    backup['phase'] = 'rolled-back'
-    write(path, rolling, entry(encode(backup)))
+    no_jobs(UNITS)
 
 
 def unique_profile(record):
@@ -2372,15 +2587,10 @@ def vpn_stop_checks(rows, units, *, require_xl_listener):
 
 
 def removal_sockets(rows, units, d, handoff, handoff_unit):
-    x, xl, ike = (units[name] for name in (X, XL, IKE))
     tproxy = d['tproxyPort']
-    expected = {('tcp', tproxy), ('udp', tproxy), ('tcp', handoff), ('udp', handoff)}
-    for p, address, n, owners in rows:
-        if n in (tproxy, handoff):
-            need((p, n) in expected and owners == [units[handoff_unit]['MainPID'] if n == handoff else x['MainPID']]
-                 and (n != handoff or address == '127.0.0.1'), 'RUNTIME_UNPROVED')
-            expected.discard((p, n))
-    need(not expected, 'RUNTIME_UNPROVED')
+    need(handoff != tproxy and sorted((p, owners) for p, _, n, owners in rows if n == tproxy)
+         == [(p, [units[X]['MainPID']]) for p in ('tcp', 'udp')], 'RUNTIME_UNPROVED')
+    verify_socks_handoff(rows, handoff, units[handoff_unit]['MainPID'])
     return {tproxy, 500, 4500, 1701} | ({handoff} if handoff_unit == X else set())
 
 
@@ -2489,7 +2699,27 @@ def owned_installation(request, *, remove_intent=None):
     return path, manifest, backup, intent
 
 
-def apply_network_snapshot(d, token, backup, record, generation, *, listeners_required=True):
+def verify_apply_handoff(rows, units, xpid, *, main_only=False):
+    bad = 'RUNTIME_UNPROVED'
+
+    def listeners(path):
+        record = read(path)
+        need(record is not None, bad)
+        return [i for i in json.loads(raw(record)).get('inbounds', []) if i.get('tag') == FOLLOW_RELAY_SOCKS]
+
+    main = listeners(MAIN)
+    if main_only and not main:
+        return  # BRIDGE is started by the caller after the fenced MAIN restart.
+    side = []
+    if not main_only and units[B]['ActiveState'] == 'active':
+        side = listeners(BRIDGE)
+    need(len(main) + len(side) == 1, bad)
+    handoff = (main or side)[0]
+    need(handoff.get('protocol') == 'socks' and handoff.get('listen') == '127.0.0.1', bad)
+    verify_socks_handoff(rows, handoff.get('port'), xpid if main else xray_argv(units[B], BRIDGE))
+
+
+def apply_network_snapshot(d, token, backup, record, generation, *, listeners_required=True, handoff_check=True):
     bad = 'ROLLBACK_DRIFT'
     before, runtime = runtime_before(backup), backup['runtime']
     legacy = legacy_network(record, d, 'bridge' in backup['after'])
@@ -2527,6 +2757,13 @@ def apply_network_snapshot(d, token, backup, record, generation, *, listeners_re
     need(all(addr in ('0.0.0.0', '*', '[::]') and owners == [xpid] for _, addr, owners in listeners), bad)
     ready = {proto for proto, _, _ in listeners} == {'tcp', 'udp'}
     need(ready or not listeners_required, 'RUNTIME_UNPROVED')
+    if ready and handoff_check:
+        try:
+            verify_apply_handoff(rows, units, xpid, main_only=not listeners_required)
+        except Refusal as error:
+            if listeners_required or str(error) != 'RUNTIME_UNPROVED':
+                raise
+            ready = False
     policy = network_projection(d, token, removing=True)
     need(policy == {'nft': runtime['nft'], 'rule': True, 'route': True} and policy['nft'] is not None, bad)
     no_jobs(UNITS)
@@ -2539,7 +2776,12 @@ def apply_network(request, action):
     path, manifest, backup, _ = owned_installation(request)
     record, generation = read(NET, 65536), remove_generation(NET)
     need(after_match(record, backup['after']['net']) and generation == backup['runtime']['files']['net'], 'ROLLBACK_DRIFT')
-    legacy, stable, main_invocation, _ = apply_network_snapshot(d, token, backup, record, generation)
+    # At restart entry the new files are already published, but MAIN still
+    # runs the old generation and BRIDGE may be stopped. The caller checked
+    # the old handoff before publishing; check MAIN after its restart and the
+    # effective pair in the final verify, never join new files to old sockets.
+    legacy, stable, main_invocation, _ = apply_network_snapshot(
+        d, token, backup, record, generation, handoff_check=action != 'restart-apply-network')
     if legacy and action == 'prepare-apply-network':
         replacement = entry(network_unit(d, 'bridge' in backup['after']), 0o644)
         pin = digest(raw(replacement))
@@ -2768,6 +3010,8 @@ def observe_removal(request, *, quiescent=False, active=False, remove_intent=Non
     bad = 'ROLLBACK_DRIFT'
     token, d = request['backupId'], request['network']
     path, manifest, backup, intent = owned_installation(request, remove_intent=remove_intent)
+    module_owner = module_boot_owner(backup)
+    check_module_boot_owner(module_owner)
     before, runtime = runtime_before(backup), backup['runtime']
     no_jobs(UNITS)
     boot_enrollment = removal_boot(before, backup, runtime)
@@ -2836,6 +3080,7 @@ def observe_removal(request, *, quiescent=False, active=False, remove_intent=Non
                 reserved=reserved, policy=policy, generations=generations, binary=binary,
                 boot_enrollment=boot_enrollment, ike_sockets=original_ike, manifest_generation=manifest_generation,
                 transit=transit, chap_after=chap_after, chap_digest=chap_digest, chap_expected=expected_chap, chap_backup=backup,
+                module_owner=module_owner,
                 **({'swanBackup': backup} if 'swan' in current else {}))
 
 
@@ -2907,8 +3152,7 @@ def removal_bridge_sockets(state, rows, b):
     need(removal_xray_sockets(rows, b['MainPID']) == state['bridge_sockets'], 'RUNTIME_UNPROVED')
     port = state['retained_handoff']
     if port is not None:
-        need(sorted((p, a, owners) for p, a, n, owners in rows if n == port)
-             == [(p, '127.0.0.1', [b['MainPID']]) for p in ('tcp', 'udp')], 'RUNTIME_UNPROVED')
+        verify_socks_handoff(rows, port, b['MainPID'])
 
 
 def removal_xray_ready(state, split):
@@ -2983,6 +3227,7 @@ def remove_installation(request, state, *, drain=None):
     # Keep the original residual guards, including unscoped/foreign state.
     if drain is None:
         removal_idle(request, sock_rows(), units)
+    check_module_boot_owner(state.get('module_owner'))
     # Retain the install manifest unchanged. Durable no-replace intent
     # prevents blind replay even if the first stop's result is unknown.
     intent_record = entry(encode({'baseline': state['baseline']}))
@@ -3118,6 +3363,7 @@ def remove_installation(request, state, *, drain=None):
          and remove_generation(XRAY) == state['binary'], STAGE)
     removal_files_after(state)
     removal_neighbors(state)
+    release_module_boot(state.get('module_owner'))
 
 
 SESSION_UNKNOWN = 'SESSION_COUNT_UNPROVED'
@@ -4718,8 +4964,7 @@ class PackageRunner:
         need((binary == '/usr/bin/dpkg' and len(args) == 1 and args[0] in (
               '--print-architecture', '--print-foreign-architectures', '--audit')) or
              (binary == '/usr/bin/dpkg-query' and args[0] == '-W') or
-             (binary == '/usr/bin/ps' and args == ['-e', '-o', 'pid=,comm=']) or
-             (binary == '/usr/bin/ss' and args == ['-H', '-aun', '( sport = :500 or sport = :4500 or sport = :1701 )']),
+             (binary == '/usr/bin/ps' and args == ['-e', '-o', 'pid=,comm=']),
              'IN_FLIGHT')
         return True
 
@@ -4790,6 +5035,7 @@ def package_preflight(machine):
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         package_no_pending()
+        check_package_observer_policy()
         _, _, commit = package_observation(guard, machine, fd, PackageRunner())
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
     return {'machineId': machine, 'packagePreparation': commit}
@@ -4825,6 +5071,7 @@ def prepare_packages(request):
             run = PackageRunner()
             plan, scope, commit = package_observation(guard, machine, fd, run)
             need(commit == request['packagePreparation'], 'BASELINE_CHANGED')
+            check_package_observer_policy()
             binding = {**scope, 'backupId': token, 'packagePreparation': commit}
             intent = entry(encode({**binding, 'phase': 'preparing'}))
             journaling = True
@@ -4878,11 +5125,232 @@ def prepare_packages(request):
     return {'ok': True, 'backupId': token, 'packagesReady': True}
 
 
+def recovery_stat(path):
+    parent, leaf = os.path.split(path)
+    try:
+        with directory(parent) as fd:
+            return os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def recovery_scan(path, refused, *, private=False):
+    with directory(path, private=private) as fd, os.scandir(fd) as rows:
+        for count, row in enumerate(rows):
+            need(count < 4096 and time.monotonic() < DEADLINE and not refused(row.name), 'IN_FLIGHT')
+
+
+def recovery_package_receipt(request, scope):
+    token = request['backupId']
+    path = VAULT + '/packages-' + token + '.json'
+    package_no_pending()
+    if not package_entry_exists(os.path.basename(path)):
+        need('packagePreparation' not in request, 'IN_FLIGHT')
+        return None
+    record = read(path, 1024)
+    value = json.loads(raw(record))
+    plan, phase = value['packagePreparation'], value['phase']
+    need(type(plan) is str and re.fullmatch(r'[a-f0-9]{64}', plan) and
+         request.get('packagePreparation', plan) == plan and phase in ('refused', 'ready') and
+         record == entry(encode({**scope, 'backupId': token, 'packagePreparation': plan, 'phase': phase})), 'IN_FLIGHT')
+    return value
+
+
+def recovery_package_artifacts():
+    guard = C3_PACKAGE_GUARD
+    # The terminal receipt proves the package writer joined. Independently
+    # refuse leftover containment; recovery never removes it.
+    need(recovery_stat(guard['POLICY']) is None, 'IN_FLIGHT')
+    mask_dir = '/var/lib/systemd/deb-systemd-helper-masked'
+    for name in guard['UNITS']:
+        state = recovery_stat(SYSTEM + '/' + name)
+        need((state is None or not stat.S_ISLNK(state.st_mode)) and
+             recovery_stat(mask_dir + '/' + name) is None, 'IN_FLIGHT')
+    for path in ('/usr/sbin', SYSTEM, guard['ARCHIVE_PARENT']):
+        if recovery_stat(path) is not None:
+            recovery_scan(path, lambda name: name.startswith('.relay-package-'))
+
+
+def recovery_cold_vpn():
+    # Corroborate the no-DIRECT-write proof without NETLINK_XFRM. These
+    # reads do not claim that arbitrary foreign XFRM policies are absent.
+    tasks = command('/usr/bin/ps', '-ww', '-e', '-o', 'pid=', '-o', 'comm=', quiet=True)
+    pids = {}
+    for row in tasks.splitlines():
+        match = re.fullmatch(rb'\s*([1-9][0-9]*) +([^\t]+)', row)
+        need(match is not None, 'IN_FLIGHT')
+        pid, name = cast(re.Match, match).groups()
+        need(pid not in pids and name not in (b'-', b'?')
+             and name.decode().lower() not in C3_PACKAGE_GUARD['DAEMONS'], 'IN_FLIGHT')
+        pids[pid] = name
+    need(pids.get(b'1') == b'systemd' and b'ps' in pids.values(), 'IN_FLIGHT')
+    # A plain RTM_GETLINK dump needs no link-kind provider. Check the named
+    # link type as well as the PPP name prefix: interfaces can be renamed.
+    result: Any = json.loads(command('/usr/sbin/ip', '-j', '-details', 'link', 'show', quiet=True))
+    need(type(result) is list, 'IN_FLIGHT')
+    links = cast(list[dict[str, Any]], result)
+    need(all(
+        isinstance(row, dict) and type(row.get('ifname')) is str and not row['ifname'].startswith('ppp')
+        and type(row.get('link_type')) is str and row['link_type'] != 'ppp'
+        and isinstance(row.get('linkinfo', {}), dict)
+        and row.get('linkinfo', {}).get('info_kind') not in ('xfrm', 'vti', 'vti6')
+        for row in links) and any(row['ifname'] == 'lo' and row['link_type'] == 'loopback' for row in links), 'IN_FLIGHT')
+    no_swan_rule()
+
+
+def recovery_empty(request):
+    d, token = request['network'], request['backupId']
+    fixed = (NFT_DIR, DROP_DIR, SWAN_PROFILE, PPP_PATH, XL_BOOT, SYSTEM + '/' + XL,
+             '/etc/nftables.d/celerity-l2tp.nft', NAMES['ike'], NAMES['options'], NET)
+    need(all(recovery_stat(path) is None for path in fixed), 'IN_FLIGHT')
+    for path in {SYSTEM, SWAN_DIR, *(os.path.dirname(p) for p in (*NAMES.values(), BRIDGE, PPP_PATH, XL_BOOT))}:
+        if recovery_stat(path) is not None:
+            recovery_scan(path, lambda name: name.startswith('.direct-'))
+    for path in (MAIN, BRIDGE):
+        record = read(path)
+        need((path == BRIDGE or record is not None) and
+             (record is None or not follow_relay_refs(unique_profile(record), shared=path == BRIDGE)), 'IN_FLIGHT')
+    for key in ('chap', 'secrets', 'starter', 'lns'):
+        record = read(NAMES[key])
+        if record is None:
+            continue
+        data = raw(record)
+        if key == 'lns':
+            need(is_stock_lns(record), 'IN_FLIGHT')
+        elif key == 'starter':
+            need(uncomment(data) in ([], [b'config setup'], [STOCK_IKE_INCLUDE], [b'config setup', STOCK_IKE_INCLUDE]), 'IN_FLIGHT')
+        else:
+            need(not uncomment(data) and CHAP_BEGIN not in data and CHAP_END not in data, 'IN_FLIGHT')
+    watched = (*UNITS, *C3_PACKAGE_GUARD['UNITS'])
+    no_jobs(watched)
+    for name in (XL, IKE, NET_UNIT):
+        info = unit(name)
+        need(info['LoadState'] in (('not-found',) if name == NET_UNIT else ('not-found', 'loaded'))
+             and info.get('ActiveState') == 'inactive' and info.get('SubState') == 'dead'
+             and info.get('MainPID') == '0' and not info.get('DropInPaths'), 'IN_FLIGHT')
+    missing = missing_network_observers()
+    # This exception is only for the unentered Install branch. Without socket
+    # or nft observers there is no independent proof here; never autoload.
+    need(not missing or missing == ['xfrm_user'], 'IN_FLIGHT')
+    need(not any(row[2] in (500, 4500, 1701, d['tproxyPort']) for row in sock_rows())
+         and network_projection(d, token) == {'nft': None, 'rule': False, 'route': False}, 'IN_FLIGHT')
+    if missing:
+        recovery_cold_vpn()
+    else:
+        need(vpn_empty(), 'IN_FLIGHT')
+    no_jobs(watched)
+
+
+def recovery_manifest(request, scope):
+    path, record, backup = read_manifest(request['backupId'])
+    phase, before, after = (backup[k] for k in ('phase', 'before', 'after'))
+    keys = {'phase', 'backupId', 'machineId', 'network', 'before', 'after'}
+    baseline_keys = {'boot', 'installLock', 'pppModules', 'files', 'units', 'bridge', 'sockets',
+                     'globalFiles', 'installBoot', 'ikeSockets', 'swanInputs'}
+    unit_keys = {'LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID',
+                 'FragmentPath', 'DropInPaths'}
+    need(keys <= set(backup) <= keys | {'runtime', 'nativePrepared', 'bootEnrollment', 'swanStart', 'swanGeneration',
+                                      'preparedSockets', 'modulePersistence'}
+         and record == entry(encode(backup)) and backup['backupId'] == request['backupId']
+         and backup['machineId'] == scope['machineId'] and encode(backup['network']) == encode(request['network'])
+         and baseline_keys <= set(before) <= baseline_keys | {'transit', 'nativePreparation'}
+         and before['boot'] == scope['boot'] and before['installLock'] == scope['installLock']
+         and type(before['installBoot']) is bool and type(before['ikeSockets']) is list
+         and ((type(before['sockets']) is list and 'preparedSockets' not in backup)
+              or (before['sockets'] is None and type(backup.get('preparedSockets')) is list
+                  and bool(backup['preparedSockets']) and any(name in before['pppModules'].get('observers', {})
+                                                            for name in SOCKET_OBSERVERS)))
+         and set(before['units']) == set(UNITS) and all(set(info) == unit_keys for info in before['units'].values())
+         and set(before['globalFiles']) == {'/etc/ppp/options', SWAN_CONF, XL_DEFAULT}
+         and set(before['files']) == set(NAMES) | {'swan'} and before['files']['swan'] is None
+         and set(after) - {'bridge'} == set(NAMES) | {'swan'}
+         and all(type(item) is dict and set(item) in ({'data', 'mode', 'gid'}, {'data', 'mode', 'gid', 'uid'})
+                 and isinstance(item['data'], str) and re.fullmatch(r'[a-f0-9]{64}', item['data'])
+                 for item in after.values()), 'IN_FLIGHT')
+    need(phase in ('installed', 'applying', 'rolled-back'), 'IN_FLIGHT')
+    # The legacy applying manifest precedes all native effects. The flock
+    # alone doesn't join an orphaned systemctl client. The stock swanStart
+    # receipt is written *after* the last native writer returns.
+    if phase != 'rolled-back':
+        started = backup['swanStart']
+        need(type(started) is list and len(started) == len(SWAN_START_UNITS)
+             and all(isinstance(birth, str) and re.fullmatch(r'[a-f0-9]{32}', birth) and int(birth, 16) for birth in started)
+             and len(set(started)) == len(started), 'IN_FLIGHT')
+        # swanStart follows all file writes; a mixed set now means drift, not
+        # an earlier stock applying transition that recovery may adopt.
+        main = load_after(backup, require_all=True)['main'] if phase == 'applying' else read(MAIN)
+        need(after_match(main, after['main']), 'IN_FLIGHT')
+        tag = 'relay-l2tp-' + request['nodeId']
+        need([row.get('tag') for row in unique_profile(main)['inbounds'] if
+              str(row.get('tag', '')).startswith('relay-l2tp-')] == [tag], 'IN_FLIGHT')
+    return path, record, backup
+
+
+def reconcile_install(request):
+    keys = {'action', 'machineId', 'nodeId', 'backupId', 'network', 'challenge'}
+    need(keys <= set(request) <= keys | {'packagePreparation'} and all(
+        type(request[k]) is str and re.fullmatch(r'[a-f0-9]{%d}' % length, request[k])
+        for k, length in (('machineId', 32), ('backupId', 32), ('nodeId', 24), ('challenge', 32))) and
+        ('packagePreparation' not in request or re.fullmatch(r'[a-f0-9]{64}', request['packagePreparation'])), 'IN_FLIGHT')
+    token, machine, node = (request[k] for k in ('backupId', 'machineId', 'nodeId'))
+    d = request['network']
+    need(type(d) is dict and set(d) == {'clientCidr', 'tproxyPort', 'fwmark', 'routeTable'}, 'IN_FLIGHT')
+    routing(d)
+    token_dir = VAULT + '/' + token
+    with directory(SYSTEM) as fd:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        scope = package_scope(machine, fd)
+        package = recovery_package_receipt(request, scope)
+        recovery_package_artifacts()
+        recovery_scan(VAULT, lambda name: name.startswith('.direct-'), private=True)
+        token_exists = package_entry_exists(token)
+        if not token_exists or recovery_stat(manifest_path(token)) is None:
+            need(package is not None, 'IN_FLIGHT')
+            marker_path = token_dir + '/' + INSTALL_ABSENT
+            fence = entry(encode({**scope, 'backupId': token, 'nodeId': node, 'network': d, 'package': package}))
+            if token_exists:
+                recovery_scan(token_dir, lambda name: name != INSTALL_ABSENT, private=True)
+                need(read(marker_path, 2048) == fence, 'IN_FLIGHT')
+            # Under the writer flock, a terminal package receipt plus ENOENT
+            # for the exact token (or our exact sole tombstone) proves that
+            # stock Install never reached its durable backup / first effect.
+            # A journal-less partial directory is NOT an empty preimage.
+            recovery_empty(request)
+            if not token_exists:
+                # Old Install exclusively creates this same directory before its
+                # first physical effect. A sidecar alone would not fence it.
+                mkdir(token_dir, 0o700)
+                write(marker_path, None, fence)
+            with directory(VAULT, private=True) as vault, directory(token_dir, private=True) as held:
+                os.fsync(held)
+                os.fsync(vault)
+            recovery_scan(token_dir, lambda name: name != INSTALL_ABSENT, private=True)
+            need(read(marker_path, 2048) == fence, 'IN_FLIGHT')
+            result = 'absent'
+        else:
+            require_network_observers()  # A manifest requires full rollback/readback proof.
+            need(package is None or package['phase'] == 'ready', 'IN_FLIGHT')
+            recovery_scan(token_dir, lambda name: name != 'manifest.json', private=True)
+            path, record, backup = recovery_manifest(request, scope)
+            if backup['phase'] == 'rolled-back':
+                verify_rollback(d, token, backup)
+                owner = module_boot_owner(backup)
+                need(owner is None or read(PPP_PATH, 4096) == owner[0], 'IN_FLIGHT')
+            else:
+                rollback(request, path, record, backup)
+            need(backup['phase'] == 'rolled-back' and read(path, 2 * MAX_FILE) == entry(encode(backup)), 'IN_FLIGHT')
+            result = 'rolled_back'
+        need(package_scope(machine, fd) == scope and recovery_package_receipt(request, scope) == package, 'IN_FLIGHT')
+    need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    return {'nodeId': node, 'backupId': token, 'machineId': machine, 'challenge': request['challenge'], 'result': result}
+
+
 def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
     lock_id = install_lock_identity(lock_fd)
     modules = observe_ppp_preparation()
-    require_network_observers()
-    before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner)
+    deferred = tuple(modules.get('observers', {}))
+    before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner,
+                     **({'deferred': deferred} if deferred else {}))
     need(install_lock_identity(lock_fd) == lock_id, 'BASELINE_CHANGED')
     return {**before, 'pppModules': modules, 'installLock': lock_id}
 
@@ -4891,6 +5359,8 @@ def dispatch(request: dict[str, Any]):
     global STAGE, NO_INSTALL_WRITES
     need(os.geteuid() == 0 and type(request) is dict, 'PREREQUISITE')
     action = request['action']
+    if action == 'reconcile-install':
+        return reconcile_install(request)
     if action == 'prepare-packages':
         NO_INSTALL_WRITES = False
         return prepare_packages(request)
@@ -4961,6 +5431,7 @@ def dispatch(request: dict[str, Any]):
                 return inspect_chap(request)
             return sync_chap(request, write_changes=action == 'sync-chap')
         if action in ('prepare-remove', 'remove'):
+            require_network_observers()
             token = request['backupId']
             keys = {'action', 'machineId', 'backupId', 'network', 'nodeId'}
             keys |= {'baseline'} if action == 'remove' else set()
@@ -5005,11 +5476,15 @@ def dispatch(request: dict[str, Any]):
                 NO_INSTALL_WRITES = False
                 install(request, before, after, fd)
         else:
+            require_network_observers()
             path, record, backup = bound_manifest(request)
             if action == 'verify':
                 need(installed_phase(backup['phase']), 'RUNTIME_UNPROVED')
                 if 'pppModules' in backup['before']:
-                    modules = observe_ppp_preparation()
+                    owner = module_boot_owner(backup)
+                    check_module_boot_owner(owner)
+                    observers = backup['before']['pppModules'].get('observers', {})
+                    modules = observe_ppp_preparation(observers, installed=owner[1]) if owner else observe_ppp_preparation()
                     need(not modules['missing'] and not modules['persist'], 'RUNTIME_UNPROVED')
                 files = load_after(backup, require_all=True)
                 need(installed_runtime(d, token, runtime_before(backup), files) == backup['runtime'], 'RUNTIME_UNPROVED')
@@ -5029,7 +5504,7 @@ def main():
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
         request = json.loads(wire)
         action = request.get('action') if type(request) is dict else None
-        if action == 'prepare-packages':
+        if action in ('prepare-packages', 'reconcile-install'):
             need(len(wire) <= 1024, 'CANDIDATE_INVALID')
 
             def unique_fields(pairs):
@@ -5038,17 +5513,18 @@ def main():
                 return value
 
             request = json.loads(wire, object_pairs_hook=unique_fields)
-            DEADLINE = PACKAGE_PREPARE_DEADLINE
+            if action == 'prepare-packages':
+                DEADLINE = PACKAGE_PREPARE_DEADLINE
             need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
         result = dispatch(request)
-        if action == 'prepare-packages' or action == 'preflight' and 'packagePreparation' in result:
+        if action in ('prepare-packages', 'reconcile-install') or action == 'preflight' and 'packagePreparation' in result:
             need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
     except (subprocess.TimeoutExpired, BlockingIOError):
         return 75
     except Refusal as error:
-        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or NATIVE_PREPARING or str(error) == 'IN_FLIGHT':
+        if action == 'reconcile-install' or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or NATIVE_PREPARING or str(error) == 'IN_FLIGHT':
             return 75
-        if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED):
+        if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED, MODULE_BLACKLISTED, OBSERVATION_REQUIRED):
             return 75
         if isinstance(error, PackageDiagnostic):
             if time.monotonic() >= DEADLINE:
@@ -5072,7 +5548,7 @@ def main():
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
-        if REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or PPP_PREPARING or NATIVE_PREPARING:
+        if action == 'reconcile-install' or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or PPP_PREPARING or NATIVE_PREPARING:
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else

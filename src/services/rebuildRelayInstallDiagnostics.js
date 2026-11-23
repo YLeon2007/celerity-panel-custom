@@ -8,6 +8,7 @@ const hostChecks = new Map([
     ['PPP_MODULES_REQUIRED', 'PPP_MODULES_REQUIRED', 'shared-prerequisite'],
     ['PPP_MODULES_PERSISTENCE_CONFLICT', 'PPP_MODULES_PERSISTENCE_CONFLICT', 'shared-prerequisite'],
     ['PPP_MODULES_LOAD_FAILED', 'PPP_MODULES_LOAD_FAILED', 'shared-prerequisite'],
+    ['KERNEL_MODULE_BLACKLISTED', 'KERNEL_MODULE_BLACKLISTED', 'shared-prerequisite'],
     ['NETWORK_OBSERVATION_REQUIRED', 'NETWORK_OBSERVATION_REQUIRED', 'shared-prerequisite'],
     ['IKE_ACTIVE_RULE_220', 'IKE_ACTIVE_RULE_220', 'pre-write-only'],
     ['RULE_220_CONFLICT', 'RULE_220_CONFLICT', 'pre-write-only'],
@@ -37,7 +38,8 @@ const profileChecks = new Map([
 const packageChecks = new Set([
     'PACKAGE_SOURCES_UNSUPPORTED', 'PACKAGE_INDEXES_UNVERIFIED', 'PACKAGE_SERVICES_UNSAFE', 'PACKAGE_APT_PLAN',
 ]);
-const packageRefusals = new Map([...packageChecks, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'].map(id => [`DIRECT_${id}\n`, id]));
+const packageRefusals = new Map([...packageChecks, 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'KERNEL_MODULE_BLACKLISTED']
+    .map(id => [`DIRECT_${id}\n`, id]));
 const packageUncertain = new Map([...packageChecks].map(id => [`DIRECT_UNCERTAIN_${id}\n`, id]));
 // Only called for prepare-packages. Neither form certifies settlement of a write.
 function packageWriteCheck(result) {
@@ -51,7 +53,9 @@ const installCheckIds = Object.freeze([...checks]);
 const isInstallCheck = check => checks.has(check);
 const isInstallStage = action => stages.has(action);
 function specificHostRefusal(action, suffix, noWrite) {
-    if (action === 'preflight' && !noWrite && packageChecks.has(suffix)) return { check: suffix, prerequisitePartial: false };
+    if (action === 'preflight' && !noWrite && (packageChecks.has(suffix) || suffix === 'KERNEL_MODULE_BLACKLISTED')) {
+        return { check: suffix, prerequisitePartial: false };
+    }
     const match = hostChecks.get(suffix);
     if (!isInstallStage(action) || !match) return undefined;
     if (match.scope === 'prepare-only' && action !== 'prepare') return undefined;

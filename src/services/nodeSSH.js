@@ -381,21 +381,32 @@ class NodeSSH {
     async #exec(command, options = {}, verifyBeforeStdin, assertConnection) {
         const guarded = !this.usePool && verifyBeforeStdin !== undefined;
         const watched = guarded || assertConnection;
+        let stdinAttempted = false;
+        const asFailure = error => {
+            // This certifies no payload was submitted, not that the exec
+            // request or a stdin-free command did not reach the peer.
+            if (guarded && assertConnection && !stdinAttempted) {
+                const refusal = createExecStdinError();
+                stdinNotAttempted.add(refusal);
+                return refusal;
+            }
+            return error;
+        };
         try { if (assertConnection) assertConnection(); else this.#assertPinnedEndpoint(); }
-        catch (error) { throw guarded ? createExecStdinError() : error; }
+        catch (error) { throw asFailure(guarded ? createExecStdinError() : error); }
         if (this.usePool) {
             return sshPool.exec(this.node, command, options, this.#hostKeyOptions);
         }
 
         const includesStdin = hasExecStdin(options);
         if (guarded && (!includesStdin || !this.#hostKeyOptions || typeof verifyBeforeStdin !== 'function')) {
-            throw createExecStdinError();
+            throw asFailure(createExecStdinError());
         }
         const client = this.directClient;
 
         return new Promise((resolve, reject) => {
             if (!client) {
-                reject(includesStdin ? createExecStdinError() : new Error('SSH not connected'));
+                reject(asFailure(includesStdin ? createExecStdinError() : new Error('SSH not connected')));
                 return;
             }
 
@@ -417,7 +428,7 @@ class NodeSSH {
                     discardLateExecStream(pendingStream);
                     pendingStream = undefined;
                 }
-                if (error) reject(error);
+                if (error) reject(asFailure(error));
                 else resolve(result);
             };
             // Match the explicit runner exec budget without changing the legacy
@@ -495,6 +506,9 @@ class NodeSSH {
                         });
 
                     const startStdin = () => {
+                        // Latch before entering the writer: even a synchronous
+                        // error from stream.write cannot prove zero bytes.
+                        stdinAttempted = true;
                         stdinController = writeExecStdin(stream, options.stdin, {
                             onComplete() {
                                 stdinComplete = true;
@@ -1098,4 +1112,6 @@ NodeSSH._cpuSamples = new Map();
 NodeSSH._activeDirect = 0;
 NodeSSH._waitQueue = [];
 
+const stdinNotAttempted = new WeakSet();
 module.exports = NodeSSH;
+module.exports.execStdinWasNotAttempted = error => stdinNotAttempted.has(error);

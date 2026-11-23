@@ -1,7 +1,7 @@
 'use strict';
 
 const { publicInstallFailure } = require('../../services/rebuildRelayInstallDiagnostics');
-const { identityChanged, grantEffectStatus } = require('./rebuildRelayAdmission');
+const { identityChanged, grantEffectStatus, validActor } = require('./rebuildRelayAdmission');
 
 function handler(service = () => require('../../services/rebuildService').createRebuildService()) {
     return async (req, res) => {
@@ -11,7 +11,11 @@ function handler(service = () => require('../../services/rebuildService').create
             return res.status(400).json({ error: { code: 'REBUILD_INVALID_REQUEST', outcome: 'refused' } });
         }
         try {
-            const result = await service().installRelay(req.params.id);
+            // New reservations bind recovery to the same authenticated admin.
+            // Never accept an actor (or any recovery witness) from the request body.
+            const actor = req.session?.adminUsername;
+            const result = await service().installRelay(req.params.id,
+                req.session?.authenticated === true && validActor(actor) ? { actor } : undefined);
             if (result?.status !== 'installed' || (result.nodeId !== undefined && result.nodeId !== req.params.id)) {
                 return res.status(503).json({ error: { outcome: 'unknown', retryAllowed: false } });
             }

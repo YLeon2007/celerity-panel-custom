@@ -6,6 +6,7 @@ const { Types } = require('mongoose');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { transactOnce, AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError } = require('./rebuildRelayInstallTransaction');
 const { readDirectory, checkDirectory, writeDirectory, logicalAccount } = require('./rebuildRelayDirectory');
+const { createRecoveryStore, plain } = require('./rebuildRelayInstallRecoveryStore');
 
 const fail = code => Object.assign(new Error(code), { code });
 const STATE_CHANGED = 'REBUILD_L2TP_RESERVATION_CHANGED';
@@ -55,7 +56,7 @@ function createStore(State, User, listMode) {
     // no source and only one login. Only legacy no-list supports standalone.
     const mutate = work => listMode ? transactOnce(State, User, work) : work();
 
-    async function reserve({ nodeId, prior, machineId, backupId, state, accounts, sourceSnapshot, inherited }, verifyLock) {
+    async function reserve({ nodeId, prior, machineId, backupId, packagePreparation, state, accounts, sourceSnapshot, inherited, recovery }, verifyLock) {
         if (!Array.isArray(accounts) || accounts.length === 0 || (!listMode && accounts.length !== 1)) throw fail(STATE_CHANGED);
         const now = new Date();
         const stateId = prior?._id ?? nodeId;
@@ -74,6 +75,9 @@ function createStore(State, User, listMode) {
             // Prepare can take time. Recheck the source and absence of target
             // accounts before making any row durable.
             if (!equal(await sourceRows(nodeId, session), sourceSnapshot)) throw fail(STATE_CHANGED);
+            const journal = recovery && createRecoveryStore(State, User);
+            const preimage = journal && await journal.snapshot(nodeId, session);
+            if (journal && !equal(preimage && plain(preimage), prior ?? null)) throw fail(STATE_CHANGED);
             await verifyLock();
             if (!session) reservationMayPersist = true;
             const options = writeIn(session);
@@ -89,6 +93,11 @@ function createStore(State, User, listMode) {
             for (const row of replicas) {
                 requireOne(await updateOnce(User, { _id: row._id }, { $setOnInsert: row },
                     { ...options, upsert: true }), 'upsertedCount');
+            }
+            if (journal) {
+                const receipt = await journal.capture({ nodeId, backupId, machineId, packagePreparation, prior: preimage, replicas,
+                    actor: recovery.actor, authority: recovery.authority, key: recovery.key }, session);
+                await recovery.owner.bind(State.db, session, receipt);
             }
             await verifyLock();
             reservationMayPersist = true; // Next step in list mode: one-shot commit.

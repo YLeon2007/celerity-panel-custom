@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { Types, mongo } = require('mongoose');
 const { createRebuildService } = require('../rebuildService');
+const { createRebuildRelayInstallRecovery } = require('../rebuildRelayInstallRecovery');
 const { makeDesired } = require('../rebuildRelayBackendDesired');
 const { makeLocks, withNode } = require('../rebuildLocks');
 const { decrypt, encrypt } = require('../../modules/relay-l2tp/services/secretBoxService');
@@ -18,10 +19,12 @@ const { bindDirectory } = require('./helpers/rebuildRelayDirectoryFixture');
 const id = 'a'.repeat(24), machineId = 'b'.repeat(32), backupId = 'rebuild-unique-backup';
 const oid = value => new Types.ObjectId(value);
 const copy = value => mongo.BSON.deserialize(mongo.BSON.serialize(value));
+const projectedCopy = (value, promoteValues = true) => mongo.BSON.deserialize(mongo.BSON.serialize(value), { promoteValues });
+const sameBson = (a, b) => mongo.BSON.serialize(a).equals(mongo.BSON.serialize(b));
 const matches = (row, where) => Object.entries(where).every(([key, value]) => {
     if (key === '$expr') {
         assert.equal(value.$eq[0], '$$ROOT');
-        return equal(row, value.$eq[1].$literal);
+        return sameBson(row, value.$eq[1].$literal);
     }
     if (key === '$or') return value.some(filter => matches(row, filter));
     if (key === '$nor') return !value.some(filter => matches(row, filter));
@@ -33,12 +36,12 @@ const matches = (row, where) => Object.entries(where).every(([key, value]) => {
     if (value === null) return row[key] == null;
     return equal(row[key], value);
 });
-function project(row, projection) {
+function project(row, projection, promoteValues) {
     if (!row) return null;
     const columns = Object.keys(projection ?? {});
-    if (columns.some(key => projection[key] === 1)) return copy(Object.fromEntries(
-        Object.entries(row).filter(([key]) => key === '_id' || projection[key] === 1)));
-    return copy(Object.fromEntries(Object.entries(row).filter(([key]) => projection?.[key] !== 0)));
+    if (columns.some(key => projection[key] === 1)) return projectedCopy(Object.fromEntries(
+        Object.entries(row).filter(([key]) => key === '_id' || projection[key] === 1)), promoteValues);
+    return projectedCopy(Object.fromEntries(Object.entries(row).filter(([key]) => projection?.[key] !== 0)), promoteValues);
 }
 
 // Real Mongoose schemas, casting and projections. Only the backing collection
@@ -61,7 +64,9 @@ function bind(t, model, data, traces) {
                 rows.push(copy(update.$setOnInsert));
                 return { acknowledged: true, upsertedCount: 1, matchedCount: 0 };
             }
-            if (index !== -1) {
+            if (index !== -1 && Array.isArray(update)) {
+                rows[index] = update[0].$replaceWith.$literal;
+            } else if (index !== -1) {
                 Object.assign(rows[index], copy(update.$set ?? {}));
                 for (const key of Object.keys(update.$unset ?? {})) delete rows[index][key];
             }
@@ -71,8 +76,12 @@ function bind(t, model, data, traces) {
     };
     t.mock.method(model.collection, 'findOne', async (where, { projection, session } = {}) => project(
         selectRows(session).find(row => matches(row, where)), projection));
-    t.mock.method(model.collection, 'find', (where, { projection, limit, session } = {}) => ({
-        toArray: async () => selectRows(session).filter(row => matches(row, where)).slice(0, limit).map(row => project(row, projection)),
+    t.mock.method(model.collection, 'find', (where, { projection, limit, session, sort, promoteValues } = {}) => ({
+        toArray: async () => {
+            const rows = selectRows(session).filter(row => matches(row, where));
+            if (sort) rows.sort((a, b) => String(a._id).localeCompare(String(b._id)));
+            return rows.slice(0, limit).map(row => project(row, projection, promoteValues));
+        },
     }));
     t.mock.method(model.collection, 'countDocuments', async (where, { session } = {}) =>
         selectRows(session).filter(row => matches(row, where)).length);
@@ -107,20 +116,42 @@ function fixture(t, planBackupId = backupId) {
     const userHooks = bind(t, User, users, events);
     bind(t, Node, nodes, events);
     bind(t, Link, links, events);
-    let lock;
+    const locks = [];
+    const lockRows = session => session ? session.rows.get(locks) : locks;
+    const lockHooks = {};
     const lockCollection = {
         async insertOne(row) {
-            if (lock) throw Object.assign(new Error('duplicate'), { code: 11000 });
-            lock = row;
+            if (locks.length) throw Object.assign(new Error('duplicate'), { code: 11000 });
+            locks.push(row);
             return { acknowledged: true };
         },
-        async findOne(filter) { return lock && matches(lock, filter) ? lock : null; },
-        async deleteMany(filter) {
-            const matched = !!lock && matches(lock, filter);
-            if (matched) lock = null;
+        async findOne(filter, options) {
+            const row = lockRows(options?.session).find(row => matches(row, filter));
+            return row ? copy(row) : null;
+        },
+        async updateMany(filter, update, options) {
+            assert.ok(options.session || options.writeConcern?.w === 'majority');
+            const row = lockRows(options.session).find(row => matches(row, filter));
+            if (row) {
+                for (const [key, value] of Object.entries(update.$set ?? {})) {
+                    if (key === 'installRecovery.phase') row.installRecovery.phase = value;
+                    else row[key] = value;
+                }
+                for (const key of Object.keys(update.$unset ?? {})) delete row[key];
+            }
+            return { acknowledged: true, matchedCount: Number(!!row) };
+        },
+        async deleteMany(filter, options) {
+            const rows = lockRows(options?.session);
+            const index = rows.findIndex(row => matches(row, filter));
+            const matched = index >= 0 && !lockHooks.refuseRelease;
+            if (matched) rows.splice(index, 1);
             return { acknowledged: true, deletedCount: Number(matched) };
         },
     };
+    const originalCollection = State.db.collection.bind(State.db);
+    t.mock.method(State.db, 'collection', (name, ...args) => name === 'c3_rebuild_locks' ? lockCollection
+        : originalCollection(name, ...args));
     const plan = { backupId: planBackupId };
     let prepared;
     const hooks = {
@@ -138,12 +169,12 @@ function fixture(t, planBackupId = backupId) {
             assert.equal(driverEnv, env);
             if (String(node._id) !== id) {
                 events.push('source-connect');
-                assert.ok(lock);
+                assert.ok(locks[0]);
                 return {
                     async checkChap(installation, current, desired, guard) {
                         await guard();
                         events.push('source-check');
-                        assert.ok(lock);
+                        assert.ok(locks[0]);
                         return hooks.checkChap(installation, current, desired);
                     },
                     async close() { events.push('source-close'); },
@@ -171,9 +202,10 @@ function fixture(t, planBackupId = backupId) {
         return create().installRelay;
     };
     return { env, events, create, enroll, enrollment, nodes, links, states, users, hooks, stateHooks, userHooks, directory,
+        deps, locks, lockCollection, lockHooks, plan,
         get prepared() { return prepared; },
-        get lockHeld() { return !!lock; },
-        loseLock: () => { lock = undefined; } };
+        get lockHeld() { return !!locks[0]; },
+        loseLock: () => { locks.length = 0; } };
 }
 
 function priorRow() {
@@ -214,7 +246,7 @@ function sessionFixture(t, f) {
         startTransaction(options) {
             assert.deepEqual(options, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
             this.active = true;
-            this.rows = new Map([f.states, f.users, f.nodes, f.links].map(rows => [rows, rows.map(copy)]));
+            this.rows = new Map([f.states, f.users, f.nodes, f.links, f.locks].map(rows => [rows, rows.map(row => copy(row))]));
         }
         inTransaction() { return this.active; }
         abortTransaction() { events.push('abort'); this.active = false; }
@@ -231,7 +263,7 @@ function sessionFixture(t, f) {
         }
     }
     function commit(session) {
-        for (const rows of [f.states, f.users]) rows.splice(0, rows.length, ...session.rows.get(rows));
+        for (const rows of [f.states, f.users, f.locks]) rows.splice(0, rows.length, ...session.rows.get(rows));
         session.commitAccountIntent?.();
         session.commitDirectory?.();
         return { ok: 1 };
@@ -249,6 +281,246 @@ function sessionFixture(t, f) {
     } }));
     return { events, hooks };
 }
+
+function recoveryFixture(t, { prior = false, source = false, pkg = false } = {}) {
+    const planId = 'f'.repeat(32), actor = 'fixture-admin';
+    const f = fixture(t, planId);
+    const tx = sessionFixture(t, f);
+    const before = prior ? priorRow() : null;
+    if (before) f.states.push(copy(before));
+    const neighbor = source && addSource(f);
+    const enrollment = f.enrollment();
+    f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(enrollment);
+    let generation = 'original-grant', recovered = 0, closed = 0, packageBackup;
+    const relayGrantStore = { snapshot: async () => ({ env: f.env,
+        grants: [{ nodeId: id, generation }], sourceFor: n => n === id ? 'db' : 'env' }) };
+    const hooks = { reconcile: async (_input, verifyLock) => { await verifyLock(); return 'absent'; },
+        close: async () => {} };
+    const installDeps = { ...f.deps, relayGrantStore, actor, createRelayDirect: options => {
+        const direct = f.deps.createRelayDirect(options);
+        return { ...direct, async preparePackages(backup, guard) { await guard(); packageBackup = backup; return true; } };
+    } };
+    if (pkg) {
+        f.hooks.preflight = async () => ({ machineId, packagePreparation: '9'.repeat(64) });
+        f.hooks.prepare = () => { f.plan.backupId = packageBackup; return f.plan; };
+    }
+    // Use the actual Install producer and the actual lock for the admission
+    // receipt. The remote deliberately loses its reply at the first write.
+    f.hooks.install = async guard => { await guard(); throw new Error('unacknowledged install'); };
+    const install = target => f.create(installDeps).installRelay(target, { actor });
+    const create = overrides => createRebuildRelayInstallRecovery({ ...installDeps,
+        locks: makeLocks(f.lockCollection), createRelayDirect: async ({ fence }) => {
+            assert.equal(fence.source, 'db');
+            return {
+                async reconcileInstall(input, verifyLock) { recovered++; return hooks.reconcile(input, verifyLock); },
+                async close() { closed++; return hooks.close(); },
+            };
+        }, ...overrides });
+    return { f, tx, before, neighbor, actor, install, create, hooks, generation: value => { generation = value; },
+        get recovered() { return recovered; }, get closed() { return closed; },
+        get backupId() { return pkg ? packageBackup : planId; } };
+}
+
+const notConfirmed = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED', retryAllowed: false };
+const recoveryBlocked = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_BLOCKED', retryAllowed: false };
+
+test('Install recovery: absent and rolled-back receipts restore only this relay, or preserve unresolved ownership', async t => {
+    for (const result of ['absent', 'rolled_back', 'unsafe']) await t.test(result, async t => {
+        const r = recoveryFixture(t, { prior: result === 'rolled_back', pkg: result === 'rolled_back', source: true });
+        const { f } = r;
+        const directory = { _id: 'directory', version: 1, generation: require('node:crypto').randomUUID(),
+            accounts: r.neighbor.users.map(({ _id, login, enabled, passwordEncrypted }) =>
+                ({ id: String(_id), login, enabled, passwordEncrypted })) };
+        await f.directory.updateMany({ _id: 'directory', generation: directory.generation }, { $setOnInsert: directory },
+            { upsert: true, writeConcern: { w: 'majority' } });
+        await assert.rejects(r.install(id), { retryAllowed: false });
+        const target = f.states.find(row => String(row.node) === id);
+        assert.equal(target.backupId, r.backupId);
+        assert.equal(f.locks[0].installRecovery.phase, 'ready');
+        assert.deepEqual(await f.deps.locks.status(), { locked: true, stale: false });
+        const original = copy({ states: f.states, users: f.users, locks: f.locks });
+        r.hooks.reconcile = async (input, guard) => {
+            assert.deepEqual(input, { nodeId: id, backupId: r.backupId,
+                network: { clientCidr: target.clientCidr, tproxyPort: target.tproxyPort, fwmark: target.fwmark, routeTable: target.routeTable },
+                ...(result === 'rolled_back' && { packagePreparation: '9'.repeat(64) }) });
+            await guard();
+            return result;
+        };
+        if (result === 'unsafe') {
+            await assert.rejects(r.create()(id), notConfirmed);
+            assert.deepEqual(f.states, original.states);
+            assert.deepEqual(f.users, original.users);
+            const { installRecoveryClaim, ...stillHeld } = f.locks[0];
+            assert.ok(installRecoveryClaim);
+            assert.deepEqual(stillHeld, original.locks[0]);
+            await assert.rejects(r.create()(id), recoveryBlocked);
+        } else {
+            assert.deepEqual(await r.create()(id), { status: 'can_install_again' });
+            assert.equal(f.lockHeld, false);
+            assert.deepEqual(f.users, r.neighbor.users);
+            assert.ok(sameBson({ state: f.states.find(row => String(row.node) === id) ?? null }, { state: r.before }));
+            assert.deepEqual(f.states.find(row => String(row.node) === sourceId), r.neighbor.state);
+        }
+        assert.deepEqual(await f.directory.findOne({ _id: 'directory' }, { readConcern: { level: 'majority' } }), directory);
+        assert.equal(r.recovered, 1);
+        assert.equal(r.closed, 1);
+    });
+});
+
+test('Install recovery: wrong generations, actor, credentials, scope or a legacy singleton never reach DIRECT', async t => {
+    for (const [name, change] of Object.entries({
+        actor: r => ({ actor: `${r.actor}-other` }),
+        missing: r => { r.f.locks.length = 0; },
+        ordinary: r => { r.f.locks[0].allowStaleUnlock = true; },
+        legacy: r => { delete r.f.locks[0].installRecovery; r.f.locks[0].heartbeat = new Date(0); },
+        active: r => { r.f.locks[0].installRecovery.phase = 'installing'; r.f.locks[0].heartbeat = new Date(0); },
+        target: r => { r.f.locks[0].installRecovery.nodeId = sourceId; },
+        lockGeneration: r => { r.f.locks[0].token = require('node:crypto').randomUUID(); },
+        grantGeneration: r => r.generation('new-grant-same-binding'),
+        key: r => { r.f.env.ENCRYPTION_KEY += 'changed'; },
+        hostKey: r => { const [row] = r.f.enrollment(); row.sshHostKeySha256 = '2'.repeat(64);
+            r.f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([row]); },
+        machine: r => { const [row] = r.f.enrollment(); row.machineId = '3'.repeat(32);
+            r.f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([row]); },
+        state: r => { r.f.states[0].unexpected = true; },
+        backup: r => { r.f.states[0].backupId = '2'.repeat(32); },
+        copies: r => { r.f.users[0].unexpected = true; },
+        duplicate: r => { r.f.states.push({ ...r.f.states[0], _id: oid() }); },
+    })) await t.test(name, async t => {
+        const r = recoveryFixture(t);
+        await assert.rejects(r.install(id), { retryAllowed: false });
+        const overrides = change(r);
+        const original = copy({ states: r.f.states, users: r.f.users, locks: r.f.locks });
+        await assert.rejects(r.create(overrides)(id), recoveryBlocked);
+        assert.deepEqual({ states: r.f.states, users: r.f.users, locks: r.f.locks }, original);
+        assert.equal(r.recovered, 0);
+    });
+});
+
+test('Install recovery: neither active Install nor another recovery admits a competing claimant', async t => {
+    const r = recoveryFixture(t);
+    const entered = deferred(), release = deferred();
+    r.f.hooks.install = async guard => { await guard(); entered.done(); await release.promise; throw new Error(); };
+    const installing = assert.rejects(r.install(id), { retryAllowed: false });
+    await entered.promise;
+    assert.equal(r.f.locks[0].installRecovery.phase, 'installing');
+    await assert.rejects(r.create()(id), recoveryBlocked);
+    release.done();
+    await installing;
+    const inFlight = deferred(), settled = deferred();
+    r.hooks.reconcile = async (_input, guard) => { await guard(); inFlight.done(); await settled.promise; return 'absent'; };
+    const recovery = r.create()(id);
+    await inFlight.promise;
+    await assert.rejects(r.create()(id), recoveryBlocked);
+    await assert.rejects(r.install(id), { code: 'REBUILD_BUSY' });
+    settled.done();
+    assert.deepEqual(await recovery, { status: 'can_install_again' });
+    assert.equal(r.recovered, 1);
+});
+
+test('Install recovery: unclassified transport failures, even before a reported guard, preserve the reservation', async t => {
+    for (const cut of ['before guard', 'after guard', 'close']) await t.test(cut, async t => {
+        const r = recoveryFixture(t);
+        await assert.rejects(r.install(id), { retryAllowed: false });
+        const original = copy({ states: r.f.states, users: r.f.users });
+        const originalToken = r.f.locks[0].token;
+        r.hooks.reconcile = async (_input, guard) => {
+            if (cut !== 'before guard') await guard();
+            if (cut !== 'close') throw Object.assign(new Error('private transport fault'), { noRequestSent: true });
+            return 'rolled_back';
+        };
+        if (cut === 'close') r.hooks.close = () => { throw new Error('private close fault'); };
+        await assert.rejects(r.create()(id), notConfirmed);
+        assert.deepEqual({ states: r.f.states, users: r.f.users }, original);
+        assert.equal(r.f.locks[0].token, originalToken);
+        assert.equal(r.closed, 1);
+        assert.deepEqual(r.tx.events, ['commit', 'commit']);
+        await assert.rejects(r.create()(id), recoveryBlocked);
+        assert.equal(r.recovered, 1);
+    });
+});
+
+test('Install recovery: claim cleanup failure after acknowledged COMMIT releases only the exact undispatched claim', async t => {
+    for (const drift of [false, true]) await t.test(drift ? 'CAS drift' : 'exact claim', async t => {
+        const r = recoveryFixture(t);
+        await assert.rejects(r.install(id), { retryAllowed: false });
+        const before = copy({ states: r.f.states, users: r.f.users, locks: r.f.locks });
+        r.tx.hooks.end = () => {
+            assert.ok(r.f.locks[0].installRecoveryClaim, 'claim commit must have landed');
+            if (drift) r.f.locks[0].unexpected = 'independently changed';
+            throw new Error('private session cleanup fault');
+        };
+        await assert.rejects(r.create()(id), drift ? notConfirmed : recoveryBlocked);
+        assert.equal(r.recovered, 0);
+        assert.deepEqual(r.tx.events, ['commit', 'commit']);
+        if (drift) {
+            assert.ok(r.f.locks[0].installRecoveryClaim);
+            assert.equal(r.f.locks[0].unexpected, 'independently changed');
+        } else {
+            assert.deepEqual({ states: r.f.states, users: r.f.users, locks: r.f.locks }, before);
+            delete r.tx.hooks.end;
+            assert.deepEqual(await r.create()(id), { status: 'can_install_again' });
+        }
+    });
+});
+
+test('Install recovery: an unacknowledged claim COMMIT neither dispatches nor clears a possibly committed claim', async t => {
+    const r = recoveryFixture(t);
+    await assert.rejects(r.install(id), { retryAllowed: false });
+    r.tx.hooks.commit = write => { write(); throw Error('private lost claim ACK'); };
+    await assert.rejects(r.create()(id), notConfirmed);
+    assert.ok(r.f.locks[0].installRecoveryClaim);
+    await assert.rejects(r.create()(id), recoveryBlocked);
+    assert.equal(r.recovered, 0);
+    assert.deepEqual(r.tx.events, ['commit', 'commit']);
+});
+
+test('Install recovery: the original transport must close before handing back its lock', async t => {
+    const r = recoveryFixture(t);
+    r.f.hooks.close = () => { throw new Error('private original close fault'); };
+    await assert.rejects(r.install(id), { retryAllowed: false });
+    assert.equal(r.f.locks[0].installRecovery.phase, 'installing');
+    await assert.rejects(r.create()(id), recoveryBlocked);
+    assert.equal(r.recovered, 0);
+});
+
+test('Install recovery: a final lock CAS miss aborts earlier copy and state CAS writes', async t => {
+    const r = recoveryFixture(t, { prior: true, source: true });
+    await assert.rejects(r.install(id), { retryAllowed: false });
+    const original = copy({ states: r.f.states, users: r.f.users });
+    const originalToken = r.f.locks[0].token;
+    r.f.lockHooks.refuseRelease = true;
+    await assert.rejects(r.create()(id), notConfirmed);
+    assert.deepEqual(r.f.events.slice(-3), ['L2tpUser:delete', 'L2tpUser:delete', 'RelayL2tpState:update']);
+    assert.deepEqual(r.tx.events, ['commit', 'commit', 'abort']);
+    assert.deepEqual({ states: r.f.states, users: r.f.users }, original);
+    assert.equal(r.f.locks[0].token, originalToken);
+    assert.ok(r.f.locks[0].installRecoveryClaim);
+});
+
+test('Install recovery: lost settlement response is not replayed regardless of whether commit landed', async t => {
+    for (const committed of [false, true]) await t.test({ false: 'uncommitted', true: 'committed' }[committed], async t => {
+        const r = recoveryFixture(t);
+        await assert.rejects(r.install(id), { retryAllowed: false });
+        const original = copy({ states: r.f.states, users: r.f.users });
+        const originalToken = r.f.locks[0].token;
+        r.hooks.reconcile = async (_input, guard) => {
+            await guard();
+            r.tx.hooks.commit = write => { if (committed) write(); throw Error('private lost ACK'); };
+            return 'rolled_back';
+        };
+        await assert.rejects(r.create()(id), notConfirmed);
+        assert.deepEqual(r.tx.events, ['commit', 'commit', 'commit']);
+        if (committed) assert.deepEqual({ states: r.f.states, users: r.f.users, locks: r.f.locks }, { states: [], users: [], locks: [] });
+        else {
+            assert.deepEqual({ states: r.f.states, users: r.f.users }, original);
+            assert.equal(r.f.locks[0].token, originalToken);
+        }
+        await assert.rejects(r.create()(id), recoveryBlocked);
+        assert.equal(r.recovered, 1);
+        assert.deepEqual(r.tx.events, ['commit', 'commit', 'commit']);
+    });
+});
 
 test('second relay inherits every login and exact ciphertext, including disabled accounts, before dispatch', async t => {
     const f = fixture(t);

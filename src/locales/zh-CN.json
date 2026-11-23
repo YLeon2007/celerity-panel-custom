@@ -252,7 +252,12 @@
   "rebuildL2tp": {
     "installProfileHint": "安装需要已应用的兼容 Xray rebuild 配置。常规节点设置只会生成旧版 JSON。如有需要，请在「节点 → 网络地图」配置此中继所需的链路，关闭自动部署后保存，再点击「部署」预览变更。仅在确认变更且所有受影响的配置均由此面板管理时才应用。请勿覆盖自定义或由外部管理的配置。",
     "installPackageHint": "对于受支持且拥有数据库准入授权的 Debian 13 中继，安装操作可以准备缺少的 VPN 软件包。请在维护窗口内操作。L2TP 安装失败不会回滚软件包变更。如果结果不确定，请勿重试，请中继管理员核实软件包及 L2TP 的状态。",
+    "recoverInstall": "检查并继续",
+    "installRecoveryHint": "此操作会检查已中断的安装，并可能完成清理。它不会启动新的安装。",
+    "refresh": "刷新状态",
+    "status": { "installing": "正在安装" },
     "installChecks": {
+      "KERNEL_MODULE_BLACKLISTED": "所需的内核网络模块或其依赖项已被列入黑名单。请中继管理员检查相关策略；安装不会绕过此限制。",
       "REBUILD_LINKS_NOT_APPLIED": "中继存在尚未应用的链路或不受支持的对端。请在网络地图上确认所需链路已应用，且对端均为由面板管理的活动 Xray 节点。请勿为通过检查而部署无关链路。",
       "XRAY_BASELINE_UNSUPPORTED": "安装不支持现有 Xray 配置的格式或路由结构。重新格式化 JSON 不会生成 rebuild 配置。仅对面板管理的配置按此中继卡片上的说明操作。",
       "XRAY_PROFILE_OWNER_UNSUPPORTED": "安装不支持某个 Xray 配置文件的所有者。请与中继管理员确认该配置由谁管理。不要为了通过检查而更改文件所有者或覆盖配置。",
@@ -263,6 +268,9 @@
     },
     "messages": {
       "installRefused": "L2TP 安装已拒绝。请检查中继的安装条件并刷新状态。",
+      "working": "正在处理…",
+      "canInstallAgain": "可以重新安装。请刷新页面，查看安装操作是否可用。",
+      "installRecoveryUnconfirmed": "无法确认已中断安装的清理是否完成。请勿重新安装。",
       "reconcileManualBlock": "当前中继身份不允许继续核对。未完成的记录已保留，供人工排查。请勿重试变更、重新确认授权或编辑该记录。",
       "accountPreEffectBlocked": "此请求未在中继上启动写入。账户操作意图已记录；请重新加载 L2TP 数据核实其状态。请勿重新提交变更。",
       "accountReconcileRequired": "先前的账户变更尚未完成。此请求未做任何更改。请重新加载 L2TP 数据，并在可用时单独执行核对操作；请勿重新提交此请求。",

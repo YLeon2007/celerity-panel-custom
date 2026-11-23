@@ -60,7 +60,7 @@ async function runFreshRelayInstall(id, deps) {
                 }
                 await checkAuthority();
                 let reservation;
-                try { reservation = await deps.reserve(inventory, backupId, checkAuthority); }
+                try { reservation = await deps.reserve(inventory, backupId, checkAuthority, preparePackages ? host.packagePreparation : undefined); }
                 catch (error) {
                     unsettled = error instanceof ReservationOutcomeUnknownError || error instanceof AcknowledgedCommitCleanupError;
                     if (isIdentityChanged(error)) throw error;
@@ -157,7 +157,7 @@ async function runFreshRelayInstall(id, deps) {
                 throw primary;
             } finally {
                 if (remote) {
-                    try { await remote.close(); }
+                    try { await remote.close(); deps.handBackRecovery?.(); }
                     catch {
                         if (!primary) throw fail(installed ? 'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED' : 'REBUILD_TRANSPORT_CLEANUP_FAILED');
                     }

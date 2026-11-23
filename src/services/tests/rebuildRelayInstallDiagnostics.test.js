@@ -253,7 +253,7 @@ test('closed diagnostics reach the authenticated API and the localized install c
 
     const apply = ['preflight', 'preflight', 'prepare', 'check', 'reserve', 'install'];
     const hostChecks = ['XRAY_DROPIN_UNSUPPORTED', 'PPP_MODULES_REQUIRED', 'PPP_MODULES_PERSISTENCE_CONFLICT',
-        'PPP_MODULES_LOAD_FAILED', 'NETWORK_OBSERVATION_REQUIRED', 'IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED',
+        'PPP_MODULES_LOAD_FAILED', 'KERNEL_MODULE_BLACKLISTED', 'NETWORK_OBSERVATION_REQUIRED', 'IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED',
         'XL2TPD_CONFIG_MISSING', 'XRAY_CONFIG_WRITABLE', 'XL2TPD_NATIVE_UNIT_REQUIRED', 'XL2TPD_NATIVE_UNIT_CONFLICT'];
     const freshChecks = ['RUNTIME_PACKAGE_AUTOSTART_UNSAFE', 'RUNTIME_NATIVE_UNIT_REQUIRED', 'PACKAGE_APT_PLAN'];
     const matrix = [
@@ -366,6 +366,10 @@ test('package diagnostics reach the authenticated route and localized Install co
             [`reserved rc70: ${check}`, packageWrite, wireFrame(70, check), check, reserved],
             [`reserved rc75: ${check}`, packageWrite, wireFrame(75, check, 'UNCERTAIN_'), check, reserved],
         ]),
+        ['observer blacklist before package admission', 'preflight', wireFrame(70, 'KERNEL_MODULE_BLACKLISTED'),
+            'KERNEL_MODULE_BLACKLISTED', preflight],
+        ['observer blacklist before package intent', packageWrite, wireFrame(70, 'KERNEL_MODULE_BLACKLISTED'),
+            'KERNEL_MODULE_BLACKLISTED', reserved],
         ['unknown plan lookalike at preflight', 'preflight', wireFrame(70, `PACKAGE_APT_PLAN_${marker}`), noHint, preflight],
         ['unknown plan lookalike after reservation', packageWrite, wireFrame(70, `PACKAGE_APT_PLAN_${marker}`), noHint, reserved],
         ['future check', packageWrite, wireFrame(75, `PACKAGE_${marker}`, 'UNCERTAIN_'), noHint, reserved],

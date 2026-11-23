@@ -59,6 +59,7 @@ STOCK_UID = 65534
 XRAY_PATHS = {X: MAIN, B: BRIDGE}
 XL_INIT = '/etc/init.d/xl2tpd'
 XL_DEFAULT = '/etc/default/xl2tpd'
+SYSV_GENERATOR = '/usr/lib/systemd/system-generators/systemd-sysv-generator'
 XL_GENERATED = '/run/systemd/generator.late/xl2tpd.service'
 XL_NATIVE = '/etc/systemd/system/xl2tpd.service'
 XL_ALIAS = 'l2tpd.service'
@@ -131,6 +132,15 @@ class LocalOS:
         assert path not in ('', '.', '..') and '/' not in path
         parent = os.readlink('/proc/self/fd/' + str(dir_fd))
         assert parent == str(root) or parent.startswith(str(root) + '/')
+        if (scenario == 'ppp-observers-mixed-release-race' and request['action'] == 'remove'
+                and parent == str(backing('/etc/modules-load.d')) and path.startswith('.direct-') and flags & os.O_CREAT):
+            assert_host_lock()
+            live = backing(h['PPP_PATH'])
+            replacement = live.with_suffix('.fixture')
+            replacement.write_bytes(live.read_bytes())
+            replacement.chmod(0o644)
+            replacement.replace(live)
+            s['moduleRaceInode'] = live.stat().st_ino
         return os.open(path, flags, mode, dir_fd=dir_fd)
 
     def geteuid(self):
@@ -153,7 +163,9 @@ class LocalOS:
 
     def fstat(self, fd):
         v = os.fstat(fd)
-        return fake_stat(v, *s['owners'].get(str(v.st_ino), [0, 0]))
+        # Only file ownership is projected. A newly made fixture directory can
+        # reuse an unlinked profile inode on the next installation.
+        return fake_stat(v) if stat.S_ISDIR(v.st_mode) else fake_stat(v, *s['owners'].get(str(v.st_ino), [0, 0]))
 
     def fchown(self, fd, uid, gid):
         assert os.readlink('/proc/self/fd/' + str(fd)).startswith(str(root) + '/')
@@ -161,20 +173,38 @@ class LocalOS:
         s['owners'][str(os.fstat(fd).st_ino)] = [uid, gid]
 
 
+OBSERVERS = ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user')
+OBSERVER_MIXED = scenario.startswith('ppp-observers-mixed')
+MISSING_OBSERVERS = ({'tcp_diag', 'udp_diag', 'nf_tables', 'xfrm_user'} if OBSERVER_MIXED else
+                     {'xfrm_user'} if scenario.startswith(('ppp-network-observers', 'ppp-observer-')) else set())
+BUILTIN_OBSERVERS = {'tcp_diag'} if OBSERVER_MIXED else set()
+
+
+def active_observers():
+    return (set(OBSERVERS) - MISSING_OBSERVERS) | set(s['modules'])
+
+
+def observe_net(*names):
+    assert set(names) <= active_observers() | BUILTIN_OBSERVERS, 'observer could implicitly load an absent module'
+    if (set(names) & (MISSING_OBSERVERS - BUILTIN_OBSERVERS) and request['action'] == 'install'
+            and s.get('moduleLoadToken') == request['backupId']):
+        assert_install_intent()
+        s.setdefault('reservedObservers', []).append(list(names))
+
+
 def stock_open(path, mode='r'):
     if path == '/etc/machine-id' and s.get('cohort'):
         return backing(path).open(mode)
     if native_stock and path in ('/etc/os-release', '/usr/lib/os-release'):
         return backing(path).open(mode)
-    observers = ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user')
-    modules = [*s['modules'], *(name for name in observers if scenario != 'ppp-network-observers' or name != 'xfrm_user')]
+    modules = sorted(active_observers())
     facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n' +
              ('108 ppp\n' if 'ppp_generic' in s['modules'] else '') + 'Block devices:\n',
              '/proc/net/dev': 'header\nheader\n eth0: 0\n',
              '/proc/sys/kernel/random/boot_id': '12345678-1234-1234-1234-123456789abc\n' if package_stock else 'fixture-boot\n',
              '/proc/999/cgroup': '0::/system.slice/foreign.service\n',
              '/proc/modules': ''.join(f'{name} 4096 0 - Live 0x0\n' for name in modules),
-             '/proc/cmdline': 'root=fixture' + (' module_blacklist=l2tp_ppp' if scenario == 'ppp-boot-blacklist' else ''),
+             '/proc/cmdline': 'root=fixture' + ({'ppp-boot-blacklist': ' module_blacklist=l2tp_ppp', 'ppp-observer-boot-blacklist': ' modprobe.blacklist=xfrm-user'}.get(scenario, '')),
              '/proc/self/status': 'CapEff:\t0000000000010000\n',
              '/proc/sys/kernel/modules_disabled': '1\n' if scenario == 'ppp-disabled' else '0\n'}
     if s['units'][IKE]['ActiveState'] == 'active':
@@ -266,7 +296,8 @@ def sockets():
             result.extend((proto, address, inbound['port'], info['MainPID']) for proto in protocols)
     if s['units'][IKE]['ActiveState'] == 'active':
         result.extend(('udp', '0.0.0.0', port, s['charonPid']) for port in (500, 4500))
-    if s['units'][XL]['ActiveState'] == 'active' and scenario not in ('settled', 'sidecar-refusal'):
+    if s['units'][XL]['ActiveState'] == 'active' and scenario not in (
+            'settled', 'sidecar-refusal', 'ppp-network-observers-rollback', 'ppp-observers-mixed-rollback'):
         result.append(('udp', '0.0.0.0', 1701, s['units'][XL]['MainPID']))
     return result
 
@@ -317,7 +348,7 @@ def run(argv, **kwargs):
     def js(value):
         return reply(json.dumps(value))
     if native_stock and prog == '/usr/bin/dpkg-divert':
-        assert v in (['--truename', XL_INIT], ['--truename', XL_DEFAULT])
+        assert v in (['--truename', XL_INIT], ['--truename', XL_DEFAULT], ['--truename', SYSV_GENERATOR])
         return reply(v[1] + '\n')
     if prog == '/usr/bin/systemd-detect-virt':
         if v == ['--container']:
@@ -327,15 +358,22 @@ def run(argv, **kwargs):
     if prog == '/usr/sbin/modprobe':
         if v == ['--showconfig']:
             return reply({'ppp-blacklist': 'blacklist l2tp-ppp\n', 'ppp-dependency-blacklist': 'blacklist l2tp_core\n',
-                          'ppp-install-hook': 'install l2tp_ppp /bin/false\n'}.get(scenario, 'blacklist unrelated\n'))
+                          'ppp-install-hook': 'install l2tp_ppp /bin/false\n',
+                          'ppp-observer-blacklist': 'blacklist xfrm-user\n',
+                          'ppp-observer-blacklist-missing-packages': 'blacklist xfrm-user\n',
+                          'ppp-observer-dependency-blacklist': 'blacklist xfrm-algo\n'}.get(scenario, 'blacklist unrelated\n'))
+        if v[:2] == ['--show-depends', '--']:
+            assert len(v) == 3 and v[2] in MISSING_OBSERVERS
+            if v[2] in BUILTIN_OBSERVERS:
+                return reply(f'builtin {v[2]}\n')
+            extra = 'insmod /lib/modules/fixture/kernel/xfrm-algo.ko\n' if v[2] == 'xfrm_user' else ''
+            return reply(extra + f'insmod /lib/modules/fixture/kernel/{v[2]}.ko\n')
         if v[:3] == ['--show-depends', '--use-blacklist', '--']:
-            if scenario == 'ppp-network-observers' and v[3:] == ['xfrm_user']:
-                return reply('insmod /lib/modules/fixture/kernel/xfrm_user.ko\n')
             assert v[3:] in (['ppp_generic'], ['l2tp_ppp'])
             modules = ['slhc', 'ppp_generic'] if v[3] == 'ppp_generic' else ['l2tp_core', 'ppp_generic', 'l2tp_ppp']
             return reply(''.join(f'insmod /lib/modules/fixture/kernel/{name}.ko\n' for name in modules))
         assert request['action'] == 'install' and v[:2] == ['--use-blacklist', '--'] and len(v) == 3
-        assert v[2] in ('ppp_generic', 'l2tp_ppp') and v[2] not in s['modules']
+        assert v[2] in {'ppp_generic', 'l2tp_ppp'} | (MISSING_OBSERVERS - BUILTIN_OBSERVERS) and v[2] not in s['modules']
         assert_install_intent()
         s.setdefault('moduleLoads', []).append(v[2])
         if scenario == 'ppp-load-timeout':
@@ -344,6 +382,7 @@ def run(argv, **kwargs):
             return reply(code=1)
         if scenario != 'ppp-no-readback':
             s['modules'].append(v[2])
+            s['moduleLoadToken'] = request['backupId']
         return reply()
     if prog == '/usr/bin/systemctl':
         stock_ctl = v[:len(STOCK_MANAGER_OPTIONS)] == STOCK_MANAGER_OPTIONS
@@ -435,6 +474,9 @@ def run(argv, **kwargs):
         return reply()
     if prog == '/usr/bin/dpkg-query':
         if native_stock:
+            if v == ['-S', SYSV_GENERATOR]:
+                assert backing(SYSV_GENERATOR).is_file()
+                return reply(f'systemd: {SYSV_GENERATOR}\n')
             if v in (['-S', XL_INIT], ['-S', XL_DEFAULT]):
                 return reply(f'xl2tpd: {v[1]}\n')
             if v in (['-W', r'-f=${binary:Package}\t${Status}\t${Architecture}\t${Version}\n${Conffiles}\n', 'xl2tpd'],
@@ -453,6 +495,7 @@ def run(argv, **kwargs):
         missing = v[2] not in packages.installed if package_stock else v[2] in s.get('missingPackages', ())
         return reply('' if missing else 'ii ', int(missing))
     if prog == '/usr/bin/ss' and v == ['-H', '-lntup']:
+        observe_net('inet_diag', 'tcp_diag', 'udp_diag')
         return reply(''.join(f'{p} LISTEN 0 0 {a}:{n} *:* users:(("fixture",pid={pid},fd=3))\n' for p, a, n, pid in sockets()))
     if prog == '/usr/sbin/ip':
         if v == ['-j', '-N', '-4', 'rule', 'show']:
@@ -464,7 +507,8 @@ def run(argv, **kwargs):
         if v == ['-j', '-N', '-4', 'addr', 'show']:
             return js([dict(addr_info=[dict(local=s.get('address', '192.0.2.4'), prefixlen=24)])])
         if v in (['xfrm', 'policy', 'list'], ['xfrm', 'policy', 'list', 'nosock'], ['xfrm', 'state', 'list', 'nokeys']):
-            return reply()
+            observe_net('xfrm_user')
+            return reply('foreign XFRM policy\n' if scenario == 'ppp-observers-mixed-conflict' else '')
         if v[:3] == ['-4', 'rule', 'del'] and s['rule']:
             r = s['rule']
             assert v == ['-4', 'rule', 'del', 'priority', str(r['priority']), 'from', r['src'],
@@ -478,6 +522,7 @@ def run(argv, **kwargs):
             s['route'] = None
             return reply()
     if prog == '/usr/sbin/nft':
+        observe_net('nfnetlink', 'nf_tables')
         table = dict(table=dict(family='inet', name=h['TABLE'], comment=s['nft']))
         if v == ['-j', 'list', 'tables']:
             return js(dict(nftables=s['foreign']['tables'] + ([table] if s['nft'] else [])))

@@ -2,9 +2,9 @@
 
 No package archives, programs, daemons or generators. Use the same private
 root and shared installed tuples for the package guard and subsequent stock
-Install. Synthetic init/defaults/generator bytes have test-only stock pins;
-manager properties, file generations, manifests and frame checks are not
-bypassed. The checked-in generated wrapper is used byte-for-byte.
+Install. Synthetic init/defaults bytes have test-only stock pins; generator
+bytes have a modeled dpkg owner and manifest. The checked-in generated wrapper
+is used byte-for-byte, and manager, generation and frame checks are not bypassed.
 """
 
 import hashlib
@@ -24,7 +24,7 @@ sys.path.pop(0)
 
 DEFAULTS = '# synthetic xl2tpd defaults\n'
 INIT = '#!/bin/sh\nexit 0\n'
-GENERATOR = 'synthetic generator identity; never executed\n'
+GENERATOR = 'synthetic systemd 257.8 generator; never executed\n'
 GENERATOR_PATH = '/usr/lib/systemd/system-generators/systemd-sysv-generator'
 LNS = '; synthetic package conffile\n[global]\n'
 APT_UPDATE = ('/usr/bin/apt-get', '--error-on=any', 'update')
@@ -141,7 +141,6 @@ def attach(root, state, scenario, h, request, assert_host_lock):
     trace_need(stock)
     assert stock['PACKAGE_ID'] == 'xl2tpd\tinstall ok installed\tamd64\t1.3.18-1+b1'
     stock['PACKAGE_FILES'] = {stock['INIT']: (0o755, *sums(INIT)), stock['DEFAULTS']: (0o644, *sums(DEFAULTS))}
-    stock['SYSV_GENERATOR_SHA'] = sums(GENERATOR)[0]
     h['STOCK_XL_DEFAULT_SHA'], md5 = sums(DEFAULTS)
     h['STOCK_XL_DEFAULT_MD5'] = md5.encode()
     state['lnsMd5'] = sums(LNS)[1]
@@ -241,7 +240,10 @@ if __name__ == '__main__':
     assert root.name.startswith('.relay-install-join-') and root.is_absolute() and root.resolve() == root
     os.umask(0o022)
     model = JoinedPackages(unittest.TestCase(), root)
+    model.installed['systemd'] = ('257.8-1~deb13u1', 'amd64')  # Modeled tuple, not a real archive.
+    model.status()
     model.put(GENERATOR_PATH, GENERATOR, 0o755)
+    model.put('/var/lib/dpkg/info/systemd.md5sums', f'{sums(GENERATOR)[1]}  {GENERATOR_PATH[1:]}\n')
     if scenario == 'package-stock-active':
         # Already installed, running IKE with other requested packages absent.
         model.candidates = {n: v for n, v in model.candidates.items()

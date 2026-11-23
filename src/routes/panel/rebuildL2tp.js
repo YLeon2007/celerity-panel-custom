@@ -11,7 +11,7 @@ const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { installCheckIds } = require('../../services/rebuildRelayInstallDiagnostics');
 const { isInspectionReason } = require('../../services/rebuildRelayInspection');
 const { mountAdmission, admissionPath, validAdmissionJson, reject: rejectAdmission,
-    validNodeId, grantEffectStatus, identityChanged } = require('./rebuildRelayAdmission');
+    validNodeId, validActor, grantEffectStatus, identityChanged } = require('./rebuildRelayAdmission');
 const { retirePath, validRetireJson, rejectRetire, mountRetire } = require('./rebuildRelayRetire');
 
 const pagePath = /^\/l2tp$/;
@@ -19,6 +19,7 @@ const accountPath = /^\/rebuild\/relays\/l2tp\/accounts\/reveal$/;
 const reconcilePath = /^\/rebuild\/relays\/l2tp\/accounts\/reconcile$/;
 // No Express parameter capture: validate the raw segment, without URL decoding.
 const pskPath = /^\/rebuild\/relays\/[^/]+\/l2tp\/psk\/reveal$/;
+const installRecoveryPath = /^\/rebuild\/relays\/[^/]+\/l2tp\/install\/recover$/;
 const effectPath = /^\/rebuild\/relays\/(?:[^/]+\/l2tp\/(?:install|remove(?:\/cancel)?)|l2tp\/accounts\/(?:create|disable|delete))\/?$/i;
 const loginPattern = /^[A-Za-z0-9._@-]{1,64}(?![\s\S])/;
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
@@ -28,6 +29,10 @@ const emptyJson = /^\s*\{\s*\}\s*$/;
 const reconcileInvalid = 'REBUILD_L2TP_RECONCILE_INVALID_REQUEST';
 const reconcileUnavailable = res => revealError(res, 503, 'REBUILD_L2TP_RECONCILE_UNAVAILABLE');
 const reconcileBlocked = 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK';
+const invalidRecovery = res => revealError(res, 400, 'REBUILD_INVALID_REQUEST');
+const unconfirmedRecovery = (res, status = 503) => res.status(status).json({
+    error: { code: 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED', retryAllowed: false },
+});
 let rebuildL2tpScriptVersion;
 
 function noStore(_req, res, next) {
@@ -70,13 +75,15 @@ function rebuildL2tpIngress(req, res, next) {
     const reconcile = reconcilePath.test(path);
     const admission = admissionPath.test(path);
     const retire = retirePath.test(path);
-    if (!admission && !retire && !reconcile && !accountPath.test(path) && !pskPath.test(path)) return next();
+    const installRecovery = installRecoveryPath.test(path);
+    if (!admission && !retire && !reconcile && !installRecovery && !accountPath.test(path) && !pskPath.test(path)) return next();
     res.set('Cache-Control', 'no-store');
     if (req.method !== 'POST') return next();
     const reject = () => admission ? rejectAdmission(res)
-        : retire ? rejectRetire(res) : reconcile ? revealError(res, 400, reconcileInvalid) : invalidRequest(res);
+        : retire ? rejectRetire(res) : installRecovery ? invalidRecovery(res)
+            : reconcile ? revealError(res, 400, reconcileInvalid) : invalidRequest(res);
     if (req.url.includes('?') || !req.is('application/json') || req.get('content-length') === '0') return reject();
-    if ((admission || retire) && !req.get('content-length') && !req.get('transfer-encoding')) return reject();
+    if ((admission || retire || installRecovery) && !req.get('content-length') && !req.get('transfer-encoding')) return reject();
     return parseScopedJson(req, res, err => err ? reject() : next());
 }
 
@@ -116,8 +123,10 @@ function requireCompletedOnboarding(onUnavailable) {
     };
 }
 
+const hasSessionId = req => req.session?.authenticated === true && typeof req.sessionID === 'string' && !!req.sessionID;
+
 function requireSessionId(req, res, next) {
-    if (req.session?.authenticated !== true || typeof req.sessionID !== 'string' || !req.sessionID) {
+    if (!hasSessionId(req)) {
         return revealError(res, 403, 'REBUILD_L2TP_SESSION_REQUIRED');
     }
     next();
@@ -149,7 +158,7 @@ function revealInput(isAccount) {
 }
 
 function mountNoStore(router) {
-    router.all([accountPath, pskPath, reconcilePath, admissionPath, effectPath, retirePath], noStore);
+    router.all([accountPath, pskPath, reconcilePath, admissionPath, effectPath, retirePath, installRecoveryPath], noStore);
     router.get(pagePath, (req, res, next) => req.method === 'GET' ? noStore(req, res, next) : next());
 }
 
@@ -162,6 +171,7 @@ function mountOverview(router, getOverview, exposePanelCsrfToken) {
                 if (removalNotice) return renderPage(res, { removalNotice, relays: [], accounts: [], canManageAccounts: false });
                 const changedRelayId = validNodeId(req.query.identityChanged) ? req.query.identityChanged : null;
                 return renderPage(res, { ...await getOverview().overview(), changedRelayId,
+                    canRequestInstallRecovery: hasSessionId(req) && validActor(req.session.adminUsername) && req.query.view !== 'only',
                     reconcileViewOnly: req.query.view === 'only' || changedRelayId !== null });
             } catch {
                 return sendLoadError(res);
@@ -261,6 +271,35 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
     router.all(reconcilePath, (_req, res) => revealError(res.set('Allow', 'POST'), 405, 'METHOD_NOT_ALLOWED'));
 }
 
+function mountInstallRecovery(router, limiter) {
+    router.post(installRecoveryPath, requireAuth, requireSessionId, (req, res, next) => {
+        if (!validActor(req.session.adminUsername)) return revealError(res, 403, 'REBUILD_L2TP_SESSION_REQUIRED');
+        next();
+    }, checkCsrf, (req, res, next) => {
+        const body = req.body;
+        if (!validNodeId(req.path.split('/')[3]) || req.url.includes('?') || !req.is('application/json')
+            || !body || Object.getPrototypeOf(body) !== Object.prototype || Object.keys(body).length !== 0) {
+            return invalidRecovery(res);
+        }
+        next();
+    }, limiter, requireCompletedOnboarding(unconfirmedRecovery), async (req, res) => {
+        const nodeId = req.path.split('/')[3];
+        try {
+            const service = require('../../services/rebuildService').createRebuildService();
+            const result = await service.recoverRelayInstall(nodeId, { actor: req.session.adminUsername });
+            if (result?.status !== 'can_install_again' || (result.nodeId !== undefined && result.nodeId !== nodeId)
+                || result.error !== undefined || result.retryAllowed === false || result.outcome === 'unknown') {
+                return unconfirmedRecovery(res);
+            }
+            return res.json({ executionMode: 'rebuild', status: 'can_install_again', nodeId });
+        } catch (error) {
+            const status = error?.code === 'REBUILD_L2TP_INSTALL_DISABLED' ? 409 : grantEffectStatus(error?.code);
+            return unconfirmedRecovery(res, status);
+        }
+    });
+    router.all(installRecoveryPath, (_req, res) => revealError(res.set('Allow', 'POST'), 405, 'METHOD_NOT_ALLOWED'));
+}
+
 function createRoutes(service, admission) {
     // No service construction or query at startup or on a refused request.
     const getOverview = () => service ??= require('../../services/rebuildL2tpOverview').createRebuildL2tpOverview();
@@ -270,6 +309,7 @@ function createRoutes(service, admission) {
         mountOverview: (router, exposePanelCsrfToken) => mountOverview(router, getOverview, exposePanelCsrfToken),
         mountReconcile: (router, limiter) => mountReconcile(router, getOverview, reconcile, limiter),
         mountReveals: router => mountReveals(router, getOverview),
+        mountInstallRecovery,
         mountAdmission: (router, limiter) => mountAdmission(router, admission,
             { requireSessionId, checkCsrf, requireCompletedOnboarding }, limiter),
         mountRetire: (router, limiter) => mountRetire(router,

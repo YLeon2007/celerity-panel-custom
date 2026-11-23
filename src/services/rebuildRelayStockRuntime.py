@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import runpy
 import stat
@@ -31,9 +32,8 @@ PACKAGE_FILES = {
     DEFAULTS: (0o644, '37b5938f462ec60b4f8c179b34f70b548c09da4691c938e88ce111ce41268833',
                'fadc31f26078d8c3fb033d7d4516500b'),
 }
-# Exact output of Debian trixie's amd64 systemd 257.13-1~deb13u1 generator
+# Exact output captured from Debian trixie's amd64 systemd 257.13-1~deb13u1 generator
 # for the pinned script at INIT: (normal runlevels 2/3/4/5, no start links).
-SYSV_GENERATOR_SHA = '662f91830e6f76e08a47be605ba2480ae87add1eac44aa095629bc0a4484cb11'
 GENERATED_HASHES = {
     'aaca316b0955a3ba75f9909a63826d3a5ba2cc46a39ca2690b7043d68b1e8ec7': True,
     '02a7d3131dd4be414a8cc025ca4144edd904f01d644572aec4722b14182ca2a3': False,
@@ -52,6 +52,7 @@ UNIT_DIRS = {
 SYSTEMCTL = '/usr/bin/systemctl'
 DPKG_QUERY = '/usr/bin/dpkg-query'
 DPKG_DIVERT = '/usr/bin/dpkg-divert'
+DPKG_INFO = '/var/lib/dpkg/info'
 QUIESCENT = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0',
                  Job='', NeedDaemonReload='no', Transient='no', DropInPaths='', TriggeredBy='')
 NO_OVERRIDES = dict(ExecCondition='', ExecStartPre='', ExecStartPost='', ExecReload='', ExecStopPost='',
@@ -82,9 +83,10 @@ def checked(result, code, statuses=(0,)):
 
 def command(*argv, timeout=30):
     # Never inherit bus, dpkg-root, pager or locale overrides.
-    return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                          encoding='utf-8', timeout=timeout,
-                          env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+    result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                            env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+    # Decode without the subprocess text mode's automatic newline rewriting.
+    return subprocess.CompletedProcess(argv, result.returncode, result.stdout.decode(), result.stderr.decode())
 
 
 def ctl(run, *argv):
@@ -276,7 +278,53 @@ def verify_manager(run, state):
     need(checked(ctl(run, 'list-jobs', '--no-legend', '--plain'), 'UNIT_STATE') == '', 'PENDING_JOBS')
 
 
-def generator_input(root, *, missing, strict):
+def generator_file_state(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@contextmanager
+def stable_generator_file(path, info, *, mode=None):
+    limit = 1024 * 1024
+    if info is None:
+        raise Refusal('UNIT_FILES')
+    need(stat.S_ISREG(info.st_mode) and owner_ok(info) and info.st_nlink == 1
+         and not info.st_mode & 0o022 and (mode is None or stat.S_IMODE(info.st_mode) == mode)
+         and info.st_size <= limit, 'UNIT_FILES')
+    expected = generator_file_state(info)
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), 'rb') as handle:
+        need(generator_file_state(os.fstat(handle.fileno())) == expected, 'UNIT_FILES')
+        data = handle.read(limit + 1)
+        need(len(data) == info.st_size, 'UNIT_FILES')
+        yield data
+        current = lstat(path)
+        need(current is not None and generator_file_state(current) == expected
+             and generator_file_state(os.fstat(handle.fileno())) == expected, 'UNIT_FILES')
+
+
+def packaged_generator(root, run, path, generator, info):
+    code = 'UNIT_FILES'
+    parent = directory(root, DPKG_INFO, code, protected=True)
+    need(parent is not None, code)
+    manifest = root / DPKG_INFO[1:] / 'systemd.md5sums'
+    with (stable_generator_file(generator, info, mode=0o755) as binary,
+          stable_generator_file(manifest, lstat(manifest)) as sums):
+        need(checked(run(DPKG_QUERY, '-S', path), code) == f'systemd: {path}\n'
+             and checked(run(DPKG_DIVERT, '--truename', path), code) == f'{path}\n', code)
+        # dpkg's non-conffile manifest uses one canonical relative pathname.
+        # Reject duplicate target rows, even when their MD5s are identical.
+        relative = path[1:].encode('ascii')
+        names = {relative, b'*' + relative}
+        rows = [row for row in sums.split(b'\n') if names.intersection(row.split())]
+        md5 = hashlib.md5(binary, usedforsecurity=False).hexdigest().encode('ascii')
+        need(rows == [md5 + b'  ' + relative], code)
+        need(directory(root, str(Path(path).parent), code, protected=True) == generator.parent
+             and directory(root, DPKG_INFO, code, protected=True) == parent, code)
+        # Keep a SHA-256 freshness witness, not a version-specific allowlist.
+        return [path, sha256(binary), [info.st_dev, info.st_ino, info.st_ctime_ns]]
+
+
+def generator_input(root, run, *, missing, strict):
     # If SysV generation is possible, installing another runtime package can
     # regenerate the wrapper before install-runtime.sh checks LoadState.
     bases = ('/run/systemd/system-generators', '/etc/systemd/system-generators',
@@ -301,9 +349,7 @@ def generator_input(root, *, missing, strict):
         # operator generator executable that could run on daemon-reload.
         need(not missing and base in ('/usr/lib/systemd/system-generators', '/lib/systemd/system-generators'),
              'UNIT_STATE')
-        digest = sha256(regular_bytes(generator, 0o755, 'UNIT_FILES', limit=1024 * 1024))
-        need(digest == SYSV_GENERATOR_SHA, 'UNIT_FILES')
-        return [path, digest, generation(generator)]
+        return packaged_generator(root, run, path, generator, info)
     return None
 
 
@@ -327,8 +373,8 @@ def observe(root, run, helper):
     evidence['state'] = state
     # The missing route must not have an effective generator. Bind the same
     # generator path and bytes (if present) through the later native readback.
-    generator = generator_input(root, missing=state == 'missing', strict=True)
-    need(state != 'generated' or (generator is not None and generator[1] == SYSV_GENERATOR_SHA), 'UNIT_STATE')
+    generator = generator_input(root, run, missing=state == 'missing', strict=True)
+    need(state != 'generated' or (generator is not None and generator[1] != 'masked'), 'UNIT_STATE')
     evidence['inputs'] = {
         'release': sha256(release),
         'generator': generator,
@@ -365,11 +411,13 @@ def prepare(root, run):
     if state == 'native':
         return 'native-present'
     if state == 'missing':
-        generator_input(root, missing=True, strict=False)
+        generator_input(root, run, missing=True, strict=False)
         return 'stock-not-found'
 
-    # Only this branch writes. The existing helper opens the fixed destination
-    # with O_EXCL | O_NOFOLLOW; an intervening occupant is never adopted.
+    # Only this branch writes. Authenticate any effective executable before
+    # daemon-reload. Unlike DIRECT, this route already allows an absent one.
+    generator_input(root, run, missing=False, strict=True)
+    # O_EXCL | O_NOFOLLOW keeps the helper from adopting an intervening file.
     try:
         helper['ensure'](root)
     except OSError as exc:

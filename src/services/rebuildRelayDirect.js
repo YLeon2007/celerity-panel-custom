@@ -139,15 +139,34 @@ function buildFiles(d, profiles, backupId) {
 }
 
 let directScript;
+function encodeDirectBytes(bytes) {
+    // RFC 1924 alphabet (Python b85decode). No quotes, backslashes or
+    // whitespace, so the result fits both Python string and shell quoting.
+    const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~';
+    let packed = '';
+    for (let i = 0; i < bytes.length; i += 4) {
+        const length = Math.min(bytes.length - i, 4);
+        let word = 0;
+        for (let j = 0; j < 4; j++) word = word * 256 + (j < length ? bytes[i + j] : 0);
+        let part = '';
+        for (let j = 0; j < 5; j++) {
+            part = alphabet[word % 85] + part;
+            word = Math.floor(word / 85);
+        }
+        packed += part.slice(0, length + 1);
+    }
+    return packed;
+}
+
 function bundleDirectScript() {
-    const pack = path => deflateSync(readFileSync(join(__dirname, path))).toString('base64');
+    const pack = path => encodeDirectBytes(deflateSync(readFileSync(join(__dirname, path))));
     const load = (key, path, name, filename) =>
         `${key}={"__name__":"${name}","__file__":"${filename}"};exec(_c3_compile("${pack(path)}","${filename}"),${key})`;
     // These are fixed repository sources, not imports from the remote working
     // directory. Non-main namespaces keep their standalone entrypoints inert.
     return [
         'import base64,zlib',
-        '_c3_compile=lambda data,filename:compile(zlib.decompress(base64.b64decode(data)),filename,"exec")',
+        '_c3_compile=lambda data,filename:compile(zlib.decompress(base64.b85decode(data)),filename,"exec")',
         // Runtime's standalone path calculation needs an absolute __file__
         // with parents; the direct host gets the ensure code as a separate dict.
         load('C3_STOCK_RUNTIME', 'rebuildRelayStockRuntime.py', 'c3_stock_runtime',
@@ -169,6 +188,9 @@ function directCommand(limits) {
     return command;
 }
 
+const recoveryUnsent = new WeakSet();
+const installRecoveryWasNotSent = error => recoveryUnsent.has(error);
+
 function createRelayDirect({ node, env = process.env, SSH, fence: authority, verifyRemoveStdin = false } = {}) {
     const nodeId = String(node?._id ?? node?.id ?? '');
     const fence = authority ?? captureRelayBinding(env, nodeId, node);
@@ -180,7 +202,8 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         ssh: Object.freeze({ port, username, password: node.ssh.password, privateKey: node.ssh.privateKey }),
     }) : node;
 
-    const ssh = new (SSH || require('./nodeSSH'))(transportNode, {
+    const Transport = SSH || require('./nodeSSH');
+    const ssh = new Transport(transportNode, {
         expectedHostKeySha256: sshHostKeySha256, expectedEndpoint: { ip, port, username },
     });
     ssh.usePool = false;
@@ -222,12 +245,13 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         throw observed && observed !== machineId ? identityChanged() : fail('DIRECT_OUTCOME_UNKNOWN');
     }
 
-    async function exec(action, params = {}, write = false, validate = () => true, verifyLock) {
+    async function exec(action, params = {}, write = false, validate = () => true, verifyLock, dispatch) {
         const retirementCount = action === 'retirement-count';
         const count = action === 'session-count' || retirementCount;
         const chap = CHAP_ACTIONS.includes(action);
         const packageWrite = action === 'prepare-packages';
-        const guarded = chap || packageWrite || action === 'install' || (merged && write)
+        const recovery = action === 'reconcile-install';
+        const guarded = chap || packageWrite || recovery || action === 'install' || (merged && write)
             || (action === 'remove' && verifyRemoveStdin === true);
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         await checkBinding();
@@ -265,16 +289,24 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         const timeout = retirementCount ? RETIREMENT_COUNT_TIMEOUT : count ? SESSION_COUNT_TIMEOUT
             : packageWrite ? PACKAGE_PREPARE_TIMEOUT : TIMEOUT;
         let result;
-        try { result = await execPinned(directCommand(shellLimits), {
-            stdin, timeout,
-            ...(packageWrite && { maxOutputBytes: 160 }),
-        }, verifyBeforeStdin); }
-        catch { throw identityRefusal ?? unknown(); }
+        try {
+            const command = directCommand(shellLimits);
+            if (dispatch) dispatch.possible = true;
+            result = await execPinned(command, {
+                stdin, timeout,
+                ...(packageWrite && { maxOutputBytes: 160 }),
+                ...(recovery && { maxOutputBytes: 256 }),
+            }, verifyBeforeStdin);
+        } catch (error) {
+            if (dispatch && !SSH && Transport.execStdinWasNotAttempted(error)) dispatch.possible = false;
+            throw identityRefusal ?? unknown();
+        }
         try { await checkBinding(); }
         catch (error) { if (write && !isIdentityChanged(error)) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
         // A verified diagnostic on rc75 is informational only. Missing or
         // tainted frames take the very same unknown/poison path without a hint.
         if (packageWrite && result?.code === 75) throw withInstallCheck(unknown(), packageWriteCheck(result));
+        if (recovery && result?.code !== 0) throw unknown();
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
             if (result.code === 70 && result.stdout === ''
@@ -318,11 +350,11 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             throw error;
         }
         try {
-            const replyLimit = action === 'inspect-chap' ? 170 : (count || chap || packageWrite) ? 160 : 46 * 1024 * 1024;
+            const replyLimit = recovery ? 256 : action === 'inspect-chap' ? 170 : (count || chap || packageWrite) ? 160 : 46 * 1024 * 1024;
             if (result.stderr !== '' || Buffer.byteLength(result.stdout) > replyLimit) throw Error();
             const reply = JSON.parse(result.stdout);
             if ((count || chap) && (closed || result.stdout !== `${JSON.stringify(reply)}\n`)) throw Error();
-            if ((packageWrite || isInstallStage(action) || ['verify', 'rollback'].includes(action))
+            if ((packageWrite || recovery || isInstallStage(action) || ['verify', 'rollback'].includes(action))
                 && (closed || result.stdout !== installReplyFrame(reply))) throw Error();
             if (!validate(reply)) throw Error();
             return reply;
@@ -518,6 +550,41 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
                 catch (err) { if (err.remoteOutcomeUncertain || isIdentityChanged(err)) throw err; return false; }
             });
         },
+        reconcileInstall(input, verifyLock) {
+            const dispatch = { possible: false };
+            return serial(async () => {
+                const invalid = 'INSTALL_INPUT_INVALID';
+                requireThat(merged && fence.listMode === true && fence.source === 'db' && !execPinned
+                    && !held && !packageAttempt && input?.nodeId === nodeId && validGeneration(input.backupId)
+                    && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'packagePreparation'].includes(key)), invalid);
+                const { backupId, packagePreparation: planDigest } = input;
+                requireThat(!Object.hasOwn(input, 'packagePreparation') || (planDigest?.length === 64 && tokenMatches(PIN, planDigest)), invalid);
+                const network = removeNetwork(input.network, invalid);
+                const challenge = randomBytes(16).toString('hex');
+                const params = { nodeId, backupId, network, challenge, ...(planDigest !== undefined && { packagePreparation: planDigest }) };
+                try {
+                    await lock(verifyLock);
+                    const proof = await exec('reconcile-install', params, true, value =>
+                        ['absent', 'rolled_back'].includes(value?.result)
+                        && JSON.stringify(value) === JSON.stringify({ nodeId, backupId, machineId, challenge, result: value.result }), verifyLock, dispatch);
+                    await lock(verifyLock);
+                    await checkBinding();
+                    requireThat(!closed && !poisoned, 'DIRECT_UNAVAILABLE');
+                    return proof.result;
+                } finally {
+                    // Recovery never joins or reuses an old Install connection, and
+                    // this driver does not open a second channel to replay it.
+                    if (!closed && !poisoned) disconnect();
+                    closed = true;
+                }
+            }).catch(() => {
+                // Errors/codes supplied by a peer or an alternative transport
+                // cannot certify no dispatch. Only the local writer can.
+                const error = fail('DIRECT_OUTCOME_UNKNOWN', true);
+                if (!dispatch.possible) recoveryUnsent.add(error);
+                throw error;
+            });
+        },
         prepareRemove: input => serial(async () => {
             const invalid = 'REMOVE_INPUT_INVALID';
             requireThat(!held && input?.nodeId === nodeId
@@ -596,4 +663,4 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
     return reply.proof;
 }
 
-module.exports = { createRelayDirect, applyRelayNetwork };
+module.exports = { createRelayDirect, applyRelayNetwork, installRecoveryWasNotSent };

@@ -14,7 +14,7 @@ const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
 const {createRebuildRelayRetire}=require('./rebuildRelayRetire');
 const {createRebuildRelayAccounts}=require('./rebuildRelayAccounts');
 const {assertNoPendingRelayAccounts}=require('./rebuildRelayAccountsStore');
-const {resolveRelayBinding}=require('./rebuildRelayAuthorization');
+const {resolveRelayBinding,relayInstallEnabled}=require('./rebuildRelayAuthorization');
 const {readRelayAuthority,captureRelayEffect,identityChanged}=require('./rebuildRelayEffectAuthority');
 const {appliedLink}=require('./rebuildAppliedLink');
 const {isReverse,unverified}=require('./rebuildReverseLinkHealth');
@@ -400,12 +400,20 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         if(retire&&req.preview&&req.mode==='online')targetBridges.set(result,baseline.get(req.nodeId).bridge??emptyBridge);
         return result;
     }
-    const installRelay=createRebuildRelayBackend({Link,Node,State,L2tpUser,locks:guardedLocks,env,relayGrantStore,createRelayDirect});
+    const installDeps={Link,Node,State,L2tpUser,locks:guardedLocks,env,relayGrantStore,createRelayDirect};
+    const installRelay=createRebuildRelayBackend(installDeps);
+    const recoverRelayInstall=async (id,{actor}={})=>{
+        if(!relayInstallEnabled(env))throw fail('REBUILD_L2TP_INSTALL_DISABLED');
+        // Only this explicit entry loads the recovery backend. It owns live
+        // role/grant checks and cleanup; never fall back to Install.
+        const {createRebuildRelayInstallRecovery}=require('./rebuildRelayInstallRecovery');
+        return createRebuildRelayInstallRecovery({...installDeps,actor})(id);
+    };
     const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks:guardedLocks,withHeldLock,env,relayGrantStore,createRelayDirect});
     const relayRetire=createRebuildRelayRetire({Link,Node,State,L2tpUser,env,sync,relayGrantStore,locks:guardedLocks,gate,
         retireGraph,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
-    return {execute,retireGraph,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,...relayRemoval,...relayRetire,
+    return {execute,retireGraph,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,recoverRelayInstall,...relayRemoval,...relayRetire,
         createRelayAccount: input=>relayAccounts().create(input),
         disableRelayAccount: input=>relayAccounts().disable(input),
         deleteRelayAccount: input=>relayAccounts().delete(input),

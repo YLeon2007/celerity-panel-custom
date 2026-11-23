@@ -28,9 +28,13 @@ const starterFiles = {
 };
 const generatedPath = '/run/systemd/generator.late/xl2tpd.service';
 const generatedAlias = '/run/systemd/generator.late/l2tpd.service';
+const generatorPath = '/usr/lib/systemd/system-generators/systemd-sysv-generator';
 const foreignDropIn = '/run/systemd/system/l2tpd.service.d/foreign.conf';
 const foreignFragment = '/usr/local/lib/systemd/system/l2tpd.service';
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+const modulesPath = '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf';
+const stockModules = '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n';
+const observers = ['inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user'];
 
 function seedNativeStock(put, root, generated) {
     // Extract data only from the previously verified Debian archives. The
@@ -47,9 +51,11 @@ function seedNativeStock(put, root, generated) {
         }
     }
     if (generated) {
-        const executable = fs.readFileSync(join(process.env.C3_FIXTURE_GENERATOR_EXTRACT, '/usr/lib/systemd/system-generators/systemd-sysv-generator'));
-        assert.equal(sha256(executable), '662f91830e6f76e08a47be605ba2480ae87add1eac44aa095629bc0a4484cb11');
-        put('/usr/lib/systemd/system-generators/systemd-sysv-generator', executable, 0o755);
+        // Synthetic executable, never run. Model dpkg provenance without a binary version pin.
+        const executable = Buffer.from('synthetic systemd SysV generator; never executed\n');
+        const md5 = createHash('md5').update(executable).digest('hex');
+        put(generatorPath, executable, 0o755);
+        put('/var/lib/dpkg/info/systemd.md5sums', `${md5}  ${generatorPath.slice(1)}\n`, 0o644);
         // Same no-start-links generator bytes as test_rebuild_relay_stock_runtime.py.
         const wrapper = fs.readFileSync(join(__dirname, 'trixie-xl2tpd-generated.fixture'));
         assert.equal(sha256(wrapper), '02a7d3131dd4be414a8cc025ca4144edd904f01d644572aec4722b14182ca2a3');
@@ -81,7 +87,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const net = 'celerity-rebuild-l2tp-network.service';
         const bootLink = '/etc/systemd/system/multi-user.target.wants/' + xl;
         const nativePath = '/etc/systemd/system/' + xl;
-        const barePackages = scenario === 'fresh-stock-runtime';
+        const barePackages = ['fresh-stock-runtime', 'ppp-observer-blacklist-missing-packages'].includes(scenario);
         const generatedStock = nativeStock && !packageStock && scenario !== 'native-stock-missing';
         const freshStock = barePackages || nativeStock;
         const stock = join(__dirname, '../../../modules/relay-l2tp/node-artifacts/l2tp');
@@ -163,7 +169,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         } else if (nativeStock) {
             seedNativeStock(put, root, generatedStock);
             if (scenario === 'native-stock-orphan-wrapper') {
-                fs.unlinkSync(join(root, '/usr/lib/systemd/system-generators/systemd-sysv-generator'));
+                fs.unlinkSync(join(root, generatorPath));
             }
             put('/usr/lib/os-release', 'ID=debian\nVERSION_CODENAME=trixie\n', 0o644);
             lns = fs.readFileSync(join(root, '/etc/xl2tpd/xl2tpd.conf'));
@@ -230,10 +236,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             tables: [{ table: { family: 'inet', name: 'foreign', comment: 'operator-owned' } }],
             sockets: [['tcp', '192.0.2.4', 39491, '999']] };
         put('/etc/machine-id', machineId + '\n', 0o644);
-        const modulesPath = '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf';
         put('/etc/modules-load.d/10-unrelated.conf', '# operator-owned\nloop\n', 0o644);
-        if (!barePackages && (!scenario.startsWith('ppp-') || ['ppp-ready', 'ppp-container-ready'].includes(scenario))) {
-            put(modulesPath, '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n', 0o644);
+        if (!barePackages && (!scenario.startsWith('ppp-') || ['ppp-ready', 'ppp-container-ready',
+            'ppp-observers-mixed', 'ppp-observers-mixed-rollback', 'ppp-observers-mixed-release-race'].includes(scenario))) {
+            put(modulesPath, stockModules, 0o644);
         }
         if (scenario === 'ppp-conflict') put(modulesPath, '# foreign\n', 0o644);
         if (scenario === 'ppp-mask') fs.symlinkSync('/dev/null', join(root, modulesPath));
@@ -265,7 +271,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             managerEnvironment: scenario === 'manager-override' ? 'STRONGSWAN_CONF=/fixture-foreign.conf\n' : 'LANG=C\n',
             owners: { [fs.statSync(mpath).ino]: [scenario === 'prewrite' ? 0 : mainUid, 65534], [fs.statSync(bpath).ino]: [0, 65534] } }));
         const actions = [], refusals = [], nativeReplies = [];
-        let removeBaseline, expectedRemoveTransit;
+        let removeBaseline, expectedRemoveTransit, beforeDirectAction;
         const records = () => JSON.parse(fs.readFileSync(manager, 'utf8'));
         const writeRecords = value => fs.writeFileSync(manager, JSON.stringify(value));
         const applyHandlers = new Map();
@@ -334,6 +340,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 if (!cohort) assert.ok(!Object.hasOwn(request, 'currentUsers') && !Object.hasOwn(request, 'expectedCensus'));
                 if (cohort && action === 'remove') assert.match(expectedCensus, /^[a-f0-9]{64}$/);
             }
+            beforeDirectAction?.(action);
             const result = spawnSync('/usr/bin/python3', ['-I', '-B', join(__dirname, 'rebuildRelayInstallHost.py'), root, scenario],
                 { input: JSON.stringify(command) + '\n' + stdin, env: {}, encoding: 'utf8', timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
             assert.ok(!result.error && [0, 70, 75].includes(result.status), 'local DIRECT harness exit: ' + (result.error?.code ?? result.status));
@@ -365,6 +372,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         return { id, relay, machineId, key, pin, execute, beforeChannel, applyHandlers, actions, refusals, root, before, mainPath, bridgePath,
             mpath, bpath, bridge, bootLink, nativePath, nativeReplies, generated, usersByNode, x, b, xl, ike, net, records, writeRecords, removeBaseline: () => removeBaseline,
             expectRemoveTransit: value => { expectedRemoveTransit = value; },
+            beforeDirectAction: fn => { beforeDirectAction = fn; },
         };
     }
 
@@ -526,7 +534,13 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         ['ppp-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
         ['ppp-shadow-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
         ['ppp-service-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
-        ['ppp-network-observers', 'NETWORK_OBSERVATION_REQUIRED', []],
+        ['ppp-network-observers', 'installed', ['xfrm_user']],
+        ['ppp-observer-blacklist', 'KERNEL_MODULE_BLACKLISTED', []],
+        ['ppp-observer-blacklist-missing-packages', 'KERNEL_MODULE_BLACKLISTED', []],
+        ['ppp-observer-dependency-blacklist', 'KERNEL_MODULE_BLACKLISTED', []],
+        ['ppp-observer-boot-blacklist', 'KERNEL_MODULE_BLACKLISTED', []],
+        ['ppp-observers-mixed', 'installed', ['udp_diag', 'nf_tables', 'xfrm_user']],
+        ['ppp-observers-mixed-conflict', undefined, ['udp_diag', 'nf_tables', 'xfrm_user'], true],
         ['ppp-publish-race', 'PPP_MODULES_PERSISTENCE_CONFLICT', [], true],
         ['ppp-load-failure', 'PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
         ['ppp-no-readback', 'PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
@@ -535,8 +549,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
     ]) {
         test(`joined Install PPP prerequisite: ${scenario}`, async t => {
             const f = host(t, scenario);
-            const file = join(f.root, '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf');
+            const file = join(f.root, modulesPath);
             const before = fs.lstatSync(file, { throwIfNoEntry: false });
+            const preimage = before && !before.isSymbolicLink() ? fs.readFileSync(file) : null;
             let status = 200, result;
             const res = { status(value) { status = value; return this; }, json(value) { result = value; } };
             await installHandler(f.create)({ params: { id }, body: {} }, res);
@@ -549,17 +564,55 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             }, diagnostic(f));
             const { moduleLoads = [], effects } = f.records();
             assert.deepEqual(moduleLoads, loads);
+            const added = loads.filter(name => observers.includes(name));
+            assert.deepEqual(fs.readdirSync(dirname(file)).filter(name => name.startsWith('70-')).sort(),
+                fs.lstatSync(file, { throwIfNoEntry: false }) ? [modulesPath.split('/').at(-1)] : []);
             assert.equal(fs.readFileSync(join(f.root, '/etc/modules-load.d/10-unrelated.conf'), 'utf8'), '# operator-owned\nloop\n');
-            if (expected === 'installed' || scenario === 'ppp-lost-ack') {
-                assert.equal(fs.readFileSync(file, 'utf8'), '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n');
+            if (expected === 'installed' || ['ppp-lost-ack', 'ppp-observers-mixed-conflict'].includes(scenario)) {
+                assert.equal(fs.readFileSync(file, 'utf8'), stockModules + added.map(name => name + '\n').join(''));
                 assert.equal(fs.statSync(file).mode & 0o777, 0o644);
-                if (before) assert.equal(fs.statSync(file).ino, before.ino);
+                if (before && !added.length) assert.equal(fs.statSync(file).ino, before.ino);
             } else {
                 assert.equal(effects.length, 0);
                 assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
                 if (scenario === 'ppp-publish-race') assert.equal(fs.readFileSync(file, 'utf8'), '# foreign late arrival\n');
                 else assert.equal(fs.lstatSync(file, { throwIfNoEntry: false })?.ino, before?.ino);
                 if (scenario === 'ppp-mask') assert.equal(fs.readlinkSync(file), '/dev/null');
+            }
+            if (expected === 'installed' && added.length) {
+                assert.deepEqual(f.actions, installedActions);
+                assert.ok(f.records().reservedObservers.some(names => names.includes('xfrm_user')));
+                const manifestPath = join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${f.states[0].backupId}/manifest.json`);
+                const originalReceipt = fs.readFileSync(manifestPath);
+                const receipt = JSON.parse(originalReceipt);
+                const { bootFile, missing } = receipt.before.pppModules;
+                assert.deepEqual(Object.keys(receipt.before.pppModules.observers), [...added].sort());
+                assert.deepEqual(bootFile.before.record && Buffer.from(bootFile.before.record.data, 'base64'), preimage);
+                assert.equal(bootFile.before.generation?.[1], before?.ino);
+                assert.deepEqual(Buffer.from(bootFile.after.data, 'base64'), fs.readFileSync(file));
+                assert.equal(receipt.modulePersistence[1], fs.statSync(file).ino);
+                if (scenario === 'ppp-observers-mixed') {
+                    assert.equal(receipt.before.sockets, null);
+                    assert.ok(receipt.preparedSockets.length > 0);
+                    assert.ok(!missing.includes('tcp_diag'));
+                } else {
+                    assert.ok(Array.isArray(receipt.before.sockets));
+                    assert.ok(!Object.hasOwn(receipt, 'preparedSockets'));
+                }
+                const neighbor = fingerprint(f, '/etc/modules-load.d/10-unrelated.conf');
+                const removed = await f.create().removeRelay(id).catch(error => error);
+                assert.equal(removed.status, 'not_installed', JSON.stringify({ code: removed.code, ...JSON.parse(diagnostic(f)) }));
+                assert.deepEqual(f.records().moduleLoads, loads);
+                assert.ok(loads.every(name => f.records().modules.includes(name)), 'Remove must not unload modules');
+                assert.deepEqual(fs.existsSync(file) ? fs.readFileSync(file) : null, preimage);
+                if (preimage) assert.equal(fs.statSync(file).mode & 0o777, before.mode & 0o777);
+                assert.deepEqual(fingerprint(f, '/etc/modules-load.d/10-unrelated.conf'), neighbor);
+                assert.deepEqual(fs.readFileSync(manifestPath), originalReceipt);
+            }
+            if (scenario === 'ppp-observers-mixed-conflict') {
+                assert.deepEqual(effects, []);
+                assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
+                assert.ok(f.records().reservedObservers.some(names => names.includes('xfrm_user')));
             }
             if (retained) {
                 assert.equal(f.states[0].status, 'installing');
@@ -569,9 +622,106 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             } else if (expected !== 'installed') {
                 assert.equal(f.states.length + f.users.length, 0);
                 assert.ok(!f.actions.includes('install'));
+                assert.equal(fs.existsSync(join(f.root, '/var/lib/celerity-rebuild-l2tp-direct')), false);
             }
         });
     }
+
+    for (const scenario of ['ppp-network-observers-rollback', 'ppp-observers-mixed-rollback']) {
+        test(`joined module persistence verified rollback: ${scenario}`, async t => {
+            const f = host(t, scenario);
+            const file = join(f.root, modulesPath);
+            const preimage = fs.existsSync(file) ? fs.readFileSync(file) : null;
+            let manifest;
+            f.beforeDirectAction(action => {
+                if (action === 'rollback') {
+                    manifest = join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${f.states[0].backupId}/manifest.json`);
+                    assert.match(fs.readFileSync(file, 'utf8'), /\nxfrm_user\n$/);
+                    assert.equal(readJson(manifest).modulePersistence[1], fs.statSync(file).ino);
+                }
+            });
+            const result = await f.create().installRelay(id).catch(error => error);
+            assert.notEqual(result.status, 'installed');
+            assert.equal(f.actions.at(-1), 'rollback', diagnostic(f));
+            assert.equal(readJson(manifest).phase, 'rolled-back', diagnostic(f));
+            assert.equal(f.states.length + f.users.length, 0);
+            assert.deepEqual(fs.existsSync(file) ? fs.readFileSync(file) : null, preimage);
+            assert.ok(f.records().modules.includes('xfrm_user'));
+        });
+    }
+
+    for (const mode of ['drift', 'identical replacement before write', 'missing generation', 'concurrent replacement at release']) {
+        test(`joined module persistence refuses ${mode}`, async t => {
+            const race = mode === 'concurrent replacement at release';
+            const f = host(t, race ? 'ppp-observers-mixed-release-race' : 'ppp-network-observers');
+            assert.equal((await f.create().installRelay(id)).status, 'installed');
+            const file = join(f.root, modulesPath);
+            const installBytes = fs.readFileSync(file);
+            const state = f.states[0];
+            const dir = join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${state.backupId}`);
+            const beforeEffects = f.records().effects;
+            let replacementInode;
+            if (mode === 'drift') fs.appendFileSync(file, '# changed\n');
+            if (mode === 'missing generation') {
+                const manifest = join(dir, 'manifest.json');
+                const receipt = readJson(manifest);
+                delete receipt.modulePersistence;
+                fs.writeFileSync(manifest, JSON.stringify(receipt));
+            }
+            if (mode === 'identical replacement before write') {
+                f.beforeDirectAction(action => {
+                    if (action !== 'remove') return;
+                    fs.writeFileSync(file + '.new', installBytes, { mode: 0o644 });
+                    fs.renameSync(file + '.new', file);
+                    replacementInode = fs.statSync(file).ino;
+                });
+            }
+            const result = await f.create().removeRelay(id).catch(error => error);
+            assert.notEqual(result.status, 'not_installed');
+            if (race) {
+                replacementInode = f.records().moduleRaceInode;
+                assert.ok(replacementInode, diagnostic(f));
+                assert.equal(f.states[0].status, 'removing');
+            } else {
+                assert.deepEqual(f.records().effects, beforeEffects);
+                assert.equal(f.states[0].status, 'installed');
+            }
+            if (replacementInode) assert.equal(fs.statSync(file).ino, replacementInode);
+            assert.deepEqual(fs.readFileSync(file), mode === 'drift' ? Buffer.concat([installBytes, Buffer.from('# changed\n')]) : installBytes);
+            assert.ok(f.records().modules.includes('xfrm_user'));
+        });
+    }
+
+    test('joined module persistence: reinstall with resident modules, new PPP-only and legacy receipts', async t => {
+        const f = host(t, 'ppp-network-observers');
+        const file = join(f.root, modulesPath);
+        let lastId;
+        for (const legacy of [false, false, true]) {
+            const installed = await f.create().installRelay(id).catch(error => error);
+            assert.equal(installed.status, 'installed', JSON.stringify({ code: installed.code, ...JSON.parse(diagnostic(f)) }));
+            const { backupId } = f.states[0];
+            assert.notEqual(backupId, lastId);
+            const manifest = join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${backupId}/manifest.json`);
+            const receipt = readJson(manifest);
+            assert.equal(fs.readFileSync(file, 'utf8'), stockModules + (lastId ? '' : 'xfrm_user\n'));
+            if (legacy) {
+                // Exact old PPP-only receipt shape. Old installations left their PPP file on Remove.
+                // Do not round unrelated nanosecond pins by reserializing the manifest in JS.
+                const original = fs.readFileSync(manifest, 'utf8');
+                const old = original.replace(/"modulePersistence":\[\d+,\d+,\d+\],/, '')
+                    .replace(`"bootFile":${JSON.stringify(receipt.before.pppModules.bootFile)},`, '');
+                assert.ok(!Object.hasOwn(JSON.parse(old).before.pppModules, 'bootFile'));
+                assert.ok(!Object.hasOwn(JSON.parse(old), 'modulePersistence'));
+                fs.writeFileSync(manifest, old);
+            }
+            const generation = fs.statSync(file).ino;
+            assert.equal((await f.create().removeRelay(id)).status, 'not_installed');
+            assert.equal(fs.existsSync(file), legacy);
+            if (legacy) assert.equal(fs.statSync(file).ino, generation);
+            assert.deepEqual(f.records().moduleLoads, ['xfrm_user']);
+            lastId = backupId;
+        }
+    });
 
     test('joined Install from unprepared Debian refuses unsafe package autostart before any effects', async t => {
         const f = host(t, 'fresh-stock-runtime');

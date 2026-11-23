@@ -61,7 +61,7 @@ appliedSide.routing.rules.push({ type: 'field', inboundTag: ['current-bridge'], 
 // helper. Only the local host boundary (systemctl, kernel/proc, Xray commands,
 // filesystem root and numeric ownership) is modeled. No network or host tools.
 const fixture = String.raw`
-import contextlib, copy, io, json, os, stat, sys
+import contextlib, copy, io, itertools, json, os, socket, stat, sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 source, root, scenario = sys.argv[1:]
@@ -69,6 +69,23 @@ root, f = Path(root), json.load(sys.stdin)
 os.umask(0o077)
 h = {'__name__': 'fixture'}
 exec(compile(Path(source).read_bytes(), source, 'exec'), h)
+probes = []
+class Associate:
+    def __init__(self, family, kind):
+        assert (family, kind) == (socket.AF_INET, socket.SOCK_STREAM)
+        self.writes = []
+    def __enter__(self): return self
+    def __exit__(self, *_): probes.append(self.writes)
+    def settimeout(self, seconds): assert 0 < seconds <= 1
+    def connect(self, endpoint):
+        ports = [i['port'] for cfg in loaded.values() for i in cfg['inbounds'] if i['tag'] == 'rebuild-relay-ingress']
+        assert endpoint[0] == '127.0.0.1' and endpoint[1] in ports
+        if not scenario.endswith('-associate'): raise ConnectionRefusedError()
+    def sendall(self, data): self.writes.append(data)
+    def recv(self, size):
+        assert self.writes == [b'\x05\x01\x00', b'\x05\x03\x00\x01' + bytes(6)][:len(self.writes)]
+        return {2:b'\x05\x00', 4:b'\x05\x00\x00\x01', 6:b'\x7f\x00\x00\x01\xc4\x00'}[size]
+h['socket'] = NS(AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM, socket=Associate)
 P = h['NAMES']
 X, B, XL, IKE, NET, MAIN, BRIDGE, XRAY, SYSTEM = [h[k] for k in ('X','B','XL','IKE','NET_UNIT','MAIN','BRIDGE','XRAY','SYSTEM')]
 req = {k:f[k] for k in ('machineId','network','backupId')}
@@ -151,6 +168,7 @@ stock = copy.deepcopy(units)
 loaded = {n:json.loads(backing(p).read_bytes()) for n,p in [(X,MAIN),(B,BRIDGE)] if backing(p).exists()}
 policy = {'rule':False,'route':False,'nft':False}
 changes, checks = [], []
+restarts = itertools.count(301)
 removing = False
 
 def proc(path, mode='r'):
@@ -215,7 +233,7 @@ def run(argv, **kw):
                 for n in (XL,IKE,NET): units[n] = dict(stock[n])
                 units[X]['RequiredBy'] = ''
         elif op == 'restart' and rest[0] in (X,B):
-            n = rest[0]; load(n, MAIN if n == X else BRIDGE, 300 + len(changes))
+            n = rest[0]; load(n, MAIN if n == X else BRIDGE, next(restarts))
         elif op == 'start' and rest == [XL]:
             for n,pid,sub,generation in [(XL,'202','running',202),(IKE,'201','running',201),(NET,'0','exited',203)]:
                 units[n].update(ActiveState='active',MainPID=pid,SubState=sub,InvocationID=f'{generation:032x}')
@@ -242,9 +260,14 @@ def run(argv, **kw):
                 tag = i['tag']
                 protos = ['tcp','udp'] if tag.startswith('relay-l2tp-') or i['protocol'] == 'socks' else ['tcp']
                 for proto in protos:
+                    if proto == 'udp' and tag == 'rebuild-relay-ingress' and scenario.endswith('-associate'): continue
                     if removing and proto == 'udp' and tag == 'rebuild-relay-ingress' and (
                         scenario.endswith('missing-udp') or scenario == 'post-bridge-udp' and ('restart',B) in changes): continue
-                    rows.append((proto,i.get('listen','0.0.0.0'),i['port'],units[name]['MainPID']))
+                    address, pid = i.get('listen','0.0.0.0'), units[name]['MainPID']
+                    if removing and proto == 'udp' and tag == 'rebuild-relay-ingress':
+                        if scenario == 'split-wrong-udp-address': address = '0.0.0.0'
+                        if scenario == 'local-wrong-udp-pid': pid = '999'
+                    rows.append((proto,address,i['port'],pid))
         for n,ports in [(XL,[1701]),(IKE,[500,4500])]:
             if units[n]['ActiveState'] == 'active':
                 rows.extend(('udp','0.0.0.0',p,units[n]['MainPID']) for p in ports)
@@ -327,8 +350,36 @@ assert a[0] == 0, a
 manifest = backing(h['manifest_path'](token))
 receipt = manifest.read_bytes(),manifest.stat().st_ino
 intent = manifest.with_name('remove-attempt.json')
+if scenario == 'apply-associate':
+    def apply_ack(action, **extra):
+        r = wire(action, **extra)
+        assert r[0] == 0 and r[2] == '', r
+        return json.loads(r[1])['proof']
+    proof = apply_ack('check-apply-network')
+    assert apply_ack('prepare-apply-network') == proof
+    assert apply_ack('verify-apply-network', proof=proof) == proof
+    # Publish the effective pair after verify-before-restart. Only the old
+    # MAIN is live at restart entry; the new MAIN owns the handoff afterward.
+    units[B].update(ActiveState='inactive',SubState='dead',MainPID='0',InvocationID='')
+    del loaded[B]
+    put(MAIN,f['applied'],(0,65534),replace=True)
+    put(BRIDGE,f['appliedSide'],(65534,65534),replace=True)
+    assert apply_ack('restart-apply-network', proof=proof) == proof
+    h['NETWORK_UPGRADE_ENTERED'] = False  # The next wire frame runs in a fresh process in production.
+    load(B, BRIDGE, 402)
+    assert apply_ack('verify-apply-network', proof=proof) == proof
+    # A conflicting fixed UDP row cannot be rescued by a server that would
+    # otherwise return a valid UDP ASSOCIATE response.
+    live_rows = h['sock_rows']
+    handoff_port = next(i['port'] for i in loaded[X]['inbounds'] if i['tag'] == 'rebuild-relay-ingress')
+    h['sock_rows'] = lambda: live_rows() + [('udp', '0.0.0.0', handoff_port, ['999'])]
+    before_probe = len(probes)
+    refusal = wire('verify-apply-network', proof=proof)
+    assert refusal == (70, '', 'DIRECT_RUNTIME_UNPROVED\n'), refusal
+    assert len(probes) == before_probe
+    h['sock_rows'] = live_rows
 req['nodeId'] = f['nodeId']
-if scenario.startswith('apply'):
+if scenario.startswith('apply') and scenario != 'apply-associate':
     put(MAIN,f['applied'],(65534 if scenario == 'apply-nobody-main' else 0,65534),replace=True)
     put(BRIDGE,f['appliedEmptySide' if scenario == 'apply-empty-bridge' else 'appliedSide'],(65534,65534),replace=True)
     load(X,MAIN,401); load(B,BRIDGE,402)
@@ -361,11 +412,14 @@ old_sockets = h['owned_sockets'](h['sock_rows'](),bridge_unit['MainPID'])
 a = wire('prepare-remove')
 assert snapshots() == before and not changes and not intent.exists()
 negative = {**dict.fromkeys(('replace-main','replace-bridge','restart-bridge','restart-main','changed-split','foreign-dependency'), 'ROLLBACK_DRIFT'),
-            **dict.fromkeys(('foreign-handoff','split-missing-udp','local-missing-udp','bridge-exe'), 'RUNTIME_UNPROVED'),
+            **dict.fromkeys(('foreign-handoff','split-missing-udp','local-missing-udp','bridge-exe',
+                             'split-wrong-udp-address','local-wrong-udp-pid'), 'RUNTIME_UNPROVED'),
             **dict.fromkeys(('wrong-node','apply-mixed','non-invertible-receipt'), 'CANDIDATE_INVALID'),
             'dynamic-user':'PROFILE_USERS'}
 if scenario in negative:
     assert a == (70,'','DIRECT_'+negative[scenario]+'\n'), a
+    if scenario in ('split-wrong-udp-address','local-wrong-udp-pid','foreign-handoff'):
+        assert not probes, 'invalid fixed sockets must not fall through to negotiation'
 else:
     assert a[0] == 0, a
     proof = json.loads(a[1])['baseline']
@@ -399,12 +453,16 @@ else:
             assert all(B not in change for change in changes) and units[B] == bridge_unit and side_after == side_before
         assert h['ip']('rule','show')[-1]['table'] == 201 and h['ip']('route','show','table','all')[0]['table'] == 201
         assert 'foreign' in [r['name'] for r in h['nft_tables']()]
+        if scenario.endswith('-associate'):
+            assert len(probes) >= (6 if scenario == 'split-associate' else 3)
+            assert all(len(writes) == 2 for writes in probes)
 assert (manifest.read_bytes(),manifest.stat().st_ino) == receipt
 print('ok')
 `;
 
-for (const scenario of ['split', 'apply', 'apply-nobody-main', 'apply-empty-bridge', 'local', 'replace-main', 'replace-bridge', 'restart-bridge', 'restart-main',
+for (const scenario of ['split', 'split-associate', 'apply', 'apply-associate', 'apply-nobody-main', 'apply-empty-bridge', 'local', 'local-associate', 'replace-main', 'replace-bridge', 'restart-bridge', 'restart-main',
     'changed-split', 'foreign-dependency', 'wrong-node', 'foreign-handoff', 'split-missing-udp', 'local-missing-udp',
+    'split-wrong-udp-address', 'local-wrong-udp-pid',
     'dynamic-user', 'bridge-exe', 'apply-mixed', 'non-invertible-receipt', 'apply-stale-bridge', 'missing-ipsec-idle-witness',
     'post-bridge-udp', 'post-user']) {
     test(`DIRECT remove layout: ${scenario}`, () => {

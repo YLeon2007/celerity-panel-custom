@@ -32,7 +32,7 @@ const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLog
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
     'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
-    'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed'];
+    'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed', 'canInstallAgain', 'installRecoveryUnconfirmed'];
 function secretControl(kind, url, index, login) {
     const valueId = `rebuild-l2tp-${kind}-${index}`;
 %>
@@ -134,7 +134,14 @@ function secretControl(kind, url, index, login) {
                                                     data-node-name="<%= relay.name %>" aria-haspopup="dialog"><%= l(`admission.${action}`) %></button>
                                         <% } } %>
                                     <% } %>
-                                    <% if (actionable && !changed && relay.canInstall === true) { %>
+                                    <% if (actionable && !changed && status === 'installing' && relay.canRecoverInstall === true
+                                        && typeof canRequestInstallRecovery !== 'undefined' && canRequestInstallRecovery === true) { %>
+                                        <p class="text-muted" id="install-recovery-<%= relay.id %>"><%= l('installRecoveryHint') %></p>
+                                        <button type="button" class="btn btn-sm btn-secondary" disabled
+                                                data-install-recovery-url="<%= relayPath(relay.id) %>/install/recover"
+                                                data-node-id="<%= relay.id %>" aria-describedby="install-recovery-<%= relay.id %>"><%= l('recoverInstall') %></button>
+                                    <% } %>
+                                    <% if (actionable && !changed && status === 'not_installed' && relay.canInstall === true) { %>
                                         <p class="text-muted" id="install-profile-<%= relay.id %>"><%= l('installProfileHint') %>
                                             <a href="/panel/nodes"><%= t('nodes.title') %></a>
                                         </p>

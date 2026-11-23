@@ -1869,6 +1869,8 @@
     },
     "installProfileHint": "Install needs an applied, compatible Xray rebuild profile. Regular Setup writes legacy JSON. If needed, configure the intended relay link in Nodes → Network Map and save without auto-deploy. Choose Deploy to preview the changes. Apply only if you approve the changes and this panel manages all affected profiles. Do not overwrite custom or externally managed profiles.",
     "installPackageHint": "Install can prepare missing VPN packages on supported Debian 13 relays with a database grant. Use a maintenance window. Packages are not rolled back if L2TP installation fails. If the result is uncertain, do not retry; have the relay administrator verify the package and L2TP state.",
+    "recoverInstall": "Check and continue",
+    "installRecoveryHint": "This checks the interrupted installation and may finish cleanup. It does not start a new installation.",
     "remove": "Remove",
     "accounts": "L2TP accounts",
     "accountsReadOnly": "Account management is unavailable.",
@@ -1978,6 +1980,8 @@
       "installBusy": "Another relay or shared-account operation is in progress. Wait for it to finish, then refresh the page.",
       "installRolledBack": "L2TP installation failed and was rolled back. Refresh the page before taking further action.",
       "installCleanupFailed": "L2TP installation was recorded, but cleanup could not be confirmed. Do not retry; refresh and verify the state.",
+      "canInstallAgain": "You can install again. Refresh the page to check if Install is available.",
+      "installRecoveryUnconfirmed": "Cleanup of the interrupted installation could not be confirmed. Do not start a new installation.",
       "rateLimited": "Too many requests. Wait before trying again.",
       "uncertain": "The outcome is uncertain. Do not retry. Reload the data and verify the current state first.",
       "canceled": "The requested account change was canceled and not applied. Reload L2TP data to see the current state.",
@@ -1988,6 +1992,7 @@
       "deleted": "The account was deleted. Reload to see the updated state."
     },
     "installChecks": {
+      "KERNEL_MODULE_BLACKLISTED": "A required kernel network module or one of its dependencies is blacklisted. Ask the relay administrator to review the policy; Install will not bypass it.",
       "REBUILD_LINKS_NOT_APPLIED": "The relay has pending links or unsupported peers. On the Network Map, check that the intended links are applied and all peers are active, panel-managed Xray nodes. Do not apply unrelated links to clear this check.",
       "XRAY_BASELINE_UNSUPPORTED": "Install does not support the existing Xray profile format or routing layout. Reformatting the JSON will not make it a rebuild profile. Follow the instructions on this relay's card only for panel-managed profiles.",
       "XRAY_PROFILE_OWNER_UNSUPPORTED": "An Xray profile has a file owner that Install does not support. Ask the relay administrator to verify who manages it. Do not change its ownership or overwrite it just to pass this check.",

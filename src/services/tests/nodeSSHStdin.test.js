@@ -64,6 +64,25 @@ const stdinFailure = error => {
     return true;
 };
 
+test('pinned exec proves zero stdin on final handoff refusal, not on a first-write failure', async () => {
+    const { execStdinWasNotAttempted } = require('../nodeSSH');
+    for (const cut of ['after guard', 'inside write']) {
+        const f = await createGuardedChannel();
+        let writes = 0;
+        f.stream.write = () => { writes++; throw new Error('ambiguous first write'); };
+        const reply = assert.rejects(f.execPinned('/fixed/receiver', guardedOptions, async () => {
+            if (cut === 'after guard') f.node.ssh.port = 23;
+        }), error => {
+            assert.equal(execStdinWasNotAttempted?.(error), cut === 'after guard');
+            return stdinFailure(error);
+        });
+        f.open();
+        await reply;
+        assert.equal(writes, Number(cut === 'inside write'));
+        f.direct.disconnect();
+    }
+});
+
 test('guarded direct exec waits for the late channel and the local guard before writing', async () => {
     const fixture = await createGuardedChannel();
     const permission = Promise.withResolvers();

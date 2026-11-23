@@ -75,6 +75,7 @@ function createPanelRouter({
     rebuildL2tp?.mountReveals(router);
     rebuildL2tp?.mountAdmission(router, injectedL2tpRateLimiter);
     rebuildL2tp?.mountRetire(router, injectedL2tpRateLimiter);
+    rebuildL2tp?.mountInstallRecovery(router, injectedL2tpRateLimiter);
 
     // Wizard routes require auth but bypass requireOnboarding (they ARE the onboarding)
     router.use('/', requireAuth, wizardRoutes);

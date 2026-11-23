@@ -219,7 +219,7 @@ class Host:
         self.archive_used = None
         self.after_update = lambda: None
         self.error_stage: str | None = None
-        self.active = self.enabled = self.listener = self.job = self.process = self.bad_audit = False
+        self.active = self.enabled = self._listener = self.job = self.process = self.bad_audit = False
         self.broken = False
         self.installed = {n: ('1.0-1', 'amd64') for n in ('apt', 'dpkg', 'systemd', 'base-files',
                                                         'init-system-helpers', 'libc6', 'libnftnl11')}
@@ -267,6 +267,19 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
         self.put('/var/lib/dpkg/lock-frontend', '', 0o640)
         self.put('/var/lib/apt/lists/lock', '', 0o640)
         self.status()
+        self.listener = False
+
+    @property
+    def listener(self):
+        return self._listener
+
+    @listener.setter
+    def listener(self, busy):
+        self._listener = busy
+        header = '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n'
+        for leaf, address in (('udp', '0' * 8), ('udp6', '0' * 32)):
+            row = f'  1: {address}:01F4 {address}:0000 07 00000000:00000000 00:00000000 00000000 0 0 42\n'
+            self.put('/proc/net/' + leaf, header + (row if busy and leaf == 'udp6' else ''))
 
     def p(self, path):
         return self.root / path.lstrip('/')
@@ -564,8 +577,6 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
                 return self._reload()
         if argv == ('/usr/bin/ps', '-e', '-o', 'pid=,comm='):
             return 0, b'      1 systemd\n    847 sshd\n' + (b'    878 charon\n' if self.process else b''), b''
-        if argv == ('/usr/bin/ss', '-H', '-aun', '( sport = :500 or sport = :4500 or sport = :1701 )'):
-            return 0, b'UNCONN 0 0 0.0.0.0:500 0.0.0.0:*\n' if self.listener else b'', b''
         raise AssertionError(f'Unexpected modeled argv {argv!r}')
 
 

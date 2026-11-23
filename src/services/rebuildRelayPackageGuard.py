@@ -295,7 +295,7 @@ def _charon_pair(packages):
     return packages[LIBCHARON][1] == ARCH and packages.get('strongswan-charon') == packages[LIBCHARON]
 
 
-def _quiet(run):
+def _quiet(root, run):
     ps = _out(run, ('/usr/bin/ps', '-e', '-o', 'pid=,comm='), 'PACKAGE_PROCESSES')
     pids = set()
     for line in ps.rstrip('\n').split('\n'):
@@ -307,8 +307,27 @@ def _quiet(run):
             need(match[2] == 'systemd', 'PACKAGE_PROCESSES')
     need('1' in pids, 'PACKAGE_PROCESSES')
     need(not _out(run, CTL + ('list-jobs', '--no-legend', '--plain'), 'PACKAGE_JOBS'), 'PACKAGE_JOBS')
-    need(not _out(run, ('/usr/bin/ss', '-H', '-aun', '( sport = :500 or sport = :4500 or sport = :1701 )'),
-                  'PACKAGE_LISTENERS'), 'PACKAGE_LISTENERS')
+    # NETLINK_SOCK_DIAG can request udp_diag even for this read-only check.
+    # UDP proc tables report bound sockets without requesting any module.
+    for leaf, address_width in (('udp', 8), ('udp6', 32)):
+        try:
+            with (root / 'proc/net' / leaf).open('rb') as stream:
+                data = stream.read(2**20 + 1)
+        except FileNotFoundError:
+            if leaf == 'udp6':  # IPv6 is not registered in this namespace.
+                continue
+            raise Refusal('PACKAGE_LISTENERS') from None
+        except OSError:
+            raise Refusal('PACKAGE_LISTENERS') from None
+        need(0 < len(data) <= 2**20 and data.endswith(b'\n'), 'PACKAGE_LISTENERS')
+        header, *rows = data.splitlines()
+        fields = header.split()
+        # Linux calls the third column rem_address for IPv4, remote_address for IPv6.
+        need(fields[:2] == [b'sl', b'local_address'] and len(fields) >= 4
+             and fields[2] in (b'rem_address', b'remote_address') and fields[3] == b'st', 'PACKAGE_LISTENERS')
+        for row in rows:
+            match = re.match(rb'\s*[0-9]+:\s+[0-9A-F]{%d}:([0-9A-F]{4})\s' % address_width, row)
+            need(match is not None and int(match[1], 16) not in (500, 4500, 1701), 'PACKAGE_LISTENERS')
 
 
 def _properties(run, args, keys, statuses=(0,)):
@@ -838,7 +857,7 @@ def _json(value):
 
 def _facts(root, run):
     _environment(root)
-    _quiet(run)
+    _quiet(root, run)
     installed, digest, status = _packages(root, run)
     layout = _layout(root, run, installed)
     units = _units(run, layout)
@@ -873,7 +892,7 @@ def _observe(root, run, *, fetched=None):
             plan, records = _plan(root, run, facts, sources, missing, bootstrap=fetched is not None)
         else:
             staging = _index_staging(root)
-    _quiet(run)
+    _quiet(root, run)
     observation = _proof(missing, facts, sources, plan, records, staging)
     return observation, facts, plan, sources
 
@@ -1146,7 +1165,7 @@ def _prepare(root, run, expected, enter):
         now = _facts(root, run)
         fetched = _sources(root)
         need(now == facts and fetched[0] == sources[0] and fetched[2] == sources[2], 'PACKAGE_PLAN_CHANGED')
-        _quiet(run)
+        _quiet(root, run)
         _fetched_indexes(root, fetched)
         need(_sources(root) == fetched, 'PACKAGE_PLAN_CHANGED')
         sources = fetched
@@ -1181,7 +1200,7 @@ def _prepare(root, run, expected, enter):
             _units(run, layout, masked=True)
             need(layout[1:3] == baseline[1:3] and _packages(root, run)[0] == installed
                  and _sources(root) == sources, 'PACKAGE_PLAN_CHANGED')
-            _quiet(run)
+            _quiet(root, run)
             policy.check(root)
             for mask in masks.values():
                 mask.check(root)
@@ -1191,7 +1210,7 @@ def _prepare(root, run, expected, enter):
                 dispatched = True
                 _command(run, apt + ('/usr/bin/apt-get', '-y') + _apt_args(specs), 'PACKAGE_APT_UNSETTLED',
                          timeout=APT_TIMEOUT, quiet=False)
-            _quiet(run)
+            _quiet(root, run)
             archives.check()
             now, _, _ = _packages(root, run)
             need(now == permits, 'PACKAGE_APT_READBACK')
@@ -1214,7 +1233,7 @@ def _prepare(root, run, expected, enter):
             alias_path = f'{VENDOR}/{IKE_ALIAS}'
             need(layout[1:3] == postinst[1:3] and layout[0].get(alias_path) == postinst[0].get(alias_path),
                  'PACKAGE_UNIT_OWNER')
-            _quiet(run)
+            _quiet(root, run)
             policy.check(root)
             _remove_owned(root, list(masks.values()))
             _reload(run)
@@ -1222,7 +1241,7 @@ def _prepare(root, run, expected, enter):
             need(unmasked[1:3] == layout[1:3] and unmasked[0].get(alias_path) == layout[0].get(alias_path),
                  'PACKAGE_UNIT_OWNER')
             _units(run, unmasked)
-            _quiet(run)
+            _quiet(root, run)
             need(_packages(root, run)[0] == permits and ('xl2tpd' not in now or 'xl2tpd.service' in unmasked[3]),
                  'PACKAGE_APT_READBACK')
             archives.remove()

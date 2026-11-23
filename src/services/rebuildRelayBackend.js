@@ -1,7 +1,7 @@
 'use strict';
 
 const { isIP } = require('node:net');
-const { withNode } = require('./rebuildLocks');
+const { withNode, installOwner } = require('./rebuildLocks');
 const { componentFor } = require('./rebuildCoordinator');
 const { readRelayAuthority, captureRelayEffect, isIdentityChanged, isGrantAuthorityError } = require('./rebuildRelayEffectAuthority');
 const { validateRebuildMode } = require('./rebuildMode');
@@ -10,6 +10,7 @@ const { createStore, read } = require('./rebuildRelayBackendStore');
 const { makeDesired } = require('./rebuildRelayBackendDesired');
 const { resolveAccountSources } = require('./rebuildRelayAccountInventory');
 const { compileRebuildGraph } = require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
+const { grantIdentity, validActor } = require('./rebuildRelayInstallRecoveryStore');
 
 const fail = code => Object.assign(new Error(code), { code });
 const eligible = (node, id, listMode) => String(node?._id) === id && node.type === 'xray'
@@ -72,8 +73,9 @@ async function precheckSource({ node, fence, installation, currentUsers }, creat
     await checkAuthority();
 }
 
-function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, relayGrantStore, createRelayDirect = defaultDriver }) {
-    return async function installRelay(id) {
+function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, relayGrantStore, actor: defaultActor,
+    createRelayDirect = defaultDriver }) {
+    return async function installRelay(id, { actor = defaultActor } = {}) {
         let enabled;
         try { enabled = validateRebuildMode(env); } catch { /* Conflicting mode. */ }
         if (enabled !== true || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== 'true' || typeof id !== 'string'
@@ -84,7 +86,7 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
         const fence = captureRelayEffect(env, relayGrantStore, snapshot, id);
         const { machineId } = fence.binding;
         const getNode = (nodeId = id) => read(Node.findById(nodeId).select('ip domain active type cascadeRole useCustomConfig ssh'));
-        let store;
+        let store, owner;
         return runFreshRelayInstall(id, {
             authorize: relayGrantStore ? async () => { await fence.check(); return true; }
                 : () => { try { fence.check(); return true; } catch { return false; } },
@@ -93,6 +95,7 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
             allowPackagePreparation: fence.listMode === true && fence.source === 'db',
             lock: fn => locks.run((verifyLock, retainLock) => withNode(id, async () => {
                 if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
+                if (fence.listMode && fence.source === 'db' && validActor(actor)) owner = installOwner(retainLock);
                 return fn(verifyLock, retainLock);
             }), { allowStaleUnlock: false }),
             async inventory() {
@@ -131,7 +134,10 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
                 ...(inventory.bound && { fence: inventory.bound }) }),
             prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit }, remote) =>
                 remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, ...(transit && { transit }) }),
-            reserve: (inventory, backupId, verifyLock) => store.reserve({ ...inventory, backupId, machineId }, verifyLock),
+            reserve: (inventory, backupId, verifyLock, packagePreparation) => store.reserve({ ...inventory, backupId, machineId, packagePreparation,
+                ...(owner && { recovery: { owner, actor, authority: grantIdentity(inventory.bound), key: inventory.key } }),
+            }, verifyLock),
+            handBackRecovery: () => owner?.handBack(),
             verifyReservation: reservation => store.verifyReservation(reservation),
             finish: (reservation, verifyLock) => store.finish(reservation, verifyLock),
             restore: (reservation, verifyLock) => store.restore(reservation, verifyLock),

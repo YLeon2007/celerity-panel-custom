@@ -346,6 +346,15 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             const admissionAbsent = admit && !withUsers.has(id) && (!state || admission.pristine.has(String(state._id)));
             const refreshOwned = admit && !!binding && state?.status === 'installed' && state.desiredState === 'installed'
                 && state.rebuildMachineId === grant?.machineId;
+            // Offer verification of a persisted rebuild Install reservation,
+            // not authorization to clear it. Unlike Install this must remain
+            // visible with the reservation/lock in place; POST rechecks both.
+            const canRecoverInstall = clear && qualified && list && grantSource === 'db' && !!binding && !problem
+                && hasKey() && !isForeign(binding.machineId)
+                && state?.status === 'installing' && state.desiredState === 'installed'
+                && state.routingMode === FOLLOW_RELAY_MODE && state.routingVersion === FOLLOW_RELAY_VERSION
+                && state.rebuildMachineId === binding.machineId && matches(hex32, state.backupId)
+                && matches(receiptPattern, state.rebuildInstallToken);
             return { id, name: typeof row.name === 'string' ? row.name : '', ip: typeof row.ip === 'string' ? row.ip : '',
                 status: !state ? 'not_installed' : statuses.includes(state.status) ? state.status : 'error', bound: !!binding,
                 grantSource, grantProblem: problem,
@@ -355,6 +364,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 canInstall: clear && qualified && !!binding && !problem && (grantSource === 'env' || admissionReady)
                     && !isForeign(binding.machineId) && hasKey()
                     && !withUsers.has(id) && (!state || pristineIds.has(String(state._id))),
+                ...(canRecoverInstall && { canRecoverInstall: true }),
                 canRemove: clear && owned.has(id), canRevealPsk: clear && owned.has(id) && hasKey() };
         });
         if (relays.some(relay => relay.canInstall)) {

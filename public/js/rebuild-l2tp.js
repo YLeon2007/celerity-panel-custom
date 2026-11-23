@@ -115,6 +115,7 @@
 
     const form = page.querySelector('[data-create]');
     const installs = page.querySelectorAll('[data-install-url]');
+    const installRecoveries = page.querySelectorAll('[data-install-recovery-url]');
     const accountButtons = page.querySelectorAll('[data-account-action]');
     const submit = form?.querySelector('button[type="submit"]');
     const status = page.querySelector('[data-action-status]');
@@ -124,7 +125,7 @@
     const removeLinks = page.querySelectorAll('[data-remove-link]');
     const dialog = page.querySelector('[data-admission-dialog]');
     const recover = page.querySelector('[data-reconcile]');
-    const mutations = [...installs, ...accountButtons, ...[submit, recover].filter(Boolean)];
+    const mutations = [...installs, ...installRecoveries, ...accountButtons, ...[submit, recover].filter(Boolean)];
     const expected = { install: 'installed', create: 'created', disable: 'disabled', delete: 'deleted' };
     const installOutcomes = new Map([
         ['refused', 'installRefused'], ['busy', 'installBusy'], ['rolled_back', 'installRolledBack'],
@@ -429,6 +430,26 @@
         updateMutations();
     }
 
+    async function recoverInstall({ installRecoveryUrl, nodeId }) {
+        if (busy || flow || requireRefresh) return;
+        busy = true;
+        clearSecrets();
+        updateMutations();
+        status.textContent = words.working;
+        let message = 'installRecoveryUnconfirmed';
+        try {
+            const { response, data } = await post(installRecoveryUrl, {});
+            if (response.ok && !noRetry(data) && data?.executionMode === 'rebuild'
+                && data.status === 'can_install_again' && data.nodeId === nodeId) message = 'canInstallAgain';
+        } catch { /* An unconfirmed response is not permission to install. */ }
+        status.textContent = words[message];
+        busy = false;
+        // Both outcomes leave this stale view locked. The refresh link only
+        // reads the overview; a subsequent Install needs a separate click.
+        requireRefresh = true;
+        updateMutations();
+    }
+
     function accountAction(action, login, password) {
         const body = action === 'create' ? { login, password } : { login };
         void mutate(action, `${page.dataset.accountUrl}/${action}`, body, data => data.login === login);
@@ -444,6 +465,9 @@
         button.addEventListener('click', () => {
             void mutate('install', button.dataset.installUrl, {}, data => data.nodeId === button.dataset.nodeId, button.dataset.nodeId);
         });
+    }
+    for (const button of installRecoveries) {
+        button.addEventListener('click', () => { void recoverInstall(button.dataset); });
     }
     for (const button of accountButtons) {
         button.addEventListener('click', () => {
