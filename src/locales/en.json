@@ -1675,6 +1675,7 @@
     "internetExit": "Internet Exit"
   },
   "mcp": {
+    "jsonBodyTooLarge": "The MCP JSON request body is too large. Send a smaller request.",
     "title": "MCP Integration",
     "subtitle": "Connect AI assistants to manage your panel",
     "motto": "Censor uses AI to block? Time to get your own.",

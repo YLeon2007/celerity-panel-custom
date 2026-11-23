@@ -221,6 +221,7 @@ app.use(cors({
 }
 
 app.use(express.json());
+app.use(require('./src/middleware/mcpJsonLimitError'));
 app.use(express.urlencoded({ extended: true }));
 
 let sessionMiddleware = null;

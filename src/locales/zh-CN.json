@@ -1668,6 +1668,7 @@
     "internetExit": "互联网出口"
   },
   "mcp": {
+    "jsonBodyTooLarge": "MCP JSON 请求体过大。请发送更小的请求。",
     "title": "MCP 集成",
     "subtitle": "连接 AI 助手来管理你的面板",
     "motto": "审查系统用 AI 来封锁？该拥有你自己的了。",
