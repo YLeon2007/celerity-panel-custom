@@ -1,7 +1,7 @@
 <%
 const retireKeys = ['loading', 'onlineZero', 'onlineForce', 'offlineSince', 'offlineSinceUnknown', 'accountCount', 'accountCountUnknown',
     'confirmDelete', 'confirmForce', 'confirmAbandon', 'changed', 'neighborUnavailable', 'protectedChange', 'previewUnavailable',
-    'neighborRefused', 'neighborUnknown', 'neighborRuntimeForeignChange',
+    'neighborRefused', 'neighborUnknown', 'neighborRuntimeForeignChange', 'neighborNetworkNotReady',
     'outcomeUnconfirmed', 'newPreviewRequired', 'forceRequired', 'deleting'];
 const retireMessages = Object.fromEntries(retireKeys.map(key => [key, t(`nodes.retireRelay.${key}`)]));
 %>
@@ -24,4 +24,4 @@ const retireMessages = Object.fromEntries(retireKeys.map(key => [key, t(`nodes.r
         <button type="button" class="btn btn-danger" data-retire-confirm hidden disabled></button>
     </div>
 </dialog>
-<script src="/js/rebuild-relay-retire.js?v=3" defer></script>
+<script src="/js/rebuild-relay-retire.js?v=4" defer></script>

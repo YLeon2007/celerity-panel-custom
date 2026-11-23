@@ -25,7 +25,7 @@ const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
 const { relayRoleBlock, withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
-const { runtimeForeignChange } = require('../../services/rebuildRelayRuntimeRefusal');
+const { runtimeForeignChange, isNetworkNotReady, networkObservationRequired } = require('../../services/rebuildRelayRuntimeRefusal');
 const { canPreviewRemoval, issueRemovalTicket, identityReviewUrl, admitPreview } = require('./rebuildRelayRemove');
 const { identityChanged } = require('./rebuildRelayAdmission');
 
@@ -584,7 +584,7 @@ router.get('/nodes/:id', async (req, res) => {
         renderNode.xray = sanitizeXrayForRender(node.xray);
         const preview = canPreviewRemoval(req);
         if (preview || rebuild) res.set('Cache-Control', 'no-store');
-        let reviewIdentity = false, unconfirmedRemoval = false, foreignChange = false;
+        let reviewIdentity = false, unconfirmedRemoval = false, runtimeBlock = null;
         const roleBlock = isRebuildEnabled() && node.cascadeRole === 'relay'
             ? await relayRoleBlock(node._id, preview ? async id => {
                 if (!await admitPreview(req, res)) return;
@@ -593,7 +593,10 @@ router.get('/nodes/:id', async (req, res) => {
                     unconfirmedRemoval = error?.outcome === 'unknown'
                         || (error?.code === identityChanged && error.retryAllowed === false);
                     reviewIdentity = error?.code === identityChanged && !unconfirmedRemoval;
-                    foreignChange = error?.code === runtimeForeignChange && !unconfirmedRemoval;
+                    if (!unconfirmedRemoval) {
+                        if (error?.code === runtimeForeignChange) runtimeBlock = 'runtimeForeignChange';
+                        else if (isNetworkNotReady(error)) runtimeBlock = 'runtimeNetworkNotReady';
+                    }
                     throw error;
                 }
             } : null)
@@ -603,9 +606,10 @@ router.get('/nodes/:id', async (req, res) => {
         if (reviewIdentity) return res.redirect(303, identityReviewUrl(req.params.id));
         const removal = preview && roleBlock?.counts ? {
             summary: res.locals.t('nodes.rebuildRemoveConfirmSummary').replace('{counts}', formatRelayCounts(roleBlock.counts, res.locals.t)),
-            ticket: foreignChange ? null : issueRemovalTicket(req, roleBlock.estimate),
-            foreignChange,
-            blocked: foreignChange ? 'rebuildL2tp.messages.runtimeForeignChange'
+            ticket: runtimeBlock ? null : issueRemovalTicket(req, roleBlock.estimate),
+            runtimeBlock,
+            hint: runtimeBlock === 'runtimeNetworkNotReady' ? `rebuildL2tp.installChecks.${networkObservationRequired}` : null,
+            blocked: runtimeBlock ? `rebuildL2tp.messages.${runtimeBlock}`
                 : roleBlock.counts.activeSessions > 0 ? 'nodes.rebuildRemoveBusy'
                 : roleBlock.counts.activeIpsec > 0 ? 'nodes.rebuildRemoveIpsecBusy'
                     : (roleBlock.counts.activeSessions === null || roleBlock.counts.activeIpsec === null

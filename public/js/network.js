@@ -262,8 +262,9 @@
         if (!rebuild || !labels || status !== 409 || error?.code !== 'REBUILD_RETIRE_NEIGHBOR_REFUSED') return '';
         const name = typeof error.neighborName === 'string' && error.neighborName.length <= 160
             && /^[\p{L}\p{M}\p{N} ._()#–—-]+(?![\s\S])/u.test(error.neighborName) ? error.neighborName : labels.neighborUnknown;
-        return labels.neighborRefused.replace('{name}', () => name)
-            + (error.reason === 'RUNTIME_FOREIGN_CHANGE' ? ' ' + labels.neighborRuntimeForeignChange : '');
+        const detail = error.reason === 'RUNTIME_FOREIGN_CHANGE' ? labels.neighborRuntimeForeignChange
+            : error.reason === 'NETWORK_OBSERVATION_REQUIRED' ? labels.neighborNetworkNotReady : '';
+        return labels.neighborRefused.replace('{name}', () => name) + (detail ? ' ' + detail : '');
     }
 
     async function fetchInPanel(path, options) {

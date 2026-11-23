@@ -145,6 +145,9 @@ class OSBoundary:
         st = os.fstat(fd)
         uid, gid = owners.get(st.st_ino, (0,0))
         return NS(**{**{k:getattr(st,k) for k in dir(st) if k.startswith('st_')}, 'st_uid':uid, 'st_gid':gid})
+    def readlink(self, path):
+        assert path == '/proc/self/ns/user'
+        return 'user:[4026531837]'
     def lstat(self, path):
         if path == '/dev/ppp': return NS(st_mode=stat.S_IFCHR, st_rdev=os.makedev(108,0))
         return os.lstat(backing(path))
@@ -176,6 +179,7 @@ removing = False
 
 def proc(path, mode='r'):
     facts = {'/etc/machine-id': f['machineId']+'\n', '/proc/devices':'Character devices:\n108 ppp\nBlock devices:\n',
+             '/proc/self/status':'CapEff:\t0000000000010000\n', '/proc/sys/kernel/modules_disabled':'0\n',
              '/proc/cmdline':'root=fixture\n', '/proc/modules':''.join(f'{n} 4096 0 - Live 0x0\n' for n in
                 ('ppp_generic','l2tp_ppp','inet_diag','tcp_diag','udp_diag','nfnetlink','nf_tables','xfrm_user')),
              '/proc/sys/kernel/random/boot_id':'fixture-boot\n', '/proc/net/dev':'header\nheader\n eth0: 0\n',
@@ -195,8 +199,13 @@ def run(argv, **kw):
     def reply(value=b'', code=0):
         return NS(returncode=code, stdout=value if isinstance(value,bytes) else value.encode(), stderr=b'')
     def js(value): return reply(h['encode'](value))
+    if exe == '/usr/bin/systemd-detect-virt':
+        assert a in (['--container'], ['--chroot'])
+        return reply('none\n' if a == ['--container'] else '', 1)
     if exe == h['MODPROBE']:
         if a == ['--showconfig']: return reply()
+        if a[:2] == ['--show-depends','--'] and len(a) == 3 and a[2] in h['OBSERVERS']:
+            return reply(f'insmod /lib/modules/fixture/{a[2]}.ko\n')
         assert a[:3] == ['--show-depends','--use-blacklist','--'] and a[3:] in (['ppp_generic'], ['l2tp_ppp']), a
         return reply(f'insmod /lib/modules/fixture/{a[3]}.ko\n')
     if exe == '/usr/bin/systemctl':

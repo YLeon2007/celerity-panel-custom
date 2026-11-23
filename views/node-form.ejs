@@ -188,7 +188,7 @@ Object.assign(locals, {
             </div>
         </form>
         <% if (typeof rebuildRemoval !== 'undefined' && rebuildRemoval) { %>
-        <details class="form-section" id="rebuild-l2tp-remove"<% if (rebuildRemoval.foreignChange) { %> open<% } %>>
+        <details class="form-section" id="rebuild-l2tp-remove"<% if (rebuildRemoval.runtimeBlock) { %> open<% } %>>
             <summary><%= t('nodes.rebuildRemoveOpen') %></summary>
             <p><%= rebuildRemoval.summary %></p>
             <% if (rebuildRemoval.ticket && typeof csrfToken !== 'undefined' && csrfToken) { %>
@@ -201,6 +201,7 @@ Object.assign(locals, {
                 </form>
             <% } else { %>
                 <p role="status"><%= t(rebuildRemoval.blocked) %></p>
+                <% if (rebuildRemoval.hint) { %><p><%= t(rebuildRemoval.hint) %></p><% } %>
             <% } %>
         </details>
         <script>

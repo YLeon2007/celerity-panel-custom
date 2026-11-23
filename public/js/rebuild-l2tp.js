@@ -357,6 +357,11 @@
             } else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_RUNTIME_FOREIGN_CHANGE'
                 && data.error.retryAllowed === false && data.error.outcome === undefined && data.outcome === undefined) {
                 message = 'runtimeForeignChange';
+            } else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_HOST_NOT_READY'
+                && data.error.check === 'NETWORK_OBSERVATION_REQUIRED' && data.error.retryAllowed === false
+                && data.error.outcome === undefined && data.outcome === undefined) {
+                message = 'runtimeNetworkNotReady';
+                if (installChecks.NETWORK_OBSERVATION_REQUIRED) note = ` ${installChecks.NETWORK_OBSERVATION_REQUIRED}`;
             } else if (response.status === 409 && data?.error?.retryAllowed === false
                 && data.error.code === 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK') {
                 message = 'reconcileManualBlock';

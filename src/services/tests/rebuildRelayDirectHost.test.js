@@ -124,7 +124,7 @@ before = dict(boot='boot-fixture', files={k: h['read'](p) for k, p in names.item
 h['unit'] = lambda name: dict(units[name])
 h['observe'] = lambda machine, d, transit, **kw: before
 # Already-prepared PPP; the joined fixture exercises actual preparation.
-h['observe_ppp_preparation'] = lambda: dict(missing=[], persist=False, builtin=[], policy='fixture')
+h['observe_ppp_preparation'] = lambda *, fresh=True: dict(missing=[], persist=False, builtin=[], policy='fixture')
 h['apply_ppp_preparation'] = lambda expected: h['need'](expected == h['observe_ppp_preparation'](), 'BASELINE_CHANGED')
 h['require_network_observers'] = lambda: None
 h['validate_profiles'] = lambda after: None

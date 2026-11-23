@@ -12,7 +12,7 @@ const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 const { sameRelayBinding } = require('./rebuildRelayAuthorization');
 const { readRelayAuthority, captureRelayEffect, identityChanged, isIdentityChanged, isGrantAuthorityError } = require('./rebuildRelayEffectAuthority');
 const { isInspectionReason } = require('./rebuildRelayInspection');
-const { isRuntimeForeignChange, isUnconfirmedRuntimeWrite } = require('./rebuildRelayRuntimeRefusal');
+const { isRuntimeForeignChange, isUnconfirmedRuntimeWrite, isNetworkObservationRequired, networkObservationRequired } = require('./rebuildRelayRuntimeRefusal');
 
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
 const machinePattern = /^[a-f0-9]{32}(?![\s\S])/;
@@ -416,6 +416,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                     'REBUILD_L2TP_ACCOUNTS_NOT_OWNED', 'REBUILD_L2TP_ACCOUNTS_BINDING_MISMATCH'].includes(error.code));
             if (phase === 'BLOCKED' && identityBlocked) phase = 'MANUAL_BLOCK';
             throw fail(phase, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds].sort(),
+                ...(phase === 'BLOCKED' && isNetworkObservationRequired(error) && { check: networkObservationRequired }),
                 ...(identityBlocked && { identityBlocked }),
                 ...(foreignChange && { runtimeForeignChange: true }),
                 ...(inspectionOutcomeUnknown && { outcome: 'unknown' }),

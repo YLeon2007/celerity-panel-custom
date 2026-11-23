@@ -61,6 +61,7 @@ import contextlib, copy, ctypes, errno, io, json, os, pathlib, runpy, shlex, sub
 from pathlib import Path
 source, tmp, scenario = sys.argv[1:]
 joined_epoch = scenario.startswith('epoch-remove-')
+xray_account = joined_epoch or scenario in ('legacy-account-drift-during-remove', 'xtls-rollback')
 network_fixture = runpy.run_path(str(Path(source).parent / 'tests/helpers/rebuildRelayNetworkFixture.py'))
 f = json.loads(sys.stdin.readline()) if scenario == 'retire-active' or joined_epoch else json.load(sys.stdin)
 root = Path(tmp)
@@ -111,6 +112,8 @@ class FixtureOS:
         return os.listdir(root / 'run' if path == '/run' else path)
     def fstat(self, fd): return stat(os.fstat(fd))
     def stat(self, path, *args, **kw):
+        if xray_account and path == '/proc/' + units[X]['MainPID']:
+            return types.SimpleNamespace(st_uid=987, st_gid=986)
         if path.startswith('/proc/'):
             return types.SimpleNamespace(st_uid=0, st_gid=0)
         return os.stat(path, *args, **kw)
@@ -140,7 +143,7 @@ def preflight(machine, *, fresh=False):
     return dict(machineId=machine, ppp=True, masked=False, unitsLoaded=True)
 h['preflight'] = preflight
 # Already-prepared PPP; the joined fixture exercises actual preparation.
-h['observe_ppp_preparation'] = lambda: dict(missing=[], persist=False, builtin=[], policy='fixture')
+h['observe_ppp_preparation'] = lambda *, fresh=False: dict(missing=[], persist=False, builtin=[], policy='fixture')
 h['apply_ppp_preparation'] = lambda expected: h['need'](expected == h['observe_ppp_preparation'](), 'BASELINE_CHANGED')
 h['require_network_observers'] = lambda: None
 if not joined_epoch:
@@ -187,6 +190,11 @@ if scenario == 'chap-inspect-active' or joined_epoch:
     h['directory'] = session_directory
 units[IKE]['ExecStart'] = '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }'
 units[X].update(ActiveState='active', SubState='running', MainPID='10', InvocationID='old-main')
+if xray_account:
+    units[X].update(User='xray', Group='xray')
+    h.update(pwd=types.SimpleNamespace(getpwnam=lambda user: {'xray': types.SimpleNamespace(pw_uid=987, pw_gid=987)}[user],
+                                      getpwuid=h['pwd'].getpwuid),
+             grp=types.SimpleNamespace(getgrnam=lambda group: {'xray': types.SimpleNamespace(gr_gid=986)}[group]))
 if joined_epoch:
     epoch = '12345678-1234-1234-1234-123456789abc'
     group_path = '/sys/fs/cgroup' + h['SESSION_GROUP']
@@ -285,6 +293,8 @@ def sc(*args):
         else:
             for n in (NET, XL, IKE): units[n] = dict(stock_units[n])
             units[X]['RequiredBy'] = ''
+            if testing and scenario == 'legacy-account-drift-during-remove':
+                units[X]['Group'] = 'root'
     elif cmd == 'start' and rest == [XL]:
         for n, pid, sub in [(XL,'11','running'), (IKE,'12','running'), (NET,'0','exited')]:
             units[n].update(ActiveState='active', SubState=sub, MainPID=pid,
@@ -323,7 +333,8 @@ def command(*a, data=None):
         return ''.join(f'{key}={units[name].get(key, "")}\n' for key in flag.removeprefix('--property=').split(',')).encode()
     if a[:2] == ('/usr/bin/systemctl','--no-pager'): return sc(*a[2:])
     if a[0] == '/usr/bin/setpriv':
-        assert a == ('/usr/bin/setpriv','--reuid=0','--regid=0','--init-groups',h['XRAY'],
+        uid, gid = (987, 986) if xray_account else (0, 0)
+        assert a == ('/usr/bin/setpriv',f'--reuid={uid}',f'--regid={gid}','--init-groups',h['XRAY'],
                      'run','-test','-format','json','-config',a[-1]) and a[-1] in (h['MAIN'],'stdin:')
         checks.append(a[-1])
         if a[-1] == 'stdin:' and testing:
@@ -451,6 +462,8 @@ stray_pppd = foreign_l2tp_listener = False
 before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stock_units, bridge=None,
               globalFiles={}, installBoot=False, ikeSockets=[],
               sockets=h['owned_sockets'](h['sock_rows'](), units[X]['MainPID']))
+if xray_account:
+    before['units'] = h['install_unit_pins'](stock_units)
 if scenario == 'apply-quiescent-dependent': before['transit'] = []
 h['observe'] = lambda m,d,transit,**kw: before
 req = {k: f[k] for k in ('network','backupId','machineId')}
@@ -476,6 +489,14 @@ assert not Path(h['NET']).exists() and not any(policy.values()) and not changes
 assert h['dispatch'](dict(req, action='install', files=payload, baseline=baseline))['ok']
 assert Path(h['NET']).read_bytes() == h['network_unit'](network, False, backup_id=token, nft_sha256=h['digest'](nft.encode()))
 manifest = Path(h['manifest_path'](token))
+if xray_account:
+    receipt = json.loads(manifest.read_bytes())
+    assert {k: receipt['before']['units'][X][k] for k in ('User', 'Group')} == dict(User='xray', Group='xray')
+    if scenario in ('epoch-remove-reboot-legacy', 'legacy-account-drift-during-remove'):
+        for n in (X, B):
+            for k in ('User', 'Group'):
+                del receipt['before']['units'][n][k]
+        manifest.write_bytes(h['encode'](receipt))
 manifest_saved = manifest.read_bytes(), manifest.stat().st_ino
 intent = manifest.with_name('remove-attempt.json')
 if scenario.startswith('apply'):
@@ -567,7 +588,7 @@ if joined_epoch:
     prior = json.loads(prior[1])
     assert prior['activeSessions'] == prior['activeIpsec'] == 0 and len(prior['census']) == 64, prior
     original_manifest = json.loads(manifest.read_bytes())
-    if scenario == 'epoch-remove-reboot':
+    if scenario.startswith('epoch-remove-reboot'):
         epoch = '12345678-1234-1234-1234-123456789abd'
         transitioned = zip(selected, 'abcd', ('31', '32', '33', '0'))
         for row in nft_rows:
@@ -615,6 +636,12 @@ if joined_epoch:
                 own = {str(p.relative_to(root)) for p in (manifest, manifest.parent)}
                 assert [row for row in after if row[0] not in own] == [row for row in initial if row[0] not in own]
                 initial = after
+                if scenario == 'epoch-remove-reboot':
+                    for name, fields in ((X, ('User', 'Group')), (B, ('Group',))):
+                        for field in fields:
+                            old, units[name][field] = units[name][field], 'root'
+                            assert wire('prepare-remove') == (70, '', 'DIRECT_ROLLBACK_DRIFT\n')
+                            units[name][field] = old
             elif action == 'session-count':
                 assert reply['activeSessions'] == 0 and reply['activeIpsec'] == int(ipsec_live), reply
                 expected_census = reply['census']
@@ -989,6 +1016,13 @@ if scenario.startswith('xtls-'):
     assert xtls_wire('verify', baseline=install_baseline) == (70, '', 'DIRECT_XRAY_DROPIN_UNSUPPORTED\n')
     units[X]['DropInPaths'] = str(xtls)
     if scenario == 'xtls-rollback':
+        for field in ('User', 'Group'):
+            old, units[X][field] = units[X][field], 'root'
+            original_snapshot, original_changes = snapshot(), list(changes)
+            assert xtls_wire('verify', baseline=install_baseline) == (70, '', 'DIRECT_RUNTIME_UNPROVED\n')
+            assert xtls_wire('rollback', baseline=install_baseline) == (70, '', 'DIRECT_ROLLBACK_DRIFT\n')
+            assert snapshot() == original_snapshot and changes == original_changes
+            units[X][field] = old
         a = xtls_wire('rollback', baseline=install_baseline)
         assert a[0] == 0 and json.loads(manifest.read_bytes())['phase'] == 'rolled-back', a
         assert R(P['main']) == before['files']['main'] and not any(policy.values())
@@ -1452,6 +1486,9 @@ else:
         assert b == (75,'','') and intent.is_file(), b
         assert policy['route'] and policy['nft']
         assert wire('prepare-remove')[0] != 0
+    elif scenario == 'legacy-account-drift-during-remove':
+        assert b == (75, '', '') and intent.is_file(), b
+        assert ('restart', X) not in changes and all(policy.values()), changes
     elif scenario == 'udp-wrong-address-final':
         assert b == (75,'','') and intent.is_file(), b
         assert not any(policy.values())  # readiness passed; the final listener proof did not
@@ -1485,7 +1522,7 @@ else:
 print('ok')
 `;
 
-for (const scenario of ['normal', 'xtls-apply-remove', 'xtls-rollback', 'apply', 'apply-quiescent-dependent',
+for (const scenario of ['normal', 'legacy-account-drift-during-remove', 'xtls-apply-remove', 'xtls-rollback', 'apply', 'apply-quiescent-dependent',
     'stale-main', 'stale-manifest', 'apply-stale-bridge', 'vpn-generation', 'chap-epoch',
     'chap-legacy-replaced', 'chap-sync-remove', 'chap-sync-drift', 'chap-sync-guards', 'chap-sync-unknown', 'chap-sync-revoke',
     'chap-unterminated-clean', 'chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix', 'chap-unterminated-separated',
@@ -1524,7 +1561,7 @@ for (const scenario of ['normal', 'xtls-apply-remove', 'xtls-rollback', 'apply',
     });
 }
 
-for (const epoch of ['reboot', 'xl2tpd-restart']) {
+for (const epoch of ['reboot', 'reboot-legacy', 'xl2tpd-restart']) {
     test(`DIRECT census auto-reattest and Remove: ${epoch}`, async () => {
         const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: nodeId,
             C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, C3_REBUILD_L2TP_SSH_SHA256: 'd'.repeat(64) };

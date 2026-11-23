@@ -257,6 +257,7 @@
     "refresh": "刷新状态",
     "status": { "installing": "正在安装" },
     "installChecks": {
+      "NETWORK_OBSERVATION_REQUIRED": "请中继管理员确认内核套接字诊断、nf_tables 和 XFRM 是否可用。",
       "KERNEL_MODULE_BLACKLISTED": "所需的内核网络模块或其依赖项已被列入黑名单。请中继管理员检查相关策略；安装不会绕过此限制。",
       "REBUILD_LINKS_NOT_APPLIED": "中继存在尚未应用的链路或不受支持的对端。请在网络地图上确认所需链路已应用，且对端均为由面板管理的活动 Xray 节点。请勿为通过检查而部署无关链路。",
       "XRAY_BASELINE_UNSUPPORTED": "安装不支持现有 Xray 配置的格式或路由结构。重新格式化 JSON 不会生成 rebuild 配置。仅对面板管理的配置按此中继卡片上的说明操作。",
@@ -269,6 +270,7 @@
     "messages": {
       "installRefused": "L2TP 安装已拒绝。请检查中继的安装条件并刷新状态。",
       "runtimeForeignChange": "中继上的 L2TP 配置已在面板之外被更改",
+      "runtimeNetworkNotReady": "中继服务器尚未就绪：面板无法核实其网络状态。",
       "working": "正在处理…",
       "canInstallAgain": "可以重新安装。请刷新页面，查看安装操作是否可用。",
       "installRecoveryUnconfirmed": "无法确认已中断安装的清理是否完成。请勿重新安装。",
@@ -424,6 +426,7 @@
       "neighborRefused": "节点 {name} 未通过网络安全检查。请检查该节点后重新请求预览。",
       "neighborUnknown": "未知节点",
       "neighborRuntimeForeignChange": "该节点的当前网络状态与面板管理的状态不一致。请先检查该节点上的更改，再重试。",
+      "neighborNetworkNotReady": "服务器尚未就绪：面板无法核实该节点的网络状态。",
       "protectedChange": "删除已阻止：它会影响受保护的配置，或面板无法排除这种影响。",
       "previewUnavailable": "无法检查删除条件。请关闭此窗口并重新请求预览。",
       "outcomeUnconfirmed": "未能确认删除结果。再次尝试前请刷新页面并检查中继状态。",

@@ -1,6 +1,6 @@
 'use strict';
 
-const { isRuntimeForeignChange } = require('./rebuildRelayRuntimeRefusal');
+const { isNetworkObservationRequired, isRuntimeForeignChange } = require('./rebuildRelayRuntimeRefusal');
 
 const validCount = value => Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
 function validCensus(value) {
@@ -46,7 +46,7 @@ async function readSessionCensus(remote, input, retirement = false, verifyLock) 
         }
     } catch (error) {
         if (error?.code === 'REBUILD_L2TP_IDENTITY_CHANGED' || error?.remoteOutcomeUncertain === true
-            || (!retirement && isRuntimeForeignChange(error))) throw error;
+            || isNetworkObservationRequired(error) || (!retirement && isRuntimeForeignChange(error))) throw error;
         // Unavailable, not zero.
     }
     return null;

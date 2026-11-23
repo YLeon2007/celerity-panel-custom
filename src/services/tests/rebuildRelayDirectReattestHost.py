@@ -182,10 +182,11 @@ class RuntimeReattest(unittest.TestCase):
         fixture_gids = {}
         self.has_ppp_link = False
         self.xray_users = h['xray_users']
+        self.xray_argv = h['xray_argv']
         h.update(os=FixtureOS(), directory=self.directory, boot=lambda: self.boot,
                  require_machine=lambda m: h['need'](m == self.machine, 'IDENTITY'), require_census_machine=lambda m: h['need'](m == self.machine, 'IDENTITY'),
                  preflight=lambda m: {'ppp': True, 'unitsLoaded': True, 'masked': False},
-                 ppp_device=lambda: True, ppp_registered=lambda: True, require_network_observers=lambda: None,
+                 ppp_device=lambda: True, ppp_registered=lambda: True, missing_network_observers=lambda: [],
                  command=command, open=installed_open, sock_rows=lambda: copy.deepcopy(self.rows),
                  unit=lambda n: copy.deepcopy(self.units[n]), in_cgroup=lambda pid, u: str(pid) in {'11'} if u.get('ControlGroup') == '/xray' else str(pid) in u.get('ModelCgroup', []),
                  xray_users=lambda *a: [], xray_argv=lambda u, path=None: u['MainPID'])
@@ -235,6 +236,8 @@ class RuntimeReattest(unittest.TestCase):
                       h['B']: unit(h['B'], 0, 'unused', ActiveState='inactive', SubState='dead', LoadState='not-found')}
 
         original = copy.deepcopy(self.units)
+        for field in ('User', 'Group'):
+            del original[h['B']][field]  # No Install account for a not-found BRIDGE.
         original[xl].update(UnitFileState='disabled', ActiveState='inactive', DropInPaths='')
         original[ike].update(ActiveState='inactive', SubState='dead', MainPID='0')
         self.manifest = dict(machineId=self.machine, backupId=self.token, network=self.network, phase='installed',
@@ -295,10 +298,115 @@ class RuntimeReattest(unittest.TestCase):
         unit['ExecStart'] = unit['ExecStart'].replace(' -I ', ' -E ')
         self.assert_foreign()
 
+    def test_missing_observer_is_not_configuration_drift(self):
+        h = self.h
+        h['missing_network_observers'] = lambda: ['tcp_diag']
+        before = self.image()
+        self.assertEqual(self.reattest(), (70, '', 'DIRECT_NETWORK_OBSERVATION_REQUIRED\n'))
+        self.assertEqual(self.image(), before)
+        self.assertEqual(self.nft_reads, 0)
+
     def assert_foreign(self):
         image = self.image()
         self.assertEqual(self.reattest(), (70, '', 'DIRECT_RUNTIME_FOREIGN_CHANGE\n'))
         self.assertEqual(self.image(), image)
+
+    def test_xray_accounts_in_serialized_install_receipts(self):
+        h, x, b = self.h, self.watch[0], self.h['B']
+        self.units[x].update(User='xray', Group='xray')
+        self.units[b].update(LoadState='loaded', ActiveState='active', SubState='running', UnitFileState='enabled',
+                             User='nobody', Group='nogroup', InvocationID='b' * 32, MainPID='16', ModelCgroup=['16'])
+        argv = {pid: (h['XRAY'], 'run', '-config', profile) for pid, profile in
+                (('11', h['MAIN']), ('16', h['BRIDGE']))}
+        self.units[b]['ExecStart'] = '{ path=' + h['XRAY'] + ' ; argv[]=' + ' '.join(argv['16']) + ' ; }'
+        proc_open = h['open']
+        cmdlines = {f'/proc/{pid}/cmdline': b'\0'.join(a.encode() for a in args) + b'\0' for pid, args in argv.items()}
+        h.update(xray_argv=self.xray_argv, open=lambda p, m='r': io.BytesIO(cmdlines[p]) if p in cmdlines else proc_open(p, m))
+        h['os'].path = SimpleNamespace(**{**vars(os.path),
+            'realpath': lambda p: {'/proc/11/exe': h['XRAY'], '/proc/16/exe': h['XRAY']}[p]})
+        self.units[x]['WorkingDirectory'] = self.units[b]['WorkingDirectory'] = '/'
+        self.starts['16'] = 104
+        main = json.loads(h['raw'](h['read'](h['MAIN'])))
+        side = dict(inbounds=[main['inbounds'].pop()], outbounds=[], routing={'rules': []})
+        for key, data in (('main', h['encode'](main)), ('bridge', h['encode'](side)),
+                          ('net', h['network_unit'](self.network, True))):
+            record = h['entry'](data, 0o644 if key == 'net' else 0o600)
+            path = h['BRIDGE'] if key == 'bridge' else h['NAMES'][key]
+            self.put(path, data, record['mode'])
+            self.manifest['after'][key] = dict(record, data=h['digest'](data))
+            self.manifest['runtime']['files'][key] = h['remove_generation'](path)
+        self.manifest['runtime']['invocations'].append('d' * 31 + '5')
+        self.rows = [(p, a, n, ['16'] if n == 12700 else owners) for p, a, n, owners in self.rows]
+        pins = h['install_unit_pins'](self.units)
+        self.assertEqual((pins[x]['User'], pins[x]['Group'], pins[b]['User'], pins[b]['Group']),
+                         ('xray', 'xray', 'nobody', 'nogroup'))
+        for fields in (('User', 'Group'), ('User',), ('Group',), ()):
+            with self.subTest(fields=fields):
+                for name in (x, b):
+                    self.manifest['before']['units'][name] = {
+                        k: v for k, v in pins[name].items() if k not in {'User', 'Group'} - set(fields)}
+                self.save_manifest()
+                self.assertEqual(self.reattest()[0], 0)
+                updated = h['read_manifest'](self.token)[2]
+                self.assertEqual(updated['before'], self.manifest['before'])
+                self.assertEqual(updated['runtime']['boot'], self.boot)
+                for name, optional in ((x, {'User', 'Group'}), (b, {'Group'})):
+                    for field in optional - set(fields):
+                        old, self.units[name][field] = self.units[name][field], 'root'
+                        self.assertEqual(self.reattest()[0], 0)
+                        self.units[name][field] = old
+                for name in (x, b):
+                    for field in fields:
+                        old = self.units[name][field]
+                        self.units[name][field] = 'root'
+                        self.assert_foreign()
+                        self.units[name][field] = old
+                for owners in (self.rows[2][3], self.units[b]['ModelCgroup']):
+                    old = owners[0]
+                    owners[0] = '99'
+                    self.assert_foreign()
+                    owners[0] = old
+                p = '/proc/11/cmdline'
+                old, cmdlines[p] = cmdlines[p], cmdlines[p].replace(b'-config', b'-confdir')
+                self.assert_foreign()
+                cmdlines[p] = old
+                if 'User' not in fields:
+                    self.units[b]['User'] = 'root'
+                    self.assert_foreign()  # Independent managed-BRIDGE requirement.
+                    self.units[b]['User'] = 'nobody'
+
+        self.manifest['before']['units'][x]['Group'] = self.units[x]['Group'] = ''
+        self.save_manifest()
+        self.assertEqual(self.reattest()[0], 0)
+        del self.units[x]['Group']
+        self.assert_foreign()  # A pinned empty property is not an omitted pin.
+
+    def test_install_recovery_accepts_full_and_old_unit_projections(self):
+        h, (x, xl, _, _) = self.h, self.watch
+        self.units[x].update(User='xray', Group='xray')
+        # Loaded units cannot silently get the legacy projection when an
+        # observer omits just one account property.
+        for field in ('User', 'Group'):
+            missing = {**self.units, x: {k: v for k, v in self.units[x].items() if k != field}}
+            with self.assertRaisesRegex(h['Refusal'], '^PREREQUISITE$'):
+                h['install_unit_pins'](missing)
+        self.manifest['phase'] = 'rolled-back'
+        before = self.manifest['before']
+        before.update(installLock=[1, 2], pppModules={}, swanInputs='fixture', units=h['install_unit_pins'](self.units),
+                      files=dict.fromkeys((*h['NAMES'], 'swan')),
+                      globalFiles=dict.fromkeys(('/etc/ppp/options', h['SWAN_CONF'], h['XL_DEFAULT'])))
+        self.manifest['after']['swan'] = dict(h['entry'](b'fixture'), data=h['digest'](b'fixture'))
+        scope = dict(machineId=self.machine, boot=self.old_boot, installLock=[1, 2])
+        for removed in (None, 'User', 'Group'):
+            with self.subTest(removed=removed):
+                if removed is not None:
+                    del before['units'][x][removed]
+                self.save_manifest()
+                self.assertEqual(h['recovery_manifest'](self.request, scope)[2], self.manifest)
+        before['units'][xl]['Group'] = 'root'  # Shape expansion was only for X/B.
+        self.save_manifest()
+        with self.assertRaisesRegex(h['Refusal'], '^IN_FLIGHT$'):
+            h['recovery_manifest'](self.request, scope)
 
     def test_legacy_receipt_refreshes_only_runtime_epoch(self):
         before = self.image()

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 
+import runpy
 import shlex
 import stat
 from subprocess import CompletedProcess
@@ -27,6 +28,7 @@ timeout = {'session-count': ['1s', '9s'], 'prepare-packages': ['4s', '220s']}.ge
 assert command_line[:-1] == ['/usr/bin/timeout', '-k', *timeout, '/usr/bin/python3', '-I', '-B', '-c']
 state_path = root / 'manager.json'
 s = json.loads(state_path.read_text())
+network_fixture = runpy.run_path(str(Path(__file__).with_name('rebuildRelayNetworkFixture.py')))
 h: dict[str, Any] = {'__name__': 'direct_fixture'}
 package_stock = scenario.startswith('package-stock-')
 native_stock = scenario.startswith('native-stock-') or package_stock
@@ -48,6 +50,12 @@ def no_host_dispatch(event, args):
 
 sys.addaudithook(no_host_dispatch)
 exec(compile(command_line[-1], '<DIRECT command>', 'exec'), h)
+if s.get('syntheticSwan'):
+    assert scenario.startswith('ppp-')
+    # Only substitute the unrelated package-data pin. The real settings
+    # validator and all install/remove generation checks still run.
+    pin = {'strongswan.conf': [0o644, 0, h['digest'](b'# synthetic defaults\n')]}
+    h['STOCK_SWAN_SHA'] = h['digest'](h['encode'](pin))
 # Seed pre-fix Install through the existing fixture, not by adopting the live
 # generation under test. Apply/Remove run the candidate without this override.
 if s.get('legacyNetwork') and request['action'] in ('prepare', 'check', 'install', 'verify') and 'network_unit' in h:
@@ -175,12 +183,16 @@ class LocalOS:
 
 OBSERVERS = ('inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user')
 OBSERVER_MIXED = scenario.startswith('ppp-observers-mixed')
-MISSING_OBSERVERS = ({'tcp_diag', 'udp_diag', 'nf_tables', 'xfrm_user'} if OBSERVER_MIXED else
-                     {'xfrm_user'} if scenario.startswith(('ppp-network-observers', 'ppp-observer-')) else set())
-BUILTIN_OBSERVERS = {'tcp_diag'} if OBSERVER_MIXED else set()
+BUILTIN_OBSERVERS = set(OBSERVERS) if scenario == 'ppp-observers-builtin' else {'tcp_diag'} if OBSERVER_MIXED else set()
+MISSING_OBSERVERS = BUILTIN_OBSERVERS | ({'udp_diag', 'nf_tables', 'xfrm_user'} if OBSERVER_MIXED else
+                                       {'xfrm_user'} if scenario.startswith(('ppp-network-observers', 'ppp-observer-')) else set())
 
 
 def active_observers():
+    if 'postBootRequests' in s:
+        # Cold boot does not inherit the socket observer loaded in the old
+        # boot. Only an explicit boot request brings tcp_diag back here.
+        return (set(OBSERVERS) - {'tcp_diag'}) | set(s['postBootRequests']) | set(s['modules'])
     return (set(OBSERVERS) - MISSING_OBSERVERS) | set(s['modules'])
 
 
@@ -361,9 +373,10 @@ def run(argv, **kwargs):
                           'ppp-install-hook': 'install l2tp_ppp /bin/false\n',
                           'ppp-observer-blacklist': 'blacklist xfrm-user\n',
                           'ppp-observer-blacklist-missing-packages': 'blacklist xfrm-user\n',
+                          'ppp-resident-observer-blacklist': 'blacklist tcp-diag\n',
                           'ppp-observer-dependency-blacklist': 'blacklist xfrm-algo\n'}.get(scenario, 'blacklist unrelated\n'))
         if v[:2] == ['--show-depends', '--']:
-            assert len(v) == 3 and v[2] in MISSING_OBSERVERS
+            assert len(v) == 3 and v[2] in OBSERVERS
             if v[2] in BUILTIN_OBSERVERS:
                 return reply(f'builtin {v[2]}\n')
             extra = 'insmod /lib/modules/fixture/kernel/xfrm-algo.ko\n' if v[2] == 'xfrm_user' else ''
@@ -443,22 +456,25 @@ def run(argv, **kwargs):
                 stop(NET)
                 s.pop('ppp', None)
             start(rest[0])
-        elif action == 'start' and rest == [XL]:
+        elif action == 'start' and rest in ([NET], [XL]):
+            assert request['action'] == 'install'
             assert s['units'][NET]['LoadState'] == 'loaded' and s['units'][X]['ActiveState'] == 'active'
             assert set(s['units'][XL]['Requires'].split()) == {NET, IKE}
             d = request['network']
-            unit_lines = backing(h['NET']).read_text().splitlines()
-            assert [line for line in unit_lines if line.startswith('ExecStart=')] == [
-                f"ExecStart=/usr/sbin/nft -f {h['NFT_FILE']}",
-                f"ExecStart=/usr/sbin/ip -4 route add local 0.0.0.0/0 dev lo table {d['routeTable']}",
-                f"ExecStart=/usr/sbin/ip -4 rule add priority {h['PRIORITY']} from {d['clientCidr']} fwmark {d['fwmark']} table {d['routeTable']}",
-            ]
-            assert h['nft_marker'](backing(h['NFT_FILE']).read_bytes(), request['backupId'])
-            assert not s['rule'] and not s['route'] and s['nft'] is None
-            s['rule'] = dict(priority=h['PRIORITY'], src=d['clientCidr'], table=str(d['routeTable']), fwmark=hex(d['fwmark']))
-            s['route'] = dict(type='local', dst='default', dev='lo', table=str(d['routeTable']), scope='254')
-            s['nft'] = request['backupId']
-            start(NET)
+            token = request['backupId']
+            nft_bytes = backing(h['NFT_FILE']).read_bytes()
+            assert h['nft_marker'](nft_bytes, token)
+            kind = h['network_kind'](h['read'](h['NET']), d, 'bridge' in request['files'], token, h['digest'](nft_bytes))
+            if rest == [NET] or kind != 'pinned':
+                assert (rest == [NET]) == (kind == 'pinned')
+                assert not s['rule'] and not s['route'] and s['nft'] is None
+                s['rule'] = dict(priority=h['PRIORITY'], src=d['clientCidr'], table=str(d['routeTable']), fwmark=hex(d['fwmark']))
+                s['route'] = dict(type='local', dst='default', dev='lo', table=str(d['routeTable']), scope='254')
+                s['nft'] = token
+                start(NET)
+            if rest == [NET]:
+                return reply()
+            assert s['units'][NET]['ActiveState'] == 'active' and s['nft'] == token
             if s['units'][IKE]['ActiveState'] != 'active':
                 start(IKE)
             if scenario == 'unacknowledged-start':
@@ -525,9 +541,13 @@ def run(argv, **kwargs):
         observe_net('nfnetlink', 'nf_tables')
         table = dict(table=dict(family='inet', name=h['TABLE'], comment=s['nft']))
         if v == ['-j', 'list', 'tables']:
-            return js(dict(nftables=s['foreign']['tables'] + ([table] if s['nft'] else [])))
+            own = network_fixture['nft_rows'](request['network'], s['nft'])[1:2] if s['nft'] else []
+            return js(dict(nftables=s['foreign']['tables'] + own))
         if v == ['-j', '-s', 'list', 'table', 'inet', h['TABLE']]:
             return js(dict(nftables=[table]))
+        if v == ['-j', '-s', '-a', 'list', 'table', 'inet', h['TABLE']]:
+            assert s['nft'] == request['backupId']
+            return js(dict(nftables=network_fixture['nft_rows'](request['network'], s['nft'])))
         if v == ['-c', '-f', '-']:
             assert_install_intent()
             assert h['nft_marker'](kwargs['input'], request['backupId'])
@@ -650,7 +670,7 @@ def model_package_timing(package_model):
     h['bounded_status'] = timed_child
     return check
 
-h.update(os=LocalOS(), open=modeled_open,
+h.update(os=LocalOS(), open=modeled_open, NETWORK_RUN=str(root / 'run'),
          subprocess=SimpleNamespace(run=modeled_run, PIPE=-1, DEVNULL=-3, TimeoutExpired=h['subprocess'].TimeoutExpired))
 check_package_timing = None
 if package_stock:

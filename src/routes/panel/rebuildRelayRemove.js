@@ -2,7 +2,7 @@
 
 const { randomBytes } = require('node:crypto');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
-const { runtimeForeignChange } = require('../../services/rebuildRelayRuntimeRefusal');
+const { runtimeForeignChange, networkNotReadyDetails, isNetworkNotReady } = require('../../services/rebuildRelayRuntimeRefusal');
 const { validNodeId, identityChanged, grantConflict, grantUnavailable, grantEffectStatus } = require('./rebuildRelayAdmission');
 
 // One-use, process-local tickets. A restart evicts them; keys and the private
@@ -85,6 +85,10 @@ async function handleRemoval(req, res, decision) {
             if (html) return res.redirect(303, '/panel/l2tp?view=remove-foreign-change');
             return res.status(409).json({ error: { code, retryAllowed: false } });
         }
+        if (code === networkNotReadyDetails.code) {
+            if (html) return res.redirect(303, '/panel/l2tp?view=remove-network-not-ready');
+            return res.status(409).json({ error: networkNotReadyDetails });
+        }
         if (html && code === identityChanged) return res.redirect(303, identityReviewUrl(id));
         if (html && res.locals.t) {
             const key = localizedErrors[code] ?? (grantEffectStatus(code) === 503 ? localizedErrors[grantUnavailable]
@@ -111,7 +115,8 @@ async function handleRemoval(req, res, decision) {
         if (result?.status !== 'not_installed' || result.nodeId !== id) return conflict('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
         return html ? res.redirect(303, nodeUrl) : res.json({ executionMode: 'rebuild', status: 'not_installed', nodeId: id });
     } catch (error) {
-        const code = publicCodes.has(error?.code) || grantEffectStatus(error?.code) ? error.code : 'REBUILD_L2TP_REMOVE_FAILED';
+        const code = publicCodes.has(error?.code) || isNetworkNotReady(error) || grantEffectStatus(error?.code)
+            ? error.code : 'REBUILD_L2TP_REMOVE_FAILED';
         return conflict(code, error);
     }
 }

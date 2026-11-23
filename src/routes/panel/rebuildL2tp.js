@@ -10,7 +10,7 @@ const { requirePanelCsrf } = require('./csrf');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { installCheckIds } = require('../../services/rebuildRelayInstallDiagnostics');
 const { isInspectionReason } = require('../../services/rebuildRelayInspection');
-const { runtimeForeignChange } = require('../../services/rebuildRelayRuntimeRefusal');
+const { runtimeForeignChange, networkObservationRequired, networkNotReadyDetails } = require('../../services/rebuildRelayRuntimeRefusal');
 const { mountAdmission, admissionPath, validAdmissionJson, reject: rejectAdmission,
     validNodeId, validActor, grantEffectStatus, identityChanged } = require('./rebuildRelayAdmission');
 const { retirePath, validRetireJson, rejectRetire, mountRetire } = require('./rebuildRelayRetire');
@@ -170,7 +170,8 @@ function mountOverview(router, getOverview, exposePanelCsrfToken) {
             try {
                 const removalNotice = req.query.view === 'remove-unconfirmed' ? 'uncertain'
                     : req.query.view === 'remove-cleanup' ? 'removeCleanupFailed'
-                        : req.query.view === 'remove-foreign-change' ? 'runtimeForeignChange' : null;
+                        : req.query.view === 'remove-foreign-change' ? 'runtimeForeignChange'
+                            : req.query.view === 'remove-network-not-ready' ? 'runtimeNetworkNotReady' : null;
                 if (removalNotice) return renderPage(res, { removalNotice, relays: [], accounts: [], canManageAccounts: false });
                 const changedRelayId = validNodeId(req.query.identityChanged) ? req.query.identityChanged : null;
                 return renderPage(res, { ...await getOverview().overview(), changedRelayId,
@@ -244,7 +245,8 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
             if (authority.canReconcileAccounts !== true) {
                 return await hasPendingAccounts() ? revealError(res, 409, 'REBUILD_L2TP_RECONCILE_DISABLED') : receipt('settled');
             }
-            let result, failed = false, reason, failureCode, identityBlocked = false, foreignChange = false, outcomeUnknown = false;
+            let result, failed = false, reason, failureCode, identityBlocked = false, foreignChange = false,
+                networkNotReady = false, outcomeUnknown = false;
             try { result = await reconcile(); } catch (error) {
                 failed = true;
                 const diagnostic = error?.retryAllowed === false && error.inspectionReason;
@@ -252,6 +254,8 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
                 failureCode = error?.code;
                 identityBlocked = error?.identityBlocked === true;
                 foreignChange = failureCode === 'REBUILD_L2TP_ACCOUNTS_BLOCKED' && error.runtimeForeignChange === true
+                    && error.retryAllowed === false && error.outcome === undefined;
+                networkNotReady = failureCode === 'REBUILD_L2TP_ACCOUNTS_BLOCKED' && error.check === networkObservationRequired
                     && error.retryAllowed === false && error.outcome === undefined;
                 outcomeUnknown = failureCode === reconcileUnknown && error.outcome === 'unknown' && error.retryAllowed === false;
             }
@@ -261,6 +265,7 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
                 if (outcomeUnknown) return res.status(409).json({ error: { code: reconcileUnknown, outcome: 'unknown', retryAllowed: false } });
                 if (identityBlocked || failureCode === reconcileBlocked || failureCode === identityChanged) return manualBlock();
                 if (foreignChange) return res.status(409).json({ error: { code: runtimeForeignChange, retryAllowed: false } });
+                if (networkNotReady) return res.status(409).json({ error: networkNotReadyDetails });
                 const grantStatus = grantEffectStatus(failureCode);
                 if (grantStatus) return revealError(res, grantStatus, failureCode);
                 if (reason) return res.json({ executionMode: 'rebuild', status: 'inspection-unproved', reason, retryAllowed: false });

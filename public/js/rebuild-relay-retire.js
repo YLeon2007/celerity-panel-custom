@@ -79,8 +79,9 @@
         const name = typeof error.neighborName === 'string' && error.neighborName.length <= 160
             && /^[\p{L}\p{M}\p{N} ._()#–—-]+(?![\s\S])/u.test(error.neighborName) ? error.neighborName : copy.neighborUnknown;
         message.textContent = '';
-        status.textContent = put('neighborRefused', 'name', name)
-            + (error.reason === 'RUNTIME_FOREIGN_CHANGE' ? ' ' + copy.neighborRuntimeForeignChange : '');
+        const detail = error.reason === 'RUNTIME_FOREIGN_CHANGE' ? copy.neighborRuntimeForeignChange
+            : error.reason === 'NETWORK_OBSERVATION_REQUIRED' ? copy.neighborNetworkNotReady : '';
+        status.textContent = put('neighborRefused', 'name', name) + (detail ? ' ' + detail : '');
         return true;
     }
 

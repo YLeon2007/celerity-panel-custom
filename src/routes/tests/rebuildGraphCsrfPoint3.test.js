@@ -174,10 +174,13 @@ test('rebuild nodes drawer keeps Delete but offers no strict Undeploy action', a
     assert.deepEqual(ui.requests, []);
 });
 
-test('link remove preview returns the attributed refusal and never dispatches deletion', async () => {
+for (const [reason, copyKey] of [
+    ['RUNTIME_FOREIGN_CHANGE', 'neighborRuntimeForeignChange'],
+    ['NETWORK_OBSERVATION_REQUIRED', 'neighborNetworkNotReady'],
+]) test(`link remove preview preserves ${reason} and never dispatches deletion`, async () => {
     const { checkNeighborRefusal } = require('../../services/rebuildNeighborRefusal');
     const previewFailure = checkNeighborRefusal(Object.assign(new Error('/private/diag'), {
-        code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason: 'RUNTIME_FOREIGN_CHANGE',
+        code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason,
     }), '212 East');
     const app = makeApp(previewFailure);
     const req = { method: 'POST', body: JSON.stringify({ linkId, remove: true }), headers: {
@@ -189,8 +192,9 @@ test('link remove preview returns the attributed refusal and never dispatches de
     assert.equal(projected.status, 409);
     const body = await projected.json();
     assert.deepEqual(body, { error: {
-        code: 'REBUILD_RETIRE_NEIGHBOR_REFUSED', neighborName: '212 East', reason: 'RUNTIME_FOREIGN_CHANGE',
+        code: 'REBUILD_RETIRE_NEIGHBOR_REFUSED', neighborName: '212 East', reason,
     } });
+    const texts = new Set();
     for (const lang of ['en', 'ru', 'zh-CN']) {
         let opened;
         const shown = new Promise(resolve => { opened = resolve; });
@@ -200,12 +204,15 @@ test('link remove preview returns the attributed refusal and never dispatches de
         assert.deepEqual(ui.requests.filter(call => call.method).map(call => call.pathname), [previewPath]);
         const copy = require(`../../locales/${lang}.json`).nodes.retireRelay;
         const warning = ui.document.getElementById('rebuildPreviewWarning');
-        assert.equal(warning.textContent, copy.neighborRefused.replace('{name}', '212 East') + ' ' + copy.neighborRuntimeForeignChange);
+        assert.equal(typeof copy[copyKey], 'string');
+        texts.add(copy[copyKey]);
+        assert.equal(warning.textContent, copy.neighborRefused.replace('{name}', '212 East') + ' ' + copy[copyKey]);
         assert.equal(warning.innerHTML, undefined);
         assert.equal(ui.document.getElementById('rebuildPreviewApply').hidden, true);
         ui.document.getElementById('rebuildPreviewCancel').onclick();
         await action;
     }
+    assert.equal(texts.size, 3);
     assert.equal(app.calls.length, 4);
     assert.ok(app.calls.every(call => call.preview === true && call.remove === true));
 });

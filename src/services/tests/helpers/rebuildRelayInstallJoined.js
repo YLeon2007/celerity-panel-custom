@@ -35,6 +35,7 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const modulesPath = '/etc/modules-load.d/70-celerity-rebuild-l2tp.conf';
 const stockModules = '# Managed by Celerity rebuild L2TP\nppp_generic\nl2tp_ppp\n';
 const observers = ['inet_diag', 'tcp_diag', 'udp_diag', 'nfnetlink', 'nf_tables', 'xfrm_user'];
+const canonicalModules = stockModules + observers.join('\n') + '\n';
 
 function seedNativeStock(put, root, generated) {
     // Extract data only from the previously verified Debian archives. The
@@ -182,11 +183,15 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             put('/etc/ipsec.conf', '# stock starter\nconfig setup\n');
             put('/usr/lib/systemd/system/' + ike, '[Service]\nExecStart=/usr/sbin/ipsec start --nofork\n', 0o644);
         }
-        // The refusal-only variant cannot reach settings-tree observation.
-        // Use the authenticated fixture when supplied; do not invent its bytes.
-        // Plan refusals cannot reach stock Install's settings validator.
+        // Plan refusals cannot reach the settings validator. Module-only cases
+        // can use a pinned synthetic settings tree instead of package extracts.
         const needsSwan = !scenario.startsWith('package-stock-plan-') && (!barePackages || process.env.C3_FIXTURE_SWAN_ETC);
-        const swanLeaves = needsSwan ? stockSwan.seed(root) : [];
+        const syntheticSwan = needsSwan && !process.env.C3_FIXTURE_SWAN_ETC && scenario.startsWith('ppp-');
+        const swanLeaves = syntheticSwan ? ['/etc/strongswan.conf'] : needsSwan ? stockSwan.seed(root) : [];
+        if (syntheticSwan) {
+            put('/etc/strongswan.conf', '# synthetic defaults\n', 0o644);
+            fs.mkdirSync(join(root, 'etc/strongswan.d/charon'), { recursive: true, mode: 0o755 });
+        }
         const packages = ['strongswan', 'strongswan-starter', 'strongswan-charon', 'xl2tpd', 'ppp', 'nftables'];
         if (!freshStock) {
             // One absolute path projected; the shipped ensure helper is used unchanged.
@@ -242,6 +247,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             put(modulesPath, stockModules, 0o644);
         }
         if (scenario === 'ppp-conflict') put(modulesPath, '# foreign\n', 0o644);
+        if (scenario === 'ppp-unreceipted-canonical') put(modulesPath, canonicalModules, 0o644);
         if (scenario === 'ppp-mask') fs.symlinkSync('/dev/null', join(root, modulesPath));
         if (scenario === 'ppp-shadow-mask') {
             put('/usr/lib/modules-load.d/50-stock.conf', 'l2tp_ppp\n', 0o644);
@@ -258,7 +264,8 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 FragmentPath: '/usr/lib/systemd/system/' + ike,
             });
         }
-        const manager = put('manager.json', JSON.stringify({ packages, packageModel, machine: machineId, address: relay.ip, cohort, original, units: original,
+        const manager = put('manager.json', JSON.stringify({ packages, packageModel, syntheticSwan, machine: machineId,
+            address: relay.ip, cohort, original, units: original,
             missingPackages: barePackages ? ['strongswan-starter', 'xl2tpd'] : scenario === 'package' ? ['ppp'] : [],
             modules: barePackages || ['ppp-both', 'ppp-reservation-ack'].includes(scenario) ? []
                 : ['ppp-l2tp', 'ppp-load-failure', 'ppp-load-timeout', 'ppp-no-readback', 'ppp-lost-ack'].includes(scenario)
@@ -521,7 +528,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         ['ppp-l2tp', 'installed', ['l2tp_ppp']],
         ['ppp-persist', 'installed', []],
         ['ppp-ready', 'installed', []],
-        ['ppp-container-ready', 'installed', []],
+        ['ppp-container-ready', 'PPP_MODULES_REQUIRED', []],
         ['ppp-container', 'PPP_MODULES_REQUIRED', []],
         ['ppp-child-userns', 'PPP_MODULES_REQUIRED', []],
         ['ppp-device-missing', 'PPP_MODULES_REQUIRED', []],
@@ -531,15 +538,18 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         ['ppp-boot-blacklist', 'PPP_MODULES_REQUIRED', []],
         ['ppp-disabled', 'PPP_MODULES_REQUIRED', []],
         ['ppp-conflict', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
+        ['ppp-unreceipted-canonical', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
         ['ppp-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
         ['ppp-shadow-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
         ['ppp-service-mask', 'PPP_MODULES_PERSISTENCE_CONFLICT', []],
         ['ppp-network-observers', 'installed', ['xfrm_user']],
         ['ppp-observer-blacklist', 'KERNEL_MODULE_BLACKLISTED', []],
+        ['ppp-resident-observer-blacklist', 'KERNEL_MODULE_BLACKLISTED', []],
         ['ppp-observer-blacklist-missing-packages', 'KERNEL_MODULE_BLACKLISTED', []],
         ['ppp-observer-dependency-blacklist', 'KERNEL_MODULE_BLACKLISTED', []],
         ['ppp-observer-boot-blacklist', 'KERNEL_MODULE_BLACKLISTED', []],
         ['ppp-observers-mixed', 'installed', ['udp_diag', 'nf_tables', 'xfrm_user']],
+        ['ppp-observers-builtin', 'installed', []],
         ['ppp-observers-mixed-conflict', undefined, ['udp_diag', 'nf_tables', 'xfrm_user'], true],
         ['ppp-publish-race', 'PPP_MODULES_PERSISTENCE_CONFLICT', [], true],
         ['ppp-load-failure', 'PPP_MODULES_LOAD_FAILED', ['l2tp_ppp'], true],
@@ -555,7 +565,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             let status = 200, result;
             const res = { status(value) { status = value; return this; }, json(value) { result = value; } };
             await installHandler(f.create)({ params: { id }, body: {} }, res);
-            assert.equal(status, expected === 'installed' ? 200 : 409);
+            assert.equal(status, expected === 'installed' ? 200 : 409, diagnostic(f));
             if (expected === 'installed') assert.equal(result.status, 'installed', diagnostic(f));
             else assert.deepEqual(result.error, {
                 code: retained ? 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_DIRECT_PREREQUISITE',
@@ -569,9 +579,9 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 fs.lstatSync(file, { throwIfNoEntry: false }) ? [modulesPath.split('/').at(-1)] : []);
             assert.equal(fs.readFileSync(join(f.root, '/etc/modules-load.d/10-unrelated.conf'), 'utf8'), '# operator-owned\nloop\n');
             if (expected === 'installed' || ['ppp-lost-ack', 'ppp-observers-mixed-conflict'].includes(scenario)) {
-                assert.equal(fs.readFileSync(file, 'utf8'), stockModules + added.map(name => name + '\n').join(''));
+                assert.equal(fs.readFileSync(file, 'utf8'), canonicalModules);
                 assert.equal(fs.statSync(file).mode & 0o777, 0o644);
-                if (before && !added.length) assert.equal(fs.statSync(file).ino, before.ino);
+                if (before) assert.notEqual(fs.statSync(file).ino, before.ino);
             } else {
                 assert.equal(effects.length, 0);
                 assert.ok(fs.readFileSync(f.mpath).equals(f.before[f.mainPath]));
@@ -579,14 +589,15 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 else assert.equal(fs.lstatSync(file, { throwIfNoEntry: false })?.ino, before?.ino);
                 if (scenario === 'ppp-mask') assert.equal(fs.readlinkSync(file), '/dev/null');
             }
-            if (expected === 'installed' && added.length) {
+            if (expected === 'installed') {
                 assert.deepEqual(f.actions, installedActions);
-                assert.ok(f.records().reservedObservers.some(names => names.includes('xfrm_user')));
+                if (added.length) assert.ok(f.records().reservedObservers.some(names => names.includes('xfrm_user')));
                 const manifestPath = join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${f.states[0].backupId}/manifest.json`);
                 const originalReceipt = fs.readFileSync(manifestPath);
                 const receipt = JSON.parse(originalReceipt);
                 const { bootFile, missing } = receipt.before.pppModules;
-                assert.deepEqual(Object.keys(receipt.before.pppModules.observers), [...added].sort());
+                assert.deepEqual(Object.keys(receipt.before.pppModules.observers), [...observers].sort());
+                assert.deepEqual(missing, loads);
                 assert.deepEqual(bootFile.before.record && Buffer.from(bootFile.before.record.data, 'base64'), preimage);
                 assert.equal(bootFile.before.generation?.[1], before?.ino);
                 assert.deepEqual(Buffer.from(bootFile.after.data, 'base64'), fs.readFileSync(file));
@@ -602,7 +613,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 const neighbor = fingerprint(f, '/etc/modules-load.d/10-unrelated.conf');
                 const removed = await f.create().removeRelay(id).catch(error => error);
                 assert.equal(removed.status, 'not_installed', JSON.stringify({ code: removed.code, ...JSON.parse(diagnostic(f)) }));
-                assert.deepEqual(f.records().moduleLoads, loads);
+                assert.deepEqual(f.records().moduleLoads ?? [], loads);
                 assert.ok(loads.every(name => f.records().modules.includes(name)), 'Remove must not unload modules');
                 assert.deepEqual(fs.existsSync(file) ? fs.readFileSync(file) : null, preimage);
                 if (preimage) assert.equal(fs.statSync(file).mode & 0o777, before.mode & 0o777);
@@ -626,6 +637,22 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
             }
         });
     }
+
+    test('joined module persistence: resident tcp_diag must be requested at next boot', async t => {
+        const f = host(t, 'ppp-persist');
+        const file = join(f.root, modulesPath);
+        assert.equal(fs.existsSync(file), false);
+        const installed = await f.create().installRelay(id).catch(error => error);
+        assert.equal(installed.status, 'installed', JSON.stringify({ code: installed.code, ...JSON.parse(diagnostic(f)) }));
+        assert.deepEqual(f.records().moduleLoads ?? [], []);
+        const bootFile = fs.readFileSync(file, 'utf8');
+        f.writeRecords({ ...f.records(), postBootRequests: bootFile.split('\n').filter(line => line && !line.startsWith('#')) });
+        const removed = await f.create().removeRelay(id).catch(error => error);
+        assert.equal(removed.status, 'not_installed', JSON.stringify({ code: removed.code, ...JSON.parse(diagnostic(f)) }));
+        assert.equal(bootFile, canonicalModules);
+        assert.equal(fs.existsSync(file), false);
+        assert.deepEqual(f.records().moduleLoads ?? [], []);
+    });
 
     for (const scenario of ['ppp-network-observers-rollback', 'ppp-observers-mixed-rollback']) {
         test(`joined module persistence verified rollback: ${scenario}`, async t => {
@@ -692,32 +719,49 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         });
     }
 
-    test('joined module persistence: reinstall with resident modules, new PPP-only and legacy receipts', async t => {
+    test('joined module persistence: reinstall with resident modules and Remove with legacy receipts', async t => {
         const f = host(t, 'ppp-network-observers');
         const file = join(f.root, modulesPath);
         let lastId;
-        for (const legacy of [false, false, true]) {
+        for (const legacy of ['subset', null, 'unowned']) {
             const installed = await f.create().installRelay(id).catch(error => error);
             assert.equal(installed.status, 'installed', JSON.stringify({ code: installed.code, ...JSON.parse(diagnostic(f)) }));
             const { backupId } = f.states[0];
             assert.notEqual(backupId, lastId);
             const manifest = join(f.root, `/var/lib/celerity-rebuild-l2tp-direct/${backupId}/manifest.json`);
             const receipt = readJson(manifest);
-            assert.equal(fs.readFileSync(file, 'utf8'), stockModules + (lastId ? '' : 'xfrm_user\n'));
+            assert.equal(fs.readFileSync(file, 'utf8'), canonicalModules);
             if (legacy) {
-                // Exact old PPP-only receipt shape. Old installations left their PPP file on Remove.
-                // Do not round unrelated nanosecond pins by reserializing the manifest in JS.
+                // Keep unrelated (including nanosecond) receipt fields byte-exact.
+                const ppp = receipt.before.pppModules;
                 const original = fs.readFileSync(manifest, 'utf8');
-                const old = original.replace(/"modulePersistence":\[\d+,\d+,\d+\],/, '')
-                    .replace(`"bootFile":${JSON.stringify(receipt.before.pppModules.bootFile)},`, '');
-                assert.ok(!Object.hasOwn(JSON.parse(old).before.pppModules, 'bootFile'));
-                assert.ok(!Object.hasOwn(JSON.parse(old), 'modulePersistence'));
+                const subset = legacy === 'subset';
+                const bytes = stockModules + (subset ? 'xfrm_user\n' : '');
+                fs.writeFileSync(file, bytes);
+                const st = fs.statSync(file, { bigint: true });
+                const generation = `[${st.dev},${st.ino},${st.ctimeNs}]`;
+                const prior = { ...ppp };
+                if (subset) {
+                    prior.bootFile.after.data = Buffer.from(bytes).toString('base64');
+                    prior.observers = { xfrm_user: ppp.observers.xfrm_user };
+                } else {
+                    delete prior.bootFile;
+                    delete prior.observers;
+                    prior.persist = false;
+                }
+                const old = original.replace(/"modulePersistence":\[\d+,\d+,\d+\],/,
+                    subset ? `"modulePersistence":${generation},` : '')
+                    .replace(/"pppModules":\{.*?\},"sockets":/, `"pppModules":${JSON.stringify(prior)},"sockets":`);
+                assert.deepEqual(JSON.parse(old).before.pppModules, prior);
                 fs.writeFileSync(manifest, old);
             }
             const generation = fs.statSync(file).ino;
             assert.equal((await f.create().removeRelay(id)).status, 'not_installed');
-            assert.equal(fs.existsSync(file), legacy);
-            if (legacy) assert.equal(fs.statSync(file).ino, generation);
+            assert.equal(fs.existsSync(file), legacy === 'unowned');
+            if (legacy === 'unowned') {
+                assert.equal(fs.readFileSync(file, 'utf8'), stockModules);
+                assert.equal(fs.statSync(file).ino, generation);
+            }
             assert.deepEqual(f.records().moduleLoads, ['xfrm_user']);
             lastId = backupId;
         }

@@ -701,16 +701,21 @@ def ppp_host_scope():
     need(caps is not None and int(caps[1], 16) & (1 << 16), PPP_REQUIRED)  # CAP_SYS_MODULE
 
 
-def observe_ppp_preparation(required_observers=(), *, installed=None):
-    """Read-only prerequisite projection included in the fresh Install baseline."""
+def observe_ppp_preparation(required_observers=(), *, installed=None, fresh=True):
+    """Observe boot policy separately from the modules needing a live load."""
     try:
         absent = missing_network_observers()
-        observers = [name for name in OBSERVERS if name in absent or name in required_observers]
+        # Fresh Install requests every provider at next boot, including the
+        # modules already loaded or built in on this boot. Check their policy
+        # and boot-file conflicts even if they need no live load.
+        canonical = fresh and installed is None
+        observers = OBSERVERS if canonical else tuple(name for name in OBSERVERS
+                                                       if name in absent or name in required_observers)
         deps, builtin, policy, observer_policy = ppp_policy(observers)
         loaded, device = ppp_loaded(builtin), ppp_device()
         need(device is not False and (not loaded['ppp_generic'] or device is True), PPP_REQUIRED)
         before = ppp_boot_file(deps, installed)
-        persist = installed is None and (before['record'] is None or bool(absent))
+        persist = installed is None and (canonical or before['record'] is None or bool(absent))
         missing = [name for name in PPP_MODULES if not loaded[name]] + absent
         if missing or persist:
             ppp_host_scope()
@@ -720,7 +725,7 @@ def observe_ppp_preparation(required_observers=(), *, installed=None):
         if observers:
             plan['observers'] = observer_policy
         if persist:
-            plan['bootFile'] = {'before': before, 'after': ppp_config(absent)}
+            plan['bootFile'] = {'before': before, 'after': ppp_config(observers)}
         return plan
     except (OSError, ValueError):
         raise Refusal(PPP_REQUIRED) from None
@@ -772,7 +777,12 @@ def module_boot_owner(backup):
         need('modulePersistence' not in backup and not plan.get('observers'), 'ROLLBACK_DRIFT')
         return None
     images, generation = plan['bootFile'], backup.get('modulePersistence')
-    names = [name for name in OBSERVERS if name in plan['missing']]
+    checked = set(plan.get('observers', {}))
+    legacy = set(plan['missing']) & set(OBSERVERS)
+    # Older receipts checked and persisted only the absent observers. All
+    # other subset combinations are drift, not alternate file ownership.
+    need(checked in (set(OBSERVERS), legacy), 'ROLLBACK_DRIFT')
+    names = [name for name in OBSERVERS if name in checked]
     need(plan['persist'] is True and set(images) == {'before', 'after'}
          and set(images['before']) == {'record', 'generation'} and images['after'] == ppp_config(names)
          and type(generation) is list and len(generation) == 3 and all(type(v) is int and v > 0 for v in generation),
@@ -1313,6 +1323,30 @@ def boot():
     return open('/proc/sys/kernel/random/boot_id').read(64).strip()
 
 
+INSTALL_UNIT_FIELDS = ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID',
+                       'FragmentPath', 'DropInPaths')
+XRAY_ACCOUNT_FIELDS = ('User', 'Group')
+
+
+def install_unit_pins(units):
+    # ExecStart includes runtime timestamps. Record only the stable projection
+    # and the original invocation/PID needed by same-boot rollback.
+    pins = {name: {key: units[name].get(key) for key in INSTALL_UNIT_FIELDS} for name in UNITS}
+    for name in (X, B):
+        info = units[name]
+        # An absent BRIDGE has no account to pin; Apply can create it later.
+        if name == X or info['LoadState'] != 'not-found':
+            need(all(type(info.get(k)) is str for k in XRAY_ACCOUNT_FIELDS), 'PREREQUISITE')
+            pins[name].update({k: info[k] for k in XRAY_ACCOUNT_FIELDS})
+    return pins
+
+
+def xray_accounts_match(info, original):
+    # Old Install receipts omitted these keys. An explicit empty systemd
+    # property is a pin, not an omission. Check User and Group independently.
+    return all(k not in original or (k in info and info[k] == original[k]) for k in XRAY_ACCOUNT_FIELDS)
+
+
 def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=()) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
@@ -1407,11 +1441,7 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
     STAGE = 'PROFILE_USERS'
     sockets = xray_users(files['main'], units[X], rows, transit) if rows is not None else None
     need(rows is None or sockets, 'RUNTIME_UNPROVED')
-    # Project stable unit fields only; systemctl ExecStart includes runtime timestamps.
-    unit_pins = {name: {key: units[name].get(key) for key in
-                 ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID', 'FragmentPath', 'DropInPaths')}
-                 for name in UNITS}
-    return dict(boot=boot(), files=files, units=unit_pins, bridge=bridge, sockets=sockets, globalFiles=globals_before,
+    return dict(boot=boot(), files=files, units=install_unit_pins(units), bridge=bridge, sockets=sockets, globalFiles=globals_before,
                 installBoot=install_boot, ikeSockets=[], swanInputs=swan,
                 **({'nativePreparation': preparation} if preparation is not None else {}),
                 **({'transit': transit} if transit is not None else {}))
@@ -1442,6 +1472,7 @@ def candidate(request, before, *, active_probe=False):
         original_side = json.loads(raw(before['bridge']))
         # An existing managed sidecar only, with no separate dynamic-user API.
         need(not original_side.get('api') and not owner.get('api') and side.get('User') == 'nobody'
+             and xray_accounts_match(side, before['units'][B])
              and side.get('UnitFileState') == 'enabled', 'PREREQUISITE')
         pid = xray_argv(side, BRIDGE)
         if rows is not None:
@@ -1831,7 +1862,7 @@ def neighbors(before, sidecar=False):
     need(all(read(path, 262144) == value for path, value in before['globalFiles'].items()), 'ROLLBACK_DRIFT')
     if sidecar:
         need(all(b.get(k) == before['units'][B][k] for k in ('LoadState', 'UnitFileState', 'FragmentPath', 'DropInPaths'))
-             and b.get('User') == 'nobody', 'ROLLBACK_DRIFT')
+             and b.get('User') == 'nobody' and xray_accounts_match(b, before['units'][B]), 'ROLLBACK_DRIFT')
     else:
         need(read(BRIDGE) == before['bridge'] and all(b.get(k) == v for k, v in before['units'][B].items()), 'ROLLBACK_DRIFT')
 
@@ -1873,12 +1904,14 @@ def installed_runtime(d, token, before, after):
     rows = sock_rows()
     pid = xray_argv(x)
     same_xray_dropin(x, before['units'][X])
+    need(xray_accounts_match(x, before['units'][X]), 'RUNTIME_UNPROVED')
     sockets = xray_users(after['main'], x, rows, before.get('transit'))
     need(set(tuple(s) for s in before['sockets']) <= set(tuple(s) for s in sockets)
          and x['InvocationID'] != before['units'][X]['InvocationID'], 'RUNTIME_UNPROVED')
     bridge_info = unit(B) if sidecar else None
     handoff_pid = xray_argv(bridge_info, BRIDGE) if bridge_info is not None else pid
-    need(bridge_info is None or bridge_info['InvocationID'] != before['units'][B]['InvocationID'], 'RUNTIME_UNPROVED')
+    need(bridge_info is None or (bridge_info['InvocationID'] != before['units'][B]['InvocationID']
+                                and xray_accounts_match(bridge_info, before['units'][B])), 'RUNTIME_UNPROVED')
     config = json.loads(raw(after['bridge' if sidecar else 'main']))
     handoff = next(i['port'] for i in config['inbounds'] if i['tag'] == 'rebuild-relay-ingress')
     need(all(any(p == proto and n == d['tproxyPort'] and owners == [pid] for p, _, n, owners in rows)
@@ -1992,7 +2025,7 @@ def install(request, before, after, lock_fd=None):
             current = entry(encode(backup))
             write(path, old_manifest, current)
             old_manifest = current
-        if modules.get('observers'):
+        if any(name in OBSERVERS for name in modules['missing']):
             # Re-run the full baseline and candidate under the reservation,
             # before any VPN config, policy or service changes.
             require_network_observers()
@@ -2036,8 +2069,11 @@ def install(request, before, after, lock_fd=None):
         old_manifest = current
     sc('daemon-reload', wait=12)
     if 'bridge' in after:
+        need(xray_accounts_match(unit(B), before['units'][B]), 'ROLLBACK_DRIFT')
         sc('restart', B, wait=22)
-    retained_xray_dropin(unit(X), before['units'][X])
+    x = unit(X)
+    retained_xray_dropin(x, before['units'][X])
+    need(xray_accounts_match(x, before['units'][X]), 'ROLLBACK_DRIFT')
     sc('restart', X, wait=22)
     if before.get('ikeSockets'):
         sc('restart', IKE, wait=22)
@@ -2353,13 +2389,16 @@ def rollback(request, path, old_manifest, backup):
         if n == NET_UNIT:
             need(info['LoadState'] == 'not-found' or info.get('FragmentPath') == NET, 'ROLLBACK_DRIFT')
         if n == X:
-            need(info['FragmentPath'] == before['units'][n]['FragmentPath'], 'ROLLBACK_DRIFT')
+            need(info['FragmentPath'] == before['units'][n]['FragmentPath']
+                 and xray_accounts_match(info, before['units'][n]), 'ROLLBACK_DRIFT')
             retained_xray_dropin(info, before['units'][n])
             if working(info):
                 original_invocation = info['InvocationID'] == before['units'][n]['InvocationID']
                 xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows(), before.get('transit'))
-        if n == B and working(info):
-            xray_argv(info, BRIDGE)
+        if n == B:
+            need(xray_accounts_match(info, before['units'][n]), 'ROLLBACK_DRIFT')
+            if working(info):
+                xray_argv(info, BRIDGE)
     if swan_units is not None and partial_start:
         no_jobs(UNITS)
         need(all(unit(n) == info for n, info in swan_units.items()), 'ROLLBACK_DRIFT')
@@ -2449,9 +2488,11 @@ def rollback(request, path, old_manifest, backup):
             rmdir(p)
     sc('daemon-reload', wait=12)
     if sidecar and (current['bridge'] != originals['bridge'] or not working(unit(B))):
+        need(xray_accounts_match(unit(B), before['units'][B]), 'ROLLBACK_DRIFT')
         sc('restart', B, wait=22)
     x = unit(X)
     retained_xray_dropin(x, before['units'][X])
+    need(xray_accounts_match(x, before['units'][X]), 'ROLLBACK_DRIFT')
     if current['main'] != before['files']['main'] or not working(x):
         sc('restart', X, wait=22)
     if before.get('ikeSockets'):
@@ -2494,7 +2535,8 @@ def verify_rollback(d, token, backup):
     reserved = (1701, d['tproxyPort']) if restored_ike else (500, 4500, 1701, d['tproxyPort'])
     x = unit(X)
     same_xray_dropin(x, before['units'][X])
-    need(xray_users(before['files']['main'], x, rows, before.get('transit')) == before['sockets'] and
+    need(xray_accounts_match(x, before['units'][X]) and
+         xray_users(before['files']['main'], x, rows, before.get('transit')) == before['sockets'] and
          not any(port in reserved for p, a, port, owners in rows), 'RUNTIME_UNPROVED')
     no_jobs(UNITS)
 
@@ -2847,7 +2889,9 @@ def network_unit_loaded(net, legacy, record=None):
 def removal_units(units, before, runtime, restart_bridge, legacy, net_record=None):
     bad = 'ROLLBACK_DRIFT'
     x, xl, ike, net = (units[name] for name in (X, XL, IKE, NET_UNIT))
-    need(x['FragmentPath'] == before['units'][X]['FragmentPath'] and working(x), bad)
+    need(x['FragmentPath'] == before['units'][X]['FragmentPath'] and working(x)
+         and xray_accounts_match(x, before['units'][X])
+         and xray_accounts_match(units[B], before['units'][B]), bad)
     need(network_unit_loaded(net, legacy, net_record), bad)
     for name, info, sub in zip((XL, IKE, NET_UNIT), (xl, ike, net), ('running', 'running', 'exited')):
         if name != NET_UNIT:
@@ -3165,13 +3209,17 @@ def reattest_sample(request, backup):
     need(removal_native(xl, XL, before, installed=True) and removal_native(ike, IKE, before, installed=True)
          and set(xl['Requires'].split()) >= {NET_UNIT, IKE} and set(xl['After'].split()) >= {NET_UNIT, IKE}, bad)
     removal_dependencies(infos, installed=True)
+    check_idle_bridge = not sidecar and any(k in old[B] for k in XRAY_ACCOUNT_FIELDS)
+    b = infos[B] if sidecar else unit(B) if check_idle_bridge or applied is not None else None
+    need(b is None or xray_accounts_match(b, old[B]), bad)
     if applied is not None:
-        need(applied['nodeId'] == request['nodeId'] and apply_bridge_state(unit(B), sidecar) == applied['bridgeUnit'], bad)
+        need(applied['nodeId'] == request['nodeId'] and apply_bridge_state(b, sidecar) == applied['bridgeUnit'], bad)
     for name in (X, B) if sidecar and applied is None else (X,):
         info = infos[name]
         enabled = 'enabled' if applied is not None else old[name].get('UnitFileState')
         need(info.get('UnitFileState') == enabled
-             and all(info.get(key) == old[name].get(key) for key in ('FragmentPath', 'DropInPaths', 'User', 'Group'))
+             and all(info.get(key) == old[name].get(key) for key in ('FragmentPath', 'DropInPaths'))
+             and (xray_accounts_match(info, old[X]) if name == X else info.get('User') == 'nobody')
              and not any(info.get(key) for key in ('ExecCondition', 'PassEnvironment', 'UnsetEnvironment')), bad)
     need(all(info.get('ActiveState') == 'active' and info.get('SubState') == ('exited' if name == NET_UNIT else 'running')
              and re.fullmatch(r'[a-f0-9]{32}', info.get('InvocationID', '')) and info['InvocationID'] != '0' * 32
@@ -3219,8 +3267,11 @@ def reattest_sample(request, backup):
          and all(line.lstrip().startswith(b'celerity-l2tp:') for line in connections[1].splitlines() if line.strip()), bad)
     policy = checked_installed_policy(backup, kind, exact_flags=True)
     no_jobs(UNITS)
-    need(all(unit(name) == info for name, info in infos.items()) and epoch == boot()
-         and (applied is None or apply_bridge_state(unit(B), sidecar) == applied['bridgeUnit']), bad)
+    need(all(unit(name) == info for name, info in infos.items()) and epoch == boot(), bad)
+    if check_idle_bridge or applied is not None:
+        confirmed_bridge = unit(B)
+        need(xray_accounts_match(confirmed_bridge, old[B])
+             and (applied is None or apply_bridge_state(confirmed_bridge, sidecar) == applied['bridgeUnit']), bad)
     return (dict(boot=epoch, invocations=invocations, pids=pids), infos, processes, connections[1], policy,
             sorted((proto, addr, number, owners) for proto, addr, number, owners in rows
                    if number in (port, d['tproxyPort'], 1701, 500, 4500)))
@@ -3258,7 +3309,7 @@ def reattest_runtime(request, lock_fd):
     except (BlockingIOError, subprocess.TimeoutExpired):
         raise
     except (Refusal, OSError, ValueError, KeyError, TypeError, IndexError) as error:
-        if REATTEST_ENTERED or str(error) in ('IDENTITY', 'IN_FLIGHT'):
+        if REATTEST_ENTERED or str(error) in ('IDENTITY', 'IN_FLIGHT', OBSERVATION_REQUIRED):
             raise
         raise Refusal(bad) from None
     return {'ok': True, 'backupId': request['backupId']}
@@ -3436,6 +3487,7 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     active = bool(side['inbounds'] or any(o.get('protocol') == 'vless' and o.get('settings', {}).get('reverse', {}).get('tag')
                                          for o in side['outbounds']))
     info = unit(B)
+    need(xray_accounts_match(info, backup['before']['units'][B]), bad)
     old_unit = apply_bridge_state(info, installed is not None and installed['bridgeActive'])
     need(old_unit == (None if installed is None else installed['bridgeUnit']), bad)
     unit_path = SYSTEM + '/' + B
@@ -3535,6 +3587,8 @@ def apply_network(request, action):
         need(main_invocation != pending['mainInvocation'], 'RUNTIME_UNPROVED')
         manifest_generation = remove_generation(path)
         x, b = unit(X), unit(B)
+        old_units = backup['before']['units']
+        need(xray_accounts_match(x, old_units[X]) and xray_accounts_match(b, old_units[B]), 'ROLLBACK_DRIFT')
         b_state = apply_bridge_state(b, pending['bridgeActive'])
         need(b_state == pending['bridgeUnit'], 'ROLLBACK_DRIFT')
         profiles = read_apply_profiles(pending['files'])
@@ -3884,8 +3938,10 @@ def removal_units_after(state, restore_ike=False):
             need((after['ActiveState'], after['SubState'], after['MainPID']) == ('inactive', 'dead', '0'),
                  'RUNTIME_UNPROVED')
     x = units[X]
+    # Compare against the fresh Remove snapshot even when the historical
+    # Install did not record accounts.
     need(all(x.get(k) == state['units'][X].get(k) for k in ('FragmentPath', 'UnitFileState', 'User', 'Group', 'DropInPaths'))
-         and working(x), 'RUNTIME_UNPROVED')
+         and xray_accounts_match(x, before['units'][X]) and working(x), 'RUNTIME_UNPROVED')
     removal_dependencies(units, installed=False)
     return units
 
@@ -3929,7 +3985,8 @@ def removal_xray_ready(state, split):
         rows, x = sock_rows(), unit(X)
         need(not any(n in state['reserved'] for _, _, n, _ in rows), 'RUNTIME_UNPROVED')
         try:
-            need(x['InvocationID'] != state['units'][X]['InvocationID'], 'RUNTIME_UNPROVED')
+            need(x['InvocationID'] != state['units'][X]['InvocationID']
+                 and xray_accounts_match(x, state['units'][X]), 'RUNTIME_UNPROVED')
             xray_users(state['profiles']['main'], x, rows, state.get('transit'))
             need(removal_main_sockets(rows, x['MainPID'], state['reserved'], state['udp_endpoints'])
                  == state['sockets'], 'RUNTIME_UNPROVED')
@@ -6020,8 +6077,8 @@ def recovery_manifest(request, scope):
     keys = {'phase', 'backupId', 'machineId', 'network', 'before', 'after'}
     baseline_keys = {'boot', 'installLock', 'pppModules', 'files', 'units', 'bridge', 'sockets',
                      'globalFiles', 'installBoot', 'ikeSockets', 'swanInputs'}
-    unit_keys = {'LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID',
-                 'FragmentPath', 'DropInPaths'}
+    unit_keys = set(INSTALL_UNIT_FIELDS)
+    account_keys = set(XRAY_ACCOUNT_FIELDS)
     need(keys <= set(backup) <= keys | {'runtime', 'nativePrepared', 'bootEnrollment', 'swanStart', 'swanGeneration',
                                       'preparedSockets', 'modulePersistence'}
          and record == entry(encode(backup)) and backup['backupId'] == request['backupId']
@@ -6031,9 +6088,12 @@ def recovery_manifest(request, scope):
          and type(before['installBoot']) is bool and type(before['ikeSockets']) is list
          and ((type(before['sockets']) is list and 'preparedSockets' not in backup)
               or (before['sockets'] is None and type(backup.get('preparedSockets')) is list
-                  and bool(backup['preparedSockets']) and any(name in before['pppModules'].get('observers', {})
+                  and bool(backup['preparedSockets']) and any(name in before['pppModules'].get('missing', ())
                                                             for name in SOCKET_OBSERVERS)))
-         and set(before['units']) == set(UNITS) and all(set(info) == unit_keys for info in before['units'].values())
+         and set(before['units']) == set(UNITS)
+         and all(set(info) == unit_keys or (name in (X, B) and unit_keys <= set(info) <= unit_keys | account_keys
+                                           and all(type(info[k]) is str for k in account_keys & info.keys()))
+                 for name, info in before['units'].items())
          and set(before['globalFiles']) == {'/etc/ppp/options', SWAN_CONF, XL_DEFAULT}
          and set(before['files']) == set(NAMES) | {'swan'} and before['files']['swan'] is None
          and set(after) - {'bridge'} == set(NAMES) | {'swan'}
@@ -6121,7 +6181,7 @@ def reconcile_install(request):
 def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
     lock_id = install_lock_identity(lock_fd)
     modules = observe_ppp_preparation()
-    deferred = tuple(modules.get('observers', {}))
+    deferred = tuple(name for name in modules['missing'] if name in OBSERVERS)
     before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner,
                      **({'deferred': deferred} if deferred else {}))
     need(install_lock_identity(lock_fd) == lock_id, 'BASELINE_CHANGED')
@@ -6275,7 +6335,7 @@ def dispatch(request: dict[str, Any]):
                     owner = module_boot_owner(backup)
                     check_module_boot_owner(owner)
                     observers = backup['before']['pppModules'].get('observers', {})
-                    modules = observe_ppp_preparation(observers, installed=owner[1]) if owner else observe_ppp_preparation()
+                    modules = observe_ppp_preparation(observers, installed=owner[1]) if owner else observe_ppp_preparation(fresh=False)
                     need(not modules['missing'] and not modules['persist'], 'RUNTIME_UNPROVED')
                 files = load_after(backup, require_all=True)
                 need(installed_runtime(d, token, runtime_before(backup), files) == backup['runtime'], 'RUNTIME_UNPROVED')
@@ -6316,7 +6376,8 @@ def main():
         if (action == 'reconcile-install' or REATTEST_ENTERED or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED
                 or NATIVE_PREPARING or str(error) == 'IN_FLIGHT'):
             return 75
-        if str(error) in (RUNTIME_REATTEST_REQUIRED, RUNTIME_FOREIGN_CHANGE) and time.monotonic() >= DEADLINE:
+        if (str(error) in (RUNTIME_REATTEST_REQUIRED, RUNTIME_FOREIGN_CHANGE) or
+                action == 'reattest-runtime' and str(error) == OBSERVATION_REQUIRED) and time.monotonic() >= DEADLINE:
             return 75
         if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED, MODULE_BLACKLISTED, OBSERVATION_REQUIRED):
             return 75

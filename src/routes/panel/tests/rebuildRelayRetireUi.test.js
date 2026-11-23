@@ -88,17 +88,21 @@ test('localized neighbor refusal never enables confirmation or prints unknown de
     for (const lang of languages) {
         const f = await launch(lang);
         const code = 'REBUILD_RETIRE_NEIGHBOR_REFUSED';
-        f.replies.push({ status: 409, data: { error: { code, neighborName: '212 East', reason: 'RUNTIME_FOREIGN_CHANGE' } } });
-        await f.buttons[0].click();
         const copy = words(lang);
-        assert.equal(f.status.textContent, copy.neighborRefused.replace('{name}', '212 East') + ' ' + copy.neighborRuntimeForeignChange);
-        assert.equal(f.confirm.hidden, true);
-        f.dialog.close();
+        for (const [reason, key] of [['RUNTIME_FOREIGN_CHANGE', 'neighborRuntimeForeignChange'],
+            ['NETWORK_OBSERVATION_REQUIRED', 'neighborNetworkNotReady']]) {
+            f.replies.push({ status: 409, data: { error: { code, neighborName: '212 East', reason } } });
+            await f.buttons[0].click();
+            assert.equal(f.status.textContent, copy.neighborRefused.replace('{name}', '212 East') + ' ' + copy[key]);
+            assert.equal(f.confirm.hidden, true);
+            assert.equal(f.confirm.disabled, true);
+            f.dialog.close();
+        }
         f.replies.push({ status: 409, data: { error: { code, neighborName: '/private/path', reason: '<raw error>' } } });
         await f.buttons[0].click();
         assert.equal(f.status.textContent, copy.neighborRefused.replace('{name}', copy.neighborUnknown));
         assert.equal(f.confirm.disabled, true);
-        assert.equal(f.calls.length, 2);
+        assert.equal(f.calls.length, 3);
     }
 });
 

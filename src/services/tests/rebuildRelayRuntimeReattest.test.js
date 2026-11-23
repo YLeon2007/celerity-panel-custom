@@ -151,16 +151,18 @@ test('Remove census forwards held authority and does not mask an uncertain metad
 });
 
 test('Remove and CHAP mutations never trigger reattestation even on the exact read refusal', async () => {
-    const f = fixture(({ action }) => action === 'prepare-remove' ? ack(removeReceipt) : required);
-    const plan = await f.remote.prepareRemove(installation, lock);
-    await assert.rejects(f.remote.remove(plan, lock), unknownWrite);
-    assert.equal(await f.remote.remove(plan, lock), false);
-    assert.deepEqual(f.names(), ['prepare-remove', 'remove']);
-    const g = fixture(({ action }) => action === 'check-chap' ? ack({ ok: true, backupId, changed: true }) : required);
-    await g.remote.checkChap(installation, [user], [], lock);
-    await assert.rejects(g.remote.syncChap(installation, [user], [], lock), unknownWrite);
-    await assert.rejects(g.remote.syncChap(installation, [user], [], lock), { code: 'REBUILD_L2TP_DIRECT_UNAVAILABLE' });
-    assert.deepEqual(g.names(), ['check-chap', 'sync-chap']);
+    for (const refusal of [required, refuse('NETWORK_OBSERVATION_REQUIRED')]) {
+        const f = fixture(({ action }) => action === 'prepare-remove' ? ack(removeReceipt) : refusal);
+        const plan = await f.remote.prepareRemove(installation, lock);
+        await assert.rejects(f.remote.remove(plan, lock), unknownWrite);
+        assert.equal(await f.remote.remove(plan, lock), false);
+        assert.deepEqual(f.names(), ['prepare-remove', 'remove']);
+        const g = fixture(({ action }) => action === 'check-chap' ? ack({ ok: true, backupId, changed: true }) : refusal);
+        await g.remote.checkChap(installation, [user], [], lock);
+        await assert.rejects(g.remote.syncChap(installation, [user], [], lock), unknownWrite);
+        await assert.rejects(g.remote.syncChap(installation, [user], [], lock), { code: 'REBUILD_L2TP_DIRECT_UNAVAILABLE' });
+        assert.deepEqual(g.names(), ['check-chap', 'sync-chap']);
+    }
 });
 
 test('CHAP fence reads a fresh CAS preimage; failure to fence is never retried', async () => {
@@ -180,6 +182,33 @@ test('exact foreign change stays distinct from a lost reattest acknowledgement',
     });
     assert.deepEqual(f.names(), ['session-count', 'reattest-runtime']);
     await f.remote.close();
+});
+
+test('missing network observation blocks DIRECT reads without inventing counts or write outcomes', async () => {
+    const missing = refuse('NETWORK_OBSERVATION_REQUIRED');
+    for (const [action, read] of [
+        ['session-count', remote => readSessionCensus(remote, installation, false, lock)],
+        ['retirement-count', remote => readSessionCensus(remote, installation, true, lock)],
+        ['inspect-chap', remote => remote.inspectChap(installation, [user], [], lock, user.login)],
+        ['prepare-remove', remote => remote.prepareRemove(installation, lock)],
+    ]) {
+        for (const replies of [[missing], [required, missing], [required, ack(receipt), missing]]) {
+            const f = fixture((_, i) => replies[i - 1]);
+            await assert.rejects(read(f.remote), error => {
+                assert.equal(error.code, 'REBUILD_L2TP_DIRECT_NETWORK_OBSERVATION_REQUIRED');
+                assert.equal(error.remoteOutcomeUncertain, undefined);
+                return true;
+            });
+            assert.deepEqual(f.names(), [action, 'reattest-runtime', action].slice(0, replies.length));
+            await f.remote.close();
+        }
+    }
+    for (const bad of [{ ...missing, stdout: ' ' }, { ...missing, code: 75 }, { ...missing, stderr: missing.stderr + '\n' }]) {
+        const f = fixture((_, i) => i === 1 ? required : bad);
+        await assert.rejects(readSessionCensus(f.remote, installation, false, lock), unknownWrite);
+        assert.deepEqual(f.names(), ['session-count', 'reattest-runtime']);
+        await f.remote.close();
+    }
 });
 
 function boundFixture(respond, { verify = async () => {}, actualMachine = machineId, storedNode = nodeId } = {}) {
@@ -241,6 +270,8 @@ test('bound activation preserves exact foreign refusal, veto, and uncertain reat
     const kind = 'REBUILD_L2TP_APPLY_NETWORK_OUTCOME_UNKNOWN';
     for (const [outcome, expected, options, names] of [
         [refuse('RUNTIME_FOREIGN_CHANGE'), { code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason: 'RUNTIME_FOREIGN_CHANGE' }],
+        [refuse('NETWORK_OBSERVATION_REQUIRED'), { code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason: 'NETWORK_OBSERVATION_REQUIRED' }],
+        [{ ...refuse('NETWORK_OBSERVATION_REQUIRED'), stdout: ' ' }, { code: kind, remoteOutcomeUncertain: true }],
         [new Error('lost'), { code: kind, remoteOutcomeUncertain: true }],
         [ack({ ...receipt, extra: true }), { code: kind, remoteOutcomeUncertain: true }],
         [ack(receipt), { code: 'REBUILD_L2TP_SSH_CONNECT_FAILED' }, { actualMachine: '' }, ['check-apply-network']],
@@ -258,6 +289,18 @@ test('bound activation preserves exact foreign refusal, veto, and uncertain reat
         assert.deepEqual(f.rawActions, []);
         await f.bound.close();
     }
+});
+
+test('bound read-only check reports missing network observation without attempting reattestation', async t => {
+    t.mock.method(logger, 'warn', () => {});
+    const f = boundFixture(() => refuse('NETWORK_OBSERVATION_REQUIRED'));
+    await f.bound.attest();
+    await assert.rejects(f.bound.checkActivation({ readOnly: true }), {
+        code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason: 'NETWORK_OBSERVATION_REQUIRED',
+    });
+    assert.deepEqual(f.names(), ['check-apply-network']);
+    assert.deepEqual(f.rawActions, []);
+    await f.bound.close();
 });
 
 test('an exact read refusal cannot induce reattest of the write-capable Apply prepare action', async t => {

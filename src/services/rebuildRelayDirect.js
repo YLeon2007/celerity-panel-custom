@@ -16,6 +16,7 @@ const { isInstallStage, specificHostRefusal, packageWriteCheck, prerequisiteChec
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
 const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
+const { networkObservationRequired } = require('./rebuildRelayRuntimeRefusal');
 
 const TIMEOUT = 145000;
 // The package host has 210s from bootstrap; allow shell startup, kill grace,
@@ -34,6 +35,9 @@ const runtimeReattestFrame = result => result?.code === 70 && result.stdout === 
     && result.stderr === 'DIRECT_RUNTIME_REATTEST_REQUIRED\n';
 const runtimeForeignFrame = result => result?.code === 70 && result.stdout === ''
     && result.stderr === 'DIRECT_RUNTIME_FOREIGN_CHANGE\n';
+// Accepted only for installed observations and their metadata reattestation.
+const networkObservationFrame = result => result?.code === 70 && result.stdout === ''
+    && result.stderr === `DIRECT_${networkObservationRequired}\n`;
 const runtimeIdentityFrame = result => result?.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_IDENTITY\n';
 const directRefusals = new Set(['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
     'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED']);
@@ -364,6 +368,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             if (!closed && runtimeAck(result, params.backupId)) return;
             if (!closed && runtimeIdentityFrame(result)) { poison(); throw identityChanged(); }
             if (!closed && runtimeForeignFrame(result)) throw fail('DIRECT_RUNTIME_FOREIGN_CHANGE');
+            if (!closed && networkObservationFrame(result)) throw fail(`DIRECT_${networkObservationRequired}`);
             throw unknown();
         }
         // A verified diagnostic on rc75 is informational only. Missing or
@@ -383,6 +388,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             if (RUNTIME_READS.has(action) && !closed) {
                 if (runtimeReattestFrame(result)) throw runtimeReattestRequired;
                 if (runtimeForeignFrame(result)) throw fail('DIRECT_RUNTIME_FOREIGN_CHANGE');
+                if (networkObservationFrame(result)) throw fail(`DIRECT_${networkObservationRequired}`);
             }
             if (action === 'inspect-chap') {
                 const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
@@ -742,10 +748,14 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
         if (['check-apply-network', 'verify-apply-network'].includes(action) && runtimeReattestFrame(result)) {
             throw runtimeReattestRequired;
         }
-        if (action === 'check-apply-network' && runtimeForeignFrame(result)) throw foreign();
+        if (action === 'check-apply-network') checkObservationRefusal(result);
         return result;
     };
-    const foreign = () => Object.assign(fail('APPLY_NETWORK_REFUSED'), { reason: 'RUNTIME_FOREIGN_CHANGE' });
+    const checkObservationRefusal = result => {
+        const reason = runtimeForeignFrame(result) ? 'RUNTIME_FOREIGN_CHANGE'
+            : networkObservationFrame(result) ? networkObservationRequired : undefined;
+        if (reason) throw Object.assign(fail('APPLY_NETWORK_REFUSED'), { reason });
+    };
     const reattest = action === 'check-apply-network' && typeof runtime?.run === 'function' ? async () => {
         const { nodeId } = runtime;
         requireThat(nodeId?.length === 24 && tokenMatches(/^[a-f0-9]{24}$/, nodeId)
@@ -754,7 +764,7 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
         const response = await runtime.run(directCommand('-k 4s 125s'), { timeout: TIMEOUT, maxOutputBytes: 256,
             stdin: JSON.stringify({ action: 'reattest-runtime', machineId, nodeId, backupId, network }) });
         if (runtimeIdentityFrame(response)) throw identityChanged();
-        if (runtimeForeignFrame(response)) throw foreign();
+        checkObservationRefusal(response);
         if (!runtimeAck(response, backupId)) throw uncertain();
     } : undefined;
     const result = await readWithRuntimeReattestation(read, reattest);

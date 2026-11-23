@@ -10,7 +10,8 @@ const { projectRelayChap, inspectAccountSources } = require('./rebuildRelayAccou
 const { readDirectory, writeDirectory, checkDirectory, logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 const { transactOnce, AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
 const { readAccountCount, readSessionCensus } = require('./rebuildRelayCounts');
-const { runtimeForeignChange, isRuntimeForeignChange, isUnconfirmedRuntimeWrite } = require('./rebuildRelayRuntimeRefusal');
+const { runtimeForeignChange, isRuntimeForeignChange, isUnconfirmedRuntimeWrite,
+    networkNotReadyDetails, isNetworkObservationRequired } = require('./rebuildRelayRuntimeRefusal');
 const { readAppliedTransit } = require('./rebuildAppliedLink');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
@@ -218,7 +219,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, withHeld
                             }
                         } catch (error) {
                             if (isIdentityChanged(error) || error?.remoteOutcomeUncertain === true
-                                || (!heldLock && isRuntimeForeignChange(error))) throw error;
+                                || (!heldLock && (isRuntimeForeignChange(error) || isNetworkObservationRequired(error)))) throw error;
                             // Unavailable, not zero.
                         }
                         finally {
@@ -445,6 +446,7 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, withHeld
                     return { executionMode: 'rebuild', status: 'not_installed', nodeId: id };
                 } catch (error) {
                     primary = !heldLock && isUnconfirmedRuntimeWrite(error) ? phaseError(fail(UNKNOWN), 'unknown')
+                        : !heldLock && isNetworkObservationRequired(error) ? Object.assign(fail(networkNotReadyDetails.code), networkNotReadyDetails)
                         : !heldLock && isRuntimeForeignChange(error) ? Object.assign(fail(runtimeForeignChange), { retryAllowed: false })
                             : safe(error);
                     if (phaseAware && (reserved || primary.code === RESERVATION_UNKNOWN)) {

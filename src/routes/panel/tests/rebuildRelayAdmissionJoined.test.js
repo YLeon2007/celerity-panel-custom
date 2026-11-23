@@ -457,8 +457,8 @@ function mount(panel, mongo) {
         return require('../rebuildRelayRemove').issueRemovalTicket({ method: 'GET', headers: {}, session, sessionID,
             params: { id: nodeId } }, estimate);
     };
-    const get = url => require('../../../services/tests/helpers/rebuildPanelRequest').request(app, url, {
-        method: 'GET', session, sessionID, headers: { 'accept-language': 'ru' },
+    const get = (url, lang = 'ru') => require('../../../services/tests/helpers/rebuildPanelRequest').request(app, url, {
+        method: 'GET', session: { ...session, lang }, sessionID, headers: { 'accept-language': lang },
     });
     return { send, get, session, preview, admission: (action, ...args) => send(`admission/${action}`, ...args) };
 }
@@ -691,6 +691,50 @@ const foreignCode = 'REBUILD_L2TP_RUNTIME_FOREIGN_CHANGE';
 const foreignRu = 'Конфигурация L2TP на релее изменена вне панели';
 const foreignFrame = { status: 70, stdout: '', stderr: 'DIRECT_RUNTIME_FOREIGN_CHANGE\n' };
 const lostFrame = { status: 75, stdout: '', stderr: '' };
+const observationFrame = { status: 70, stdout: '', stderr: 'DIRECT_NETWORK_OBSERVATION_REQUIRED\n' };
+const notReady = { code: 'REBUILD_L2TP_HOST_NOT_READY', check: 'NETWORK_OBSERVATION_REQUIRED', retryAllowed: false };
+
+test('network observation refusal shows localized server-not-ready on the real census card and blocks Remove', { timeout: 5000 }, async t => {
+    const f = joined(t);
+    await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+    await f.send('install');
+    const url = `/panel/nodes/${nodeId}`;
+    const issue = async () => (await f.get(url)).body.match(/name="ticket" value="([a-f0-9]{64})"/)[1];
+    const censusTicket = await issue();
+    const prepareTicket = await issue();
+    const preserved = [STATES, USERS, DIRECTORY].map(f.mongo.rows);
+    const start = f.frames.length;
+    f.remote.staleRead = 'session-count';
+    f.remote.reattestReply = observationFrame;
+    const texts = new Set();
+    for (const lang of ['ru', 'en', 'zh-CN']) {
+        const { status, body } = await f.get(url, lang);
+        const { nodes, rebuildL2tp: copy } = require(`../../../locales/${lang}.json`);
+        assert.equal(status, 200);
+        assert.match(body, /id="rebuild-l2tp-remove" open>/);
+        assert.ok(body.includes(`<p role="status">${copy.messages.runtimeNetworkNotReady}</p>`));
+        assert.ok(body.includes(nodes.rebuildRelayCounts.replace('{accounts}', '1')
+            .replace('{sessions}', nodes.rebuildCountUnavailable).replace('{ipsec}', nodes.rebuildCountUnavailable)));
+        assert.ok(body.includes(copy.installChecks[notReady.check]));
+        assert.doesNotMatch(body, /name="ticket"|DIRECT_NETWORK_OBSERVATION_REQUIRED/);
+        assert.ok(!body.includes(copy.messages.runtimeForeignChange));
+        texts.add(copy.messages.runtimeNetworkNotReady);
+    }
+    assert.equal(texts.size, 3);
+    require('../index').l2tpRateLimiter.resetKey('192.0.2.10');
+    assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket: censusTicket }, { expected: 409 }), { error: notReady });
+    f.remote.staleRead = 'prepare-remove';
+    const notice = await f.get(await f.send('remove', { decision: 'confirm', ticket: prepareTicket }, { html: true, expected: 303 }));
+    assert.equal(notice.status, 200);
+    assert.ok(notice.body.includes(require('../../../locales/ru.json').rebuildL2tp.messages.runtimeNetworkNotReady));
+    assert.doesNotMatch(notice.body, /data-(?:install-url|account-action|remove-link|reconcile-url)=/);
+    assert.deepEqual(f.frames.slice(start).map(([id, action]) => { assert.equal(id, nodeId); return action; }), [
+        ...Array.from({ length: 4 }, () => ['session-count', 'reattest-runtime']).flat(),
+        'session-count', 'prepare-remove', 'reattest-runtime',
+    ]);
+    assert.deepEqual([STATES, USERS, DIRECTORY].map(f.mongo.rows), preserved);
+    assert.deepEqual(f.remote.effects, ['install']);
+});
 
 test('runtime foreign change reaches the real node card and normal Remove without a new ticket', { timeout: 5000 }, async t => {
     const f = joined(t);
@@ -748,7 +792,7 @@ test('runtime foreign change reaches the real node card and normal Remove withou
     assert.deepEqual(f.remote.effects, ['install']);
 });
 
-test('runtime foreign change reaches the real CHAP reconciliation route with the intent still pending', { timeout: 5000 }, async t => {
+test('runtime refusals and unknown ACK reach the real CHAP reconciliation route with intent still pending', { timeout: 5000 }, async t => {
     const f = joined(t);
     await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
     await f.send('install');
@@ -768,15 +812,17 @@ test('runtime foreign change reaches the real CHAP reconciliation route with the
     const unknown = { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false };
     for (const [wire, error] of [
         [foreignFrame, { code: foreignCode, retryAllowed: false }],
+        [observationFrame, notReady],
         [lostFrame, unknown],
-        [{ ...foreignFrame, stderr: foreignFrame.stderr + privateError }, unknown],
+        [{ ...observationFrame, stderr: observationFrame.stderr + privateError }, unknown],
     ]) {
         f.remote.reattestReply = wire;
         let click, request;
         const status = { textContent: '' }, refresh = { hidden: true };
         const reconcile = { disabled: true, addEventListener: (_, handler) => { click = handler; } };
         const page = {
-            dataset: { csrf: attribute('csrf'), messages: attribute('messages'), reconcileUrl: attribute('reconcile-url') },
+            dataset: { csrf: attribute('csrf'), messages: attribute('messages'), reconcileUrl: attribute('reconcile-url'),
+                installChecks: attribute('install-checks') },
             querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': reconcile })[key] ?? null,
             querySelectorAll: () => [],
         };
@@ -793,14 +839,15 @@ test('runtime foreign change reaches the real CHAP reconciliation route with the
         click();
         assert.deepEqual(await request, { error });
         await new Promise(resolve => setImmediate(resolve));
-        assert.equal(status.textContent, wire === foreignFrame ? foreignRu
-            : require('../../../locales/ru.json').rebuildL2tp.messages.reconcileUnconfirmed);
+        const copy = require('../../../locales/ru.json').rebuildL2tp;
+        assert.equal(status.textContent, wire === foreignFrame ? foreignRu : wire === observationFrame
+            ? `${copy.messages.runtimeNetworkNotReady} ${copy.installChecks[notReady.check]}` : copy.messages.reconcileUnconfirmed);
         assert.equal(refresh.hidden, false);
         assert.equal(reconcile.disabled, true);
         click(); // A stale control must not post again, even if invoked directly.
         assert.deepEqual([STATES, USERS, DIRECTORY].map(f.mongo.rows), preserved);
     }
-    assert.deepEqual(f.frames.slice(start), Array.from({ length: 3 }, () => [
+    assert.deepEqual(f.frames.slice(start), Array.from({ length: 4 }, () => [
         [nodeId, 'inspect-chap'], [nodeId, 'reattest-runtime'],
     ]).flat());
     assert.deepEqual(f.remote.effects, ['install', 'sync-chap']);

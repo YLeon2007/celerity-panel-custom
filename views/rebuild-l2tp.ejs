@@ -1,7 +1,7 @@
 <%
 const l = key => t(`rebuildL2tp.${key}`);
 const available = typeof loadError === 'undefined' || !loadError;
-const removalMessage = typeof removalNotice !== 'undefined' && ['uncertain', 'removeCleanupFailed', 'runtimeForeignChange'].includes(removalNotice)
+const removalMessage = typeof removalNotice !== 'undefined' && ['uncertain', 'removeCleanupFailed', 'runtimeForeignChange', 'runtimeNetworkNotReady'].includes(removalNotice)
     ? l(`messages.${removalNotice}`) : '';
 const pending = available && typeof accountsPending !== 'undefined' && accountsPending === true;
 const topProblem = typeof grantProblem !== 'undefined' && grantProblem;
@@ -30,7 +30,7 @@ const problemText = problem => l(`admission.${problemKeys.get(problem) ?? 'grant
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
     'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
-    'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired', 'runtimeForeignChange',
+    'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired', 'runtimeForeignChange', 'runtimeNetworkNotReady',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
     'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed', 'canInstallAgain', 'installRecoveryUnconfirmed', 'installRecoveryNoState'];
 function secretControl(kind, url, index, login) {
