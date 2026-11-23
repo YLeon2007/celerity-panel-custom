@@ -129,6 +129,11 @@ function fixture(t, planBackupId = backupId) {
             const row = lockRows(options?.session).find(row => matches(row, filter));
             return row ? copy(row) : null;
         },
+        async updateOne(filter, { $set: { heartbeat } }) {
+            const row = locks.find(row => matches(row, filter));
+            if (row) row.heartbeat = heartbeat;
+            return { acknowledged: true, matchedCount: Number(!!row) };
+        },
         async updateMany(filter, update, options) {
             assert.ok(options.session || options.writeConcern?.w === 'majority');
             const row = lockRows(options.session).find(row => matches(row, filter));
@@ -1857,6 +1862,7 @@ test('verified bootstrap rollback restores exact existing row', async t => {
 test('later Apply retains ownership and adds the new policy to the live follow-relay profile', async t => {
     t.after(() => require.cache[require.resolve('../sshPoolService')]?.exports.closeAll());
     const f = fixture(t, '1'.repeat(32));
+    const { createHash } = require('node:crypto');
     const { composeRebuildProfiles } = require('../../modules/relay-l2tp/services/rebuildTopologyComposer');
     t.mock.method(require('../configGenerator'), 'buildPanelInlineCertificate', () => null);
     t.mock.method(Link.db, 'transaction', async fn => fn({}));
@@ -1870,10 +1876,7 @@ test('later Apply retains ownership and adds the new policy to the live follow-r
     const files = {};
     const service = f.create({
         sync: { _getUsersForNode: async () => [] }, cache: { invalidateAllSubscriptions: async () => {} },
-        connect: () => ({ requireSupportedCore: async () => {}, read: async name => structuredClone(files[name]),
-            close: async () => {}, stagePair: async () => {}, putPair: async pair => {
-                for (const { profile, config } of pair) files[profile] = structuredClone(config);
-            } }),
+        connect: () => assert.fail('installed relay must use the pinned transport'),
     });
     f.hooks.verify = async () => {
         const installed = { ...f.states[0], status: 'installed' };
@@ -1889,20 +1892,51 @@ test('later Apply retains ownership and adds the new policy to the live follow-r
     const { bindProfileWire, pin } = require('./helpers/rebuildBoundProfileWire');
     f.env.C3_REBUILD_L2TP_SSH_SHA256 = pin;
     f.nodes[0].ssh.password = 'fixture-ssh-auth';
+    const preparedProof = '2'.repeat(64), publishedProof = '3'.repeat(64);
+    const actions = [];
+    let staged;
     bindProfileWire(t.mock.method.bind(t.mock), f.nodes[0].ip, machineId, () => ({
-        relayNetwork: async () => '2'.repeat(64),
-        requireSupportedCore: async () => {}, read: async name => structuredClone(files[name]),
-        close: async () => {}, stagePair: async () => {}, putPair: async pair => {
-            for (const { profile, config } of pair) files[profile] = structuredClone(config);
+        relayNetwork: async ({ action, backupId, proof, nodeId, profiles }) => {
+            actions.push(action);
+            assert.equal(backupId, old.backupId);
+            switch (action) {
+                case 'check-apply-network':
+                case 'prepare-apply-network':
+                    assert.equal(proof, undefined);
+                    return preparedProof;
+                case 'verify-apply-network':
+                    assert.equal(proof, preparedProof);
+                    return preparedProof;
+                case 'publish-apply-profiles':
+                    assert.equal(proof, preparedProof);
+                    assert.equal(nodeId, id);
+                    assert.deepEqual(profiles, Object.fromEntries(staged.map(({ profile, config }) => [profile,
+                        createHash('sha256').update(JSON.stringify(config)).digest('hex')])));
+                    for (const { profile, config } of staged) files[profile] = structuredClone(config);
+                    return publishedProof;
+                case 'restart-apply-network':
+                case 'finalize-apply-profiles':
+                    assert.equal(proof, publishedProof);
+                    return publishedProof;
+                default:
+                    assert.fail('unexpected DIRECT Apply action');
+            }
         },
+        requireSupportedCore: async () => {}, read: async name => structuredClone(files[name]),
+        close: async () => {}, stagePair: async pair => { staged = pair; },
+        // This callback models the stop of the old BRIDGE unit, not publication.
+        putPair: async () => assert.equal(actions.at(-1), 'publish-apply-profiles'),
     }));
     assert.equal((await service.execute({ nodeId: id })).allowed, true);
+    assert.deepEqual(actions, ['check-apply-network', 'prepare-apply-network', 'verify-apply-network',
+        'publish-apply-profiles', 'restart-apply-network', 'finalize-apply-profiles']);
     assert.equal(files.main.inbounds.find(x => x.tag === pppTag).port, oldPort);
     assert.ok(files.main.routing.rules.some(x => x.outboundTag === 'block' && x.inboundTag.includes(pppTag)
         && x.domain?.includes('full:example.invalid')));
     assert.deepEqual([f.states[0].backupId, f.states[0].rebuildInstallToken, f.states[0].rebuildMachineId, f.states[0].pskEncrypted],
         [old.backupId, old.rebuildInstallToken, old.rebuildMachineId, old.pskEncrypted]);
     assert.equal(f.events.includes('rollback'), false);
+    assert.equal(f.lockHeld, false);
 });
 
 test('settled install failure with verified rollback restores prior absence', async t => {

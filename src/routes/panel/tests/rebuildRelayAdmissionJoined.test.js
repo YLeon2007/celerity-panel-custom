@@ -548,7 +548,8 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
     assert.deepEqual(await f.send('install'), { executionMode: 'rebuild', status: 'installed', nodeId });
     assert.deepEqual(f.frames.map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify']);
     assert.deepEqual(f.remote.effects, ['install']);
-    assert.deepEqual(f.mongo.commits, [['grant', GRANTS, AUDIT], ['install', STATES, USERS], ['install', USERS, DIRECTORY, STATES]]);
+    // The reservation binds the recovery receipt to the held Install lock in the same transaction.
+    assert.deepEqual(f.mongo.commits, [['grant', GRANTS, AUDIT], ['install', STATES, USERS, LOCK], ['install', USERS, DIRECTORY, STATES]]);
     const states = f.mongo.rows(STATES), accounts = f.mongo.rows(USERS), directory = f.mongo.rows(DIRECTORY);
     assert.deepEqual(states.map(s => [s.status, s.desiredState, s.rebuildMachineId]), [['installed', 'installed', machineId]]);
     assert.deepEqual(accounts.map(row => [String(row.relayNode), row.login, row.syncStatus, row.appliedRevision, row.desiredRevision]),

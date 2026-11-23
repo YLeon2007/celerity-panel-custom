@@ -255,7 +255,6 @@
     "recoverInstall": "检查并继续",
     "installRecoveryHint": "此操作会检查已中断的安装，并可能完成清理。它不会启动新的安装。",
     "refresh": "刷新状态",
-    "status": { "installing": "正在安装" },
     "installChecks": {
       "NETWORK_OBSERVATION_REQUIRED": "请中继管理员确认内核套接字诊断、nf_tables 和 XFRM 是否可用。",
       "KERNEL_MODULE_BLACKLISTED": "所需的内核网络模块或其依赖项已被列入黑名单。请中继管理员检查相关策略；安装不会绕过此限制。",

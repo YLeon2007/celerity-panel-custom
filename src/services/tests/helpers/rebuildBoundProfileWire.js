@@ -30,7 +30,12 @@ function bindProfileWire(replace, endpoint, machineId, createFixture) {
         stream.write = chunk => { chunks.push(Buffer.from(chunk)); return true; };
         let ended = false;
         async function run(stdin) {
-            const ok = (stdout = '') => { stream.emit('data', stdout); stream.emit('close', 0); };
+            const ok = (stdout = '') => {
+                stream.emit('data', stdout);
+                // The pinned stdin transport waits for stderr EOF as well as channel close.
+                stream.stderr.emit('end');
+                stream.emit('close', 0);
+            };
             try {
                 if (command === '/usr/bin/head -c 34 /etc/machine-id') return ok(machineId + '\n');
                 if (accepts) assert.ok(accepts(machineId));
