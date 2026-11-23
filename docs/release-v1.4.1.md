@@ -1,10 +1,10 @@
-# v1.4.0 — operator release notes
+# v1.4.1 — operator release notes
 
-[Русский](release-v1.4.0.ru.md) · [Changelog](../CHANGELOG.md)
+[Русский](release-v1.4.1.ru.md) · [Changelog](../CHANGELOG.md)
 
 ## Upgrade from 1.3.3.12
 
-1. Wait for MAIN to publish the release and verify that `v1.4.0` points to MAIN's announced commit. Do not upgrade from a moving branch or `latest`. Before the maintenance window, record the current commit and rollback image. Keep a verified MongoDB backup and private copies of `.env`, the Compose files and `mongo-keyfile`. Keep the **existing `ENCRYPTION_KEY`**; it is needed to read stored secrets.
+1. Use the published `v1.4.1` release and verify that the tag points to the commit listed on the release page. Do not upgrade from a moving branch or `latest`. Before the maintenance window, record the current commit and rollback image. Keep a verified MongoDB backup and private copies of `.env`, the Compose files and `mongo-keyfile`. Keep the **existing `ENCRYPTION_KEY`**; it is needed to read stored secrets.
 2. For an existing source installation, check that the working tree is clean and that the Compose project, Mongo volume and environment file are the original ones. The stock 1.3.3.12 Compose file already uses replica set `rs0`. Shared accounts and database-backed relay admission need transactions and an elected PRIMARY. If Mongo is standalone, stop before enabling these features: replica-set conversion is a separate operation, not a volume replacement.
 3. Check out the verified release commit. Set the flags you need in the existing `.env` (below). For stock source Compose, build and recreate only the panel during the window: `docker compose -f docker-compose.yml up -d --no-deps --build backend`. Do not rerun the installer or delete volumes. For a custom deployment, use its own deployment mechanism with the same pinned release.
 4. Check `/health`, then sign in and compare the node list, map, subscription and L2TP page with their pre-upgrade state. The upgrade does not require Apply or Install. Inspect Preview before changing links. Neither `/health` nor `deployed` proves PPP forwarding; verify both intended exits from a client. Stop before making changes if anything differs unexpectedly. Rolling back the app image and environment does not roll back database writes.
@@ -36,5 +36,5 @@ If `users.json` is damaged, the agent leaves existing Xray users in place and wa
 ## Limitations
 
 - An old Classic L2TP record left after uninstall does not reserve its former pool or prevent installation on another relay. No database cleanup is needed. If a Classic operation is still in progress, wait for it to finish.
-- After a reboot, the panel cannot recognize a pre-v1.4.0 L2TP installation that lacks its last applied configuration record (`currentApply`). Reinstall L2TP during a maintenance window; do not clear locks or bypass verification.
+- After a reboot, the panel cannot recognize a pre-v1.4.1 L2TP installation that lacks its last applied configuration record (`currentApply`). Reinstall L2TP during a maintenance window; do not clear locks or bypass verification.
 - The systemd package pin for Debian 13.0 (`257.8`) has not been tested on a live relay. The live test used `257.13`.

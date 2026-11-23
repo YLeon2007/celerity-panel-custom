@@ -5,7 +5,7 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
-## v1.4.0 — Rebuild и L2TP / Rebuild and L2TP
+## v1.4.1 — Rebuild и L2TP / Rebuild and L2TP
 
 ### RU
 
@@ -14,7 +14,7 @@
 - **Install из панели** может подготовить недостающие пакеты VPN на поддерживаемом Debian 13 amd64 при допуске из БД. **Remove** снимает L2TP с выбранного релея, не удаляя общий справочник учёток. Удаление самой ноды — отдельное действие с предпросмотром и подтверждением последствий для клиентов.
 - **cc-agent 1.5.1** сохраняет пользователей Xray при повреждении локального `users.json` и не теряет свежую активность reverse-связи при сбросе счётчиков. Обновление панели не обновляет агентов на нодах.
 
-[Переход с 1.3.3.12: настройки и проверка после обновления](docs/release-v1.4.0.ru.md).
+[Переход с 1.3.3.12: настройки и проверка после обновления](docs/release-v1.4.1.ru.md).
 
 ### EN
 
@@ -23,13 +23,13 @@
 - **Install from the panel** can prepare missing VPN packages on supported Debian 13 amd64 relays with a database-backed grant. **Remove** uninstalls L2TP from one relay without deleting the shared account directory. Deleting the node itself has a separate preview and confirmation of client impact.
 - **cc-agent 1.5.1** preserves Xray users when the local `users.json` is damaged and retains fresh reverse-link activity evidence across a counter reset. Upgrading the panel does not upgrade node agents.
 
-[Upgrading from 1.3.3.12: settings and post-upgrade checks](docs/release-v1.4.0.md).
+[Upgrading from 1.3.3.12: settings and post-upgrade checks](docs/release-v1.4.1.md).
 
 ## CC Agent 1.5.1
 
 - Preserve Xray users when `users.json` is missing, invalid, or conflicts with the managed clients at startup. Recovery requires a successful full panel `/sync`; `users.json` saves are atomic.
 - Preserve fresh reverse-link activity evidence when `/stats` resets billing counters mid-sample. Draining an old balance alone does not establish activity.
-- The agent build uses `cc-agent-v1.5.1`, separate from panel `v1.4.0`, and produces Actions artifacts only.
+- The agent build uses `cc-agent-v1.5.1`, separate from panel `v1.4.1`, and produces Actions artifacts only.
 
 ## CC Agent 1.5.0
 
