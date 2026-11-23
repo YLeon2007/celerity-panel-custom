@@ -7,6 +7,19 @@ test('agent mutation queues behind Apply; nested user-only sync does not deadloc
  const agent=withNode('a',async()=>withNode('a',async()=>events.push('agent')));await withNode('c',async()=>events.push('other'));assert.deepEqual(events,['apply','other']);release();await Promise.all([applying,agent]);assert.equal(events.at(-1),'agent');
 });
 
+test('unacknowledged protected lock acquisition does not enter Install or attempt cleanup', async () => {
+    let inserts = 0, deletes = 0;
+    const store = { deleteMany() { deletes++; }, async insertOne(row, options) {
+        inserts++;
+        assert.equal(row.allowStaleUnlock, false);
+        assert.equal(options.writeConcern.w, 'majority');
+        return { acknowledged: false };
+    } };
+    await assert.rejects(makeLocks(store).run(() => assert.fail('entered Install'), { allowStaleUnlock: false }),
+        { code: 'REBUILD_LOCK_LOST' });
+    assert.deepEqual([inserts, deletes], [1, 0]);
+});
+
 test('Apply requires an acknowledged exact-token release without retry', async t => {
     for (const [name, release, keepRow] of [
         ['acknowledged', () => ({ acknowledged: true, deletedCount: 1 }), false],
@@ -78,6 +91,13 @@ test('Mongo singleton blocks concurrency; restart leaves stale row for exact ope
  const dir=await fs.mkdtemp(path.join(process.env.TMPDIR,'rebuild-lock-'));const listener=net.createServer();await new Promise(r=>listener.listen(0,'127.0.0.1',r));const port=listener.address().port;await new Promise(r=>listener.close(r));
  const daemon=spawn(process.env.C3_MONGOD||'mongod',['--dbpath',dir,'--bind_ip','127.0.0.1','--port',String(port),'--nounixsocket','--quiet'],{stdio:'ignore'});const exited=new Promise(r=>{daemon.once('error',r);daemon.once('exit',r)});let conn;
  try {conn=await mongoose.createConnection(`mongodb://127.0.0.1:${port}/rebuild_local_lock`,{serverSelectionTimeoutMS:10000}).asPromise();const store=conn.db.collection('locks'),locks=makeLocks(store);await locks.run(async check=>{await check();const status=await locks.status();assert.equal(status.stale,false);await assert.rejects(locks.unlock(status.token),{code:'REBUILD_LOCK_NOT_STALE'});await assert.rejects(locks.run(()=>assert.fail()),{code:'REBUILD_BUSY'})});
- await store.insertOne({_id:'apply',token:'abandoned',heartbeat:new Date(0)});assert.equal((await locks.status()).stale,true);await assert.rejects(locks.unlock('older'),{code:'REBUILD_LOCK_NOT_STALE'});await locks.unlock('abandoned');assert.deepEqual(await locks.status(),{locked:false});
+ // Historical rows have no durable purpose; age (or a malformed flag) is not proof of Apply.
+ for (const flag of [{}, {allowStaleUnlock:[true]}]) {
+   const row={_id:'apply',token:'abandoned',heartbeat:new Date(0),...flag};
+   await store.insertOne(row);assert.equal((await locks.status()).stale,false);
+   await assert.rejects(locks.unlock(row.token),{code:'REBUILD_LOCK_NOT_STALE'});
+   assert.deepEqual(await store.findOne({_id:'apply'}),row);await store.deleteOne({_id:'apply'});
+ }
+ await store.insertOne({_id:'apply',token:'abandoned',heartbeat:new Date(0),allowStaleUnlock:true});assert.equal((await locks.status()).stale,true);await assert.rejects(locks.unlock('older'),{code:'REBUILD_LOCK_NOT_STALE'});await locks.unlock('abandoned');assert.deepEqual(await locks.status(),{locked:false});
  }finally{await conn?.close();daemon.kill();await exited;await fs.rm(dir,{recursive:true,force:true})}
 });

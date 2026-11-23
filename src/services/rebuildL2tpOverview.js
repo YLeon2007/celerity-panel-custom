@@ -357,6 +357,12 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                     && !withUsers.has(id) && (!state || pristineIds.has(String(state._id))),
                 canRemove: clear && owned.has(id), canRevealPsk: clear && owned.has(id) && hasKey() };
         });
+        if (relays.some(relay => relay.canInstall)) {
+            // An unacknowledged Install can retain the global writer lock even when the card is pristine.
+            const lock = await db.collection('c3_rebuild_locks').findOne({ _id: 'apply' },
+                { ...nativeRead, projection: { _id: 1 } }).catch(() => undefined);
+            if (lock !== null) for (const relay of relays) relay.canInstall = false;
+        }
         const cohort = list ? ownedCohort(states.filter(row => !isAbsent(row)), owned, list)
             : owned.size === 1 ? owned : null;
         const accountRows = list ? rows : rows.filter(row => displayOwned.has(String(row.relayNode)));

@@ -112,6 +112,7 @@ function fixture(t, planBackupId = backupId) {
         async insertOne(row) {
             if (lock) throw Object.assign(new Error('duplicate'), { code: 11000 });
             lock = row;
+            return { acknowledged: true };
         },
         async findOne(filter) { return lock && matches(lock, filter) ? lock : null; },
         async deleteMany(filter) {

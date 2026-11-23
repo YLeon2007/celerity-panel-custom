@@ -76,7 +76,7 @@ function fixture(t, { legacy = false } = {}) {
         passwordEncrypted, updatedAt: stamp, createdAt: stamp, lastSyncedAt: stamp, comment: 'fixture-private-comment' }));
     const queries = [];
     const f = { cards, bindings, states, users, env, queries, grants: [], audit: [], pending: false, fenceReads: 0,
-        busy: { l2tpoperations: [], remoteadmissions: [], nodeoperationlocks: [] } };
+        busy: { l2tpoperations: [], remoteadmissions: [], nodeoperationlocks: [], c3_rebuild_locks: [] } };
     for (const [model, rows] of [[Node, cards], [State, states], [User, users]]) {
         const get = (filter, options) => {
             if (!options.session?.inTransaction()) {

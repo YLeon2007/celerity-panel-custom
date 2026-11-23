@@ -71,6 +71,64 @@ async function fixture(t, relayCount = 3) {
         overview: () => createRebuildL2tpOverview({ Node, State, L2tpUser: User, env }) };
 }
 
+for (const cut of ['preflight refusal', 'lost host reply', 'lost restore reply']) {
+    test(`fresh Install page: ${cut}`, { skip: !port }, async t => {
+        const { env, overview, enrollment: [relay] } = await fixture(t, 1);
+        const express = require('express'), app = express(), router = express.Router();
+        t.after(() => require('../sshPoolService').closeAll());
+        const routes = require('../../routes/panel/rebuildL2tp').createRoutes(overview());
+        routes.mountNoStore(router);
+        routes.mountOverview(router, require('../../routes/panel').exposePanelCsrfToken);
+        app.set('view engine', 'ejs');
+        app.set('views', require('node:path').resolve(__dirname, '../../../views'));
+        app.use(require('../../middleware/i18n').i18nMiddleware);
+        app.use('/panel', router);
+        await db.collection('settings').insertOne({ _id: 'settings', deployment: { completed: true } });
+        const get = async (session, sessionID, expectButton, status) => {
+            const page = await require('./helpers/rebuildPanelRequest').request(app, '/panel/l2tp', {
+                method: 'GET', session, sessionID, headers: { 'accept-language': 'en' },
+            });
+            assert.equal(page.status, 200);
+            assert.equal(page.headers['cache-control'], 'no-store');
+            const card = page.body.match(new RegExp(`<tr id="relay-${relay.nodeId}">[\\s\\S]*?</tr>`))?.[0];
+            assert.ok(card, 'relay card was rendered');
+            assert.ok(card.includes(`>${require('../../locales/en.json').rebuildL2tp.status[status]}</span>`), status);
+            assert.equal(card.includes(`data-install-url="/panel/rebuild/relays/${relay.nodeId}/l2tp/install"`), expectButton,
+                'freshly rendered Install control must follow the persisted lock');
+        };
+        await State.collection.insertOne({ node: new mongoose.Types.ObjectId(relay.nodeId), status: 'not_installed', desiredState: 'absent' });
+        const first = { authenticated: true }, other = { authenticated: true };
+        await get(first, 'first', true, 'not_installed');
+        const refused = cut === 'preflight refusal', lostHost = cut === 'lost host reply';
+        let installs = 0, rolledBack = false, lostRestore = false;
+        const command = mongoose.mongo.Db.prototype.command;
+        t.mock.method(mongoose.mongo.Db.prototype, 'command', async function (cmd, ...args) {
+            const reply = await command.call(this, cmd, ...args);
+            // Mongo applied the restore, but the writer never saw its acknowledgement.
+            if (rolledBack && cmd.commitTransaction && !lostRestore) { lostRestore = true; throw Error('fixture lost ACK'); }
+            return reply;
+        });
+        const service = createRebuildService({ env, grantDb: db, createRelayDirect: () => ({
+            preflight: async () => ({ machineId: relay.machineId, ppp: !refused, unitsLoaded: true, masked: false }),
+            prepare: async () => ({ backupId: randomUUID() }),
+            install: async (_, guard) => { await guard(); installs++; if (lostHost) throw Error('fixture lost ACK'); return false; },
+            rollback: async (_, guard) => { await guard(); rolledBack = true; return true; },
+            close: async () => {},
+        }) });
+        await assert.rejects(service.installRelay(relay.nodeId), refused ? { code: 'REBUILD_L2TP_HOST_NOT_READY', outcome: 'refused' }
+            : { code: lostHost ? 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false });
+        assert.equal(installs, refused ? 0 : 1);
+        assert.equal(lostRestore, cut === 'lost restore reply');
+        const readLock = () => db.collection('c3_rebuild_locks').findOne({ _id: 'apply' }, majority);
+        const saved = await readLock();
+        assert.equal(saved !== null, !refused);
+        for (const [session, sid] of [[first, 'first'], [other, 'other']]) {
+            await get(session, sid, refused, lostHost ? 'installing' : 'not_installed');
+            assert.ok(same(await readLock(), saved), 'GET must not change the lock');
+        }
+    });
+}
+
 const run = (name, fn) => test(name, { skip: !port }, async t => fn(await fixture(t), t));
 for (const reorderOnly of [true, false]) {
     run(reorderOnly ? 'fresh intent settles with the stored field order' : 'fresh intent refuses same-owner BSON drift before sync', async (f, t) => {
@@ -220,6 +278,61 @@ run('legacy singleton can Remove and reinstall the same bootstrap without transa
     assert.equal(replica.login, original.login);
     assert.ok(same(catalog, await accounts.findOne({ _id: 'directory' })));
 });
+
+for (const cut of ['unknown', 'crash', 'apply', 'refused']) {
+    test(`Install fence after owner exit: ${cut}`, { skip: !port }, async t => {
+        const { env, enrollment: [relay] } = await fixture(t, 1);
+        await require('node:util').promisify(require('node:child_process').execFile)(process.execPath,
+            [require.resolve('./helpers/rebuildInstallLockOwner.cjs'), db.name, cut], { env: { ...process.env, ...env }, timeout: 15000 });
+        const store = db.collection('c3_rebuild_locks');
+        const read = () => store.findOne({ _id: 'apply' }, majority);
+        const saved = await read();
+        if (cut === 'refused') {
+            assert.equal(saved, null);
+            // A fresh service can actually enter a subsequent preflight (no host write).
+            let checked = false;
+            const next = createRebuildService({ env, grantDb: db, cache: {}, sync: {}, createRelayDirect: () => ({
+                preflight: async () => { checked = true; return { machineId: relay.machineId, ppp: false, unitsLoaded: true, masked: false }; },
+                close: async () => {},
+            }) });
+            await assert.rejects(next.installRelay(relay.nodeId), { code: 'REBUILD_L2TP_HOST_NOT_READY', outcome: 'refused' });
+            assert.equal(checked, true);
+            assert.equal(await read(), null);
+            return;
+        }
+        assert.ok(saved);
+        let now = saved.heartbeat.getTime();
+        const locks = require('../rebuildLocks').makeLocks(store, () => now);
+        const service = createRebuildService({ locks, env, grantDb: db, cache: {}, sync: {},
+            createRelayDirect() { assert.fail('blocked Install reached the relay'); } });
+        const app = require('express')();
+        app.use('/api/cascade', require('../../routes/cascadeRebuild').routerForRebuild({ service }));
+        const session = { authenticated: true };
+        const send = (method, path, body) => require('./helpers/rebuildPanelRequest').request(app, `/api/cascade/rebuild/${path}`, {
+            method, body, session, headers: { 'x-csrf-token': require('../../routes/panel/csrf').issuePanelCsrfToken({ session }) },
+        });
+        const observed = await send('GET', 'lock');
+        assert.equal(observed.status, 200);
+        const { token, stale } = JSON.parse(observed.body);
+        assert.ok(typeof token === 'string' && token === saved.token);
+        assert.equal(stale, false);
+        const unlock = async token => {
+            const response = await send('POST', 'unlock', { token });
+            assert.deepEqual(JSON.parse(response.body), response.status === 200
+                ? { locked: false } : { error: { code: 'REBUILD_LOCK_NOT_STALE' } });
+            return response.status;
+        };
+        assert.equal(await unlock(token), 409, 'fresh lock');
+        now += 120001;
+        assert.equal(await unlock('wrong-fixture-token'), 409);
+        assert.equal(await unlock(token), cut === 'apply' ? 200 : 409, 'stale unlock after restart');
+        if (cut === 'apply') { assert.equal(await read(), null); return; }
+        assert.ok(same(await read(), saved), 'retained generation must be unchanged');
+        assert.equal((await locks.status()).stale, false);
+        await assert.rejects(service.installRelay(relay.nodeId), { code: 'REBUILD_BUSY' });
+        assert.ok(same(await read(), saved));
+    });
+}
 
 const recoveryLogin = 'pending-user';
 const majority = { readPreference: 'primary', readConcern: { level: 'majority' } };

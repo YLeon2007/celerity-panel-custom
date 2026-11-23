@@ -94,7 +94,7 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
             lock: fn => locks.run((verifyLock, retainLock) => withNode(id, async () => {
                 if (await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                 return fn(verifyLock, retainLock);
-            })),
+            }), { allowStaleUnlock: false }),
             async inventory() {
                 const node = await getNode();
                 if (!eligible(node, id, fence.listMode)) return { eligible: false };
