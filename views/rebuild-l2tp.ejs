@@ -28,7 +28,7 @@ const problemKeys = new Map([
 ]);
 const problemText = problem => l(`admission.${problemKeys.get(problem) ?? 'grantUnavailable'}`);
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
-    'rateLimited', 'uncertain', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
+    'rateLimited', 'uncertain', 'observationTimeout', 'refreshFailed', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
     'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired', 'runtimeForeignChange', 'runtimeNetworkNotReady',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
@@ -64,21 +64,24 @@ function secretControl(kind, url, index, login) {
     #rebuild-l2tp [data-review][hidden] { display: none; }
 </style>
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
-     <% if (reconcile) { %>data-reconcile-url="<%= accountPath %>/reconcile"<% } %>
      data-install-checks="<%= JSON.stringify(typeof installChecks === 'undefined' ? {} : installChecks) %>"
      data-admission-messages="<%= JSON.stringify({ ...Object.fromEntries(admissionMessages.map(key => [key, l(`admission.${key}`)])),
          conflictFields: Object.fromEntries(conflictFields.map(key => [key, l(`admission.conflictFields.${key}`)])) }) %>"
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
+    <div class="card-body">
+        <p data-action-status role="status"><%= removalMessage || (mismatch ? l('admission.identityChanged') : '') %></p>
+        <% if (removalMessage) { %><a href="/panel/l2tp"><%= l('refresh') %></a><% } %>
+        <a href="/panel/l2tp" data-refresh hidden><%= l('refresh') %></a>
+        <a href="#rebuild-l2tp-relays" data-review hidden><%= l('admission.reviewRelays') %></a>
+    </div>
+    <div data-l2tp-view>
     <% if (!available) { %><p class="alert alert-error" role="alert"><%= l('loadError') %></p><% } %>
     <% if (available && topProblem) { %><p class="alert alert-error" role="alert"><%= manualBlock ? l('messages.reconcileManualBlock') : problemText(topProblem) %></p><% } %>
     <div class="card">
-        <div class="card-body">
-            <p data-action-status role="status"><%= removalMessage || (pending ? l(eligible || topProblem ? 'accountsPendingLocked' : 'admission.recoveryIneligible') : mismatch ? l('admission.identityChanged') : '') %></p>
-            <% if (reconcile) { %><button type="button" class="btn btn-sm btn-secondary" data-reconcile disabled><%= l('admission.recoverAccounts') %></button><% } %>
-            <% if (removalMessage) { %><a href="/panel/l2tp"><%= l('refresh') %></a><% } %>
-            <a href="/panel/l2tp" data-refresh hidden><%= l('refresh') %></a>
-            <a href="#rebuild-l2tp-relays" data-review hidden><%= l('admission.reviewRelays') %></a>
-        </div>
+        <% if (pending) { %><div class="card-body">
+            <p role="status"><%= l(eligible || topProblem ? 'accountsPendingLocked' : 'admission.recoveryIneligible') %></p>
+            <% if (reconcile) { %><button type="button" class="btn btn-sm btn-secondary" data-reconcile-url="<%= accountPath %>/reconcile" data-reconcile disabled><%= l('admission.recoverAccounts') %></button><% } %>
+        </div><% } %>
         <section aria-labelledby="rebuild-l2tp-relays">
             <div class="card-header"><h2 id="rebuild-l2tp-relays"><i class="ti ti-server-2" aria-hidden="true"></i> <%= l('relays') %></h2></div>
             <% if (relays.length) { %>
@@ -226,6 +229,7 @@ function secretControl(kind, url, index, login) {
             <p class="card-body text-muted"><%= l('noAccounts') %></p>
         <% } %>
     </section>
+    </div>
     <dialog class="card" data-admission-dialog aria-labelledby="rebuild-l2tp-admission-title">
         <div class="card-header"><h2 id="rebuild-l2tp-admission-title"><%= l('admission.label') %></h2></div>
         <div class="card-body">

@@ -27,6 +27,7 @@ const { relayRoleBlock, withNodeWrite, assertNodeEditAllowed, describeRoleError 
 const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
 const { runtimeForeignChange, isNetworkNotReady, networkObservationRequired } = require('../../services/rebuildRelayRuntimeRefusal');
 const { canPreviewRemoval, issueRemovalTicket, identityReviewUrl, admitPreview } = require('./rebuildRelayRemove');
+const { rebuildL2tpScriptVersion } = require('./rebuildL2tpObservation');
 const { identityChanged } = require('./rebuildRelayAdmission');
 
 const {
@@ -607,6 +608,7 @@ router.get('/nodes/:id', async (req, res) => {
         const removal = preview && roleBlock?.counts ? {
             summary: res.locals.t('nodes.rebuildRemoveConfirmSummary').replace('{counts}', formatRelayCounts(roleBlock.counts, res.locals.t)),
             ticket: runtimeBlock ? null : issueRemovalTicket(req, roleBlock.estimate),
+            scriptVersion: rebuildL2tpScriptVersion(),
             runtimeBlock,
             hint: runtimeBlock === 'runtimeNetworkNotReady' ? `rebuildL2tp.installChecks.${networkObservationRequired}` : null,
             blocked: runtimeBlock ? `rebuildL2tp.messages.${runtimeBlock}`

@@ -106,9 +106,9 @@ test('pending page does not POST until click; each outcome requires a fresh view
         const url = `${route}/l2tp/accounts/reconcile`;
         const words = require('../../locales/ru.json').rebuildL2tp;
         const status = { textContent: words.accountsPendingLocked }, refresh = { hidden: true };
-        const recover = messageKey ? clickControl(true) : null;
+        const recover = messageKey ? Object.assign(clickControl(true), { dataset: { reconcileUrl: url } }) : null;
         const page = {
-            dataset: { csrf, messages: JSON.stringify(words.messages), admissionMessages: JSON.stringify(words.admission),
+            contains: () => true, dataset: { csrf, messages: JSON.stringify(words.messages), admissionMessages: JSON.stringify(words.admission),
                 ...(messageKey && { reconcileUrl: url }) },
             querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': recover })[key] ?? null,
             querySelectorAll: () => [],
@@ -116,7 +116,7 @@ test('pending page does not POST until click; each outcome requires a fresh view
         const calls = [];
         let complete;
         runInNewContext(script, {
-            document: { getElementById: () => page },
+            AbortController, performance, setTimeout() {}, clearTimeout() {}, document: { getElementById: () => page },
             window: { addEventListener() {}, location: { reload: () => calls.push('reload') } },
             async fetch(path, options) {
                 calls.push({ path, options });
@@ -142,8 +142,9 @@ test('pending page does not POST until click; each outcome requires a fresh view
             recover.click();
             await new Promise(resolve => setImmediate(resolve));
         }
-        assert.equal(calls.length, recover ? 1 : 0, outcome);
-        assert.equal(refresh.hidden, !messageKey, outcome);
+        assert.equal(calls.filter(call => call.options.method === 'POST').length, recover ? 1 : 0, outcome);
+        assert.equal(calls.filter(call => call.options.method === 'GET').length, messageKey === 'reconcileSettled' ? 1 : 0, outcome);
+        assert.equal(refresh.hidden, !messageKey || messageKey === 'reconcileSettled', outcome);
         const message = messageKey ? words.messages[messageKey] ?? words.admission[messageKey] : words.accountsPendingLocked;
         assert.equal(status.textContent, count === undefined ? message : `${message} Подтверждено завершение сеансов этим запросом: ${count}.`, outcome);
         if (messageKey) {
@@ -172,10 +173,11 @@ test('unproved inspection replaces the working status with localized, allowliste
             ['ppp-unproved', 'reconcilePppInspection'], ['pidfd-getfd-eperm', 'reconcilePidfdGetfdEperm'],
             ['inspect-readback-unproved', 'reconcileInspectReadback'], ['FIXTURE_PRIVATE_DETAIL', null], ['constructor', null],
         ]) {
-            const status = { textContent: /data-action-status role="status">([^<]+)</.exec(content)[1] };
+            const status = { textContent: /data-action-status role="status">([^<]*)</.exec(content)[1] };
             const refresh = { hidden: true }, staleControl = clickControl(), recover = clickControl(true);
             const url = /data-reconcile-url="([^"]+)"/.exec(content)[1];
-            const page = { dataset: { csrf, messages, reconcileUrl: url },
+            recover.dataset = { reconcileUrl: url };
+            const page = { contains: () => true, dataset: { csrf, messages },
                 querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': recover })[selector] ?? null,
                 querySelectorAll: selector => selector === '[data-install-url]' ? [staleControl] : [] };
             const calls = [];
@@ -250,6 +252,7 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
     const fetchCalls = [], clipboard = [];
     let respond, confirmChoice = false;
     window.fetch = (url, options) => {
+        if (options.method === 'GET') return new Promise(() => {});
         fetchCalls.push({ url, options });
         return respond();
     };
@@ -310,19 +313,21 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
     finish(response({ secret: marker }));
     await flush();
     check(value.hidden && value.textContent === '', 'stale response after hide was displayed');
-    copy.click();
-    window.dispatchEvent(new PageTransitionEvent('pagehide'));
-    finish(response({ secret: marker }));
-    await flush();
-    check(relayText.hidden && relayText.textContent === '' && value.hidden && value.textContent === '' && clipboard.length === 2,
-        'pagehide did not clear shown data or invalidate a pending copy');
-    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+    if (terminal === 'secretPagehide') {
+        copy.click();
+        window.dispatchEvent(new PageTransitionEvent('pagehide'));
+        finish(response({ secret: marker }));
+        await flush();
+        check(relayText.hidden && relayText.textContent === '' && value.hidden && value.textContent === '' && clipboard.length === 2,
+            'pagehide did not clear shown data or invalidate a pending copy');
+        check(relayEye.getAttribute('aria-label') === words.psk.show, 'pagehide left the relay eye in its hide state');
+        return;
+    }
     respond = async () => response({ error: { code: marker } }, 403);
     eye.click();
     await flush();
     check(password.querySelector('[role="status"]').textContent === words.messages.revealFailed && value.hidden,
         'reveal failure exposed backend text or was not localized');
-    check(relayEye.getAttribute('aria-label') === words.psk.show, 'pagehide left the relay eye in its hide state');
 
     const form = $('[data-create]'), login = form.querySelector('input');
     const submit = form.querySelector('button');
@@ -394,16 +399,15 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
         const second = params(`${route}/l2tp/accounts/create`, { login: 'new.user' }, ['login', 'password']).password;
         check(second !== first, 'password reused between submissions');
         if (terminal === 'created') {
-            check(login.value === '', 'successful form was not cleared');
-            expectedMessage = words.messages.created;
+                expectedMessage = words.messages.created;
         }
         if (terminal === 'canceled') {
             check(login.value === 'new.user', 'canceled request was treated as a creation');
-            expectedMessage = 'The requested account change was canceled and not applied. Reload L2TP data to see the current state.';
+            expectedMessage = words.messages.canceled;
         }
     }
     check(status.textContent === expectedMessage, 'wrong terminal message: ' + status.textContent);
-    check(submit.disabled && install.disabled && disable.disabled && !$('[data-refresh]').hidden,
+    check(submit.disabled && install.disabled && disable.disabled,
         'terminal action did not require a fresh view');
     const count = fetchCalls.length;
     submit.click();
@@ -436,7 +440,10 @@ async function admissionVisibility({ route, id, otherId }) {
     }
     const flush = () => new Promise(resolve => setTimeout(resolve, 0));
     const requests = [];
-    window.fetch = (url, options) => new Promise(resolve => requests.push({ url, options, resolve }));
+    const markup = $('#rebuild-l2tp').outerHTML;
+    window.fetch = (url, options) => options.method === 'GET' ? Promise.resolve({ status: 200,
+        url: 'http://fixture.invalid/panel/l2tp', headers: new Headers({ 'content-type': 'text/html', 'cache-control': 'no-store' }),
+        text: async () => markup }) : new Promise(resolve => requests.push({ url, options, resolve }));
     const respond = async (path, data, ok = true) => {
         const request = requests.shift();
         check(request?.url === path && request.options.method === 'POST', `expected ${path}`);
@@ -481,24 +488,193 @@ async function admissionVisibility({ route, id, otherId }) {
     check(visible($('[data-admission-machine-row]')), 'verification did not expose the machine field');
     click('[data-admission-approve="confirm"]');
     await respond(`${url}/confirm`, identified);
-    check(getComputedStyle(dialog).display === 'none' && !visible(review) && visible($('[data-refresh]')),
-        'confirmation did not close the dialog and replace review with refresh');
+    check(getComputedStyle(dialog).display === 'none' && !visible(review) && !visible($('[data-refresh]')),
+        'confirmation did not close the dialog and adopt fresh controls');
+    const beforeRevoke = $('[data-l2tp-view]');
+    click('[data-admission-action="revoke"]');
+    check(requests.length === 0, 'revoke preflight issued a POST');
+    click('[data-admission-approve="revoke"]');
+    click('[data-admission-approve="revoke"]');
+    await respond(`${url}/revoke`, { nodeId: id });
+    check(!beforeRevoke.isConnected && !dialog.open, 'affirmative revoke did not refresh the overview');
+}
+
+
+async function refreshMatrix({ terminal, route, id, otherId, csrf, words, snapshots }) {
+    const check = (ok, message) => { if (!ok) throw new Error(message); };
+    const $ = selector => document.querySelector(selector);
+    const defer = () => {
+        let resolve, reject;
+        const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+        return { resolve, reject, promise };
+    };
+    const flush = async () => { for (let i = 0; i < 24; i++) await Promise.resolve(); };
+    const loaded = new Promise(resolve => window.addEventListener('load', resolve, { once: true }));
+    const calls = [], reads = [], timers = new Map();
+    let time = 0, nextTimer = 0;
+    const tick = async target => {
+        for (;;) {
+            const due = [...timers].filter(([, t]) => t.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+            if (!due) break;
+            const [key, t] = due;
+            timers.delete(key); time = t.at; t.callback(); await flush();
+        }
+        time = target; await flush();
+    };
+    Object.defineProperty(performance, 'now', { value: () => time });
+    Date.now = () => time;
+    window.setTimeout = (callback, delay) => { const key = ++nextTimer; timers.set(key, { callback, at: time + delay }); return key; };
+    window.clearTimeout = key => timers.delete(key);
+    window.confirm = () => true;
+    const nonceHeader = 'x-rebuild-l2tp-observation';
+    function html(markup, echo) {
+        const wrapper = '<script>window.badInsertion=true;</scr' + 'ipt><p id="not-in-fragment">layout</p>';
+        return { status: 200, url: 'http://fixture.invalid/panel/l2tp', text: async () => wrapper + markup,
+            headers: new Headers({ 'content-type': 'text/html', 'cache-control': 'no-store', ...(echo && { [nonceHeader]: echo }) }) };
+    }
+    const post = defer();
+    let progress;
+    window.addEventListener('rebuild-l2tp:install-start', event => { progress = event.detail; });
+    window.fetch = (url, options) => {
+        check(options.mode === 'same-origin' && options.credentials === 'same-origin' && options.redirect === 'error'
+            && options.cache === 'no-store', 'wrong transport options');
+        if (options.method === 'GET') {
+            check(url === '/panel/l2tp' && !options.body && options.headers.Accept === 'text/html', 'unsafe refresh request');
+            const wait = defer(); reads.push({ wait, options, time }); return wait.promise;
+        }
+        calls.push({ url, options });
+        check(!url.endsWith('/reveal') && options.headers['x-csrf-token'] === csrf, 'unrequested reveal or token mismatch');
+        return post.promise;
+    };
+    await loaded;
+    check(calls.length === 0 && reads.length === 0, 'automatic request at startup');
+    const respond = (data, status = 200) => post.resolve({ status, ok: status < 400, json: async () => data });
+    const relayUrl = `${route}/${otherId}/l2tp`;
+    const accounts = `${route}/l2tp/accounts`;
+    const model = status => ({ status, executionMode: 'rebuild' });
+    const table = () => $('[aria-labelledby="rebuild-l2tp-accounts"]');
+    const priorTable = table();
+    if (terminal === 'matrixRemove' || terminal === 'matrixRemoveLost') {
+        const button = $('[data-l2tp-remove] [value="confirm"]');
+        button.click(); button.click();
+        check(calls.length === 1 && button.disabled && calls[0].url.endsWith(`/${id}/l2tp/remove`), 'Remove was not single-shot');
+        const token = calls[0].options.headers[nonceHeader];
+        check(calls[0].options.body.toString() === `decision=confirm&ticket=${'1'.repeat(64)}`, 'Remove did not use the exact preview ticket');
+        if (terminal === 'matrixRemoveLost') {
+            respond({ error: { outcome: 'unknown' } }, 503); await flush(); await tick(2000);
+            check(reads[0].options.headers[nonceHeader] === token && !window.navigation, 'Remove guessed an outcome');
+            reads[0].wait.resolve(html(snapshots.after, `${token}:removed`));
+        } else respond({ ...model('not_installed'), nodeId: id });
+        await flush();
+        check(window.navigation === '/panel/l2tp' && calls.length === 1, 'Remove did not navigate to the current overview');
+        return;
+    }
+    const actions = {
+        matrixInstall: ['[data-install-url]', `${relayUrl}/install`, { ...model('installed'), nodeId: otherId }],
+        matrixInstallLost: ['[data-install-url]', `${relayUrl}/install`, null],
+        matrixTimeout: ['[data-install-url]', `${relayUrl}/install`, null],
+        matrixRecover: ['[data-install-recovery-url]', `${relayUrl}/install/recover`, { ...model('can_install_again'), nodeId: otherId }],
+        matrixCreate: ['[data-create] button[type="submit"]', `${accounts}/create`, { ...model('created'), login: 'new.user' }],
+        matrixDisable: ['[data-account-action="disable"]', `${accounts}/disable`, { ...model('disabled'), login: 'alice.test' }],
+        matrixDisableLost: ['[data-account-action="disable"]', `${accounts}/disable`, null],
+        matrixDelete: ['[data-account-action="delete"]', `${accounts}/delete`, { ...model('deleted'), login: 'alice.test' }],
+        matrixReconcile: ['[data-reconcile]', `${accounts}/reconcile`, model('settled')],
+    };
+    if (terminal === 'matrixCreate') $('[data-create] input').value = 'new.user';
+    const [selector, url, receipt] = actions[terminal];
+    const old = $(selector);
+    old.click(); old.click();
+    check(calls.length === 1 && calls[0].url === url && old.disabled, 'action not locked after one POST');
+    if (terminal === 'matrixInstall') {
+        check(progress.nodeId === otherId && !progress.signal.aborted, 'install progress hook is missing');
+        const stale = progress.refresh();
+        const current = progress.refresh();
+        check(reads.length === 2 && reads[0].options.signal.aborted, 'superseded GET still live');
+        reads[1].wait.resolve(html(snapshots.progress));
+        check(await current && $(`#relay-${otherId}`).textContent.includes(words.status.installing), 'in-flight Install was not rendered');
+        check(!await stale, 'superseded request reported success');
+        respond(receipt); await flush();
+        check(progress.signal.aborted && !await progress.refresh(), 'progress hook survived POST completion');
+        reads[2].wait.resolve(html(snapshots.after));
+        reads[0].wait.resolve(html(snapshots.before));
+    } else if (receipt) {
+        respond(receipt); await flush();
+        check(reads.length === 1 && old.disabled && table() === priorTable, 'did not wait for a fresh authenticated view');
+        reads[0].wait.resolve(html(snapshots.after));
+    } else {
+        const token = calls[0].options.headers[nonceHeader];
+        const outcome = terminal === 'matrixDisableLost' ? 'disabled' : 'installed';
+        check(/^[a-f0-9]{32}$/.test(token), 'missing operation correlation');
+        if (terminal === 'matrixDisableLost') post.reject(new TypeError('fixture network loss'));
+        else respond({}, terminal === 'matrixTimeout' ? 408 : 503);
+        await flush();
+        await tick(1999); check(reads.length === 0, 'polled too early');
+        await tick(2000);
+        check(reads.length === 1 && reads[0].options.headers[nonceHeader] === token, 'poll not bound to original POST');
+        // Even a matching-looking terminal row with another request's receipt cannot confirm.
+        reads[0].wait.resolve(html(terminal === 'matrixTimeout' ? snapshots.after : snapshots.before, `${'f'.repeat(32)}:${outcome}`));
+        await flush();
+        check($('[data-action-status]').textContent === words.messages.uncertain, 'inferred success from an unrelated observation');
+        if (terminal === 'matrixTimeout') {
+            await tick(298000);
+            check(reads.at(-1).time === 298000, 'wrong last poll slot');
+            const last = reads.at(-1), lastTable = table();
+            time = 300000; last.wait.resolve(html(snapshots.after, `${token}:installed`)); await flush();
+            await tick(300001);
+            check(lastTable === table(), 'exact-deadline reply was accepted');
+            check($('[data-action-status]').textContent === words.messages.observationTimeout && !$('[data-refresh]').hidden,
+                'deadline did not leave the UI locked and unknown');
+            old.click(); await tick(302000);
+            check(calls.length === 1 && reads.at(-1) === last, 'continued observing or replayed after deadline');
+            return;
+        }
+        await tick(4000);
+        check(reads.length === 2, 'wrong read-only polling cadence');
+        reads[1].wait.resolve(html(snapshots.after, `${token}:${outcome}`));
+    }
+    await flush();
+    check(priorTable !== table() && !priorTable.isConnected && !old.isConnected, 'rows/account table were not replaced');
+    check(table().textContent.includes('fixture.after') && !$('#not-in-fragment') && !window.badInsertion, 'did not isolate safe refreshed fragment');
+    check(!$('[data-l2tp-view]').innerHTML.includes('SERVER-ONLY-') && [...document.querySelectorAll('[data-secret-value]')]
+        .every(value => value.hidden && !value.textContent), 'refresh exposed secret values');
+    check(!$('[data-account-action="disable"][data-login="fixture.after"]').disabled, 'fresh eligible control was not rebound');
+    check($('[data-refresh]').hidden && calls.length === 1, 'action replayed or fresh view still marked stale');
+    old.dispatchEvent(new Event('click')); check(calls.length === 1, 'detached stale control dispatched');
+    $('[data-account-action="disable"][data-login="fixture.after"]').click();
+    check(calls.length === 2 && JSON.parse(calls[1].options.body).login === 'fixture.after', 'fresh control did not handle an explicit click');
 }
 
 for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainInstall'], ['en', 'created'],
-    ...['canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial', 'admissionVisibility'].map(terminal => ['en', terminal])]) {
-    const admission = terminal === 'admissionVisibility';
-    test(admission ? 'Firefox: only the current admission/reconfirm approval is displayed'
+    ...['secretPagehide', 'canceled', 'wrongLogin', 'recoveredDisable', 'recoveredPartial', 'admissionVisibility',
+        'matrixInstall', 'matrixInstallLost', 'matrixTimeout', 'matrixRemove', 'matrixRemoveLost', 'matrixRecover',
+        'matrixCreate', 'matrixDisable', 'matrixDisableLost', 'matrixDelete', 'matrixReconcile'].map(terminal => ['en', terminal])]) {
+    const admission = terminal === 'admissionVisibility', matrix = terminal.startsWith('matrix');
+    test(matrix ? `Firefox: refresh regression ${terminal}` : admission ? 'Firefox: only the current admission/reconfirm approval is displayed'
         : `Firefox: clicks, secret lifecycle and account/relay requests (${lang}, ${terminal})`, {
         skip: browserAvailable ? false : 'requires local Firefox (or REBUILD_L2TP_FIREFOX)',
     }, async () => {
-        const { content } = await render(lang, admission ? { relays: [
+        let { content } = await render(lang, terminal === 'matrixRecover' ? { canRequestInstallRecovery: true,
+            relays: [installed, { ...fresh, status: 'installing', grantSource: 'db', canRecoverInstall: true }] }
+            : terminal === 'matrixReconcile' ? { accountsPending: true, canReconcileAccounts: true }
+            : admission ? { relays: [
             { ...installed, grantSource: 'db', canReconfirm: true, canRevoke: true },
             { ...fresh, grantSource: null, canGrant: true },
         ] } : undefined);
         const client = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
         const words = require(`../../locales/${lang}.json`).rebuildL2tp;
-        const input = JSON.stringify({ route, id, otherId, csrf, words, terminal }).replaceAll('<', '\\u003c');
+        const snapshots = matrix ? { before: content,
+            progress: (await render(lang, { relays: [installed, { ...fresh, status: 'installing', canInstall: false }] })).content,
+            after: (await render(lang, { relays: [installed, { ...fresh, status: 'installed', canInstall: false }],
+                accounts: [{ ...account, login: 'fixture.after' }] })).layout } : null;
+        if (terminal.startsWith('matrixRemove')) {
+            const card = await ejs.renderFile(join(root, 'views/node-form.ejs'), { t: key => t(key, lang), lang, csrfToken: csrf,
+                node: { _id: id, cascadeRole: 'relay', type: 'xray' }, error: null, groups: [], candidateNodes: [],
+                cascadeLinks: [], panelDomain: '', lastInitScript: '', baseUrl: '', rebuildRemoval: {
+                    summary: 'Fixture preview', ticket: '1'.repeat(64), scriptVersion: rebuildL2tpScriptVersion },
+            });
+            content = card.match(/<details class="form-section" id="rebuild-l2tp-remove"[\s\S]*?<\/details>/)[0];
+        }
+        const input = JSON.stringify({ route, id, otherId, csrf, words, terminal, snapshots }).replaceAll('<', '\\u003c');
         const home = mkdtempSync(join(tmpdir(), 'rebuild-l2tp-ui-'));
         try {
             const settings = {
@@ -519,17 +695,19 @@ for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainIns
             writeFileSync(join(home, 'user.js'), Object.entries(settings)
                 .map(([key, value]) => `user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`).join('\n'));
             const file = join(home, 'fixture.html');
-            const scenario = admission ? admissionVisibility : browserScenario;
+            const scenario = matrix ? refreshMatrix : admission ? admissionVisibility : browserScenario;
             const stylesheet = admission ? `<style>${readFileSync(join(root, 'public/css/style.min.css'), 'utf8')}</style>` : '';
             const inline = `<script>(${scenario})(${input}).then(() => dump('L2TP_UI:OK\\n'),
-                error => dump('L2TP_UI:FAIL ' + error.message + '\\n'));</script><script>${client}</script>`;
+                error => dump('L2TP_UI:FAIL ' + error.message + '\\n'));</script><script>((location) => { ${client} })(
+                    { origin: 'http://fixture.invalid', assign: path => { window.navigation = path; } });</script>`;
             assert.ok(content.includes(scriptTag));
             writeFileSync(file, '<!doctype html><meta charset="UTF-8">' +
                 '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; style-src \'unsafe-inline\'">' +
                 stylesheet + content.replace(scriptTag, () => inline));
             await new Promise((resolve, reject) => {
                 const child = spawn(firefox, ['--no-remote', '--headless', '--profile', home, pathToFileURL(file).href], {
-                    env: { PATH: process.env.PATH, HOME: home, TMPDIR: home, MOZ_CRASHREPORTER_DISABLE: '1' },
+                    env: { PATH: process.env.PATH, HOME: home, TMPDIR: home, MOZ_CRASHREPORTER_DISABLE: '1',
+                        ...(process.env.REBUILD_L2TP_FIREFOX && process.env.LD_LIBRARY_PATH && { LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH }) },
                     stdio: ['ignore', 'pipe', 'pipe'],
                 });
                 let output = '', diagnostics = '', timedOut = false;

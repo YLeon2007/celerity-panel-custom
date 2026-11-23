@@ -104,10 +104,10 @@ async function launch() {
     let reply;
     const recovery = control({ installRecoveryUrl: attr('install-recovery-url'), nodeId: id });
     const install = control(); // Another relay's normal Install button.
-    const page = { dataset: { csrf: attr('csrf'), messages: attr('messages') },
+    const page = { contains: () => true, dataset: { csrf: attr('csrf'), messages: attr('messages') },
         querySelector: sel => ({ '[data-action-status]': status, '[data-refresh]': refresh })[sel],
         querySelectorAll: sel => ({ '[data-install-recovery-url]': [recovery], '[data-install-url]': [install] })[sel] ?? [] };
-    runInNewContext(script, { document: { getElementById: () => page }, window: { addEventListener() {} },
+    runInNewContext(script, { AbortController, performance, setTimeout() {}, clearTimeout() {}, document: { getElementById: () => page }, window: { addEventListener() {} },
         fetch: (...params) => { calls.push(params); return new Promise(resolve => { reply = resolve; }); } });
     return { status, refresh, recovery, install, calls,
         resolve: value => reply(value), next: () => new Promise(resolve => setImmediate(resolve)) };
@@ -134,11 +134,11 @@ test('one explicit click sends only empty JSON and waits for the bound success r
     f.resolve({ ok: true, json: async () => receipt });
     await f.next();
     assert.match(f.status.textContent, /^Можно установить заново\./);
-    assert.equal(f.refresh.hidden, false);
+    assert.equal(f.refresh.hidden, true); // The authenticated read is still outstanding.
     assert.equal(f.recovery.disabled, true);
     assert.equal(f.install.disabled, true);
     f.recovery.click();
-    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.calls.map(([path, options]) => [path, options.method]), [[url, 'POST'], ['/panel/l2tp', 'GET']]);
 });
 
 test('empty recovery reports a refresh-only result, not permission to reinstall', async () => {

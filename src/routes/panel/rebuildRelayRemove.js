@@ -4,6 +4,7 @@ const { randomBytes } = require('node:crypto');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { runtimeForeignChange, networkNotReadyDetails, isNetworkNotReady } = require('../../services/rebuildRelayRuntimeRefusal');
 const { validNodeId, identityChanged, grantConflict, grantUnavailable, grantEffectStatus } = require('./rebuildRelayAdmission');
+const { observe } = require('./rebuildL2tpObservation');
 
 // One-use, process-local tickets. A restart evicts them; keys and the private
 // estimates never enter the session store. This panel has one active instance.
@@ -110,10 +111,12 @@ async function handleRemoval(req, res, decision) {
     // Consume synchronously, before any DB/SSH await, including on cancellation.
     tickets.delete(body.ticket);
     if (decision === 'cancel') return res.redirect(303, '/panel/nodes');
+    const acknowledge = observe(req);
     try {
         const result = await require('../../services/rebuildService').createRebuildService().confirmRemoveRelay(id, entry.estimate);
         if (result?.status !== 'not_installed' || result.nodeId !== id) return conflict('REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN');
-        return html ? res.redirect(303, nodeUrl) : res.json({ executionMode: 'rebuild', status: 'not_installed', nodeId: id });
+        acknowledge('removed');
+        return html ? res.redirect(303, '/panel/l2tp') : res.json({ executionMode: 'rebuild', status: 'not_installed', nodeId: id });
     } catch (error) {
         const code = publicCodes.has(error?.code) || isNetworkNotReady(error) || grantEffectStatus(error?.code)
             ? error.code : 'REBUILD_L2TP_REMOVE_FAILED';

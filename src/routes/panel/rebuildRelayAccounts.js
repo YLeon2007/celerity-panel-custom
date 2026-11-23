@@ -2,6 +2,7 @@
 
 const { createRebuildService } = require('../../services/rebuildService');
 const { identityChanged, grantEffectStatus, validNodeId } = require('./rebuildRelayAdmission');
+const { observe } = require('./rebuildL2tpObservation');
 
 const methods = Object.freeze({ create: 'createRelayAccount', disable: 'disableRelayAccount', delete: 'deleteRelayAccount' });
 const statuses = Object.freeze({ create: 'created', disable: 'disabled', delete: 'deleted' });
@@ -24,6 +25,7 @@ function accountHandler(action, service = createRebuildService) {
         if (Object.keys(req.query ?? {}).length || !body || typeof body !== 'object' || Array.isArray(body)
             || Object.keys(body).some(key => !allowed.includes(key)) || typeof body.login !== 'string'
             || (action === 'create' && typeof body.password !== 'string')) return res.status(400).json({ error: { code: invalid } });
+        const acknowledge = observe(req);
         try {
             const { login } = body;
             const result = await service()[methods[action]]({ login, ...(action === 'create' && { password: body.password }) });
@@ -37,6 +39,7 @@ function accountHandler(action, service = createRebuildService) {
             }
             // Only the public receipt crosses this boundary, even if the
             // service starts returning private inventory or transport metadata.
+            acknowledge(status);
             return res.status(action === 'create' && !canceled ? 201 : 200).json({ executionMode: 'rebuild', status, login, relayCount,
                 ...(recovered && { recovered }),
                 ...(revocation && { sessionsTerminated, ...(recovered && { sessionsTerminatedScope: 'request' }) }) });

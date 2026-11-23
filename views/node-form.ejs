@@ -192,13 +192,20 @@ Object.assign(locals, {
             <summary><%= t('nodes.rebuildRemoveOpen') %></summary>
             <p><%= rebuildRemoval.summary %></p>
             <% if (rebuildRemoval.ticket && typeof csrfToken !== 'undefined' && csrfToken) { %>
-                <form method="POST" action="/panel/rebuild/relays/<%= node._id %>/l2tp/remove">
+                <% const removeMessages = Object.fromEntries(['working', 'uncertain', 'observationTimeout',
+                    'requestFailed', 'rateLimited', 'removeCleanupFailed', 'runtimeForeignChange', 'runtimeNetworkNotReady']
+                    .map(key => [key, t(`rebuildL2tp.messages.${key}`)])); %>
+                <form method="POST" action="/panel/rebuild/relays/<%= node._id %>/l2tp/remove" data-l2tp-remove
+                      data-node-id="<%= node._id %>" data-messages="<%= JSON.stringify(removeMessages) %>">
                     <input type="hidden" name="_csrf" value="<%= csrfToken %>">
                     <input type="hidden" name="ticket" value="<%= rebuildRemoval.ticket %>">
                     <p><%= t('nodes.rebuildRemoveWarning') %></p>
                     <button type="submit" name="decision" value="cancel" formaction="/panel/rebuild/relays/<%= node._id %>/l2tp/remove/cancel" class="btn"><%= t('common.cancel') %></button>
                     <button type="submit" name="decision" value="confirm" class="btn btn-danger"><%= t('nodes.rebuildRemoveConfirm') %></button>
+                    <p data-remove-status role="status"></p>
+                    <a href="/panel/l2tp" data-remove-refresh hidden><%= t('rebuildL2tp.refresh') %></a>
                 </form>
+                <script src="/js/rebuild-l2tp.js?v=<%= rebuildRemoval.scriptVersion %>" defer></script>
             <% } else { %>
                 <p role="status"><%= t(rebuildRemoval.blocked) %></p>
                 <% if (rebuildRemoval.hint) { %><p><%= t(rebuildRemoval.hint) %></p><% } %>

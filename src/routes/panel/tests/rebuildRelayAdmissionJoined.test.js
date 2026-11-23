@@ -758,7 +758,7 @@ for (const cut of ['identity before reservation', 'identity after reservation', 
             });
         } else {
             assert.equal(await f.send('remove', { decision: 'confirm', ticket }, { expected: 303, html: true }), pre
-                ? `/panel/l2tp?identityChanged=${nodeId}#relay-${nodeId}` : success ? `/panel/nodes/${nodeId}`
+                ? `/panel/l2tp?identityChanged=${nodeId}#relay-${nodeId}` : success ? '/panel/l2tp'
                     : finishCleanup ? '/panel/l2tp?view=remove-cleanup' : '/panel/l2tp?view=remove-unconfirmed');
         }
         assert.deepEqual(f.remote.effects, pre || identity || lostReservation || reservationCleanup ? ['install'] : ['install', 'remove']);
@@ -931,15 +931,15 @@ test('runtime refusals and unknown ACK reach the real CHAP reconciliation route 
         f.remote.reattestReply = wire;
         let click, request;
         const status = { textContent: '' }, refresh = { hidden: true };
-        const reconcile = { disabled: true, addEventListener: (_, handler) => { click = handler; } };
+        const reconcile = { dataset: { reconcileUrl: attribute('reconcile-url') }, disabled: true, addEventListener: (_, handler) => { click = handler; } };
         const page = {
-            dataset: { csrf: attribute('csrf'), messages: attribute('messages'), reconcileUrl: attribute('reconcile-url'),
+            contains: () => true, dataset: { csrf: attribute('csrf'), messages: attribute('messages'), reconcileUrl: attribute('reconcile-url'),
                 installChecks: attribute('install-checks') },
             querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': reconcile })[key] ?? null,
             querySelectorAll: () => [],
         };
         require('node:vm').runInNewContext(source, {
-            document: { getElementById: () => page }, window: { addEventListener() {} }, fetch(url, options) {
+            performance, setTimeout() {}, document: { getElementById: () => page }, window: { addEventListener() {} }, fetch(url, options) {
                 assert.equal(url, '/panel/rebuild/relays/l2tp/accounts/reconcile');
                 assert.equal(options.method, 'POST');
                 request = f.send(url, JSON.parse(options.body), { expected: 409, csrfToken: options.headers['x-csrf-token'] });

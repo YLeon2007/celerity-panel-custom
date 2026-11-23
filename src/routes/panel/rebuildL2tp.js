@@ -1,8 +1,5 @@
 'use strict';
 
-const { createHash } = require('node:crypto');
-const { readFileSync } = require('node:fs');
-const { resolve } = require('node:path');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { requireAuth, render } = require('./helpers');
@@ -14,6 +11,7 @@ const { runtimeForeignChange, networkObservationRequired, networkNotReadyDetails
 const { mountAdmission, admissionPath, validAdmissionJson, reject: rejectAdmission,
     validNodeId, validActor, grantEffectStatus, identityChanged } = require('./rebuildRelayAdmission');
 const { retirePath, validRetireJson, rejectRetire, mountRetire } = require('./rebuildRelayRetire');
+const { observe, readObservation, header, rebuildL2tpScriptVersion } = require('./rebuildL2tpObservation');
 
 const pagePath = /^\/l2tp$/;
 const accountPath = /^\/rebuild\/relays\/l2tp\/accounts\/reveal$/;
@@ -35,7 +33,6 @@ const invalidRecovery = res => revealError(res, 400, 'REBUILD_INVALID_REQUEST');
 const unconfirmedRecovery = (res, status = 503) => res.status(status).json({
     error: { code: 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED', retryAllowed: false },
 });
-let rebuildL2tpScriptVersion;
 
 function noStore(_req, res, next) {
     res.set('Cache-Control', 'no-store');
@@ -92,12 +89,9 @@ function rebuildL2tpIngress(req, res, next) {
 function renderPage(res, model) {
     const t = res.locals.t;
     const title = t?.('rebuildL2tp.title');
-    // Hash the packaged script on first use; there is no version to bump by hand.
-    rebuildL2tpScriptVersion ??= createHash('sha256')
-        .update(readFileSync(resolve(__dirname, '../../../public/js/rebuild-l2tp.js'))).digest('hex').slice(0, 16);
     const installChecks = Object.fromEntries(installCheckIds.map(check => [check, t?.(`rebuildL2tp.installChecks.${check}`)]));
     return render(res, 'rebuild-l2tp', { title: title && title !== 'rebuildL2tp.title' ? title : 'L2TP', page: 'l2tp',
-        ...model, installChecks, rebuildL2tpScriptVersion });
+        ...model, installChecks, rebuildL2tpScriptVersion: rebuildL2tpScriptVersion() });
 }
 
 function sendLoadError(res) {
@@ -174,7 +168,12 @@ function mountOverview(router, getOverview, exposePanelCsrfToken) {
                             : req.query.view === 'remove-network-not-ready' ? 'runtimeNetworkNotReady' : null;
                 if (removalNotice) return renderPage(res, { removalNotice, relays: [], accounts: [], canManageAccounts: false });
                 const changedRelayId = validNodeId(req.query.identityChanged) ? req.query.identityChanged : null;
-                return renderPage(res, { ...await getOverview().overview(), changedRelayId,
+                // Read the request-bound witness before loading the overview. A
+                // completion during the GET cannot vouch for an earlier snapshot.
+                const outcome = req.url === '/l2tp' && readObservation(req);
+                const model = await getOverview().overview();
+                if (outcome) res.set(header, `${req.headers[header]}:${outcome}`);
+                return renderPage(res, { ...model, changedRelayId,
                     canRequestInstallRecovery: hasSessionId(req) && validActor(req.session.adminUsername) && req.query.view !== 'only',
                     reconcileViewOnly: req.query.view === 'only' || changedRelayId !== null });
             } catch {
@@ -223,7 +222,8 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
             return revealError(res, 409, 'REBUILD_L2TP_RECONCILE_DISABLED');
         }
         next();
-    }, requireCompletedOnboarding(reconcileUnavailable), limiter, async (_req, res) => {
+    }, requireCompletedOnboarding(reconcileUnavailable), limiter, async (req, res) => {
+        const acknowledge = observe(req);
         const receipt = (status, count) => res.json({ executionMode: 'rebuild', status,
             ...(count !== undefined && { sessionsTerminated: count, sessionsTerminatedScope: 'request' }) });
         const manualBlock = () => res.status(409).json({ error: { code: reconcileBlocked, retryAllowed: false } });
@@ -276,6 +276,8 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
             const count = result?.sessionsTerminated;
             const proved = result?.executionMode === 'rebuild' && result.recovered === true
                 && (result.status === 'disabled' || result.status === 'deleted') && Number.isSafeInteger(count) && count >= 0;
+            if (result?.executionMode === 'rebuild' && result.recovered === true
+                && ['created', 'disabled', 'deleted', 'canceled'].includes(result.status)) acknowledge('settled');
             return receipt('settled', proved ? count : undefined);
         } catch {
             return reconcileUnavailable(res);
@@ -297,6 +299,7 @@ function mountInstallRecovery(router, limiter) {
         next();
     }, limiter, requireCompletedOnboarding(unconfirmedRecovery), async (req, res) => {
         const nodeId = req.path.split('/')[3];
+        const acknowledge = observe(req);
         try {
             const service = require('../../services/rebuildService').createRebuildService();
             const result = await service.recoverRelayInstall(nodeId, { actor: req.session.adminUsername });
@@ -304,6 +307,7 @@ function mountInstallRecovery(router, limiter) {
                 || result.error !== undefined || result.retryAllowed === false || result.outcome === 'unknown') {
                 return unconfirmedRecovery(res);
             }
+            acknowledge('can_install_again');
             return res.json({ executionMode: 'rebuild', status: 'can_install_again', nodeId });
         } catch (error) {
             if (error?.code === 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE' && error.retryAllowed === false

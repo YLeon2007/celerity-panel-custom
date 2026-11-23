@@ -202,6 +202,41 @@ test('only exact authenticated, onboarded GET /panel/l2tp renders the rebuild ov
     assert.deepEqual(state.calls, [['overview'], ['overview']]);
 });
 
+test('only the original signed-in session and request nonce can observe a terminal acknowledgement', async t => {
+    const { request, signIn, state } = await mount(t, { realView: true, ingress: true });
+    const auth = await signIn(), other = await signIn();
+    const header = 'x-rebuild-l2tp-observation', token = 'a'.repeat(32);
+    const get = (session, value = token, extra = {}) => request(page, { auth: session, headers: { [header]: value, ...extra } });
+    const post = (session, value) => request(reconcile, { auth: session, method: 'POST', json: {}, headers: { [header]: value } });
+    const previous = process.env[listKey];
+    process.env[listKey] = '[]';
+    t.after(() => { if (previous === undefined) delete process.env[listKey]; else process.env[listKey] = previous; });
+
+    // Reconcile's existing no-fence ACK is not proof of the originally pending change.
+    safe(await post(auth, 'b'.repeat(32)), 200);
+    assert.equal((await get(auth, 'b'.repeat(32))).headers.get(header), null);
+    state.pending = state.settles = true;
+    state.recoveryReceipt = { executionMode: 'rebuild', recovered: true, status: 'deleted', sessionsTerminated: 0, secret: marker };
+    assert.equal((await get(auth)).headers.get(header), null);
+    assert.equal((await post({ ...auth, csrf: 'invalid' }, token)).status, 403);
+    assert.equal((await get(auth)).headers.get(header), null);
+    safe(await post(auth, token), 200);
+    state.calls.length = 0;
+    const same = await get(auth);
+    safe(same, 200);
+    assert.equal(same.headers.get(header), `${token}:settled`);
+    assert.match(same.text, /data-l2tp-view/);
+    assert.equal((await get(other)).headers.get(header), null);
+    assert.equal((await get(auth, 'c'.repeat(32))).headers.get(header), null);
+    assert.equal((await get(auth, token, { 'sec-fetch-site': 'cross-site' })).headers.get(header), null);
+    assert.equal((await get(undefined, token, { Authorization: 'Bearer fixture-api-key' })).headers.get(header), null);
+    state.overviewFailure = true;
+    const failed = await get(auth);
+    safe(failed, 503);
+    assert.equal(failed.headers.get(header), null);
+    assert.ok(state.calls.length > 0 && state.calls.every(([action]) => action === 'overview'));
+});
+
 test('pending GET and refresh render without a writer or SSH; view-only and unknown GET have no trigger', async t => {
     const { request, signIn, state } = await mount(t, { realView: true });
     const connect = t.mock.method(require('ssh2').Client.prototype, 'connect', () => assert.fail('GET attempted SSH'));

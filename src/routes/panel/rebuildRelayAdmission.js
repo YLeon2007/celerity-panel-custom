@@ -1,5 +1,7 @@
 'use strict';
 
+const { observe } = require('./rebuildL2tpObservation');
+
 const { requireAuth } = require('./helpers');
 
 // Match the raw URL; don't let Express decode an alternate spelling of a node ID.
@@ -92,10 +94,12 @@ function mountAdmission(router, service, { requireSessionId, checkCsrf, requireC
     }, limiter, requireCompletedOnboarding(res => errorResponse(res, 503, unavailable)), async (req, res) => {
         const [,,, nodeId] = req.path.split('/');
         const action = actionFrom(req.path);
+        const acknowledge = action === 'confirm' || action === 'revoke' ? observe(req) : null;
         try {
             const result = publicReceipt(action, nodeId, await getService().perform({ action, nodeId,
                 actor: req.session.adminUsername, sessionId: req.sessionID, challenge: req.body.challenge }));
             if (!result) return errorResponse(res, 503, unavailable);
+            acknowledge?.(action === 'confirm' ? 'granted' : 'revoked');
             // Do not derive an ETag from the one-use challenge.
             return res.type('application/json').end(JSON.stringify(result));
         } catch (error) {

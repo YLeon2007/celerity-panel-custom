@@ -100,8 +100,10 @@ function widget(dataset = {}) {
 }
 
 function launch(action = 'grant', { target = id, pending = false, admissionWords = words.admission } = {}) {
-    const replies = [], calls = [];
-    const dialog = widget(), status = widget(), refresh = widget(), review = widget(), recover = widget();
+    const replies = [], calls = [], reads = [];
+    const dialog = widget(), status = widget(), refresh = widget(), review = widget(), recover = widget({ reconcileUrl: '/accounts/reconcile' });
+    let pendingControl = pending;
+    const view = { replaceWith() { pendingControl = false; } };
     const install = widget({ nodeId: target, installUrl: '/install' });
     const account = widget({ accountAction: 'disable', login: 'test' });
     const button = (admissionAction, nodeId) => widget({ admissionAction, nodeId, admissionUrl: baseUrl(nodeId), nodeName: '<untrusted relay>' });
@@ -115,20 +117,28 @@ function launch(action = 'grant', { target = id, pending = false, admissionWords
     const approvals = Object.fromEntries(['verify', 'confirm', 'revoke'].map(admissionApprove => [admissionApprove, widget({ admissionApprove })]));
     dialog.querySelectorAll = selector => selector === '[data-admission-approve]' ? Object.values(approvals)
         : ['verify', 'confirm', 'revoke'].map(admissionStep => widget({ admissionStep }));
-    const page = { dataset: { csrf: 'fixture', messages: JSON.stringify(words.messages),
+    const page = { contains: element => element !== recover || pendingControl, dataset: { csrf: 'fixture', messages: JSON.stringify(words.messages),
         accountUrl: '/accounts', admissionMessages: JSON.stringify(admissionWords), ...(pending && { reconcileUrl: '/accounts/reconcile' }) },
     querySelector: selector => ({ '[data-action-status]': status, '[data-refresh]': refresh,
-        '[data-review]': review, '[data-admission-dialog]': dialog, '[data-reconcile]': pending ? recover : null })[selector] ?? null,
+        '[data-l2tp-view]': view, '[data-review]': review, '[data-admission-dialog]': dialog, '[data-reconcile]': pendingControl ? recover : null })[selector] ?? null,
     querySelectorAll: selector => ({ '[data-install-url]': [install], '[data-account-action]': [account],
         '[data-admission-action]': [selected, other] })[selector] ?? [] };
-    runInNewContext(script, { document: { getElementById: key => key === 'rebuild-l2tp' ? page : null },
-        window: { addEventListener() {} }, async fetch(url, options) {
+    runInNewContext(script, { AbortController, performance, setTimeout() {}, clearTimeout() {}, URL, CustomEvent,
+        location: { origin: 'http://fixture.invalid' },
+        document: { getElementById: key => key === 'rebuild-l2tp' ? page : null,
+            createElement: () => ({ content: { querySelector: () => page } }) },
+        window: { addEventListener() {}, dispatchEvent() {} }, async fetch(url, options) {
+            if (options.method === 'GET') {
+                reads.push(url);
+                return { status: 200, url: 'http://fixture.invalid/panel/l2tp', text: async () => '',
+                    headers: { get: key => ({ 'content-type': 'text/html', 'cache-control': 'no-store' })[key] } };
+            }
             calls.push({ url, body: JSON.parse(options.body), csrf: options.headers['x-csrf-token'], method: options.method });
             const reply = replies.shift();
             if (!reply) throw new Error('lost reply');
             return { status: reply.status ?? 200, ok: !reply.status, json: async () => reply.data };
         } });
-    return { replies, calls, status, refresh, review, selected, other, field, install, account, dialog, approvals, recover };
+    return { replies, calls, reads, status, refresh, review, selected, other, field, install, account, dialog, approvals, recover };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
@@ -158,8 +168,9 @@ for (const action of ['grant', 'reconfirm']) {
             body: i ? { challenge: i === 1 ? first : second } : {}, csrf: 'fixture', method: 'POST' })));
         assert.equal(f.dialog.open, false);
         assert.equal(f.field('key').textContent, '');
-        assert.equal(f.refresh.hidden, false);
-        assert.ok(f.install.disabled && f.account.disabled && f.selected.disabled);
+        assert.equal(f.refresh.hidden, true);
+        assert.ok(!f.install.disabled && !f.account.disabled && !f.selected.disabled);
+        assert.deepEqual(f.reads, Array(3).fill('/panel/l2tp'));
     });
 }
 

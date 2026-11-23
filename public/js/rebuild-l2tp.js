@@ -1,20 +1,154 @@
 (() => {
     'use strict';
 
+    const overviewUrl = '/panel/l2tp';
+    const observation = 'x-rebuild-l2tp-observation';
+    const interval = 2000, observationLimit = 300_000;
+    const requestOptions = { mode: 'same-origin', credentials: 'same-origin', cache: 'no-store', redirect: 'error' };
+    let reading, readVersion = 0, active = true;
+    window.addEventListener('pagehide', () => { active = false; cancelRead(); });
+
+    function cancelRead() {
+        readVersion++;
+        reading?.abort();
+    }
+
+    function nonce() {
+        try { return Array.from(window.crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join(''); }
+        catch { return null; } // Without a nonce, a lost response cannot be attributed.
+    }
+
+    async function request(url, body, headers, signal) {
+        const response = await fetch(url, { ...requestOptions, method: 'POST', headers, body, signal });
+        const data = await response.json().catch(() => null);
+        return { response, data };
+    }
+
+    const unknownOutcome = data => data?.outcome === 'unknown' || data?.error?.outcome === 'unknown';
+    const noRetry = data => unknownOutcome(data) || data?.retryAllowed === false || data?.error?.retryAllowed === false;
+    const ambiguous = (response, data) => response.status === 408 || response.status >= 500 || unknownOutcome(data);
+    const makeDeadline = duration => {
+        const monotonic = performance.now() + duration, wall = Date.now() + duration;
+        return () => Math.min(monotonic - performance.now(), wall - Date.now());
+    };
+
+    async function readOverview(csrf, token, remaining) {
+        if (!active || remaining() <= 0) return null;
+        cancelRead();
+        const version = readVersion;
+        const read = new AbortController();
+        reading = read;
+        const timer = setTimeout(() => read.abort(), Math.min(remaining(), interval));
+        const canceled = new Promise(resolve => read.signal.addEventListener('abort', () => resolve(null), { once: true }));
+        const current = () => active && version === readVersion && !read.signal.aborted && remaining() > 0;
+        try {
+            const fetchView = async () => {
+                const response = await fetch(overviewUrl, { ...requestOptions, method: 'GET', signal: read.signal,
+                    headers: { Accept: 'text/html', ...(token && { [observation]: token }) } });
+                if (!current() || response.status !== 200 || response.redirected
+                    || response.url !== new URL(overviewUrl, location.origin).href
+                    || !/^text\/html(?:;|$)/i.test(response.headers.get('content-type') || '')
+                    || !/(?:^|,)\s*no-store\s*(?:,|$)/i.test(response.headers.get('cache-control') || '')) return null;
+                // Keep the full page inert: never insert layout, scripts, or a login page.
+                const template = document.createElement('template');
+                template.innerHTML = await response.text();
+                if (!current()) return null;
+                const root = template.content.querySelector('#rebuild-l2tp');
+                const view = root?.querySelector('[data-l2tp-view]');
+                if (!view || !csrf || root.dataset.csrf !== csrf) return null;
+                const echo = token && response.headers.get(observation);
+                return { view, current, outcome: echo?.startsWith(`${token}:`) ? echo.slice(token.length + 1) : null };
+            };
+            const result = await Promise.race([fetchView(), canceled]);
+            return current() ? result : null;
+        } catch { return null; }
+        finally {
+            clearTimeout(timer);
+            if (reading === read) reading = null;
+        }
+    }
+
+    async function pollOverview(csrf, token, accept) {
+        const remaining = makeDeadline(observationLimit);
+        let next = observationLimit - interval;
+        while (active && next > 0 && remaining() > 0) {
+            await new Promise(resolve => setTimeout(resolve, Math.max(0, remaining() - next)));
+            if (!active || remaining() <= 0) break;
+            const snapshot = await readOverview(csrf, token, remaining);
+            if (snapshot?.current() && accept(snapshot) && remaining() > 0) return true;
+            do next -= interval; while (next > remaining());
+        }
+        if (active && remaining() > 0) await new Promise(resolve => setTimeout(resolve, remaining()));
+        return false;
+    }
+
     const page = document.getElementById('rebuild-l2tp');
-    if (!page) return;
+    if (!page) {
+        const form = document.querySelector?.('[data-l2tp-remove]');
+        if (form) bindRemove(form);
+        return;
+    }
     const words = JSON.parse(page.dataset.messages);
     const installChecks = JSON.parse(page.dataset.installChecks || '{}');
     const admissionWords = JSON.parse(page.dataset.admissionMessages || '{}');
 
-    async function post(url, body, signal) {
-        const response = await fetch(url, {
-            method: 'POST', mode: 'same-origin', credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal,
-            headers: { 'Content-Type': 'application/json', 'x-csrf-token': page.dataset.csrf },
-            body: JSON.stringify(body),
+    function post(url, body, signal, token, csrf = page.dataset.csrf) {
+        return request(url, JSON.stringify(body), { 'Content-Type': 'application/json', 'x-csrf-token': csrf,
+            ...(token && { [observation]: token }) }, signal);
+    }
+
+    function bindRemove(form) {
+        const words = JSON.parse(form.dataset.messages);
+        const status = form.querySelector('[data-remove-status]');
+        const refresh = form.querySelector('[data-remove-refresh]');
+        let submitted = false;
+        form.addEventListener('submit', async event => {
+            if (submitted || !active) { event.preventDefault(); return; }
+            if (event.submitter?.value !== 'confirm') return; // Preserve the native Cancel.
+            event.preventDefault();
+            submitted = true;
+            const csrf = form.elements.namedItem('_csrf').value;
+            const body = new URLSearchParams({ decision: 'confirm', ticket: form.elements.namedItem('ticket').value });
+            const token = nonce();
+            for (const button of form.querySelectorAll('button')) button.disabled = true;
+            status.textContent = words.working;
+            let result;
+            try { result = await request(form.action, body, { Accept: 'application/json', 'x-csrf-token': csrf,
+                ...(token && { [observation]: token }) }); } catch { /* no reply */ }
+            if (!active) return;
+            const { response, data } = result ?? {};
+            if (response?.ok && !noRetry(data) && !ambiguous(response, data) && data?.executionMode === 'rebuild'
+                && data.status === 'not_installed' && data.nodeId === form.dataset.nodeId) {
+                // The preview lives on the node card. Navigate by GET to the
+                // current overview instead of reopening a consumed preview.
+                location.assign(overviewUrl);
+                return;
+            }
+            let message = 'requestFailed';
+            if (!response || response.ok || ambiguous(response, data) || (noRetry(data) && !data?.error?.code)) {
+                status.textContent = words.uncertain;
+                if (await pollOverview(csrf, token, snapshot => snapshot.outcome === 'removed')) {
+                    if (active) location.assign(overviewUrl);
+                    return;
+                }
+                message = 'observationTimeout';
+            } else if (response.status === 429) message = 'rateLimited';
+            else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_IDENTITY_CHANGED'
+                && data.error.outcome === 'refused' && !noRetry(data) && /^[a-f0-9]{24}$/.test(form.dataset.nodeId)) {
+                const id = form.dataset.nodeId;
+                location.assign(`${overviewUrl}?identityChanged=${id}#relay-${id}`);
+                return;
+            }
+            else if (data?.error?.outcome === 'removed') message = 'removeCleanupFailed';
+            else if (data?.error?.code === 'REBUILD_L2TP_RUNTIME_FOREIGN_CHANGE') message = 'runtimeForeignChange';
+            else if (data?.error?.code === 'REBUILD_L2TP_HOST_NOT_READY' && data.error.check === 'NETWORK_OBSERVATION_REQUIRED') {
+                message = 'runtimeNetworkNotReady';
+            }
+            if (active) {
+                status.textContent = words[message];
+                refresh.hidden = false;
+            }
         });
-        const data = await response.json().catch(() => null);
-        return { response, data };
     }
 
     function bindSecret(widget) {
@@ -54,7 +188,7 @@
         }
 
         async function useSecret(show) {
-            if (requireRefresh || flow) return;
+            if (!active || busy || requireRefresh || flow || !isCurrent(widget)) return;
             const clipboard = navigator.clipboard;
             const visible = !value.hidden;
             if (!show && (visible ? typeof clipboard?.writeText !== 'function'
@@ -109,23 +243,14 @@
         return hide;
     }
 
-    const hideSecrets = Array.from(page.querySelectorAll('[data-secret-url]'), bindSecret);
+    let hideSecrets = [], form, installs, installRecoveries, accountButtons, admissionButtons, removeLinks, recover, mutations;
     const clearSecrets = () => hideSecrets.forEach(hide => hide());
     window.addEventListener('pagehide', clearSecrets);
 
-    const form = page.querySelector('[data-create]');
-    const installs = page.querySelectorAll('[data-install-url]');
-    const installRecoveries = page.querySelectorAll('[data-install-recovery-url]');
-    const accountButtons = page.querySelectorAll('[data-account-action]');
-    const submit = form?.querySelector('button[type="submit"]');
     const status = page.querySelector('[data-action-status]');
     const refresh = page.querySelector('[data-refresh]');
     const review = page.querySelector('[data-review]');
-    const admissionButtons = page.querySelectorAll('[data-admission-action]');
-    const removeLinks = page.querySelectorAll('[data-remove-link]');
     const dialog = page.querySelector('[data-admission-dialog]');
-    const recover = page.querySelector('[data-reconcile]');
-    const mutations = [...installs, ...installRecoveries, ...accountButtons, ...[submit, recover].filter(Boolean)];
     const expected = { install: 'installed', create: 'created', disable: 'disabled', delete: 'deleted' };
     const installOutcomes = new Map([
         ['refused', 'installRefused'], ['busy', 'installBusy'], ['rolled_back', 'installRolledBack'],
@@ -151,8 +276,7 @@
         ['REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK', 'reconcileManualBlock'],
         ['REBUILD_L2TP_ACCOUNTS_PRE_EFFECT_BLOCKED', 'accountPreEffectBlocked'],
     ]);
-    const unknownOutcome = data => data?.outcome === 'unknown' || data?.error?.outcome === 'unknown';
-    const noRetry = data => unknownOutcome(data) || data?.retryAllowed === false || data?.error?.retryAllowed === false;
+    const isCurrent = element => active && page.contains(element);
     function conflictNote(conflict) {
         const { field, sources } = conflict ?? {};
         const labels = admissionWords.conflictFields;
@@ -167,9 +291,9 @@
         && button.dataset.nodeId === reviewId;
 
     function updateMutations() {
-        const locked = busy || !!flow || requireRefresh;
+        const locked = !active || busy || !!flow || requireRefresh;
         for (const button of mutations) button.disabled = locked;
-        for (const button of admissionButtons) button.disabled = busy || !!flow || (requireRefresh && !canReview(button));
+        for (const button of admissionButtons) button.disabled = !active || busy || !!flow || (requireRefresh && !canReview(button));
         for (const link of removeLinks) link.setAttribute('aria-disabled', String(locked));
         refresh.hidden = !requireRefresh;
         if (review) {
@@ -187,9 +311,70 @@
         return row?.querySelector('[data-env-grant]') ? ` ${admissionWords.envReadOnly}` : '';
     }
 
-    for (const link of removeLinks) link.addEventListener('click', event => {
-        if (busy || flow || requireRefresh) event.preventDefault();
-    });
+    function applyOverview({ view, current }) {
+        if (!current()) return false;
+        const previous = page.querySelector('[data-l2tp-view]');
+        if (!previous) return false;
+        clearSecrets();
+        previous.replaceWith(view);
+        bindView();
+        return true;
+    }
+
+    async function refreshAcknowledged(csrf) {
+        const snapshot = await readOverview(csrf, null, makeDeadline(interval));
+        return (snapshot && applyOverview(snapshot)) || pollOverview(csrf, null, applyOverview);
+    }
+
+    async function finishAcknowledged(csrf, message, keepLocked = false) {
+        status.textContent = message;
+        const refreshed = await refreshAcknowledged(csrf);
+        if (!active) return;
+        identityReview = false;
+        requireRefresh = !refreshed || keepLocked;
+        if (!refreshed) status.textContent += ` ${words.refreshFailed}`;
+    }
+
+    async function reconcileUnknown(csrf, token, accepted) {
+        requireRefresh = true;
+        identityReview = false;
+        updateMutations();
+        let outcome;
+        const confirmed = await pollOverview(csrf, token, snapshot => {
+            if (applyOverview(snapshot) && accepted.includes(snapshot.outcome)) {
+                outcome = snapshot.outcome;
+                return true;
+            }
+            return false;
+        });
+        if (!confirmed) return null;
+        requireRefresh = false;
+        return outcome;
+    }
+
+    function lockForAction() {
+        busy = true;
+        clearSecrets();
+        updateMutations();
+    }
+
+    function installProgress(nodeId, csrf) {
+        const progress = new AbortController();
+        window.addEventListener('pagehide', () => progress.abort(), { once: true, signal: progress.signal });
+        // Item 2 can observe the outstanding synchronous POST without access
+        // to its write or receipt nonce. Superseded reads cannot replace newer DOM.
+        window.dispatchEvent(new CustomEvent('rebuild-l2tp:install-start', { detail: {
+            nodeId, signal: progress.signal,
+            async refresh() {
+                if (progress.signal.aborted) return false;
+                const snapshot = await readOverview(csrf, null, makeDeadline(interval));
+                return !!snapshot && !progress.signal.aborted && applyOverview(snapshot);
+            },
+        } }));
+        return () => { progress.abort(); cancelRead(); };
+    }
+
+    let openAdmission;
 
     if (dialog) {
         const field = name => dialog.querySelector(`[data-admission-${name}]`);
@@ -233,27 +418,38 @@
 
         async function advance(action) {
             const current = flow;
-            if (!current || busy) return;
-            busy = true;
-            updateMutations();
+            if (!active || !current || busy) return;
+            lockForAction();
             cancel.disabled = true;
             for (const button of approvals) button.disabled = true;
             notice.textContent = words.working;
             const mutating = action === 'confirm' || action === 'revoke';
-            let errorText = mutating ? words.uncertain : admissionWords.checkUnavailable, stale = mutating;
+            const success = action === 'confirm' ? 'granted' : 'revoked';
+            const token = mutating ? nonce() : null;
+            let errorText = mutating ? words.uncertain : admissionWords.checkUnavailable, stale = mutating, unknown = true;
             try {
                 const body = action === 'verify' || action === 'confirm' ? { challenge: current.identity.challenge } : {};
-                const { response, data } = await post(`${current.url}/${action}`, body);
-                if (current !== flow) return;
+                const { response, data } = await post(`${current.url}/${action}`, body, undefined, token, current.csrf);
+                if (!active || current !== flow) return;
                 const blocked = noRetry(data);
-                if (response.ok && !blocked && matchesReceipt(current, action, data)) {
+                unknown = ambiguous(response, data) || response.ok;
+                if (response.ok && !ambiguous(response, data) && !blocked && matchesReceipt(current, action, data)) {
+                    unknown = false;
                     if (mutating) {
-                        requireRefresh = true;
-                        identityReview = false;
-                        clearSecrets();
-                        status.textContent = admissionWords[action === 'confirm' ? 'granted' : 'revoked'];
                         dismiss();
+                        await finishAcknowledged(current.csrf, admissionWords[success]);
                     } else {
+                        if (!await refreshAcknowledged(current.csrf)) {
+                            if (!active) return;
+                            current.identity = null;
+                            requireRefresh = true;
+                            identityReview = false;
+                            draw(null, null);
+                            notice.textContent = words.refreshFailed;
+                            status.textContent = words.refreshFailed;
+                            return;
+                        }
+                        if (!active || flow !== current) return;
                         current.identity = data;
                         draw(action === 'probe' ? 'verify' : 'confirm', data);
                         notice.textContent = '';
@@ -282,12 +478,27 @@
                 }
             } catch { /* Do not retry an ambiguous response or reuse its challenge. */ }
             finally {
+                // GET cannot restore a lost approval challenge or reviewed identity.
+                if (active && flow === current && unknown) {
+                    current.identity = null;
+                    draw(null, null);
+                    notice.textContent = errorText;
+                    status.textContent = errorText;
+                    const outcome = await reconcileUnknown(current.csrf, token, mutating ? [success] : []);
+                    if (active && outcome) {
+                        dismiss();
+                        status.textContent = admissionWords[outcome];
+                    } else if (active) {
+                        stale = true;
+                        errorText = words.observationTimeout;
+                    }
+                }
                 busy = false;
                 cancel.disabled = false;
                 for (const button of approvals) button.disabled = false;
                 updateMutations();
             }
-            if (flow !== current) return;
+            if (!active || flow !== current) return;
             current.identity = null;
             draw(null, null);
             notice.textContent = errorText;
@@ -300,16 +511,16 @@
             }
         }
 
-        for (const button of admissionButtons) button.addEventListener('click', () => {
-            if (busy || flow || (requireRefresh && !canReview(button))) return;
+        openAdmission = button => {
+            if (!isCurrent(button) || busy || flow || (requireRefresh && !canReview(button))) return;
             const { admissionAction, admissionUrl, nodeId, nodeName } = button.dataset;
-            flow = { nodeId, url: admissionUrl, step: null, identity: null };
+            flow = { nodeId, url: admissionUrl, csrf: page.dataset.csrf, step: null, identity: null };
             field('name').textContent = nodeName;
             draw(admissionAction === 'revoke' ? 'revoke' : null, null);
             dialog.showModal();
             updateMutations();
             if (admissionAction !== 'revoke') void advance('probe');
-        });
+        };
         for (const button of approvals) button.addEventListener('click', event => {
             if (event.detail <= 1 && button.dataset.admissionApprove === flow?.step) void advance(flow.step);
         });
@@ -332,20 +543,28 @@
     ]);
 
     async function reconcileAccounts() {
-        if (busy || flow || requireRefresh || !page.dataset.reconcileUrl) return;
-        busy = true;
-        updateMutations();
+        const url = recover?.dataset.reconcileUrl;
+        if (!active || busy || flow || requireRefresh || !url) return;
+        lockForAction();
         status.textContent = words.working;
+        const csrf = page.dataset.csrf, token = nonce();
         let message = 'reconcileUnconfirmed', note = '';
+        let unknown = true;
         try {
-            const { response, data } = await post(page.dataset.reconcileUrl, {});
-            if (response.ok && data?.executionMode === 'rebuild') {
-                if (data.status === 'settled') {
+            const { response, data } = await post(url, {}, undefined, token, csrf);
+            unknown = ambiguous(response, data) || response.ok;
+            if (response.ok && !ambiguous(response, data) && data?.executionMode === 'rebuild') {
+                if (data.status === 'settled' && !noRetry(data)) {
                     message = 'reconcileSettled';
                     note = closureNote(data, data.sessionsTerminated);
+                    unknown = false;
                 }
-                if (data.status === 'pending') message = 'reconcileStillPending';
+                if (data.status === 'pending') {
+                    message = 'reconcileStillPending';
+                    unknown = false;
+                }
                 if (data.status === 'inspection-unproved' && data.retryAllowed === false) {
+                    unknown = false;
                     message = 'reconcileInspectionUnproved';
                     const detail = inspectionMessages.get(data.reason);
                     if (detail) note = ` ${words[detail]}`;
@@ -369,31 +588,41 @@
                 message = data.error.code === 'REBUILD_L2TP_IDENTITY_CHANGED' ? 'reconcileManualBlock' : effectErrors.get(data.error.code);
             }
         } catch { /* A lost response does not establish whether the fence cleared. */ }
+        if (!active) return;
         status.textContent = (words[message] ?? admissionWords[message]) + note;
-        busy = false;
-        // Never unlock this stale overview or automatically repeat recovery.
         requireRefresh = true;
+        if (message === 'reconcileSettled') await finishAcknowledged(csrf, status.textContent);
+        else if (unknown) {
+            const outcome = await reconcileUnknown(csrf, token, ['settled']);
+            if (active) status.textContent = words[outcome ? 'reconcileSettled' : 'observationTimeout'];
+        }
+        busy = false;
         updateMutations();
     }
 
     async function mutate(action, url, body, match, nodeId) {
-        if (busy || flow || requireRefresh) return;
-        busy = true;
-        updateMutations();
+        if (!active || busy || flow || requireRefresh) return;
+        lockForAction();
         status.textContent = words.working;
+        const csrf = page.dataset.csrf, token = nonce();
         let result = 'uncertain', note = '';
         const revocation = action === 'disable' || action === 'delete';
+        const accepted = action === 'install' ? [expected[action]] : [expected[action], 'canceled'];
+        let unknown = true, endProgress;
         try {
-            const { response, data } = await post(url, body);
+            const pending = post(url, body, undefined, token, csrf);
+            if (action === 'install') endProgress = installProgress(nodeId, csrf);
+            const { response, data } = await pending;
+            if (!active) return;
             const { code, outcome, check } = data?.error ?? {};
             const blocked = noRetry(data);
-            if (response.ok && !blocked) {
+            unknown = ambiguous(response, data);
+            if (response.ok && !blocked && !unknown) {
                 const canceled = action !== 'install' && data?.status === 'canceled' && data.recovered === true
                     && (!revocation || (data.sessionsTerminated === 0 && data.sessionsTerminatedScope === 'request'));
                 if (data?.executionMode === 'rebuild' && (data.status === expected[action] || canceled) && match(data)) {
                     result = data.status;
                     requireRefresh = true;
-                    if (result === 'created') form.reset();
                     if (revocation && data.recovered === true) note = closureNote(data, data.sessionsTerminated);
                     clearSecrets();
                 }
@@ -428,37 +657,43 @@
                 note = closureNote(data.error, data.error.confirmedSessionsTerminated);
             }
         } catch { /* A lost response is not proof that the mutation failed. */ }
-        if (result === 'uncertain') {
-            requireRefresh = true;
-            identityReview = false;
-            clearSecrets();
-        }
+        finally { endProgress?.(); }
+        if (!active) return;
         status.textContent = (words[result] ?? admissionWords[result]) + note;
+        if (accepted.includes(result) || result === 'installCleanupFailed' || result === 'installRolledBack') {
+            await finishAcknowledged(csrf, status.textContent, !accepted.includes(result));
+        } else if (unknown || result === 'uncertain') {
+            const outcome = await reconcileUnknown(csrf, token, accepted);
+            if (active) status.textContent = words[outcome ?? 'observationTimeout'] + (outcome ? '' : note);
+        }
         busy = false;
         updateMutations();
     }
 
     async function recoverInstall({ installRecoveryUrl, nodeId }) {
-        if (busy || flow || requireRefresh) return;
-        busy = true;
-        clearSecrets();
-        updateMutations();
+        if (!active || busy || flow || requireRefresh) return;
+        lockForAction();
         status.textContent = words.working;
+        const csrf = page.dataset.csrf, token = nonce();
         let message = 'installRecoveryUnconfirmed';
         try {
-            const { response, data } = await post(installRecoveryUrl, {});
-            if (response.ok && !noRetry(data) && data?.executionMode === 'rebuild'
+            const { response, data } = await post(installRecoveryUrl, {}, undefined, token, csrf);
+            if (response.ok && !ambiguous(response, data) && !noRetry(data) && data?.executionMode === 'rebuild'
                 && data.status === 'can_install_again' && data.nodeId === nodeId) message = 'canInstallAgain';
             else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE'
                 && data.error.retryAllowed === false && data.error.outcome === undefined && data.outcome === undefined) {
                 message = 'installRecoveryNoState';
             }
         } catch { /* An unconfirmed response is not permission to install. */ }
+        if (!active) return;
         status.textContent = words[message];
-        busy = false;
-        // All outcomes leave this stale view locked. The refresh link only
-        // reads the overview; a subsequent Install needs a separate click.
         requireRefresh = true;
+        if (message === 'canInstallAgain') await finishAcknowledged(csrf, status.textContent);
+        else if (message === 'installRecoveryUnconfirmed') {
+            const outcome = await reconcileUnknown(csrf, token, ['can_install_again']);
+            if (active) status.textContent = words[outcome ? 'canInstallAgain' : 'observationTimeout'];
+        }
+        busy = false;
         updateMutations();
     }
 
@@ -473,37 +708,54 @@
         return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
     }
 
-    for (const button of installs) {
-        button.addEventListener('click', () => {
-            void mutate('install', button.dataset.installUrl, {}, data => data.nodeId === button.dataset.nodeId, button.dataset.nodeId);
+    function bindView() {
+        hideSecrets = Array.from(page.querySelectorAll('[data-secret-url]'), bindSecret);
+        form = page.querySelector('[data-create]');
+        installs = page.querySelectorAll('[data-install-url]');
+        installRecoveries = page.querySelectorAll('[data-install-recovery-url]');
+        accountButtons = page.querySelectorAll('[data-account-action]');
+        admissionButtons = page.querySelectorAll('[data-admission-action]');
+        removeLinks = page.querySelectorAll('[data-remove-link]');
+        recover = page.querySelector('[data-reconcile]');
+        mutations = [...installs, ...installRecoveries, ...accountButtons,
+            ...[form?.querySelector('button[type="submit"]'), recover].filter(Boolean)];
+
+        for (const button of admissionButtons) button.addEventListener('click', () => openAdmission?.(button));
+        for (const link of removeLinks) link.addEventListener('click', event => {
+            if (!isCurrent(link) || busy || flow || requireRefresh) event.preventDefault();
         });
-    }
-    for (const button of installRecoveries) {
-        button.addEventListener('click', () => { void recoverInstall(button.dataset); });
-    }
-    for (const button of accountButtons) {
-        button.addEventListener('click', () => {
-            if (busy || flow || requireRefresh) return;
+        for (const button of installs) button.addEventListener('click', () => {
+            if (!isCurrent(button)) return;
+            const { installUrl, nodeId } = button.dataset;
+            void mutate('install', installUrl, {}, data => data.nodeId === nodeId, nodeId);
+        });
+        for (const button of installRecoveries) button.addEventListener('click', () => {
+            if (isCurrent(button)) void recoverInstall(button.dataset);
+        });
+        for (const button of accountButtons) button.addEventListener('click', () => {
+            if (!isCurrent(button) || busy || flow || requireRefresh) return;
             const { accountAction: action, login, confirm } = button.dataset;
             if (action === 'disable' || (action === 'delete' && window.confirm(`${confirm}\n${login}`))) accountAction(action, login);
         });
+        form?.addEventListener('submit', event => {
+            event.preventDefault();
+            if (!isCurrent(event.currentTarget) || busy || flow || requireRefresh) return;
+            const login = form.querySelector('input').value.trim();
+            if (login === 'relay-bootstrap' || !/^[A-Za-z0-9._@-]{1,64}$/.test(login)) {
+                status.textContent = words.invalidLogin;
+                return;
+            }
+            let password;
+            try { password = generatePassword(); }
+            catch {
+                status.textContent = words.cryptoUnavailable;
+                return;
+            }
+            accountAction('create', login, password);
+        });
+        const button = recover;
+        button?.addEventListener('click', () => { if (isCurrent(button)) void reconcileAccounts(); });
+        updateMutations();
     }
-    form?.addEventListener('submit', event => {
-        event.preventDefault();
-        if (busy || flow || requireRefresh) return;
-        const login = form.querySelector('input').value.trim();
-        if (login === 'relay-bootstrap' || !/^[A-Za-z0-9._@-]{1,64}$/.test(login)) {
-            status.textContent = words.invalidLogin;
-            return;
-        }
-        let password;
-        try { password = generatePassword(); }
-        catch {
-            status.textContent = words.cryptoUnavailable;
-            return;
-        }
-        accountAction('create', login, password);
-    });
-    recover?.addEventListener('click', () => { void reconcileAccounts(); });
-    updateMutations();
+    bindView();
 })();

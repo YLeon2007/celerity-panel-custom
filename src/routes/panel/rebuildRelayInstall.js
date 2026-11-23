@@ -2,6 +2,7 @@
 
 const { publicInstallFailure } = require('../../services/rebuildRelayInstallDiagnostics');
 const { identityChanged, grantEffectStatus, validActor } = require('./rebuildRelayAdmission');
+const { observe } = require('./rebuildL2tpObservation');
 
 function handler(service = () => require('../../services/rebuildService').createRebuildService()) {
     return async (req, res) => {
@@ -10,6 +11,7 @@ function handler(service = () => require('../../services/rebuildService').create
             Object.keys(req.body).some(k => k !== '_csrf')))) {
             return res.status(400).json({ error: { code: 'REBUILD_INVALID_REQUEST', outcome: 'refused' } });
         }
+        const acknowledge = observe(req);
         try {
             // New reservations bind recovery to the same authenticated admin.
             // Never accept an actor (or any recovery witness) from the request body.
@@ -19,6 +21,7 @@ function handler(service = () => require('../../services/rebuildService').create
             if (result?.status !== 'installed' || (result.nodeId !== undefined && result.nodeId !== req.params.id)) {
                 return res.status(503).json({ error: { outcome: 'unknown', retryAllowed: false } });
             }
+            acknowledge('installed');
             return res.json({ executionMode: 'rebuild', status: 'installed', nodeId: req.params.id });
         } catch (error) {
             const failure = publicInstallFailure(error);
