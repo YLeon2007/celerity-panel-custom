@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ FILE = '/etc/strongswan.d/celerity-rebuild-l2tp.conf'
 PAYLOAD = b'charon {\n    routing_table = 0\n    install_routes = no\n}\n'
 MACHINE, TOKEN = 'a' * 32, 'b' * 32
 NET = dict(clientCidr='10.255.1.0/24', tproxyPort=12345, fwmark=77, routeTable=177)
+NETWORK_FIXTURE = runpy.run_path(str(Path(__file__).with_name('helpers') / 'rebuildRelayNetworkFixture.py'))
 
 
 class Files(unittest.TestCase):
@@ -35,6 +37,7 @@ class Files(unittest.TestCase):
         h['install'] = Mock(side_effect=AssertionError('Install forbidden'))
         self.root = ROOT / self._testMethodName
         self.root.mkdir(mode=0o755)
+        h['NETWORK_RUN'] = str(self.root / 'run')
         self.req = dict(machineId=MACHINE, backupId=TOKEN, network=NET, nodeId='c' * 24)
         self.path = self.real(FILE)
         # Preserve real openat, O_NOFOLLOW, mode/owner checks, atomic file ops,
@@ -140,7 +143,7 @@ class Files(unittest.TestCase):
         h = self.h
         payload = {'main': h['encode']({'inbounds': [{'tag':'relay-l2tp-a','port':12345},
             {'tag':'rebuild-relay-ingress','listen':'127.0.0.1','port':23456}]}),
-            'nft': ('create table inet ' + h['TABLE'] + ' {\n    comment "' + TOKEN + '"\n}').encode(),
+            'nft': NETWORK_FIXTURE['nft_source'](Path(__file__).resolve().parents[1] / 'rebuildRelayDirectHost.py', NET, TOKEN),
             'lns': (b'[global]\nport = 1701\n\n[lns default]\n'
                     b'ip range = 10.255.1.10-10.255.1.19\nlocal ip = 10.255.1.1\n'
                     b'require authentication = yes\npppoptfile = /etc/ppp/options.xl2tpd\nlength bit = yes\n'),
@@ -205,7 +208,8 @@ class Files(unittest.TestCase):
         self.units[self.N].update(InvocationID='3' * 32, ActiveState='active', SubState='exited', LoadState='loaded',
             FragmentPath=h['NET'], Type=net['Type'], UnitFileState='static', RequiredBy=self.XL,
             Requires=net.get('Requires', ''), Wants=net['Wants'], After=net['After'],
-            ExecStartPre=f'{{ path={pre.split()[0]} ; argv[]={pre} ; ignore_errors=no ; }}')
+            ExecStartPre=f'{{ path={pre.split()[0]} ; argv[]={pre} ; ignore_errors=no ; }}',
+            ExecStart=NETWORK_FIXTURE['systemctl_start'](h['raw'](after['net'])))
         self.real(h['XRAY']).parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         self.real(h['XRAY']).write_bytes(b'modeled binary identity\n')
         self.policy.update(nft={'marker': TOKEN}, rule=True, route=True)

@@ -12,6 +12,7 @@ const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 const { sameRelayBinding } = require('./rebuildRelayAuthorization');
 const { readRelayAuthority, captureRelayEffect, identityChanged, isIdentityChanged, isGrantAuthorityError } = require('./rebuildRelayEffectAuthority');
 const { isInspectionReason } = require('./rebuildRelayInspection');
+const { isRuntimeForeignChange, isUnconfirmedRuntimeWrite } = require('./rebuildRelayRuntimeRefusal');
 
 const idPattern = /^[a-f0-9]{24}(?![\s\S])/;
 const machinePattern = /^[a-f0-9]{32}(?![\s\S])/;
@@ -280,7 +281,7 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
         const matching = requested.action === action && requested.login === login
             && (action !== 'create' || requested.password === password);
         let phase = 'BLOCKED', uncertainNodeId;
-        let inspectionReason;
+        let inspectionReason, foreignChange = false, inspectionOutcomeUnknown = false;
         let sessionsTerminated = 0;
         const confirmedNodeIds = new Set();
         const verifyAuthority = async () => {
@@ -316,6 +317,13 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
                     try {
                         receipt = await remote.inspectChap(installation, currentUsers, desiredUsers, recheck, revokedLogin);
                     } catch (error) {
+                        if (phase === 'BLOCKED' && isRuntimeForeignChange(error)) {
+                            await recheck();
+                            foreignChange = true;
+                        } else if (isUnconfirmedRuntimeWrite(error)) {
+                            phase = 'OUTCOME_UNKNOWN';
+                            inspectionOutcomeUnknown = true;
+                        }
                         const reason = error?.code === 'REBUILD_L2TP_DIRECT_INSPECT_UNPROVED' && error.inspectionReason;
                         if (isInspectionReason(reason)) {
                             await recheck();
@@ -409,6 +417,8 @@ function createRebuildRelayAccounts({ Node, State, L2tpUser, locks, env = proces
             if (phase === 'BLOCKED' && identityBlocked) phase = 'MANUAL_BLOCK';
             throw fail(phase, { intentId, retryAllowed: false, confirmedNodeIds: [...confirmedNodeIds].sort(),
                 ...(identityBlocked && { identityBlocked }),
+                ...(foreignChange && { runtimeForeignChange: true }),
+                ...(inspectionOutcomeUnknown && { outcome: 'unknown' }),
                 ...(inspectionReason && { inspectionReason }),
                 // Do not attribute closures from a different pending action to the requested mutation.
                 ...(revokedLogin && (!requested.action || matching) && { confirmedSessionsTerminated: sessionsTerminated,

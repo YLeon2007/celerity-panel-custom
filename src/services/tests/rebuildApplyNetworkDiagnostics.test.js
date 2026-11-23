@@ -4,12 +4,14 @@ const assert = require('node:assert/strict');
 const { createTransport } = require('../rebuildTransport');
 const logger = require('../../utils/logger');
 
-const machineId = '1'.repeat(32), backupId = '2'.repeat(32), proof = '3'.repeat(64);
-const installation = { rebuildMachineId: machineId, backupId,
+const machineId = '1'.repeat(32), backupId = '2'.repeat(32), proof = '3'.repeat(64), published = '4'.repeat(64);
+const nodeId = '5'.repeat(24);
+const installation = { node: nodeId, rebuildMachineId: machineId, backupId,
     rebuildInstallToken: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
     clientCidr: '10.20.30.0/24', fwmark: 77, routeTable: 177, tproxyPort: 12345 };
-const phases = ['check', 'prepare', 'verify_before_restart', 'restart', 'verify_after_restart'];
-const actions = ['check', 'prepare', 'verify', 'restart', 'verify'].map(x => `${x}-apply-network`);
+const phases = ['check', 'prepare', 'verify_before_restart', 'publish', 'restart', 'verify_after_restart'];
+const actions = ['check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'publish-apply-profiles',
+    'restart-apply-network', 'finalize-apply-profiles'];
 const unknown = 'REBUILD_L2TP_APPLY_NETWORK_OUTCOME_UNKNOWN';
 const refused = 'REBUILD_L2TP_APPLY_NETWORK_REFUSED';
 const identity = 'REBUILD_L2TP_IDENTITY_CHANGED';
@@ -33,14 +35,21 @@ async function exercise(t, at, respond, expectedClass, code, options = {}) {
             if (cmd.includes('LoadState')) return { code: 0, stdout: cmd.includes('xray-bridge') ? 'not-found' : 'loaded' };
             if (cmd.includes('ExecStart')) return { code: 0, stdout: 'path=/usr/local/bin/xray ; -config /usr/local/etc/xray/config.json ;' };
             if (!cmd.startsWith('/usr/bin/timeout ')) return { code: 0, stdout: '', stderr: '' };
-            const action = JSON.parse(opts.stdin).action;
+            const request = JSON.parse(opts.stdin), { action } = request;
             seen.push(action);
+            if (action === 'publish-apply-profiles') {
+                assert.equal(request.nodeId, nodeId);
+                assert.equal(request.proof, proof);
+                const sha = require('node:crypto').createHash('sha256').update('{"inbounds":[],"outbounds":[]}').digest('hex');
+                assert.deepEqual(request.profiles, { main: sha, bridge: sha });
+            }
+            if (action === 'restart-apply-network' || action === 'finalize-apply-profiles') assert.equal(request.proof, published);
             if (action === 'restart-apply-network' && options.effectBeforeLoss) modeledRestarts++;
-            return seen.length - 1 === at ? respond() : ok;
+            return seen.length - 1 === at ? respond() : (seen.length >= 4 ? { ...ok, stdout: ok.stdout.replace(proof, published) } : ok);
         }
         disconnect() {}
     }
-    const bound = createTransport({}, SSH, { machineId, installation, merged: true,
+    const bound = createTransport({ _id: nodeId }, SSH, { machineId, installation, merged: true,
         verify: async () => { if (guardArmed && options.guardFails) lost(); } });
     const apply = async () => {
         await bound.attest();
@@ -54,7 +63,7 @@ async function exercise(t, at, respond, expectedClass, code, options = {}) {
         if (!code) await apply();
         else await assert.rejects(apply(), err => {
             assert.equal(err.code, code);
-            assert.equal(err.remoteOutcomeUncertain, code === unknown && [1, 3].includes(at) ? true : undefined);
+            assert.equal(err.remoteOutcomeUncertain, code === unknown && [1, 3, 4, 5].includes(at) ? true : undefined);
             return true;
         });
     } finally { guardArmed = false; await bound.close(); }
@@ -78,7 +87,42 @@ for (const [label, response, kind, code] of [
     ['other nonzero status', { ...frame, code: 23 }, 'other_nonzero_exit', unknown],
     ['malformed success frame', { ...ok, stdout: privateText }, 'invalid_reply', unknown],
     ['wrong proof', { ...ok, stdout: ok.stdout.replace(proof, 'a'.repeat(64)) }, 'invalid_reply', unknown],
-]) test(`Apply restart: ${label}`, t => exercise(t, 3, () => response, kind, code));
+]) test(`Apply restart: ${label}`, t => exercise(t, 4, () => response, kind, code));
 test('local guard rejection is not a lost SSH result', t => exercise(t, 0, lost, 'local_check', unknown, { guardFails: true }));
-test('logging failure cannot replace the unknown outcome', t => exercise(t, 3, lost, 'ssh_no_reply', unknown, { brokenLogger: true }));
+test('logging failure cannot replace the unknown outcome', t => exercise(t, 4, lost, 'ssh_no_reply', unknown, { brokenLogger: true }));
 test('acknowledged Apply emits no failure event', t => exercise(t, -1, null));
+
+test('preview checks project an exact runtime refusal without ever sending reattestation', async t => {
+    const nodeId = '4'.repeat(24);
+    const actions = [];
+    let stdout = '', stderr = 'DIRECT_RUNTIME_FOREIGN_CHANGE\n';
+    t.mock.method(logger, 'warn', () => {});
+    class SSH {
+        async connectDirectOnce() {
+            return async (_cmd, options) => {
+                const action = JSON.parse(options.stdin).action;
+                actions.push(action);
+                assert.equal(action, 'check-apply-network');
+                return { code: 70, stdout, stderr };
+            };
+        }
+        async exec(cmd) {
+            assert.equal(cmd, '/usr/bin/head -c 34 /etc/machine-id');
+            return { code: 0, stdout: machineId, stderr: '' };
+        }
+        disconnect() {}
+    }
+    const bound = createTransport({ _id: nodeId }, SSH, { machineId, merged: true,
+        installation: { ...installation, node: nodeId }, verify: async () => {} });
+    const check = () => bound.checkActivation({ readOnly: true });
+    try {
+        await bound.attest();
+        await assert.rejects(check(), { code: refused, reason: 'RUNTIME_FOREIGN_CHANGE' });
+        stdout = privateText;
+        await assert.rejects(check(), { code: unknown });
+        stdout = '';
+        stderr = 'DIRECT_RUNTIME_REATTEST_REQUIRED\n';
+        await assert.rejects(check(), { code: 'REBUILD_L2TP_DIRECT_RUNTIME_REATTEST_REQUIRED' });
+    } finally { await bound.close(); }
+    assert.deepEqual(actions, Array(3).fill('check-apply-network'));
+});

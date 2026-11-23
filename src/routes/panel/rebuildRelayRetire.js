@@ -4,6 +4,7 @@ const { randomBytes } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { requireAuth } = require('./helpers');
 const { validNodeId, validActor } = require('./rebuildRelayAdmission');
+const { neighborRefusalForError } = require('../../services/rebuildNeighborRefusal');
 
 const retirePath = /^\/rebuild\/relays\/[^/]+\/retire\/(?:preview|confirm)$/;
 const invalid = 'REBUILD_RETIRE_INVALID_REQUEST';
@@ -71,6 +72,8 @@ async function sendPreview(req, res, nodeId, stale) {
         const body = stale ? { error: { code: changed }, preview } : { preview };
         return res.status(stale ? 409 : 200).type('application/json').end(JSON.stringify(body));
     } catch (error) {
+        const refusal = neighborRefusalForError(error);
+        if (refusal) return res.status(409).json({ error: refusal });
         const code = safeRefusal(error);
         return code ? respondError(res, 409, code) : respondError(res, 503, unavailable);
     }
@@ -96,6 +99,8 @@ async function confirm(req, res, nodeId) {
         if (error?.code === changed && error.outcome !== 'unknown' && error.retryAllowed !== false) {
             return entry.decision === 'abandon' ? respondError(res, 409, changed) : sendPreview(req, res, nodeId, true);
         }
+        const refusal = neighborRefusalForError(error);
+        if (refusal) return res.status(409).json({ error: refusal });
         const code = safeRefusal(error);
         if (code) return respondError(res, 409, code);
     }

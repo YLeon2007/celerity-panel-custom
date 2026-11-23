@@ -257,6 +257,15 @@
             allowed: allowed.join(', ') });
     }
 
+    function neighborRefusal(status, error) {
+        const labels = previewLabels?.neighbor;
+        if (!rebuild || !labels || status !== 409 || error?.code !== 'REBUILD_RETIRE_NEIGHBOR_REFUSED') return '';
+        const name = typeof error.neighborName === 'string' && error.neighborName.length <= 160
+            && /^[\p{L}\p{M}\p{N} ._()#–—-]+(?![\s\S])/u.test(error.neighborName) ? error.neighborName : labels.neighborUnknown;
+        return labels.neighborRefused.replace('{name}', () => name)
+            + (error.reason === 'RUNTIME_FOREIGN_CHANGE' ? ' ' + labels.neighborRuntimeForeignChange : '');
+    }
+
     async function fetchInPanel(path, options) {
         const url = new URL(path, window.location.origin);
         if (url.origin !== window.location.origin || url.username || url.password) throw new Error('Invalid panel URL');
@@ -398,6 +407,12 @@
                 headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }, sessionToken);
             report = await response.json();
             if (!response.ok) {
+                const neighbor = neighborRefusal(response.status, report?.error);
+                if (neighbor) {
+                    await showRebuildPreview({ title: previewLabels.refused, warning: neighbor, details: '', allowed: false,
+                        applyLabel: previewLabels.apply });
+                    throw new RebuildPreviewStopped(neighbor);
+                }
                 const refusal = fingerprintRefusal(response.status, report);
                 if (refusal) {
                     await showRebuildPreview({ title: previewLabels.refused, warning: refusal, details: '', allowed: false,
@@ -567,10 +582,11 @@
     async function handleDraftMutationResponse(response, expectedKind, expectedLinkId) {
         const payload = await response.json().catch(() => ({}));
         const refusal = fingerprintRefusal(response.status, payload);
+        const neighbor = neighborRefusal(response.status, payload?.error);
         const errorMessage = (payload.desiredSaved === true
             ? ((refusal && fingerprintLabels?.savedNotApplied) || i18n.savedApplyUnconfirmed
                 || 'Изменения сохранены; принятие применения не подтверждено. Обновите топологию.') + ' ' : '')
-            + (refusal || describeTopologyError(payload, 'HTTP ' + response.status));
+            + (neighbor || refusal || describeTopologyError(payload, 'HTTP ' + response.status));
         if (response.status === 409) {
             await loadTopology();
             showToast((i18n.networkError || 'Error') + ': ' + errorMessage, 'error');

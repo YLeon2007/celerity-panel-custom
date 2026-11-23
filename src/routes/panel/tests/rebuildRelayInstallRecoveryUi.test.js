@@ -29,7 +29,7 @@ test('localized recovery is rendered only for an eligible installing card and an
         assert.ok(html.includes(`>${ejs.escapeXML(copy.recoverInstall)}<`));
         assert.ok(html.includes(`>${ejs.escapeXML(copy.refresh)}<`));
         assert.ok(html.includes(`>${ejs.escapeXML(copy.status.installing)}<`));
-        for (const message of ['working', 'canInstallAgain', 'installRecoveryUnconfirmed']) {
+        for (const message of ['working', 'canInstallAgain', 'installRecoveryUnconfirmed', 'installRecoveryNoState']) {
             assert.equal(typeof copy.messages[message], 'string');
             assert.ok(html.includes(ejs.escapeXML(copy.messages[message])));
         }
@@ -137,6 +137,20 @@ test('one explicit click sends only empty JSON and waits for the bound success r
     assert.equal(f.recovery.disabled, true);
     assert.equal(f.install.disabled, true);
     f.recovery.click();
+    assert.equal(f.calls.length, 1);
+});
+
+test('empty recovery reports a refresh-only result, not permission to reinstall', async () => {
+    const f = await launch();
+    f.recovery.click();
+    f.resolve({ ok: false, status: 409, json: async () => ({ error: {
+        code: 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE', retryAllowed: false, detail: '/private/path',
+    } }) });
+    await f.next();
+    assert.equal(f.status.textContent, require('../../../locales/ru.json').rebuildL2tp.messages.installRecoveryNoState);
+    assert.equal(f.refresh.hidden, false);
+    assert.equal(f.recovery.disabled, true);
+    assert.equal(f.install.disabled, true);
     assert.equal(f.calls.length, 1);
 });
 

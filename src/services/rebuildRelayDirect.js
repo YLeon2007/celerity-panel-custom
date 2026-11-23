@@ -28,6 +28,13 @@ const MACHINE_ID_FRAME = /^([a-f0-9]{32})\n?(?![\s\S])/;
 const PIN = /^[a-f0-9]{64}$/;
 const TOKEN = /^[a-f0-9]{32}$/;
 const CHAP_ACTIONS = ['check-chap', 'sync-chap', 'inspect-chap', 'read-chap-generation', 'fence-chap'];
+const RUNTIME_READS = new Set(['session-count', 'retirement-count', 'inspect-chap', 'check-chap', 'read-chap-generation', 'prepare-remove']);
+const runtimeReattestRequired = Symbol('authenticated runtime reattestation refusal');
+const runtimeReattestFrame = result => result?.code === 70 && result.stdout === ''
+    && result.stderr === 'DIRECT_RUNTIME_REATTEST_REQUIRED\n';
+const runtimeForeignFrame = result => result?.code === 70 && result.stdout === ''
+    && result.stderr === 'DIRECT_RUNTIME_FOREIGN_CHANGE\n';
+const runtimeIdentityFrame = result => result?.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_IDENTITY\n';
 const directRefusals = new Set(['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
     'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED']);
 const refusalFrame = /^DIRECT_(NO_WRITE_)?([A-Z][A-Z0-9_]*)\n(?![\s\S])/;
@@ -45,6 +52,23 @@ const ipv4 = value => typeof value === 'string' && isIPv4(value)
     ? value.split('.').reduce((acc, octet) => acc * 256 + Number(octet), 0) : NaN;
 const safeSecret = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/.test(value);
 const tokenMatches = (re, value) => typeof value === 'string' && re.test(value);
+
+async function readWithRuntimeReattestation(read, reattest) {
+    try { return await read(); }
+    catch (error) { if (error !== runtimeReattestRequired) throw error; }
+    if (reattest) await reattest();
+    else throw fail('DIRECT_RUNTIME_REATTEST_REQUIRED');
+    // The ACK is not an observation. Only the original read, run once more
+    // with its original inputs and authority, can yield a fresh observation.
+    try { return await read(); }
+    catch (error) {
+        if (error === runtimeReattestRequired) throw fail('DIRECT_RUNTIME_REATTEST_REQUIRED');
+        throw error;
+    }
+}
+
+const runtimeAck = (result, backupId) => result?.code === 0 && result.stderr === ''
+    && result.stdout === installReplyFrame({ ok: true, backupId });
 
 function removeNetwork(value, invalid = 'REMOVE_INPUT_INVALID') {
     const keys = ['clientCidr', 'tproxyPort', 'fwmark', 'routeTable'];
@@ -139,43 +163,72 @@ function buildFiles(d, profiles, backupId) {
 }
 
 let directScript;
+// Seven base-120 digits carry six bytes. The SSH exec string (no PTY) and
+// POSIX single quotes preserve this ASCII alphabet verbatim. Exclude NUL,
+// CR/LF, EOF/DEL and both layers' quote/escape characters.
+const directAlphabet = Array.from({ length: 127 }, (_, i) => i + 1)
+    .filter(i => ![10, 13, 26, 34, 39, 92, 127].includes(i)).map(i => String.fromCharCode(i)).join('');
 function encodeDirectBytes(bytes) {
-    // RFC 1924 alphabet (Python b85decode). No quotes, backslashes or
-    // whitespace, so the result fits both Python string and shell quoting.
-    const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~';
     let packed = '';
-    for (let i = 0; i < bytes.length; i += 4) {
-        const length = Math.min(bytes.length - i, 4);
+    for (let i = 0; i < bytes.length; i += 6) {
         let word = 0;
-        for (let j = 0; j < 4; j++) word = word * 256 + (j < length ? bytes[i + j] : 0);
+        for (let j = 0; j < 6; j++) word = word * 256 + (bytes[i + j] ?? 0);
         let part = '';
-        for (let j = 0; j < 5; j++) {
-            part = alphabet[word % 85] + part;
-            word = Math.floor(word / 85);
+        for (let j = 0; j < 7; j++) {
+            part = directAlphabet[word % 120] + part;
+            word = Math.floor(word / 120);
         }
-        packed += part.slice(0, length + 1);
+        packed += part;
     }
     return packed;
 }
 
 function bundleDirectScript() {
-    const pack = path => encodeDirectBytes(deflateSync(readFileSync(join(__dirname, path))));
-    const load = (key, path, name, filename) =>
-        `${key}={"__name__":"${name}","__file__":"${filename}"};exec(_c3_compile("${pack(path)}","${filename}"),${key})`;
+    // Compress a single stream to share the zlib window across sources, but
+    // compile the original bytes separately in their original namespaces.
+    const sources = ['../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'rebuildRelayStockRuntime.py',
+        'rebuildRelayPackageGuard.py', 'rebuildRelayDirectHost.py'].map(path => readFileSync(join(__dirname, path)));
+    const offsets = sources.reduce((indexes, source) => [...indexes, indexes.at(-1) + source.length], [0]);
+    const joined = Buffer.concat(sources);
+    // Give frequent identifiers and whitespace runs a one-byte representation
+    // before deflate. Only use byte values absent from the original sources:
+    // UTF-8 and all other original bytes must survive without normalization.
+    const text = joined.toString('latin1'), tokens = /\b[A-Za-z_][A-Za-z0-9_]{2,}\b| {2,}/g;
+    const counts = new Map();
+    for (const [word] of text.matchAll(tokens)) counts.set(word, (counts.get(word) || 0) + 1);
+    const dictionary = {}, codes = new Map();
+    const available = Array.from({ length: 128 }, (_, i) => i + 128).filter(byte => !joined.includes(byte));
+    const savings = ([word, count]) => (word.length - 1) * (count - 1);
+    [...counts].filter(item => savings(item) > 0).sort((a, b) => savings(b) - savings(a))
+        .slice(0, available.length).forEach(([word], i) => {
+            dictionary[available[i]] = word;
+            codes.set(word, String.fromCharCode(available[i]));
+        });
+    const packed = Buffer.from(`${JSON.stringify(dictionary)}\n${text.replace(tokens, word => codes.get(word) ?? word)}`, 'latin1');
+    const compressed = deflateSync(packed, { level: 9 });
+    const load = (key, index, name, filename) =>
+        `${key}={"__name__":"${name}","__file__":"${filename}"};exec(_c3_compile(${index},"${filename}"),${key})`;
     // These are fixed repository sources, not imports from the remote working
     // directory. Non-main namespaces keep their standalone entrypoints inert.
     return [
-        'import base64,zlib',
-        '_c3_compile=lambda data,filename:compile(zlib.decompress(base64.b85decode(data)),filename,"exec")',
+        'import zlib,functools,json,re',
+        `_c3_digits={c:i for i,c in enumerate("${directAlphabet}")}`,
+        '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(6,"big")',
+        `_c3_payload="${encodeDirectBytes(compressed)}"`,
+        `_c3_dict,_,_c3_packed=zlib.decompress(b"".join(_c3_chunk(_c3_payload[i:i+7]) for i in range(0,len(_c3_payload),7))[:${compressed.length}]).partition(b"\\n")`,
+        '_c3_words={int(k):v.encode("ascii") for k,v in json.loads(_c3_dict).items()}',
+        '_c3_sources=re.sub(rb"[\\x80-\\xff]",lambda m:_c3_words.get(m[0][0],m[0]),_c3_packed)',
+        `_c3_offsets=${JSON.stringify(offsets)}`,
+        '_c3_compile=lambda n,filename:compile(_c3_sources[_c3_offsets[n]:_c3_offsets[n+1]],filename,"exec")',
         // Runtime's standalone path calculation needs an absolute __file__
         // with parents; the direct host gets the ensure code as a separate dict.
-        load('C3_STOCK_RUNTIME', 'rebuildRelayStockRuntime.py', 'c3_stock_runtime',
+        load('C3_STOCK_RUNTIME', 1, 'c3_stock_runtime',
             '/__c3_direct__/services/rebuildRelayStockRuntime.py'),
-        load('C3_STOCK_ENSURE', '../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'c3_stock_ensure',
+        load('C3_STOCK_ENSURE', 0, 'c3_stock_ensure',
             '/__c3_direct__/modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'),
-        load('C3_PACKAGE_GUARD', 'rebuildRelayPackageGuard.py', 'c3_package_guard',
+        load('C3_PACKAGE_GUARD', 2, 'c3_package_guard',
             '/__c3_direct__/services/rebuildRelayPackageGuard.py'),
-        `exec(_c3_compile("${pack('rebuildRelayDirectHost.py')}","<DIRECT host>"))`,
+        'exec(_c3_compile(3,"<DIRECT host>"))',
     ].join(';');
 }
 
@@ -251,8 +304,9 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         const chap = CHAP_ACTIONS.includes(action);
         const packageWrite = action === 'prepare-packages';
         const recovery = action === 'reconcile-install';
+        const reattest = action === 'reattest-runtime';
         const guarded = chap || packageWrite || recovery || action === 'install' || (merged && write)
-            || (action === 'remove' && verifyRemoveStdin === true);
+            || reattest || (action === 'remove' && verifyRemoveStdin === true) || (RUNTIME_READS.has(action) && verifyLock !== undefined);
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         await checkBinding();
         await connect(count ? 5000 : CONNECT_TIMEOUT_MS);
@@ -266,7 +320,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         requireThat(!closed && !poisoned, 'DIRECT_CLOSED');
         const stdin = JSON.stringify({ action, machineId, ...params });
         requireThat(Buffer.byteLength(stdin) <= 25 * 1024 * 1024, 'INSTALL_INPUT_INVALID');
-        let identityRefusal;
+        let identityRefusal, localReadVeto;
         const verifyBeforeStdin = async () => {
             try {
                 requireThat(busy && !closed && !poisoned, 'DIRECT_UNAVAILABLE');
@@ -277,6 +331,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
                 // The SSH wrapper sanitizes stdin errors; preserve a local
                 // identity veto made before the stream is allowed to write.
                 if (isIdentityChanged(error)) identityRefusal = error;
+                if (reattest || RUNTIME_READS.has(action)) localReadVeto = { error };
                 poison();
                 throw error;
             }
@@ -295,14 +350,22 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             result = await execPinned(command, {
                 stdin, timeout,
                 ...(packageWrite && { maxOutputBytes: 160 }),
-                ...(recovery && { maxOutputBytes: 256 }),
+                ...((recovery || reattest) && { maxOutputBytes: 256 }),
             }, verifyBeforeStdin);
         } catch (error) {
             if (dispatch && !SSH && Transport.execStdinWasNotAttempted(error)) dispatch.possible = false;
+            if (localReadVeto) throw localReadVeto.error;
+            if (reattest && !SSH && Transport.execStdinWasNotAttempted(error)) throw fail('SSH_CONNECT_FAILED');
             throw identityRefusal ?? unknown();
         }
         try { await checkBinding(); }
         catch (error) { if (write && !isIdentityChanged(error)) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
+        if (reattest) {
+            if (!closed && runtimeAck(result, params.backupId)) return;
+            if (!closed && runtimeIdentityFrame(result)) { poison(); throw identityChanged(); }
+            if (!closed && runtimeForeignFrame(result)) throw fail('DIRECT_RUNTIME_FOREIGN_CHANGE');
+            throw unknown();
+        }
         // A verified diagnostic on rc75 is informational only. Missing or
         // tainted frames take the very same unknown/poison path without a hint.
         if (packageWrite && result?.code === 75) throw withInstallCheck(unknown(), packageWriteCheck(result));
@@ -317,6 +380,10 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             // A package-phase refusal isn't an Install no-write certificate.
             // Whatever stopped the helper, do not infer package settlement.
             if (packageWrite) throw withInstallCheck(unknown(), packageWriteCheck(result));
+            if (RUNTIME_READS.has(action) && !closed) {
+                if (runtimeReattestFrame(result)) throw runtimeReattestRequired;
+                if (runtimeForeignFrame(result)) throw fail('DIRECT_RUNTIME_FOREIGN_CHANGE');
+            }
             if (action === 'inspect-chap') {
                 const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
                 if (!reason) throw unknown();
@@ -381,6 +448,16 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         requireThat(typeof check === 'function', 'DIRECT_LOCK_REQUIRED');
         requireThat(await check() !== false, 'DIRECT_LOCK_REQUIRED');
     }
+    function readInstalled(action, params, validate, verifyLock) {
+        const { backupId, network } = params;
+        const installation = { nodeId, backupId, network };
+        return readWithRuntimeReattestation(() => exec(action, params, false, validate, verifyLock), async () => {
+            requireThat(nodeId.length === 24 && tokenMatches(/^[a-f0-9]{24}$/, nodeId), 'DIRECT_RUNTIME_REATTEST_REQUIRED');
+            await lock(verifyLock);
+            await exec('reattest-runtime', installation, true, undefined, verifyLock);
+            await lock(verifyLock);
+        });
+    }
     const exactAck = backupId => value => value?.ok === true && value.backupId === backupId;
     const installAck = backupId => value => exactKeys(value, ['ok', 'backupId']) && exactAck(backupId)(value);
     const validGeneration = value => value?.length === 32 && tokenMatches(TOKEN, value);
@@ -410,13 +487,13 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         if (retire) {
             // Read only the CAS preimage, not the CHAP/PPP projection. The
             // coordinator must inspect again after the retirement is durable.
-            const preimage = await exec('read-chap-generation', binding, false, value => exactAck(backupId)(value)
+            const preimage = await readInstalled('read-chap-generation', binding, value => exactAck(backupId)(value)
                 && Object.keys(value).length === 3 && (value.generation === null || validGeneration(value.generation)), verifyLock);
             await lock(verifyLock);
             params.generation = preimage.generation;
         }
         const draining = revoke && sync;
-        const reply = await exec(action, params, write, value => {
+        const validate = value => {
             if (!exactAck(backupId)(value)) return false;
             if (retire) return Object.keys(value).length === 3 && value.fenced === true;
             const versioned = Object.hasOwn(value, 'generation');
@@ -427,7 +504,9 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             return typeof value.changed === 'boolean' && (draining ? keys === 5
                 && integer(value.sessionsTerminated, 0, Number.MAX_SAFE_INTEGER) && typeof value.complete === 'boolean'
                 : keys === 3);
-        }, verifyLock);
+        };
+        const reply = RUNTIME_READS.has(action) ? await readInstalled(action, params, validate, verifyLock)
+            : await exec(action, params, write, validate, verifyLock);
         try {
             await lock(verifyLock);
             requireThat(!closed, 'DIRECT_CLOSED');
@@ -444,7 +523,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         return draining ? { changed, sessionsTerminated, complete } : { changed };
     });
 
-    const sessionCount = (input, retirement) => serial(async () => {
+    const sessionCount = (input, retirement, verifyLock) => serial(async () => {
         const invalid = 'SESSION_COUNT_INPUT_INVALID';
         requireThat(input?.nodeId === nodeId
             && ['nodeId', 'backupId', 'network'].every(key => Object.hasOwn(input, key))
@@ -456,8 +535,8 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         const params = { nodeId, backupId, network,
             ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
             ...(input.transit !== undefined && { transit: structuredClone(input.transit) }) };
-        return retirement ? exec('retirement-count', params, false, validRetirementCensus)
-            : exec('session-count', params, false, validCensus);
+        return retirement ? readInstalled('retirement-count', params, validRetirementCensus, verifyLock)
+            : readInstalled('session-count', params, validCensus, verifyLock);
     });
 
     return Object.freeze({
@@ -485,8 +564,8 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         syncChap: (...args) => chapOperation('sync-chap', ...args),
         inspectChap: (...args) => chapOperation('inspect-chap', ...args),
         fenceChap: (...args) => chapOperation('fence-chap', ...args),
-        readSessionCount: input => sessionCount(input, false),
-        readRetirementCount: input => sessionCount(input, true),
+        readSessionCount: (input, verifyLock) => sessionCount(input, false, verifyLock),
+        readRetirementCount: (input, verifyLock) => sessionCount(input, true, verifyLock),
         prepare: input => serial(async () => {
             requireThat(!held && (!packageAttempt || packageAttempt.ready) && input?.nodeId === nodeId && typeof input.carryDomain === 'boolean'
                 && Array.isArray(input.controlPlaneAddresses), 'INSTALL_INPUT_INVALID');
@@ -585,7 +664,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
                 throw error;
             });
         },
-        prepareRemove: input => serial(async () => {
+        prepareRemove: (input, verifyLock) => serial(async () => {
             const invalid = 'REMOVE_INPUT_INVALID';
             requireThat(!held && input?.nodeId === nodeId
                 && Object.keys(input).every(key => ['nodeId', 'backupId', 'network', 'transit', 'expectedCensus', 'currentUsers', 'retirement', 'drain'].includes(key))
@@ -601,9 +680,9 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
                 ...(Object.hasOwn(input, 'currentUsers') && { currentUsers: chapUsers(input.currentUsers, invalid) }),
                 ...(input.transit !== undefined && { transit: structuredClone(input.transit) }),
                 ...(retirement && { retirement: true, expectedCensus, ...(drain && { drain: true }) }) };
-            const proof = await exec('prepare-remove', params, false, value => exactAck(params.backupId)(value)
+            const proof = await readInstalled('prepare-remove', params, value => exactAck(params.backupId)(value)
                 && tokenMatches(TOKEN, value.machineId) && typeof value.baseline === 'string' && value.baseline.length === 64
-                && PIN.test(value.baseline));
+                && PIN.test(value.baseline), verifyLock);
             if (proof.machineId !== machineId) { poison(); throw identityChanged(); }
             const plan = Object.freeze({});
             held = { plan, params: { ...params, baseline: proof.baseline, ...(hasCensus && { expectedCensus }) },
@@ -637,21 +716,51 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
     });
 }
 
-async function applyRelayNetwork(run, machineId, state, action, proof, merged = false) {
+async function applyRelayNetwork(run, machineId, state, action, proof, merged = false, runtime, publication) {
     const invalid = 'APPLY_NETWORK_NOT_OWNED';
     const { backupId, rebuildMachineId, clientCidr, tproxyPort, fwmark, routeTable } = state;
     requireThat(rebuildMachineId === machineId && backupId?.length === 32 && tokenMatches(TOKEN, backupId)
         && typeof state.rebuildInstallToken === 'string' && state.rebuildInstallToken.length === 36
         && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(state.rebuildInstallToken), invalid);
     const network = removeNetwork({ clientCidr, tproxyPort, fwmark, routeTable }, invalid);
-    const unknown = () => fail('APPLY_NETWORK_OUTCOME_UNKNOWN', ['prepare-apply-network', 'restart-apply-network'].includes(action));
-    let result;
-    try {
-        result = await run(directCommand('-k 4s 125s'), { timeout: TIMEOUT,
-            stdin: JSON.stringify({ action, machineId, backupId, network, ...(proof !== undefined && { proof }) }) });
-    } catch (error) { if (isIdentityChanged(error)) throw error; throw unknown(); }
+    const publishing = action === 'publish-apply-profiles';
+    const finalizing = action === 'finalize-apply-profiles';
+    if (publishing) requireThat(publication && publication.nodeId === String(state.node ?? '')
+        && tokenMatches(/^[a-f0-9]{24}$/, publication.nodeId), invalid);
+    const unknown = () => fail('APPLY_NETWORK_OUTCOME_UNKNOWN', publishing || finalizing
+        || ['prepare-apply-network', 'restart-apply-network'].includes(action));
+    const read = async () => {
+        let result;
+        try {
+            result = await run(directCommand('-k 4s 125s'), { timeout: TIMEOUT,
+                stdin: JSON.stringify({ action, machineId, backupId, network, ...(proof !== undefined && { proof }),
+                    ...(publishing && { nodeId: publication.nodeId, stageId: publication.stageId,
+                        profiles: publication.profiles, bridgeUnit: publication.bridgeUnit }) }) });
+        } catch (error) { if (isIdentityChanged(error)) throw error; throw unknown(); }
+        // Pipeline Verify is bound to a previous proof and can follow live
+        // writes. Do not change its epoch or replay any part of activation.
+        if (['check-apply-network', 'verify-apply-network'].includes(action) && runtimeReattestFrame(result)) {
+            throw runtimeReattestRequired;
+        }
+        if (action === 'check-apply-network' && runtimeForeignFrame(result)) throw foreign();
+        return result;
+    };
+    const foreign = () => Object.assign(fail('APPLY_NETWORK_REFUSED'), { reason: 'RUNTIME_FOREIGN_CHANGE' });
+    const reattest = action === 'check-apply-network' && typeof runtime?.run === 'function' ? async () => {
+        const { nodeId } = runtime;
+        requireThat(nodeId?.length === 24 && tokenMatches(/^[a-f0-9]{24}$/, nodeId)
+            && String(state.node ?? '') === nodeId, 'APPLY_NETWORK_NOT_OWNED');
+        const uncertain = () => fail('APPLY_NETWORK_OUTCOME_UNKNOWN', true);
+        const response = await runtime.run(directCommand('-k 4s 125s'), { timeout: TIMEOUT, maxOutputBytes: 256,
+            stdin: JSON.stringify({ action: 'reattest-runtime', machineId, nodeId, backupId, network }) });
+        if (runtimeIdentityFrame(response)) throw identityChanged();
+        if (runtimeForeignFrame(response)) throw foreign();
+        if (!runtimeAck(response, backupId)) throw uncertain();
+    } : undefined;
+    const result = await readWithRuntimeReattestation(read, reattest);
     if (merged && result?.code === 70 && result.stdout === '' && result.stderr === 'DIRECT_IDENTITY\n') throw identityChanged();
     if (result?.code === 70 && result.stdout === '' && /^DIRECT_(?:ROLLBACK_DRIFT|IDENTITY|PREREQUISITE|RUNTIME_UNPROVED|CANDIDATE_INVALID|COMMAND_FAILED)\n$(?![\s\S])/.test(result.stderr)) {
+        if (finalizing) throw unknown();
         throw fail('APPLY_NETWORK_REFUSED');
     }
     if (result?.code !== 0 || result.stderr !== '' || typeof result.stdout !== 'string' || result.stdout.length > 140) throw unknown();
@@ -659,7 +768,7 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
     try { reply = JSON.parse(result.stdout); } catch { throw unknown(); }
     if (reply?.ok !== true || reply.backupId !== backupId || reply.proof?.length !== 64 || !tokenMatches(PIN, reply.proof)
         || result.stdout !== `${JSON.stringify({ ok: true, backupId, proof: reply.proof })}\n`
-        || (proof !== undefined && proof !== reply.proof)) throw unknown();
+        || (proof !== undefined && (publishing ? proof === reply.proof : proof !== reply.proof))) throw unknown();
     return reply.proof;
 }
 

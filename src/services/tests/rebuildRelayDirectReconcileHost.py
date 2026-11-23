@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import runpy
 import shlex
 import stat
 import sys
@@ -17,6 +18,8 @@ frame = json.load(sys.stdin)
 source = shlex.split(frame['command'])[-1]
 request = frame['wire']
 old = frame.get('old')
+HOST = pathlib.Path(__file__).resolve().parents[1] / 'rebuildRelayDirectHost.py'
+NETWORK_FIXTURE = runpy.run_path(str(HOST.parent / 'tests/helpers/rebuildRelayNetworkFixture.py'))
 
 
 def deny_native(event, args):
@@ -105,6 +108,11 @@ def model(scope):
         return machine
 
     def command(*args, **kwargs):
+        if scenario == 'rollback-policy-start' and args == ('/usr/sbin/nft', '-j', 'list', 'tables'):
+            return scope['encode']({'nftables': nft_rows[:2] if state['nft'] else nft_rows[:1]})
+        if scenario == 'rollback-policy-start' and args == ('/usr/sbin/nft', '-j', '-s', '-a', 'list', 'table', 'inet', scope['TABLE']):
+            assert state['nft']
+            return scope['encode']({'nftables': nft_rows})
         if args[:-1] in ((scope['MODPROBE'], '--show-depends', '--'),
                          (scope['MODPROBE'], '--show-depends', '--use-blacklist', '--')):
             assert args[-1] in state['missing']
@@ -155,6 +163,13 @@ def model(scope):
         if verb == 'daemon-reload':
             if physical(scope['NET']).exists():
                 units[NET].update(LoadState='loaded', FragmentPath=scope['NET'])
+                if scenario == 'rollback-policy-start':
+                    unit = physical(scope['NET']).read_bytes()
+                    units[NET].update(Type='oneshot', UnitFileState='static', User='', Group='', NeedDaemonReload='no',
+                        PrivateNetwork='no',
+                        Wants=X, Requires='', After=X,
+                        ExecStart=NETWORK_FIXTURE['systemctl_start'](unit),
+                        ExecStartPre=f'{{ path=/usr/bin/systemctl ; argv[]={scope["NETWORK_START_CHECK"]} ; ignore_errors=no ; pid=0 }}')
                 units[XL]['DropInPaths'] = scope['DROP']
             else:
                 units[NET] = copy.deepcopy(original[NET])
@@ -162,13 +177,25 @@ def model(scope):
         elif verb == 'restart':
             units[X]['InvocationID'] = 'f' * 32
         elif verb == 'start':
+            if args == (NET,) and scenario == 'rollback-policy-start':
+                state.update(route=True, nft='fixture-owned-nft')
+                if state['unverified']:
+                    units[NET].update(ActiveState='failed', SubState='failed', InvocationID='3' * 32)
+                    raise scope['Refusal']('COMMAND_FAILED')
+                state['rule'] = True
+                units[NET].update(ActiveState='active', SubState='exited', InvocationID='4' * 32)
+                return b''
             assert args == (XL,)
+            if scenario == 'rollback-policy-start':
+                assert ('start', NET) in effects and units[NET]['ActiveState'] == 'active' and state['rule']
             state.update(rule=True, route=True, nft='fixture-owned-nft')
             for n, ch in zip((XL, IKE, NET), '123'):
+                if n == NET and scenario == 'rollback-policy-start':
+                    continue
                 units[n].update(ActiveState='active', MainPID=ch, InvocationID=ch * 32)
         elif verb == 'stop':
             (name,) = args
-            units[name].update({k: original[name][k] for k in ('ActiveState', 'MainPID', 'InvocationID')})
+            units[name].update({k: original[name][k] for k in ('ActiveState', 'SubState', 'MainPID', 'InvocationID')})
         else:
             return die()
         return b''
@@ -258,6 +285,7 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
     os.umask(0o077)
     h = load(source)
     legacy = load(old or source)
+    h['NETWORK_RUN'] = legacy['NETWORK_RUN'] = str(root / 'run')
     XL, IKE, X, B, NET = (h[k] for k in ('XL', 'IKE', 'X', 'B', 'NET_UNIT'))
     units = {name: dict(LoadState='not-found' if name == NET else 'loaded', UnitFileState='disabled',
                         ActiveState='inactive', SubState='dead', MainPID='0', InvocationID='', DropInPaths='',
@@ -292,6 +320,13 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
     manifest = token_dir + '/manifest.json'
     package_path = vault + '/packages-' + request['backupId'] + '.json'
     scenario = frame['scenario']
+    if scenario == 'rollback-policy-start':
+        nft = NETWORK_FIXTURE['nft_source'](HOST, request['network'], request['backupId'])
+        nft_rows = NETWORK_FIXTURE['nft_rows'](request['network'], request['backupId'])
+        after.update(nft=h['entry'](nft, 0o644), net=h['entry'](h['network_unit'](
+            request['network'], False, backup_id=request['backupId'], nft_sha256=h['digest'](nft)), 0o644))
+    else:
+        after['net'] = h['entry'](legacy['network_unit'](request['network'], False), 0o644)
     if scenario == 'missing':
         pass
     elif scenario.startswith('mismatch-'):
@@ -364,9 +399,9 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
         state['stray_ike'] = True
     if scenario in ('cold-ppp', 'warm-vpn'):
         state['vpn'] = True
-    if scenario in ('rollback', 'rollback-applying', 'rollback-partial', 'rollback-postcondition', 'already-rolled-back',
+    if scenario in ('rollback', 'rollback-applying', 'rollback-policy-start', 'rollback-partial', 'rollback-postcondition', 'already-rolled-back',
                     'drift-rolled-back', 'manifest-lock', 'manifest-node', 'manifest-network', 'rollback-cold'):
-        state['unverified'] = scenario in ('rollback-applying', 'rollback-partial')
+        state['unverified'] = scenario in ('rollback-applying', 'rollback-partial', 'rollback-policy-start')
         assert legacy_install()[0] == (70 if state['unverified'] else 0), 'stock control must reach intended phase'
         backup = read_manifest()
         if scenario == 'rollback-cold':
@@ -459,6 +494,30 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
             assert rejected == [token_dir], (result, rejected)
             assert snapshot() == sealed and not effects
             assert run_host(h, payload) == (code, out, err)
+    elif scenario == 'rollback-policy-start':
+        # Recovery without the prior start receipt must remain unknown. The
+        # explicit rollback of this settled Install failure has its own proof.
+        assert (code, out, err) == (75, '', '') and snapshot() == preimage and not effects
+        rollback_request = dict(action='rollback', machineId=request['machineId'], backupId=request['backupId'],
+                                network=request['network'], baseline=h['digest'](h['encode'](before)))
+        assert h['dispatch'](rollback_request)['ok']
+        assert read_manifest()['phase'] == 'rolled-back'
+        assert ('stop', NET) in effects and not any(('stop', n) in effects for n in (XL, IKE))
+        assert state['nft'] is None and not state['rule'] and not state['route']
+        assert not physical(h['NET']).exists() and not physical(h['NFT_FILE']).exists()
+        assert not (root / 'run').exists()
+        new_token = '7' * 32
+        nft = NETWORK_FIXTURE['nft_source'](HOST, request['network'], new_token)
+        nft_rows = NETWORK_FIXTURE['nft_rows'](request['network'], new_token)
+        after.update(nft=h['entry'](nft, 0o644), net=h['entry'](h['network_unit'](
+            request['network'], False, backup_id=new_token, nft_sha256=h['digest'](nft)), 0o644))
+        effects.clear()
+        state['unverified'] = False
+        retry = {**rollback_request, 'action': 'install', 'backupId': new_token}
+        assert h['dispatch'](retry)['ok']
+        assert effects.index(('start', NET)) < effects.index(('start', XL))
+        assert h['network_projection'](request['network'], new_token, pinned=True)['rule']
+        assert h['read_manifest'](new_token)[2]['phase'] == 'installed' and not (root / 'run').exists()
     elif scenario in ('rollback', 'rollback-applying', 'already-rolled-back'):
         assert code == 0 and json.loads(out)['result'] == 'rolled_back'
         assert read_manifest()['phase'] == 'rolled-back' and h['read'](h['MAIN']) == before['files']['main']

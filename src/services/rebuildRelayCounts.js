@@ -1,5 +1,7 @@
 'use strict';
 
+const { isRuntimeForeignChange } = require('./rebuildRelayRuntimeRefusal');
+
 const validCount = value => Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
 function validCensus(value) {
     if (value == null || Object.keys(value).length !== 3
@@ -31,11 +33,11 @@ async function readAccountCount(User, nodeId) {
 
 // The caller must first establish the enrolled installed generation. Neither
 // a user-row count nor an SSH refusal says anything about active PPP sessions.
-async function readSessionCensus(remote, input, retirement = false) {
+async function readSessionCensus(remote, input, retirement = false, verifyLock) {
     const method = retirement && typeof remote?.readRetirementCount === 'function' ? 'readRetirementCount' : 'readSessionCount';
     if (typeof remote?.[method] !== 'function' || typeof remote.close !== 'function') return null;
     try {
-        const reply = await remote[method](input);
+        const reply = await remote[method](input, verifyLock);
         if (method === 'readRetirementCount' ? validRetirementCensus(reply) : validCensus(reply)) {
             const { activeSessions, activeIpsec, census } = reply;
             const activeClients = method === 'readRetirementCount' ? reply.activeClients
@@ -43,7 +45,8 @@ async function readSessionCensus(remote, input, retirement = false) {
             return Object.freeze({ activeSessions, activeIpsec, census, ...(retirement && { activeClients }) });
         }
     } catch (error) {
-        if (error?.code === 'REBUILD_L2TP_IDENTITY_CHANGED') throw error;
+        if (error?.code === 'REBUILD_L2TP_IDENTITY_CHANGED' || error?.remoteOutcomeUncertain === true
+            || (!retirement && isRuntimeForeignChange(error))) throw error;
         // Unavailable, not zero.
     }
     return null;

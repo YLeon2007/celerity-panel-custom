@@ -9,6 +9,8 @@ const previewLabels = Object.fromEntries(previewKeys.map(key => [key, t('network
 previewLabels.fingerprint = Object.fromEntries([
     'known', 'limited', 'unknown', 'mismatch', 'serverMismatch', 'refused', 'savedNotApplied', 'unknownVersion', 'unset',
 ].map(key => [key, t('network.rebuildFingerprint.' + key)]));
+previewLabels.neighbor = Object.fromEntries(['neighborRefused', 'neighborUnknown', 'neighborRuntimeForeignChange']
+    .map(key => [key, t('nodes.retireRelay.' + key)]));
 previewLabels.lang = typeof lang === 'string' ? lang : 'en';
 previewLabels.cancel = t('common.cancel');
 previewLabels.close = t('common.close');

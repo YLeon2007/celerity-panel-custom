@@ -105,6 +105,7 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
         const blocked = () => error('REBUILD_L2TP_INSTALL_RECOVERY_BLOCKED');
         if (!sameDb(db)) throw blocked();
         const row = await store.findOne({ _id: rowId }, lockRead);
+        if (row === null) return null;
         const receipt = row?.installRecovery;
         // 8a56425 and pre-handoff crashes have no durable proof the original
         // writer has exited. Neither age nor an empty local active set suffices.

@@ -53,8 +53,10 @@ for (const rebuild of [true, false]) test(`GET /panel/nodes selects the ${rebuil
     const version = createHash('sha256').update(readFileSync(path.resolve(__dirname, '../../../public/js', asset))).digest('hex').slice(0, 16);
     assert.deepEqual(selected.filter(url => url.startsWith('/js/network')), [`/js/${asset}?v=${version}`]);
     if (!rebuild) assert.equal(version, '8c1440573d630ba3');
-    if (rebuild) assert.ok(readFileSync(path.resolve(__dirname, '../../../views/network.ejs'), 'utf8').includes(`/js/${asset}?v=${version}`));
     if (rebuild) {
+        const redirected = await request(app, '/panel/network', { method: 'GET', session });
+        assert.equal(redirected.status, 302);
+        assert.equal(redirected.headers.location, '/panel/nodes');
         const token = JSON.parse(inline.match(/window\._networkCsrfToken\s*=\s*("[A-Za-z0-9_-]+")/)[1]);
         const service = { locks: { run: callback => callback() } };
         app.use('/api/cascade', auth, routerForRebuild({ service }));

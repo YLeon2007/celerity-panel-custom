@@ -2,6 +2,7 @@
 
 const { randomBytes } = require('node:crypto');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
+const { runtimeForeignChange } = require('../../services/rebuildRelayRuntimeRefusal');
 const { validNodeId, identityChanged, grantConflict, grantUnavailable, grantEffectStatus } = require('./rebuildRelayAdmission');
 
 // One-use, process-local tickets. A restart evicts them; keys and the private
@@ -60,7 +61,7 @@ const localizedErrors = Object.freeze({
     [grantConflict]: 'rebuildL2tp.admission.grantConflict',
     [grantUnavailable]: 'rebuildL2tp.admission.grantUnavailable',
 });
-const publicCodes = new Set([...Object.keys(localizedErrors), identityChanged,
+const publicCodes = new Set([...Object.keys(localizedErrors), identityChanged, runtimeForeignChange,
     'REBUILD_BUSY', 'REBUILD_LOCK_LOST', 'REBUILD_LOCK_RELEASE_UNCONFIRMED', 'REBUILD_TRANSPORT_CLEANUP_FAILED',
     ...['DISABLED', 'NOT_OWNED', 'CHANGED', 'REFUSED', 'OUTCOME_UNKNOWN', 'FINISH_OUTCOME_UNKNOWN', 'RESERVATION_FAILED',
         'RESERVATION_OUTCOME_UNKNOWN', 'BACKEND_UNAVAILABLE', 'PLAN_INVALID', 'RESERVATION_CLEANUP_FAILED'].map(code => `REBUILD_L2TP_REMOVE_${code}`),
@@ -79,6 +80,10 @@ async function handleRemoval(req, res, decision) {
         if (outcome) {
             if (html) return res.redirect(303, `/panel/l2tp?view=${outcome === 'unknown' ? 'remove-unconfirmed' : 'remove-cleanup'}`);
             return res.status(status).json({ error: { code, outcome, retryAllowed: false } });
+        }
+        if (code === runtimeForeignChange) {
+            if (html) return res.redirect(303, '/panel/l2tp?view=remove-foreign-change');
+            return res.status(409).json({ error: { code, retryAllowed: false } });
         }
         if (html && code === identityChanged) return res.redirect(303, identityReviewUrl(id));
         if (html && res.locals.t) {

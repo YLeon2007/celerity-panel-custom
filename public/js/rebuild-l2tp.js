@@ -354,6 +354,9 @@
                 message = 'rateLimited';
             } else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_RECONCILE_DISABLED') {
                 message = 'recoveryIneligible';
+            } else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_RUNTIME_FOREIGN_CHANGE'
+                && data.error.retryAllowed === false && data.error.outcome === undefined && data.outcome === undefined) {
+                message = 'runtimeForeignChange';
             } else if (response.status === 409 && data?.error?.retryAllowed === false
                 && data.error.code === 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK') {
                 message = 'reconcileManualBlock';
@@ -441,10 +444,14 @@
             const { response, data } = await post(installRecoveryUrl, {});
             if (response.ok && !noRetry(data) && data?.executionMode === 'rebuild'
                 && data.status === 'can_install_again' && data.nodeId === nodeId) message = 'canInstallAgain';
+            else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE'
+                && data.error.retryAllowed === false && data.error.outcome === undefined && data.outcome === undefined) {
+                message = 'installRecoveryNoState';
+            }
         } catch { /* An unconfirmed response is not permission to install. */ }
         status.textContent = words[message];
         busy = false;
-        // Both outcomes leave this stale view locked. The refresh link only
+        // All outcomes leave this stale view locked. The refresh link only
         // reads the overview; a subsequent Install needs a separate click.
         requireRefresh = true;
         updateMutations();

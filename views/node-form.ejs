@@ -188,7 +188,7 @@ Object.assign(locals, {
             </div>
         </form>
         <% if (typeof rebuildRemoval !== 'undefined' && rebuildRemoval) { %>
-        <details class="form-section" id="rebuild-l2tp-remove">
+        <details class="form-section" id="rebuild-l2tp-remove"<% if (rebuildRemoval.foreignChange) { %> open<% } %>>
             <summary><%= t('nodes.rebuildRemoveOpen') %></summary>
             <p><%= rebuildRemoval.summary %></p>
             <% if (rebuildRemoval.ticket && typeof csrfToken !== 'undefined' && csrfToken) { %>

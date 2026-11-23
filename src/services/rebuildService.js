@@ -2,6 +2,7 @@
 const {isDeepStrictEqual}=require('node:util');
 const {isRebuildEnabled}=require('./rebuildMode');
 const {runRebuild,runRetireGraph,retirementScope,fingerprintLinks,hasProtectedClientInbound,profilePreview}=require('./rebuildCoordinator');
+const {checkNeighborRefusal}=require('./rebuildNeighborRefusal');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {createTransport,createBoundRelayTransport}=require('./rebuildTransport');
@@ -214,7 +215,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     }
     async function runGraph(req,alreadyHeld,retire=false){
         gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock,verifyBinding,settlementSession;
-        const baseline=new Map();
+        const baseline=new Map(), inventoryNames=new Map();
         const keyRoot=retire?env.ENCRYPTION_KEY:undefined;
         // Keep the existing preparation/validation and envelope format. For
         // retirement only, join its missing-envelope write to final settlement
@@ -267,6 +268,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             async build(ids,links,retirement){
                 const nodes=ids.length?await Node.find({_id:{$in:ids}}).select('+xray.manualKey').lean():[];
                 if(nodes.length!==ids.length||nodes.some(n=>n.type!=='xray'||!n.active||n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
+                if(req.preview)for(const node of nodes)inventoryNames.set(String(node._id),node.name);
                 if(retire){
                     // Abandon only reads the target card identity/role. No
                     // target credentials, state, binding or profiles are needed.
@@ -351,7 +353,15 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             async checkActivation(ids,retirement){
                 if(retire)await checkLinks(retirement);
                 for(const id of ids)await preflight(id,()=>transports.get(id).verifyIdentity?.());
-                for(const id of ids)await preflight(id,()=>transports.get(id).checkActivation?.());
+                for(const id of ids){
+                    try{await preflight(id,()=>transports.get(id).checkActivation?.({readOnly:!!req.preview,reattestRuntime:true}));}
+                    catch(error){
+                        if(req.preview&&(!retire||id!==req.nodeId)&&inventoryNames.has(id)){
+                            throw checkNeighborRefusal(error,inventoryNames.get(id));
+                        }
+                        throw error;
+                    }
+                }
                 if(!req.preview&&retire)await req.beforeEffects?.();
             },
             async prepareActivation(ids){

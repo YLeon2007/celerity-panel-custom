@@ -74,6 +74,16 @@
         status.textContent = copy[key];
     }
 
+    function showNeighborRefusal(response, error) {
+        if (response.status !== 409 || error?.code !== 'REBUILD_RETIRE_NEIGHBOR_REFUSED') return false;
+        const name = typeof error.neighborName === 'string' && error.neighborName.length <= 160
+            && /^[\p{L}\p{M}\p{N} ._()#–—-]+(?![\s\S])/u.test(error.neighborName) ? error.neighborName : copy.neighborUnknown;
+        message.textContent = '';
+        status.textContent = put('neighborRefused', 'name', name)
+            + (error.reason === 'RUNTIME_FOREIGN_CHANGE' ? ' ' + copy.neighborRuntimeForeignChange : '');
+        return true;
+    }
+
     function refusal(code) {
         if (code === 'REBUILD_NEIGHBOR_UNAVAILABLE') return 'neighborUnavailable';
         if (code === 'REBUILD_RETIRE_PROTECTED_CHANGE') return 'protectedChange';
@@ -101,6 +111,7 @@
                 const { response, data } = await post(context, 'preview', {});
                 if (selected !== context) return;
                 status.textContent = '';
+                if (showNeighborRefusal(response, data?.error)) return;
                 if (!response.ok || !applyPreview(context, data?.preview)) {
                     showError(refusal(data?.error?.code) ?? 'previewUnavailable');
                 }
@@ -126,6 +137,7 @@
                 location.reload();
                 return;
             }
+            if (showNeighborRefusal(response, data?.error)) return;
             const code = data?.error?.code;
             if (response.status === 409 && code === 'PREVIEW_CHANGED') {
                 if (decision === 'abandon') { showError('newPreviewRequired'); return; }

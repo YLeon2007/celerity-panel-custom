@@ -4,6 +4,7 @@ const {requireScope}=require('../middleware/auth');
 const {issuePanelCsrfToken, originMatchesHost, requirePanelCsrf}=require('./panel/csrf');
 const {createRebuildService}=require('../services/rebuildService');
 const {componentFor,previewForError}=require('../services/rebuildCoordinator');
+const {neighborRefusalForError}=require('../services/rebuildNeighborRefusal');
 const fail=code=>Object.assign(new Error(code),{code});
 const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
 const objectId=id=>typeof id==='string'&&/^[a-f\d]{24}$/i.test(id);
@@ -40,11 +41,12 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     const outcome={};
     try{res.json(await fn(req,outcome));}catch(e){
         const rawCode=errorField(e,'code');
-        const code=typeof rawCode==='string'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(rawCode)?rawCode:'REBUILD_FAILED';
+        const refusal=neighborRefusalForError(e);
+        const code=typeof rawCode==='string'&&rawCode!=='REBUILD_RETIRE_NEIGHBOR_REFUSED'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(rawCode)?rawCode:'REBUILD_FAILED';
         const preview=previewForError(e);
         const fingerprintIssue=fingerprintIssueForError(e,code);
         res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:code==='REBUILD_INVALID_REQUEST'?400:409)
-            .json({error:{code},...(outcome.linkId?{desiredSaved:true,linkId:outcome.linkId}:{}),...(preview?{preview}:{}),...(fingerprintIssue?{fingerprintIssue}:{})});
+            .json({error:refusal??{code},...(outcome.linkId?{desiredSaved:true,linkId:outcome.linkId}:{}),...(preview?{preview}:{}),...(fingerprintIssue?{fingerprintIssue}:{})});
     }
  };
  const run=async(req,preview=false,remove=false)=>{const linkId=req.params.id??req.body?.linkId??req.body?.domainLinkId;

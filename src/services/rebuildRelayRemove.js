@@ -10,6 +10,7 @@ const { projectRelayChap, inspectAccountSources } = require('./rebuildRelayAccou
 const { readDirectory, writeDirectory, checkDirectory, logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 const { transactOnce, AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
 const { readAccountCount, readSessionCensus } = require('./rebuildRelayCounts');
+const { runtimeForeignChange, isRuntimeForeignChange, isUnconfirmedRuntimeWrite } = require('./rebuildRelayRuntimeRefusal');
 const { readAppliedTransit } = require('./rebuildAppliedLink');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 
@@ -39,6 +40,8 @@ const safe = (error, fallback = 'REBUILD_L2TP_REMOVE_FAILED') => Object.assign(f
     typeof error?.code === 'string' && /^REBUILD_[A-Z0-9_]+$(?!\n)/.test(error.code) ? error.code : fallback), {
     ...(error?.outcome === 'unknown' && { outcome: 'unknown' }),
     ...(error?.retryAllowed === false && { retryAllowed: false }),
+    ...(error?.code === 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' && error.remoteOutcomeUncertain === true
+        && { remoteOutcomeUncertain: true, retryAllowed: false }),
 });
 const write = { writeConcern: { w: 'majority' }, timestamps: false };
 const defaultDriver = options => require('./rebuildRelayDirect').createRelayDirect(options);
@@ -211,9 +214,13 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, withHeld
                         try {
                             if (!fence.listMode || approved) {
                                 remote = await open();
-                                census = await readSessionCensus(remote, input, !!heldLock);
+                                census = await readSessionCensus(remote, input, !!heldLock, () => checkInventory(state, accounts));
                             }
-                        } catch (error) { if (isIdentityChanged(error)) throw error; /* Unavailable, not zero. */ }
+                        } catch (error) {
+                            if (isIdentityChanged(error) || error?.remoteOutcomeUncertain === true
+                                || (!heldLock && isRuntimeForeignChange(error))) throw error;
+                            // Unavailable, not zero.
+                        }
                         finally {
                             if (typeof remote?.close === 'function') {
                                 try { await remote.close(); } catch { census = null; }
@@ -278,9 +285,10 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, withHeld
                     if (typeof remote?.prepareRemove !== 'function' || typeof remote.remove !== 'function' || typeof remote.close !== 'function') {
                         throw fail('REBUILD_L2TP_REMOVE_BACKEND_UNAVAILABLE');
                     }
+                    const checkReadAuthority = async () => { await checkInventory(state, accounts); checkPreview(); };
                     let expectedCensus;
                     if (proof || currentUsers) {
-                        const census = await readSessionCensus(remote, input, !!heldLock);
+                        const census = await readSessionCensus(remote, input, !!heldLock, checkReadAuthority);
                         if (heldLock) {
                             if (!census || census.activeClients !== proof.activeClients || census.census !== proof.census) {
                                 throw fail(PREVIEW_CHANGED);
@@ -302,7 +310,8 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, withHeld
                     let plan;
                     try {
                         plan = await remote.prepareRemove({ ...input, ...(expectedCensus && { expectedCensus }),
-                            ...(heldLock && { retirement: true, ...(proof.activeClients > 0 && { drain: true }) }) });
+                            ...(heldLock && { retirement: true, ...(proof.activeClients > 0 && { drain: true }) }) },
+                        checkReadAuthority);
                     } catch (error) {
                         if (heldLock && error?.code === DIRECT_PREVIEW_CHANGED) throw fail(PREVIEW_CHANGED);
                         if (error?.code === DIRECT_IPSEC_BUSY) throw fail(IPSEC_BUSY);
@@ -435,7 +444,9 @@ function createRebuildRelayRemove({ Link, Node, State, L2tpUser, locks, withHeld
                     removed = true;
                     return { executionMode: 'rebuild', status: 'not_installed', nodeId: id };
                 } catch (error) {
-                    primary = safe(error);
+                    primary = !heldLock && isUnconfirmedRuntimeWrite(error) ? phaseError(fail(UNKNOWN), 'unknown')
+                        : !heldLock && isRuntimeForeignChange(error) ? Object.assign(fail(runtimeForeignChange), { retryAllowed: false })
+                            : safe(error);
                     if (phaseAware && (reserved || primary.code === RESERVATION_UNKNOWN)) {
                         retainLock?.();
                         phaseError(primary, 'unknown');

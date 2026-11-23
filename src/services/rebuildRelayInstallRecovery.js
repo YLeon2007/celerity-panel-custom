@@ -2,15 +2,16 @@
 
 const { isDeepStrictEqual: equal } = require('node:util');
 const { withNode } = require('./rebuildLocks');
-const { read } = require('./rebuildRelayBackendStore');
+const { read, isPristine } = require('./rebuildRelayBackendStore');
 const { readRelayAuthority, captureRelayEffect } = require('./rebuildRelayEffectAuthority');
 const { relayInstallEnabled } = require('./rebuildRelayAuthorization');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 const { installRecoveryWasNotSent } = require('./rebuildRelayDirect');
-const { BLOCKED, changed, createRecoveryStore, grantIdentity, validActor } = require('./rebuildRelayInstallRecoveryStore');
+const { BLOCKED, changed, createRecoveryStore, grantIdentity, plain, validActor } = require('./rebuildRelayInstallRecoveryStore');
 const { transactOnce, AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
 
 const UNCONFIRMED = 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED';
+const NO_STATE = 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE';
 const fail = code => Object.assign(new Error(code), { code, retryAllowed: false });
 const defaultDriver = options => require('./rebuildRelayDirect').createRelayDirect(options);
 
@@ -27,7 +28,7 @@ function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, 
         }
         const store = createRecoveryStore(State, L2tpUser);
         const getNode = session => read(Node.findById(id).select('ip domain active type cascadeRole useCustomConfig ssh').maxTimeMS(5000), session);
-        let held, stagedClaim, remote, mayHaveDispatched = false, closing = false, settling = false;
+        let held, stagedClaim, remote, noState, mayHaveDispatched = false, closing = false, settling = false;
         // Claim the global fence before entering the process-local node queue.
         // An active Install or another claimant is refused, not queued behind.
         try {
@@ -48,6 +49,17 @@ function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, 
                 await fence.check(current);
                 await assertNoRelayAccountIntent(session);
             };
+            if (pending === null) {
+                // Lock absence alone also occurs with orphaned or settled
+                // state. Keep those cases blocked, and recheck the singleton
+                // after the reads to detect a new Install that is in flight.
+                await checkAuthority();
+                const prior = await store.snapshot(id);
+                if (prior !== null && (String(prior.node) !== id || !isPristine(plain(prior)))) throw changed();
+                const replica = await read(L2tpUser.findOne({ relayNode: id }).select('_id').maxTimeMS(5000));
+                if (replica !== null || await locks.readInstallRecovery(db, id, actor) !== null) throw changed();
+                throw (noState = fail(NO_STATE));
+            }
             const check = async session => {
                 if (held) await held.verify(session);
                 await checkAuthority(session);
@@ -106,6 +118,7 @@ function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, 
                 return { status: 'can_install_again' };
             });
         } catch (error) {
+            if (noState && error === noState) throw error;
             if (remote && !closing && typeof remote.close === 'function') {
                 try { await remote.close(); } catch { /* The claim remains if dispatch was possible. */ }
             }

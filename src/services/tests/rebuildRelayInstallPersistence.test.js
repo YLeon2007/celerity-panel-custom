@@ -323,6 +323,40 @@ function recoveryFixture(t, { prior = false, source = false, pkg = false } = {})
 
 const notConfirmed = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED', retryAllowed: false };
 const recoveryBlocked = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_BLOCKED', retryAllowed: false };
+const recoveryNoState = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE', retryAllowed: false };
+
+test('Install recovery: authorized empty state is distinct from an in-flight Install, orphan state or failed read', async t => {
+    const r = recoveryFixture(t);
+    const run = r.create({ createRelayDirect: () => assert.fail('must not create transport') });
+    await assert.rejects(run(id), recoveryNoState);
+    r.f.states.push(priorRow());
+    await assert.rejects(run(id), recoveryNoState);
+    r.f.states[0].backupId = 'f'.repeat(32);
+    await assert.rejects(run(id), recoveryBlocked);
+    r.f.states.length = 0;
+    r.f.users.push({ _id: new Types.ObjectId(), relayNode: oid(id) });
+    await assert.rejects(run(id), recoveryBlocked);
+    r.f.users.length = 0;
+    const findState = State.collection.find;
+    t.mock.method(State.collection, 'find', () => { throw new Error('untrusted state read'); });
+    await assert.rejects(run(id), recoveryBlocked);
+    State.collection.find.mock.mockImplementation(findState);
+    await makeLocks(r.f.lockCollection).run(async () => {
+        await assert.rejects(run(id), recoveryBlocked);
+    }, { allowStaleUnlock: false });
+    const exactRead = r.f.lockCollection.findOne;
+    t.mock.method(r.f.lockCollection, 'findOne', async () => { throw new Error('untrusted DB detail'); });
+    await assert.rejects(run(id), recoveryBlocked);
+    let reads = 0;
+    r.f.lockCollection.findOne.mock.mockImplementation(async () => ++reads === 1 ? null : { _id: 'apply' });
+    await assert.rejects(run(id), recoveryBlocked);
+    assert.equal(reads, 2);
+    r.f.lockCollection.findOne.mock.mockImplementation(exactRead);
+    await assert.rejects(r.create({ relayGrantStore: { snapshot: async () => ({
+        env: r.f.env, grants: [], sourceFor: () => 'env',
+    }) } })(id), recoveryBlocked);
+    assert.deepEqual(r.tx.events, []);
+});
 
 test('Install recovery: absent and rolled-back receipts restore only this relay, or preserve unresolved ownership', async t => {
     for (const result of ['absent', 'rolled_back', 'unsafe']) await t.test(result, async t => {
@@ -516,7 +550,9 @@ test('Install recovery: lost settlement response is not replayed regardless of w
             assert.deepEqual({ states: r.f.states, users: r.f.users }, original);
             assert.equal(r.f.locks[0].token, originalToken);
         }
-        await assert.rejects(r.create()(id), recoveryBlocked);
+        // A new explicit request may observe empty storage, but cannot
+        // retroactively confirm the earlier lost settlement response.
+        await assert.rejects(r.create()(id), committed ? recoveryNoState : recoveryBlocked);
         assert.equal(r.recovered, 1);
         assert.deepEqual(r.tx.events, ['commit', 'commit', 'commit']);
     });

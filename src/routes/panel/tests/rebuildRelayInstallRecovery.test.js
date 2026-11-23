@@ -221,6 +221,17 @@ test('a missing backend, grant or role refusal, lost acknowledgement and non-suc
     assert.equal(f.calls.length, 11);
 });
 
+test('proved empty recovery reports its own 409, without unlocking Install', async t => {
+    const f = mount(t);
+    const code = 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE';
+    f.failure = Object.assign(new Error(privateFixture), { code, retryAllowed: false, detail: privateFixture });
+    assert.deepEqual(JSON.parse(checked(await f.send(), 409).body), { error: { code, retryAllowed: false } });
+    for (const patch of [{ outcome: 'unknown' }, { retryAllowed: true }]) {
+        f.failure = Object.assign(new Error(privateFixture), { code, retryAllowed: false, ...patch });
+        assert.deepEqual(JSON.parse(checked(await f.send(), 503).body), unconfirmed);
+    }
+});
+
 test('fresh Install binds the same admin from the session, not the submitted payload', async t => {
     const f = mount(t);
     const service = require('../../../services/rebuildService');

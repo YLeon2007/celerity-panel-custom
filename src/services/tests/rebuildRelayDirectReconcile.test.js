@@ -90,7 +90,7 @@ const scenarios = {
     rolled_back: ['rollback', 'rollback-applying', 'already-rolled-back'],
     unknown: ['missing', 'mismatch-token', 'mismatch-machine', 'mismatch-boot', 'mismatch-lock', 'mismatch-plan',
         'pending', 'preparing', 'empty-token-dir', 'symlink-receipt', 'trace-policy', 'trace-config', 'trace-ppp',
-        'trace-network', 'trace-listener', 'jobs', 'unavailable', 'concurrent', 'rollback-partial',
+        'trace-network', 'trace-listener', 'jobs', 'unavailable', 'concurrent', 'rollback-partial', 'rollback-policy-start',
         'rollback-postcondition', 'drift-rolled-back', 'manifest-lock', 'manifest-node', 'manifest-network', 'rollback-cold',
         'cold-nft-unavailable', 'cold-socket-unavailable', 'cold-partial-token', 'cold-bridge-drift', 'cold-network-drift',
         'cold-swan-drift', 'cold-nft-trace', 'cold-listener', 'cold-stray-ike', 'cold-ppp', 'warm-vpn'],
@@ -99,7 +99,7 @@ for (const [result, cases] of Object.entries(scenarios)) {
     for (const scenario of cases) test(`packed recovery: ${scenario} → ${result}`, async () => {
         // Default tests need no Git metadata. The immutable baseline replay
         // can additionally supply the exact old host source bytes via stdin below.
-        const legacyRef = process.env.C3_DIRECT_FIXTURE_LEGACY;
+        const legacyRef = scenario !== 'rollback-policy-start' && process.env.C3_DIRECT_FIXTURE_LEGACY;
         const old = legacyRef && spawnSync('/usr/bin/git', ['--no-optional-locks', 'show',
             `${legacyRef}:src/services/rebuildRelayDirectHost.py`], { encoding: 'utf8', timeout: 3000, env: {} });
         if (old) assert.equal(old.status, 0, old.stderr);

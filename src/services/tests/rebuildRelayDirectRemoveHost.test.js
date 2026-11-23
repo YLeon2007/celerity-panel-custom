@@ -57,10 +57,12 @@ const expected = compose(...laterArgs, false);
 // Actual helper, file IO, flock, manifest, parser, and mutation sequence.
 // No subprocess can run a real systemctl, ip, nft, Xray, ss or IPsec command.
 const fixture = String.raw`
-import contextlib, copy, ctypes, errno, io, json, os, pathlib, shlex, subprocess, sys, types
+import contextlib, copy, ctypes, errno, io, json, os, pathlib, runpy, shlex, subprocess, sys, types
 from pathlib import Path
 source, tmp, scenario = sys.argv[1:]
-f = json.loads(sys.stdin.readline()) if scenario == 'retire-active' else json.load(sys.stdin)
+joined_epoch = scenario.startswith('epoch-remove-')
+network_fixture = runpy.run_path(str(Path(source).parent / 'tests/helpers/rebuildRelayNetworkFixture.py'))
+f = json.loads(sys.stdin.readline()) if scenario == 'retire-active' or joined_epoch else json.load(sys.stdin)
 root = Path(tmp)
 os.umask(0o077)
 h = {'__name__': 'fixture'}
@@ -72,7 +74,8 @@ def no_host_dispatch(event, _):
 sys.addaudithook(no_host_dispatch)
 if 'command' in f:
     argv = shlex.split(f['command'])
-    assert argv[:-1] == ['/usr/bin/timeout', '-k', *(['1s', '22s'] if scenario == 'retire-active' else ['4s', '125s']),
+    limits = ['1s', '9s'] if joined_epoch else ['1s', '22s'] if scenario == 'retire-active' else ['4s', '125s']
+    assert argv[:-1] == ['/usr/bin/timeout', '-k', *limits,
                          '/usr/bin/python3', '-I', '-B', '-c']
     exec(compile(argv[-1], '<DIRECT command>', 'exec'), h)
 else:
@@ -116,6 +119,7 @@ class FixtureOS:
     def geteuid(self): return 0
 h['os'] = FixtureOS()
 (root / 'run').mkdir(exist_ok=True)
+h['NETWORK_RUN'] = str(root / 'run')
 @contextlib.contextmanager
 def directory(path, private=False):
     assert Path(path).is_relative_to(root)
@@ -139,8 +143,9 @@ h['preflight'] = preflight
 h['observe_ppp_preparation'] = lambda: dict(missing=[], persist=False, builtin=[], policy='fixture')
 h['apply_ppp_preparation'] = lambda expected: h['need'](expected == h['observe_ppp_preparation'](), 'BASELINE_CHANGED')
 h['require_network_observers'] = lambda: None
-h['boot'] = lambda: 'fixture-boot'
-h['ppp_empty'] = lambda: not (testing and scenario == 'active-ppp')
+if not joined_epoch:
+    h['boot'] = lambda: 'fixture-boot'
+    h['ppp_empty'] = lambda: not (testing and scenario == 'active-ppp')
 h['in_cgroup'] = lambda pid, info: pid == info['MainPID']
 def modeled_xray_argv(info, path=None):
     expected_unit = B if path == h['BRIDGE'] else X
@@ -158,11 +163,12 @@ for n in (X, B, XL, IKE, NET):
         RequiredBy='', BoundBy='', ConsistsOf='', PropagatesStopTo='', Conflicts='shutdown.target', ConflictedBy='',
         Wants='', BindsTo='', Upholds='', Type='simple', EnvironmentFiles='', ExecStopPost='')
 units[XL]['ExecStart'] = '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }'
-if scenario == 'chap-inspect-active':
+if scenario == 'chap-inspect-active' or joined_epoch:
     fragment = Path(h['SYSTEM'], XL)
-    fragment.write_bytes(b'modeled native unit')
+    unit_helper = Path(source).parent.parent / 'modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'
+    fragment.write_bytes(runpy.run_path(str(unit_helper))['UNIT'] if joined_epoch else b'modeled native unit')
     fragment.chmod(0o644)
-    h['NATIVE_XL_SHA'] = h['digest'](fragment.read_bytes())
+    if not joined_epoch: h['NATIVE_XL_SHA'] = h['digest'](fragment.read_bytes())
     units[XL].update(FragmentPath=str(fragment), ControlGroup=h['SESSION_GROUP'])
     h['SESSION_GLOBAL'] = {}
     h['session_binary'] = lambda path: (path, 'modeled stock binary generation')
@@ -174,12 +180,52 @@ if scenario == 'chap-inspect-active':
     (root / 'root').mkdir()
     @contextlib.contextmanager
     def session_directory(path, private=False):
-        projected = path in ('/etc/ppp', '/root') or path.startswith('/etc/ppp/')
+        projected = (path in ('/etc/ppp', '/root') or path.startswith('/etc/ppp/') or
+                     joined_epoch and path in ('/etc/ipsec.d', '/proc', '/sys/fs/cgroup' + h['SESSION_GROUP']))
         with directory(str(root) + path if projected else path, private) as fd:
             yield fd
     h['directory'] = session_directory
 units[IKE]['ExecStart'] = '{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }'
 units[X].update(ActiveState='active', SubState='running', MainPID='10', InvocationID='old-main')
+if joined_epoch:
+    epoch = '12345678-1234-1234-1234-123456789abc'
+    group_path = '/sys/fs/cgroup' + h['SESSION_GROUP']
+    group = root / group_path[1:]
+    group.mkdir(parents=True)
+    (group / 'cgroup.stat').write_bytes(b'nr_descendants 0\nnr_dying_descendants 0\n')
+    proc_net = root / 'proc/self/net'
+    proc_net.mkdir(parents=True)
+    (proc_net / 'pppol2tp').write_bytes(h['SESSION_L2TP_HEADER'])
+    lstat = h['os'].lstat
+    h['os'].lstat = lambda path: os.lstat(group) if path == group_path else lstat(path)
+    def pidfd_open(pid):
+        assert pid == int(units[XL]['MainPID'])
+        return os.open(group, os.O_DIRECTORY)
+    h['os'].pidfd_open = pidfd_open
+    starts = {}
+    def proc_open(path, *args, **kw):
+        if path == '/proc/sys/kernel/random/boot_id': return io.StringIO(epoch + '\n')
+        if path == '/proc/devices': return io.BytesIO(b'Character devices:\n108 ppp\n\nBlock devices:\n')
+        if path == '/proc/net/dev': return io.StringIO('Inter-| Receive | Transmit\n face |bytes\n lo: 0\n')
+        if path.startswith('/proc/') and path.endswith('/stat'):
+            pid = path.split('/')[2]
+            return io.BytesIO(f"{pid} (fixture) S {'0 ' * 18}{starts[pid]}\n".encode())
+        assert path == '/etc/machine-id', path
+        return open(machine_file, *args, **kw)
+    @contextlib.contextmanager
+    def session_process(proc, pid, main, binaries, watch):
+        assert pid == main == int(units[XL]['MainPID'])
+        watch()
+        yield None, starts[str(pid)], b'/usr/sbin/xl2tpd\0-D\0'
+    @contextlib.contextmanager
+    def route_socket(family, kind, protocol):
+        assert (family, kind, protocol) == (16, 3, 0)
+        def bind(addr): assert addr == (0, 17)
+        yield types.SimpleNamespace(bind=bind)
+    h.update(open=proc_open, ppp_device=lambda: True, session_fs=lambda *_: None,
+             session_process=session_process, select=types.SimpleNamespace(POLLIN=1,
+                 poll=lambda: types.SimpleNamespace(register=lambda *_: None, poll=lambda _: [])),
+             socket=types.SimpleNamespace(AF_NETLINK=16, SOCK_RAW=1, SOCK_NONBLOCK=2, socket=route_socket))
 if scenario.startswith('xtls-'):
     start = f"{h['XRAY']} run -config {h['MAIN']}"
     xtls = Path(h['SYSTEM'], 'xray.service.d', '10-donot_touch_single_conf.conf')
@@ -207,6 +253,8 @@ stock_rules = [{'priority': n, 'src': 'all', 'table': t} for n, t in [(0, 255), 
 foreign_rule = dict(priority=10078, src='198.51.100.0/24', table=201)
 foreign_route = dict(dst='198.51.100.0/24', table=201, dev='fixture0')
 network, token = f['network'], f['backupId']
+nft = network_fixture['nft_source'](source, network, token).decode()
+nft_rows = network_fixture['nft_rows'](network, token)
 policy = {'nft': False, 'rule': False, 'route': False}
 changes, checks = [], []
 testing = False
@@ -223,13 +271,15 @@ def sc(*args):
     changes.append(args)
     if args == ('daemon-reload',):
         if Path(h['NET']).exists():
-            lines = Path(h['NET']).read_text().splitlines()
+            net_bytes = Path(h['NET']).read_bytes()
+            lines = net_bytes.decode().splitlines()
             pre = next((line.split('=', 1)[1] for line in lines if line.startswith('ExecStartPre=')), '')
             legacy = f'Requires={X}' in lines
             units[NET].update(LoadState='loaded', FragmentPath=h['NET'], UnitFileState='static',
                               Type='oneshot', Requires=X if legacy else '', Wants='' if legacy else X, RequiredBy=XL,
                               After=next(line.split('=', 1)[1] for line in lines if line.startswith('After=')),
-                              ExecStartPre=f'{{ path=/usr/bin/systemctl ; argv[]={pre} ; ignore_errors=no ; }}' if pre else '')
+                              ExecStartPre=f'{{ path=/usr/bin/systemctl ; argv[]={pre} ; ignore_errors=no ; }}' if pre else '',
+                              ExecStart=network_fixture['systemctl_start'](net_bytes, 'quoted' if scenario == 'apply' else 'native'))
             units[XL].update(DropInPaths=h['DROP'], Requires=f'{NET} {IKE}', After=f'{NET} {IKE}')
             units[X]['RequiredBy'], units[IKE]['RequiredBy'] = (NET if legacy else ''), XL
         else:
@@ -238,10 +288,12 @@ def sc(*args):
     elif cmd == 'start' and rest == [XL]:
         for n, pid, sub in [(XL,'11','running'), (IKE,'12','running'), (NET,'0','exited')]:
             units[n].update(ActiveState='active', SubState=sub, MainPID=pid,
-                            InvocationID='1'*32 if n == XL and scenario == 'chap-inspect-active' else n + '-installed')
+                            InvocationID=({XL:'b', IKE:'c', NET:'d'}[n] * 32 if joined_epoch else
+                                          '1'*32 if n == XL and scenario == 'chap-inspect-active' else n + '-installed'))
         policy.update(nft=True, rule=True, route=True)
     elif args == ('restart', X):
-        units[X].update(MainPID=str(40 + len(changes)), InvocationID='main-' + str(len(changes)))
+        invocation = f'{40 + len(changes):032x}' if joined_epoch else 'main-' + str(len(changes))
+        units[X].update(MainPID=str(40 + len(changes)), InvocationID=invocation)
     elif cmd in ('stop', 'reset-failed') and len(rest) == 1 and rest[0] in (XL, IKE, NET):
         if testing and scenario == 'unknown-stop':
             raise Refusal('COMMAND_FAILED')
@@ -353,17 +405,23 @@ def command(*a, data=None):
     if a in (('/usr/sbin/ip','xfrm','policy','list'),('/usr/sbin/ip','xfrm','policy','list','nosock'),
              ('/usr/sbin/ip','xfrm','state','list','nokeys')): return b''
     if a == ('/usr/sbin/ip','-j','-N','-4','rule','show'):
-        rules = stock_rules + ([foreign_rule] if testing else [])
+        # The epoch cases keep the stock RPDB required by reattestation.
+        rules = stock_rules + ([foreign_rule] if testing and not joined_epoch else [])
         if policy['rule']:
             rules += [dict(priority=h['PRIORITY'], src=network['clientCidr'], table=network['routeTable'], fwmark='0x4d')]
         if testing and scenario == 'foreign-rule': rules += [dict(foreign_rule, table=network['routeTable'])]
         return h['encode'](rules)
     if a == ('/usr/sbin/ip','-j','-N','-4','route','show','table','all'):
-        return h['encode'](([foreign_route] if testing else []) + ([dict(dst='default', table=network['routeTable'],
+        return h['encode'](([foreign_route] if testing and not joined_epoch else []) + ([dict(dst='default', table=network['routeTable'],
             dev='lo', type='local', scope='host')] if policy['route'] else []))
     if a == ('/usr/sbin/nft','-j','list','tables'):
         return h['encode']({'nftables': [{'table': {'family':'inet','name':'foreign'}}] +
-            ([{'table': {'family':'inet','name':h['TABLE']}}] if policy['nft'] else [])})
+            (nft_rows[1:2] if policy['nft'] else [])})
+    if a == ('/usr/sbin/nft','-j','-s','-a','list','table','inet',h['TABLE']):
+        result = copy.deepcopy(nft_rows)
+        if testing and scenario == 'nft-drift':
+            result[-1]['rule']['expr'][-1] = {'accept': None}
+        return h['encode']({'nftables': result})
     if a == ('/usr/sbin/nft','-j','-s','list','table','inet',h['TABLE']):
         return h['encode']({'nftables': [{'table': {'family':'inet','name':h['TABLE'],'comment':token,
             'handle': 2 if testing and scenario == 'nft-drift' else 1}}]})
@@ -396,7 +454,6 @@ before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stoc
 if scenario == 'apply-quiescent-dependent': before['transit'] = []
 h['observe'] = lambda m,d,transit,**kw: before
 req = {k: f[k] for k in ('network','backupId','machineId')}
-nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
 begin = b'# BEGIN CELERITY MANAGED L2TP USERS\n'
 end = b'# END CELERITY MANAGED L2TP USERS\n'
 old_row = b'"alice" l2tpd "test-old" 10.255.1.10\n'
@@ -407,13 +464,17 @@ cohort = retirement_test.startswith('cohort-')
 nat = retirement_test in ('cohort-nat', 'cohort-two-nat', 'cohort-nat-drift', 'cohort-wrong-encap')
 files = dict(main=f['installed'], nft=nft, chap=(begin + old_row + (new_row if cohort else b'') + end).decode(),
              lns='ip range = 10.255.1.10-10.255.1.19\n', **{k: 'secret-fixture-only' for k in ('ike','options','secrets')})
-if scenario == 'chap-inspect-active':
+if scenario == 'chap-inspect-active' or joined_epoch:
     files['lns'] = ('[global]\nport = 1701\n\n[lns default]\n' + files['lns'] + 'local ip = 10.255.1.1\n'
                     'require authentication = yes\npppoptfile = /etc/ppp/options.xl2tpd\nlength bit = yes\n')
     files['options'] = ('auth\nrefuse-pap\nrefuse-chap\nrefuse-mschap\nrequire-mschap-v2\nrefuse-eap\nname l2tpd\n'
                         'mtu 1400\nmru 1400\nnoipv6\nnodefaultroute\nms-dns 192.0.2.53\n')
 baseline = h['dispatch'](dict(req, action='prepare'))['baseline']
-assert h['dispatch'](dict(req, action='install', files={k:h['b64'](v.encode()) for k,v in files.items()}, baseline=baseline))['ok']
+payload = {k:h['b64'](v.encode()) for k,v in files.items()}
+assert h['dispatch'](dict(req, action='check', files=payload, baseline=baseline))['ok']
+assert not Path(h['NET']).exists() and not any(policy.values()) and not changes
+assert h['dispatch'](dict(req, action='install', files=payload, baseline=baseline))['ok']
+assert Path(h['NET']).read_bytes() == h['network_unit'](network, False, backup_id=token, nft_sha256=h['digest'](nft.encode()))
 manifest = Path(h['manifest_path'](token))
 manifest_saved = manifest.read_bytes(), manifest.stat().st_ino
 intent = manifest.with_name('remove-attempt.json')
@@ -440,6 +501,10 @@ if scenario.endswith('-suffix') or scenario == 'chap-unterminated-separated':
     else:
         Path(P['chap']).write_bytes(Path(P['chap']).read_bytes() + suffix)
 if scenario == 'foreign-drop': Path(h['DROP_DIR'], 'foreign.conf').write_text('untouched')
+if scenario == 'foreign-network-witness':
+    foreign_witness = Path(h['network_witness_path'](token))
+    foreign_witness.parent.mkdir(exist_ok=True)
+    foreign_witness.symlink_to('missing')
 if scenario == 'foreign-dep': units[X]['RequiredBy'] += ' ' + B
 if scenario in ('vpn-generation', 'chap-legacy-replaced'):
     p = Path(P['chap' if scenario.startswith('chap') else 'lns']); q = p.with_suffix('.new')
@@ -475,6 +540,7 @@ def wire(action, *, stdin=None, helper=h, **kw):
     saved = sys.stdin
     try:
         helper['REMOVE_ENTERED'] = False  # one invocation per process on the host
+        helper['REATTEST_ENTERED'] = False
         helper['CHAP_ENTERED'] = False
         helper['NETWORK_UPGRADE_ENTERED'] = False
         sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(
@@ -490,6 +556,86 @@ def wire(action, *, stdin=None, helper=h, **kw):
 def snapshot():
     return sorted((str(p.relative_to(root)), p.lstat().st_ino, p.lstat().st_ctime_ns,
                    p.read_bytes() if p.is_file() else None) for p in root.rglob('*'))
+
+if joined_epoch:
+    req['currentUsers'] = old_users
+    selected = (X, XL, IKE, NET)
+    starts.update((units[n]['MainPID'], i + 100) for i, n in enumerate(selected[:-1]))
+    (group / 'cgroup.procs').write_text(units[XL]['MainPID'] + '\n')
+    prior = wire('session-count')
+    assert prior[0] == 0 and prior[2] == '', prior
+    prior = json.loads(prior[1])
+    assert prior['activeSessions'] == prior['activeIpsec'] == 0 and len(prior['census']) == 64, prior
+    original_manifest = json.loads(manifest.read_bytes())
+    if scenario == 'epoch-remove-reboot':
+        epoch = '12345678-1234-1234-1234-123456789abd'
+        transitioned = zip(selected, 'abcd', ('31', '32', '33', '0'))
+        for row in nft_rows:
+            value = next(iter(row.values()))
+            if 'handle' in value: value['handle'] += 100
+    else:
+        assert scenario == 'epoch-remove-xl2tpd-restart'
+        transitioned = [(XL, 'b', '32')]
+    for n, invocation, pid in transitioned:
+        units[n].update(InvocationID=invocation * 31 + 'f', MainPID=pid)
+        starts[pid] = 200 + int(pid)
+    (group / 'cgroup.procs').write_text(units[XL]['MainPID'] + '\n')
+    initial = snapshot()
+    binding = {k: req[k] for k in ('machineId', 'nodeId', 'backupId', 'network')}
+    expected_census = baseline = None
+    for i, action in enumerate(('session-count', 'reattest-runtime', 'session-count', 'prepare-remove',
+                                'session-count', 'prepare-remove', 'remove')):
+        if i == 0:
+            frame = f
+        else:
+            line = sys.stdin.readline()
+            if not line: break  # JS reports an aborted caller; it also asserts the complete action sequence.
+            frame = json.loads(line)
+        limits = ['1s', '9s'] if action == 'session-count' else ['4s', '125s']
+        assert shlex.split(frame['command']) == ['/usr/bin/timeout', '-k', *limits, '/usr/bin/python3', '-I', '-B', '-c', argv[-1]]
+        params = binding if action == 'reattest-runtime' else req
+        if action == 'remove': params = dict(req, baseline=baseline, expectedCensus=expected_census)
+        assert json.loads(frame['stdin']) == dict(params, action=action)
+        ipsec_live = i in (2, 3)  # Independent host activity, not an input to DIRECT.
+        result = wire(action, stdin=frame['stdin'])
+        if i == 0:
+            assert result == (70, '', 'DIRECT_RUNTIME_REATTEST_REQUIRED\n'), result
+        elif i == 3:
+            assert result == (70, '', 'DIRECT_REMOVE_IPSEC_BUSY\n'), result
+        else:
+            assert result[0] == 0 and result[2] == '', (action, result, changes)
+            reply = json.loads(result[1])
+            if action == 'reattest-runtime':
+                assert reply == dict(ok=True, backupId=token)
+                refreshed = dict(original_manifest['runtime'], boot=epoch,
+                                 invocations=[units[n]['InvocationID'] for n in selected],
+                                 pids=[units[n]['MainPID'] for n in selected])
+                assert json.loads(manifest.read_bytes()) == dict(original_manifest, runtime=refreshed)
+                after = snapshot()
+                own = {str(p.relative_to(root)) for p in (manifest, manifest.parent)}
+                assert [row for row in after if row[0] not in own] == [row for row in initial if row[0] not in own]
+                initial = after
+            elif action == 'session-count':
+                assert reply['activeSessions'] == 0 and reply['activeIpsec'] == int(ipsec_live), reply
+                expected_census = reply['census']
+                assert len(expected_census) == 64 and expected_census != prior['census']
+            elif action == 'prepare-remove':
+                baseline = reply['baseline']
+                assert reply == dict(ok=True, machineId=f['machineId'], backupId=token, baseline=baseline) and len(baseline) == 64
+            else:
+                assert reply == dict(ok=True, backupId=token, removed=True)
+        if action != 'remove':
+            assert snapshot() == initial and not changes and not intent.exists()
+        else:
+            assert json.loads(intent.read_bytes()) == dict(baseline=baseline)
+            assert changes[:3] == [('stop', XL), ('stop', IKE), ('stop', NET)] and ('restart', X) in changes
+            assert not any(policy.values()) and all(B not in cmd for cmd in changes)
+            assert not Path(h['DROP_DIR']).exists() and not Path(h['NFT_DIR']).exists()
+            assert json.loads(Path(P['main']).read_text()) == json.loads(f['old'])
+            assert all(R(p) == before['files'][k] for k, p in P.items() if k != 'main')
+            assert json.loads(manifest.read_bytes()) == dict(original_manifest, runtime=refreshed)
+        print(json.dumps(result), flush=True)
+    sys.exit(0)
 
 if scenario.startswith('retire-'):
     # Same emitted helper bytes as the SSH transport. The file/manifest and
@@ -1096,8 +1242,9 @@ if scenario.startswith('chap-sync-'):
         assert chap.read_bytes() == stock_chap + begin + end + foreign
     elif scenario == 'chap-sync-unknown':
         write = h['write']
-        def lost(*args):
-            write(*args)
+        def lost(path, *args, **kwargs):
+            assert path == str(chap)
+            write(path, *args, **kwargs)
             raise Refusal('RUNTIME_UNPROVED')
         h['write'] = lost
         assert wire('sync-chap', **params) == (75, '', '')
@@ -1160,11 +1307,14 @@ if scenario in ('udp-missing-preview','udp-wrong-owner-preview'):
 elif scenario == 'udp-unproved-transport':
     assert a == (70, '', 'DIRECT_CANDIDATE_INVALID\n'), a
 elif scenario in ('foreign-drop','foreign-dep','vpn-generation','foreign-ike','foreign-rule','foreign-listener', 'dynamic-user','ambiguous',
+                'foreign-network-witness',
                 'ambiguous-shared','duplicate-json','nft-drift','invalid-candidate','active-ppp','wrong-network','wrong-node',
                 'wrong-machine','missing-manifest'):
     assert a[0] == 70 and a[1] == '' and a[2].startswith('DIRECT_'), a
     if scenario == 'invalid-candidate': assert a[2] == 'DIRECT_CANDIDATE_INVALID\n' and checks[-2:] == [h['MAIN'], 'stdin:']
     if scenario == 'dynamic-user': assert a[2] == 'DIRECT_PROFILE_USERS\n'
+    if scenario == 'foreign-network-witness':
+        assert a == (70, '', 'DIRECT_ROLLBACK_DRIFT\n') and foreign_witness.is_symlink() and all(policy.values())
 else:
     assert a[0] == 0 and a[2] == '', a
     proof = json.loads(a[1])
@@ -1326,6 +1476,7 @@ else:
         assert R(P['chap'])['mode'] == 0o600
         assert not any(policy.values()) and intent.is_file() and wire('prepare-remove')[0] != 0
         assert not Path(h['DROP_DIR']).exists() and not Path(h['NFT_DIR']).exists()
+        assert not list((root / 'run').glob('celerity-rebuild-l2tp-network-*'))
         assert all(B not in cmd for cmd in changes) and ('restart',X) in changes
         if scenario == 'xtls-apply-remove':
             assert xtls.read_bytes() == xtls_bytes and xtls.stat().st_ino == xtls_inode
@@ -1340,7 +1491,7 @@ for (const scenario of ['normal', 'xtls-apply-remove', 'xtls-rollback', 'apply',
     'chap-unterminated-clean', 'chap-unterminated-legacy-suffix', 'chap-unterminated-list-suffix', 'chap-unterminated-separated',
     'chap-terminated-suffix',
     'foreign-drop', 'foreign-dep', 'foreign-ike', 'foreign-rule', 'foreign-listener', 'ambiguous', 'ambiguous-shared',
-    'duplicate-json', 'nft-drift', 'invalid-candidate', 'active-ppp', 'wrong-network', 'wrong-machine', 'wrong-node',
+    'duplicate-json', 'nft-drift', 'foreign-network-witness', 'invalid-candidate', 'active-ppp', 'wrong-network', 'wrong-machine', 'wrong-node',
     'missing-manifest', 'dynamic-user', 'unknown-stop', 'lingering-listener', 'lingering-route',
     'xl-stop-failed', 'xl-stop-nonzero', 'xl-stop-timeout', 'xl-stop-job', 'xl-stop-live-pid',
     'xl-reset-job', 'xl-reset-live-pid', 'ike-stop-failed',
@@ -1370,6 +1521,71 @@ for (const scenario of ['normal', 'xtls-apply-remove', 'xtls-rollback', 'apply',
             assert.equal(result.status, 0, result.stderr || result.error?.message);
             assert.equal(result.stdout, 'ok\n');
         } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+}
+
+for (const epoch of ['reboot', 'xl2tpd-restart']) {
+    test(`DIRECT census auto-reattest and Remove: ${epoch}`, async () => {
+        const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: nodeId,
+            C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, C3_REBUILD_L2TP_SSH_SHA256: 'd'.repeat(64) };
+        const node = { _id: nodeId, ip: relay.ip, ssh: { port: 22, username: 'root' } };
+        const currentUsers = [{ login: 'alice', password: 'test-old', ipAddress: '10.255.1.10', enabled: true }];
+        const dir = mkdtempSync(join(process.cwd(), '.direct-epoch-fixture-'));
+        let worker, exit, replies;
+        let workerStderr = '';
+        const actions = [];
+        class SSH {
+            connect() {}
+            disconnect() {}
+            async exec(command, { stdin }, verify) {
+                await verify();
+                actions.push(JSON.parse(stdin).action);
+                let frame = { command, stdin };
+                if (!worker) {
+                    frame = { ...frame, old, installed, network, backupId, nodeId, machineId };
+                    worker = spawn('/usr/bin/python3', ['-I', '-B', '-c', fixture,
+                        join(__dirname, '../rebuildRelayDirectHost.py'), dir, `epoch-remove-${epoch}`], { env: {}, timeout: 10000 });
+                    exit = new Promise(resolve => worker.once('close', resolve));
+                    worker.on('error', error => { workerStderr += error.message; });
+                    worker.stdin.on('error', error => { workerStderr += error.message; });
+                    worker.stderr.setEncoding('utf8').on('data', text => { workerStderr += text; });
+                    replies = createInterface({ input: worker.stdout })[Symbol.asyncIterator]();
+                }
+                worker.stdin.write(`${JSON.stringify(frame)}\n`);
+                const reply = await replies.next();
+                assert.ok(!reply.done, 'missing emitted host reply');
+                const [code, stdout, stderr] = JSON.parse(reply.value);
+                return { code, stdout, stderr };
+            }
+        }
+        const remote = createRelayDirect({ node, env, SSH: attested(SSH, machineId), verifyRemoveStdin: true });
+        const input = { nodeId, backupId, network, currentUsers };
+        const held = () => true;
+        try {
+            const busy = await remote.readSessionCount(input, held);
+            assert.deepEqual(busy, { activeSessions: 0, activeIpsec: 1, census: busy.census });
+            assert.match(busy.census, /^[a-f0-9]{64}$/);
+            await assert.rejects(remote.prepareRemove({ ...input, expectedCensus: busy.census }, held), {
+                code: 'REBUILD_L2TP_DIRECT_REMOVE_IPSEC_BUSY',
+            });
+            const idle = await remote.readSessionCount(input, held);
+            assert.deepEqual(idle, { activeSessions: 0, activeIpsec: 0, census: idle.census });
+            assert.match(idle.census, /^[a-f0-9]{64}$/);
+            assert.notEqual(idle.census, busy.census);
+            const plan = await remote.prepareRemove({ ...input, expectedCensus: idle.census }, held);
+            assert.equal(await remote.remove(plan, held), true);
+            assert.deepEqual(actions, ['session-count', 'reattest-runtime', 'session-count', 'prepare-remove',
+                'session-count', 'prepare-remove', 'remove']);
+        } finally {
+            try {
+                await remote.close();
+                if (worker) {
+                    worker.stdin.end();
+                    assert.equal(await exit, 0, workerStderr);
+                    assert.equal(workerStderr, '');
+                }
+            } finally { rmSync(dir, { recursive: true, force: true }); }
+        }
     });
 }
 

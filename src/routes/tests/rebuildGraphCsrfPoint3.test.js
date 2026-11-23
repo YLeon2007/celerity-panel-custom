@@ -25,13 +25,14 @@ const previewId = 'b'.repeat(64);
 const csrf = code => ({ error: 'CSRF validation failed', code });
 
 // Real Express dispatch and auth/CSRF guards, no sockets listening or connecting.
-function makeApp() {
+function makeApp(previewFailure) {
     const browser = { authenticated: true }, other = { authenticated: true };
     const stale = issuePanelCsrfToken({ session: browser });
     const fresh = issuePanelCsrfToken({ session: other });
     const calls = [];
     const service = { execute: async input => {
         calls.push(input);
+        if (input.preview && previewFailure) throw previewFailure;
         if (input.preview) return { allowed: true, previewId, nodes: [] };
         return {};
     } };
@@ -106,6 +107,10 @@ function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () =>
     }
     const document = {
         readyState: 'complete', body: element(), createElement: element,
+        addEventListener(event, callback) {
+            assert.equal(event, 'visibilitychange');
+            assert.equal(typeof callback, 'function');
+        },
         getElementById: id => tags.get(id) ?? null,
         querySelector(selector) {
             if (selector === '.network-loading') return document.body.querySelector(selector);
@@ -115,7 +120,7 @@ function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () =>
     };
     tags.get('btnAddLink').parentElement = element();
     const handlers = {};
-    const emptyEdge = { length: 0, filter: () => emptyEdge };
+    const emptyEdge = Object.assign([], { filter: () => emptyEdge });
     const cytoscape = () => ({
         on(event, query, cb) { handlers[event + query] = cb; },
         edges: () => emptyEdge, nodes: () => [], getElementById: () => emptyEdge,
@@ -167,6 +172,42 @@ test('rebuild nodes drawer keeps Delete but offers no strict Undeploy action', a
     assert.doesNotMatch(drawer, /id="btnUndeploy"|_cascadeUndeploy\(/);
     await ui.context._cascadeUndeploy(linkId);
     assert.deepEqual(ui.requests, []);
+});
+
+test('link remove preview returns the attributed refusal and never dispatches deletion', async () => {
+    const { checkNeighborRefusal } = require('../../services/rebuildNeighborRefusal');
+    const previewFailure = checkNeighborRefusal(Object.assign(new Error('/private/diag'), {
+        code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason: 'RUNTIME_FOREIGN_CHANGE',
+    }), '212 East');
+    const app = makeApp(previewFailure);
+    const req = { method: 'POST', body: JSON.stringify({ linkId, remove: true }), headers: {
+        cookie: 'fixture=session', origin, 'content-type': 'application/json', 'x-csrf-token': app.stale,
+    } };
+    assert.equal((await app.request(previewPath, { ...req, headers: { ...req.headers, cookie: 'fixture=api' } })).status, 403);
+    assert.deepEqual(app.calls, []);
+    const projected = await app.request(previewPath, req);
+    assert.equal(projected.status, 409);
+    const body = await projected.json();
+    assert.deepEqual(body, { error: {
+        code: 'REBUILD_RETIRE_NEIGHBOR_REFUSED', neighborName: '212 East', reason: 'RUNTIME_FOREIGN_CHANGE',
+    } });
+    for (const lang of ['en', 'ru', 'zh-CN']) {
+        let opened;
+        const shown = new Promise(resolve => { opened = resolve; });
+        const ui = mount('nodes', lang, app.stale, true, call => dispatch(app, call), { onDialog: opened });
+        const action = ui.context._cascadeDelete(linkId);
+        await openedBy({ opened: shown, confirmations: ui.confirmations }, action);
+        assert.deepEqual(ui.requests.filter(call => call.method).map(call => call.pathname), [previewPath]);
+        const copy = require(`../../locales/${lang}.json`).nodes.retireRelay;
+        const warning = ui.document.getElementById('rebuildPreviewWarning');
+        assert.equal(warning.textContent, copy.neighborRefused.replace('{name}', '212 East') + ' ' + copy.neighborRuntimeForeignChange);
+        assert.equal(warning.innerHTML, undefined);
+        assert.equal(ui.document.getElementById('rebuildPreviewApply').hidden, true);
+        ui.document.getElementById('rebuildPreviewCancel').onclick();
+        await action;
+    }
+    assert.equal(app.calls.length, 4);
+    assert.ok(app.calls.every(call => call.preview === true && call.remove === true));
 });
 
 for (const [view, lang, actionCopy] of [['network', 'ru', /Повторите действие вручную/], ['nodes', 'en', /Retry the action manually/]]) {
@@ -439,7 +480,10 @@ for (const view of ['nodes', 'network']) for (const [lang, expected] of Object.e
         const action = ui.context._cascadeDelete(linkId);
         const dialog = await openedBy(ui, action);
         const currentAsset = require('node:crypto').createHash('sha256').update(readFileSync(path.join(root, 'public/js/network.js'))).digest('hex').slice(0, 16);
-        assert.deepEqual(ui.resources.filter(src => src.startsWith('/js/network')), ['/js/network.js?v=' + currentAsset]);
+        // The standalone template is a render fixture; /panel/network
+        // redirects to the Nodes loader, which owns the active digest pin.
+        assert.deepEqual(ui.resources.filter(src => src.startsWith('/js/network')),
+            ['/js/network.js?v=' + (view === 'nodes' ? currentAsset : 'b4ff107132c65fd7')]);
         assert.ok(dialog.open);
         assert.match(ui.html, /<dialog[^>]*id="rebuildPreview"[^>]*aria-labelledby="rebuildPreviewTitle"[^>]*>/);
         assert.match(ui.html, /id="rebuildPreviewWarning"[\s\S]*id="rebuildPreviewDetails"[\s\S]*id="rebuildPreviewCancel"[^>]*autofocus/);

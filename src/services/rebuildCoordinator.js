@@ -194,7 +194,7 @@ async function runGraph(d, req, retire = false) {
             const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;
             if(observedMain&&(req.preview||!result.allowed||stale))addRemoveExitImpacts(report,links,observedMain,candidates,d.nodeRole);
             if(req.preview){
-                if(retire){await verify(); await d.checkActivation(nodes,retirement);}
+                if(d.checkActivation){await verify(); await d.checkActivation(nodes,retirement);}
                 return result;
             }
             if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);

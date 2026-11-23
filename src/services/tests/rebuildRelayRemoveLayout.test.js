@@ -61,10 +61,11 @@ appliedSide.routing.rules.push({ type: 'field', inboundTag: ['current-bridge'], 
 // helper. Only the local host boundary (systemctl, kernel/proc, Xray commands,
 // filesystem root and numeric ownership) is modeled. No network or host tools.
 const fixture = String.raw`
-import contextlib, copy, io, itertools, json, os, socket, stat, sys
+import contextlib, copy, io, itertools, json, os, runpy, socket, stat, sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 source, root, scenario = sys.argv[1:]
+network_fixture = runpy.run_path(str(Path(source).parent / 'tests/helpers/rebuildRelayNetworkFixture.py'))
 root, f = Path(root), json.load(sys.stdin)
 os.umask(0o077)
 h = {'__name__': 'fixture'}
@@ -90,6 +91,8 @@ P = h['NAMES']
 X, B, XL, IKE, NET, MAIN, BRIDGE, XRAY, SYSTEM = [h[k] for k in ('X','B','XL','IKE','NET_UNIT','MAIN','BRIDGE','XRAY','SYSTEM')]
 req = {k:f[k] for k in ('machineId','network','backupId')}
 d, token = req['network'], req['backupId']
+nft = network_fixture['nft_source'](source, d, token).decode()
+nft_rows = network_fixture['nft_rows'](d, token)
 
 def backing(path):
     assert path.startswith('/') and '..' not in Path(path).parts
@@ -218,13 +221,13 @@ def run(argv, **kw):
         changes.append(tuple(a))
         if op == 'daemon-reload':
             if backing(P['net']).exists():
-                lines = backing(P['net']).read_text().splitlines()
-                commands = [l.removeprefix('ExecStart=') for l in lines if l.startswith('ExecStart=')]
-                records = [f'{{ path={cmd.split()[0]} ; argv[]={cmd} ; ignore_errors=no ; }}' for cmd in commands]
+                net_bytes = backing(P['net']).read_bytes()
+                lines = net_bytes.decode().splitlines()
                 pre = next((l.removeprefix('ExecStartPre=') for l in lines if l.startswith('ExecStartPre=')), '')
                 legacy = f'Requires={X}' in lines
                 units[NET].update(LoadState='loaded', FragmentPath=P['net'], UnitFileState='static', Type='oneshot',
-                                  Requires=X if legacy else '', Wants='' if legacy else X, RequiredBy=XL, ExecStart=records,
+                                  Requires=X if legacy else '', Wants='' if legacy else X, RequiredBy=XL,
+                                  ExecStart=network_fixture['systemctl_start'](net_bytes),
                                   After=next(l.removeprefix('After=') for l in lines if l.startswith('After=')),
                                   ExecStartPre=f'{{ path=/usr/bin/systemctl ; argv[]={pre} ; ignore_errors=no ; }}' if pre else '')
                 units[XL].update(DropInPaths=h['DROP'],Requires=NET+' '+IKE,After=NET+' '+IKE)
@@ -234,10 +237,14 @@ def run(argv, **kw):
                 units[X]['RequiredBy'] = ''
         elif op == 'restart' and rest[0] in (X,B):
             n = rest[0]; load(n, MAIN if n == X else BRIDGE, next(restarts))
-        elif op == 'start' and rest == [XL]:
-            for n,pid,sub,generation in [(XL,'202','running',202),(IKE,'201','running',201),(NET,'0','exited',203)]:
-                units[n].update(ActiveState='active',MainPID=pid,SubState=sub,InvocationID=f'{generation:032x}')
+        elif op == 'start' and rest == [NET]:
+            assert units[NET]['ActiveState'] == 'inactive' and not any(policy.values())
+            units[NET].update(ActiveState='active',SubState='exited',InvocationID=f'{203:032x}')
             policy.update(rule=True,route=True,nft=True)
+        elif op == 'start' and rest == [XL]:
+            assert units[NET]['ActiveState'] == 'active' and all(policy.values())
+            for n,generation in [(XL,202),(IKE,201)]:
+                units[n].update(ActiveState='active',MainPID=str(generation),SubState='running',InvocationID=f'{generation:032x}')
         elif op == 'stop' and len(rest) == 1 and rest[0] in (XL,IKE,NET):
             units[rest[0]].update(ActiveState='inactive',SubState='dead',MainPID='0',InvocationID='')
         else: raise AssertionError(a)
@@ -301,10 +308,11 @@ def run(argv, **kw):
         assert a[:1] == ['-4'] and a[2] == 'del' and a[3:] == expect[a[1]], a
         policy[a[1]] = False; changes.append(tuple(a)); return reply()
     if exe == '/usr/sbin/nft':
-        table = dict(table=dict(family='inet',name=h['TABLE'],comment=token))
         foreign = dict(table=dict(family='inet',name='foreign',comment='keep'))
-        if a == ['-j','list','tables']: return js(dict(nftables=[foreign]+([table] if policy['nft'] else [])))
-        if a == ['-j','-s','list','table','inet',h['TABLE']]: return js(dict(nftables=[table]))
+        if a == ['-j','list','tables']: return js(dict(nftables=[foreign]+(nft_rows[1:2] if policy['nft'] else [])))
+        if a == ['-j','-s','-a','list','table','inet',h['TABLE']]:
+            assert policy['nft']
+            return js(dict(nftables=nft_rows))
         if a == ['-c','-f','-']: return reply()
         assert a == ['delete','table','inet',h['TABLE']], a
         policy['nft'] = False; changes.append(tuple(a)); return reply()
@@ -327,6 +335,8 @@ def no_host_dispatch(event, _):
 sys.addaudithook(no_host_dispatch)
 h.update(os=OSBoundary(),open=model(proc),pwd=NS(getpwnam=lambda name:NS(pw_uid=65534,pw_gid=65534)),
     subprocess=NS(run=model(run),PIPE=-1,DEVNULL=-3,TimeoutExpired=h['subprocess'].TimeoutExpired))
+# The shared policy observer has its own globals; its /run lookup must also use backing().
+h['_NETWORK_POLICY']['os'] = NS(lstat=h['os'].lstat)
 
 def wire(action, **extra):
     out, err = io.StringIO(),io.StringIO()
@@ -338,7 +348,6 @@ def wire(action, **extra):
 status, out, err = wire('prepare')
 assert status == 0, err
 baseline = json.loads(out)['baseline']
-nft = f'create table inet {h["TABLE"]} {{\n    comment "{token}"\n}}\n'
 files = dict(f['installed'],nft=nft,chap='# BEGIN CELERITY MANAGED L2TP USERS\n# END CELERITY MANAGED L2TP USERS\n',
              **{k:'fixture-only' for k in ('ike','lns','options','secrets')})
 if scenario == 'non-invertible-receipt':
@@ -411,7 +420,8 @@ bridge_unit = dict(units[B])
 old_sockets = h['owned_sockets'](h['sock_rows'](),bridge_unit['MainPID'])
 a = wire('prepare-remove')
 assert snapshots() == before and not changes and not intent.exists()
-negative = {**dict.fromkeys(('replace-main','replace-bridge','restart-bridge','restart-main','changed-split','foreign-dependency'), 'ROLLBACK_DRIFT'),
+negative = {**dict.fromkeys(('replace-main','replace-bridge','changed-split','foreign-dependency'), 'ROLLBACK_DRIFT'),
+            **dict.fromkeys(('restart-bridge','restart-main'), 'RUNTIME_REATTEST_REQUIRED'),
             **dict.fromkeys(('foreign-handoff','split-missing-udp','local-missing-udp','bridge-exe',
                              'split-wrong-udp-address','local-wrong-udp-pid'), 'RUNTIME_UNPROVED'),
             **dict.fromkeys(('wrong-node','apply-mixed','non-invertible-receipt'), 'CANDIDATE_INVALID'),

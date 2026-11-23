@@ -9,7 +9,8 @@ const fail=code=>Object.assign(new Error(code),{code});
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
 const readMachineId='/usr/bin/head -c 34 /etc/machine-id';
 const applyActions={check:'check-apply-network',prepare:'prepare-apply-network',
-    verify_before_restart:'verify-apply-network',restart:'restart-apply-network',verify_after_restart:'verify-apply-network'};
+    verify_before_restart:'verify-apply-network',publish:'publish-apply-profiles',
+    restart:'restart-apply-network',verify_after_restart:'finalize-apply-profiles'};
 const guardExit=70, machineUnavailable='REBUILD_APPLY_MACHINE_ID_UNAVAILABLE', machineMismatch='REBUILD_APPLY_MACHINE_ID_MISMATCH';
 function guardMutation(machineId,command){
     // Read at most one byte past the longest accepted value. Encoding bytes
@@ -23,6 +24,7 @@ function guardMutation(machineId,command){
 function createTransport(node, SSH=require('./nodeSSH'), authority) {
     const ssh=new SSH(node,authority?.sshOptions), token=randomUUID(), staged=new Map();
     let connected=false, attemptedStage=false, attestationStarted=false, attested=false, closed=false;
+    let execPinned, runtimeUnsafe=false;
     // A pooled channel can reconnect between commands. A bound transport keeps
     // one direct client from machine-ID attestation through cleanup, with no replay.
     if(authority)ssh.usePool=false;
@@ -43,7 +45,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         attestationStarted=true;
         await authority.verify();
         if(closed)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
-        try{await ssh.connectDirectOnce(CONNECT_TIMEOUT_MS);}catch(error){
+        try{execPinned=await ssh.connectDirectOnce(CONNECT_TIMEOUT_MS);}catch(error){
             if(authority.merged && error?.code==='SSH_HOST_KEY_MISMATCH')throw identityChanged();
             throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');
         }
@@ -59,15 +61,15 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         await attestMachine();
         await authority.verify();
     }
-    async function run(command,options,write=false,onExec){
-        if(closed || authority && !attested)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+    async function run(command,options,write=false,onExec,execute){
+        if(closed || runtimeUnsafe || authority && !attested)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         if(authority){
             if(authority.merged && write)await verifyIdentity();
             else await authority.verify();
             if(closed||!connected)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
         }else if(!connected){await ssh.connect();connected=true;}
         onExec?.();
-        return ssh.exec(command,options);
+        return execute ? execute(command,options) : ssh.exec(command,options);
     }
     async function check(command,stdin,write=false) {
         const guarded=authority&&write;
@@ -112,16 +114,18 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             }
             const active=profile==='main'||config.inbounds.length>0||config.outbounds.some(o=>o.protocol==='vless' && o.settings?.reverse?.tag);
             attemptedStage=true;
-            await check(`set -eu; umask 077; test ! -L ${dir}; test ! -L ${path}; if ! test -d ${dir}; then install -d -m 0755 ${dir}; fi; (set -C; cat > ${file}); /usr/local/bin/xray run -test -config ${file} >/dev/null 2>&1`,JSON.stringify(config),true);
-            staged.set(profile,{active,state});
+            const bytes=JSON.stringify(config);
+            await check(`set -eu; umask 077; test ! -L ${dir}; test ! -L ${path}; if ! test -d ${dir}; then install -d -m 0755 ${dir}; fi; (set -C; cat > ${file}); /usr/local/bin/xray run -test -config ${file} >/dev/null 2>&1`,bytes,true);
+            staged.set(profile,{active,state,sha256:createHash('sha256').update(bytes).digest('hex')});
         }
     }
     let networkProof;
     // DIRECT checks the machine ID within its own command under its host flock.
-    async function relayNetwork(phase,proof){
+    async function relayNetwork(phase,proof,{readOnly=false,reattestRuntime=false,publication}={}){
         let failureClass='local_check';
+        const observePinned=phase==='check'&&typeof execPinned==='function' ? execPinned : undefined;
         const observe=async(cmd,options)=>{
-            const result=await run(cmd,options,phase==='prepare'||phase==='restart',()=>{failureClass='ssh_no_reply';});
+            const result=await run(cmd,options,['prepare','publish','restart','verify_after_restart'].includes(phase),()=>{failureClass='ssh_no_reply';},observePinned);
             // Record only what the caller observed, not a guess about host writes.
             // A clean exit still needs the existing DIRECT decoder's exact receipt.
             const status=result?.code;
@@ -131,10 +135,51 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             else failureClass=status===0?'invalid_reply':'other_nonzero_exit';
             return result;
         };
+        // Read-only probes default to no writes. The fenced panel Preview
+        // may opt into this one metadata repair, never activation writes.
+        const runtime=observePinned&&(!readOnly||reattestRuntime===true) ? {
+            nodeId: String(node._id??''),
+            async run(command,options){
+                // This is a metadata write, not a second read. Requalify the
+                // held lock and machine, and gate stdin on that same client.
+                const verify=async()=>{
+                    if(closed||!attested||runtimeUnsafe)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+                    if(await authority.verify()===false)throw fail('REBUILD_LOCK_LOST');
+                    if(closed||runtimeUnsafe)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+                };
+                failureClass='local_check';
+                await verify();
+                let observed;
+                try{observed=await observePinned(readMachineId,{timeout:5000,maxOutputBytes:34});}
+                catch{throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');}
+                if(observed?.code!==0||observed.stderr!==''||typeof observed.stdout!=='string'
+                    || !/^[a-f0-9]{32}\n?(?![\s\S])/.test(observed.stdout))throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');
+                if(observed.stdout!==authority.machineId&&observed.stdout!==`${authority.machineId}\n`)throw identityChanged();
+                await verify();
+                const uncertain=()=>Object.assign(fail('REBUILD_L2TP_APPLY_NETWORK_OUTCOME_UNKNOWN'),{remoteOutcomeUncertain:true});
+                let veto;
+                failureClass='ssh_no_reply';
+                let result;
+                try{
+                    result=await observePinned(command,options,async()=>{
+                        try{await verify();}
+                        catch(error){veto={error};throw error;}
+                    });
+                }catch(error){
+                    if(veto)throw veto.error;
+                    if(SSH.execStdinWasNotAttempted?.(error))throw fail('REBUILD_L2TP_SSH_CONNECT_FAILED');
+                    throw uncertain();
+                }
+                try{await verify();}catch(error){if(isIdentityChanged(error))throw error;throw uncertain();}
+                failureClass=result?.code===70?'unrecognized_exit_70':'invalid_reply';
+                return result;
+            },
+        } : undefined;
         try {
             return await require('./rebuildRelayDirect').applyRelayNetwork(observe,authority.machineId,
-                authority.installation,applyActions[phase],proof,authority.merged);
+                authority.installation,applyActions[phase],proof,authority.merged,runtime,publication);
         } catch(error) {
+            if(runtime&&(error?.remoteOutcomeUncertain||isIdentityChanged(error)))runtimeUnsafe=true;
             // Only the existing decoder can confirm a refusal. A guard error or an
             // unframed exit 70 cannot vouch for it, nor for any earlier Apply step.
             if(failureClass==='unrecognized_exit_70' && (error?.code==='REBUILD_L2TP_APPLY_NETWORK_REFUSED'||isIdentityChanged(error)))failureClass='direct_refusal';
@@ -151,20 +196,26 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         if(authority?.installation){
             if(!networkProof)throw fail('REBUILD_L2TP_APPLY_NETWORK_REFUSED');
             await relayNetwork('verify_before_restart',networkProof);
+            networkProof=await relayNetwork('publish',networkProof,{publication:{nodeId:String(node._id),stageId:token,
+                profiles:Object.fromEntries(['main','bridge'].map(key=>[key,staged.get(key).sha256])),
+                bridgeUnit:generateBridgeSystemdService()}});
         }
         // Release the previous socket owner before moving any listener between
         // services; enable both effective profiles for a normal unattended boot.
         const side=staged.get('bridge');
         if(side.state==='loaded')await check('systemctl stop xray-bridge.service',undefined,true);
-        for(const profile of ['bridge','main']){
+        for(const profile of authority?.installation ? [] : ['bridge','main']){
             const path=paths[profile], f=temp(profile);
             // Keep an existing profile's service readability and privileges;
             // classic freshly provisioned bridge units run as nobody.
             await check(`set -eu; if test -f ${path}; then chown --reference=${path} ${f}; chmod --reference=${path} ${f}; else chown root:$(id -gn nobody) ${f}; chmod 0640 ${f}; fi; mv -fT ${f} ${path}`,undefined,true);
         }
         if(side.active && side.state==='not-found'){
-            const unit='/etc/systemd/system/xray-bridge.service';
-            await check(`set -eu; test ! -e ${unit}; test ! -L ${unit}; (umask 022; set -C; cat > ${unit}); systemctl daemon-reload`,generateBridgeSystemdService(),true);
+            if(authority?.installation)await check('systemctl daemon-reload',undefined,true);
+            else {
+                const unit='/etc/systemd/system/xray-bridge.service';
+                await check(`set -eu; test ! -e ${unit}; test ! -L ${unit}; (umask 022; set -C; cat > ${unit}); systemctl daemon-reload`,generateBridgeSystemdService(),true);
+            }
         }
         if(authority?.installation){
             await check('systemctl enable xray.service',undefined,true);
@@ -182,7 +233,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
     return {read,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,
         ...(authority&&{attest}),
         ...(authority?.merged&&{verifyIdentity}),
-        ...(authority?.installation&&{checkActivation:()=>relayNetwork('check'),prepareActivation}),
+        ...(authority?.installation&&{checkActivation:options=>relayNetwork('check',undefined,options),prepareActivation}),
         readTunnelCertificate:()=>check(READ_CHAIN),verifyTunnelCertificate:input=>check(VERIFY_CHAIN,input)};
 }
 
@@ -192,6 +243,6 @@ function createBoundRelayTransport(node,fence,verifyLock,installation,verifyBind
     // take only authentication material from the corroborating card.
     const target={_id:nodeId,name:nodeId,ip,ssh:{port,username,password:node.ssh.password,privateKey:node.ssh.privateKey}};
     return createTransport(target,undefined,{machineId,installation,merged:fence.merged,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
-        expectedEndpoint:{ip,port,username}},async verify(){await verifyLock();await verifyBinding();}});
+        expectedEndpoint:{ip,port,username}},async verify(){if(await verifyLock()===false)throw fail('REBUILD_LOCK_LOST');await verifyBinding();}});
 }
 module.exports={createTransport,createBoundRelayTransport};

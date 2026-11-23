@@ -10,6 +10,7 @@ const { requirePanelCsrf } = require('./csrf');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { installCheckIds } = require('../../services/rebuildRelayInstallDiagnostics');
 const { isInspectionReason } = require('../../services/rebuildRelayInspection');
+const { runtimeForeignChange } = require('../../services/rebuildRelayRuntimeRefusal');
 const { mountAdmission, admissionPath, validAdmissionJson, reject: rejectAdmission,
     validNodeId, validActor, grantEffectStatus, identityChanged } = require('./rebuildRelayAdmission');
 const { retirePath, validRetireJson, rejectRetire, mountRetire } = require('./rebuildRelayRetire');
@@ -29,6 +30,7 @@ const emptyJson = /^\s*\{\s*\}\s*$/;
 const reconcileInvalid = 'REBUILD_L2TP_RECONCILE_INVALID_REQUEST';
 const reconcileUnavailable = res => revealError(res, 503, 'REBUILD_L2TP_RECONCILE_UNAVAILABLE');
 const reconcileBlocked = 'REBUILD_L2TP_ACCOUNTS_MANUAL_BLOCK';
+const reconcileUnknown = 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN';
 const invalidRecovery = res => revealError(res, 400, 'REBUILD_INVALID_REQUEST');
 const unconfirmedRecovery = (res, status = 503) => res.status(status).json({
     error: { code: 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED', retryAllowed: false },
@@ -167,7 +169,8 @@ function mountOverview(router, getOverview, exposePanelCsrfToken) {
         requireAuth, exposePanelCsrfToken, requireCompletedOnboarding(sendLoadError), async (req, res) => {
             try {
                 const removalNotice = req.query.view === 'remove-unconfirmed' ? 'uncertain'
-                    : req.query.view === 'remove-cleanup' ? 'removeCleanupFailed' : null;
+                    : req.query.view === 'remove-cleanup' ? 'removeCleanupFailed'
+                        : req.query.view === 'remove-foreign-change' ? 'runtimeForeignChange' : null;
                 if (removalNotice) return renderPage(res, { removalNotice, relays: [], accounts: [], canManageAccounts: false });
                 const changedRelayId = validNodeId(req.query.identityChanged) ? req.query.identityChanged : null;
                 return renderPage(res, { ...await getOverview().overview(), changedRelayId,
@@ -241,18 +244,23 @@ function mountReconcile(router, getOverview, reconcile, limiter) {
             if (authority.canReconcileAccounts !== true) {
                 return await hasPendingAccounts() ? revealError(res, 409, 'REBUILD_L2TP_RECONCILE_DISABLED') : receipt('settled');
             }
-            let result, failed = false, reason, failureCode, identityBlocked = false;
+            let result, failed = false, reason, failureCode, identityBlocked = false, foreignChange = false, outcomeUnknown = false;
             try { result = await reconcile(); } catch (error) {
                 failed = true;
                 const diagnostic = error?.retryAllowed === false && error.inspectionReason;
                 if (isInspectionReason(diagnostic)) reason = diagnostic;
                 failureCode = error?.code;
                 identityBlocked = error?.identityBlocked === true;
+                foreignChange = failureCode === 'REBUILD_L2TP_ACCOUNTS_BLOCKED' && error.runtimeForeignChange === true
+                    && error.retryAllowed === false && error.outcome === undefined;
+                outcomeUnknown = failureCode === reconcileUnknown && error.outcome === 'unknown' && error.retryAllowed === false;
             }
             // A host refusal is diagnostic only while the pending fence still
             // exists. Busy, lost replies and unclassified outcomes stay pending.
             if (await hasPendingAccounts()) {
+                if (outcomeUnknown) return res.status(409).json({ error: { code: reconcileUnknown, outcome: 'unknown', retryAllowed: false } });
                 if (identityBlocked || failureCode === reconcileBlocked || failureCode === identityChanged) return manualBlock();
+                if (foreignChange) return res.status(409).json({ error: { code: runtimeForeignChange, retryAllowed: false } });
                 const grantStatus = grantEffectStatus(failureCode);
                 if (grantStatus) return revealError(res, grantStatus, failureCode);
                 if (reason) return res.json({ executionMode: 'rebuild', status: 'inspection-unproved', reason, retryAllowed: false });
@@ -293,6 +301,10 @@ function mountInstallRecovery(router, limiter) {
             }
             return res.json({ executionMode: 'rebuild', status: 'can_install_again', nodeId });
         } catch (error) {
+            if (error?.code === 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE' && error.retryAllowed === false
+                && error.outcome === undefined && !error.remoteOutcomeUncertain) {
+                return res.status(409).json({ error: { code: error.code, retryAllowed: false } });
+            }
             const status = error?.code === 'REBUILD_L2TP_INSTALL_DISABLED' ? 409 : grantEffectStatus(error?.code);
             return unconfirmedRecovery(res, status);
         }

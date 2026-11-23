@@ -58,12 +58,14 @@ test('DIRECT unit reader preserves the real three-row managed oneshot ExecStart 
 // in-worktree root. Runtime facts and privileged UID are modeled; no host
 // commands, sockets, or service manager are called by this harness.
 const harness = String.raw`
-import contextlib, json, os, pathlib, sys
+import contextlib, json, os, pathlib, runpy, sys
 source, root, scenario = sys.argv[1:]
+network_fixture = runpy.run_path(str(pathlib.Path(source).parent / 'tests/helpers/rebuildRelayNetworkFixture.py'))
 os.umask(0o077)
 h = {'__name__': 'fixture'}
 exec(compile(pathlib.Path(source).read_bytes(), source, 'exec'), h)
 root = pathlib.Path(root)
+h['NETWORK_RUN'] = str(root / 'run')
 for k in ('MAIN', 'BRIDGE', 'SYSTEM', 'NET', 'DROP_DIR', 'DROP', 'NFT_DIR', 'NFT_FILE', 'VAULT'):
     h[k] = str(root) + h[k]
 h['NAMES'] = {k: str(root) + v for k, v in h['NAMES'].items()}
@@ -128,7 +130,7 @@ h['require_network_observers'] = lambda: None
 h['validate_profiles'] = lambda after: None
 policy = dict(nft=None, rule=False, route=False)
 commands = []
-h['network_projection'] = lambda d, t: dict(policy)
+h['network_projection'] = lambda d, t, **kw: dict(policy)
 h['nft_projection'] = lambda t: policy['nft']
 h['no_jobs'] = lambda names: None
 h['xray_users'] = lambda record, info, rows, transit: before['sockets']
@@ -189,7 +191,7 @@ baseline = h['dispatch'](dict(action='prepare', machineId=machine, network=d))['
 req = dict(machineId=machine, backupId=token, baseline=baseline, network=d)
 raw = dict(main=h['encode']({'inbounds': [{'tag':'relay-l2tp-a','port':12345},
     {'tag':'rebuild-relay-ingress','listen':'127.0.0.1','port':23456}]}),
-    nft=('create table inet ' + h['TABLE'] + ' {\n    comment "' + token + '"\n}').encode(),
+    nft=network_fixture['nft_source'](source, d, token),
     **{k: ('generated-' + k).encode() for k in ('ike','lns','options','chap','secrets')})
 files = {k: h['b64'](v) for k,v in raw.items()}
 assert h['dispatch'](dict(req, action='check', files=files)) == {'ok': True, 'backupId': token}

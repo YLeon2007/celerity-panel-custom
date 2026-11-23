@@ -347,7 +347,7 @@ def rmdir(path):
         os.fsync(fd)
 
 
-def write(path, before, after, *, generation=None):
+def write(path, before, after, *, generation=None, witness=False):
     need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
     parent, name = os.path.split(path)
 
@@ -375,7 +375,7 @@ def write(path, before, after, *, generation=None):
                     os.fchown(output.fileno(), uid, after['gid'])
                     os.fchmod(output.fileno(), after['mode'])
                     os.fsync(output.fileno())
-                    if path == PPP_PATH:
+                    if path == PPP_PATH or witness:
                         st = os.fstat(output.fileno())
                         published = [st.st_dev, st.st_ino]
                 need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
@@ -1057,7 +1057,9 @@ def number(value):
     return int(value, 0) if isinstance(value, str) and value.isdecimal() is False else int(value)
 
 
-def network_projection(d, token, removing=False, *, inspect_nft=True):
+def network_projection(d, token, removing=False, *, inspect_nft=True, exact_flags=False, pinned=False):
+    if pinned:
+        return pinned_network_projection(d, token, removing)
     rules = ip('rule', 'show')
     routes = ip('route', 'show', 'table', 'all')
     # The narrow first-install profile supports only the stock all-source rules
@@ -1088,6 +1090,7 @@ def network_projection(d, token, removing=False, *, inspect_nft=True):
          'NETWORK_CONFLICT')
     need(len(own_routes) <= 1 and all(r.get('type') in ('local', 2, '2') and r.get('dst') in ('default', '0.0.0.0/0') and r.get('dev') == 'lo'
          and r.get('scope') in ('host', 254, '254') and not (set(r) - {'type', 'dst', 'dev', 'table', 'scope', 'flags', 'protocol'})
+         and (not exact_flags or r.get('flags', []) == [])
          for r in own_routes), 'NETWORK_CONFLICT')
     return dict(rule=bool(own_rules), route=bool(own_routes), nft=nft_projection(token) if inspect_nft else None)
 
@@ -1391,7 +1394,7 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
          and (vpn_empty() if inspect_xfrm else ppp_empty())
          and network_projection(d, '', **({} if inspect_nft else {'inspect_nft': False}))
          == {'nft': None, 'rule': False, 'route': False}, 'NETWORK_CONFLICT')
-    need(not inspect_nft or not any(row.get('name') == 'celerity_l2tp' for row in nft_tables()), 'NETWORK_CONFLICT')
+    need(not inspect_nft or not any(row.get('name') in ('celerity_l2tp', TABLE) for row in nft_tables()), 'NETWORK_CONFLICT')
     no_swan_rule()
     need(not units[IKE].get('PassEnvironment') and (STOCK_IKE_INCLUDE in starter or stock_starter), 'PREREQUISITE')
     need(all(removal_native(units[n], n, {'units': units}, installed=False)
@@ -1458,7 +1461,9 @@ def candidate(request, before, *, active_probe=False):
         raw(original['starter']) + b'\ninclude ' + NAMES['ike'].encode() + b'\n', original['starter']['mode'], original['starter']['gid'])
     for k in ('chap', 'secrets'):
         after[k] = entry(raw(original[k]) + b'\n' + bytes_[k])
-    after['net'], after['drop'] = entry(network_unit(d, sidecar), 0o644), entry(drop, 0o644)
+    need(network_witness_absent(network_witness_path(token)), 'NETWORK_CONFLICT')
+    after['net'], after['drop'] = entry(network_unit(d, sidecar, backup_id=token,
+                                                   nft_sha256=digest(bytes_['nft'])), 0o644), entry(drop, 0o644)
     if 'swan' in original:
         after['swan'] = entry(SWAN_SETTINGS, 0o644)
     need(nft_marker(bytes_['nft'], token), 'CANDIDATE_INVALID')
@@ -1466,16 +1471,254 @@ def candidate(request, before, *, active_probe=False):
 
 
 NETWORK_START_CHECK = '/usr/bin/systemctl is-active --quiet ' + X
+NETWORK_RUN = '/run'
 
 
-def network_unit(d, sidecar, *, legacy=False):
+def network_witness_path(token):
+    need(isinstance(token, str) and re.fullmatch(r'[a-f0-9]{32}', token), 'CANDIDATE_INVALID')
+    return NETWORK_RUN + '/celerity-rebuild-l2tp-network-' + token
+
+
+# The same fixed observer runs in the packed DIRECT helper and in the unit.
+# No /run receipt is created. A token alone is not proof of ownership: bind
+# the full ordered rules in each chain, plus the complete route and RPDB rows.
+NETWORK_POLICY_SOURCE = r'''import hashlib
+import json
+import os
+
+def require(ok):
+    if not ok:
+        raise ValueError('unexpected policy state')
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def witness_absent(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    return False
+
+def nft_rows(run, *args):
+    rows = json.loads(run('/usr/sbin/nft', '-j', *args))['nftables']
+    require(type(rows) is list and all(type(row) is dict and len(row) == 1 for row in rows))
+    return rows
+
+def firewall(run, d, token, name):
+    tables = nft_rows(run, 'list', 'tables')
+    require(all('table' in row or 'metainfo' in row for row in tables))
+    own = [row['table'] for row in tables if 'table' in row and row['table']['name'] == name]
+    if not own:
+        return None
+    require(len(own) == 1 and own[0]['family'] == 'inet' and own[0]['comment'] == token)
+    common = dict(family='inet', table=name)
+    hooks = dict(prerouting=-150, input=0, forward=0)
+    address, prefix = d['clientCidr'].split('/')
+    mark, port = d['fwmark'], d['tproxyPort']
+
+    def match(left, right):
+        return dict(match=dict(op='==', left=left, right=right))
+
+    def meta(key, value):
+        return match(dict(meta=dict(key=key)), value)
+
+    def payload(protocol, field, value):
+        return match(dict(payload=dict(protocol=protocol, field=field)), value)
+
+    ppp = meta('iifname', 'ppp*')
+    src = payload('ip', 'saddr', dict(prefix=dict(addr=address, len=int(prefix))))
+    l4 = meta('l4proto', dict(set=['tcp', 'udp']))
+    l2tp = payload('udp', 'dport', 1701)
+    accept, drop = dict(accept=None), dict(drop=None)
+    expected = dict(
+        prerouting=[[ppp, src, l4, dict(tproxy=dict(family='ip', port=port)),
+                     dict(mangle=dict(key=dict(meta=dict(key='mark')), value=mark)), accept]],
+        input=[[ppp, src, meta('mark', mark), accept], [ppp, drop],
+               [l4, payload('th', 'dport', port), drop], [l2tp, meta('ipsec', True), accept], [l2tp, drop]],
+        forward=[[ppp, drop]])
+    chains, rules, table = {}, {key: [] for key in hooks}, None
+    for row in nft_rows(run, '-s', '-a', 'list', 'table', 'inet', name):
+        key, value = next(iter(row.items()))
+        if key == 'metainfo':
+            require(value['json_schema_version'] == 1)
+            continue
+        handle = value['handle']
+        require(type(handle) is int and handle > 0)
+        value = {k: v for k, v in value.items() if k != 'handle'}
+        if key == 'table':
+            require(table is None and handle == own[0]['handle'])
+            table = value
+        elif key == 'chain':
+            chain = value['name']
+            require(chain in hooks and chain not in chains)
+            chains[chain] = value
+        elif key == 'rule':
+            chain = value['chain']
+            expr = value['expr']
+            require(value == dict(common, chain=chain, expr=expr))
+            rules[chain].append(expr)
+        else:
+            require(False)
+    require(table == dict(family='inet', name=name, comment=token)
+            and canonical(chains) == canonical({key: dict(common, name=key, type='filter', hook=key,
+                                                          prio=prio, policy='accept') for key, prio in hooks.items()})
+            and canonical(rules) == canonical(expected))
+    # Handles and library version are not an identity across a kernel boot.
+    return sha(canonical([table, chains, rules]))
+
+def observe_policy(run, d, token, name, priority, *, removing=False):
+    def observe(kind, *opts):
+        rows = json.loads(run('/usr/sbin/ip', '-j', '-N', '-4', kind, 'show', *opts))
+        require(type(rows) is list and all(type(r) is dict and
+                r.get('family', 'inet') in ('inet', '2', 2) for r in rows))
+        for r in rows:
+            r.pop('family', None)
+        return rows
+
+    def table_id(value):
+        names = dict(local=255, main=254, default=253)
+        if type(value) is str and value in names:
+            return names[value]
+        require(type(value) is int or (type(value) is str and value.isascii() and value.isdecimal()))
+        return int(value)
+
+    rules, routes = observe('rule'), observe('route', 'table', 'all')
+    require(all(type(r['priority']) is int for r in rules))
+    table = d['routeTable']
+    others = [r for r in rules if r['priority'] != priority]
+    own = [r for r in rules if r['priority'] == priority]
+    if removing:
+        require(all(table_id(r['table']) != table for r in others if 'table' in r))
+    else:
+        stock = {0: 255, 32766: 254, 32767: 253}
+        require(len(others) == 3 and {r['priority'] for r in others} == set(stock)
+                and all(r['src'] == 'all' and table_id(r['table']) == stock[r['priority']]
+                        and not (set(r) - {'priority', 'src', 'table', 'protocol'}) for r in others))
+    # iproute2 omits the table on main-table routes; their absence does not
+    # mean table 0. -N avoids arbitrary rt_tables aliases on other rows.
+    selected = [r for r in routes if table_id(r.get('table', 254)) == table]
+    cidr = d['clientCidr']
+    address, length = cidr.split('/')
+    require(len(own) <= 1 and all(table_id(r['table']) == table and
+            ((r['src'] == cidr and 'srclen' not in r) or
+             (r['src'] == address and type(r.get('srclen')) is int and r['srclen'] == int(length))) and
+            type(r['fwmark']) in (int, str) and
+            (int(r['fwmark'], 10 if r['fwmark'].isdecimal() else 0) if type(r['fwmark']) is str else r['fwmark']) == d['fwmark'] and
+            not (set(r) - {'priority', 'src', 'srclen', 'table', 'fwmark', 'protocol'}) for r in own))
+    require(len(selected) <= 1 and all(r.get('type') in ('local', 2, '2') and r.get('dst') in ('default', '0.0.0.0/0')
+            and r['dev'] == 'lo' and r['scope'] in ('host', 254, '254') and r.get('flags', []) == []
+            and not (set(r) - {'type', 'dst', 'dev', 'scope', 'table', 'flags', 'protocol'}) for r in selected))
+    return dict(nft=firewall(run, d, token, name), rule=bool(own), route=bool(selected))
+'''
+
+_NETWORK_POLICY: dict[str, Any] = {}
+exec(NETWORK_POLICY_SOURCE, _NETWORK_POLICY)
+network_witness_absent = _NETWORK_POLICY['witness_absent']
+
+
+def pinned_network_projection(d, token, removing):
+    try:
+        need(network_witness_absent(network_witness_path(token)), 'ROLLBACK_DRIFT')
+        return _NETWORK_POLICY['observe_policy'](command, d, token, TABLE, PRIORITY, removing=removing)
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        raise Refusal('ROLLBACK_DRIFT') from error
+
+
+def network_unit_start():
+    # The boot-time unit cannot depend on the transient DIRECT payload or
+    # take its host flock (Install already holds it while starting XL).
+    return (NETWORK_POLICY_SOURCE + r'''
+import stat
+import subprocess
+import sys
+
+def run(*args, data=None):
+    result = subprocess.run(args, input=data, stdin=subprocess.DEVNULL if data is None else None,
+                            capture_output=True, timeout=3, cwd='/',
+                            env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+    require(result.returncode == 0 and not result.stderr and len(result.stdout) <= 16 * 1024 * 1024)
+    return result.stdout
+
+def read(path, mode, limit):
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as f:
+        s = os.fstat(f.fileno())
+        require(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_uid == s.st_gid == 0
+                and stat.S_IMODE(s.st_mode) == mode)
+        data = f.read(limit + 1)
+        require(len(data) <= limit)
+        return data
+
+def main():
+    token, source_sha, nft_file, name, cidr, mark, table, priority, port, witness = sys.argv[1:]
+    nft, ip = '/usr/sbin/nft', '/usr/sbin/ip'
+    require(witness_absent(witness))
+    policy = read(nft_file, 0o644, 1024 * 1024)
+    require(sha(policy) == source_sha and
+            policy.startswith(f'create table inet {name} {{\n    comment "{token}"\n'.encode()))
+    d = dict(clientCidr=cidr, fwmark=int(mark), routeTable=int(table), tproxyPort=int(port))
+    live = observe_policy(run, d, token, name, int(priority))
+    require(witness_absent(witness))
+    if all(live.values()):
+        return
+    # Never repair a partial policy on start. An empty kernel after boot is
+    # legitimate; creation starts with the atomic, exclusive nft batch.
+    require(not any(live.values()))
+    run(nft, '-f', '-', data=policy)
+    created = firewall(run, d, token, name)
+    require(created is not None)
+    run(ip, '-4', 'route', 'add', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', table)
+    run(ip, '-4', 'rule', 'add', 'priority', priority, 'from', cidr, 'fwmark', mark, 'table', table)
+    require(observe_policy(run, d, token, name, int(priority)) == dict(nft=created, rule=True, route=True))
+    require(witness_absent(witness))
+
+try:
+    main()
+except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
+    raise SystemExit('Celerity L2TP policy missing, conflicting or unverified') from None
+''').encode()
+
+
+def managed_nft_bytes(d, backup_id):
+    return f'''create table inet {TABLE} {{
+    comment "{backup_id}"
+    chain prerouting {{
+        type filter hook prerouting priority mangle; policy accept;
+        iifname "ppp*" ip saddr {d['clientCidr']} meta l4proto {{ tcp, udp }} tproxy ip to :{d['tproxyPort']} meta mark set {d['fwmark']} accept
+    }}
+    chain input {{
+        type filter hook input priority filter; policy accept;
+        iifname "ppp*" ip saddr {d['clientCidr']} meta mark {d['fwmark']} accept
+        iifname "ppp*" drop
+        meta l4proto {{ tcp, udp }} th dport {d['tproxyPort']} drop
+        udp dport 1701 meta ipsec exists accept
+        udp dport 1701 drop
+    }}
+    chain forward {{
+        type filter hook forward priority filter; policy accept;
+        iifname "ppp*" drop
+    }}
+}}
+'''.encode()
+
+
+def network_unit(d, sidecar, *, legacy=False, backup_id=None, nft_sha256=None):
+    """Render historical bytes, or explicitly construct a new install generation.
+
+    Without install pins, legacy=True is the original Requires template and
+    legacy=False is the c83c995 Wants template (also its old Apply replacement).
+    Do not render pinned bytes as a replacement for either historical receipt.
+    """
     prerequisite = X + (' ' + B if sidecar else '')
     dependency = 'Requires' if legacy else 'Wants'
     # Xray is needed to bring the network up, but a routine restart must not
     # stop the resident policy or the LNS. PPP can't fall back to forwarding:
     # that is denied by the resident nft table even with no Xray listener.
     startup = '' if legacy else f'ExecStartPre={NETWORK_START_CHECK}\n'
-    return f'''[Unit]
+    header = f'''[Unit]
 Description=Celerity rebuild L2TP TPROXY policy
 Before={XL}
 {dependency}={X}
@@ -1485,10 +1728,25 @@ After={prerequisite} nftables.service
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=20s
-{startup}ExecStart=/usr/sbin/nft -f {NFT_FILE}
+{startup}'''
+    if backup_id is not None or nft_sha256 is not None:
+        need(not legacy and isinstance(backup_id, str) and re.fullmatch(r'[0-9a-f]{32}', backup_id)
+             and isinstance(nft_sha256, str) and re.fullmatch(r'[0-9a-f]{64}', nft_sha256), 'CANDIDATE_INVALID')
+        d = routing(d)
+        # Bind this version to buildFiles' single exclusive NEWTABLE. Even an
+        # already pinned file must not smuggle another nft command into startup.
+        policy = managed_nft_bytes(d, backup_id)
+        need(digest(policy) == nft_sha256, 'CANDIDATE_INVALID')
+        code = network_unit_start().hex()
+        # No ExecStop or ExecStopPost: Remove stops the unit before it tears
+        # down the still-resident policy. Only host Remove/rollback delete it.
+        return (header + f'ExecStart=/usr/bin/python3 -I -B -S -c "exec(bytes.fromhex(\'{code}\'))" '
+                f'{backup_id} {nft_sha256} {NFT_FILE} {TABLE} {d["clientCidr"]} {d["fwmark"]} {d["routeTable"]} '
+                f'{PRIORITY} {d["tproxyPort"]} {network_witness_path(backup_id)}\n').encode()
+    return (header + f'''ExecStart=/usr/sbin/nft -f {NFT_FILE}
 ExecStart=/usr/sbin/ip -4 route add local 0.0.0.0/0 dev lo table {d['routeTable']}
 ExecStart=/usr/sbin/ip -4 rule add priority {PRIORITY} from {d['clientCidr']} fwmark {d['fwmark']} table {d['routeTable']}
-'''.encode()
+''').encode()
 
 
 def nft_marker(data, token):
@@ -1604,7 +1862,8 @@ def installed_runtime(d, token, before, after):
     sidecar = 'bridge' in after
     neighbors(before, sidecar)
     x, lns, ike, net_unit = (unit(name) for name in (X, XL, IKE, NET_UNIT))
-    need(network_unit_loaded(net_unit, legacy_network(after['net'], d, sidecar)), 'RUNTIME_UNPROVED')
+    kind = network_kind(after['net'], d, sidecar, token, digest(raw(after['nft'])))
+    need(network_unit_loaded(net_unit, kind == 'requires', after['net'] if kind == 'pinned' else None), 'RUNTIME_UNPROVED')
     need(native_vpn(lns, XL) and native_vpn(ike, IKE) and working(lns) and working(ike)
          and lns['UnitFileState'] == 'enabled'
          and ike['UnitFileState'] == before['units'][IKE]['UnitFileState']
@@ -1633,7 +1892,7 @@ def installed_runtime(d, token, before, after):
              'RUNTIME_UNPROVED')
     status = command('/usr/sbin/ipsec', 'statusall')
     need(re.search(rb'^\s*celerity-l2tp\s*:\s+[^\n]+', status, re.M), 'RUNTIME_UNPROVED')
-    policy = network_projection(d, token)
+    policy = network_projection(d, token, pinned=kind == 'pinned')
     need(policy['rule'] and policy['route'] and policy['nft'] is not None, 'RUNTIME_UNPROVED')
     need(all(read(path) == after[k] for k, path in operation_files(after).items()), 'RUNTIME_UNPROVED')
     need(ike_include_matches(after['starter'], [os.path.basename(NAMES['ike'])]), 'RUNTIME_UNPROVED')
@@ -1794,6 +2053,11 @@ def install(request, before, after, lock_fd=None):
              and not ike.get('ExecCondition') and all(ike.get(k) == v for k, v in before['units'][IKE].items()),
              'ROLLBACK_DRIFT')
         swan_default_environment('ROLLBACK_DRIFT')
+    if 'swan' in after and pinned_network_manifest(d, token, backup):
+        # Settle the policy start before XL's parallel Requires jobs can start
+        # IKE. A failed policy start can then be rolled back without claiming
+        # ownership of an unrecorded VPN daemon invocation.
+        sc('start', NET_UNIT, wait=24)
     sc('start', XL, wait=26)
     if 'swan' in after:
         # A successful manager start and fresh, named invocations are distinct
@@ -1827,7 +2091,12 @@ def after_match(record, expected):
 
 CHAP_ACTIONS = ('check-chap', 'sync-chap', 'inspect-chap', 'read-chap-generation', 'fence-chap')
 CHAP_GENERATION_PREFIX = 'installed-chap-v2:'
-APPLY_NETWORK_ACTIONS = ('check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network')
+APPLY_NETWORK_ACTIONS = ('check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network',
+                         'publish-apply-profiles', 'finalize-apply-profiles')
+APPLY_PROFILES_PHASE = 'apply-profiles-pending'
+# Exact fragment from generateBridgeSystemdService; stdin cannot select a
+# different privileged service definition.
+APPLY_BRIDGE_UNIT_SHA = '8419e3b8dc8345ed8f7c1ce585a1e8bd6300134d040fef2de70535aee773696a'
 CHAP_BEGIN = b'# BEGIN CELERITY MANAGED L2TP USERS'
 CHAP_END = b'# END CELERITY MANAGED L2TP USERS'
 CHAP_LOGIN = rb'[A-Za-z0-9._@-]{1,64}'
@@ -2007,6 +2276,9 @@ def rollback(request, path, old_manifest, backup):
     STAGE = 'COMMAND_FAILED'
     was_installed = installed_phase(backup['phase'])
     need(backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
+    # Reattestation does not transfer the original Install rollback authority,
+    # even if only a service (not the machine boot) changed generation.
+    need(not was_installed or 'boot' not in backup['runtime'], 'ROLLBACK_DRIFT')
     module_owner = module_boot_owner(backup)
     check_module_boot_owner(module_owner)
     before, d, token = runtime_before(backup), request['network'], request['backupId']
@@ -2019,7 +2291,14 @@ def rollback(request, path, old_manifest, backup):
     boot_enrollment = boot_link() if before.get('installBoot') else None
     need(boot_enrollment == backup.get('bootEnrollment'), 'ROLLBACK_DRIFT')
     need(vpn_empty(allow_socket_policies=True), 'ROLLBACK_DRIFT')
-    policy = network_projection(d, token)
+    pinned = pinned_network_manifest(d, token, backup)
+    policy = network_projection(d, token, pinned=pinned)
+    if pinned:
+        # A partial start only adds nft -> route -> rule. Refuse non-prefix
+        # states and never remove policy without an installed unit postimage.
+        need((not policy['rule'] or policy['route']) and
+             (not policy['route'] or policy['nft'] is not None) and
+             (not any(policy.values()) or current['net'] is not None and current['nft'] is not None), 'ROLLBACK_DRIFT')
     watched = (X, XL, IKE, NET_UNIT, B) if sidecar else (X, XL, IKE, NET_UNIT)
     swan_units = None
     started = None
@@ -2028,7 +2307,19 @@ def rollback(request, path, old_manifest, backup):
         swan_units = {n: unit(n) for n in SWAN_START_UNITS}
         started = backup.get('swanStart')
         if started is None:
-            need(not was_installed and all(swan_unstarted(swan_units[n], before, n) for n in SWAN_START_UNITS)
+            net = swan_units[NET_UNIT]
+            net_unstarted = swan_unstarted(net, before, NET_UNIT)
+            if not net_unstarted and pinned:
+                # The pinned oneshot is now started separately, before the VPN
+                # daemons. Admit only a settled, exact managed NET generation.
+                need(current['net'] is not None and current['nft'] is not None
+                     and network_unit_loaded(net, False, current['net'])
+                     and ((net['ActiveState'], net['SubState']) == ('failed', 'failed')
+                          or (net['ActiveState'], net['SubState']) == ('active', 'exited') and all(policy.values())),
+                     'ROLLBACK_DRIFT')
+                removal_dependencies(swan_units, installed=True)
+                net_unstarted = True
+            need(not was_installed and net_unstarted and all(swan_unstarted(swan_units[n], before, n) for n in (XL, IKE))
                  and not any(port in (500, 4500, 1701) for _, _, port, _ in sock_rows()), 'ROLLBACK_DRIFT')
         else:
             need(current['swan'] is not None and started == [swan_units[n].get('InvocationID') for n in SWAN_START_UNITS]
@@ -2079,7 +2370,13 @@ def rollback(request, path, old_manifest, backup):
         info = unit(n)
         if swan_units is not None:
             if started is None:
-                need(swan_unstarted(info, before, n), 'ROLLBACK_DRIFT')
+                if n == NET_UNIT and pinned:
+                    no_jobs(UNITS)
+                    need(info == swan_units[n] and unit(n) == info
+                         and all(swan_unstarted(unit(k), before, k) for k in (XL, IKE))
+                         and not any(port in (500, 4500, 1701) for _, _, port, _ in sock_rows()), 'ROLLBACK_DRIFT')
+                else:
+                    need(swan_unstarted(info, before, n), 'ROLLBACK_DRIFT')
             else:
                 initial = swan_units[n]
                 need(info.get('InvocationID') == initial.get('InvocationID'), 'ROLLBACK_DRIFT')
@@ -2124,13 +2421,20 @@ def rollback(request, path, old_manifest, backup):
                 sc('reset-failed', n)
     need(vpn_empty() and not any(p == 'udp' and port in (500, 4500, 1701) for p, a, port, owners in sock_rows()),
          'RUNTIME_UNPROVED')
+    if pinned:
+        need(network_projection(d, token, pinned=True) == policy, 'ROLLBACK_DRIFT')
     if policy['rule']:
         command('/usr/sbin/ip', '-4', 'rule', 'del', 'priority', str(PRIORITY), 'from', d['clientCidr'],
                 'fwmark', str(d['fwmark']), 'table', str(d['routeTable']))
+    if pinned:
+        need(network_projection(d, token, pinned=True) == {**policy, 'rule': False}, 'ROLLBACK_DRIFT')
     if policy['route']:
         command('/usr/sbin/ip', '-4', 'route', 'del', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(d['routeTable']))
     if policy['nft'] is not None:
-        need(nft_projection(token) == policy['nft'], 'ROLLBACK_DRIFT')
+        if pinned:
+            need(network_projection(d, token, pinned=True) == {**policy, 'rule': False, 'route': False}, 'ROLLBACK_DRIFT')
+        else:
+            need(nft_projection(token) == policy['nft'], 'ROLLBACK_DRIFT')
         command('/usr/sbin/nft', 'delete', 'table', 'inet', TABLE)
     paths, originals = operation_files(current), original_files(before, current)
     for k in reversed(operation_order(current)):
@@ -2175,7 +2479,8 @@ def verify_rollback(d, token, backup):
     need(all(directory_absent(p) for p in (DROP_DIR, NFT_DIR)) and
          {key: read(p) for key, p in paths.items()} == originals and
          (not before.get('installBoot') or boot_link() is None) and
-         network_projection(d, token) == {'nft': None, 'rule': False, 'route': False}
+         network_projection(d, token, pinned=pinned_network_manifest(d, token, backup))
+         == {'nft': None, 'rule': False, 'route': False}
          and vpn_empty(allow_socket_policies=bool(before.get('ikeSockets'))), 'RUNTIME_UNPROVED')
     for n in (XL, IKE, NET_UNIT):
         info = unit(n)
@@ -2473,22 +2778,57 @@ def removal_profiles(main, side, node_id, tproxy, backup, units, main_generation
     need('bridge' in after and len(runtime['invocations']) == 5
          and after_match(main, after['main']) and after_match(side, after['bridge'])
          and main_generation == runtime['files']['main'] and side_generation == runtime['files']['bridge']
-         and units[X]['InvocationID'] == runtime['invocations'][0]
-         and units[B]['InvocationID'] == runtime['invocations'][4]
          and units[B]['User'] == 'nobody' and units[B]['UnitFileState'] == 'enabled', 'ROLLBACK_DRIFT')
+    check_runtime_unit_epoch(runtime, X, units[X])
+    check_runtime_unit_epoch(runtime, B, units[B])
+    need(units[X]['InvocationID'] == runtime['invocations'][0]
+         and units[B]['InvocationID'] == runtime['invocations'][4], 'ROLLBACK_DRIFT')
     port = invert_installed_split(current, bridge, node_id, tproxy, backup)
     original = backup['before']
     return {'main': {**main, 'data': original['files']['main']['data']},
             'bridge': {**side, 'data': original['bridge']['data']}}, port, B
 
 
-def legacy_network(record, d, sidecar):
-    need(record in (entry(network_unit(d, sidecar), 0o644),
-                    entry(network_unit(d, sidecar, legacy=True), 0o644)), 'ROLLBACK_DRIFT')
-    return raw(record) == network_unit(d, sidecar, legacy=True)
+def network_kind(record, d, sidecar, token, nft_sha, *, manifest=False):
+    def matches(data):
+        expected = entry(data, 0o644)
+        return after_match(expected, record) if manifest else expected == record
+
+    for legacy, kind in ((True, 'requires'), (False, 'wants')):
+        if matches(network_unit(d, sidecar, legacy=legacy)):
+            return kind
+    need(matches(network_unit(d, sidecar, backup_id=token, nft_sha256=nft_sha)), 'ROLLBACK_DRIFT')
+    return 'pinned'
 
 
-def network_unit_loaded(net, legacy):
+def pinned_network_manifest(d, token, backup):
+    after = backup['after']
+    return network_kind(after['net'], d, 'bridge' in after, token, after['nft']['data'], manifest=True) == 'pinned'
+
+
+def network_loaded_starts(info, record):
+    commands = [line.removeprefix('ExecStart=') for line in raw(record).decode().splitlines()
+                if line.startswith('ExecStart=')]
+    text = info.get('ExecStart', '')
+    loaded = re.findall(r'\{ path=([^ ;{}]+) ; argv\[\]=([^{}]+?) ; ignore_errors=no ;[^{}]*\}', text)
+    if not commands or len(loaded) != len(commands) or not re.fullmatch(r'\{[^{}]+\}(?: \{[^{}]+\})*', text):
+        return False
+    for (path, value), line in zip(loaded, commands):
+        argv = shlex.split(line)
+        if path != argv[0]:
+            return False
+        # Native systemctl show joins argv literally. Also admit an equivalent
+        # shell-quoted presentation without discarding Python's literal quotes.
+        if value != ' '.join(argv):
+            try:
+                if shlex.split(value) != argv:
+                    return False
+            except ValueError:
+                return False
+    return True
+
+
+def network_unit_loaded(net, legacy, record=None):
     pre = net.get('ExecStartPre', '')
     return (net['LoadState'] == 'loaded' and net['FragmentPath'] == NET and not net['DropInPaths']
             and net['UnitFileState'] == 'static' and net['NeedDaemonReload'] == 'no'
@@ -2498,23 +2838,23 @@ def network_unit_loaded(net, legacy):
             and net['MainPID'] == '0' and X in net['After'].split()
             and (X in net['Requires'].split()) == legacy and (X in net['Wants'].split()) != legacy
             and not any(net.get(k) for k in ('BindsTo', 'PartOf', 'Upholds'))
+            and (record is None or network_loaded_starts(net, record))
             and (not pre if legacy else re.fullmatch(
                 r'\{ path=/usr/bin/systemctl ; argv\[\]=' + re.escape(NETWORK_START_CHECK)
                 + r' ; ignore_errors=no ;[^{}]*\}', pre)))
 
 
-def removal_units(units, before, runtime, restart_bridge, legacy):
+def removal_units(units, before, runtime, restart_bridge, legacy, net_record=None):
     bad = 'ROLLBACK_DRIFT'
     x, xl, ike, net = (units[name] for name in (X, XL, IKE, NET_UNIT))
     need(x['FragmentPath'] == before['units'][X]['FragmentPath'] and working(x), bad)
-    need(network_unit_loaded(net, legacy), bad)
-    for name, info, invocation, sub in zip((XL, IKE, NET_UNIT), (xl, ike, net), runtime['invocations'][1:],
-                                          ('running', 'running', 'exited')):
+    need(network_unit_loaded(net, legacy, net_record), bad)
+    for name, info, sub in zip((XL, IKE, NET_UNIT), (xl, ike, net), ('running', 'running', 'exited')):
         if name != NET_UNIT:
             need(removal_native(info, name, before, installed=True), bad)
         if info['ActiveState'] == 'active':
-            need(info['InvocationID'] == invocation and info['SubState'] == sub
-                 and (name == NET_UNIT or working(info)), bad)
+            need(info['SubState'] == sub and (name == NET_UNIT or working(info)), bad)
+            check_runtime_unit_epoch(runtime, name, info)
         else:
             # Apply restarts MAIN. systemd can stop its dependents or fail to
             # restart the oneshot (which attempts to add existing policy).
@@ -2687,16 +3027,241 @@ def removal_intent_matches(path, expected):
     return directory_absent(path) if expected is None else read(path, 128) == expected
 
 
-def owned_installation(request, *, remove_intent=None):
+RUNTIME_REATTEST_REQUIRED = 'RUNTIME_REATTEST_REQUIRED'
+RUNTIME_FOREIGN_CHANGE = 'RUNTIME_FOREIGN_CHANGE'
+RUNTIME_EPOCH_READS = ('session-count', 'retirement-count', 'inspect-chap', 'prepare-remove',
+                       'check-apply-network', 'verify-apply-network')
+REATTEST_ENTERED = False
+RUNTIME_UNITS = (X, XL, IKE, NET_UNIT, B)
+BOOT_ID_PATTERN = r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}'
+
+
+def installed_boot(backup):
+    # c83c995 receipts predate the separate installed runtime boot pin.
+    return backup['runtime'].get('boot', backup['before']['boot'])
+
+
+def check_runtime_boot(backup):
+    current, recorded = boot(), installed_boot(backup)
+    need(type(recorded) is str and bool(recorded) and bool(current), 'ROLLBACK_DRIFT')
+    if current != recorded:
+        need(re.fullmatch(BOOT_ID_PATTERN, current) and re.fullmatch(BOOT_ID_PATTERN, recorded), 'ROLLBACK_DRIFT')
+        raise Refusal(RUNTIME_REATTEST_REQUIRED)
+    return current
+
+
+def check_runtime_unit_epoch(runtime, name, info):
+    # Compare positive generations only. Inactivity/failure was never proof
+    # of a replacement, and some Apply layouts deliberately leave units idle.
+    i = RUNTIME_UNITS.index(name)
+    if info.get('ActiveState') != 'active':
+        return
+    invocation, recorded = info.get('InvocationID', ''), runtime['invocations'][i]
+    need(invocation and invocation.strip('0') and recorded and recorded.strip('0'), 'ROLLBACK_DRIFT')
+    if invocation != recorded:
+        need(all(re.fullmatch(r'[a-f0-9]{32}', inv) for inv in (invocation, recorded)), 'ROLLBACK_DRIFT')
+        raise Refusal(RUNTIME_REATTEST_REQUIRED)
+    if 'pids' in runtime:
+        pid = info.get('MainPID', '')
+        need(re.fullmatch(r'0' if name == NET_UNIT else r'[1-9][0-9]*', pid), 'ROLLBACK_DRIFT')
+        need(pid == runtime['pids'][i], RUNTIME_REATTEST_REQUIRED)
+
+
+def owned_installation(request, *, remove_intent=None, reattest=False, pending_apply=False):
     bad = 'ROLLBACK_DRIFT'
     token = request['backupId']
     path, manifest, backup = read_manifest(token)
-    need(installed_phase(backup['phase']) and backup['machineId'] == request['machineId']
-         and backup['backupId'] == token and encode(backup['network']) == encode(request['network'])
-         and backup['before']['boot'] == boot(), bad)
+    need((installed_phase(backup['phase']) or pending_apply and backup['phase'] == APPLY_PROFILES_PHASE)
+         and backup['machineId'] == request['machineId']
+         and backup['backupId'] == token and encode(backup['network']) == encode(request['network']), bad)
     intent = os.path.join(os.path.dirname(path), 'remove-attempt.json')
     need(removal_intent_matches(intent, remove_intent), bad)
+    if not reattest:
+        check_runtime_boot(backup)
     return path, manifest, backup, intent
+
+
+def reattest_process(pid, info):
+    need(in_cgroup(pid, info), RUNTIME_FOREIGN_CHANGE)
+    with open('/proc/' + pid + '/stat', 'rb') as task:
+        data = task.read(4097)
+    prefix, separated, fields = data.rpartition(b') ')
+    need(separated and prefix.startswith(pid.encode() + b' (') and len(data) <= 4096, RUNTIME_FOREIGN_CHANGE)
+    state = fields.split()
+    need(len(state) > 19 and state[0] not in (b'Z', b'X', b'x') and state[19].isdigit(), RUNTIME_FOREIGN_CHANGE)
+    return int(state[19])
+
+
+def reattest_files(backup):
+    bad = RUNTIME_FOREIGN_CHANGE
+    after, generations = backup['after'], backup['runtime']['files']
+    paths = operation_files(after)
+    need(set(paths) == set(after) == set(generations), bad)
+    applied = backup.get('currentApply')
+    if applied is not None:
+        paths['bridge'] = BRIDGE
+    records = {}
+    for key, path in paths.items():
+        generation = remove_generation(path)
+        record = read(path)
+        if applied is not None and key in ('main', 'bridge'):
+            expected = applied['files'][key]
+        else:
+            expected = backup.get('currentChap', [after[key], generations[key]]) if key == 'chap' else [after[key], generations[key]]
+        need(encode(file_pin(record, generation)) == encode(expected) and remove_generation(path) == generation, bad)
+        records[key] = record
+    return records
+
+
+def checked_installed_policy(backup, kind, *, removing=False, exact_flags=False):
+    d, token = backup['network'], backup['backupId']
+    def current():
+        return network_projection(d, token, removing=removing, exact_flags=exact_flags, pinned=kind == 'pinned')
+    live = current()
+    need(live['nft'] is not None and live['rule'] is True and live['route'] is True, 'ROLLBACK_DRIFT')
+    if live['nft'] != backup['runtime']['nft']:
+        # Older receipts hash nft JSON including boot-local handles. The opaque
+        # hash cannot be normalized retrospectively. Prove the immutable input
+        # and every live rule against the same known template instead. Retain
+        # the new raw observation for this Remove's strict same-boot checks.
+        need(kind in ('wants', 'requires') and boot() != backup['before']['boot'] and
+             backup['after']['nft']['data'] == digest(managed_nft_bytes(d, token)), 'ROLLBACK_DRIFT')
+        semantic = pinned_network_projection(d, token, removing)
+        need(semantic['nft'] is not None and semantic['rule'] is True and semantic['route'] is True
+             and current() == live, 'ROLLBACK_DRIFT')
+    return live
+
+
+def reattest_sample(request, backup):
+    bad = RUNTIME_FOREIGN_CHANGE
+    d, token = request['network'], request['backupId']
+    epoch = boot()
+    need(re.fullmatch(BOOT_ID_PATTERN, epoch), bad)
+    before, runtime = runtime_before(backup), backup['runtime']
+    after = backup['after']
+    records = reattest_files(backup)
+    need(nft_marker(raw(records['nft']), token), bad)
+    removal_boot(before, backup, runtime)
+    check_module_boot_owner(module_boot_owner(backup))
+    check_swan_profile(backup, records.get('swan'), bad)
+    need(ike_include_matches(records['starter'], [os.path.basename(NAMES['ike'])], check_tree=True), bad)
+    need(all(read(name, 262144) == value for name, value in before['globalFiles'].items()), bad)
+
+    no_jobs(UNITS)
+    applied = backup.get('currentApply')
+    sidecar = applied['bridgeActive'] if applied is not None else 'bridge' in after
+    names = RUNTIME_UNITS if sidecar else RUNTIME_UNITS[:-1]
+    need(re.fullmatch(BOOT_ID_PATTERN, installed_boot(backup)) and type(runtime['invocations']) is list
+         and (len(runtime['invocations']) in (4, 5) if applied is not None else len(runtime['invocations']) == len(names))
+         and all(re.fullmatch(r'[a-f0-9]{32}', inv) and inv != '0' * 32 for inv in runtime['invocations'])
+         and ('pids' not in runtime and 'boot' not in runtime or type(runtime.get('pids')) is list and 'boot' in runtime
+              and len(runtime['pids']) == len(runtime['invocations'])
+              and all(re.fullmatch(r'0' if n == NET_UNIT else r'[1-9][0-9]*', p) for n, p in zip(RUNTIME_UNITS, runtime['pids']))), bad)
+    infos = {name: unit(name) for name in names}
+    old = before['units']
+    x, xl, ike, net = (infos[name] for name in RUNTIME_UNITS[:-1])
+    kind = network_kind(records['net'], d, 'bridge' in after, token, after['nft']['data'])
+    need(network_unit_loaded(net, kind == 'requires', records['net']), bad)
+    need(removal_native(xl, XL, before, installed=True) and removal_native(ike, IKE, before, installed=True)
+         and set(xl['Requires'].split()) >= {NET_UNIT, IKE} and set(xl['After'].split()) >= {NET_UNIT, IKE}, bad)
+    removal_dependencies(infos, installed=True)
+    if applied is not None:
+        need(applied['nodeId'] == request['nodeId'] and apply_bridge_state(unit(B), sidecar) == applied['bridgeUnit'], bad)
+    for name in (X, B) if sidecar and applied is None else (X,):
+        info = infos[name]
+        enabled = 'enabled' if applied is not None else old[name].get('UnitFileState')
+        need(info.get('UnitFileState') == enabled
+             and all(info.get(key) == old[name].get(key) for key in ('FragmentPath', 'DropInPaths', 'User', 'Group'))
+             and not any(info.get(key) for key in ('ExecCondition', 'PassEnvironment', 'UnsetEnvironment')), bad)
+    need(all(info.get('ActiveState') == 'active' and info.get('SubState') == ('exited' if name == NET_UNIT else 'running')
+             and re.fullmatch(r'[a-f0-9]{32}', info.get('InvocationID', '')) and info['InvocationID'] != '0' * 32
+             and (name == NET_UNIT or working(info)) for name, info in infos.items()), bad)
+    invocations = [infos[name]['InvocationID'] for name in names]
+    pids = [infos[name]['MainPID'] for name in names]
+    need(len(set(invocations)) == len(names) and len(set(pids)) == len(names)
+         and all(re.fullmatch(r'0' if name == NET_UNIT else r'[1-9][0-9]*', pid) for name, pid in zip(names, pids)), bad)
+    processes = {pid: reattest_process(pid, infos[name]) for name, pid in zip(names, pids) if name != NET_UNIT}
+
+    rows = sock_rows()
+    xpid = xray_argv(x)
+    sockets = xray_users(records['main'], x, rows, before.get('transit') if applied is None else apply_transit(records['main']))
+    if sidecar:
+        xray_argv(infos[B], BRIDGE)
+    if applied is None:
+        need(set(map(tuple, before['sockets'])) <= set(map(tuple, sockets)), bad)
+    else:
+        need(apply_tcp_pin(rows, x, infos.get(B)) == applied['tcp'], bad)
+        apply_udp_check(records, rows, x, infos.get(B), d['tproxyPort'])
+    split = sidecar and applied is None
+    handoff_pid = infos[B]['MainPID'] if split else xpid
+    profile = unique_profile(records['main'])
+    tproxy = [i for i in profile['inbounds'] if i.get('tag', '').startswith('relay-l2tp-')]
+    # The c83c995 manifest did not store a separate panel node ID. Bind the
+    # request to the node tag in the authenticated installed MAIN profile.
+    need(len(tproxy) == 1 and tproxy[0]['tag'] == 'relay-l2tp-' + request['nodeId']
+         and tproxy[0].get('port') == d['tproxyPort'], bad)
+    owner_profile = unique_profile(records['bridge']) if split else profile
+    handoff = [i for i in owner_profile['inbounds'] if i.get('tag') == FOLLOW_RELAY_SOCKS]
+    need(len(handoff) == 1 and handoff[0].get('protocol') == 'socks' and handoff[0].get('listen') == '127.0.0.1', bad)
+    port = handoff[0]['port']
+    verify_socks_handoff(rows, port, handoff_pid)
+    listeners = [(proto, address, owners) for proto, address, number, owners in rows if number == d['tproxyPort']]
+    need({proto for proto, _, _ in listeners} == {'tcp', 'udp'}
+         and all(address in ('0.0.0.0', '*', '[::]') and owners == [xpid] for _, address, owners in listeners), bad)
+    vpn_listener_ownership(rows, infos, require_xl_listener=True)
+    for _, _, number, owners in rows:
+        if number in (500, 4500):
+            for pid in owners:
+                processes[pid] = reattest_process(pid, ike)
+    status = command('/usr/sbin/ipsec', 'statusall')
+    connections = re.search(rb'^Connections:[ \t]*\n(.*?)^Security Associations ', status, re.M | re.S)
+    need(connections is not None and connections[1].strip()
+         and all(line.lstrip().startswith(b'celerity-l2tp:') for line in connections[1].splitlines() if line.strip()), bad)
+    policy = checked_installed_policy(backup, kind, exact_flags=True)
+    no_jobs(UNITS)
+    need(all(unit(name) == info for name, info in infos.items()) and epoch == boot()
+         and (applied is None or apply_bridge_state(unit(B), sidecar) == applied['bridgeUnit']), bad)
+    return (dict(boot=epoch, invocations=invocations, pids=pids), infos, processes, connections[1], policy,
+            sorted((proto, addr, number, owners) for proto, addr, number, owners in rows
+                   if number in (port, d['tproxyPort'], 1701, 500, 4500)))
+
+
+def reattest_runtime(request, lock_fd):
+    global REATTEST_ENTERED
+    bad = RUNTIME_FOREIGN_CHANGE
+    try:
+        lock_id = install_lock_identity(lock_fd)
+        manifest_generation = remove_generation(manifest_path(request['backupId']))
+        path, record, backup, intent = owned_installation(request, reattest=True)
+        require_network_observers()
+        need(ppp_device() is True and ppp_registered(), bad)
+        first = reattest_sample(request, backup)
+        need(first == reattest_sample(request, backup), bad)
+        epoch = first[0]
+        require_machine(request['machineId'])
+        reattest_files(backup)
+        removal_boot(runtime_before(backup), backup, backup['runtime'])
+        need(epoch['boot'] == boot() and install_lock_identity(lock_fd) == lock_id and directory_absent(intent)
+             and manifest_generation is not None and read(path, 2 * MAX_FILE) == record
+             and remove_generation(path) == manifest_generation, bad)
+        need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+        runtime = backup['runtime']
+        # No publication for an already-attested legacy epoch. In particular
+        # do not replace the original Install rollback witness for a no-op.
+        if (installed_boot(backup), runtime['invocations'], runtime.get('pids', epoch['pids'])) != (
+                epoch['boot'], epoch['invocations'], epoch['pids']):
+            replacement = entry(encode({**backup, 'runtime': {**runtime, **epoch}}))
+            need(len(raw(replacement)) <= 2 * MAX_FILE, bad)
+            REATTEST_ENTERED = True
+            write(path, record, replacement, generation=manifest_generation)
+            need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    except (BlockingIOError, subprocess.TimeoutExpired):
+        raise
+    except (Refusal, OSError, ValueError, KeyError, TypeError, IndexError) as error:
+        if REATTEST_ENTERED or str(error) in ('IDENTITY', 'IN_FLIGHT'):
+            raise
+        raise Refusal(bad) from None
+    return {'ok': True, 'backupId': request['backupId']}
 
 
 def verify_apply_handoff(rows, units, xpid, *, main_only=False):
@@ -2722,7 +3287,8 @@ def verify_apply_handoff(rows, units, xpid, *, main_only=False):
 def apply_network_snapshot(d, token, backup, record, generation, *, listeners_required=True, handoff_check=True):
     bad = 'ROLLBACK_DRIFT'
     before, runtime = runtime_before(backup), backup['runtime']
-    legacy = legacy_network(record, d, 'bridge' in backup['after'])
+    kind = network_kind(record, d, 'bridge' in backup['after'], token, backup['after']['nft']['data'])
+    legacy = kind == 'requires'
     need(read(NET, 65536) == record and remove_generation(NET) == generation, bad)
     for key in ('drop', 'nft'):
         p = NAMES[key]
@@ -2730,7 +3296,7 @@ def apply_network_snapshot(d, token, backup, record, generation, *, listeners_re
     removal_boot(before, backup, runtime)
     no_jobs(UNITS)
     units = {n: unit(n) for n in UNITS}
-    removal_units(units, before, runtime, False, legacy)
+    removal_units(units, before, runtime, False, legacy, record if kind == 'pinned' else None)
     xpid = xray_argv(units[X])
     # A sidecar may be stopped by putPair even if its replacement will be
     # empty. Neither it nor MAIN may propagate stop outside the old exact edge.
@@ -2764,16 +3330,150 @@ def apply_network_snapshot(d, token, backup, record, generation, *, listeners_re
             if listeners_required or str(error) != 'RUNTIME_UNPROVED':
                 raise
             ready = False
-    policy = network_projection(d, token, removing=True)
-    need(policy == {'nft': runtime['nft'], 'rule': True, 'route': True} and policy['nft'] is not None, bad)
+    policy = checked_installed_policy(backup, kind, removing=True)
     no_jobs(UNITS)
     return legacy, [[units[n][key] for key in ('InvocationID', 'MainPID', 'ControlGroup')] for n in vpn], units[X]['InvocationID'], ready
+
+
+def apply_profile_read(path):
+    generation = remove_generation(path)
+    record = read(path)
+    need(remove_generation(path) == generation, 'ROLLBACK_DRIFT')
+    return record, generation
+
+
+def apply_bridge_state(info, active):
+    bad = 'RUNTIME_UNPROVED'
+    if info['LoadState'] == 'not-found':
+        need(not active and rollback_quiescent(info) and directory_absent(SYSTEM + '/' + B), bad)
+        return None
+    need(info['FragmentPath'] == SYSTEM + '/' + B and not info['DropInPaths'] and info['User'] == 'nobody'
+         and info['NeedDaemonReload'] == 'no' and no_hooks(info)
+         and not any(info.get(k) for k in ('Environment', 'EnvironmentFiles', 'ExecCondition', 'ExecReload',
+                                          'PassEnvironment', 'UnsetEnvironment')), bad)
+    if active:
+        need(info['UnitFileState'] == 'enabled' and xray_argv(info, BRIDGE) == info['MainPID'], bad)
+    else:
+        need(info['UnitFileState'] == 'disabled' and rollback_quiescent(info), bad)
+    return file_pin(*apply_profile_read(SYSTEM + '/' + B))
+
+
+def apply_tcp_pin(rows, *units):
+    # UDP SS rows may be outbound ephemeral sockets. The managed fixed VPN,
+    # TPROXY and SOCKS UDP endpoints are separately proved by their consumers.
+    tcp = [row for row in rows if row[0] == 'tcp']
+    return digest(encode([removal_xray_sockets(tcp, u['MainPID']) if u is not None and working(u) else [] for u in units]))
+
+
+def apply_udp_check(records, rows, main, bridge, tproxy):
+    # Do not pin outbound ephemeral UDP tuples. Require every supported fixed
+    # endpoint from the authenticated config, in addition to the separate
+    # VPN, TPROXY and SOCKS listener checks.
+    profile = unique_profile(records['main'])
+    handoff = next(i['port'] for i in profile['inbounds'] if i['tag'] == FOLLOW_RELAY_SOCKS)
+    profile['inbounds'] = [i for i in profile['inbounds'] if not follow_relay_reserved(i['tag'])]
+    reserved = {500, 4500, 1701, tproxy, handoff}
+    endpoints = removal_udp_endpoints(entry(encode(profile)))
+    removal_main_sockets(rows, main['MainPID'], reserved, endpoints)
+    if bridge is not None and working(bridge):
+        removal_main_sockets(rows, bridge['MainPID'], reserved, removal_udp_endpoints(records['bridge']))
+
+
+def apply_transit(record):
+    # Derive only from the exact staged/current Apply bytes, not foreign live files.
+    result: list[dict[str, Any]] = []
+    for inbound in unique_profile(record)['inbounds']:
+        match = re.fullmatch(r'(fwd-hop-|rebuild-rp-conn-)([a-f0-9]{8})', inbound.get('tag', ''))
+        if match:
+            clients: Any = inbound['settings']['clients']
+            need(type(clients) is list and len(clients) == 1, 'PROFILE_USERS')
+            email = clients[0].get('email', '')
+            label = re.fullmatch(r'rproof-([a-f0-9]{24})-[a-f0-9]{64}@rebuild\.invalid', email) if email else None
+            need(not email or label is not None and label[1][-8:] == match[2], 'PROFILE_USERS')
+            result.append(dict(linkId=label[1] if label else '0' * 16 + match[2],
+                               mode='forward' if match[1] == 'fwd-hop-' else 'reverse',
+                               port=inbound['port'], uuid=clients[0]['id']))
+    return result
+
+
+def read_apply_profiles(pins):
+    records = {}
+    for key, target in (('main', MAIN), ('bridge', BRIDGE)):
+        record, generation = apply_profile_read(target)
+        need(encode(file_pin(record, generation)) == encode(pins[key]), 'ROLLBACK_DRIFT')
+        records[key] = record
+    return records
+
+
+def publish_apply_profiles(request, path, manifest, backup, live):
+    global NETWORK_UPGRADE_ENTERED
+    bad = 'ROLLBACK_DRIFT'
+    after, runtime = backup['after'], backup['runtime']
+    installed = backup.get('currentApply')
+    before, replacements, plan = {}, {}, {}
+    for key, target in (('main', MAIN), ('bridge', BRIDGE)):
+        record, generation = apply_profile_read(target)
+        if installed is not None or key in after:
+            expected = installed['files'][key] if installed is not None else [after[key], runtime['files'][key]]
+            need(encode(file_pin(record, generation)) == encode(expected), bad)
+        else:
+            # A pre-existing unpinned BRIDGE (including a byte-identical
+            # replacement) is not an owned Apply target.
+            need(record is None and backup['before']['bridge'] is None, bad)
+        stage = read(target + '.rebuild-' + request['stageId'] + '.json')
+        if stage is None:
+            raise Refusal(bad)
+        need(stage['mode'] == 0o600 and digest(raw(stage)) == request['profiles'][key], bad)
+        before[key] = (record, generation)
+        replacements[key] = {**(record or entry(b'', 0o640, pwd.getpwnam('nobody').pw_gid)), 'data': stage['data']}
+        plan[key] = file_pin(replacements[key], [10**20 - 1] * 3)
+    node = request['nodeId']
+    pins = unique_profile(before['main'][0])['inbounds']
+    need([i.get('tag') for i in pins if i.get('tag', '').startswith('relay-l2tp-')] == ['relay-l2tp-' + node], bad)
+    side = unique_profile(replacements['bridge'])
+    subtract_follow_relay(replacements['main'], unique_profile(replacements['main']), side, node, request['network']['tproxyPort'])
+    transit_inbounds(unique_profile(replacements['main']), apply_transit(replacements['main']))
+    active = bool(side['inbounds'] or any(o.get('protocol') == 'vless' and o.get('settings', {}).get('reverse', {}).get('tag')
+                                         for o in side['outbounds']))
+    info = unit(B)
+    old_unit = apply_bridge_state(info, installed is not None and installed['bridgeActive'])
+    need(old_unit == (None if installed is None else installed['bridgeUnit']), bad)
+    unit_path = SYSTEM + '/' + B
+    new_unit = entry(request['bridgeUnit'].encode(), 0o644) if active and old_unit is None else None
+    need(new_unit is None or digest(raw(new_unit)) == APPLY_BRIDGE_UNIT_SHA, bad)
+    pending: dict[str, Any] = dict(phase=backup['phase'], nodeId=node, bridgeActive=active, bridgeUnit=old_unit,
+                   mainInvocation=live, files=plan)
+    if new_unit is not None:
+        pending['bridgeUnit'] = file_pin(new_unit, [10**20 - 1] * 3)
+    journal = {**backup, 'phase': APPLY_PROFILES_PHASE, 'applyPending': pending}
+    proof = entry(encode(journal))
+    generation = remove_generation(path)
+    need(generation is not None and len(raw(proof)) <= 2 * MAX_FILE and time.monotonic() < DEADLINE, bad)
+    NETWORK_UPGRADE_ENTERED = True
+    journal_generation = write(path, manifest, proof, generation=generation, witness=True)
+    for key, target in (('bridge', BRIDGE), ('main', MAIN)):
+        record, generation = before[key]
+        observed = write(target, record, replacements[key], generation=generation, witness=True)
+        pending['files'][key] = file_pin(replacements[key], observed)
+    if new_unit is not None:
+        pending['bridgeUnit'] = file_pin(new_unit, write(unit_path, None, new_unit, witness=True))
+    final = entry(encode(journal))
+    read_apply_profiles(pending['files'])
+    need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    write(path, proof, final, generation=journal_generation)
+    return final
 
 
 def apply_network(request, action):
     global NETWORK_UPGRADE_ENTERED
     token, d = request['backupId'], request['network']
-    path, manifest, backup, _ = owned_installation(request)
+    finalizing = action == 'finalize-apply-profiles'
+    path, manifest, backup, _ = owned_installation(request, pending_apply=finalizing or action == 'restart-apply-network')
+    pending = backup.get('applyPending')
+
+    if pending is not None:
+        need(backup['phase'] == APPLY_PROFILES_PHASE and installed_phase(pending['phase']), 'ROLLBACK_DRIFT')
+        read_apply_profiles(pending['files'])
     record, generation = read(NET, 65536), remove_generation(NET)
     need(after_match(record, backup['after']['net']) and generation == backup['runtime']['files']['net'], 'ROLLBACK_DRIFT')
     # At restart entry the new files are already published, but MAIN still
@@ -2806,11 +3506,17 @@ def apply_network(request, action):
         legacy = False
     need(action != 'prepare-apply-network' or not legacy, 'RUNTIME_UNPROVED')
     proof = digest(encode([digest(raw(manifest)), generation, stable]))
-    if action in ('verify-apply-network', 'restart-apply-network'):
+    if finalizing or action in ('verify-apply-network', 'restart-apply-network', 'publish-apply-profiles'):
         need(not legacy and proof == request['proof'], 'RUNTIME_UNPROVED')
+    if action == 'publish-apply-profiles':
+        manifest = publish_apply_profiles(request, path, manifest, backup, main_invocation)
+        proof = digest(encode([digest(raw(manifest)), generation, stable]))
     if action == 'restart-apply-network':
         # Final effective-graph observation and the actual restart share the
         # DIRECT flock; no manager reload or separate SSH channel intervenes.
+        need(pending is None or main_invocation == pending['mainInvocation'], 'RUNTIME_UNPROVED')
+        if pending is not None:
+            read_apply_profiles(pending['files'])
         NETWORK_UPGRADE_ENTERED = True
         sc('restart', X, wait=45)
         until = min(DEADLINE, time.monotonic() + 6)
@@ -2822,7 +3528,42 @@ def apply_network(request, action):
             if ready:
                 break
             time.sleep(0.2)
+    if finalizing:
+        if pending is None:
+            raise Refusal('ROLLBACK_DRIFT')
+        NETWORK_UPGRADE_ENTERED = True  # The earlier publication has entered.
+        need(main_invocation != pending['mainInvocation'], 'RUNTIME_UNPROVED')
+        manifest_generation = remove_generation(path)
+        x, b = unit(X), unit(B)
+        b_state = apply_bridge_state(b, pending['bridgeActive'])
+        need(b_state == pending['bridgeUnit'], 'ROLLBACK_DRIFT')
+        profiles = read_apply_profiles(pending['files'])
+        rows = sock_rows()
+        xray_users(profiles['main'], x, rows, apply_transit(profiles['main']))
+        apply_udp_check(profiles, rows, x, b, d['tproxyPort'])
+        tcp = apply_tcp_pin(rows, x, b)
+        snapshot = apply_network_snapshot(d, token, backup, record, generation)
+        confirmed_rows = sock_rows()
+        apply_udp_check(profiles, confirmed_rows, x, b, d['tproxyPort'])
+        need(snapshot[:3] == (False, stable, main_invocation) and x['InvocationID'] == main_invocation
+             and x['UnitFileState'] == 'enabled'
+             and apply_tcp_pin(confirmed_rows, x, b) == tcp and apply_bridge_state(b, pending['bridgeActive']) == b_state
+             and unit(X) == x and unit(B) == b and manifest_generation is not None
+             and time.monotonic() < DEADLINE, 'RUNTIME_UNPROVED')
+        read_apply_profiles(pending['files'])
+        finished = {**backup, 'phase': pending['phase'], 'currentApply': {
+            'nodeId': pending['nodeId'], 'files': pending['files'], 'bridgeActive': pending['bridgeActive'],
+            'bridgeUnit': b_state, 'tcp': tcp}}
+        del finished['applyPending']
+        replacement = entry(encode(finished))
+        need(len(raw(replacement)) <= 2 * MAX_FILE, 'ROLLBACK_DRIFT')
+        write(path, manifest, replacement, generation=manifest_generation)
     return {'ok': True, 'backupId': token, 'proof': proof}
+
+
+def file_pin(record: Any, generation):
+    need(record is not None and generation is not None, 'ROLLBACK_DRIFT')
+    return [{**record, 'data': digest(raw(record))}, generation]
 
 
 def chap_preconditions(request):
@@ -2854,9 +3595,9 @@ def chap_preconditions(request):
                  {k: u for k, u in current.items() if k != revoked}, 'CANDIDATE_INVALID')
     xl = unit(XL)
     need(all(read(p, 262144) == record for p, record in before['globalFiles'].items())
-         and removal_native(xl, XL, before, installed=True)
-         and ((working(xl) and xl['InvocationID'] == runtime['invocations'][1])
-              or rollback_quiescent(xl) or (xl['ActiveState'], xl['SubState'], xl['MainPID']) == ('failed', 'failed', '0')), bad)
+         and removal_native(xl, XL, before, installed=True), bad)
+    need(working(xl) or rollback_quiescent(xl) or (xl['ActiveState'], xl['SubState'], xl['MainPID']) == ('failed', 'failed', '0'), bad)
+    check_runtime_unit_epoch(runtime, XL, xl)
     return path, manifest, backup, intent, xl, current_rows, desired_rows, current_logins | desired_logins
 
 
@@ -2869,6 +3610,7 @@ def sync_chap(request, *, write_changes):
     # previously valid CHAP preimage does not authorize an obsolete command.
     need(not write_changes or request.get('generation') == generation, bad)
     target = NAMES['chap']
+    manifest_generation, old_generation = remove_generation(path), remove_generation(target)
     record = read(target)
     prefix, suffix, rows = owned_chap(record, backup, (current_rows, logins))
     need(record is not None, bad)
@@ -2877,13 +3619,28 @@ def sync_chap(request, *, write_changes):
         data = prefix + CHAP_BEGIN + b'\n' + b''.join(desired_rows[k] for k in sorted(desired_rows)) + CHAP_END + b'\n' + suffix
         need(len(data) <= MAX_FILE, bad)
         after = {**record, 'data': b64(data)}
-    need(read(path, 2 * MAX_FILE) == manifest and directory_absent(intent) and read(target) == record, bad)
+    need(manifest_generation is not None and old_generation is not None and read(path, 2 * MAX_FILE) == manifest
+         and remove_generation(path) == manifest_generation and directory_absent(intent) and read(target) == record
+         and remove_generation(target) == old_generation, bad)
     changed = after != record
     if write_changes and changed:
         # The control-plane intent owns DB settlement. Do not accept the desired
         # projection in place of current, or attempt a physical retry/rollback.
+        # A valid managed DB projection does not authorize unrelated neighbor
+        # bytes or an historical replacement inode for reboot reattestation.
+        tracked = file_pin(record, old_generation) == backup.get('currentChap', [
+            backup['after']['chap'], backup['runtime']['files']['chap']])
+        if tracked:
+            upper = entry(encode({**backup, 'currentChap': file_pin(after, [10**20-1]*3)}))
+            need(len(raw(upper)) <= 2 * MAX_FILE, bad)
         CHAP_ENTERED = True
-        write(target, record, after)
+        actual = write(target, record, after, generation=old_generation, witness=True)
+        if tracked:
+            replacement = entry(encode({**backup, 'currentChap': file_pin(after, actual)}))
+            need(len(raw(replacement)) <= 2 * MAX_FILE and remove_generation(target) == actual
+                 and time.monotonic() < DEADLINE, bad)
+            write(path, manifest, replacement, generation=manifest_generation)
+            manifest = replacement
     reply = {'ok': True, 'backupId': request['backupId'], 'changed': changed}
     if not write_changes and generation is not None:
         reply['generation'] = generation
@@ -2944,7 +3701,7 @@ def inspect_stage(stage):
     except (InspectUnproved, subprocess.TimeoutExpired, BlockingIOError):
         raise
     except Exception as error:
-        if isinstance(error, Refusal) and str(error) == 'IN_FLIGHT':
+        if isinstance(error, Refusal) and str(error) in ('IN_FLIGHT', RUNTIME_REATTEST_REQUIRED):
             raise
         if time.monotonic() >= DEADLINE:
             raise subprocess.TimeoutExpired([], 0) from None
@@ -2966,6 +3723,7 @@ def inspect_chap(request):
 
     def unchanged():
         no_jobs(UNITS)
+        check_runtime_boot(backup)
         need(unit(XL) == xl and directory_absent(intent) and read(path, 2 * MAX_FILE) == manifest
              and manifest_generation is not None and remove_generation(path) == manifest_generation
              and read(target) == record and generation is not None and remove_generation(target) == generation, bad)
@@ -3036,21 +3794,29 @@ def observe_removal(request, *, quiescent=False, active=False, remove_intent=Non
     need(all(read(p, 262144) == r for p, r in before['globalFiles'].items()), bad)
     units = {n: unit(n) for n in UNITS}
     b = units[B]
+    if (applied := backup.get('currentApply')) is not None:
+        need(applied['nodeId'] == request['nodeId']
+             and encode(file_pin(main, generations['main'])) == encode(applied['files']['main'])
+             and encode(file_pin(side, side_generation)) == encode(applied['files']['bridge'])
+             and apply_bridge_state(b, applied['bridgeActive']) == applied['bridgeUnit'], bad)
     need(b['ActiveState'] in ('active', 'inactive') and b['NeedDaemonReload'] == 'no'
          and (working(b) and side is not None if b['ActiveState'] == 'active' else b['MainPID'] == '0'), bad)
     profiles, handoff, handoff_unit = removal_profiles(current['main'], side, request['nodeId'], d['tproxyPort'],
                                                        backup, units, generations['main'], side_generation)
     if b['ActiveState'] == 'active':
         xray_argv(b, BRIDGE)
-    removal_units(units, before, runtime, 'bridge' in profiles,
-                  legacy_network(current['net'], d, 'bridge' in backup['after']))
+    kind = network_kind(current['net'], d, 'bridge' in backup['after'], token, backup['after']['nft']['data'])
+    pinned = kind == 'pinned'
+    removal_units(units, before, runtime, 'bridge' in profiles, kind == 'requires', current['net'] if pinned else None)
     if quiescent:
         # An inactive unit alone does not prove the supported Apply layout.
         session_need(rollback_quiescent(units[XL])
                      and units[X]['InvocationID'] != runtime['invocations'][0])
-    policy = network_projection(d, token, removing=True)
-    need(policy == {'nft': runtime['nft'], 'rule': True, 'route': True} and policy['nft'] is not None, bad)
+    policy = checked_installed_policy(backup, kind, removing=True)
     rows = sock_rows()
+    if applied is not None:
+        need(apply_tcp_pin(rows, units[X], b) == applied['tcp'], bad)
+        apply_udp_check({'main': main, 'bridge': side}, rows, units[X], b, d['tproxyPort'])
     if quiescent:
         # PPP absence does not require IKE/XFRM to be idle. Keep listener
         # ownership and the PPP guard; Remove still requires full VPN idleness.
@@ -3074,10 +3840,11 @@ def observe_removal(request, *, quiescent=False, active=False, remove_intent=Non
                               side, side_generation, units, policy, sockets, bridge_sockets, sorted(reserved),
                               handoff, handoff_unit, transit, chap_digest]))
     return dict(baseline=baseline, intent=intent, path=path, manifest=manifest, before=before, current=current,
+                runtime_boot=installed_boot(backup),
                 profiles=profiles, units=units, side=side, side_generation=side_generation, sockets=sockets,
                 udp_endpoints=udp_endpoints,
                 bridge_sockets=bridge_sockets, retained_handoff=handoff if handoff_unit == B else None,
-                reserved=reserved, policy=policy, generations=generations, binary=binary,
+                reserved=reserved, policy=policy, pinned_network=pinned, generations=generations, binary=binary,
                 boot_enrollment=boot_enrollment, ike_sockets=original_ike, manifest_generation=manifest_generation,
                 transit=transit, chap_after=chap_after, chap_digest=chap_digest, chap_expected=expected_chap, chap_backup=backup,
                 module_owner=module_owner,
@@ -3096,7 +3863,7 @@ def removal_neighbors(state):
     need(all(read(p, 262144) == r for p, r in state['before']['globalFiles'].items())
          and read(state['path'], 2 * MAX_FILE) == state['manifest']
          and remove_generation(state['path']) == state['manifest_generation']
-         and boot() == state['before']['boot'] and remove_generation(XRAY) == state['binary'], 'RUNTIME_UNPROVED')
+         and boot() == state['runtime_boot'] and remove_generation(XRAY) == state['binary'], 'RUNTIME_UNPROVED')
 
 
 def removal_units_after(state, restore_ike=False):
@@ -3194,6 +3961,10 @@ def remove_installation(request, state, *, drain=None):
     token, d = request['backupId'], request['network']
     before, current, profiles, units = (state[k] for k in ('before', 'current', 'profiles', 'units'))
     policy, reserved, sockets = (state[k] for k in ('policy', 'reserved', 'sockets'))
+
+    def observe_policy():
+        return network_projection(d, token, removing=True, pinned=state.get('pinned_network', False))
+
     boot_enrollment, restore_ike = state['boot_enrollment'], bool(state['ike_sockets'])
     split = 'bridge' in profiles
     STAGE = 'RUNTIME_UNPROVED'
@@ -3265,7 +4036,7 @@ def remove_installation(request, state, *, drain=None):
             after = unit(name)
         need((after['ActiveState'], after['SubState'], after['MainPID']) == ('inactive', 'dead', '0'), STAGE)
     need(vpn_empty() and not any(n in (500, 4500, 1701) for _, _, n, _ in sock_rows())
-         and network_projection(d, token, removing=True) == policy, STAGE)
+         and observe_policy() == policy, STAGE)
     removal_neighbors(state)
     removal_owned_dirs()
     need(file_generations(current, include_chap=False) == state['generations'] and (boot_enrollment is None or boot_link() == boot_enrollment),
@@ -3324,12 +4095,12 @@ def remove_installation(request, state, *, drain=None):
         sc('restart', B, wait=22)
     x, b = removal_xray_ready(state, split)
     profiles_unchanged()
-    need(remove_generation(XRAY) == state['binary'] and network_projection(d, token, removing=True) == policy, STAGE)
+    need(remove_generation(XRAY) == state['binary'] and observe_policy() == policy, STAGE)
     command('/usr/sbin/ip', '-4', 'rule', 'del', 'priority', str(PRIORITY), 'from', d['clientCidr'], 'fwmark',
             str(d['fwmark']), 'table', str(d['routeTable']))
-    need(network_projection(d, token, removing=True) == {**policy, 'rule': False}, STAGE)
+    need(observe_policy() == {**policy, 'rule': False}, STAGE)
     command('/usr/sbin/ip', '-4', 'route', 'del', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(d['routeTable']))
-    need(network_projection(d, token, removing=True) == {**policy, 'rule': False, 'route': False}, STAGE)
+    need(observe_policy() == {**policy, 'rule': False, 'route': False}, STAGE)
     command('/usr/sbin/nft', 'delete', 'table', 'inet', TABLE)
     empty_policy = {'nft': None, 'rule': False, 'route': False}
     restored_invocation = None
@@ -3341,7 +4112,7 @@ def remove_installation(request, state, *, drain=None):
         removal_files_after(state)
         removal_units_after(state)
         need(vpn_empty() and not any(n in reserved for _, _, n, _ in sock_rows())
-             and network_projection(d, token, removing=True) == empty_policy, STAGE)
+             and observe_policy() == empty_policy, STAGE)
         sc('start', IKE, wait=22)
         restored_invocation = removal_ike_ready(state)
     no_jobs(UNITS)
@@ -3358,8 +4129,8 @@ def remove_installation(request, state, *, drain=None):
     xray_users(profiles['main'], final_x, rows, state.get('transit'))
     need(removal_main_sockets(rows, final_x['MainPID'], reserved, state['udp_endpoints']) == sockets
          and not any(n in absent for _, _, n, _ in rows)
-         and network_projection(d, token, removing=True) == {'nft': None, 'rule': False, 'route': False}
-         and vpn_empty(allow_socket_policies=restore_ike) and read(state['path'], 2 * MAX_FILE) == state['manifest'] and before['boot'] == boot()
+         and observe_policy() == empty_policy
+         and vpn_empty(allow_socket_policies=restore_ike) and read(state['path'], 2 * MAX_FILE) == state['manifest'] and state['runtime_boot'] == boot()
          and remove_generation(XRAY) == state['binary'], STAGE)
     removal_files_after(state)
     removal_neighbors(state)
@@ -3458,18 +4229,19 @@ def session_owner(request, *, remove_intent=None):
     path, manifest, backup = read_manifest(token)
     before, runtime = runtime_before(backup), backup['runtime']
     session_need(installed_phase(backup['phase']) and backup['backupId'] == token and backup['machineId'] == machine
-                 and encode(backup['network']) == encode(network) and before['boot'] == boot()
+                 and encode(backup['network']) == encode(network)
                  and removal_intent_matches(os.path.dirname(path) + '/remove-attempt.json', remove_intent))
+    epoch = check_runtime_boot(backup)
     no_jobs((XL, NET_UNIT, IKE))
     info = unit(XL)
     session_need(info['FragmentPath'] == SYSTEM + '/' + XL and removal_native(info, XL, before, installed=True)
                  and working(info) and info['SubState'] == 'running' and info['Type'] == 'simple'
-                 and info['InvocationID'] == runtime['invocations'][1]
                  and re.fullmatch(r'[a-f0-9]{32}', info['InvocationID']) and info['ControlGroup'] == SESSION_GROUP
                  and re.fullmatch(r'[1-9][0-9]*', info['MainPID'])
                  and re.fullmatch(r'\{ path=/usr/sbin/xl2tpd ; argv\[\]=/usr/sbin/xl2tpd -D ;[^{}]*\}', info['ExecStart'])
                  and not any(info.get(k) for k in ('SourcePath', 'ExecCondition', 'ExecReload', 'PassEnvironment', 'UnsetEnvironment'))
                  and set(info['Requires'].split()) >= {NET_UNIT, IKE} and set(info['After'].split()) >= {NET_UNIT, IKE})
+    check_runtime_unit_epoch(runtime, XL, info)
     rows = [owners for proto, _, port, owners in sock_rows() if proto == 'udp' and port == 1701]
     session_need(rows and all(owners == [info['MainPID']] for owners in rows))
     records, generations = {}, {}
@@ -3499,7 +4271,7 @@ def session_owner(request, *, remove_intent=None):
     profile = session_profile(raw(records['lns']), raw(records['options']), network)
     _, _, chap_rows = owned_chap(read(NAMES['chap']), backup, chap_expected(request, records['lns']))
     generations['chapRows'] = chap_rows_digest(chap_rows)
-    return (before['boot'], info['InvocationID'], int(info['MainPID']), remove_generation(path), digest(raw(manifest)),
+    return (epoch, info['InvocationID'], int(info['MainPID']), remove_generation(path), digest(raw(manifest)),
             generations, {p: session_binary(p) for p in SESSION_STOCK}, profile)
 
 
@@ -4110,17 +4882,18 @@ def ipsec_session_sample(request):
         session_need(not sockets)
         inventory = []
     else:
-        session_need(working(ike) and ike['SubState'] == 'running' and ike['InvocationID'] == runtime['invocations'][2]
+        session_need(working(ike) and ike['SubState'] == 'running'
                      and {port for _, _, port, _ in sockets} == {500, 4500}
                      and all(proto == 'udp' and owners and all(in_cgroup(pid, ike) for pid in owners)
                              for proto, _, _, owners in sockets))
+        check_runtime_unit_epoch(runtime, IKE, ike)
         inventory = ipsec_status_inventory(command('/usr/sbin/ipsec', 'statusall', quiet=True))
     if not inventory:
         # A stale child in the kernel or a failed dump is not a known zero.
         session_need(not command('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys', quiet=True).strip())
     session_need(ike == unit(IKE))
     no_jobs((IKE,))
-    return len(inventory), digest(encode([before['boot'], remove_generation(path), digest(raw(manifest)),
+    return len(inventory), digest(encode([check_runtime_boot(backup), remove_generation(path), digest(raw(manifest)),
                                          generations, ike['InvocationID'], ike['MainPID'], sockets, inventory]))
 
 
@@ -4706,7 +5479,7 @@ def census_observation(probe, request):
     try:
         return probe(request)
     except Refusal as error:
-        if str(error) in ('IN_FLIGHT', 'IDENTITY'):
+        if str(error) in ('IN_FLIGHT', 'IDENTITY', RUNTIME_REATTEST_REQUIRED):
             raise
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         pass  # Unreadable or unsupported, never a count of zero.
@@ -4782,7 +5555,7 @@ def retirement_observation():
     try:
         yield
     except Refusal as error:
-        if str(error) in ('IDENTITY', 'IN_FLIGHT') or REMOVE_ENTERED:
+        if str(error) in ('IDENTITY', 'IN_FLIGHT', RUNTIME_REATTEST_REQUIRED) or REMOVE_ENTERED:
             raise
         raise Refusal(RETIRE_CHANGED) from None
     except RETIRE_ERRORS:
@@ -5364,6 +6137,17 @@ def dispatch(request: dict[str, Any]):
     if action == 'prepare-packages':
         NO_INSTALL_WRITES = False
         return prepare_packages(request)
+    if action == 'reattest-runtime':
+        NO_INSTALL_WRITES = False
+        need(set(request) == {'action', 'machineId', 'backupId', 'nodeId', 'network'}
+             and all(type(request[key]) is str and re.fullmatch(pattern, request[key])
+                     for key, pattern in (('machineId', r'[a-f0-9]{32}'), ('backupId', r'[a-f0-9]{32}'),
+                                          ('nodeId', r'[a-f0-9]{24}'))), 'CANDIDATE_INVALID')
+        routing(request['network'])
+        with directory(SYSTEM) as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            require_machine(request['machineId'])
+            return reattest_runtime(request, fd)
     machine = request['machineId']
     if action in ('session-count', 'retirement-count'):
         return read_session_count(request)
@@ -5399,9 +6183,16 @@ def dispatch(request: dict[str, Any]):
             package_no_pending()
         if action in APPLY_NETWORK_ACTIONS:
             keys = {'action', 'machineId', 'backupId', 'network'}
-            if action in ('verify-apply-network', 'restart-apply-network'):
+            if action in ('verify-apply-network', 'restart-apply-network', 'publish-apply-profiles', 'finalize-apply-profiles'):
                 keys.add('proof')
                 need(re.fullmatch(r'[a-f0-9]{64}', request['proof']), 'CANDIDATE_INVALID')
+            if action == 'publish-apply-profiles':
+                keys |= {'nodeId', 'stageId', 'profiles', 'bridgeUnit'}
+                need(re.fullmatch(r'[a-f0-9]{24}', request['nodeId'])
+                     and re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}', request['stageId'])
+                     and type(request['profiles']) is dict and set(request['profiles']) == {'main', 'bridge'}
+                     and all(isinstance(value, str) and re.fullmatch(r'[a-f0-9]{64}', value) for value in request['profiles'].values())
+                     and type(request['bridgeUnit']) is str and 1 <= len(request['bridgeUnit']) <= 4096, 'CANDIDATE_INVALID')
             need(set(request) == keys and re.fullmatch(r'[a-f0-9]{32}', request['backupId']), 'CANDIDATE_INVALID')
             need(ready['ppp'] and ready['unitsLoaded'] and not ready['masked'], 'PREREQUISITE')
             return apply_network(request, action)
@@ -5504,7 +6295,7 @@ def main():
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
         request = json.loads(wire)
         action = request.get('action') if type(request) is dict else None
-        if action in ('prepare-packages', 'reconcile-install'):
+        if action in ('prepare-packages', 'reconcile-install', 'reattest-runtime'):
             need(len(wire) <= 1024, 'CANDIDATE_INVALID')
 
             def unique_fields(pairs):
@@ -5517,12 +6308,15 @@ def main():
                 DEADLINE = PACKAGE_PREPARE_DEADLINE
             need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
         result = dispatch(request)
-        if action in ('prepare-packages', 'reconcile-install') or action == 'preflight' and 'packagePreparation' in result:
+        if action in ('prepare-packages', 'reconcile-install', 'reattest-runtime') or action == 'preflight' and 'packagePreparation' in result:
             need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
     except (subprocess.TimeoutExpired, BlockingIOError):
         return 75
     except Refusal as error:
-        if action == 'reconcile-install' or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or NATIVE_PREPARING or str(error) == 'IN_FLIGHT':
+        if (action == 'reconcile-install' or REATTEST_ENTERED or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED
+                or NATIVE_PREPARING or str(error) == 'IN_FLIGHT'):
+            return 75
+        if str(error) in (RUNTIME_REATTEST_REQUIRED, RUNTIME_FOREIGN_CHANGE) and time.monotonic() >= DEADLINE:
             return 75
         if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED, MODULE_BLACKLISTED, OBSERVATION_REQUIRED):
             return 75
@@ -5538,17 +6332,20 @@ def main():
             return 70
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + (
               'IDENTITY' if str(error) == 'IDENTITY' else
+              RUNTIME_REATTEST_REQUIRED if action in RUNTIME_EPOCH_READS and str(error) == RUNTIME_REATTEST_REQUIRED else
               RETIRE_CHANGED if action in ('prepare-remove', 'remove') and str(error) == RETIRE_CHANGED else
               'REMOVE_IPSEC_BUSY' if action in ('prepare-remove', 'remove') and str(error) == 'REMOVE_IPSEC_BUSY' else
               'REMOVE_REFUSED' if action == 'remove' else
               'INSPECT_' + str(error) if action == 'inspect-chap' and isinstance(error, InspectUnproved)
               and str(error) in ('CHAP_PROJECTION_UNPROVED', 'PPP_UNPROVED', 'PIDFD_GETFD_EPERM', 'READBACK_UNPROVED') else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
-              SESSION_UNKNOWN if action in ('session-count', 'retirement-count') else str(error)), file=sys.stderr)
+              SESSION_UNKNOWN if action in ('session-count', 'retirement-count') else
+              'ROLLBACK_DRIFT' if str(error) == RUNTIME_REATTEST_REQUIRED else str(error)), file=sys.stderr)
         return 70
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
-        if action == 'reconcile-install' or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED or PPP_PREPARING or NATIVE_PREPARING:
+        if (action == 'reconcile-install' or REATTEST_ENTERED or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED
+                or PPP_PREPARING or NATIVE_PREPARING):
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else

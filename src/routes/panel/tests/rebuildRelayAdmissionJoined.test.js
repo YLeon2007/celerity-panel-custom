@@ -37,7 +37,7 @@ function mongoFixture(t) {
             ssh: { port: 22, username: 'root', password },
         }))],
         ...[GRANTS, AUDIT, STATES, USERS, LOCK, DIRECTORY, 'c3_rebuild_l2tp_retired_relays', 'l2tpoperations', 'remoteadmissions',
-            'nodeoperationlocks', 'cascadelinks'].map(name => [name, []]),
+            'nodeoperationlocks', 'cascadelinks', 'servergroups'].map(name => [name, []]),
     ]);
     const writes = [], commits = [];
     let grantIndexes = [];
@@ -69,13 +69,21 @@ function mongoFixture(t) {
         if (!include.length) {
             const result = copy(row);
             for (const [key, flag] of Object.entries(projection)) {
-                assert.ok(!key.includes('.') && flag === 0);
-                delete result[key];
+                assert.equal(flag, 0);
+                const parts = key.split('.'), leaf = parts.pop();
+                const parent = parts.reduce((value, part) => value?.[part], result);
+                if (parent) delete parent[leaf];
             }
             return result;
         }
         const result = projection._id === 0 || row._id === undefined ? {} : { _id: row._id };
         for (const key of include) {
+            if (key.startsWith('relays.') && Array.isArray(row.relays)) {
+                result.relays ??= row.relays.map(() => ({}));
+                const field = key.slice('relays.'.length);
+                row.relays.forEach((relay, i) => { if (Object.hasOwn(relay, field)) result.relays[i][field] = relay[field]; });
+                continue;
+            }
             const value = get(row, key);
             if (value === undefined) continue;
             const path = key.split('.');
@@ -250,6 +258,11 @@ function hostFixture(t, mongo) {
         assert.equal(mongo.rows(LOCK).length, 1);
         assert.ok(!command.includes(sshPassword));
         const ok = body => ({ status: 0, stdout: JSON.stringify(body) + '\n', stderr: '' });
+        if (req.action === remote.staleRead) return { status: 70, stdout: '', stderr: 'DIRECT_RUNTIME_REATTEST_REQUIRED\n' };
+        if (req.action === 'reattest-runtime') {
+            assert.equal(req.backupId, installedId);
+            return remote.reattestReply;
+        }
         switch (req.action) {
         case 'preflight':
             if (remote.machineId !== machineId) return { status: 70, stdout: '', stderr: 'DIRECT_IDENTITY\n' };
@@ -400,6 +413,9 @@ function configure(t) {
 function mount(panel, mongo) {
     panel.l2tpRateLimiter.resetKey('192.0.2.10');
     const app = express();
+    app.set('views', require('node:path').resolve(__dirname, '../../../../views'));
+    app.set('view engine', 'ejs');
+    app.use(require('../../../middleware/i18n').i18nMiddleware);
     app.use(require('../rebuildL2tp').rebuildL2tpIngress);
     app.use(express.json());
     // Default production composition; no injected admission or Install service.
@@ -415,7 +431,7 @@ function mount(panel, mongo) {
         const url = action.startsWith('/') ? action : `/panel/rebuild/relays/${path}/${action}`;
         Object.assign(req, { method: 'POST', url, session, sessionID, complete: true, headers: {
             host: 'panel.fixture.invalid', 'content-type': 'application/json', 'content-length': String(payload.length), 'x-csrf-token': csrfToken,
-            ...(html && { accept: 'text/html' }),
+            ...(html && { accept: 'text/html', 'accept-language': 'ru' }),
         } });
         req.push(payload);
         req.push(null);
@@ -441,7 +457,10 @@ function mount(panel, mongo) {
         return require('../rebuildRelayRemove').issueRemovalTicket({ method: 'GET', headers: {}, session, sessionID,
             params: { id: nodeId } }, estimate);
     };
-    return { send, session, preview, admission: (action, ...args) => send(`admission/${action}`, ...args) };
+    const get = url => require('../../../services/tests/helpers/rebuildPanelRequest').request(app, url, {
+        method: 'GET', session, sessionID, headers: { 'accept-language': 'ru' },
+    });
+    return { send, get, session, preview, admission: (action, ...args) => send(`admission/${action}`, ...args) };
 }
 
 function audit(mongo, expected) {
@@ -666,6 +685,125 @@ test('admitted account POSTs leave a prior uncertain intent untouched', { timeou
         assert.deepEqual(f.frames, frames);
         assert.deepEqual(f.mongo.commits, commits);
     }
+});
+
+const foreignCode = 'REBUILD_L2TP_RUNTIME_FOREIGN_CHANGE';
+const foreignRu = 'Конфигурация L2TP на релее изменена вне панели';
+const foreignFrame = { status: 70, stdout: '', stderr: 'DIRECT_RUNTIME_FOREIGN_CHANGE\n' };
+const lostFrame = { status: 75, stdout: '', stderr: '' };
+
+test('runtime foreign change reaches the real node card and normal Remove without a new ticket', { timeout: 5000 }, async t => {
+    const f = joined(t);
+    await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+    await f.send('install');
+    const cardUrl = `/panel/nodes/${nodeId}`;
+    const ticket = async () => {
+        f.remote.staleRead = undefined;
+        const card = await f.get(cardUrl);
+        assert.equal(card.status, 200, card.body.slice(0, 300));
+        const match = card.body.match(/name="ticket" value="([a-f0-9]{64})"/);
+        assert.ok(match, 'normal card renders a real confirmation ticket');
+        return match[1];
+    };
+    const assertFrames = (start, ...names) => assert.deepEqual(f.frames.slice(start), names.map(action => [nodeId, action]));
+    const preserved = [STATES, USERS, DIRECTORY].map(f.mongo.rows);
+    const censusTicket = await ticket();
+    const originalFrames = f.frames.length;
+    f.remote.staleRead = 'session-count';
+    f.remote.reattestReply = foreignFrame;
+    const card = await f.get(cardUrl);
+    assert.equal(card.status, 200);
+    assert.match(card.body, /id="rebuild-l2tp-remove" open>/);
+    assert.match(card.body, new RegExp(`<p role="status">${foreignRu}</p>`));
+    assert.doesNotMatch(card.body, /name="ticket"|DIRECT_RUNTIME_FOREIGN_CHANGE/);
+    assertFrames(originalFrames, 'session-count', 'reattest-runtime');
+    assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket: censusTicket }, { expected: 409 }),
+        { error: { code: foreignCode, retryAllowed: false } });
+    assertFrames(originalFrames + 2, 'session-count', 'reattest-runtime');
+
+    const prepareTicket = await ticket();
+    const startPrepare = f.frames.length;
+    f.remote.staleRead = 'prepare-remove';
+    const location = await f.send('remove', { decision: 'confirm', ticket: prepareTicket }, { html: true, expected: 303 });
+    const notice = await f.get(location);
+    assert.equal(notice.status, 200);
+    assert.match(notice.body, new RegExp(`data-action-status role="status">${foreignRu}<`));
+    assert.doesNotMatch(notice.body, /data-(?:install-url|account-action|remove-link|reconcile-url)=/);
+    assertFrames(startPrepare, 'session-count', 'prepare-remove', 'reattest-runtime');
+    assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket: prepareTicket }, { expected: 409 }),
+        { error: { code: 'REBUILD_L2TP_REMOVE_CONFIRMATION_REQUIRED' } });
+
+    require('../index').l2tpRateLimiter.resetKey('192.0.2.10');
+    const lostTicket = await ticket();
+    const startLost = f.frames.length;
+    f.remote.staleRead = 'session-count';
+    f.remote.reattestReply = lostFrame;
+    const unconfirmed = await f.get(cardUrl);
+    assert.equal(unconfirmed.status, 303);
+    assert.equal(unconfirmed.headers.location, '/panel/l2tp?view=remove-unconfirmed');
+    assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket: lostTicket }, { expected: 409 }),
+        { error: { code: 'REBUILD_L2TP_REMOVE_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false } });
+    assertFrames(startLost, 'session-count', 'reattest-runtime', 'session-count', 'reattest-runtime');
+    assert.deepEqual([STATES, USERS, DIRECTORY].map(f.mongo.rows), preserved);
+    assert.deepEqual(f.remote.effects, ['install']);
+});
+
+test('runtime foreign change reaches the real CHAP reconciliation route with the intent still pending', { timeout: 5000 }, async t => {
+    const f = joined(t);
+    await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+    await f.send('install');
+    f.remote.loseChapReply = true;
+    await f.send('accounts/create', { login: 'fixture-new', password: 'fixture-password' }, { expected: 409 });
+    const preserved = [STATES, USERS, DIRECTORY].map(f.mongo.rows);
+    assert.ok(preserved[2].some(row => row._id === 'pending'));
+    f.remote.staleRead = 'inspect-chap';
+    const start = f.frames.length;
+    const overview = await f.get('/panel/l2tp');
+    assert.equal(overview.status, 200);
+    assert.match(overview.body, /data-reconcile disabled/);
+    const entities = { '&#34;': '"', '&#39;': "'", '&amp;': '&', '&lt;': '<', '&gt;': '>' };
+    const attribute = name => overview.body.match(new RegExp(`data-${name}="([^"]+)"`))[1]
+        .replace(/&#34;|&#39;|&amp;|&lt;|&gt;/g, match => entities[match]);
+    const source = require('node:fs').readFileSync(require('node:path').resolve(__dirname, '../../../../public/js/rebuild-l2tp.js'), 'utf8');
+    const unknown = { code: 'REBUILD_L2TP_ACCOUNTS_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false };
+    for (const [wire, error] of [
+        [foreignFrame, { code: foreignCode, retryAllowed: false }],
+        [lostFrame, unknown],
+        [{ ...foreignFrame, stderr: foreignFrame.stderr + privateError }, unknown],
+    ]) {
+        f.remote.reattestReply = wire;
+        let click, request;
+        const status = { textContent: '' }, refresh = { hidden: true };
+        const reconcile = { disabled: true, addEventListener: (_, handler) => { click = handler; } };
+        const page = {
+            dataset: { csrf: attribute('csrf'), messages: attribute('messages'), reconcileUrl: attribute('reconcile-url') },
+            querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-reconcile]': reconcile })[key] ?? null,
+            querySelectorAll: () => [],
+        };
+        require('node:vm').runInNewContext(source, {
+            document: { getElementById: () => page }, window: { addEventListener() {} }, fetch(url, options) {
+                assert.equal(url, '/panel/rebuild/relays/l2tp/accounts/reconcile');
+                assert.equal(options.method, 'POST');
+                request = f.send(url, JSON.parse(options.body), { expected: 409, csrfToken: options.headers['x-csrf-token'] });
+                return request.then(data => ({ status: 409, ok: false, json: async () => data }));
+            },
+        });
+        assert.equal(request, undefined);
+        assert.equal(reconcile.disabled, false);
+        click();
+        assert.deepEqual(await request, { error });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(status.textContent, wire === foreignFrame ? foreignRu
+            : require('../../../locales/ru.json').rebuildL2tp.messages.reconcileUnconfirmed);
+        assert.equal(refresh.hidden, false);
+        assert.equal(reconcile.disabled, true);
+        click(); // A stale control must not post again, even if invoked directly.
+        assert.deepEqual([STATES, USERS, DIRECTORY].map(f.mongo.rows), preserved);
+    }
+    assert.deepEqual(f.frames.slice(start), Array.from({ length: 3 }, () => [
+        [nodeId, 'inspect-chap'], [nodeId, 'reattest-runtime'],
+    ]).flat());
+    assert.deepEqual(f.remote.effects, ['install', 'sync-chap']);
 });
 
 test('installed pin rotation checks the original receipt, commits only grant and audit, and leaves host state alone', { timeout: 5000 }, async t => {

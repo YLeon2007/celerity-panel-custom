@@ -180,6 +180,26 @@ test('wrong node or session never consumes a matching ticket; wrong or missing f
     assert.deepEqual(f.calls.map(call => call.action), ['preview', 'preview', 'preview']);
 });
 
+test('neighbor refusal is a sanitized 409 with no ticket, including an online replacement preview', async t => {
+    const f = mount(t);
+    const { checkNeighborRefusal } = require('../../../services/rebuildNeighborRefusal');
+    const code = 'REBUILD_RETIRE_NEIGHBOR_REFUSED';
+    f.state.previewError = Object.assign(new Error(privateValue), { code, neighborName: privateValue });
+    assert.deepEqual(checked(await f.send(url('preview')), 503), { error: { code: 'REBUILD_RETIRE_PREVIEW_UNAVAILABLE' } });
+    const refusal = checkNeighborRefusal(Object.assign(new Error(privateValue), {
+        code: 'REBUILD_L2TP_APPLY_NETWORK_REFUSED', reason: 'RUNTIME_FOREIGN_CHANGE', nodeName: privateValue,
+    }), '212\nEast');
+    f.state.previewError = refusal;
+    const expected = { error: { code, neighborName: '212 East', reason: 'RUNTIME_FOREIGN_CHANGE' } };
+    assert.deepEqual(checked(await f.send(url('preview')), 409), expected);
+    f.state.previewError = undefined;
+    const preview = await getPreview(f);
+    f.state.confirmError = Object.assign(new Error(privateValue), { code: 'PREVIEW_CHANGED' });
+    f.state.previewError = refusal;
+    assert.deepEqual(checked(await submit(f, preview.ticket, 'delete'), 409), expected);
+    assert.deepEqual(f.calls.map(c => c.action), ['preview', 'preview', 'preview', 'confirm', 'preview']);
+});
+
 test('census change re-previews the same node but does not retry confirm; positive protected/neighbor refusals carry no ticket', async t => {
     const f = mount(t);
     let preview = await getPreview(f);

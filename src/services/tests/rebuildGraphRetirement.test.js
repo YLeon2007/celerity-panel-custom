@@ -23,7 +23,7 @@ const code = name => Object.assign(new Error('untrusted transport detail'), { co
 function fixture(t, { isolated = false, offline = true, onlineL2tp = false } = {}) {
     t.mock.method(generator, 'buildPanelInlineCertificate', () => null);
     const nodes = ['portal','relay','bridge','portal','bridge','portal','bridge'].map((cascadeRole, i) => ({
-        _id: ids[i], cascadeRole, type: 'xray', active: i !== 1 || !offline, ip: `192.0.2.${i + 1}`,
+        _id: ids[i], name: `Node ${i + 1}`, cascadeRole, type: 'xray', active: i !== 1 || !offline, ip: `192.0.2.${i + 1}`,
         xray: {security: 'none', apiPort: 15000 + i, inboundTag: `users-${i}`}, port: 16000 + i,
     }));
     const expectedDesired = incident(4, upstream, exit);
@@ -126,7 +126,7 @@ function fixture(t, { isolated = false, offline = true, onlineL2tp = false } = {
                 assert.equal(input.controlPlaneAddresses.includes(nodes[1].ip), false);
                 assert.equal(input.followRelayStates.some(r => r.node === relay), false);
             }
-            assert.equal(input.links.some(l => [l.portalNode,l.bridgeNode].includes(relay)), false);
+            if (offline) assert.equal(input.links.some(l => [l.portalNode,l.bridgeNode].includes(relay)), false);
             return composeRebuildProfiles(input);
         },
         connect(node) {
@@ -136,7 +136,7 @@ function fixture(t, { isolated = false, offline = true, onlineL2tp = false } = {
             return {
                 async requireSupportedCore() { trace.push(['core', id]); },
                 async verifyIdentity() { trace.push(['identity', id]); },
-                async checkActivation() { trace.push(['check', id]); check(); },
+                async checkActivation({ readOnly }) { trace.push(['check', id, readOnly]); check(); },
                 async prepareActivation() { trace.push(['prepare', id]); },
                 async read(profile) {
                     trace.push(['read', id, profile]);
@@ -182,9 +182,10 @@ test('abandon rebuilds both disconnected halves and inactive/tombstone neighbors
         f.trace.push(['finish']);
     } });
     assert.equal(result.previewId, preview.previewId);
-    for (const step of ['connect','users','core','identity','check','stage','prepare','put','close']) {
+    for (const step of ['connect','users','core','identity','stage','prepare','put','close']) {
         assert.deepEqual(operations(f, step).flat().sort(), [portal, exit, upstream, retiredPeer]);
     }
+    assert.deepEqual(operations(f, 'check').sort(), [portal, exit, upstream, retiredPeer].map(id => [id, false]));
     assert.deepEqual(operations(f, 'state'), [[portal, exit, upstream, retiredPeer]]);
     assert.deepEqual(operations(f, 'delete'), [before.slice(0, 3).map(l => l._id)]);
     assert.deepEqual(operations(f, 'update'), [[before[3]._id]]);
@@ -286,6 +287,45 @@ test('preserves protected profiles and activation refusal before any staging', a
     assert.equal(drift.allowed, false);
     assert.notEqual(original.survivorPreview, drift.survivorPreview);
     await assert.rejects(f.run({ preview: false, expectedPreview: drift.previewId }), { code: 'REBUILD_CLIENT_CHANGE' });
+    noWrite(f);
+});
+
+test('retire and link previews project only an attributed read-only activation refusal', async t => {
+    const f = fixture(t, { offline: false });
+    const peer = f.nodes.find(n => n._id === retiredPeer);
+    peer.name = '  212\n\u202e East  ';
+    const family = 'REBUILD_L2TP_APPLY_NETWORK_REFUSED';
+    const denied = (reason, extra) => Object.assign(code(family), { reason, nodeName: '/private/path', ...extra });
+    f.fail(retiredPeer, 'activation', denied('RUNTIME_FOREIGN_CHANGE'));
+    const link = f.links.find(l => l.bridgeNode === retiredPeer);
+    for (const preview of [() => f.run({ preview: true }),
+        () => f.service.execute({ linkId: link._id, preview: true, remove: true })]) {
+        await assert.rejects(preview(), error => {
+            assert.equal(error.code, 'REBUILD_RETIRE_NEIGHBOR_REFUSED');
+            const { neighborRefusalForError } = require('../rebuildNeighborRefusal');
+            assert.deepEqual(neighborRefusalForError(error), {
+                code: 'REBUILD_RETIRE_NEIGHBOR_REFUSED', neighborName: '212 East', reason: 'RUNTIME_FOREIGN_CHANGE',
+            });
+            return true;
+        });
+    }
+    assert.ok(f.trace.some(([kind, id]) => kind === 'check' && id === retiredPeer));
+    assert.ok(f.trace.filter(([kind]) => kind === 'check').every(([, , readOnly]) => readOnly === true));
+    f.fail(retiredPeer, 'activation', denied('/private/path'));
+    peer.name = '界'.repeat(130);
+    await assert.rejects(f.run({ preview: true }), error => {
+        const { neighborRefusalForError } = require('../rebuildNeighborRefusal');
+        assert.deepEqual(neighborRefusalForError(error), {
+            code: 'REBUILD_RETIRE_NEIGHBOR_REFUSED', neighborName: '界'.repeat(80), reason: 'APPLY_NETWORK_REFUSED',
+        });
+        return true;
+    });
+    f.fail(retiredPeer, 'activation', denied('RUNTIME_FOREIGN_CHANGE', { outcome: 'unknown' }));
+    await assert.rejects(f.run({ preview: true }), { code: family, outcome: 'unknown' });
+    f.fail(retiredPeer, 'activation', code('REBUILD_L2TP_IDENTITY_CHANGED'));
+    await assert.rejects(f.run({ preview: true }), { code: 'REBUILD_L2TP_IDENTITY_CHANGED' });
+    f.fail(relay, 'activation', denied('RUNTIME_FOREIGN_CHANGE'));
+    await assert.rejects(f.run({ preview: true }), { code: family });
     noWrite(f);
 });
 

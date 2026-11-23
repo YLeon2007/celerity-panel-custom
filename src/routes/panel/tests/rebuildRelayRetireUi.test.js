@@ -84,6 +84,24 @@ const preview = (override = {}) => ({ nodeId: id, mode: 'online', activeClients:
     unavailableSince: null, allowed: true, ticket, ...override });
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
+test('localized neighbor refusal never enables confirmation or prints unknown details', async () => {
+    for (const lang of languages) {
+        const f = await launch(lang);
+        const code = 'REBUILD_RETIRE_NEIGHBOR_REFUSED';
+        f.replies.push({ status: 409, data: { error: { code, neighborName: '212 East', reason: 'RUNTIME_FOREIGN_CHANGE' } } });
+        await f.buttons[0].click();
+        const copy = words(lang);
+        assert.equal(f.status.textContent, copy.neighborRefused.replace('{name}', '212 East') + ' ' + copy.neighborRuntimeForeignChange);
+        assert.equal(f.confirm.hidden, true);
+        f.dialog.close();
+        f.replies.push({ status: 409, data: { error: { code, neighborName: '/private/path', reason: '<raw error>' } } });
+        await f.buttons[0].click();
+        assert.equal(f.status.textContent, copy.neighborRefused.replace('{name}', copy.neighborUnknown));
+        assert.equal(f.confirm.disabled, true);
+        assert.equal(f.calls.length, 2);
+    }
+});
+
 for (const lang of languages) {
     test(`${lang}: rendered desktop/mobile relay actions differ from ordinary Delete and load translated dialog copy`, async () => {
         const html = await render(lang);
