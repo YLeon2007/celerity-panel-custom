@@ -35,5 +35,6 @@ If `users.json` is damaged, the agent leaves existing Xray users in place and wa
 
 ## Limitations
 
+- An old Classic L2TP record left after uninstall does not reserve its former pool or prevent installation on another relay. No database cleanup is needed. If a Classic operation is still in progress, wait for it to finish.
 - After a reboot, the panel cannot recognize a pre-v1.4.0 L2TP installation that lacks its last applied configuration record (`currentApply`). Reinstall L2TP during a maintenance window; do not clear locks or bypass verification.
 - The systemd package pin for Debian 13.0 (`257.8`) has not been tested on a live relay. The live test used `257.13`.

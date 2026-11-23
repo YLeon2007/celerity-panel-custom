@@ -5,11 +5,13 @@ const { test } = require('node:test');
 const { EventEmitter } = require('node:events');
 const { createHash } = require('node:crypto');
 const { Client } = require('ssh2');
+const { Types: { ObjectId } } = require('mongoose');
 const { MAIN, BRIDGE } = require('../src/services/classicAppliedConfig');
 const { appliedLink } = require('../src/services/rebuildAppliedLink');
 const { encrypt } = require('../src/modules/relay-l2tp/services/secretBoxService');
 const { composeRebuildProfiles } = require('../src/modules/relay-l2tp/services/rebuildTopologyComposer');
 const { rebuildApplyMachineGuard } = require('../src/services/tests/helpers/rebuildApplyMachineGuard');
+const { inactiveClassicRelay, operations } = require('../src/services/tests/helpers/rebuildRelayClassicLifecycleFixture');
 
 const sha = value => createHash('sha256').update(value).digest('hex');
 const hostKey = Buffer.from('synthetic retirement fixture key');
@@ -22,6 +24,7 @@ const byLogin = (a, b) => a.login.localeCompare(b.login, 'en');
 
 function installedPeer({ binding, collections, relay }, initialCount) {
     const { machineId, host, port, username } = binding;
+    const bindingId = new ObjectId(relay);
     const backupId = 'a'.repeat(32);
     const state = { ...network, backupId, status: 'installed', desiredState: 'installed', routingMode: 'follow-relay',
         routingVersion: 1, secretRevision: 1, updatedAt: stamp, lastVerifiedAt: stamp, lastSyncAt: stamp };
@@ -53,7 +56,8 @@ function installedPeer({ binding, collections, relay }, initialCount) {
             const transit = [{ linkId: listener._id, mode: 'forward', port: listener.tunnelPort, uuid: listener.tunnelUuid }];
             const baseline = sha('owned installed target preimage');
             const clients = new Map(), faults = [];
-            const getState = () => independent.collection(collections.state).findOne({}, { readConcern: { level: 'majority' } });
+            const getState = () => independent.collection(collections.state).findOne({ node: bindingId },
+                { readConcern: { level: 'majority' } });
             const ack = value => JSON.stringify(value) + '\n';
             const direct = /^\/usr\/bin\/timeout (-k (?:1s 22s|4s 125s)) \/usr\/bin\/python3 -I -B -c '[^']+'$/;
             t.after(() => { assert.deepEqual(faults, []); assert.equal(clients.size, 0, 'all modeled SSH clients closed'); });
@@ -208,7 +212,7 @@ module.exports = function onlineTests(ctx) {
             || e[0] === 'direct' && ['prepare-remove', 'remove'].includes(e[1])), []);
         await f.unlocked();
     }
-    async function retired(f, host, before, profiles, count) {
+    async function retired(f, host, before, profiles, count, classicState) {
         const writesIn = commit => f.commands.filter(e => e.inTxn && e.session === commit.session && e.txn === commit.txn
             && writes.has(e.commandName)).map(e => e.collection);
         const commits = f.commands.filter(e => e.commandName === 'commitTransaction');
@@ -245,7 +249,8 @@ module.exports = function onlineTests(ctx) {
         assert.equal(String(after[C.links][0].rebuildApplied.listener), exit);
         assert.match(after[C.links][0].rebuildApplyEpoch, /^[a-f0-9]{32}$/);
         assert.deepEqual(after[C.links][1], before[C.links][4]);
-        for (const name of [C.state, C.accounts, C.grants]) assert.deepEqual(after[name], []);
+        assert.deepEqual(after[C.state], classicState ? [classicState] : []);
+        for (const name of [C.accounts, C.grants]) assert.deepEqual(after[name], []);
         assert.deepEqual(after[C.retired], [{ _id: relay }]);
         assert.equal(after[C.directory].length, 1);
         assert.deepEqual(after[C.directory][0].accounts, before[C.accounts].toSorted(byLogin).map(a => ({
@@ -273,11 +278,28 @@ module.exports = function onlineTests(ctx) {
         await f.unlocked();
     }
 
-    for (const count of [0, 2]) test(`installed ONLINE retirement joins real Remove and graph (${count ? 'explicit force for two clients' : 'zero clients'})`, async t => {
+    for (const [count, classic] of [[0, false], [2, false], [0, true]]) test(classic
+        ? '#13 ONLINE Retire joins directory-backfilling Remove and graph with an inactive classic neighbor'
+        : `installed ONLINE retirement joins real Remove and graph (${count ? 'explicit force for two clients' : 'zero clients'})`, async t => {
         const host = installedPeer(ctx, count);
         const f = await fixture(t, { online: host });
+        let classicRows, classicBytes;
+        if (classic) {
+            classicRows = inactiveClassicRelay('8'.repeat(24), host.state.clientCidr.split('.').slice(0, 3).join('.'));
+            const { state, operation } = classicRows;
+            await f.independent.collection(C.nodes).insertOne({ _id: state.node,
+                name: 'Inactive classic fixture', type: 'xray', cascadeRole: 'relay', active: false, ip: '192.0.2.8' });
+            await f.independent.collection(C.state).insertOne(state);
+            await f.independent.collection(operations).insertOne(operation);
+            classicBytes = () => Promise.all([
+                f.independent.collection(C.state).findOne({ _id: state._id }, { raw: true }),
+                f.independent.collection(operations).findOne({ _id: operation._id }, { raw: true }),
+            ]);
+        }
+        const classicBefore = await classicBytes?.();
         const app = await mountOnline(t, f);
         const before = await f.snapshot(false), raw = await f.snapshot(), profiles = new Map(f.profiles), hostBefore = host.snapshot();
+        if (classic) assert.deepEqual(before[C.directory], [], 'exercise directory backfill');
         const first = await app.preview();
         if (!first.json?.preview?.allowed) t.diagnostic(JSON.stringify(f.trace.filter(e => e[0] !== 'mongo')));
         let ticket = previewIs(first, count);
@@ -322,7 +344,11 @@ module.exports = function onlineTests(ctx) {
         assert.equal(result.status, 200, `${result.text}; ${f.trace.map(e => e[0] === 'direct' ? e.join(':') : e[0]).filter(x => x !== 'mongo').join(' ')}`);
         assert.equal(result.cache, 'no-store');
         assert.deepEqual(result.json, { nodeId: relay, status: 'deleted' });
-        await retired(f, host, before, profiles, count);
+        await retired(f, host, before, profiles, count, classicRows?.state);
+        if (classic) {
+            assert.deepEqual(await classicBytes(), classicBefore);
+            assert.ok(!f.commands.some(e => e.collection === operations && writes.has(e.commandName)));
+        }
         f.reset();
         await rejectedReplay(app, ticket, count ? 'force' : 'delete');
         assert.deepEqual(f.trace, []);

@@ -29,6 +29,10 @@ function matches(row, filter) {
     return Object.entries(filter).every(([path, expected]) => {
         if (path === '$nor') return expected.every(f => !matches(row, f));
         if (path === '$or') return expected.some(f => matches(row, f));
+        if (path === '$expr') {
+            const [[field, values]] = expected.$not.map(expr => expr.$in);
+            return !values.includes(fieldAt(row, field.slice(1)));
+        }
         const actual = fieldAt(row, path);
         if (expected && Object.hasOwn(expected, '$in')) return expected.$in.some(v => eq(actual, v));
         if (expected && Object.hasOwn(expected, '$nin')) return !expected.$nin.some(v => eq(actual, v));
@@ -75,7 +79,7 @@ function fixture(t, { legacy = false } = {}) {
         enabled: true, ip: states[i].poolStart, syncStatus: 'synced', desiredRevision: 1, appliedRevision: 1,
         passwordEncrypted, updatedAt: stamp, createdAt: stamp, lastSyncedAt: stamp, comment: 'fixture-private-comment' }));
     const queries = [];
-    const f = { cards, bindings, states, users, env, queries, grants: [], audit: [], pending: false, fenceReads: 0,
+    const f = { cards, bindings, states, users, env, queries, grants: [], audit: [], pending: false, fenceReads: 0, retiredReads: [],
         busy: { l2tpoperations: [], remoteadmissions: [], nodeoperationlocks: [], c3_rebuild_locks: [] } };
     for (const [model, rows] of [[Node, cards], [State, states], [User, users]]) {
         const get = (filter, options) => {
@@ -92,6 +96,7 @@ function fixture(t, { legacy = false } = {}) {
         t.mock.method(model.collection, 'findOne', async (filter, options) => get(filter, options)[0] ?? null);
     }
     const db = { readyState: 1, createCollection: async name => assert.equal(name, auditCollection) };
+    db.db = db;
     class Session {
         transaction = { transition: state => {
             assert.equal(state, 'TRANSACTION_COMMITTED');
@@ -115,6 +120,10 @@ function fixture(t, { legacy = false } = {}) {
         } };
     } });
     db.collection = name => {
+        if (name === 'c3_rebuild_l2tp_retired_relays') return { find(filter) {
+            f.retiredReads.push(...filter._id.$in);
+            return { async toArray() { return []; } }; // No tombstones, even for a missing card.
+        } };
         if (name === grantCollection) return {
             find(filter, options) {
                 assert.deepEqual(filter, {});
@@ -147,7 +156,19 @@ function fixture(t, { legacy = false } = {}) {
         };
         if (name === User.collection.collectionName) return User.collection;
         if (Object.hasOwn(f.busy, name)) return {
+            find(filter, options) {
+                assert.equal(name, 'l2tpoperations');
+                assert.equal(options.readPreference, 'primary');
+                assert.equal(options.readConcern.level, 'majority');
+                assert.deepEqual(options.projection, { _id: 1, node: 1, status: 1 });
+                return { async toArray() {
+                    if (f.operationsError) throw new Error('fixture-private-operation-error');
+                    return f.busy[name].filter(row => matches(row, filter)).slice(0, options.limit)
+                        .map(row => project(row, options.projection));
+                } };
+            },
             async findOne(filter, options) {
+                if (name === 'l2tpoperations' && f.operationsError) throw new Error('fixture-private-operation-error');
                 const row = f.busy[name].find(row => matches(row, filter));
                 return row ? project(row, options.projection) : null;
             },
@@ -160,7 +181,8 @@ function fixture(t, { legacy = false } = {}) {
         return { async findOne(filter, options) {
             if (filter._id === 'directory') {
                 if (f.directoryError) throw new Error('fixture-private-directory-error');
-                return null;
+                if (!f.directory || !options.projection) return f.directory ?? null;
+                return { ...f.directory, accounts: f.directory.accounts.map(({ passwordEncrypted, ...row }) => row) };
             }
             assert.deepEqual(filter, { _id: 'pending' });
             assert.equal(options.readConcern.level, 'majority');
@@ -255,6 +277,114 @@ test('install affordance reflects static node eligibility, state and residual ac
 const relayActions = ['canGrant', 'canReconfirm', 'canRevoke', 'canInstall', 'canRemove', 'canRevealPsk'];
 const enabledActions = row => relayActions.filter(action => row[action] === true);
 
+function classicState(f) {
+    const state = { _id: oid('c'), node: oid('c'), status: 'not_installed', desiredState: 'not_installed',
+        routingMode: 'route-group', routeGroup: oid('f'), operationId: oid('e'), activePathKey: 'classic-path',
+        appliedTopologyRevision: 17, secretRevision: 4, backupId: 'classic-backup', managedVersion: 'fixture-classic',
+        pskEncrypted: 'fixture-classic-psk', pskHint: 'fixture-classic-hint', clientCidr: '10.65.0.0/24',
+        localAddress: '10.65.0.1', poolStart: '10.65.0.11', poolEnd: '10.65.0.200', tproxyPort: 15001,
+        fwmark: 10077, routeTable: 200 };
+    const operation = { _id: state.operationId, node: state.node, kind: 'install', status: 'succeeded' };
+    f.states.push(state);
+    f.busy.l2tpoperations.push(operation);
+    return { state, operation };
+}
+
+test('dormant classic row is not a cohort member and cannot become a target; unresolved operations stay blocking', async t => {
+    const f = fixture(t);
+    const { state, operation } = classicState(f);
+    const fresh = { ...f.bindings[1], nodeId: String(oid('d')), host: '192.0.2.4', machineId: '4'.repeat(32),
+        sshHostKeySha256: '4'.repeat(64) };
+    f.cards.push({ ...f.cards[1], _id: oid('d'), ip: fresh.host });
+    f.env[listKey] = JSON.stringify(f.bindings.slice(0, 2));
+    const beforeGrant = await f.service.overview();
+    assert.deepEqual(enabledActions(beforeGrant.relays[2]), []);
+    assert.deepEqual(enabledActions(beforeGrant.relays[3]), ['canGrant']);
+    f.grants.push(grantRow(f.bindings[2]), grantRow(fresh));
+    for (const status of ['succeeded', 'failed', 'cancelled', 'rolled_back', 'running', 'unknown']) {
+        operation.status = status;
+        const settled = !['running', 'unknown'].includes(status);
+        const view = await f.service.overview();
+        assert.deepEqual(enabledActions(view.relays[2]), [], status);
+        assert.deepEqual(enabledActions(view.relays[3]), settled ? ['canReconfirm', 'canRevoke', 'canInstall'] : ['canReconfirm', 'canRevoke'], status);
+        assert.equal(view.canManageAccounts, settled, status);
+        assert.equal(view.accounts[0].canRevealPassword, settled, status);
+        assert.deepEqual(view.accounts[0].addresses.map(row => row.id), [idA, idB], status);
+        assert.equal((await f.service.revealPassword(login)) === password, settled, status);
+        assert.equal(await f.service.revealPsk(idC), null, status);
+    }
+    operation.status = 'succeeded';
+    for (const change of [
+        () => { state.rebuildInstallToken = 'unexpected-ownership'; return () => delete state.rebuildInstallToken; },
+        () => { state.rebuildMachineId = f.bindings[2].machineId; return () => delete state.rebuildMachineId; },
+        () => { f.states.push({ ...state, _id: oid('f') }); return () => f.states.pop(); },
+        () => { f.users.push({ ...f.users[0], _id: state._id, relayNode: state.node, login: 'foreign' }); return () => f.users.pop(); },
+        () => { operation.node = oid('f'); return () => { operation.node = state.node; }; },
+        () => {
+            f.busy.l2tpoperations.push({ _id: oid('f'), node: state.node, status: 'running' });
+            return () => f.busy.l2tpoperations.pop();
+        },
+    ]) {
+        const undo = change();
+        const view = await f.service.overview();
+        assert.equal(view.canManageAccounts, false);
+        assert.equal(view.accounts[0].canRevealPassword, false);
+        assert.equal(await f.service.revealPassword(login), null);
+        undo();
+    }
+    f.busy.l2tpoperations.length = 0;
+    assert.equal((await f.service.overview()).canManageAccounts, true, 'confirmed missing operation is not a failed read');
+    delete state.operationId;
+    state.desiredState = 'absent';
+    assert.equal((await f.service.overview()).canManageAccounts, true, 'classic teardown need not retain an operation reference');
+    assert.deepEqual(enabledActions((await f.service.overview()).relays[2]), [], 'retained classic fields are not target freshness');
+    state.replacementFence = 1;
+    assert.equal((await f.service.overview()).canManageAccounts, false);
+    assert.equal(await f.service.revealPassword(login), null);
+});
+
+test('dormant classic operation proof is reread before reveal and errors fail closed', async t => {
+    const f = fixture(t);
+    const { operation } = classicState(f);
+    for (const injectAfter of [1, 2]) {
+        let envelopes = 0;
+        f.afterRead = (_, fields) => {
+            if (fields.passwordEncrypted && ++envelopes === injectAfter) operation.status = 'running';
+        };
+        assert.equal(await f.service.revealPassword(login), null);
+        assert.equal(envelopes, injectAfter);
+        assert.equal(f.decipher.mock.callCount(), 0);
+        operation.status = 'succeeded';
+    }
+    f.operationsError = true;
+    const view = await f.service.overview();
+    assert.equal(view.canManageAccounts, false);
+    assert.equal(view.accounts[0].canRevealPassword, false);
+    assert.deepEqual(view.accounts[0].addresses.map(row => row.id), [idA, idB]);
+    assert.equal(await f.service.revealPassword(login), null);
+    assert.equal(f.decipher.mock.callCount(), 0);
+});
+
+test('directory inventory survives a dormant classic row, but not users without a settled DIRECT cohort', async t => {
+    const f = fixture(t);
+    f.directory = { _id: 'directory', version: 1, generation: crypto.randomUUID(),
+        accounts: [{ id: idA, login, enabled: true, passwordEncrypted: f.users[0].passwordEncrypted }] };
+    f.states.length = f.users.length = 0;
+    const { state, operation } = classicState(f);
+    let view = await f.service.overview();
+    assert.deepEqual(view.accounts, [{ login, enabled: true, consistent: true, canRevealPassword: true, addresses: [] }]);
+    assert.equal(view.canManageAccounts, false);
+    assert.equal((await f.service.revealPassword(login)) === password, true);
+    operation.status = 'running';
+    assert.deepEqual((await f.service.overview()).accounts, []);
+    assert.equal(await f.service.revealPassword(login), null);
+    operation.status = 'succeeded';
+    f.users.push({ _id: state._id, relayNode: state.node, login: 'foreign' });
+    view = await f.service.overview();
+    assert.deepEqual(view.accounts, []);
+    assert.equal(await f.service.revealPassword(login), null);
+});
+
 test('overview → admission confirmation → overview observes a committed grant without a restart', async t => {
     const f = fixture(t, { legacy: true });
     const read = () => f.service.overview();
@@ -284,6 +414,85 @@ test('overview → admission confirmation → overview observes a committed gran
     ]);
     assert.equal(Object.hasOwn(f.env, listKey), false);
     assert.equal(f.decipher.mock.callCount(), 0);
+});
+
+test('stale ENV list with no node or tombstone reserves identity but does not hide unrelated inventory or stop a disjoint grant', async t => {
+    const f = fixture(t);
+    f.cards.pop(); // idC is still in ENV; never retired and has no state/users.
+    const stale = f.bindings[2];
+    const fresh = { ...stale, nodeId: String(oid('d')), host: '192.0.2.4', machineId: '4'.repeat(32),
+        sshHostKeySha256: '4'.repeat(64) };
+    f.bindings.push(fresh);
+    const card = { ...f.cards[1], _id: oid('d'), ip: stale.host, ssh: { ...f.cards[1].ssh, port: stale.port } };
+    f.cards.push(card);
+    const perform = f.admission().perform;
+    const scope = { nodeId: fresh.nodeId, actor: 'fixture-admin', sessionId: 'fixture-session' };
+    const read = async () => {
+        const view = await f.service.overview();
+        assert.equal(view.grantProblem, null);
+        assert.deepEqual(view.relays.map(row => row.id), [idA, idB, fresh.nodeId]);
+        assert.deepEqual(view.accounts[0].addresses.map(row => row.id), [idA, idB]);
+        assert.equal(view.canManageAccounts, true);
+        return view.relays[2];
+    };
+    const confirm = async () => {
+        const { challenge } = await perform({ ...scope, action: 'probe' });
+        const verified = await perform({ ...scope, action: 'verify', challenge });
+        return perform({ ...scope, action: 'confirm', challenge: verified.challenge });
+    };
+    const endpointCollision = await read();
+    assert.equal(endpointCollision.grantProblem, 'REBUILD_L2TP_GRANT_CONFLICT');
+    assert.deepEqual(enabledActions(endpointCollision), []);
+    await assert.rejects(perform({ ...scope, nodeId: idC, action: 'probe' }),
+        { code: 'REBUILD_L2TP_GRANT_CONFLICT', detail: 'env-read-only' });
+    await assert.rejects(confirm(), { code: 'REBUILD_L2TP_GRANT_CONFLICT', detail: 'endpoint' });
+    card.ip = fresh.host;
+    for (const field of ['machineId', 'sshHostKeySha256']) {
+        assert.deepEqual(enabledActions(await read()), ['canGrant']); // Probe identity is not known to GET.
+        const original = fresh[field];
+        fresh[field] = stale[field];
+        await assert.rejects(confirm(), { code: 'REBUILD_L2TP_GRANT_CONFLICT', detail: field });
+        fresh[field] = original;
+    }
+    assert.deepEqual(f.grants, []);
+    assert.equal((await confirm()).source, 'db');
+    assert.deepEqual(enabledActions(await read()), ['canReconfirm', 'canRevoke', 'canInstall']);
+    assert.equal((await f.service.revealPassword(login)) === password, true);
+    assert.ok(f.retiredReads.includes(idC));
+    assert.equal(JSON.parse(f.env[listKey]).some(binding => binding.nodeId === idC), true);
+
+    // A conflicting *persisted* DB grant poisons the union, unlike a refused
+    // contender. The read-only inventory is still visible, with no secrets.
+    f.grants[0].sshHostKeySha256 = stale.sshHostKeySha256;
+    const conflict = await f.service.overview();
+    assert.equal(conflict.grantProblem, 'REBUILD_L2TP_GRANT_CONFLICT');
+    assert.ok(conflict.relays.every(row => enabledActions(row).length === 0));
+    assert.deepEqual(conflict.accounts[0].addresses.map(row => row.id), [idA, idB]);
+    assert.equal(conflict.accounts[0].canRevealPassword, false);
+});
+
+test('explicit [] masks singleton variables; unset uses legacy, while either accepts actual DB-only authority without a singleton', async t => {
+    const f = fixture(t, { legacy: true });
+    const read = () => f.service.overview();
+    assert.equal((await read()).relays[0].grantSource, 'env');
+    assert.equal((await read()).accounts[0].consistent, true);
+    f.env[listKey] = '[]';
+    assert.equal((await read()).relays[0].grantSource, null);
+    assert.deepEqual((await read()).accounts, []);
+    assert.equal(await f.service.revealPassword(login), null);
+    f.grants.push(grantRow(f.bindings[0]));
+    const readDbInventory = async () => {
+        const view = await read();
+        assert.equal(view.relays[0].grantSource, 'db');
+        assert.deepEqual(view.accounts[0].addresses, [{ id: idA, ip: f.users[0].ip }]);
+        assert.equal(view.canManageAccounts, true);
+        assert.equal((await f.service.revealPassword(login)) === password, true);
+    };
+    await readDbInventory();
+    delete f.env[listKey];
+    assert.equal((await read()).grantProblem, 'REBUILD_L2TP_GRANT_CONFLICT');
+    for (const field of ['C3_REBUILD_L2TP_RELAY_ID', 'C3_REBUILD_L2TP_RELAY_MACHINE_ID', 'C3_REBUILD_L2TP_SSH_SHA256']) delete f.env[field];
+    await readDbInventory();
 });
 
 test('DB-only grants expose first Install only on a fresh relay, without creating ownership or allowing accounts', async t => {
@@ -394,9 +603,13 @@ test('pending recovery requires the merged installed cohort and its recorded gra
     f.directoryError = true;
     f.pendingRelays = f.states.map((s, i) => ({ ...f.bindings[i], backupId: s.backupId,
         ...(i === 1 && { grantGeneration: f.grants[0].generation }) }));
+    const { operation } = classicState(f);
     const valid = await f.service.overview();
     assert.equal(valid.canReconcileAccounts, true);
     assert.ok(valid.relays.every(row => enabledActions(row).length === 0));
+    operation.status = 'running';
+    assert.equal((await f.service.overview()).canReconcileAccounts, false);
+    operation.status = 'succeeded';
     for (const [row, field, replacement] of [
         [f.grants[0], 'generation', crypto.randomUUID()],
         [f.cards[1], 'ip', 'replacement.example'],

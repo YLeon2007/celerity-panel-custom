@@ -1,8 +1,10 @@
 'use strict';
 
+const { Types: { ObjectId } } = require('mongoose');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { transactOnce } = require('./rebuildRelayInstallTransaction');
 const { collectionName: COLLECTION, readDirectory, writeDirectory, logicalAccount } = require('./rebuildRelayDirectory');
+const { inspectAccountSources, isDormantClassicState, readClassicOperations } = require('./rebuildRelayAccountInventory');
 const singleton = { _id: 'pending' };
 const readOptions = { readPreference: 'primary', readConcern: { level: 'majority' }, maxTimeMS: 5000 };
 
@@ -55,8 +57,35 @@ function createRebuildRelayAccountsStore({ Node, State, L2tpUser }) {
             try { return await fence().findOne(singleton, readOptions); }
             catch { throw accountError('PERSISTENCE_UNAVAILABLE'); }
         },
-        states: session => read(State.find({ $nor: [{ status: 'not_installed', desiredState: 'absent' }] })
-            .select('+rebuildInstallToken +rebuildMachineId').sort({ node: 1, _id: 1 }), session),
+        async states(session) {
+            // Read the unfiltered scope: even an absent row can have a new
+            // operation or duplicate another member's identity.
+            const states = await read(State.find({}).select('+rebuildInstallToken +rebuildMachineId').sort({ node: 1, _id: 1 }), session);
+            const classicStates = states.filter(isDormantClassicState);
+            if (!classicStates.length) return states;
+            const classicIds = new Set(classicStates.map(row => String(row.node)));
+            const cohort = states.filter(row => !classicIds.has(String(row.node)));
+            if (states.length - cohort.length !== classicIds.size) throw accountError('NOT_OWNED');
+
+            try {
+                const classicOperations = await readClassicOperations(db, classicStates, session);
+                // A same-login inventory read is not enough: any local user
+                // precludes skipping this relay. Match both persisted ID types.
+                const refs = [...classicIds].flatMap(id => [new ObjectId(id), id]);
+                const localUser = await db.collection(L2tpUser.collection.name).findOne({ relayNode: { $in: refs } }, {
+                    ...(session ? { session, maxTimeMS: readOptions.maxTimeMS } : readOptions),
+                    projection: { _id: 1 }, collation: { locale: 'simple' },
+                });
+                inspectAccountSources({ rows: { states: classicStates, users: localUser === null ? [] : [localUser], classicOperations },
+                    listMode: true });
+            } catch (error) {
+                if (['REBUILD_L2TP_ACCOUNT_SOURCE_BUSY', 'REBUILD_L2TP_ACCOUNT_INVENTORY_INVALID'].includes(error?.code)) {
+                    throw accountError('NOT_OWNED');
+                }
+                throw error;
+            }
+            return cohort;
+        },
         async inventory(ids, login, session) {
             // Sequential queries also support reuse within a single transaction.
             const nodes = await read(Node.find({ _id: { $in: ids } })

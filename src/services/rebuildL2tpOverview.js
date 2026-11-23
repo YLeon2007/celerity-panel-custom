@@ -8,6 +8,7 @@ const { resolveRelayBinding: defaultResolveBinding, normalizeRelayBinding, parse
 const { createRelayGrantStore } = require('./rebuildRelayGrantStore');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 const { readDirectory, sameAccounts, collectionName: accountsCollection } = require('./rebuildRelayDirectory');
+const { inspectAccountSources, isDormantClassicState, readClassicOperations } = require('./rebuildRelayAccountInventory');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 
@@ -196,7 +197,25 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         if (states.length === 0 || states.length !== owned.size || (!list && states.length !== 1)) return null;
         return owned;
     }
-    async function stableReveal(load, envelopeFor) {
+    async function accountScope(states, hasUsers) {
+        const classicStates = states.filter(isDormantClassicState);
+        const classicIds = new Set(classicStates.map(row => String(row.node)));
+        // Check the original scope, not just the filtered one: a duplicate
+        // absent/active row or a local replica cannot be hidden by the skip.
+        if (states.filter(row => classicIds.has(String(row.node))).length !== classicIds.size) return null;
+        let classicOperations = [];
+        if (classicStates.length) {
+            try {
+                classicOperations = await readClassicOperations(db, classicStates);
+                // Use the same operation evidence rules as Install/Remove,
+                // without reading any envelopes or treating classic as a source.
+                inspectAccountSources({ rows: { states: classicStates, users: [], classicOperations }, listMode: true });
+            } catch { return null; }
+            if (await hasUsers(classicStates.map(row => row.node))) return null;
+        }
+        return { states: states.filter(row => !classicIds.has(String(row.node))), classicStates, classicOperations };
+    }
+    async function stableReveal(load, envelopeFor, confirm = () => true) {
         const key = env.ENCRYPTION_KEY;
         if (!hasKey() || await hasPendingAccounts()) return null;
         const authority = await readAuthority();
@@ -207,7 +226,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         // untouched, and an account publication can clear its intent. Recheck
         // both witnesses without taking a writer lock or requiring a replica set.
         const after = await load(authority);
-        if (!equal(before, after) || await hasPendingAccounts()) return null;
+        if (!equal(before, after) || !await confirm(after) || await hasPendingAccounts()) return null;
         // The grant can change during the last inventory/envelope read without
         // changing either. Compare the effective union AND DB generations.
         const current = await readAuthority();
@@ -367,6 +386,9 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 ...(canRecoverInstall && { canRecoverInstall: true }),
                 canRemove: clear && owned.has(id), canRevealPsk: clear && owned.has(id) && hasKey() };
         });
+        const scope = await accountScope(states, refs => refs.some(node => withUsers.has(String(node))));
+        // Grant has its own per-node checks. Install also consumes the shared account inventory.
+        if (!scope) for (const relay of relays) relay.canInstall = false;
         if (relays.some(relay => relay.canInstall)) {
             // A shared lock says nothing about the outcome of Install on this relay.
             let lock;
@@ -383,7 +405,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 }
             }
         }
-        const cohort = list ? ownedCohort(states.filter(row => !isAbsent(row)), owned, list)
+        const cohort = list ? scope && ownedCohort(scope.states, owned, list)
             : owned.size === 1 ? owned : null;
         const accountRows = list ? rows : rows.filter(row => displayOwned.has(String(row.relayNode)));
         // An unfinished operation can leave this inventory unsettled. Do not
@@ -416,7 +438,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 addresses: visible.filter(row => isIPv4(row.ip)).map(row => ({ id: String(row.relayNode), ip: row.ip }))
                     .sort((a, b) => compare(a.id, b.id)) });
         }
-        if (directory && !rows.length && states.every(isAbsent)
+        if (directory && !rows.length && scope?.states.length === 0
             && (list || !authority || (directory.accounts.length === 1 && matches(idPattern, config[legacyId])))) {
             for (const { login, enabled } of directory.accounts) {
                 accounts.push({ login, enabled, consistent: clear, canRevealPassword: clear && hasKey(), addresses: [] });
@@ -449,36 +471,47 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
             const list = Object.hasOwn(config, relayList);
             const singleton = config[legacyId];
             if (!list && (!matches(idPattern, singleton) || login !== bootstrap)) return null;
-            const filter = list ? { $nor: [absentState] } : { node: singleton };
-            const states = await read(State.find(filter).sort('_id'), stateFields);
+            const candidates = await read(State.find(list ? {} : { node: singleton }).sort('_id'), stateFields);
+            const legacyDormant = !list && (candidates.length === 0 || (candidates.length === 1
+                && (isAbsent(candidates[0]) || isDormantClassicState(candidates[0]))));
+            const scope = list || legacyDormant ? await accountScope(list ? candidates : await read(State.find({}).sort('_id'), stateFields),
+                refs => read(L2tpUser.findOne({ relayNode: { $in: refs } }), '_id')) : { states: candidates };
+            if (!scope) return null;
+            const { states } = scope;
             if (states.some(row => !matches(idPattern, String(row.node)))) return null;
             const directory = await readDirectory(L2tpUser.db);
-            if (states.length === 0 || (!list && states.length === 1 && isAbsent(states[0]))) {
+            if (states.length === 0) {
                 if (!directory || (!list && directory.accounts.length !== 1)) return null;
-                if ((!list && await read(State.findOne({ $nor: [absentState] }), '_id'))
-                    || await read(L2tpUser.findOne({}), '_id')) return null;
-                return { list, dormant: true, directory, states };
+                if (await read(L2tpUser.findOne({}), '_id')) return null;
+                return { list, dormant: true, directory, scope };
             }
+            if (legacyDormant) return null;
             const nodes = await findNodes({ _id: { $in: states.map(row => row.node) } });
             const cohort = passwordCohort(states, nodes, authority, list);
             if (!cohort) return null;
-            const scope = list ? {} : { relayNode: singleton };
-            const inventoryScope = list ? { $or: [{ relayNode: { $in: states.map(row => row.node) } }, { login }] } : scope;
+            const userScope = list ? {} : { relayNode: singleton };
+            const inventoryScope = list ? { $or: [{ relayNode: { $in: states.map(row => row.node) } }, { login }] } : userScope;
             const inventory = await read(L2tpUser.find(inventoryScope).sort('_id'), userFields);
             if (!inventoryMatches(inventory, cohort, list)) return null;
             if (directory && ![...cohort.keys()].every(id => sameAccounts(directory.accounts,
                 inventory.filter(row => String(row.relayNode) === id), false))) return null;
             // An unexpected same-login replica invalidates the account; don't
             // filter down to a good-looking subset of the installed cohort.
-            const copies = await read(L2tpUser.find({ ...scope, login }).sort('_id'), `${userFields} passwordEncrypted`);
+            const copies = await read(L2tpUser.find({ ...userScope, login }).sort('_id'), `${userFields} passwordEncrypted`);
             if (!equal(inventory.filter(row => row.login === login), copies.map(({ passwordEncrypted: _, ...row }) => row))) return null;
-            return { list, nodes, states, inventory, copies, directory };
-        }, ({ list, dormant, states, nodes, copies, directory }, authority) => {
+            return { list, nodes, scope, inventory, copies, directory };
+        }, ({ list, dormant, scope: { states }, nodes, copies, directory }, authority) => {
             const account = directory?.accounts.find(row => row.login === login);
             if (dormant) return account?.passwordEncrypted;
             if (!replicasAgree(copies, passwordCohort(states, nodes, authority, list), list, true)) return null;
             if (directory && (!account || account.enabled !== copies[0].enabled || account.passwordEncrypted !== copies[0].passwordEncrypted)) return null;
             return copies[0].passwordEncrypted;
+        }, async ({ scope: { classicStates, classicOperations } }) => {
+            if (!classicStates?.length) return true;
+            // A new classic job can start without changing the retained state
+            // or the requested envelope. Check again after the last envelope.
+            try { return equal(classicOperations, await readClassicOperations(db, classicStates)); }
+            catch { return false; }
         });
     }
 

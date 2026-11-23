@@ -28,7 +28,8 @@ test('localized recovery is rendered only for an eligible installing card and an
         assert.ok(html.includes(`data-install-recovery-url="${url}"`));
         assert.ok(html.includes(`>${ejs.escapeXML(copy.recoverInstall)}<`));
         assert.ok(html.includes(`>${ejs.escapeXML(copy.refresh)}<`));
-        assert.ok(html.includes(`>${ejs.escapeXML(copy.status.installing)}<`));
+        const status = lang === 'zh-CN' ? require('../../../locales/en.json').rebuildL2tp.status : copy.status;
+        assert.ok(html.includes(`>${ejs.escapeXML(status.installing)}<`));
         for (const message of ['working', 'canInstallAgain', 'installRecoveryUnconfirmed', 'installRecoveryNoState']) {
             assert.equal(typeof copy.messages[message], 'string');
             assert.ok(html.includes(ejs.escapeXML(copy.messages[message])));

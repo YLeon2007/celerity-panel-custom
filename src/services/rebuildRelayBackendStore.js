@@ -7,6 +7,7 @@ const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2
 const { transactOnce, AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError } = require('./rebuildRelayInstallTransaction');
 const { readDirectory, checkDirectory, writeDirectory, logicalAccount } = require('./rebuildRelayDirectory');
 const { createRecoveryStore, plain } = require('./rebuildRelayInstallRecoveryStore');
+const { readClassicOperations } = require('./rebuildRelayAccountInventory');
 
 const fail = code => Object.assign(new Error(code), { code });
 const STATE_CHANGED = 'REBUILD_L2TP_RESERVATION_CHANGED';
@@ -49,7 +50,8 @@ function createStore(State, User, listMode) {
     async function sourceRows(id, session) {
         const states = await read(State.find(id == null ? {} : { node: { $ne: id } }).select(privateStateFields), session);
         const users = await read(User.find({}).select('+passwordEncrypted'), session);
-        return { states: states.sort(byId), users: users.sort(byId), directory: await readDirectory(User.db, session) };
+        const classicOperations = await readClassicOperations(State.db, states, session);
+        return { states: states.sort(byId), users: users.sort(byId), classicOperations, directory: await readDirectory(User.db, session) };
     }
 
     // List enrollment joins state and accounts even for the first relay, with

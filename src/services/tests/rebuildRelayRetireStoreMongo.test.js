@@ -19,6 +19,7 @@ const HyUser = require('../../models/hyUserModel');
 const Link = require('../../models/cascadeLinkModel');
 const State = require('../../modules/relay-l2tp/models/relayL2tpStateModel');
 const L2tpUser = require('../../modules/relay-l2tp/models/l2tpUserModel');
+const { inactiveClassicRelay, operations } = require('./helpers/rebuildRelayClassicLifecycleFixture');
 const port = process.env.C3_RETIRE_FIXTURE_PORT;
 const db = mongoose.connection;
 const id = n => new ObjectId(String(n).repeat(24));
@@ -279,6 +280,65 @@ run('capture refuses conflicting legacy ciphertext without changing graph or dir
     const expected = await f.snapshotAll();
     await f.underLock(() => assert.rejects(f.store.capture(a), { code: 'REBUILD_L2TP_ACCOUNT_SOURCE_CONFLICT' }));
     assert.deepEqual(await f.snapshotAll(), expected);
+});
+
+for (const running of [false, true]) run(running
+    ? '#13 raw Retire aborts if the classic reference is running at transactional recheck'
+    : '#13 raw Retire backfills the directory in one transaction without mutating the inactive classic neighbor', async f => {
+    const { state, operation } = inactiveClassicRelay(x, '10.200.1');
+    const operationStore = db.collection(operations);
+    await Node.collection.updateOne({ _id: x }, { $set: { active: false } });
+    await State.collection.insertOne(state);
+    await operationStore.insertOne(operation);
+    assert.equal(await f.directory.findOne({ _id: 'directory' }), null);
+    const neighborBytes = async () => Promise.all([
+        Node.collection.findOne({ _id: x }, { raw: true }),
+        State.collection.findOne({ _id: state._id }, { raw: true }),
+        operationStore.findOne({ _id: operation._id }, { raw: true }),
+    ]);
+    const inTxn = [], ends = [];
+    db.getClient().on('commandStarted', ({ commandName, command }) => {
+        if (command.autocommit !== false) return;
+        if (['commitTransaction', 'abortTransaction'].includes(commandName)) ends.push(commandName);
+        inTxn.push({ commandName, command });
+    });
+    await f.underLock(async verify => {
+        const snapshot = await f.store.capture(a);
+        if (running) await operationStore.updateOne({ _id: operation._id }, {
+            $set: { status: 'running' }, $unset: { finishedAt: '' },
+        });
+        const before = await f.snapshotAll(), classicBefore = await neighborBytes();
+        const retire = () => transactOnce(State, L2tpUser, async session => {
+            await f.removeLinks(session);
+            await f.store.finish(snapshot, session, verify);
+            assert.deepEqual(await f.snapshotAll(), before, 'independent read still sees the preimage before commit');
+        });
+        if (running) {
+            await assert.rejects(retire, { code: 'REBUILD_L2TP_ACCOUNT_SOURCE_BUSY' });
+            assert.deepEqual(await f.snapshotAll(), before);
+            assert.deepEqual(ends, ['abortTransaction']);
+        } else {
+            await retire();
+            assert.deepEqual(ends, ['commitTransaction']);
+            assert.equal(await Node.collection.findOne({ _id: a }), null);
+            assert.equal(await State.collection.findOne({ node: a }), null);
+            assert.equal(await L2tpUser.collection.countDocuments({ relayNode: a }), 0);
+            assert.equal(await f.grants.findOne({ nodeId: String(a) }), null);
+            assert.deepEqual(await f.retired.findOne({ _id: String(a) }), { _id: String(a) });
+            assert.deepEqual((await f.directory.findOne({ _id: 'directory' })).accounts,
+                before[3].filter(row => row.relayNode.equals(a)).toSorted((l, r) => l.login.localeCompare(r.login)).map(row => ({
+                    id: String(row._id), login: row.login, enabled: row.enabled, passwordEncrypted: row.passwordEncrypted,
+                })));
+        }
+        assert.deepEqual(await neighborBytes(), classicBefore);
+    });
+    assert.ok(inTxn.some(({ command }) => command.find === operations || command.aggregate === operations),
+        'classic operation is read in the same transaction, not only at capture');
+    assert.ok(inTxn.every(({ command }) => ![command.insert, command.update, command.delete, command.findAndModify].includes(operations)));
+    for (const { command } of inTxn) {
+        assert.deepEqual(command.lsid, inTxn[0].command.lsid);
+        assert.deepEqual(command.txnNumber, inTxn[0].command.txnNumber);
+    }
 });
 
 run('retiring the last DB grant cannot downgrade a different installed legacy ENV singleton', async f => {

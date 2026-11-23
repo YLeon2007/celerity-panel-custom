@@ -12,6 +12,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { Client } = require('ssh2');
 const { issuePanelCsrfToken } = require('../csrf');
+const { inactiveClassicRelay, operations } = require('../../../services/tests/helpers/rebuildRelayClassicLifecycleFixture');
 
 const nodeId = 'a'.repeat(24), machineId = 'b'.repeat(32), host = '192.0.2.4';
 const key = Buffer.from('synthetic-admission-host-key');
@@ -27,16 +28,16 @@ const copy = value => mongoose.mongo.BSON.deserialize(mongoose.mongo.BSON.serial
 
 // Model the driver API, not the workflow, grant store, Mongoose queries, or
 // Install reservations. Raw collection reads and Mongoose see the same rows.
-function mongoFixture(t) {
+function mongoFixture(t, classicNeighbor) {
     // Seed the same encrypted representation that saving the node card writes.
     const password = require('../../../services/cryptoService').encrypt(sshPassword);
     const tables = new Map([
         ['settings', [{ _id: 'settings', deployment: { completed: true } }]],
         ['hynodes', [[nodeId, host], [unusedId, unusedHost]].map(([id, ip]) => ({
-            _id: new mongoose.Types.ObjectId(id), name: 'Joined relay', ip, type: 'xray', active: true, cascadeRole: 'relay',
+            _id: new mongoose.Types.ObjectId(id), name: 'Joined relay', ip, type: 'xray', active: id !== classicNeighbor, cascadeRole: 'relay',
             ssh: { port: 22, username: 'root', password },
         }))],
-        ...[GRANTS, AUDIT, STATES, USERS, LOCK, DIRECTORY, 'c3_rebuild_l2tp_retired_relays', 'l2tpoperations', 'remoteadmissions',
+        ...[GRANTS, AUDIT, STATES, USERS, LOCK, DIRECTORY, 'c3_rebuild_l2tp_retired_relays', operations, 'remoteadmissions',
             'nodeoperationlocks', 'cascadelinks', 'servergroups'].map(name => [name, []]),
     ]);
     const writes = [], commits = [];
@@ -240,7 +241,7 @@ function mongoFixture(t) {
     return { rows: name => tables.get(name).map(copy), commits, writes: () => writes.splice(0), password, faults };
 }
 
-function hostFixture(t, mongo) {
+function hostFixture(t, mongo, classicNeighbor) {
     const bindWire = require('../../../services/tests/helpers/rebuildRelayInstallJoined')({ wireOnly: true });
     const ready = { machineId, ppp: true, masked: false, unitsLoaded: true };
     const main = JSON.stringify({ inbounds: [{ tag: 'fwd-hop-a', protocol: 'vless', port: 443 }],
@@ -251,6 +252,7 @@ function hostFixture(t, mongo) {
     let candidate, installedId, chapLogins;
     const census = 'f'.repeat(64);
     const logins = users => users.map(user => user.login).sort();
+    const states = () => mongo.rows(STATES).filter(row => String(row.node) !== classicNeighbor);
     const frames = bindWire(t, [{ id: nodeId, relay: { ip: host }, get key() { return remote.key; },
         get machineId() { return remote.machineId; }, applyHandlers: new Map(), execute(command, stdin) {
         const req = JSON.parse(stdin);
@@ -269,13 +271,14 @@ function hostFixture(t, mongo) {
             return ok({ ...ready, pppPreparation: true });
         case 'prepare': return ok({ ...ready, main, bridge: null, mainSha256: hash(main), bridgeSha256: null, baseline: 'd'.repeat(64) });
         case 'check':
-            assert.deepEqual(mongo.rows(STATES), []);
+            assert.deepEqual(states(), []);
             assert.deepEqual(mongo.rows(USERS), []);
             candidate = hash(stdin.replace('"check"', '"install"'));
             break;
         case 'install':
             assert.equal(hash(stdin), candidate);
-            assert.deepEqual(mongo.rows(STATES).map(s => [s.status, s.backupId, s.rebuildMachineId]), [['installing', req.backupId, machineId]]);
+            remote.installCidr = req.network.clientCidr;
+            assert.deepEqual(states().map(s => [s.status, s.backupId, s.rebuildMachineId]), [['installing', req.backupId, machineId]]);
             assert.deepEqual(mongo.rows(USERS).map(u => [u.login, u.syncStatus]), [['relay-bootstrap', 'pending']]);
             assert.equal(installedId, undefined);
             installedId = req.backupId;
@@ -285,10 +288,10 @@ function hostFixture(t, mongo) {
             break;
         case 'verify':
             assert.equal(req.backupId, installedId);
-            assert.equal(mongo.rows(STATES)[0].status, 'installing');
+            assert.equal(states()[0].status, 'installing');
             break;
         case 'check-apply-network': {
-            const [state] = mongo.rows(STATES);
+            const [state] = states();
             assert.equal(state.status, 'installed');
             assert.ok(installedId);
             assert.deepEqual(req, { action: 'check-apply-network', machineId, backupId: installedId,
@@ -316,7 +319,7 @@ function hostFixture(t, mongo) {
             if (req.action === 'session-count') return ok({ activeSessions: 0, activeIpsec: 0, census });
             if (req.action === 'prepare-remove') return ok({ ok: true, backupId: installedId, machineId, baseline: '9'.repeat(64) });
             assert.equal(req.expectedCensus, census);
-            assert.equal(mongo.rows(STATES)[0].status, 'removing');
+            assert.equal(states()[0].status, 'removing');
             remote.effects.push(req.action);
             installedId = undefined;
             chapLogins = undefined;
@@ -479,10 +482,10 @@ const CHANGED = 'REBUILD_L2TP_IDENTITY_CHANGED';
 const CONFLICT = 'REBUILD_L2TP_GRANT_CONFLICT';
 const refused = code => ({ error: { code } });
 
-function joined(t) {
+function joined(t, { classicNeighbor } = {}) {
     const panel = configure(t);
-    const mongo = mongoFixture(t);
-    const wire = hostFixture(t, mongo);
+    const mongo = mongoFixture(t, classicNeighbor);
+    const wire = hostFixture(t, mongo, classicNeighbor);
     const app = mount(panel, mongo);
     const probe = () => app.admission('probe');
     const verify = challenge => app.admission('verify', { challenge });
@@ -568,6 +571,114 @@ test('guarded DB-only admission joins Install and refuses replay and installed r
     assert.deepEqual(f.remote.effects, ['install']);
     assert.deepEqual(f.remote.checks, checks);
     audit(f.mongo, [ok('probe'), ok('verify'), ok('grant'), ['confirm', 'denied', CHALLENGE], ['revoke', 'denied', CONFLICT]]);
+});
+
+// Pinned to the first pool for this fixed target in a clean inventory.
+const preferredPrefix = '10.255.25';
+async function seedClassicNeighbor(status) {
+    const fixture = inactiveClassicRelay(unusedId, preferredPrefix, status);
+    await mongoose.connection.collection(STATES).insertOne(fixture.state);
+    await mongoose.connection.collection(operations).insertOne(fixture.operation);
+    return fixture;
+}
+
+test('#13 DB-granted Install uses its preferred pool despite an inactive classic neighbor with a succeeded install', async t => {
+    const f = joined(t, { classicNeighbor: unusedId });
+    await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+    const { state, operation } = await seedClassicNeighbor();
+    const grants = f.mongo.rows(GRANTS);
+    const cards = f.mongo.rows('hynodes');
+    f.mongo.writes();
+    assert.equal(process.env.C3_REBUILD_L2TP_RELAYS_JSON, undefined);
+    assert.deepEqual(await f.send('install'), { executionMode: 'rebuild', status: 'installed', nodeId });
+    const target = f.mongo.rows(STATES).find(row => String(row.node) === nodeId);
+    assert.deepEqual([target.status, target.clientCidr, target.localAddress, target.poolStart, target.poolEnd],
+        ['installed', `${preferredPrefix}.0/24`, `${preferredPrefix}.1`, `${preferredPrefix}.10`, `${preferredPrefix}.250`]);
+    assert.notEqual(target.pskEncrypted, state.pskEncrypted);
+    assert.equal(f.remote.installCidr, target.clientCidr);
+    assert.deepEqual(f.mongo.rows(USERS).map(row => [String(row.relayNode), row.login, row.ip, row.syncStatus]),
+        [[nodeId, 'relay-bootstrap', `${preferredPrefix}.10`, 'synced']]);
+    assert.deepEqual(f.mongo.rows(DIRECTORY).map(row => row.accounts.map(account => account.login)), [['relay-bootstrap']]);
+    assert.deepEqual(f.mongo.rows(STATES).filter(row => String(row.node) !== nodeId), [state]);
+    assert.deepEqual(f.mongo.rows(operations), [operation]);
+    assert.deepEqual(f.mongo.rows(GRANTS), grants);
+    assert.deepEqual(f.mongo.rows('hynodes'), cards);
+    assert.ok(!f.mongo.writes().includes(operations));
+    assert.deepEqual(f.frames.map(([id, action]) => [id, action]),
+        ['preflight', 'preflight', 'prepare', 'check', 'install', 'verify'].map(action => [nodeId, action]));
+    assert.deepEqual(f.remote.effects, ['install']);
+    assert.deepEqual(f.mongo.rows(LOCK), []);
+});
+
+test('#13 DB-granted Install refuses a running classic operation before DIRECT or business writes', async t => {
+    const f = joined(t, { classicNeighbor: unusedId });
+    await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+    const { state, operation } = await seedClassicNeighbor('running');
+    const grants = f.mongo.rows(GRANTS);
+    f.mongo.writes();
+    assert.deepEqual(await f.send('install', {}, { expected: 409 }), {
+        error: { code: 'REBUILD_L2TP_ACCOUNT_SOURCE_BUSY', outcome: 'busy' },
+    });
+    assert.deepEqual(f.frames, []);
+    assert.deepEqual(f.remote.effects, []);
+    assert.deepEqual(f.mongo.rows(GRANTS), grants);
+    assert.deepEqual(f.mongo.rows(STATES), [state]);
+    assert.deepEqual(f.mongo.rows(operations), [operation]);
+    for (const name of [USERS, DIRECTORY, LOCK]) assert.deepEqual(f.mongo.rows(name), []);
+    assert.deepEqual(f.mongo.writes(), [LOCK, LOCK]);
+    assert.deepEqual(f.mongo.commits, [['grant', GRANTS, AUDIT]]);
+});
+
+async function installedWithoutDirectory(t) {
+    const f = joined(t, { classicNeighbor: unusedId });
+    await f.confirm((await f.verify((await f.probe()).challenge)).challenge);
+    assert.deepEqual(await f.send('install'), { executionMode: 'rebuild', status: 'installed', nodeId });
+    // Model a settled Install that predates the canonical account directory.
+    assert.equal((await mongoose.connection.collection(DIRECTORY).deleteMany({ _id: 'directory' })).deletedCount, 1);
+    assert.deepEqual(f.mongo.rows(DIRECTORY), []);
+    return f;
+}
+
+test('#13 Remove backfills the directory without adopting an inactive classic neighbor', async t => {
+    const f = await installedWithoutDirectory(t);
+    const [bootstrap] = f.mongo.rows(USERS);
+    const { state, operation } = await seedClassicNeighbor();
+    const cards = f.mongo.rows('hynodes');
+    f.mongo.writes();
+    const ticket = await f.preview();
+    assert.ok(ticket);
+    assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket }), { executionMode: 'rebuild', status: 'not_installed', nodeId });
+    assert.deepEqual(f.mongo.rows(USERS), []);
+    assert.deepEqual(f.mongo.rows(DIRECTORY).map(doc => [doc._id, doc.accounts]), [['directory', [{
+        id: String(bootstrap._id), login: bootstrap.login, enabled: bootstrap.enabled, passwordEncrypted: bootstrap.passwordEncrypted,
+    }]]]);
+    const target = f.mongo.rows(STATES).find(row => String(row.node) === nodeId);
+    assert.deepEqual([target.status, target.desiredState], ['not_installed', 'absent']);
+    assert.deepEqual(f.mongo.rows(STATES).filter(row => String(row.node) !== nodeId), [state]);
+    assert.deepEqual(f.mongo.rows(operations), [operation]);
+    assert.deepEqual(f.mongo.rows('hynodes'), cards);
+    assert.ok(!f.mongo.writes().includes(operations));
+    assert.deepEqual(f.remote.effects, ['install', 'remove']);
+    assert.deepEqual(f.mongo.rows(LOCK), []);
+});
+
+test('#13 Remove refuses a running classic reference before backfill or host Remove', async t => {
+    const f = await installedWithoutDirectory(t);
+    await seedClassicNeighbor('running');
+    const tables = [STATES, USERS, DIRECTORY, GRANTS, operations, 'hynodes'];
+    const before = tables.map(name => f.mongo.rows(name));
+    const ticket = await f.preview();
+    assert.ok(ticket);
+    const frames = f.frames.length, commits = f.mongo.commits.length;
+    f.mongo.writes();
+    assert.deepEqual(await f.send('remove', { decision: 'confirm', ticket }, { expected: 409 }),
+        refused('REBUILD_L2TP_REMOVE_FAILED'));
+    assert.deepEqual(f.frames.slice(frames), [], 'backfill survey refused before opening the Remove receiver');
+    assert.deepEqual(f.remote.effects, ['install']);
+    assert.deepEqual(tables.map(name => f.mongo.rows(name)), before);
+    assert.equal(f.mongo.commits.length, commits);
+    assert.deepEqual(f.mongo.writes(), [LOCK, LOCK]);
+    assert.deepEqual(f.mongo.rows(LOCK), []);
 });
 
 for (const cut of ['lost reservation acknowledgement', 'identity after reservation', 'lost host reply', 'lost finish acknowledgement',

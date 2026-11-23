@@ -5,7 +5,7 @@ const { mongo: { BSON }, Types: { ObjectId } } = require('mongoose');
 const { assertNoIncidentLinks } = require('./rebuildNodeDeleteGuard');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 const { isPristine } = require('./rebuildRelayBackendStore');
-const { inspectAccountSources } = require('./rebuildRelayAccountInventory');
+const { inspectAccountSources, readClassicOperations } = require('./rebuildRelayAccountInventory');
 const { collectionName: DIRECTORY, readDirectory, sameAccounts, writeDirectory, conflict } = require('./rebuildRelayDirectory');
 const { GRANTS, RETIRED, authorityKeys, legacyBinding } = require('./rebuildRelayGrantStore');
 const { relayListKey, parseRelayBindingList } = require('./rebuildRelayAuthorization');
@@ -157,8 +157,10 @@ function createRetireStore({ Link, Node, State, L2tpUser, env = process.env }) {
                 };
                 if (!equal(sources.states.filter(row => String(unpack(row).node) === id), states)
                     || !equal(sources.users.filter(row => String(unpack(row).relayNode) === id), accounts)) throw changed();
+                const cohort = sources.states.map(row => unpack(row));
+                sources.classicOperations = await readClassicOperations(db, cohort, session);
                 backfill = inspectAccountSources({ rows: {
-                    states: sources.states.map(row => unpack(row)), users: sources.users.map(row => unpack(row)),
+                    states: cohort, users: sources.users.map(row => unpack(row)), classicOperations: sources.classicOperations,
                 }, listMode: true }).legacy;
                 if (!backfill) throw conflict();
             }

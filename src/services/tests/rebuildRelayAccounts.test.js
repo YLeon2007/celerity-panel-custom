@@ -5,10 +5,10 @@ const assert = require('node:assert/strict');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { createRebuildRelayAccounts } = require('../rebuildRelayAccounts');
 const { resolveRelayBinding } = require('../rebuildRelayAuthorization');
-const { accountError } = require('../rebuildRelayAccountsStore');
+const { accountError, createRebuildRelayAccountsStore } = require('../rebuildRelayAccountsStore');
 const { encrypt, decrypt } = require('../../modules/relay-l2tp/services/secretBoxService');
 
-const A = 'a'.repeat(24), B = 'b'.repeat(24);
+const A = 'a'.repeat(24), B = 'b'.repeat(24), C = 'c'.repeat(24);
 const key = 'unit-fixture-key-'.repeat(3);
 const credentials = { login: 'shared', password: 'fixture-only' };
 const sharedCipher = encrypt(credentials.password, key);
@@ -51,28 +51,65 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
         C3_REBUILD_L2TP_SSH_SHA256: operatorList[0].sshHostKeySha256,
         ...(!legacy && { C3_REBUILD_L2TP_RELAYS_JSON: JSON.stringify(operatorList) }) };
     const events = [];
-    let pending, held = false, inTransaction = false, directory;
+    let pending, held = false, activeSession, directory;
+    const classicOperations = [];
     const sessions = Object.fromEntries(ids.map((id, i) => [id, [bootstrap, ...(other ? [neighbor] : []),
         ...(shared ? Array(i + 1).fill(credentials.login) : [])]]));
-    const f = { rows, users, hosts, sessions, events, env, get pending() { return pending; },
+    const f = { rows, users, hosts, sessions, events, env, classicOperations, get pending() { return pending; },
         set pending(value) { pending = value; }, get directory() { return directory; }, set directory(value) { directory = value; } };
     const step = (name, id) => {
         assert.equal(held, true);
-        if (id) assert.equal(inTransaction, false, 'no resolver or DIRECT I/O in the transaction');
+        if (id) assert.equal(activeSession, undefined, 'no resolver or DIRECT I/O in the transaction');
         events.push(id ? `${name}:${id}` : name);
         return fault(name, id, f);
     };
     const compareInTransaction = async check => {
-        inTransaction = true;
-        try { await check({}); } finally { inTransaction = false; }
+        const session = { inTransaction: () => activeSession === session };
+        activeSession = session;
+        try { await check(session); } finally { activeSession = undefined; }
     };
+    // Exercise the default store's cohort reads; model only the DB boundary.
+    const matches = (row, filter) => Object.entries(filter).every(([field, query]) => {
+        if (field === '$nor') return !query.some(part => matches(row, part));
+        if (field === '$or') return query.some(part => matches(row, part));
+        if (field === '$expr') return !query.$not[0].$in[1].includes(row.status);
+        return query?.$in ? query.$in.includes(row[field]) : row[field] === query;
+    });
+    const readMode = (name, { session, readPreference, readConcern }) => {
+        assert.equal(session, activeSession);
+        if (!session) assert.deepEqual([readPreference, readConcern?.level], ['primary', 'majority']);
+        step(session ? `${name}:snapshot` : name);
+    };
+    const db = { collection(name) {
+        if (name === 'l2tpoperations') return { find(filter, options) { return { async toArray() {
+            readMode('classic-operations', options);
+            return structuredClone(classicOperations.filter(row => matches(row, filter)));
+        } }; } };
+        assert.equal(name, 'l2tpusers');
+        return { async findOne(filter, options) {
+            readMode('classic-users', options);
+            assert.deepEqual(options.projection, { _id: 1 });
+            const found = users.find(row => matches(row, filter));
+            return found ? { _id: found._id } : null;
+        } };
+    } };
+    const State = { db, find(filter) {
+        const options = {};
+        return { select() { return this; }, sort() { return this; }, lean() { return this; }, maxTimeMS() { return this; },
+            read(value) { options.readPreference = value; return this; }, readConcern(level) { options.readConcern = { level }; return this; },
+            session(value) { options.session = value; return this; }, then(resolve) {
+                readMode('inventory', options);
+                resolve(structuredClone(rows.map(r => r.state).filter(row => matches(row, filter)).reverse()));
+            } };
+    } };
+    const cohortStore = createRebuildRelayAccountsStore({ State, Node: { db }, L2tpUser: { db, collection: { name: 'l2tpusers' } } });
     const store = {
         async assertNoPending() { step('gate'); if (pending) throw accountError('BLOCKED'); },
         async pending() { await step('pending'); return pending === undefined ? null : structuredClone(pending); },
-        async states() { step('inventory'); return structuredClone(rows.map(r => r.state).reverse()); },
+        states: cohortStore.states,
         async inventory(ids, login) {
             step('read');
-            return structuredClone({ nodes: rows.map(r => r.node),
+            return structuredClone({ nodes: rows.filter(r => r.node).map(r => r.node),
                 users: users.filter(u => ids.includes(u.relayNode) || u.login === login), directory });
         },
         async begin(intent) { step('intent'); assert.equal(pending, undefined);
@@ -176,6 +213,64 @@ function fixture({ shared = false, single = false, legacy = false, disabled = fa
 
 const effects = f => f.events.filter(x => /^(check:|intent$|sync:|publish$|settle$)/.test(x));
 const noWrites = f => assert.deepEqual(effects(f).filter(x => !x.startsWith('check:')), []);
+
+function addClassic(f) {
+    const operation = { _id: 'e'.repeat(24), node: C, status: 'succeeded' };
+    const state = { _id: C, node: C, routingMode: 'route-group', status: 'not_installed', desiredState: 'not_installed',
+        operationId: operation._id, routeGroup: 'd'.repeat(24), activePathKey: 'classic-path',
+        clientCidr: f.rows[0].state.clientCidr, pskEncrypted: 'fixture-classic-envelope', secretRevision: 1 };
+    f.rows.push({ state });
+    f.classicOperations.push(operation);
+    return { operation, state };
+}
+
+test('terminal classic neighbor does not join an account write or its settlement snapshot', async () => {
+    const f = fixture({ fault(step, _, f) {
+        if (step === 'intent-ack') assert.deepEqual(f.pending.relays.map(row => row.nodeId), [A, B]);
+    } });
+    withDbGrants(f);
+    const { state, operation } = addClassic(f);
+    const before = structuredClone([state, operation]);
+    assert.equal((await f.restart().create(credentials)).relayCount, 2);
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish', 'settle']);
+    assert.deepEqual(f.events.filter(x => x.endsWith(':snapshot')), ['inventory:snapshot', 'classic-operations:snapshot', 'classic-users:snapshot']);
+    assert.deepEqual(f.users.filter(row => row.login === credentials.login).map(row => row.relayNode), [A, B]);
+    assert.deepEqual([state, operation], before);
+});
+
+test('an ordinary pristine absent row remains compatible with account management', async () => {
+    const f = fixture();
+    f.rows.push({ state: { _id: C, node: C, status: 'not_installed', desiredState: 'absent', secretRevision: 0 } });
+    assert.equal((await f.service.create(credentials)).relayCount, 2);
+});
+
+for (const [name, change] of [
+    ['running classic operation', (_, { operation }) => { operation.status = 'running'; }],
+    ['new running operation on an absent row', (f, { state }) => {
+        state.desiredState = 'absent';
+        delete state.operationId;
+        f.classicOperations.push({ _id: 'f'.repeat(24), node: C, status: 'running' });
+    }],
+    ['classic local user with another login', f => {
+        f.users.push({ ...f.users[0], _id: 'f'.repeat(24), relayNode: C, login: neighbor, enabled: false });
+    }],
+    ['duplicate state beside an absent classic row', (f, { state }) => {
+        state.desiredState = 'absent';
+        f.rows.push({ state: { ...f.rows[0].state, node: C } });
+    }],
+    ['apparent absence with a retained fence', (_, { state }) => {
+        state.desiredState = 'absent';
+        state.replacementFence = 1;
+    }],
+]) {
+    test(`account write refuses ${name} before DIRECT or intent`, async () => {
+        const f = fixture();
+        change(f, addClassic(f));
+        await assert.rejects(f.service.create(credentials), code('NOT_OWNED'));
+        noWrites(f);
+        assert.ok(!f.events.some(x => x.startsWith('connect:')));
+    });
+}
 
 for (const action of ['create', 'disable', 'delete']) {
     test(`legacy singleton refuses mutating ${action} before DIRECT or persistence`, async () => {
@@ -469,6 +564,38 @@ function releasedIntent(f, action) {
 }
 
 const recoveryEffects = f => f.events.filter(x => /^(inspect:|fence:|check:|sync:|cancel$|intent$|publish$)/.test(x));
+
+test('an already stored intent recovers with a terminal classic neighbor, but not while it is running', async () => {
+    const f = fixture({ shared: true });
+    f.pending = releasedIntent(f, 'delete');
+    const before = structuredClone(f.pending);
+    const { operation } = addClassic(f);
+    operation.status = 'running';
+    await assert.rejects(f.restart().reconcile(), { ...code('BLOCKED'), retryAllowed: false });
+    assert.deepEqual(recoveryEffects(f), []);
+    assert.deepEqual(f.pending, before);
+
+    operation.status = 'succeeded';
+    assert.deepEqual(await f.restart().reconcile(), { executionMode: 'rebuild', status: 'canceled', login: credentials.login,
+        relayCount: 2, recovered: true, sessionsTerminated: 0 });
+    assert.deepEqual(recoveryEffects(f), [...fencePass, 'cancel']);
+    assert.deepEqual(f.events.filter(x => x.endsWith(':snapshot')), ['inventory:snapshot', 'classic-operations:snapshot', 'classic-users:snapshot']);
+    assert.equal(f.pending, undefined);
+});
+
+test('a classic job observed only in the settlement transaction keeps the original intent', async () => {
+    let operation, reserved;
+    const f = fixture({ fault(step, _, f) {
+        if (step === 'intent-ack') reserved = structuredClone(f.pending);
+        if (step === 'inventory:snapshot') operation.status = 'running';
+    } });
+    ({ operation } = addClassic(f));
+    const before = structuredClone(f.users);
+    await assert.rejects(f.service.create(credentials), { ...code('FINISH_UNKNOWN'), retryAllowed: false });
+    assert.deepEqual(effects(f), [`check:${A}`, `check:${B}`, 'intent', `sync:${A}`, `sync:${B}`, 'publish']);
+    assert.deepEqual(f.users, before);
+    assert.deepEqual(f.pending, reserved);
+});
 
 function withDbGrants(f) {
     const list = JSON.parse(f.env.C3_REBUILD_L2TP_RELAYS_JSON);

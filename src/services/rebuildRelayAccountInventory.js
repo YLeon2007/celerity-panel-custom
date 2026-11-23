@@ -1,7 +1,8 @@
 'use strict';
 
 const { isIPv4 } = require('node:net');
-const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
+const { Types: { ObjectId } } = require('mongoose');
+const { ROUTE_GROUP_MODE, FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
 const { ipv4, occupiedRange, validLogin } = require('./rebuildRelayBackendDesired');
 const { captureRelayEffect, identityChanged, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
@@ -10,10 +11,104 @@ const { logicalAccount, sameAccounts } = require('./rebuildRelayDirectory');
 const fail = code => Object.assign(new Error(`REBUILD_L2TP_${code}`), { code: `REBUILD_L2TP_${code}` });
 const inventoryInvalid = () => fail('ACCOUNT_INVENTORY_INVALID');
 const exactToken = (value, re) => typeof value === 'string' && re.exec(value)?.[0] === value;
-const objectId = value => exactToken(String(value), /^[a-f0-9]{24}$/);
+const hexId = value => {
+    const hex = value instanceof ObjectId ? value.toHexString() : value;
+    return exactToken(hex, /^[a-f0-9]{24}$/) ? hex : undefined;
+};
 const empty = value => value == null || value === '';
+const zero = value => value == null || value === 0;
 const bootstrap = 'relay-bootstrap';
-const transitional = new Set(['queued', 'preflight', 'installing', 'removing']);
+const stateStatuses = new Set(['not_installed', 'queued', 'preflight', 'installing', 'installed', 'degraded',
+    'drifted', 'removing', 'error', 'role_lost']);
+const terminalOperations = ['succeeded', 'failed', 'cancelled', 'rolled_back'];
+const activeOperations = new Set(['queued', 'running', 'rolling_back']);
+const classicLimit = 1024;
+const operationLimit = 4096;
+
+const classicRouting = state => (state.routingMode === undefined || state.routingMode === ROUTE_GROUP_MODE)
+    && state.routingVersion === undefined;
+const unowned = state => empty(state.rebuildInstallToken) && empty(state.rebuildMachineId);
+const validClassicRefs = state => (state._id === undefined || !!hexId(state._id))
+    && (state.operationId == null || !!hexId(state.operationId))
+    && (state.routeGroup == null || !!hexId(state.routeGroup))
+    && (state.activePathKey == null || typeof state.activePathKey === 'string');
+
+// Shape only: classic uninstall can retain the pool, PSK, path, group and
+// operation pointer. This predicate says nothing about outstanding work and
+// must not be used as target freshness or proof of physical absence.
+function isDormantClassicState(state) {
+    return !!state && !!hexId(state.node) && classicRouting(state) && unowned(state) && validClassicRefs(state)
+        && zero(state.pppDriftQueueFence) && zero(state.replacementFence)
+        && state.status === 'not_installed' && ['not_installed', 'absent'].includes(state.desiredState);
+}
+
+function classicScope(states) {
+    if (!Array.isArray(states)) throw inventoryInvalid();
+    const nodes = new Map(), pointers = new Map(), seen = new Set();
+    for (const state of states) {
+        const node = hexId(state?.node);
+        if (!node || seen.has(node) || !stateStatuses.has(state.status)
+            || !['installed', 'absent', 'not_installed'].includes(state.desiredState)) throw inventoryInvalid();
+        seen.add(node);
+        if (state.routingMode === FOLLOW_RELAY_MODE) continue;
+        if (!classicRouting(state) || !validClassicRefs(state)) throw inventoryInvalid();
+        if (!isDormantClassicState(state)) continue;
+        nodes.set(node, state);
+        const pointer = hexId(state.operationId);
+        if (pointer) {
+            if (pointers.has(pointer)) throw inventoryInvalid();
+            pointers.set(pointer, state);
+        }
+        if (nodes.size > classicLimit) throw inventoryInvalid();
+    }
+    return { nodes, pointers };
+}
+
+function validateClassicOperations({ nodes, pointers }, rows) {
+    if (!Array.isArray(rows) || rows.length > operationLimit) throw inventoryInvalid();
+    const seen = new Set();
+    let active = false;
+    for (const row of rows) {
+        const id = hexId(row?._id), node = hexId(row?.node);
+        const state = nodes.get(node), pointedBy = pointers.get(id);
+        const terminal = terminalOperations.includes(row?.status);
+        if (!id || seen.has(id) || !state || typeof row.node !== typeof state.node
+            || (pointedBy && (pointedBy !== state || typeof row._id !== typeof pointedBy.operationId))
+            || (terminal ? !pointedBy : !activeOperations.has(row.status))) throw inventoryInvalid();
+        seen.add(id);
+        if (!terminal) active = true;
+    }
+    return active;
+}
+
+// Native read: Mongoose would cast string query operands to ObjectId. Query
+// both spellings to detect a persisted type mismatch, never to authorize one.
+const typedRefs = ids => [...ids].flatMap(hex => [new ObjectId(hex), hex]);
+
+// Pass the same states to this reader and inspectAccountSources, with the
+// returned array as rows.classicOperations. [] is a completed observation
+// (or no dormant candidates), never a substitute for omitted/failed I/O.
+// A supplied session must be the caller's active snapshot transaction.
+async function readClassicOperations(db, states, session) {
+    const scope = classicScope(states);
+    if (!scope.nodes.size) return [];
+    if (session != null && session.inTransaction?.() !== true) throw inventoryInvalid();
+    // Classic Install enqueues by node before the worker updates the state
+    // pointer. Read every nonterminal job on the node as well as the pointed
+    // row (even terminal or on a wrong node). Compare the entire status value
+    // so a malformed array containing a terminal token cannot hide a job.
+    const byNode = { node: { $in: typedRefs(scope.nodes.keys()) },
+        $expr: { $not: [{ $in: ['$status', terminalOperations] }] } };
+    const filter = scope.pointers.size ? { $or: [{ _id: { $in: typedRefs(scope.pointers.keys()) } }, byNode] } : byNode;
+    const rows = await db.collection('l2tpoperations').find(filter, {
+        projection: { _id: 1, node: 1, status: 1 }, collation: { locale: 'simple' },
+        limit: operationLimit + 1, maxTimeMS: 5000, timeoutMS: 5000,
+        ...(session ? { session } : { readPreference: 'primary', readConcern: { level: 'majority' } }),
+    }).toArray();
+    validateClassicOperations(scope, rows);
+    return rows.map(({ _id, node, status }) => ({ _id, node, status }))
+        .sort((a, b) => hexId(a._id).localeCompare(hexId(b._id)));
+}
 
 function sourcePool(row) {
     const [first, last] = occupiedRange(row.clientCidr);
@@ -28,7 +123,7 @@ function sourcePool(row) {
 
 function installedSource(row) {
     if (row.status !== 'installed' || row.desiredState !== 'installed') throw fail('ACCOUNT_SOURCE_BUSY');
-    if (!objectId(row._id) || row.routingMode !== FOLLOW_RELAY_MODE || row.routingVersion !== FOLLOW_RELAY_VERSION
+    if (!hexId(row._id) || row.routingMode !== FOLLOW_RELAY_MODE || row.routingVersion !== FOLLOW_RELAY_VERSION
         || row.routeGroup != null || row.operationId != null || !empty(row.activePathKey)
         || row.appliedTopologyRevision != null || ![null, undefined, 0].includes(row.pppDriftQueueFence)
         || ![null, undefined, 0].includes(row.replacementFence)
@@ -68,7 +163,7 @@ async function enrollSource(env, relayGrantStore, snapshot, id, state, readNode)
 }
 
 function validateAccount(row, pool, logins, addresses) {
-    if (!objectId(row._id) || !validLogin(row.login) || !isIPv4(row.ip) || typeof row.enabled !== 'boolean'
+    if (!hexId(row._id) || !validLogin(row.login) || !isIPv4(row.ip) || typeof row.enabled !== 'boolean'
         || typeof row.passwordEncrypted !== 'string' || !row.passwordEncrypted || logins.has(row.login)
         || addresses.has(row.ip) || ipv4(row.ip) < pool.lo || ipv4(row.ip) > pool.hi) throw inventoryInvalid();
     if (row.syncStatus !== 'synced' || row.syncOperationId != null || !Number.isSafeInteger(row.desiredRevision)
@@ -101,27 +196,29 @@ function projectRelayChap(state, rows, key) {
 // Login is the logical key. Source IP and the per-row sync revision are local
 // to each relay. Agreement is on the actual envelope and enablement, not on
 // decrypted passwords (independent historical bootstraps must not be merged).
+// Callers with a dormant candidate must supply rows.classicOperations from
+// readClassicOperations against this same set of states. No I/O occurs here.
 function inspectAccountSources({ nodeId, rows, listMode }) {
+    const scope = classicScope(rows?.states);
+    if (scope.nodes.size || Object.hasOwn(rows, 'classicOperations')) {
+        if (!Object.hasOwn(rows, 'classicOperations')) throw inventoryInvalid();
+        if (validateClassicOperations(scope, rows.classicOperations)) throw fail('ACCOUNT_SOURCE_BUSY');
+    }
+    if (!Array.isArray(rows.users)) throw inventoryInvalid();
     const sources = new Map();
-    const stateIds = new Set(), machineIds = new Set();
+    const machineIds = new Set();
     const occupied = [], allocations = [];
     for (const state of rows.states) {
-        const id = String(state.node);
-        if (!objectId(id) || id === nodeId || stateIds.has(id)) throw inventoryInvalid();
-        stateIds.add(id);
-        if (state.status !== 'not_installed' || state.desiredState !== 'absent') {
-            occupied.push(state);
-            if (state.localAddress != null && state.localAddress !== '') allocations.push(state.localAddress);
-        }
-        if (state.routingMode !== FOLLOW_RELAY_MODE && empty(state.rebuildInstallToken) && empty(state.rebuildMachineId)) {
-            // Not a source or an authorization to mint over an existing install.
+        const id = hexId(state.node);
+        if (id === nodeId) throw inventoryInvalid();
+        if (scope.nodes.has(id)) continue; // Eligible shape and verified idle.
+        if (classicRouting(state) && unowned(state)) {
             if (state.status === 'installed') throw inventoryInvalid();
-            if (state.desiredState === 'installed' || state.operationId != null || transitional.has(state.status)) {
-                throw fail('ACCOUNT_SOURCE_BUSY');
-            }
-            continue;
+            throw fail('ACCOUNT_SOURCE_BUSY');
         }
         const pool = installedSource(state);
+        occupied.push(state);
+        allocations.push(state.localAddress);
         if (machineIds.has(state.rebuildMachineId) || [...sources.values()].some(source =>
             pool.first <= source.pool.last && pool.last >= source.pool.first)) throw inventoryInvalid();
         machineIds.add(state.rebuildMachineId);
@@ -181,4 +278,4 @@ async function resolveAccountSources({ nodeId, rows, env, relayGrantStore, snaps
     return { occupied, allocations, inherited, prechecks };
 }
 
-module.exports = { resolveAccountSources, inspectAccountSources, projectRelayChap };
+module.exports = { resolveAccountSources, inspectAccountSources, projectRelayChap, isDormantClassicState, readClassicOperations };
