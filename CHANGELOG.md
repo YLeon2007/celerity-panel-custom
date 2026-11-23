@@ -5,6 +5,30 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.4.2 — Rebuild, L2TP, API и MCP / Rebuild, L2TP, API and MCP
+
+### RU
+
+- **Второй выход через бридж:** исправление рассчитано только на точную штатную пустую заглушку Xray. Для этого случая не нужна переустановка L2TP ни после новой установки, ни на релеях с L2TP, установленным в v1.4.1. Если заглушку нельзя подтвердить, не заменяйте неизвестный профиль.
+- **Результаты действий в панели:** панель показывает подтверждённый результат и обновляет данные запросами на чтение. При неизвестном исходе проверяет его около пяти минут; если подтверждения нет, кнопки остаются заблокированными. Не повторяйте операцию.
+- **Install:** показывает реальные этапы, в том числе распаковку и настройку пакетов по отметкам APT. До резервирования установки и действий APT проверяет применённую связь от релея к бриджу и совпадение профиля MAIN с отпечатком Apply. Старым связям без такого подтверждения может понадобиться обычный Apply.
+- **Допуск релея:** через консоль провайдера сверяйте фактический тип публичного ключа SSH, SHA-256 от его декодированных байтов и идентификатор машины. Секреты для сверки не нужны.
+- **Настройка Xray через API и MCP** использует те же сценарии по ролям, что и панель. Бридж остаётся только выходом (exit-only), без установки `cc-agent` и запуска службы при настройке.
+- **MCP:** лимит JSON-запроса не изменился (100 КиБ). HTTP `413` теперь явно просит уменьшить размер запроса.
+
+`cc-agent` остаётся на версии **1.5.1**. [Памятка оператора](docs/release-v1.4.2.ru.md).
+
+### EN
+
+- **Second bridge exit:** the fix is limited to the exact canonical empty Xray placeholder. This case does not require reinstalling L2TP on either new installations or relays installed under v1.4.1. Do not replace an unknown profile if the placeholder cannot be verified.
+- **Panel action outcomes:** the panel acknowledges confirmed results and refreshes with read-only requests. If an outcome is uncertain, it checks for about five minutes; if unconfirmed, controls stay locked. Do not retry the operation.
+- **Install:** shows actual stages, including unpacking and setup milestones from APT. Before reserving the installation or touching APT, it checks for an applied relay-to-bridge link and a MAIN profile that matches the Apply fingerprint. Older links without that proof may need a normal Apply.
+- **Relay admission:** use the provider console to compare the actual SSH public key type, the SHA-256 digest of its decoded bytes, and the machine ID. The comparison needs no secrets.
+- **API and MCP Xray setup** follows the same role-specific path as the panel. Bridge setup remains exit-only, without installing `cc-agent` or starting the service.
+- **MCP:** the JSON request limit remains 100 KiB. HTTP `413` now tells clients to send a smaller request.
+
+`cc-agent` stays at **1.5.1**. [Operator release notes](docs/release-v1.4.2.md).
+
 ## v1.4.1 — Rebuild и L2TP / Rebuild and L2TP
 
 ### RU
