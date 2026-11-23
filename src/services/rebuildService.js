@@ -5,7 +5,7 @@ const {runRebuild,runRetireGraph,retirementScope,fingerprintLinks,hasProtectedCl
 const {checkNeighborRefusal}=require('./rebuildNeighborRefusal');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
-const {createTransport,createBoundRelayTransport}=require('./rebuildTransport');
+const {createTransport,createBoundRelayTransport,profileBytes,profileSha256}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {assertRealityFingerprint,realityDialerId}=require('./rebuildRealityFingerprint');
 const {prepareLinks}=require('./rebuildLinkKeys');
@@ -238,8 +238,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 throw error;
             }
         };
-        const readProfile=async(id,p)=>{
-            const current=await transports.get(id).read(p);
+        const readProfile=async(id,p,expectedMainSha256)=>{
+            const current=await transports.get(id).read(p,expectedMainSha256);
             if(retire&&id===req.nodeId&&!states.has(id)&&current&&hasRetiredIngress(current)){
                 throw fail('REBUILD_L2TP_BASELINE_MISMATCH');
             }
@@ -339,8 +339,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 return {coreIdentities,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
             },
             nodeRole:id=>roles.get(id),
-            async read(id,p,before){
-                if(!retire||!before)return readProfile(id,p);
+            async read(id,p,before,expected){
+                if(!retire||!before)return readProfile(id,p,p==='main'&&expected?profileSha256(profileBytes(expected)):undefined);
                 // The early read established reachability and drove bridge
                 // client-inbound inference. Do not confirm a stale baseline
                 // if it changed while preparing the full set of candidates.
@@ -372,7 +372,10 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             },
             stagePair:(id,pair)=>{if(retire)req.onEffect?.();return transports.get(id).stagePair(pair);},
             putPair:(id,pair)=>transports.get(id).putPair(pair),
-            async finish({desired,removed,retirement}){
+            async finish({desired,removed,retirement,candidates}){
+                // Same compact bytes staged by transport; publish only after activation and readback.
+                const mainPins=new Map(candidates.filter(p=>p.profile==='main').map(p=>[p.nodeId,
+                    profileSha256(profileBytes(p.config))]));
                 // Close while the target card and grant still exist: bound
                 // teardown may need both, and custom finish may delete either.
                 if(retire)await closeTransports(transports);
@@ -391,7 +394,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     for(const link of desired){
                         const result=await Link.updateOne({_id:link._id,active:{$ne:false},rebuildDelete:{$ne:true}},
                             {$set:{...(isReverse(link)?unverified:{status:'deployed',lastError:''}),rebuildApplied:appliedLink(link),
-                                rebuildApplyEpoch:randomBytes(16).toString('hex')},
+                                rebuildApplyEpoch:randomBytes(16).toString('hex'),rebuildAppliedMainSha256:mainPins.get(String(link.portalNode))},
                             $unset:{rebuildReverseObservation:''}},{session,runValidators:true});
                         if(result.acknowledged!==true||result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');
                     }

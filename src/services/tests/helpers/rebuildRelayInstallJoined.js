@@ -70,6 +70,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
 
     function seedHost(t, f, relay, machineId, scenario, { preEnabled = false, idleIke = false, subscribers = [], lifecycle = false,
         mainUid = 65534, cohort = false, freshDeploy = false } = {}) {
+        f.removeDefaultLink();
         const id = String(relay._id);
         const number = f.nodes.indexOf(relay);
         const packageStock = scenario.startsWith('package-stock-');
@@ -155,6 +156,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const mainMode = 0o640, bridgeMode = lifecycle && bridgeActive ? 0o644 : 0o640;
         const mpath = put(mainPath, setupMain ?? JSON.stringify(main), mainMode), bpath = join(root, bridgePath);
         if (!freshDeploy) put(bridgePath, JSON.stringify(bridge), bridgeMode);
+        for (const link of f.links.filter(row => !freshDeploy && String(row.portalNode) === id)) {
+            Object.assign(link, { rebuildApplied: require('../../rebuildAppliedLink').appliedLink(link), rebuildApplyEpoch: 'e'.repeat(32),
+                rebuildAppliedMainSha256: createHash('sha256').update(setupMain ?? JSON.stringify(main)).digest('hex') });
+        }
         put('/usr/local/bin/xray', 'modeled executable\n', 0o755);
         put('/etc/systemd/system/' + x, generateXraySystemdService(), 0o644);
         if (bridgeActive) put('/etc/systemd/system/' + b, generateBridgeSystemdService(), 0o644);
@@ -321,7 +326,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const execute = (command, stdin) => {
             const request = JSON.parse(stdin);
             const { action } = request;
-            actions.push(action);
+            if (action !== 'prove-applied-main') actions.push(action);
             const state = f.states.find(row => String(row.node) === id);
             const rows = f.users.filter(row => String(row.relayNode) === id);
             if (action === 'install') assert.ok(state?.status === 'installing' && rows.length
@@ -453,7 +458,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                     assert.equal(peer.observed, true, 'DIRECT payload requires attestation on this client');
                     peer.observed = false;
                 }
-                frames.push([host.id, action]);
+                if (action !== 'prove-applied-main') frames.push([host.id, action]);
                 return host.execute(command, stdin);
             };
             let ended = false;

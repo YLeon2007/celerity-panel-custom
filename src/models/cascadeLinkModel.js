@@ -33,6 +33,7 @@ function hideRebuildSecrets(_doc, row) {
     delete row._rebuildVless;
     delete row.rebuildApplied;
     delete row.rebuildApplyEpoch;
+    delete row.rebuildAppliedMainSha256;
     delete row.rebuildReverseObservation;
     return row;
 }
@@ -115,6 +116,7 @@ const cascadeLinkSchema = new mongoose.Schema({
     // never-applied draft. Only successful Apply readback writes a descriptor.
     rebuildApplied: { type: appliedLinkSchema, select: false, default: undefined },
     rebuildApplyEpoch: { type: String, select: false, match: /^[a-f0-9]{32}$/ },
+    rebuildAppliedMainSha256: { type: String, select: false, match: /^[a-f0-9]{64}$/ },
     rebuildReverseObservation: { type: reverseObservationSchema, select: false },
     // Metadata only. Startup must never infer a fresh deploy from this flag.
     autoDeploy: { type: Boolean, default: false },

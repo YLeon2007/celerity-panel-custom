@@ -58,6 +58,11 @@ function createPanelRouter({
 
     // Cache control must be set even if a guard denies the request.
     rebuildL2tp?.mountNoStore(router);
+    const installProgress = rebuildEnabled ? require('./rebuildRelayInstallProgress') : null;
+    if (installProgress) router.all(installProgress.path, (_req, res, next) => {
+        res.set('Cache-Control', 'no-store');
+        next();
+    });
 
     // IP whitelist applies to all panel routes
     router.use(checkIpWhitelist);
@@ -95,6 +100,7 @@ function createPanelRouter({
     router.use('/', requireAuth, requireOnboarding, accessLogsRoutes);
 
     if (rebuildEnabled) {
+        router.get(installProgress.path, requireAuth, requireOnboarding, installProgress.handler());
         // Same panel IP whitelist, authenticated session, onboarding, CSRF and
         // rate limiter as the stock installer. No API-key-only install route.
         router.post('/rebuild/relays/:id/l2tp/install', requireAuth, requireOnboarding,

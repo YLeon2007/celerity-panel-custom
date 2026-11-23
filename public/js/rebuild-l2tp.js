@@ -361,6 +361,10 @@
     function installProgress(nodeId, csrf) {
         const progress = new AbortController();
         window.addEventListener('pagehide', () => progress.abort(), { once: true, signal: progress.signal });
+        try {
+            const stop = window.rebuildL2tpInstallProgress?.start(page, nodeId);
+            if (stop) progress.signal.addEventListener('abort', stop, { once: true });
+        } catch { /* Progress is observational only. */ }
         // Item 2 can observe the outstanding synchronous POST without access
         // to its write or receipt nonce. Superseded reads cannot replace newer DOM.
         window.dispatchEvent(new CustomEvent('rebuild-l2tp:install-start', { detail: {

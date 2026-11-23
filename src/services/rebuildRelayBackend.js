@@ -1,6 +1,9 @@
 'use strict';
 
 const { isIP } = require('node:net');
+const { isDeepStrictEqual: equal } = require('node:util');
+const { appliedLink } = require('./rebuildAppliedLink');
+const hex = (value, size) => typeof value === 'string' && value.length === size && /^[a-f0-9]+$/.test(value);
 const { withNode, installOwner } = require('./rebuildLocks');
 const { componentFor } = require('./rebuildCoordinator');
 const { readRelayAuthority, captureRelayEffect, isIdentityChanged, isGrantAuthorityError } = require('./rebuildRelayEffectAuthority');
@@ -19,9 +22,10 @@ const eligible = (node, id, listMode) => String(node?._id) === id && node.type =
 async function readTopology(Node, Link, node, panelDomain) {
     const id = String(node._id);
     const links = await read(Link.find({ $or: [{ active: true }, { rebuildDelete: true }] })
-        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelPort tunnelUuid'));
+        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelPort tunnelUuid rebuildApplied rebuildApplyEpoch +rebuildAppliedMainSha256'));
     // Offline also describes an applied link whose tunnel is unconfirmed.
-    const applied = link => !link.rebuildDelete && !link.lifecycle && ['deployed', 'online', 'offline'].includes(link.status);
+    const applied = link => link.active === true && !link.rebuildDelete && !link.lifecycle && ['deployed', 'online', 'offline'].includes(link.status);
+    const notApplied = () => fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
 
     const ids = new Set(componentFor(links, [id]));
     const scoped = links.filter(link => ids.has(String(link.portalNode)) && ids.has(String(link.bridgeNode)));
@@ -35,13 +39,34 @@ async function readTopology(Node, Link, node, panelDomain) {
         throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
     }
     const nodes = [node, ...peers];
-    const { byNodeId } = compileRebuildGraph({ nodes, links: scoped, affectedNodeIds: [...ids] });
+    let byNodeId;
+    try { ({ byNodeId } = compileRebuildGraph({ nodes, links: scoped, affectedNodeIds: [...ids] })); }
+    catch { throw notApplied(); }
     const relay = byNodeId.get(id);
+    const ready = relay.outgoing.filter(edge => byNodeId.get(edge.target).role === 'bridge').map(({ id, link, target }) => {
+        const expected = appliedLink(link), saved = link.rebuildApplied;
+        if (!Number.isInteger(expected.port) || expected.port < 1 || expected.port > 65535
+            || typeof expected.uuid !== 'string' || !/^\S{1,128}(?![\s\S])/.test(expected.uuid)
+            || !saved || typeof saved !== 'object' || Object.keys(saved).length !== 5 || String(saved.listener) !== String(expected.listener)
+            || !['mode', 'protocol', 'port', 'uuid'].every(key => saved[key] === expected[key])
+            || !hex(link.rebuildApplyEpoch, 32) || !hex(link.rebuildAppliedMainSha256, 64)) {
+            throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
+        }
+        return { id, target, expected, epoch: link.rebuildApplyEpoch, sha: link.rebuildAppliedMainSha256 };
+    });
+    if (!ready.length || ready.some(edge => edge.sha !== ready[0].sha)) throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
     const transit = [...relay.outgoing.filter(edge => edge.mode === 'reverse'),
         ...relay.incoming.filter(edge => edge.mode === 'forward' && edge.protocol === 'vless')]
         .map(({ id: linkId, mode, link }) => ({ linkId, mode, port: link.tunnelPort, uuid: link.tunnelUuid }));
     return {
-        controlPlaneAddresses: [...new Set([panelDomain, ...nodes.flatMap(n => [n.ip, n.domain])].filter(Boolean))],
+        appliedMain: ready[0].sha,
+        // Compare authoritative inputs, not the periodically updated health time.
+        topologyWitness: { ready, peers: peers.map(({ _id, ip, domain, cascadeRole }) => [String(_id), ip, domain, cascadeRole])
+            .sort((a, b) => a[0].localeCompare(b[0])), relay: [node.ip, node.domain],
+            links: scoped.map(l => [String(l._id), String(l.portalNode), String(l.bridgeNode), l.mode, l.tunnelProtocol,
+                l.tunnelPort, l.tunnelUuid, l.priority, l.geoRouting, l.rebuildApplied, l.rebuildApplyEpoch])
+                .sort((a, b) => a[0].localeCompare(b[0])) },
+        controlPlaneAddresses: [...new Set([panelDomain, ...nodes.flatMap(n => [n.ip, n.domain])].filter(Boolean))].sort(),
         carryDomain: relay.carryDomain,
         ...(transit.length && { transit }),
     };
@@ -132,13 +157,25 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
             },
             connect: inventory => createRelayDirect({ node: inventory.node, env,
                 ...(inventory.bound && { fence: inventory.bound }) }),
-            prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit }, remote) =>
-                remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, ...(transit && { transit }) }),
+            async verifyTopology(inventory) {
+                const node = await getNode();
+                if (!eligible(node, id, fence.listMode)) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
+                const current = await readTopology(Node, Link, node, env.PANEL_DOMAIN);
+                if (!equal(current, Object.fromEntries(Object.keys(current).map(key => [key, inventory[key]])))) {
+                    throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
+                }
+            },
+            async proveMain({ appliedMain }, remote, guard) {
+                if (await remote.proveAppliedMain?.(appliedMain, guard) !== true) throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
+            },
+            prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit, appliedMain }, remote) =>
+                remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, appliedMain, ...(transit && { transit }) }),
             reserve: (inventory, backupId, verifyLock, packagePreparation) => store.reserve({ ...inventory, backupId, machineId, packagePreparation,
                 ...(owner && { recovery: { owner, actor, authority: grantIdentity(inventory.bound), key: inventory.key } }),
             }, verifyLock),
             handBackRecovery: () => owner?.handBack(),
             verifyReservation: reservation => store.verifyReservation(reservation),
+            progress: (reservation, stage, percent) => store.progress(reservation, stage, percent),
             finish: (reservation, verifyLock) => store.finish(reservation, verifyLock),
             restore: (reservation, verifyLock) => store.restore(reservation, verifyLock),
         });

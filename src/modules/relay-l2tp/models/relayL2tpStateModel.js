@@ -1,6 +1,18 @@
 const mongoose = require('mongoose');
 const { ROUTE_GROUP_MODE, FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../domain/l2tpRoutingSelection');
 
+const { stages, validPercent } = require('../../../services/rebuildInstallProgress');
+const strictType = test => value => {
+    if (!test(value)) throw new TypeError('Invalid install progress type');
+    return value;
+};
+const installProgressSchema = new mongoose.Schema({
+    stage: { type: String, enum: stages, required: true, set: strictType(v => typeof v === 'string') },
+    percent: { type: Number, required: true, min: 0, max: 100, set: strictType(Number.isInteger),
+        validate(v) { return validPercent(this.stage, v); } },
+    at: { type: Date, required: true, set: strictType(v => v instanceof Date && Number.isFinite(v.getTime())) },
+}, { _id: false, versionKey: false, strict: 'throw' });
+
 const DESIRED_STATES = ['absent', 'installed'];
 const STATUSES = [
     'not_installed',
@@ -86,6 +98,7 @@ const relayL2tpStateSchema = new mongoose.Schema({
     // backupId is an ownership witness, not permission to restore an old MAIN.
     rebuildInstallToken: { type: String, select: false },
     rebuildMachineId: { type: String, select: false },
+    installProgress: { type: installProgressSchema, default: undefined },
     operationId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'L2tpOperation',

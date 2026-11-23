@@ -46,6 +46,8 @@ class Adapter(unittest.TestCase):
         self.vault = self.root / 'vault'
         self.h: dict[str, Any] = {'__name__': 'fixture'}
         exec(compile(HOST.read_bytes(), str(HOST), 'exec'), self.h)
+        self.main_pin = 'a' * 64
+        self.h['applied_main_matches'] = lambda machine, expected: machine == MACHINE and expected == self.main_pin
         self.installed = False
         self.plan: dict[str, Any] = dict(missing=['xl2tpd'], versions={'xl2tpd': 'fixture-v1'})
         self.guard_calls = []
@@ -144,6 +146,8 @@ class Adapter(unittest.TestCase):
         self.installed = True
 
     def wire(self, action, **params):
+        if action == 'prepare-packages':
+            params.setdefault('appliedMain', self.main_pin)
         request = dict(action=action, machineId=MACHINE, **params)
         return self.raw_wire(json.dumps(request).encode())
 
@@ -163,6 +167,64 @@ class Adapter(unittest.TestCase):
         self.assertEqual(offer['machineId'], MACHINE)
         self.assertRegex(offer['packagePreparation'], r'^[a-f0-9]{64}$')
         return offer['packagePreparation']
+
+    def test_missing_applied_main_never_enters_the_package_guard(self):
+        offer = self.offered()
+        self.guard_calls.clear()
+        status, stdout, stderr = self.wire('prepare-packages', backupId=TOKEN,
+                                           packagePreparation=offer, appliedMain='b' * 64)
+        self.assertEqual((status, stdout, stderr), (70, '', 'DIRECT_BASELINE_CHANGED\n'))
+        self.assertNotIn('prepare', self.guard_calls)
+        self.assertEqual(self.effects, [])
+        self.assertFalse(self.vault.exists())
+
+    def test_main_drift_after_package_entry_vetoes_apt_install(self):
+        offer = self.offered()
+        seen, children = [], []
+        self.h['applied_main_matches'] = lambda machine, expected: seen.append((machine, expected)) or len(seen) < 3
+        self.h['bounded_status'] = lambda *a, **kw: children.append(a) or (0, b'', b'')
+        def enter_then_attempt(_root, run, _expected, enter):
+            enter()
+            run(APT_INSTALL, 78)
+        self.h['C3_PACKAGE_GUARD']['prepare'] = enter_then_attempt
+        self.assertEqual(self.wire('prepare-packages', backupId=TOKEN, packagePreparation=offer), (75, '', ''))
+        self.assertEqual(seen, [(MACHINE, self.main_pin)] * 3)
+        self.assertEqual(children, [])
+        self.assertFalse(self.effects)
+        self.assertEqual(json.loads((self.vault / self.h['PACKAGE_PENDING']).read_bytes())['phase'], 'preparing')
+
+    def test_applied_main_requires_live_stable_xray_and_exact_bytes(self):
+        h = dict(self.h)
+        # Retrieve the real function evaluated against the private test observers.
+        del h['applied_main_matches']
+        exec(compile(HOST.read_bytes(), str(HOST), 'exec'), h)
+        record = h['entry'](b'{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}')
+        pin = h['digest'](h['raw'](record))
+        def stopped(_):
+            raise h['Refusal']('RUNTIME_UNPROVED')
+        h.update(require_machine=lambda _: None, read=lambda *args, **kw: record, no_jobs=lambda _: None,
+                 unit=lambda _: {'InvocationID': '1' * 32}, xray_argv=lambda _: '12',
+                 remove_generation=lambda _: [1, 2, 3])
+        prove = h['applied_main_matches']
+        self.assertTrue(prove(MACHINE, pin))
+        self.assertFalse(prove(MACHINE, 'b' * 64))
+        with patch.dict(h, xray_argv=stopped):
+            self.assertFalse(prove(MACHINE, pin))
+        generations = iter([[1, 2, 3], [1, 2, 4]])
+        with patch.dict(h, remove_generation=lambda _: next(generations)):
+            self.assertFalse(prove(MACHINE, pin))
+
+    def test_apt_progress_is_bounded_monotone_and_emits_only_fixed_marks(self):
+        with patch.dict(self.h, install_progress=lambda mark: marks.append(mark)):
+            marks = []
+            detector = self.h['AptProgress']()
+            for chunk in (b'private-output\n', b'Unpacking secret-fixture (1', b'.0) ...\n',
+                          b'Unpacking ' + b'a' * 1000 + b' (1) ...\n',
+                          b'Unpacking another-fixture (2) ...\nSetting up another-fixture (2) ...\n',
+                          b'Unpacking out-of-order (3) ...\nSetting up duplicate (2) ...\n'):
+                detector.feed(chunk)
+                self.assertLessEqual(len(detector.line), 256)
+        self.assertEqual(marks, ['unpacking', 'settingUp'])
 
     def test_offer_and_ack_are_exact_and_install_directory_is_unclaimed(self):
         proof = self.offered()

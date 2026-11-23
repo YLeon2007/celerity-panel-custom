@@ -9,6 +9,7 @@ const { readDirectory, checkDirectory, writeDirectory, logicalAccount } = requir
 const { createRecoveryStore, plain } = require('./rebuildRelayInstallRecoveryStore');
 const { readClassicOperations } = require('./rebuildRelayAccountInventory');
 
+const { validPercent } = require('./rebuildInstallProgress');
 const fail = code => Object.assign(new Error(code), { code });
 const STATE_CHANGED = 'REBUILD_L2TP_RESERVATION_CHANGED';
 const write = { timestamps: false, setDefaultsOnInsert: false };
@@ -48,7 +49,7 @@ function createStore(State, User, listMode) {
         return { prior, pristine };
     }
     async function sourceRows(id, session) {
-        const states = await read(State.find(id == null ? {} : { node: { $ne: id } }).select(privateStateFields), session);
+        const states = await read(State.find(id == null ? {} : { node: { $ne: id } }).select(`${privateStateFields} -installProgress`), session);
         const users = await read(User.find({}).select('+passwordEncrypted'), session);
         const classicOperations = await readClassicOperations(State.db, states, session);
         return { states: states.sort(byId), users: users.sort(byId), classicOperations, directory: await readDirectory(User.db, session) };
@@ -67,6 +68,7 @@ function createStore(State, User, listMode) {
             routingMode: FOLLOW_RELAY_MODE, routingVersion: FOLLOW_RELAY_VERSION,
             rebuildInstallToken: randomUUID(), rebuildMachineId: machineId, updatedAt: now,
         };
+        const initialProgress = { stage: 'reserve', percent: 10, at: now };
         const key = { _id: stateId, node: nodeId };
         const fence = { ...key, ...exact({ ...prior, ...fields }, [...Object.keys(fields), ...zeroFields, ...emptyFields]) };
         const replicas = accounts.map(account => ({ _id: new Types.ObjectId(), relayNode: new Types.ObjectId(nodeId),
@@ -85,11 +87,11 @@ function createStore(State, User, listMode) {
             const options = writeIn(session);
             if (prior) {
                 const before = exact(prior, [...Object.keys(fields), ...zeroFields, ...emptyFields]);
-                requireOne(await updateOnce(State, { ...key, ...before }, { $set: fields }, options), 'matchedCount');
+                requireOne(await updateOnce(State, { ...key, ...before }, { $set: { ...fields, installProgress: initialProgress } }, options), 'matchedCount');
             } else {
                 // The unique node index excludes any independently created row.
                 requireOne(await updateOnce(State, { ...key, rebuildInstallToken: fields.rebuildInstallToken },
-                    { $setOnInsert: { ...key, ...fields, createdAt: now } }, { ...options, upsert: true }), 'upsertedCount');
+                    { $setOnInsert: { ...key, ...fields, installProgress: initialProgress, createdAt: now } }, { ...options, upsert: true }), 'upsertedCount');
             }
             // Credentials are durable *before* dispatch, as one complete set.
             for (const row of replicas) {
@@ -125,6 +127,14 @@ function createStore(State, User, listMode) {
         })) throw fail(STATE_CHANGED);
     }
 
+    async function progress(reservation, stage, percent) {
+        if (!validPercent(stage, percent) || stage === 'installed' || stage === 'preflight') return;
+        // Same business fence, no timestamp churn to the business row, no retries.
+        // The writer serializes milestones and drains them before settlement.
+        await updateOnce(State, reservation.fence, { $set: { installProgress: { stage, percent, at: new Date() } } },
+            { ...writeIn(), runValidators: true, timeoutMS: 1500, maxTimeMS: 1200 });
+    }
+
     function finish(reservation, verifyLock) {
         return mutate(async session => {
             await verifyReservation(reservation, session);
@@ -139,6 +149,7 @@ function createStore(State, User, listMode) {
             }
             await verifyLock();
             requireOne(await updateOnce(State, reservation.fence, { $set: { status: 'installed', installedAt: now,
+                installProgress: { stage: 'installed', percent: 100, at: now },
                 lastVerifiedAt: now, lastSyncAt: now, lastError: '', lastErrorCode: '', updatedAt: now } }, options), 'matchedCount');
             if (session) await verifyLock();
         });
@@ -156,6 +167,8 @@ function createStore(State, User, listMode) {
                 requireOne(await deleteOnce(State, fence, options), 'deletedCount');
             } else {
                 const set = {}, unset = {};
+                // A restored absent row never advertises this attempt.
+                unset.installProgress = '';
                 for (const key of Object.keys(fields)) {
                     if (Object.hasOwn(prior, key)) set[key] = prior[key];
                     else unset[key] = '';
@@ -166,7 +179,7 @@ function createStore(State, User, listMode) {
             if (session) await verifyLock();
         });
     }
-    return { snapshot, sourceRows, reserve, verifyReservation, finish, restore };
+    return { snapshot, sourceRows, reserve, verifyReservation, finish, restore, progress };
 }
 
 module.exports = { createStore, read, isPristine };

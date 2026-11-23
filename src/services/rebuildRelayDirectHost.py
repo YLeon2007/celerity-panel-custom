@@ -201,16 +201,58 @@ def package_child_scope():
         need(libc.prctl(36, prior.value, 0, 0, 0) == 0, 'IN_FLIGHT')
 
 
-def bounded_status(argv, end, maximum, *, may_write=False):
+def install_progress(mark):
+    # Only fixed marks, never child bytes. Don't block the host writer on UI.
+    try:
+        fd = sys.stderr.fileno()
+        blocking = os.get_blocking(fd)
+        os.set_blocking(fd, False)
+        try:
+            os.write(fd, ('DIRECT_PROGRESS ' + mark + '\n').encode('ascii'))
+        finally:
+            os.set_blocking(fd, blocking)
+    except Exception:
+        pass
+
+
+class AptProgress:
+    def __init__(self):
+        self.line = b''
+        self.overflow = False
+        self.phase = 0
+
+    def feed(self, chunk):
+        for i, part in enumerate(chunk.split(b'\n')):
+            if i:
+                self.finish_line()
+            if not self.overflow:
+                if len(part) + len(self.line) <= 256:
+                    self.line += part
+                else:
+                    self.overflow = True
+
+    def finish_line(self):
+        if not self.overflow and self.phase < 2:
+            prefix = re.match(rb'^(Unpacking|Setting up) [a-z0-9][a-z0-9+.:\-]* \([^\r\n]+\) \.\.\.\r?$', self.line)
+            if prefix:
+                phase = 1 if prefix[1] == b'Unpacking' else 2
+                if phase > self.phase:
+                    self.phase = phase
+                    install_progress('unpacking' if phase == 1 else 'settingUp')
+        self.line = b''
+        self.overflow = False
+
+
+def bounded_status(argv, end, maximum, *, may_write=False, progress=None):
     """Join bounded pipe EOF and original reap, plus writer descendant settlement."""
     with package_child_scope() if may_write else contextlib.nullcontext():
-        result = _bounded_child_status(argv, end, maximum, may_write)
+        result = _bounded_child_status(argv, end, maximum, may_write, progress)
     if time.monotonic() >= end:
         raise subprocess.TimeoutExpired((), 0)
     return result
 
 
-def _bounded_child_status(argv, end, maximum, may_write):
+def _bounded_child_status(argv, end, maximum, may_write, progress=None):
     def left():
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -237,6 +279,11 @@ def _bounded_child_status(argv, end, maximum, may_write):
                         pipes.unregister(key.fileobj)
                     else:
                         buf.extend(data)
+                        if progress is not None and buf is out:
+                            try:
+                                progress.feed(data)
+                            except Exception:
+                                progress = None
                         if len(buf) > maximum:
                             raise subprocess.TimeoutExpired((), 0)
             status = child.wait(timeout=left())
@@ -2074,6 +2121,8 @@ def install(request, before, after, lock_fd=None):
         current = entry(encode(backup))
         write(path, old_manifest, current)
         old_manifest = current
+    if request.get('progress') is True:
+        install_progress('restart')
     sc('daemon-reload', wait=12)
     if 'bridge' in after:
         need(xray_accounts_match(unit(B), before['units'][B]), 'ROLLBACK_DRIFT')
@@ -5789,6 +5838,8 @@ class PackageRunner:
         self.update_settled = False
         self.apt_dispatched = False
         self.apt_settled = False
+        self.check_profile = lambda: None
+        self.emit_progress = False
 
     def __call__(self, argv: tuple[str, ...], timeout: int) -> tuple[int, bytes, bytes]:
         try:
@@ -5803,7 +5854,11 @@ class PackageRunner:
             already_dispatched = self.apt_dispatched
             read_only = self.admit(argv)
             self.remaining -= 1
-            status = bounded_status(argv, end, PACKAGE_MAX_OUTPUT, may_write=not read_only)
+            apt_install = not already_dispatched and self.apt_dispatched
+            if apt_install or (not already_updated and self.update_dispatched):
+                self.check_profile()
+            status = bounded_status(argv, end, PACKAGE_MAX_OUTPUT, may_write=not read_only,
+                                    **({'progress': AptProgress()} if apt_install and self.emit_progress else {}))
             need(time.monotonic() < end and type(status[0]) is int and status[0] >= 0, 'IN_FLIGHT')
             if not already_updated and self.update_dispatched:
                 # Like the guard's strict update check, reject warnings even on zero.
@@ -5934,11 +5989,39 @@ def package_preflight(machine):
     return {'machineId': machine, 'packagePreparation': commit}
 
 
+def applied_main_matches(machine, expected):
+    # Join the exact Apply bytes to the service actually running the fixed
+    # MAIN path. No package, nft or module observer is needed for this read.
+    require_machine(machine)
+    try:
+        generation = remove_generation(MAIN)
+        main = read(MAIN, diagnose_main_mode=True, diagnose_profile_owner=True)
+        need(generation is not None and main is not None and digest(raw(main)) == expected, 'BASELINE_CHANGED')
+        no_jobs((X,))
+        info = unit(X)
+        pid = xray_argv(info)
+        current = unit(X)
+        need(pid == xray_argv(current) and info['InvocationID'] == current['InvocationID']
+             and read(MAIN) == main and generation == remove_generation(MAIN),
+             'BASELINE_CHANGED')
+        no_jobs((X,))
+        need(time.monotonic() < DEADLINE, 'BASELINE_CHANGED')
+    except Refusal as error:
+        if str(error) in (XRAY_CONFIG_WRITABLE, 'XRAY_PROFILE_OWNER_UNSUPPORTED', XRAY_DROPIN_UNSUPPORTED):
+            raise
+        return False
+    except OSError:
+        return False
+    require_machine(machine)
+    return True
+
+
 def prepare_packages(request):
-    need(set(request) == {'action', 'machineId', 'backupId', 'packagePreparation'} and all(
+    keys = {'action', 'machineId', 'backupId', 'packagePreparation', 'appliedMain'}
+    need(keys <= set(request) <= keys | {'progress'} and request.get('progress', True) is True and all(
         type(request[key]) is str and re.fullmatch(pattern, request[key])
         for key, pattern in (('machineId', r'[a-f0-9]{32}'), ('backupId', r'[a-f0-9]{32}'),
-                             ('packagePreparation', r'[a-f0-9]{64}'))), 'CANDIDATE_INVALID')
+                             ('packagePreparation', r'[a-f0-9]{64}'), ('appliedMain', r'[a-f0-9]{64}'))), 'CANDIDATE_INVALID')
     guard = globals().get('C3_PACKAGE_GUARD')
     if guard is None:
         raise Refusal(PACKAGE_AUTOSTART_UNSAFE)
@@ -5961,7 +6044,13 @@ def prepare_packages(request):
             else:
                 raise Refusal('BASELINE_CHANGED')
 
+            def check_profile():
+                need(applied_main_matches(machine, request['appliedMain']), 'BASELINE_CHANGED')
+
+            check_profile()
             run = PackageRunner()
+            run.check_profile = check_profile
+            run.emit_progress = request.get('progress') is True
             plan, scope, commit = package_observation(guard, machine, fd, run)
             need(commit == request['packagePreparation'], 'BASELINE_CHANGED')
             check_package_observer_policy()
@@ -5984,6 +6073,7 @@ def prepare_packages(request):
             def enter():
                 need(not run.entered, 'IN_FLIGHT')
                 recheck()
+                check_profile()
                 run.entered = True
 
             try:
@@ -6257,6 +6347,13 @@ def dispatch(request: dict[str, Any]):
     action = request['action']
     if action == 'reconcile-install':
         return reconcile_install(request)
+    if action == 'prove-applied-main':
+        need(set(request) == {'action', 'machineId', 'appliedMain'}
+             and all(type(request[k]) is str and re.fullmatch(p, request[k]) for k, p in
+                     (('machineId', r'[a-f0-9]{32}'), ('appliedMain', r'[a-f0-9]{64}'))), 'CANDIDATE_INVALID')
+        with directory(SYSTEM) as fd:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return {'applied': applied_main_matches(request['machineId'], request['appliedMain'])}
     if action == 'prepare-packages':
         NO_INSTALL_WRITES = False
         return prepare_packages(request)
@@ -6370,6 +6467,7 @@ def dispatch(request: dict[str, Any]):
             return {'ok': True, 'backupId': token, 'removed': True}
         transit = request.get('transit')
         need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
+        need('progress' not in request or (action == 'install' and request['progress'] is True), 'CANDIDATE_INVALID')
         if action == 'prepare':
             before = observe_install(machine, d, transit, fd, diagnose_profile_owner=True)
             if 'nativePreparation' in before:
@@ -6418,7 +6516,7 @@ def main():
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
         request = json.loads(wire)
         action = request.get('action') if type(request) is dict else None
-        if action in ('prepare-packages', 'reconcile-install', 'reattest-runtime'):
+        if action in ('prove-applied-main', 'prepare-packages', 'reconcile-install', 'reattest-runtime'):
             need(len(wire) <= 1024, 'CANDIDATE_INVALID')
 
             def unique_fields(pairs):

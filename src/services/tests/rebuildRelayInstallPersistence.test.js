@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { isDeepStrictEqual: equal } = require('node:util');
+const { appliedLink } = require('../rebuildAppliedLink');
 const { Types, mongo } = require('mongoose');
 const { createRebuildService } = require('../rebuildService');
 const { createRebuildRelayInstallRecovery } = require('../rebuildRelayInstallRecovery');
@@ -23,8 +24,13 @@ const projectedCopy = (value, promoteValues = true) => mongo.BSON.deserialize(mo
 const sameBson = (a, b) => mongo.BSON.serialize(a).equals(mongo.BSON.serialize(b));
 const matches = (row, where) => Object.entries(where).every(([key, value]) => {
     if (key === '$expr') {
-        assert.equal(value.$eq[0], '$$ROOT');
-        return sameBson(row, value.$eq[1].$literal);
+        const [image, expected] = value.$eq;
+        if (image !== '$$ROOT') {
+            assert.deepEqual(image, { $arrayToObject: { $filter: { input: { $objectToArray: '$$ROOT' }, as: 'field',
+                cond: { $ne: ['$$field.k', 'installProgress'] } } } });
+            row = Object.fromEntries(Object.entries(row).filter(([name]) => name !== 'installProgress'));
+        }
+        return sameBson(row, expected.$literal);
     }
     if (key === '$or') return value.some(filter => matches(row, filter));
     if (key === '$nor') return !value.some(filter => matches(row, filter));
@@ -46,13 +52,17 @@ function project(row, projection, promoteValues) {
 
 // Real Mongoose schemas, casting and projections. Only the backing collection
 // and direct host commands are simulated; no process, Mongo URI or SSH socket.
-function bind(t, model, data, traces) {
+function bind(t, model, data, traces, progress) {
     const handlers = {};
     const selectRows = session => session ? session.rows.get(data) : data;
     const invoke = async (kind, where, update, options) => {
         assert.ok((where._id?.$eq ?? where._id) instanceof Types.ObjectId);
         assert.deepEqual(options.writeConcern, options.session ? undefined : { w: 'majority' });
-        traces.push(`${model.modelName}:${kind}`);
+        const telemetry = Object.keys(update?.$set ?? {}).join() === 'installProgress';
+        if (telemetry && progress) {
+            progress.push(copy(update.$set.installProgress));
+            if (handlers.progress) return handlers.progress();
+        } else traces.push(`${model.modelName}:${kind}`);
         const rows = selectRows(options.session);
         const index = rows.findIndex(row => matches(row, where));
         const apply = () => {
@@ -111,8 +121,13 @@ function fixture(t, planBackupId = backupId) {
         C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, ENCRYPTION_KEY: 'test-only-credential-key-'.repeat(2), PANEL_DOMAIN: 'fixture.invalid' };
     const nodes = [{ _id: oid(id), ip: '192.0.2.4', domain: 'relay.fixture.invalid', type: 'xray', active: true,
         cascadeRole: 'relay', ssh: { port: 22, username: 'root' } }];
-    const links = [], states = [], users = [], events = [];
-    const stateHooks = bind(t, State, states, events);
+    const bridge = { _id: oid('f'.repeat(24)), ip: '192.0.2.244', active: true, type: 'xray', cascadeRole: 'bridge' };
+    const defaultLink = { _id: oid('1'.repeat(24)), portalNode: nodes[0]._id, bridgeNode: bridge._id,
+        active: true, status: 'deployed', mode: 'forward', tunnelPort: 21443, tunnelUuid: 'fixture-tunnel-id' };
+    pinApplied(defaultLink, 'a'.repeat(64));
+    nodes.push(bridge);
+    const links = [defaultLink], states = [], users = [], events = [], progress = [];
+    const stateHooks = bind(t, State, states, events, progress);
     const userHooks = bind(t, User, users, events);
     bind(t, Node, nodes, events);
     bind(t, Link, links, events);
@@ -160,6 +175,7 @@ function fixture(t, planBackupId = backupId) {
     const plan = { backupId: planBackupId };
     let prepared;
     const hooks = {
+        proveAppliedMain: async () => true,
         preflight: async () => ({ ppp: true, masked: false, unitsLoaded: true, machineId }),
         prepare: async () => plan,
         install: async guard => { await guard(); return true; },
@@ -188,9 +204,10 @@ function fixture(t, planBackupId = backupId) {
             events.push('connect');
             assert.deepEqual(node.ssh, nodes[0].ssh);
             return {
+                async proveAppliedMain(pin, gate) { await gate(); return hooks.proveAppliedMain(pin); },
                 async preflight() { events.push('preflight'); return hooks.preflight(); },
                 async prepare(args) { events.push('prepare'); prepared = args; return hooks.prepare(); },
-                async install(p, guard) { events.push('install'); assert.equal(p, plan); return hooks.install(guard); },
+                async install(p, guard, notify) { events.push('install'); assert.equal(p, plan); return hooks.install(guard, notify); },
                 async verify(p) { events.push('verify'); assert.equal(p, plan); return hooks.verify(); },
                 async rollback(p, guard) { events.push('rollback'); assert.equal(p, plan); return hooks.rollback(guard); },
                 async close() { events.push('close'); return hooks.close(); },
@@ -198,7 +215,7 @@ function fixture(t, planBackupId = backupId) {
         },
     };
     const create = overrides => createRebuildService({ ...deps, ...overrides });
-    const enrollment = () => nodes.map(({ _id, ip: host, ssh: { port, username } }, i) => ({
+    const enrollment = () => nodes.filter(n => n.cascadeRole === 'relay').map(({ _id, ip: host, ssh: { port, username } }, i) => ({
         nodeId: String(_id), host, port, username, sshHostKeySha256: String(i + 1).repeat(64),
         machineId: i === 0 ? machineId : states.find(row => String(row.node) === String(_id))?.rebuildMachineId,
     }));
@@ -207,7 +224,8 @@ function fixture(t, planBackupId = backupId) {
         return create().installRelay;
     };
     return { env, events, create, enroll, enrollment, nodes, links, states, users, hooks, stateHooks, userHooks, directory,
-        deps, locks, lockCollection, lockHooks, plan,
+        deps, locks, lockCollection, lockHooks, plan, progress,
+        removeDefaultLink() { const i = links.indexOf(defaultLink); if (i !== -1) links.splice(i, 1); const j = nodes.indexOf(bridge); if (j !== -1) nodes.splice(j, 1); },
         get prepared() { return prepared; },
         get lockHeld() { return !!locks[0]; },
         loseLock: () => { locks.length = 0; } };
@@ -646,7 +664,7 @@ test('independent legacy bootstraps conflict even when plaintext is the same', a
 test('cohort install refuses source binding, physical and logical disagreements before reservation', async t => {
     for (const [name, expected, alter] of [
         ['persisted machine mismatch', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ rows }) => { rows[1].machineId = 'f'.repeat(32); }],
-        ['source endpoint mismatch', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ f }) => { f.nodes[1].ssh = { port: 2322, username: 'root' }; }],
+        ['source endpoint mismatch', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ f }) => { f.nodes.find(row => String(row._id) === sourceId).ssh = { port: 2322, username: 'root' }; }],
         ['legacy singleton cannot inherit', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ f }) => f.create().installRelay],
         ['bootstrap disabled', 'ACCOUNT_INVENTORY_INVALID', ({ source }) => { source.users[0].enabled = false; }],
         ['enrollment pin changed after prepare', 'ACCOUNT_SOURCE_NOT_ENROLLED', ({ f, rows }) => {
@@ -976,6 +994,10 @@ test('first list Install never ends a still-active session after attempting comm
     });
 });
 
+function pinApplied(link, sha) {
+    Object.assign(link, { rebuildApplied: appliedLink(link), rebuildApplyEpoch: 'e'.repeat(32), rebuildAppliedMainSha256: sha });
+}
+
 function addLink(f, portalNode, bridgeNode, geoRouting) {
     f.links.push({ _id: oid(), portalNode, bridgeNode, mode: 'reverse', active: true, status: 'deployed', ...(geoRouting ? { geoRouting } : {}) });
 }
@@ -1068,6 +1090,7 @@ function emptyIndexHost(t, f, scenario) {
         assert.equal(dirname(keyring), path('/usr/share/keyrings'));
         fs.chmodSync(keyring, 0o666);
     }
+    f.removeDefaultLink();
     const relay = f.nodes[0];
     Object.assign(relay, { port: 21443, xray: { apiPort: 61001, security: 'none' },
         aclRules: ['reject(denied.invalid)'], ssh: { ...relay.ssh, password: 'local-fixture-only' } });
@@ -1079,6 +1102,7 @@ function emptyIndexHost(t, f, scenario) {
         dialerVersions: new Map([[String(exit._id), '26.3.27']]) });
     const main = profiles.find(row => row.nodeId === id && row.profile === 'main').config;
     const mainPath = '/usr/local/etc/xray/config.json';
+    pinApplied(f.links[0], createHash('sha256').update(JSON.stringify(main)).digest('hex'));
     put(mainPath, JSON.stringify(main), 0o640);
     put('/usr/local/etc/xray-bridge/config.json', JSON.stringify(profiles.find(row => row.nodeId === id && row.profile === 'bridge').config), 0o640);
     put('/usr/local/bin/xray', 'synthetic executable; never run\n', 0o755);
@@ -1289,7 +1313,11 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
     delete f.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
     if (twoRelays) f.nodes.push({ ...f.nodes[0], _id: oid('c'.repeat(24)), ip: '192.0.2.20' });
     for (const node of f.nodes) node.ssh = { ...node.ssh, password: 'fixture-only-ssh-auth' };
-    const hosts = f.nodes.map(({ _id, ip, ssh }, index) => {
+    if (twoRelays) {
+        const peerLink = { ...f.links[0], _id: oid(), portalNode: oid('c'.repeat(24)), tunnelPort: 21444 };
+        f.links.push(peerLink);
+    }
+    const hosts = f.nodes.filter(node => node.cascadeRole === 'relay').map(({ _id, ip, ssh }, index) => {
         const key = Buffer.from(`fixture host key ${index}`);
         const binding = { nodeId: String(_id), host: ip, port: ssh.port, username: ssh.username,
             machineId: index ? 'd'.repeat(32) : machineId, sshHostKeySha256: digest(key) };
@@ -1320,11 +1348,12 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
     } };
     const service = f.create({ ...(useGrantDb ? { grantDb } : { relayGrantStore }),
         createRelayDirect: require('../rebuildRelayDirect').createRelayDirect });
-    const peers = new WeakMap(), attestedPeers = new WeakSet(), frames = [], effects = [], opens = [], hooks = {};
+    const peers = new WeakMap(), attestedPeers = new WeakSet(), frames = [], proofFrames = [], effects = [], opens = [], hooks = {};
     const main = JSON.stringify({ inbounds: [{ tag: 'fwd-hop-a', protocol: 'vless', port: 443 }],
         outbounds: [{ tag: 'block', protocol: 'blackhole' }], routing: { rules: [
             { type: 'field', ruleTag: 'rebuild-policy-default', inboundTag: ['fwd-hop-a'], outboundTag: 'block' },
         ] } });
+    for (const link of f.links) pinApplied(link, digest(main));
     t.mock.method(Client.prototype, 'connect', function (options) {
         const host = hosts.find(row => row.binding.host === options.host);
         assert.ok(f.lockHeld && host);
@@ -1363,7 +1392,8 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
             queueMicrotask(() => {
                 const input = JSON.parse(Buffer.concat(chunks));
                 const { action, backupId, machineId: expected, currentUsers, desiredUsers } = input;
-                frames.push([host.binding.nodeId, action]);
+                if (action === 'prove-applied-main') proofFrames.push([host.binding.nodeId, f.states.length, input.appliedMain]);
+                else frames.push([host.binding.nodeId, action]);
                 hooks.atDispatch?.(action, host);
                 let value;
                 const readiness = { machineId: host.machine, ppp: true, masked: false, unitsLoaded: true };
@@ -1379,7 +1409,8 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
                     stream.stderr.emit('end');
                     return stream.emit('close', reply.code);
                 }
-                if (action === 'preflight') value = readiness;
+                if (action === 'prove-applied-main') value = { applied: input.appliedMain === digest(main) };
+                else if (action === 'preflight') value = readiness;
                 else if (action === 'prepare') value = { ...readiness, main, mainSha256: digest(main),
                     bridge: null, bridgeSha256: null, baseline: 'e'.repeat(64) };
                 else if (action === 'session-count') value = { activeSessions: 0, activeIpsec: 0, census: 'e'.repeat(64) };
@@ -1401,7 +1432,7 @@ function admissionEffects(t, { twoRelays = false, useGrantDb = false } = {}) {
         return this;
     });
     t.after(() => require('../sshPoolService').closeAll());
-    return { ...f, get lockHeld() { return f.lockHeld; }, service, session, intents, hosts, grants, grant, frames, effects, opens, hooks };
+    return { ...f, get lockHeld() { return f.lockHeld; }, service, session, intents, hosts, grants, grant, frames, proofFrames, effects, opens, hooks };
 }
 
 const packageDigest = 'a1'.repeat(32);
@@ -1438,10 +1469,13 @@ test('package flow: one panel click commits the reservation before exact stdin; 
             assert.ok(f.lockHeld);
             reserved = f.states[0].backupId;
             assert.match(reserved, /^[a-f0-9]{32}$/);
-            assert.deepEqual(input, { action: 'prepare-packages', machineId, backupId: reserved, packagePreparation: packageDigest });
+            assert.deepEqual(input, { action: 'prepare-packages', machineId, backupId: reserved, packagePreparation: packageDigest,
+                appliedMain: f.links[0].rebuildAppliedMainSha256, progress: true });
+            assert.equal(f.states[0].installProgress.stage, 'preparePackages');
             assert.deepEqual(f.states.map(row => row.status), ['installing']);
             assert.deepEqual(f.users.map(row => [row.syncStatus, Boolean(row.passwordEncrypted)]), [['pending', true]]);
-            return wire({ ok: true, backupId: reserved, packagesReady: true });
+            return { ...wire({ ok: true, backupId: reserved, packagesReady: true }),
+                stderr: 'DIRECT_PROGRESS unpacking\nDIRECT_PROGRESS settingUp\n' };
         }
         if (['check', 'install', 'verify'].includes(input.action)) assert.equal(input.backupId, reserved);
     } });
@@ -1452,9 +1486,12 @@ test('package flow: one panel click commits the reservation before exact stdin; 
     assert.deepEqual(f.opens, []);
     assert.deepEqual(await f.click(), { status: 200, data: { executionMode: 'rebuild', status: 'installed', nodeId: id } });
     assert.deepEqual(f.opens, [id]);
+    assert.deepEqual(f.proofFrames, Array.from({ length: 2 }, () => [id, 0, f.links[0].rebuildAppliedMainSha256]));
     assert.deepEqual(f.byAction(), ['preflight', 'prepare-packages', 'preflight', 'prepare', 'check', 'install', 'verify']);
     assert.deepEqual(f.session.events, ['commit', 'commit']);
     assert.deepEqual(f.states.map(row => [row.status, row.backupId]), [['installed', reserved]]);
+    assert.deepEqual(f.progress.map(p => p.percent), [20, 30, 45, 50, 65, 92]);
+    assert.equal(f.states[0].installProgress.percent, 100);
     assert.deepEqual(f.users.map(row => row.syncStatus), ['synced']);
     assert.equal(f.lockHeld, false);
 });
@@ -1497,7 +1534,7 @@ test('package flow: lost majority reservation ACK never opens a package receiver
 });
 
 test('package flow: late identity or reservation drift vetoes stdin on the open pinned channel', async t => {
-    for (const kind of ['machine', 'grant', 'reservation']) await t.test(kind, async child => {
+    for (const kind of ['machine', 'grant', 'reservation', 'topology']) await t.test(kind, async child => {
         const f = packageFlow(child);
         f.hooks.beforeAttestation = host => {
             if (kind === 'machine' && f.states[0]?.status === 'installing') host.machine = '1'.repeat(32);
@@ -1506,9 +1543,10 @@ test('package flow: late identity or reservation drift vetoes stdin on the open 
             if (f.states[0]?.status !== 'installing') return;
             if (kind === 'grant') { f.grants.pop(); f.grant(); }
             if (kind === 'reservation') f.users[0].syncStatus = 'drifted';
+            if (kind === 'topology') f.links[0].rebuildApplyEpoch = 'f'.repeat(32);
         };
         const { data } = await f.click();
-        assert.deepEqual(data.error, { code: kind === 'reservation' ? 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_IDENTITY_CHANGED',
+        assert.deepEqual(data.error, { code: ['reservation', 'topology'].includes(kind) ? 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN' : 'REBUILD_L2TP_IDENTITY_CHANGED',
             outcome: 'unknown', retryAllowed: false });
         assert.deepEqual(f.byAction(), ['preflight']);
         assert.deepEqual(f.session.events, ['commit']);
@@ -1635,7 +1673,7 @@ test('admission effects: late Install attestation mismatch blocks the secret rec
     const f = admissionEffects(t);
     f.grant();
     f.hooks.beforeAttestation = host => {
-        if (f.frames.at(-1)?.[1] === 'check') host.machine = '8'.repeat(32);
+        if (f.states[0]?.status === 'installing' && f.frames.at(-1)?.[1] === 'check') host.machine = '8'.repeat(32);
     };
     await assert.rejects(f.service.installRelay(id), { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'unknown', retryAllowed: false });
     assert.deepEqual(f.frames.map(([, action]) => action), ['preflight', 'preflight', 'prepare', 'check']);
@@ -1647,7 +1685,7 @@ test('admission effects: a same-binding grant replacement during the Install std
     const f = admissionEffects(t);
     f.grant();
     f.hooks.beforeChannel = () => {
-        if (f.frames.at(-1)?.[1] === 'check') {
+        if (f.states[0]?.status === 'installing' && f.frames.at(-1)?.[1] === 'check') {
             f.grants.pop();
             f.grant();
         }
@@ -1741,11 +1779,15 @@ test('operator list installs two relays under Apply exclusion and records their 
     const rows = [f.nodes[0], second].map(({ _id, ip, ssh }, i) => ({ nodeId: String(_id), host: ip,
         ...ssh, machineId: (i ? 'd' : 'e').repeat(32), sshHostKeySha256: (i ? '1' : '2').repeat(64) }));
     f.nodes.push(second);
+    const edge = { ...f.links[0], _id: oid(), portalNode: second._id };
+    pinApplied(edge, 'b'.repeat(64));
+    f.links.push(edge);
     f.env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify(rows);
     const preflight = [];
     const service = f.create({ createRelayDirect: ({ node }) => {
         const selected = rows.find(row => row.nodeId === String(node._id));
         return {
+            async proveAppliedMain(_pin, guard) { await guard(); return true; },
             async preflight() {
                 assert.equal(f.lockHeld, true);
                 preflight.push(selected.nodeId);
@@ -1808,11 +1850,16 @@ test('list Install refuses a bad card, host machine, or changed binding before r
 
 test('createRebuildService installs follow-relay, reserves encrypted usable credentials before dispatch, and persists an owner receipt', async t => {
     const f = fixture(t);
+    f.removeDefaultLink();
     const downstream = { _id: oid(), type: 'xray', active: true, cascadeRole: 'relay', ip: '192.0.2.5' };
     const exit = { _id: oid(), type: 'xray', active: true, cascadeRole: 'bridge', ip: '192.0.2.6' };
     f.nodes.push(downstream, exit);
     addLink(f, oid(id), downstream._id);
     addLink(f, downstream._id, exit._id, { enabled: true, domains: ['full:target.invalid'] });
+    const outgoing = { _id: oid(), portalNode: oid(id), bridgeNode: exit._id, mode: 'forward', active: true, status: 'deployed',
+        priority: 200, tunnelPort: 21443, tunnelUuid: 'fixture-tunnel-id' };
+    pinApplied(outgoing, 'a'.repeat(64));
+    f.links.push(outgoing);
     f.hooks.install = async guard => {
         await guard();
         assert.equal(f.states[0].status, 'installing');
@@ -1824,7 +1871,7 @@ test('createRebuildService installs follow-relay, reserves encrypted usable cred
     assert.deepEqual(result, { executionMode: 'rebuild', status: 'installed', nodeId: id });
     const { desired } = f.prepared;
     const [row] = f.states, [user] = f.users;
-    assert.deepEqual(f.prepared.controlPlaneAddresses, ['fixture.invalid', '192.0.2.4', 'relay.fixture.invalid', '192.0.2.5', '192.0.2.6']);
+    assert.deepEqual(f.prepared.controlPlaneAddresses, ['192.0.2.4', '192.0.2.5', '192.0.2.6', 'fixture.invalid', 'relay.fixture.invalid']);
     assert.equal(f.prepared.carryDomain, true);
     assert.equal(f.prepared.nodeId, id);
     assert.equal(desired.credentialRevision, 1);
@@ -1882,12 +1929,13 @@ test('later Apply retains ownership and adds the new policy to the live follow-r
     });
     f.hooks.verify = async () => {
         const installed = { ...f.states[0], status: 'installed' };
-        for (const { profile, config } of composeRebuildProfiles({ nodes: f.nodes, links: [], followRelayStates: [installed],
+        for (const { profile, config } of composeRebuildProfiles({ nodes: [f.nodes[0]], links: [], followRelayStates: [installed],
             controlPlaneAddresses: f.prepared.controlPlaneAddresses })) files[profile] = config;
         return true;
     };
     await service.installRelay(id);
     const old = copy(f.states[0]);
+    f.removeDefaultLink(); // This pre-existing test is about Apply after graph detachment.
     const pppTag = 'rebuild-relay-ingress';
     const oldPort = files.main.inbounds.find(x => x.tag === pppTag).port;
     f.nodes[0].aclRules = ['reject(example.invalid)'];
@@ -2057,4 +2105,60 @@ test('non-relay, orphan credentials, and unapplied topology are refused before a
     await assert.rejects(service.installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED',
         outcome: 'refused', check: 'REBUILD_LINKS_NOT_APPLIED' });
     assert.deepEqual(f.events, []);
+});
+
+
+test('fresh Install refuses missing or unproved links and live MAIN before reservation', async t => {
+    for (const cut of ['absent', 'draft', 'no receipt', 'no MAIN pin', 'changed link', 'wrong MAIN', 'drift before reserve']) {
+        await t.test(cut, async child => {
+            const f = fixture(child);
+            const link = f.links[0];
+            let probes = 0;
+            f.hooks.proveAppliedMain = async () => { assert.ok(f.lockHeld); probes++; return cut !== 'wrong MAIN'; };
+            if (cut === 'absent') f.links.length = 0;
+            if (cut === 'draft') link.status = 'pending';
+            if (cut === 'no receipt') delete link.rebuildApplied;
+            if (cut === 'no MAIN pin') delete link.rebuildAppliedMainSha256;
+            if (cut === 'changed link') link.tunnelPort++;
+            if (cut === 'drift before reserve') f.hooks.prepare = async () => { link.rebuildApplyEpoch = 'f'.repeat(32); return f.plan; };
+            await assert.rejects(f.create().installRelay(id), { code: 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED',
+                outcome: 'refused', check: 'REBUILD_LINKS_NOT_APPLIED' });
+            assert.equal(probes, ['wrong MAIN', 'drift before reserve'].includes(cut) ? 1 : 0);
+            assert.deepEqual([f.states, f.users, f.progress, f.locks], [[], [], [], []]);
+            assert.ok(!f.events.includes('install'));
+        });
+    }
+});
+
+test('Install progress is fenced, secret-free, and cannot settle or break row CAS', async t => {
+    for (const result of ['success', 'restore', 'unknown', 'telemetry failure']) await t.test(result, async child => {
+        const f = fixture(child);
+        const before = priorRow(); f.states.push(copy(before));
+        if (result === 'telemetry failure') f.stateHooks.progress = () => { throw Error('telemetry unavailable'); };
+        f.hooks.install = async (guard, mark) => {
+            await guard();
+            assert.equal(f.states[0].installProgress.stage, result === 'telemetry failure' ? 'reserve' : 'install');
+            mark('restart'); mark('arbitrary host output'); mark('restart');
+            if (result === 'unknown') throw Error('lost acknowledgement');
+            return result !== 'restore';
+        };
+        const work = f.create().installRelay(id);
+        if (result === 'restore') {
+            await assert.rejects(work, { outcome: 'rolled_back' });
+            assert.deepEqual(f.states, [before]);
+        } else if (result === 'unknown') {
+            await assert.rejects(work, { outcome: 'unknown' });
+            assert.equal(f.states[0].status, 'installing');
+            assert.equal(f.states[0].installProgress.stage, 'unknown');
+        } else {
+            assert.equal((await work).status, 'installed');
+            assert.equal(f.states[0].installProgress.percent, 100);
+        }
+        assert.deepEqual(f.progress.map(p => p.stage), result === 'unknown' ? ['prepare', 'install', 'restart', 'unknown']
+            : result === 'restore' ? ['prepare', 'install', 'restart'] : ['prepare', 'install', 'restart', 'verify']);
+        for (const p of f.progress) {
+            assert.deepEqual(Object.keys(p), ['stage', 'percent', 'at']);
+            assert.ok(p.at instanceof Date);
+        }
+    });
 });

@@ -57,6 +57,10 @@ function specificHostRefusal(action, suffix, noWrite) {
         return { check: suffix, prerequisitePartial: false };
     }
     const match = hostChecks.get(suffix);
+    if (action === 'prove-applied-main' && !noWrite
+        && ['XRAY_DROPIN_UNSUPPORTED', 'XRAY_CONFIG_WRITABLE', 'XRAY_PROFILE_OWNER_UNSUPPORTED'].includes(suffix)) {
+        return { check: match.check, prerequisitePartial: false };
+    }
     if (!isInstallStage(action) || !match) return undefined;
     if (match.scope === 'prepare-only' && action !== 'prepare') return undefined;
     if (match.scope && match.scope !== 'fresh-pre-write' && action === 'preflight') return undefined;

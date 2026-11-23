@@ -31,7 +31,32 @@ async function runFreshRelayInstall(id, deps) {
                 if (deps.verifyBinding && await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                 await checkAuthorization();
             };
-            let remote, unsettled = false;
+            let remote, reservation, unsettled = false, progressTail = Promise.resolve(), percent = 10, lastStage = 'reserve';
+            const verifyTopology = async () => {
+                if (deps.verifyTopology) await deps.verifyTopology(inventory);
+            };
+            const topologyGuard = async () => {
+                await checkAuthority();
+                await verifyTopology();
+                await checkAuthority();
+            };
+            const proveMain = async () => {
+                if (!deps.proveMain) return;
+                await topologyGuard();
+                await deps.proveMain(inventory, remote, topologyGuard);
+                await topologyGuard();
+            };
+            const progress = (stage, next = percent) => {
+                if (!reservation || !deps.progress || next < percent || (stage === lastStage && next === percent)) return progressTail;
+                percent = next;
+                lastStage = stage;
+                progressTail = progressTail.then(async () => {
+                    // Advisory telemetry cannot supersede a phase or change its outcome.
+                    if (await verifyLock() === false) return;
+                    await deps.progress(reservation, stage, next);
+                }).catch(() => {});
+                return progressTail;
+            };
             try {
                 await checkAuthority();
                 inventory = await deps.inventory(id);
@@ -41,6 +66,7 @@ async function runFreshRelayInstall(id, deps) {
                 await checkAuthorization();
                 remote = await deps.connect(inventory);
                 await checkAuthorization();
+                await proveMain();
                 const host = await remote.preflight();
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
                     throw fail(deps.unifiedIdentity ? IDENTITY_CHANGED : 'REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
@@ -58,12 +84,11 @@ async function runFreshRelayInstall(id, deps) {
                 if (typeof backupId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(backupId)) {
                     throw fail('REBUILD_L2TP_INSTALL_PLAN_INVALID');
                 }
-                await checkAuthority();
-                let reservation;
-                try { reservation = await deps.reserve(inventory, backupId, checkAuthority, preparePackages ? host.packagePreparation : undefined); }
+                await proveMain();
+                try { reservation = await deps.reserve(inventory, backupId, deps.verifyTopology ? topologyGuard : checkAuthority, preparePackages ? host.packagePreparation : undefined); }
                 catch (error) {
                     unsettled = error instanceof ReservationOutcomeUnknownError || error instanceof AcknowledgedCommitCleanupError;
-                    if (isIdentityChanged(error)) throw error;
+                    if (isIdentityChanged(error) || error?.code === 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED') throw error;
                     // No host dispatch without both a checked commit and a
                     // clean handoff, even when the reservation is durable.
                     throw fail(error instanceof AcknowledgedCommitCleanupError
@@ -78,14 +103,21 @@ async function runFreshRelayInstall(id, deps) {
 
                 if (preparePackages) {
                     await guard();
-                    if (await remote.preparePackages(backupId, guard) !== true) throw fail(UNKNOWN);
+                    await progress('preparePackages', 20);
+                    const packageGuard = async () => { await guard(); await topologyGuard(); };
+                    if (await remote.preparePackages(backupId, packageGuard, mark => {
+                        if (mark === 'unpacking') void progress('preparePackages', 30);
+                        if (mark === 'settingUp') void progress('preparePackages', 45);
+                    }) !== true) throw fail(UNKNOWN);
                     await guard();
                     // DIRECT repeats ordinary preflight in prepare, on this
                     // same pinned client. Do not reserve or generate an ID again.
+                    await progress('prepare', 50);
                     plan = await deps.prepare(inventory, remote);
                     if (plan?.backupId !== backupId) throw fail('REBUILD_L2TP_INSTALL_PLAN_INVALID');
                 }
 
+                if (!preparePackages) await progress('prepare', 50);
                 const rollback = async (code, { noHostChanges = false, check } = {}) => {
                     // Not even a no-write Install refusal establishes that the
                     // earlier package phase was undone. Retain the reservation.
@@ -107,7 +139,10 @@ async function runFreshRelayInstall(id, deps) {
                 let installResult;
                 try {
                     await guard();
-                    installResult = await remote.install(plan, guard);
+                    await progress('install', 65);
+                    installResult = await remote.install(plan, guard, mark => {
+                        if (mark === 'restart') void progress('restart', 80);
+                    });
                 } catch (error) {
                     if (isIdentityChanged(error)) throw identityAfterReservation();
                     const check = checkedInstallId(error);
@@ -125,6 +160,7 @@ async function runFreshRelayInstall(id, deps) {
                 }
                 if (installResult === false) await rollback('REBUILD_L2TP_INSTALL_FAILED');
                 let verified;
+                await progress('verify', 92);
                 try { verified = await remote.verify(plan); }
                 catch (error) {
                     if (isIdentityChanged(error)) throw identityAfterReservation();
@@ -148,6 +184,8 @@ async function runFreshRelayInstall(id, deps) {
                 return { executionMode: 'rebuild', status: 'installed', nodeId: id };
             } catch (error) {
                 primary = classifyInstallFailure(error);
+                if (unsettled) await progress('unknown');
+                else await progressTail;
                 if (deps.unifiedIdentity && unsettled) {
                     retainLock?.();
                     primary = installFailure(primary.code, 'unknown', checkedInstallId(primary), { retryAllowed: false });

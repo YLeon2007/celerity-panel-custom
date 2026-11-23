@@ -6,6 +6,8 @@ const {READ_CHAIN,VERIFY_CHAIN}=require('./rebuildTunnelTls');
 const {identityChanged,isIdentityChanged,isGrantAuthorityError}=require('./rebuildRelayEffectAuthority');
 const {CONNECT_TIMEOUT_MS}=require('./rebuildSshLimits');
 const fail=code=>Object.assign(new Error(code),{code});
+const profileBytes=config=>JSON.stringify(config);
+const profileSha256=bytes=>createHash('sha256').update(bytes).digest('hex');
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
 const readMachineId='/usr/bin/head -c 34 /etc/machine-id';
 const applyActions={check:'check-apply-network',prepare:'prepare-apply-network',
@@ -81,9 +83,14 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         }
         if(result?.code!==0)throw fail('REBUILD_NODE_COMMAND_FAILED');return result.stdout;
     }
-    async function read(profile){
+    async function read(profile,expectedMainSha256){
         if(!Object.hasOwn(paths,profile))throw fail('REBUILD_INVALID_PROFILE');
-        return readClassicProfile({exec:command=>run(command,authority?{timeout:60000}:undefined)},paths[profile],{allowAbsent:profile==='bridge'});
+        return readClassicProfile({exec:async command=>{
+            const result=await run(command,authority?{timeout:60000}:undefined);
+            if(profile==='main'&&expectedMainSha256!==undefined&&result?.code===0&&
+                (typeof result.stdout!=='string'||profileSha256(result.stdout)!==expectedMainSha256))throw fail('REBUILD_READBACK_MISMATCH');
+            return result;
+        }},paths[profile],{allowAbsent:profile==='bridge'});
     }
     async function requireSupportedCoreIdentity(){
         // Probe the exact binary used by the checked units, not a cached DB
@@ -114,9 +121,9 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             }
             const active=profile==='main'||config.inbounds.length>0||config.outbounds.some(o=>o.protocol==='vless' && o.settings?.reverse?.tag);
             attemptedStage=true;
-            const bytes=JSON.stringify(config);
+            const bytes=profileBytes(config);
             await check(`set -eu; umask 077; test ! -L ${dir}; test ! -L ${path}; if ! test -d ${dir}; then install -d -m 0755 ${dir}; fi; (set -C; cat > ${file}); /usr/local/bin/xray run -test -config ${file} >/dev/null 2>&1`,bytes,true);
-            staged.set(profile,{active,state,sha256:createHash('sha256').update(bytes).digest('hex')});
+            staged.set(profile,{active,state,sha256:profileSha256(bytes)});
         }
     }
     let networkProof;
@@ -246,4 +253,4 @@ function createBoundRelayTransport(node,fence,verifyLock,installation,verifyBind
     return createTransport(target,undefined,{machineId,installation,merged:fence.merged,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
         expectedEndpoint:{ip,port,username}},async verify(){if(await verifyLock()===false)throw fail('REBUILD_LOCK_LOST');await verifyBinding();}});
 }
-module.exports={createTransport,createBoundRelayTransport};
+module.exports={createTransport,createBoundRelayTransport,profileBytes,profileSha256};

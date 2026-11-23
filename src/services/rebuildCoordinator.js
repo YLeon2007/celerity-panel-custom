@@ -210,9 +210,9 @@ async function runGraph(d, req, retire = false) {
             // was missed. Never skip an unchanged profile pair on a retry.
             for(const [nodeId,pair] of pairs) { await verify(); await d.putPair(nodeId,pair); }
             for(const [nodeId,pair] of pairs) for(const p of pair) {
-                if(!equal(await d.read(nodeId,p.profile),p.config))throw fail('REBUILD_READBACK_MISMATCH');
+                if(!equal(await d.read(nodeId,p.profile,false,p.config),p.config))throw fail('REBUILD_READBACK_MISMATCH');
             }
-            await verify(); await d.finish({nodes,desired,removed,retirement});return result;
+            await verify(); await d.finish({nodes,desired,removed,retirement,candidates});return result;
         });
     });
 }

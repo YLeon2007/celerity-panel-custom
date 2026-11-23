@@ -131,6 +131,32 @@ test('render, refresh, view queries and non-POST methods never construct or invo
     assert.equal(f.constructs + f.loads + f.calls.length, 0);
 });
 
+test('mounted progress is an authenticated no-store read and never loads an install writer', async t => {
+    const f = mount(t);
+    const State = require('../../../modules/relay-l2tp/models/relayL2tpStateModel');
+    const at = new Date('2026-01-01T00:00:00.000Z');
+    let reads = 0;
+    t.mock.method(State.collection, 'findOne', async (filter, opts) => {
+        reads++;
+        assert.equal(String(filter.node), id);
+        assert.deepEqual(filter.status, { $in: ['installing', 'installed'] });
+        assert.equal(filter.desiredState, 'installed');
+        assert.deepEqual(opts.projection, { status: 1, installProgress: 1, _id: 0 });
+        assert.equal(opts.readConcern.level, 'majority');
+        return { status: 'installing', backupId: privateFixture, installProgress: { stage: 'reserve', percent: 10, at } };
+    });
+    const progressUrl = url.replace('/recover', '/progress');
+    checked(await f.send(progressUrl, { method: 'GET', ip: '192.0.2.11' }), 403);
+    checked(await f.send(progressUrl, { method: 'GET', session: undefined }), 302);
+    checked(await f.send(progressUrl, { method: 'GET', sessionID: undefined }), 403);
+    checked(await f.send(`${progressUrl}?token=fixture`, { method: 'GET' }), 400);
+    assert.equal(reads, 0);
+    assert.deepEqual(JSON.parse(checked(await f.send(progressUrl, { method: 'GET' }), 200).body),
+        { nodeId: id, installProgress: { stage: 'reserve', percent: 10, at: at.toISOString() } });
+    assert.equal(reads, 1);
+    assert.equal(f.constructs + f.loads, 0);
+});
+
 test('recovery requires the panel admin session, header CSRF and an empty JSON object without query inputs', async t => {
     const f = mount(t);
     checked(await f.send(url, { session: undefined }), 302);
@@ -327,6 +353,15 @@ test('mounted default Install and Recovery preserve the reservation on zero disp
         await Settings.collection.insertOne({ _id: 'settings', deployment: { completed: true } });
         await Node.collection.insertOne({ _id, active: true, type: 'xray', cascadeRole: 'relay', ip: binding.host,
             ssh: { port: 22, username: 'root' } });
+        const Link = require('../../../models/cascadeLinkModel');
+        const { appliedLink } = require('../../../services/rebuildAppliedLink');
+        const bridgeNode = new mongoose.Types.ObjectId('f'.repeat(24));
+        await Node.collection.insertOne({ _id: bridgeNode, active: true, type: 'xray', cascadeRole: 'bridge', ip: '192.0.2.20' });
+        const appliedMain = 'a'.repeat(64);
+        const link = { portalNode: _id, bridgeNode, active: true, mode: 'forward', status: 'deployed',
+            tunnelProtocol: 'vless', tunnelPort: 21443, tunnelUuid: 'fixture-tunnel-id' };
+        await Link.collection.insertOne({ ...link, rebuildApplied: appliedLink(link), rebuildApplyEpoch: 'e'.repeat(32),
+            rebuildAppliedMainSha256: appliedMain });
         await createRelayGrantStore({ db, env: process.env }).mutate({ action: 'grant', binding, actor });
         let mode = 'install', opens = 0, writes = 0, originalBackup;
         const seen = [];
@@ -364,6 +399,7 @@ test('mounted default Install and Recovery preserve the reservation on zero disp
                     seen.push(wire.action);
                     queueMicrotask(() => {
                         done();
+                        if (wire.action === 'prove-applied-main') return reply(`${JSON.stringify({ applied: wire.appliedMain === appliedMain })}\n`);
                         if (wire.action === 'preflight') return reply(`${JSON.stringify({ machineId, packagePreparation })}\n`);
                         if (wire.action === 'prepare-packages') {
                             originalBackup = wire.backupId;
@@ -406,7 +442,7 @@ test('mounted default Install and Recovery preserve the reservation on zero disp
             return before;
         };
         const before = await begin();
-        assert.deepEqual(seen, ['preflight', 'prepare-packages']);
+        assert.deepEqual(seen, ['prove-applied-main', 'preflight', 'prove-applied-main', 'prepare-packages']);
         const wrongActor = { ...session, adminUsername: 'other-admin' };
         assert.deepEqual(JSON.parse(checked(await send(url, { session: wrongActor }), 503).body), unconfirmed);
         assert.equal(opens, 1);

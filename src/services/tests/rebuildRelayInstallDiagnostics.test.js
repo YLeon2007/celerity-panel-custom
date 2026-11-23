@@ -3,7 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
-const { createHash } = require('node:crypto');
+const { createHash, webcrypto } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { runInNewContext } = require('node:vm');
@@ -20,6 +20,9 @@ const { i18nMiddleware, t: translate } = require('../../middleware/i18n');
 const nodeId = 'a'.repeat(24), machineId = 'b'.repeat(32), marker = 'FIXTURE_PRIVATE_VALUE';
 const base = '/panel/rebuild/relays';
 const installUrl = `${base}/${nodeId}/l2tp/install`;
+const progressUrl = `${installUrl}/progress`, overviewUrl = '/panel/l2tp';
+const observation = 'x-rebuild-l2tp-observation';
+const progressAt = new Date('2026-01-01T00:00:00Z');
 const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true', C3_REBUILD_L2TP_RELAY_ID: nodeId,
     C3_REBUILD_L2TP_RELAY_MACHINE_ID: machineId, C3_REBUILD_L2TP_SSH_SHA256: 'c'.repeat(64) };
 const node = { _id: nodeId, ip: '192.0.2.19', ssh: { username: 'root', port: 22 } };
@@ -77,53 +80,169 @@ assert package_calls == ['/usr/bin/dpkg-query']
 sys.exit(status)
 `;
 
-function localizedFrontend(html, response, headers, app) {
+async function localizedFrontend(html, expected, { app, headers, csrf }) {
     const attr = (source, key) => {
         const match = new RegExp(`\\b${key}="([^"]*)"`).exec(source);
         assert.ok(match, `SSR attribute missing: ${key}`);
         const entities = { '#34': '"', '#39': "'", lt: '<', gt: '>', amp: '&' };
         return match[1].replace(/&(#34|#39|lt|gt|amp);/g, (_, name) => entities[name]);
     };
-    const open = html.match(/<div id="rebuild-l2tp"[^>]*>/)[0];
-    const button = html.match(/<button[^>]*\bdata-install-url=[^>]*>/)[0];
+    const pageTag = markup => markup.match(/<div id="rebuild-l2tp"[^>]*>/)[0];
+    const open = pageTag(html);
     const dataset = { csrf: attr(open, 'data-csrf'), messages: attr(open, 'data-messages'),
         installChecks: attr(open, 'data-install-checks') };
+    assert.equal(dataset.csrf, csrf);
     const status = { textContent: '' }, refresh = { hidden: true, addEventListener() {} };
-    let click, finished;
-    const task = new Promise(resolve => { finished = resolve; });
-    let calls = 0;
-    const install = { disabled: false, dataset: { installUrl: attr(button, 'data-install-url'), nodeId: attr(button, 'data-node-id') },
-        addEventListener(event, callback) { assert.equal(event, 'click'); click = callback; } };
+    const label = { textContent: '' }, bar = { value: 0 };
+    let view;
+    function renderView(markup) {
+        assert.match(markup, /<div data-l2tp-view>/);
+        const button = markup.match(/<button[^>]*\bdata-install-url=[^>]*>/)[0];
+        const progressTag = markup.match(/<div data-install-progress[^>]*>/)[0];
+        const install = { disabled: /\sdisabled(?:\s|>)/.test(button),
+            dataset: { installUrl: attr(button, 'data-install-url'), nodeId: attr(button, 'data-node-id') },
+            addEventListener(event, callback) { assert.equal(event, 'click'); this.click = callback; } };
+        const progress = { hidden: /\shidden(?:\s|>)/.test(progressTag),
+            dataset: { progressUrl: attr(progressTag, 'data-progress-url'), progressWords: attr(progressTag, 'data-progress-words') },
+            get isConnected() { return view.progress === this; },
+            querySelector: key => ({ '[data-progress-text]': label, progress: bar })[key] ?? null };
+        return { install, progress, progressNode: attr(progressTag, 'data-progress-node'),
+            replaceWith(next) { assert.equal(view, this); view = next; } };
+    }
+    view = renderView(html);
+    const initialView = view;
     const page = { dataset,
-        querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh })[key] ?? null,
-        querySelectorAll: key => key === '[data-install-url]' ? [install] : [] };
-    assert.match(html, /<script src="\/js\/rebuild-l2tp\.js\?v=[a-f0-9]+" defer><\/script>/);
-    const script = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
-    runInNewContext(script, { document: { getElementById: () => page },
-        window: { addEventListener() {}, location: { reload: () => assert.fail('no automatic reload') } },
+        contains: element => element === view.install,
+        querySelector: key => ({ '[data-action-status]': status, '[data-refresh]': refresh, '[data-l2tp-view]': view,
+            [`[data-install-progress][data-progress-node="${view.progressNode}"]`]: view.progress })[key] ?? null,
+        querySelectorAll: key => key === '[data-install-url]' ? [view.install] : [] };
+    const document = { getElementById: id => id === 'rebuild-l2tp' ? page : null,
+        createElement(tag) {
+            assert.equal(tag, 'template');
+            return { set innerHTML(markup) {
+                const parsed = renderView(markup);
+                this.content = { querySelector: key => key === '#rebuild-l2tp' ? {
+                    dataset: { csrf: attr(pageTag(markup), 'data-csrf') },
+                    querySelector: selector => selector === '[data-l2tp-view]' ? parsed : null,
+                } : null };
+            } };
+        } };
+    const calls = [], timers = new Map();
+    let now = 0, interval, releasePost, overviewReads = 0;
+    const heldPost = new Promise(resolve => { releasePost = resolve; });
+    const flush = () => new Promise(resolve => setImmediate(resolve));
+    async function advance(to) {
+        now = to;
+        for (const [key, { at, callback }] of timers) {
+            if (at <= now) { timers.delete(key); callback(); }
+        }
+        await flush();
+    }
+    const unknown = expected.error.outcome === 'unknown';
+    const location = { origin: 'http://panel.fixture.invalid', reload: () => assert.fail('no automatic reload') };
+    const window = Object.assign(new EventTarget(), { location, crypto: webcrypto });
+    const context = { document, window, location, URL, CustomEvent, AbortController, Headers,
+        performance: { now: () => now }, Date: class extends Date { static now() { return now; } },
+        setTimeout(callback, delay) { const key = {}; timers.set(key, { at: now + delay, callback }); return key; },
+        clearTimeout: key => timers.delete(key),
+        setInterval(callback, delay) { interval = { callback, delay }; return interval; },
+        clearInterval(key) { if (key === interval) interval = undefined; },
         async fetch(path, options) {
-            calls++;
-            assert.equal(options.method, 'POST');
-            assert.equal(path, installUrl);
-            assert.equal(options.headers['x-csrf-token'], dataset.csrf);
-            let result;
-            try { result = await request(app, path, { headers: { ...headers, 'x-csrf-token': dataset.csrf },
-                body: JSON.parse(options.body) }); }
-            finally { finished(result); }
-            return { ok: result.status === 200, status: result.status, json: async () => JSON.parse(result.body) };
+            const { method, body, headers: sent } = options;
+            const call = { path, options };
+            calls.push(call);
+            const post = method === 'POST' && path === installUrl && calls.length === 1;
+            const read = method === 'GET' && (path === progressUrl || path === overviewUrl);
+            if (!post && !read) throw new Error('unexpected diagnostic UI request');
+            // Forward the browser's actual headers, not a fixture-injected CSRF token or nonce.
+            const forwarded = Object.fromEntries(Object.entries(sent ?? {}).map(([key, value]) => [key.toLowerCase(), value]));
+            const result = await (call.reply = request(app, path, { method, headers: {
+                cookie: headers.cookie, 'accept-language': headers['accept-language'], ...forwarded,
+            }, ...(body !== undefined && { body: JSON.parse(body) }) }));
+            if (post) await heldPost;
+            // First ambiguous read models otherwise valid HTML with a different session token.
+            const wrongCsrf = path === overviewUrl && unknown && ++overviewReads === 1;
+            return { status: result.status, ok: result.status >= 200 && result.status < 300,
+                url: new URL(path, location.origin).href, redirected: result.status >= 300 && result.status < 400,
+                headers: new Headers(result.headers), json: async () => JSON.parse(result.body),
+                text: async () => wrongCsrf ? result.body.replace(`data-csrf="${csrf}"`, 'data-csrf="wrong-session"') : result.body };
         },
-    });
-    assert.equal(calls, 0);
-    click();
-    return task.then(async result => {
-        await new Promise(resolve => setImmediate(resolve));
-        // Even if the click handler is reached again, a refresh-required
-        // outcome must not cause a second request from the stale page.
-        if (install.disabled) click();
-        assert.equal(calls, 1);
-        assert.deepEqual(JSON.parse(result.body), response);
-        return [status.textContent, install.disabled, refresh.hidden];
-    });
+    };
+    const scripts = [...html.matchAll(/<script src="\/js\/(rebuild-l2tp(?:-install-progress)?\.js)\?v=[a-f0-9]+" defer><\/script>/g)]
+        .map(match => match[1]);
+    assert.deepEqual(scripts, ['rebuild-l2tp-install-progress.js', 'rebuild-l2tp.js']);
+    for (const script of scripts) runInNewContext(readFileSync(join(root, 'public/js', script), 'utf8'), context, { filename: script });
+    assert.equal(calls.length, 0);
+
+    const { install, progress } = initialView;
+    install.click();
+    assert.equal(install.disabled, true);
+    install.click(); // Deliberately reach the handler despite the disabled button.
+    assert.deepEqual(calls.map(call => [call.options.method, call.path]), [['POST', installUrl]]);
+    const post = calls[0].options;
+    assert.equal(post.headers['x-csrf-token'], csrf);
+    assert.deepEqual(JSON.parse(post.body), {});
+    const token = post.headers[observation];
+    assert.match(token, /^[a-f0-9]{32}$/);
+    assert.equal(progress.hidden, false);
+    assert.equal(label.textContent, translate('rebuildL2tp.installProgress.preflight', headers['accept-language']));
+    assert.equal(interval?.delay, 2000);
+    await interval.callback();
+    const checkRead = (index, path, headers) => {
+        assert.equal(calls.length, index + 1);
+        const call = calls[index];
+        assert.equal(call.path, path);
+        const { method, body, headers: sent, cache, credentials, redirect, signal } = call.options;
+        assert.deepEqual([method, body, cache, credentials, redirect], ['GET', undefined, 'no-store', 'same-origin', 'error']);
+        assert.deepEqual({ ...sent }, headers);
+        assert.ok(signal instanceof AbortSignal);
+        return call;
+    };
+    const progressRead = checkRead(1, progressUrl, {});
+    assert.equal((await progressRead.reply).status, 200);
+    assert.equal(bar.value, 10);
+    assert.equal(label.textContent, translate('rebuildL2tp.installProgress.reserve', headers['accept-language']));
+    const result = await calls[0].reply;
+    assert.equal(result.status, 409);
+    assert.deepEqual(JSON.parse(result.body), expected);
+    releasePost();
+    await flush();
+    assert.equal(interval, undefined);
+    assert.equal(progress.hidden, true);
+    assert.equal(progressRead.options.signal.aborted, true);
+
+    const initialText = status.textContent;
+    let readCount = 0;
+    if (unknown) {
+        assert.equal(refresh.hidden, false);
+        await advance(1999);
+        assert.equal(calls.length, 2);
+        for (const time of [2000, 4000]) {
+            await advance(time);
+            assert.equal(view.install.disabled, true);
+            view.install.click();
+            const read = checkRead(2 + readCount++, overviewUrl, { Accept: 'text/html', [observation]: token });
+            const snapshot = await read.reply;
+            assert.equal(snapshot.status, 200);
+            assert.equal(snapshot.headers[observation], undefined, 'no acknowledgement for an unknown install');
+            await flush();
+            assert.equal(view === initialView, time === 2000, 'replace only a CSRF-matched overview');
+            assert.equal(status.textContent, initialText, 'read-only overview must not settle the unknown install');
+        }
+        await advance(300000); // Expire the observation window without waiting or replaying missed slots.
+        assert.equal(timers.size, 0);
+    } else if (['rolled_back', 'installed'].includes(expected.error.outcome)) {
+        const read = checkRead(2 + readCount++, overviewUrl, { Accept: 'text/html' });
+        assert.equal((await read.reply).status, 200);
+        await flush();
+        assert.notEqual(view, initialView);
+    }
+    if (unknown || readCount) {
+        install.click(); // Detached after an accepted GET.
+        view.install.click(); // Still refresh-required, even on the new view.
+    }
+    assert.equal(calls.length, 2 + readCount);
+    return { initialText, finalText: status.textContent, disabled: view.install.disabled, refreshHidden: refresh.hidden };
 }
 
 async function diagnosticPanel(t, installRelay) {
@@ -136,6 +255,13 @@ async function diagnosticPanel(t, installRelay) {
     const Settings = require('../../models/settingsModel');
     t.mock.method(Settings, 'get', async () => ({ deployment: { completed: true } }));
     t.mock.method(Settings, 'findById', () => ({ select: () => ({ lean: Settings.get }) }));
+    const State = require('../../modules/relay-l2tp/models/relayL2tpStateModel');
+    t.mock.method(State, 'findOne', ({ node: id }) => {
+        assert.equal(id, nodeId);
+        const read = { select: () => read, read: () => read, readConcern: () => read, setOptions: () => read,
+            lean: async () => ({ status: 'installing', installProgress: { stage: 'reserve', percent: 10, at: progressAt } }) };
+        return read;
+    });
     t.after(() => { invalidateOnboardingCache(); require.cache[require.resolve('../sshPoolService')]?.exports.closeAll(); });
     invalidateOnboardingCache();
     const app = express();
@@ -296,7 +422,7 @@ test('closed diagnostics reach the authenticated API and the localized install c
             assert.ok(words.installChecks?.[key], `${lang}: ${key}`);
         }
         const headers = { ...auth, 'accept-language': lang };
-        const { status, body } = await request(app, '/panel/l2tp', { method: 'GET', headers });
+        const { status, body } = await request(app, overviewUrl, { method: 'GET', headers });
         assert.equal(status, 200);
         for (const [name, code, outcome, check, message, actions, retryAllowed] of matrix) {
             scenario = name;
@@ -309,12 +435,14 @@ test('closed diagnostics reach the authenticated API and the localized install c
             assert.doesNotMatch(result.body, /FIXTURE_PRIVATE_VALUE|Traceback/);
             assert.deepEqual(log, actions, name);
             log = [];
-            const [text, disabled, hidden] = await localizedFrontend(body, expected, headers, app);
-            assert.equal(text, translate(`rebuildL2tp.messages.${message}`, lang)
-                + (check ? ` ${translate(`rebuildL2tp.installChecks.${check}`, lang)}` : ''), `${name}: ${lang}`);
+            const { initialText, finalText, disabled, refreshHidden } = await localizedFrontend(body, expected, { headers, app, csrf });
+            const note = check ? ` ${translate(`rebuildL2tp.installChecks.${check}`, lang)}` : '';
+            assert.equal(initialText, translate(`rebuildL2tp.messages.${message}`, lang) + note, `${name}: ${lang}`);
+            assert.equal(finalText, translate(`rebuildL2tp.messages.${outcome === 'unknown' ? 'observationTimeout' : message}`, lang)
+                + note, `${name}: ${lang}`);
             assert.deepEqual(log, actions, name);
             assert.equal(disabled, ['unknown', 'rolled_back', 'installed'].includes(outcome), name);
-            assert.equal(hidden, !disabled, name);
+            assert.equal(refreshHidden, !disabled, name);
         }
     }
 });
@@ -399,9 +527,10 @@ test('package diagnostics reach the authenticated route and localized Install co
             await verify();
             const input = JSON.parse(stdin);
             const { action, backupId } = input;
+            if (action === 'prove-applied-main') return ok({ applied: input.appliedMain === snapshot.mainSha256 });
             if (action === packageWrite) {
                 assert.match(reservation.backupId, /^[a-f0-9]{32}$/);
-                assert.deepEqual(input, { action, machineId, backupId: reservation.backupId, packagePreparation });
+                assert.deepEqual(input, { action, machineId, backupId: reservation.backupId, packagePreparation, appliedMain: snapshot.mainSha256, progress: true });
             }
             log.push(action);
             if (action === failingAction) {
@@ -416,6 +545,7 @@ test('package diagnostics reach the authenticated route and localized Install co
     const { app, auth, csrf } = await diagnosticPanel(t, id => runFreshRelayInstall(id, {
         authorize: () => true, machineId, inventory: async () => ({ eligible: true, pristine: true }),
         unifiedIdentity: true, allowPackagePreparation: true,
+        proveMain: (_, remote, guard) => remote.proveAppliedMain(snapshot.mainSha256, guard),
         lock: fn => fn(() => true, () => log.push('retain')),
         connect: async () => createRelayDirect({ node, fence, SSH: attested(SSH, machineId) }),
         prepare: (_, remote) => remote.prepare({ nodeId, desired, carryDomain: false, controlPlaneAddresses: ['panel.fixture.invalid'] }),
@@ -433,7 +563,7 @@ test('package diagnostics reach the authenticated route and localized Install co
     for (const lang of packageLanguages) {
         const { installChecks, messages } = require(`../../locales/${lang}.json`).rebuildL2tp;
         const headers = { ...auth, 'accept-language': lang };
-        const page = await request(app, '/panel/l2tp', { method: 'GET', headers });
+        const page = await request(app, overviewUrl, { method: 'GET', headers });
         assert.equal(page.status, 200);
         for (const [name, action, reply, check, actions] of matrix) {
             await t.test(`${lang}: ${name}`, async () => {
@@ -453,10 +583,13 @@ test('package diagnostics reach the authenticated route and localized Install co
                 assert.doesNotMatch(result.body, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|DIRECT_(?:UNCERTAIN_)?PACKAGE_/);
                 assert.deepEqual(log, actions);
                 log = [];
-                const [text, disabled, refreshHidden] = await localizedFrontend(page.body, expected, headers, app);
-                assert.equal(text, (refused ? messages.installRefused : messages.uncertain)
-                    + (check ? ` ${installChecks[check]}` : ''));
-                assert.doesNotMatch(text, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|PACKAGE_(SOURCES|INDEXES|SERVICES|APT_PLAN)|REBUILD_L2TP_/);
+                const { initialText, finalText, disabled, refreshHidden } = await localizedFrontend(page.body, expected, { headers, app, csrf });
+                const note = check ? ` ${installChecks[check]}` : '';
+                assert.equal(initialText, (refused ? messages.installRefused : messages.uncertain) + note);
+                assert.equal(finalText, (refused ? messages.installRefused : messages.observationTimeout) + note);
+                for (const text of [initialText, finalText]) {
+                    assert.doesNotMatch(text, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|PACKAGE_(SOURCES|INDEXES|SERVICES|APT_PLAN)|REBUILD_L2TP_/);
+                }
                 assert.deepEqual(log, actions);
                 assert.equal(disabled, !refused);
                 assert.equal(refreshHidden, refused);

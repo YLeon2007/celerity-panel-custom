@@ -35,6 +35,14 @@ async function fixture(t, relayCount = 3) {
     await Node.collection.insertMany(enrollment.map(({ nodeId, host: ip, port, username }) => ({
         _id: new mongoose.Types.ObjectId(nodeId), ip, active: true, type: 'xray', cascadeRole: 'relay', ssh: { port, username },
     })));
+    const bridge = new mongoose.Types.ObjectId('f'.repeat(24));
+    await Node.collection.insertOne({ _id: bridge, ip: '192.0.2.244', active: true, type: 'xray', cascadeRole: 'bridge' });
+    const { appliedLink } = require('../rebuildAppliedLink');
+    await Link.collection.insertMany(enrollment.map(({ nodeId }, i) => {
+        const row = { portalNode: new mongoose.Types.ObjectId(nodeId), bridgeNode: bridge, active: true, status: 'deployed',
+            mode: 'forward', tunnelProtocol: 'vless', tunnelPort: 21443 + i, tunnelUuid: randomUUID() };
+        return { ...row, rebuildApplied: appliedLink(row), rebuildApplyEpoch: 'e'.repeat(32), rebuildAppliedMainSha256: 'a'.repeat(64) };
+    }));
     const env = { C3_REBUILD_ENABLED: 'true', C3_REBUILD_L2TP_INSTALL_ENABLED: 'true',
         C3_REBUILD_L2TP_RELAYS_JSON: JSON.stringify(enrollment), ENCRYPTION_KEY: 'fixture-only-key-'.repeat(3) };
     const hosts = new Map(), calls = [];
@@ -45,6 +53,7 @@ async function fixture(t, relayCount = 3) {
             if (hostFactory) return hostFactory(nodeId, binding);
             function check(users) { assert.ok(same(rendered(users), hosts.get(nodeId)), 'selected CHAP preimage'); }
             return {
+                proveAppliedMain: async (_pin, guard) => { await guard(); return true; },
                 preflight: async () => ({ ppp: true, masked: false, unitsLoaded: true,
                     machineId: enrollment.find(x => x.nodeId === nodeId).machineId }),
                 prepare: async ({ desired }) => ({ desired, backupId: randomBytes(16).toString('hex') }),
@@ -109,6 +118,7 @@ for (const cut of ['preflight refusal', 'lost host reply', 'lost restore reply']
             return reply;
         });
         const service = createRebuildService({ env, grantDb: db, createRelayDirect: () => ({
+            proveAppliedMain: async (_pin, guard) => { await guard(); return true; },
             preflight: async () => ({ machineId: relay.machineId, ppp: !refused, unitsLoaded: true, masked: false }),
             prepare: async () => ({ backupId: randomUUID() }),
             install: async (_, guard) => { await guard(); installs++; if (lostHost) throw Error('fixture lost ACK'); return false; },
@@ -177,6 +187,7 @@ run('legacy Remove-last → reinstall on another relay preserves encrypted ident
     await service().removeRelay(id(1));
     assert.equal((await users()).length, 0);
     assert.equal(hosts.size, 0);
+    await Link.deleteMany({ portalNode: id(1) });
     await Node.deleteOne({ _id: id(1) });
     const reinstated = await service().installRelay(id(2));
     assert.equal(reinstated.status, 'installed');
@@ -292,6 +303,7 @@ for (const cut of ['unknown', 'crash', 'apply', 'refused']) {
             // A fresh service can actually enter a subsequent preflight (no host write).
             let checked = false;
             const next = createRebuildService({ env, grantDb: db, cache: {}, sync: {}, createRelayDirect: () => ({
+                proveAppliedMain: async (_pin, guard) => { await guard(); return true; },
                 preflight: async () => { checked = true; return { machineId: relay.machineId, ppp: false, unitsLoaded: true, masked: false }; },
                 close: async () => {},
             }) });

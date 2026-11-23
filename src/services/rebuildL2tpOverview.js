@@ -11,6 +11,7 @@ const { readDirectory, sameAccounts, collectionName: accountsCollection } = requ
 const { inspectAccountSources, isDormantClassicState, readClassicOperations } = require('./rebuildRelayAccountInventory');
 const { FOLLOW_RELAY_MODE, FOLLOW_RELAY_VERSION } = require('../modules/relay-l2tp/domain/l2tpRoutingSelection');
 const { decrypt } = require('../modules/relay-l2tp/services/secretBoxService');
+const { publicProgress } = require('./rebuildInstallProgress');
 
 const legacyId = 'C3_REBUILD_L2TP_RELAY_ID';
 const legacyMachine = 'C3_REBUILD_L2TP_RELAY_MACHINE_ID';
@@ -309,7 +310,7 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
         let grantProblem = null;
         const cards = Promise.resolve(findNodes());
         const [nodes, states, rows, authority] = await Promise.all([
-            cards, read(State.find({}), stateFields), read(L2tpUser.find({}), userFields),
+            cards, read(State.find({}), `${stateFields} installProgress`), read(L2tpUser.find({}), userFields),
             cards.then(nodes => readAuthority({ nodeIds: nodes.filter(row => eligible(row, true)).map(row => String(row._id)) }))
                 .catch(error => { grantProblem = error.code; return null; }),
         ]);
@@ -374,7 +375,9 @@ function createRebuildL2tpOverview({ Node = require('../models/hyNodeModel'),
                 && state.routingMode === FOLLOW_RELAY_MODE && state.routingVersion === FOLLOW_RELAY_VERSION
                 && state.rebuildMachineId === binding.machineId && matches(hex32, state.backupId)
                 && matches(receiptPattern, state.rebuildInstallToken);
-            return { id, name: typeof row.name === 'string' ? row.name : '', ip: typeof row.ip === 'string' ? row.ip : '',
+            const installProgress = qualified && !duplicates.has(id) && state?.status === 'installing'
+                && state.desiredState === 'installed' && publicProgress(state);
+            return { ...(installProgress && { installProgress }), id, name: typeof row.name === 'string' ? row.name : '', ip: typeof row.ip === 'string' ? row.ip : '',
                 status: !state ? 'not_installed' : statuses.includes(state.status) ? state.status : 'error', bound: !!binding,
                 grantSource, grantProblem: problem,
                 canGrant: grantSource === null && admissionAbsent,

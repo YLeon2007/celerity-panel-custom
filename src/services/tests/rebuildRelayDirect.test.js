@@ -147,7 +147,7 @@ assert len({scope['__name__'] for scope in scopes}) == len(scopes)
 });
 
 test('DIRECT selects a longer exec ceiling only for the one-shot package receiver', async () => {
-    const backupId = '1'.repeat(32), packagePreparation = '2'.repeat(64), calls = [];
+    const backupId = '1'.repeat(32), packagePreparation = '2'.repeat(64), appliedMain = '3'.repeat(64), calls = [];
     const fence = { merged: true, listMode: true, source: 'db', check() {},
         binding: { host: node.ip, port: 22, username: 'root', machineId, sshHostKeySha256: pin } };
     let guardChecks = 0;
@@ -160,19 +160,23 @@ test('DIRECT selects a longer exec ceiling only for the one-shot package receive
             assert.ok(Buffer.byteLength(command) + 1 <= 128 * 1024);
             await verify();
             if (request.action === 'preflight') return ok({ machineId, packagePreparation });
-            assert.deepEqual(request, { action: 'prepare-packages', machineId, backupId, packagePreparation });
+            if (request.action === 'prove-applied-main') return ok({ applied: request.appliedMain === appliedMain });
+            assert.deepEqual(request, { action: 'prepare-packages', machineId, backupId, packagePreparation, appliedMain });
             return ok({ ok: true, backupId, packagesReady: true });
         }
     }
     const remote = createRelayDirect({ node, fence, SSH: attested(SSH, machineId) });
     try {
         await remote.preflight();
+        await assert.rejects(remote.preparePackages(backupId, () => {}), { code: 'REBUILD_L2TP_INSTALL_INPUT_INVALID' });
+        assert.equal(await remote.proveAppliedMain(appliedMain, () => {}), true);
         assert.equal(await remote.preparePackages(backupId, () => { guardChecks++; }), true);
         await assert.rejects(remote.preparePackages(backupId, () => { guardChecks++; }), { code: 'REBUILD_L2TP_INSTALL_INPUT_INVALID' });
         await remote.preflight();
         assert.equal(guardChecks, 1);
         assert.deepEqual(calls, [
             ['preflight', 145000, undefined, ['-k', '4s', '125s']],
+            ['prove-applied-main', 145000, 160, ['-k', '4s', '125s']],
             ['prepare-packages', 240000, 160, ['-k', '4s', '220s']],
             ['preflight', 145000, undefined, ['-k', '4s', '125s']],
         ]);

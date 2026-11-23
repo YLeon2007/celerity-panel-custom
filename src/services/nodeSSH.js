@@ -496,7 +496,12 @@ class NodeSSH {
                             settle(includesStdin ? createExecStdinError() : error);
                         })
                         .stderr.on('data', (data) => {
-                            if (withinOutputLimit(data)) stderr += data.toString();
+                            if (withinOutputLimit(data)) {
+                                stderr += data.toString();
+                                if (assertConnection && !settled && typeof options.observeStderr === 'function') {
+                                    try { options.observeStderr(data); } catch { /* advisory; result is unchanged */ }
+                                }
+                            }
                         }).on('end', () => {
                             // ssh2 can emit the channel close before stderr EOF.
                             stderrEnded = true;

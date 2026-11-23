@@ -14,6 +14,7 @@ const { createRebuildService } = require('../../rebuildService');
         const [relay] = JSON.parse(process.env.C3_REBUILD_L2TP_RELAYS_JSON);
         let dispatched = false;
         const service = createRebuildService({ cache: {}, sync: {}, createRelayDirect: () => ({
+            proveAppliedMain: async (_pin, guard) => { await guard(); return true; },
             preflight: async () => ({ machineId: relay.machineId, ppp: cut !== 'refused', unitsLoaded: true, masked: false }),
             prepare: async () => ({ backupId: 'fixture-install' }),
             install: async (_, verify) => {

@@ -1872,6 +1872,18 @@
       "unspecified": "Installation is unavailable: a lock is in place, but its purpose is unclear.",
       "unreadable": "Installation is unavailable: the panel could not read the lock status."
     },
+    "installProgress": {
+      "label": "Installation progress",
+      "preflight": "Checking the link and applied profile",
+      "reserve": "Reserving the installation",
+      "preparePackages": "Preparing packages",
+      "prepare": "Preparing configuration",
+      "install": "Installing",
+      "restart": "Restarting services",
+      "verify": "Verifying installation",
+      "unknown": "Outcome unconfirmed",
+      "installed": "Installed"
+    },
     "installProfileHint": "Install needs an applied, compatible Xray rebuild profile. Regular Setup writes legacy JSON. If needed, configure the intended relay link in Nodes → Network Map and save without auto-deploy. Choose Deploy to preview the changes. Apply only if you approve the changes and this panel manages all affected profiles. Do not overwrite custom or externally managed profiles.",
     "installPackageHint": "Install can prepare missing VPN packages on supported Debian 13 relays with a database grant. Use a maintenance window. Packages are not rolled back if L2TP installation fails. If the result is uncertain, do not retry; have the relay administrator verify the package and L2TP state.",
     "recoverInstall": "Check and continue",
@@ -2003,7 +2015,7 @@
     },
     "installChecks": {
       "KERNEL_MODULE_BLACKLISTED": "A required kernel network module or one of its dependencies is blacklisted. Ask the relay administrator to review the policy; Install will not bypass it.",
-      "REBUILD_LINKS_NOT_APPLIED": "The relay has pending links or unsupported peers. On the Network Map, check that the intended links are applied and all peers are active, panel-managed Xray nodes. Do not apply unrelated links to clear this check.",
+      "REBUILD_LINKS_NOT_APPLIED": "First create and apply a relay-to-bridge link",
       "XRAY_BASELINE_UNSUPPORTED": "Install does not support the existing Xray profile format or routing layout. Reformatting the JSON will not make it a rebuild profile. Follow the instructions on this relay's card only for panel-managed profiles.",
       "XRAY_PROFILE_OWNER_UNSUPPORTED": "An Xray profile has a file owner that Install does not support. Ask the relay administrator to verify who manages it. Do not change its ownership or overwrite it just to pass this check.",
       "XRAY_PROFILE_USERS_UNPROVED": "Install could not verify the Xray user inventory or match the transit inbounds to applied links. Check the applied links and the running Xray user inventory with the relay owner before retrying.",

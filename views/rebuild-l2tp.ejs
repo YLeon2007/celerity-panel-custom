@@ -144,6 +144,9 @@ function secretControl(kind, url, index, login) {
                                                 data-install-recovery-url="<%= relayPath(relay.id) %>/install/recover"
                                                 data-node-id="<%= relay.id %>" aria-describedby="install-recovery-<%= relay.id %>"><%= l('recoverInstall') %></button>
                                     <% } %>
+                                    <% if (relay.installProgress || (actionable && !changed && status === 'not_installed' && relay.canInstall === true)) { %>
+                                        <%- include('partials/rebuild-l2tp-install-progress', {relay, relayPath, l}) %>
+                                    <% } %>
                                     <% if (actionable && !changed && status === 'not_installed' && relay.canInstall === true) { %>
                                         <p class="text-muted" id="install-profile-<%= relay.id %>"><%= l('installProfileHint') %>
                                             <a href="/panel/nodes"><%= t('nodes.title') %></a>
@@ -255,4 +258,5 @@ function secretControl(kind, url, index, login) {
         </div>
     </dialog>
 </div>
+<script src="/js/rebuild-l2tp-install-progress.js?v=1" defer></script>
 <script src="/js/rebuild-l2tp.js?v=<%= rebuildL2tpScriptVersion %>" defer></script>

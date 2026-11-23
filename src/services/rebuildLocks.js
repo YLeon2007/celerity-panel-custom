@@ -111,7 +111,7 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
         // writer has exited. Neither age nor an empty local active set suffices.
         if (row?._id !== rowId || row.allowStaleUnlock !== false || typeof row.token !== 'string'
             || row.token.length !== 36 || !generation.test(row.token)
-            || active.has(row.token) || Object.hasOwn(row, 'installRecoveryClaim') || receipt?.version !== 1
+            || active.has(row.token) || Object.hasOwn(row, 'installRecoveryClaim') || ![1, 2].includes(receipt?.version)
             || receipt.phase !== 'ready' || receipt.nodeId !== nodeId || receipt.actor !== actor
             || receipt.ownerDigest !== ownerDigest(row.token)) throw blocked();
         const filter = exactLock(row);

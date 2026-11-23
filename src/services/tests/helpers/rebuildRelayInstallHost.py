@@ -116,7 +116,8 @@ class LocalOS:
     def __getattr__(self, name):
         assert name in ('O_RDONLY', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_WRONLY', 'O_CREAT', 'O_EXCL', 'O_DIRECTORY',
                         'fdopen', 'listxattr', 'mkdir', 'rmdir', 'fsync', 'close', 'fchmod', 'link',
-                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'symlink', 'uname', 'getpid'), name
+                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'symlink', 'uname', 'getpid',
+                        'get_blocking', 'set_blocking', 'write'), name
         return getattr(os, name)
 
     def readlink(self, path, *, dir_fd=None):
