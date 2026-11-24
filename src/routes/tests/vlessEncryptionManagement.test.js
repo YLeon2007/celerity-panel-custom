@@ -189,7 +189,15 @@ Node.collection.collection = {
     async find(filter, opts) {
         return { toArray: async () => rows.filter(row => matches(row, filter)).map(row => project(row, opts.projection)) };
     },
-    async findOne(filter, opts) { return project(rows.find(row => matches(row, filter)), opts.projection); },
+    async findOne(filter, opts) {
+        // This is the native-driver boundary, AFTER the real Mongoose Query#_applyPaths.
+        // Mongo rejects overlapping parent/child paths before looking at documents;
+        // applyProjection alone accepts them and masked the real PUT regression.
+        const paths = Object.keys(opts.projection ?? {});
+        const parent = paths.find(p => paths.some(child => child.startsWith(`${p}.`)));
+        if (parent) throw Object.assign(new Error(`Projection path collision: ${parent}`), { code: 31249 });
+        return project(rows.find(row => matches(row, filter)), opts.projection);
+    },
     async insertOne(row) { writes.push({ insert: true }); rows.push(bson(row)); return { insertedId: row._id }; },
     async updateOne(filter, update) { return { matchedCount: change(filter, update) ? 1 : 0 }; },
     async findOneAndUpdate(filter, update, opts) { return project(change(filter, update), opts.projection); },
@@ -251,6 +259,21 @@ function assertRedacted(body) {
     assert.equal(body.includes(rows[0].xray[privateField]), false);
     assert.equal(body.includes(rows[0].xray.extraInbounds[0][privateField]), false);
 }
+
+test('Rebuild portal: main-only enable reaches the ownership check without a write or push', async () => {
+    reset('26.3.27');
+    process.env.C3_REBUILD_ENABLED = 'true';
+    const before = bson(rows[0]);
+    const body = { xray: { vlessEncryption: true } };
+    const rest = await restEdit(body);
+    assert.equal(rest.status, 409);
+    assert.equal(JSON.parse(rest.body).code, 'REBUILD_VLESS_CLIENT_PROTECTED');
+    const mcp = await mcpEdit(body);
+    assert.equal(mcp.code, 409);
+    assert.equal(mcp.reason, 'REBUILD_VLESS_CLIENT_PROTECTED');
+    assert.deepEqual(rows[0], before);
+    assert.deepEqual([writes.length, invalidations.length, pushes.length], [0, 0, 0]);
+});
 
 test('stock create paths refuse main or extra encryption even with caller-supplied version', async () => {
     reset(undefined, { ip: '192.0.2.20' });

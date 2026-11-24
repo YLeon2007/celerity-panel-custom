@@ -27,7 +27,6 @@ const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 const vless = require('../../utils/vlessEncryption');
-const editXraySelect = `+xray.manualKey +xray.accessLogs.ingestTokenEncrypted ${vless.PRIVATE_KEY_SELECT}`;
 const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { assertRebuildVlessEditAllowed } = require('../../services/rebuildClientConfigOwnership');
 const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
@@ -745,7 +744,7 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
         const guardMode = guardFormMode(req.body);
         // Both private Xray fields must survive the full subdocument merge below.
         const result = await withNodeWrite(nodeId, async (options, current, verify) => {
-            const read = () => HyNode.findById(nodeId).select(editXraySelect);
+            const read = () => HyNode.findById(nodeId).select(vless.EDIT_XRAY_SELECT);
             // Capture the raw policy before constructing the form update. The
             // hydrated document is still used for validation and the same save.
             const raw = guardMode === undefined ? null : await read().lean();
@@ -925,7 +924,7 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
                 await HyNode.updateMany({ ip: before.ip, _id: { $ne: existingNode._id } }, { $set: sshUpdates }, options);
             }
             return { before, after, updates };
-        }, { select: editXraySelect });
+        }, { select: vless.EDIT_XRAY_SELECT });
         if (result?.stale) return res.status(409).send(new RealityGuardConflictError().message);
         if (result?.staleEncryption) return res.status(409).send(vlessEditConflict(res.locals.t));
         if (!result || result.redirect) return res.redirect(result?.redirect ?? '/panel/nodes');

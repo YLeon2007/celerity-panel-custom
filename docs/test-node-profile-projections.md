@@ -1,0 +1,12 @@
+# Проекции HyNode: повторная проверка на TEST (MongoDB 7)
+
+Использовать только TEST. Для проверки синтаксиса достаточно `findOne` по новому `ObjectId` в существующей коллекции `hynodes`: сервер разбирает проекцию и при отсутствии записи. Результат проверки — принят запрос или номер ошибки. Не выводить документы, ключи, URI подключения или тело ответа с настройками ноды.
+
+Проекции ниже даны в синтаксисе Mongoose `.select()`, а не Mongo shell. `+` означает override `select: false` и не передаётся серверу как имя поля.
+
+- **REST PUT, MCP `manage_node update`, POST формы (включая чтение под lock):** `+xray.manualKey +xray.accessLogs.ingestTokenEncrypted +xray.vlessEncryptionPrivateKey +xray.extraInbounds.vlessEncryptionPrivateKey` (`EDIT_XRAY_SELECT`). Не добавлять `xray` или обычные include-поля. На текущей схеме и Mongoose 8.24.1 на сервер уходит `{executionBindingCheck: 0}`.
+- **GET формы / Sync, ручной TLS:** `+xray.manualKey`. **Sync, ключи VLESS:** `xray.vlessEncryptionPrivateKey xray.extraInbounds.vlessEncryptionPrivateKey xray.vlessEncryptionPublicKey xray.extraInbounds.id xray.extraInbounds.vlessEncryptionPublicKey` (`loadVlessServerKeys`). Это два независимых чтения, не объединять.
+- **Rebuild, загрузка профилей для конфигурации:** `+xray.manualKey +xray.vlessEncryptionPrivateKey +xray.extraInbounds.vlessEncryptionPrivateKey`.
+- **Reality Guard, список/одиночное чтение и форма:** объект `profileProjection` из `src/services/realityGuardService.js`; нативному драйверу он передаётся как `projection`, Mongoose — через `.select({ ...profileProjection })`. Включены `xray.security`, `xray.realityDest`, `xray.realitySni`, `xray.extraInbounds.{id,security,realityDest,realitySni}`, `xray.realityGuard.mode`; родитель `xray` не включён. **Guard-only edit:** `type cascadeRole role useCustomConfig xray.security xray.realityDest xray.extraInbounds xray.realityGuard.mode`.
+
+Поведение: на portal под Rebuild повторить `PUT /api/nodes/:id` с `{"xray":{"vlessEncryption":true}}`. Ожидается HTTP **409**, JSON `code: REBUILD_VLESS_CLIENT_PROTECTED`, без записи карточки и push. MCP для такой же операции — `code: 409`, `reason: REBUILD_VLESS_CLIENT_PROTECTED`. На разрешённой тестовой карточке проверить обычное сохранение: `manualKey`, `accessLogs.ingestTokenEncrypted` и приватные ключи основного и дополнительного входов не изменились (сравнивать на месте, выводить только да/нет).

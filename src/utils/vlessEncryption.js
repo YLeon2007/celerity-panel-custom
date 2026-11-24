@@ -16,6 +16,9 @@ const FIELDS = Object.freeze([ENABLED, AUTH, MODE, TICKET, PRIVATE, PUBLIC]);
 const PRIVATE_PATHS = [`xray.${PRIVATE}`, `xray.extraInbounds.${PRIVATE}`];
 const PRIVATE_KEY_EXCLUDE = PRIVATE_PATHS.map(p => `-${p}`).join(' ');
 const PRIVATE_KEY_SELECT = PRIVATE_PATHS.map(p => `+${p}`).join(' ');
+// Internal edit preimage only, never a response projection. Keep this plus-only:
+// adding an inclusive `xray` would send both the parent and its leaves to MongoDB.
+const EDIT_XRAY_SELECT = `+xray.manualKey +xray.accessLogs.ingestTokenEncrypted ${PRIVATE_KEY_SELECT}`;
 const KEY_BYTES = Object.freeze({ x25519: Object.freeze({ server: 32, client: 32 }),
     mlkem768: Object.freeze({ server: 64, client: 1184 }) });
 
@@ -367,7 +370,7 @@ function redactNode(node) {
 
 module.exports = {
     PREFIX, MIN_XRAY_VERSION, AUTH_VALUES, MODE_VALUES, DEFAULT_AUTH, DEFAULT_MODE, DEFAULT_TICKET, KEY_BYTES,
-    FIELDS, PRIVATE_KEY_EXCLUDE, PRIVATE_KEY_SELECT, message,
+    FIELDS, PRIVATE_KEY_EXCLUDE, PRIVATE_KEY_SELECT, EDIT_XRAY_SELECT, message,
     normalizeTicket, applyVlessEncryption, applyVlessEncryptionToXray, takeRegenerateIds,
     buildServerDecryption, buildClientEncryption, hasEnabledInbound, versionError,
     stripVlessEncryptionKeys, redactNode, deriveClientKey,

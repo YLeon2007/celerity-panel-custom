@@ -512,7 +512,7 @@ async function manageNodeAction(args, emit, translate) {
                 const bindGuard = guardMode !== undefined;
                 const profileEdit = xrayEdit || ['type', 'cascadeRole', 'active'].some(key => Object.hasOwn(updates, key));
                 const projection = profileEdit
-                    ? `type ip virtual name cascadeRole role useCustomConfig updatedAt xrayVersion xray ${vless.PRIVATE_KEY_SELECT}`
+                    ? vless.EDIT_XRAY_SELECT
                     : 'type ip virtual' + (bindGuard ? ` ${PROFILE_FIELDS} ${MODE_PATH}` : '');
                 const existing = (bindGuard || profileEdit ? null : current) ?? await HyNode.findById(id).select(projection).lean();
                 if (!existing) return { error: `Node '${id}' not found`, code: 404 };

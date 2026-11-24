@@ -466,7 +466,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             const bindGuard = !!updates.xray || guardMode !== undefined;
             const profileEdit = updates.xray || ['type', 'cascadeRole', 'active'].some(key => Object.hasOwn(updates, key));
             const projection = profileEdit
-                ? `type ip virtual name cascadeRole role useCustomConfig updatedAt xrayVersion xray +xray.manualKey +xray.accessLogs.ingestTokenEncrypted ${vless.PRIVATE_KEY_SELECT}`
+                ? vless.EDIT_XRAY_SELECT
                 : `type ip virtual${guardMode !== undefined ? ` ${PROFILE_FIELDS} ${MODE_PATH}` : ''}`;
             const existing = (bindGuard || profileEdit ? null : current) ?? await HyNode.findById(req.params.id).select(projection).lean();
             if (!existing) {
