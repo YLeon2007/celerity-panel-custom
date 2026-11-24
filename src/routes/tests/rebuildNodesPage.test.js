@@ -49,10 +49,10 @@ function mount(t, rebuild, customize = (_req, _res) => {}) {
 
 const tagId = (html, id) => html.match(new RegExp(`<[^>]+\\bid="${id}"[^>]*>`))?.[0] ?? '';
 const mapDictionary = html => html.match(/<script type="application\/json" id="networkI18n">([^]*?)<\/script>/)?.[1];
+const scripts = html => [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
 
 function boot(html, { restore = false, blockedStorage = false, failAt = -1 } = {}) {
-    const inline = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1])
-        .find(js => js.includes('function loadNetworkScripts()'));
+    const inline = scripts(html).find(js => js.includes('function loadNetworkScripts()'));
     assert.ok(inline, 'page contains its graph loader');
     const start = inline.indexOf('// ==================== View Tabs');
     const end = inline.indexOf('// ==================== DRAG-AND-DROP', start);
@@ -82,6 +82,9 @@ function boot(html, { restore = false, blockedStorage = false, failAt = -1 } = {
         removeItem() {},
     };
     const context = vm.createContext({ window, document, sessionStorage, setTimeout: () => {} });
+    for (const js of scripts(html)) {
+        if (/^\s*window\._networkCsrfToken\s*=/.test(js)) vm.runInContext(js, context);
+    }
     vm.runInContext(inline.slice(start, end), context);
     return { selected, window, switchView: view => context.switchNodesView(view),
         mapOpen: () => document.getElementById('viewNetwork').style.display !== 'none',
@@ -124,8 +127,8 @@ for (const rebuild of [false, true]) {
     });
 }
 
-test('Rebuild defaults to modern, lazy-loads only the ES module and has a link to the fallback', async t => {
-    const { get } = mount(t, true);
+test('Rebuild defaults to modern with its session CSRF and the shared preview dialog', async t => {
+    const { app, get, session } = mount(t, true);
     const page = await get('/panel/nodes');
     assert.equal(page.status, 200);
     const ui = boot(page.body);
@@ -138,12 +141,21 @@ test('Rebuild defaults to modern, lazy-loads only the ES module and has a link t
     assert.equal(ui.mapOpen(), true);
     assert.equal(ui.listOpen(), false);
     assert.deepEqual(ui.selected, [{ src: `/js/network/dist/index.js?v=${assetRevision('js/network/dist/index.js')}`, type: 'module' }]);
-    assert.equal(ui.window._networkCsrfToken, undefined);
+    assert.ok(session.panelCsrfToken && ui.window._networkCsrfToken === session.panelCsrfToken,
+        'the modern module gets the authenticated panel session token');
+    app.use('/api/cascade', auth, routerForRebuild({ service: {} }));
+    const token = await request(app, '/api/cascade/rebuild/csrf-token', { method: 'GET', session });
+    assert.equal(token.status, 200);
+    assert.ok(JSON.parse(token.body).csrfToken === ui.window._networkCsrfToken);
     assert.equal(ui.window._networkI18n, undefined);
     assert.doesNotMatch(page.body, /cytoscape(?:-dagre)?\.min\.js|\/js\/network(?:\.min)?\.js|\/css\/network\.min\.css/);
     assert.ok(page.body.includes(`/css/network-map.css?v=${assetRevision('css/network-map.css')}`));
     assert.match(page.body, /href="\/panel\/nodes\?map=classic"/);
-    assert.match(tagId(page.body, 'networkRoot'), /data-read-only="true"/);
+    assert.match(tagId(page.body, 'networkRoot'), /data-link-actions="true"/);
+    assert.equal([...page.body.matchAll(/<dialog\b[^>]*\bid="rebuildPreview"/g)].length, 1);
+    assert.ok(tagId(page.body, 'rebuildPreviewApply'));
+    assert.ok(tagId(page.body, 'rebuildPreviewCancel'));
+    assert.ok(scripts(page.body).some(js => /^\s*window\._networkRebuildPreviewI18n\s*=/.test(js)));
     for (const part of ['nm-bar', 'nm-body', 'nm-stage', 'nm-insp', 'nm-state']) assert.match(page.body, new RegExp(`class="${part}"`));
     for (const id of ['btnAddLink', 'addLinkForm', 'addLinkModal', 'btnAutoLayout']) assert.equal(tagId(page.body, id), '');
     assert.deepEqual([...page.body.matchAll(/data-nm-view="([^"]+)"/g)].map(m => m[1]), ['chains', 'graph', 'geo']);
@@ -190,6 +202,7 @@ test('modern locale payload is limited, translated, and safe inside an HTML scri
     const marker = '</script><script>fixture()</script>\u2028\u2029&';
     const { get } = mount(t, true, (req, res) => {
         if (req.query.fixture !== '1') return;
+        res.locals.csrfToken = marker;
         const { t: translate, locales } = res.locals;
         res.locals.t = key => key === 'network.loadingTopology' ? marker : translate(key);
         res.locals.locales = { ...locales, network: { ...locales.network, map: { ...locales.network.map, searchPlaceholder: marker } } };
@@ -197,17 +210,24 @@ test('modern locale payload is limited, translated, and safe inside an HTML scri
     for (const lang of ['en', 'ru', 'zh-CN']) {
         const page = await get(`/panel/nodes?map=modern&lang=${lang}`);
         assert.equal(page.status, 200);
-        const { network: { map, mkcpAppliedUnverified } } = require(`../../locales/${lang}.json`);
+        const { network } = require(`../../locales/${lang}.json`);
+        const { map, mkcpAppliedUnverified } = network;
         const data = JSON.parse(mapDictionary(page.body));
         assert.equal(data.map.searchPlaceholder, map.searchPlaceholder);
         assert.equal(data.map.status.deployed, map.status.deployed);
         assert.equal(data.map.status.unknown, map.status.unknown);
         assert.equal(data.mkcpAppliedUnverified, mkcpAppliedUnverified);
         assert.equal(data.tunnelUnknown, map.tunnelUnknown);
-        assert.ok(page.body.includes(map.readOnlyNotice));
+        assert.deepEqual(data.map.linkActions, map.linkActions);
+        for (const key of ['deploySuccess', 'deployFailed', 'chainDeploySuccess', 'chainDeployFailed', 'deleteSuccess',
+            'csrfTokenInvalid', 'csrfTokenRefreshed', 'csrfAuthRequired', 'csrfOriginInvalid', 'csrfSavedDraft']) {
+            assert.equal(typeof network[key], 'string', `${lang}: ${key} is explicitly translated`);
+            assert.equal(data[key], network[key]);
+        }
+        assert.ok(page.body.includes(map.linkEditNotice));
         assert.ok(page.body.includes(map.openClassic));
         assert.equal(data.map.create, undefined);
-        assert.equal(data.confirmDeploy, undefined);
+        assert.equal(data.confirmUndeploy, undefined);
         assert.equal(data.kcpMtu, undefined);
     }
     const adversarial = await get('/panel/nodes?fixture=1');
@@ -217,5 +237,45 @@ test('modern locale payload is limited, translated, and safe inside an HTML scri
     const parsed = JSON.parse(raw);
     assert.equal(parsed.loadingTopology, marker);
     assert.equal(parsed.map.searchPlaceholder, marker);
+    assert.equal(boot(adversarial.body).window._networkCsrfToken, marker);
     assert.doesNotMatch(adversarial.body, /<script>fixture\(\)<\/script>/);
+});
+
+test('a tokenless modern mount is read-only and emits no CSRF bootstrap', async t => {
+    const { get } = mount(t, true, (_req, res) => { delete res.locals.csrfToken; });
+    const page = await get('/panel/nodes?map=modern');
+    assert.equal(page.status, 200);
+    assert.match(tagId(page.body, 'networkRoot'), /data-read-only="true"/);
+    assert.doesNotMatch(tagId(page.body, 'networkRoot'), /data-link-actions/);
+    assert.equal(boot(page.body).window._networkCsrfToken, undefined);
+});
+
+test('the authenticated Rebuild mount reaches the effective link health handler', async t => {
+    const prior = process.env.C3_REBUILD_ENABLED;
+    process.env.C3_REBUILD_ENABLED = 'true';
+    t.after(() => {
+        if (prior === undefined) delete process.env.C3_REBUILD_ENABLED;
+        else process.env.C3_REBUILD_ENABLED = prior;
+    });
+    const id = '0123456789abcdef01234567';
+    const row = { _id: id, mode: 'forward', status: 'deployed' };
+    t.mock.method(Link, 'findById', received => {
+        assert.equal(received, id);
+        return { select: () => Object.assign(Promise.resolve(row), { lean: async () => row }) };
+    });
+    const health = t.mock.method(require('../../services/cascadeService'), 'healthCheckLink', async received => {
+        assert.equal(received, row);
+        return false;
+    });
+    const app = express();
+    // Same order as index.js: the Rebuild router falls through for health.
+    app.use('/api/cascade', requireAuth, routerForRebuild({ service: {} }));
+    app.use('/api/cascade', requireAuth, require('../cascade'));
+    const response = await request(app, `/api/cascade/links/${id}/health`, {
+        method: 'GET', session: { authenticated: true },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers['cache-control'], 'no-store');
+    assert.equal(JSON.parse(response.body).healthy, false);
+    assert.equal(health.mock.callCount(), 1);
 });

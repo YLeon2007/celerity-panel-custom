@@ -1,8 +1,9 @@
 /**
- * Read-only details for the selected node or link (bottom sheet on mobile).
+ * Details and available actions for the selection (bottom sheet on mobile).
  */
 
 import model from '../core/model.js';
+import { linkIdOf } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { h, icon, clear, toast } from './dom.js';
 import {
@@ -10,7 +11,7 @@ import {
     roleTag, statusPill, dot, modeIcon,
 } from './format.js';
 
-export function createInspector(el, { store, onGoto }) {
+export function createInspector(el, { store, actions, onGoto }) {
     let mode = null;
 
     function close() {
@@ -191,6 +192,19 @@ export function createInspector(el, { store, onGoto }) {
     }
 
     // ==================== LINK ====================
+    function linkActions(link) {
+        if (!actions || link.isInternetEdge || !linkIdOf(link.id)) return null;
+        const id = link.id;
+        return h('div.nm-insp-foot.nm-link-actions', null,
+            h('div.row', null,
+                inspectBtn('.primary', 'cloud-upload', t('map.linkActions.deploy'), () => actions.deploy(id)),
+                inspectBtn('', 'route', t('map.linkActions.deployChain'), () => actions.deployChain(id))),
+            h('div.row', null,
+                inspectBtn('', 'stethoscope', t('map.linkActions.checkHealth'), () => actions.checkHealth(id)),
+                inspectBtn('.danger', 'trash', t('map.linkActions.remove'), () => actions.remove(id))),
+            h('small', null, t('map.linkActions.reconnectHint')));
+    }
+
 
     function cdnEdgeView(e) {
         const index = store.index;
@@ -266,6 +280,7 @@ export function createInspector(el, { store, onGoto }) {
                         l.publishedExit ? t('map.subPublished', { id: l.routeId })
                             : isFwd ? t('map.subForward') : t('map.subNotPublished')) : null,
                     l.lastHealthCheck ? prop('stethoscope', t('map.prop.checked'), ago(l.lastHealthCheck)) : null)),
+            linkActions(l),
         ];
     }
 

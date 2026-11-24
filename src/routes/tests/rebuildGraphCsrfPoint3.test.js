@@ -7,6 +7,7 @@ const { Socket } = require('node:net');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
+const { createHash } = require('node:crypto');
 const { render } = require('../panel/helpers');
 const express = require('express');
 const auth = require('../../middleware/auth');
@@ -15,6 +16,8 @@ const { issuePanelCsrfToken } = require('../panel/csrf');
 const { routerForRebuild } = require('../cascadeRebuild');
 
 const root = path.resolve(__dirname, '../../..');
+const assetUrl = file => `/js/${file}?v=` + createHash('sha256')
+    .update(readFileSync(path.join(root, 'public/js', file))).digest('hex').slice(0, 16);
 const origin = 'https://graph.example.invalid';
 const hostname = new URL(origin).host;
 const refreshPath = '/api/cascade/rebuild/csrf-token';
@@ -75,13 +78,13 @@ function response(url, body, status = 200, options = {}) {
 
 // Render the complete templates; only the DOM/Cytoscape APIs and Fetch are
 // modelled. Missing rendered IDs are not filled in by the harness.
-function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () => true } = {}) {
+function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () => true, useModernMap = false } = {}) {
     let html;
-    render({ locals: { t: key => t(key, lang), lang, csrfToken, c3Rebuild: rebuild },
+    render({ locals: { t: key => t(key, lang), locales: require(`../../locales/${lang}.json`), lang, csrfToken, c3Rebuild: rebuild },
         render(layout, data) { assert.equal(layout, 'layout'); html = data.content; },
     }, view, {
         nodes: [], groups: [], nodesCount: 0, linksCount: 0, ipProtocolCount: {},
-        panelDomain: hostname, loadBalancingEnabled: false,
+        panelDomain: hostname, loadBalancingEnabled: false, useModernMap,
     });
     const tags = new Map(), resources = [], requests = [], confirmations = [], alerts = [];
     let runAsset;
@@ -119,7 +122,7 @@ function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () =>
             return null;
         },
     };
-    tags.get('btnAddLink').parentElement = element();
+    if (!useModernMap) tags.get('btnAddLink').parentElement = element();
     const handlers = {};
     const emptyEdge = Object.assign([], { filter: () => emptyEdge });
     const cytoscape = () => ({
@@ -143,8 +146,8 @@ function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () =>
     context.window = context;
     runAsset = src => {
         resources.push(src);
-        if (src.startsWith('/js/network.js?')) {
-            vm.runInContext(readFileSync(path.join(root, 'public/js/network.js'), 'utf8'), context);
+        if (/^\/js\/(network|rebuild-preview)\.js\?/.test(src)) {
+            vm.runInContext(readFileSync(path.join(root, 'public', src.split('?')[0]), 'utf8'), context);
         }
     };
     for (const [, src, code] of html.matchAll(/<script(?: src="([^"]+)"[^>]*)?>([\s\S]*?)<\/script>/g)) {
@@ -260,6 +263,7 @@ for (const [view, lang, actionCopy] of [['network', 'ru', /Повторите д
         assert.ok(ui.resources.includes('/js/network.min.js?v=' + version));
         assert.ok(!ui.resources.some(src => src.startsWith('/js/network.js?')));
         assert.equal(ui.document.getElementById('rebuildPreview'), null);
+        assert.equal(ui.context.C3RebuildPreview, undefined);
     });
 }
 
@@ -441,8 +445,8 @@ const removePath = '/api/cascade/links/' + linkId;
 const profile = (profile, sections, options = {}) => ({ profile, change: sections.length ? 'replace' : 'unchanged',
     sections, protectedChanged: false, ...options });
 
-async function mountPreview(view, lang, { exitImpact, protectedChanged = false, native = true, approve = true,
-    reportId = previewId } = {}) {
+async function mountPreview(view, lang, { exitImpact, protectedChanged = false, allowed = !protectedChanged,
+    native = true, approve = true, reportId = previewId } = {}) {
     const opened = Promise.withResolvers();
     const nodes = [
         { nodeId: portalId, role: 'portal', exitImpact, profiles: [profile('main', ['inbounds', 'routing'], { protectedChanged }),
@@ -457,7 +461,7 @@ async function mountPreview(view, lang, { exitImpact, protectedChanged = false, 
             [portalId, portalLabel, 'portal'], [gatewayId, 'West Exit', 'bridge'], [relayId, 'Middle', 'relay'],
         ].map(([id, label, cascadeRole]) => ({ data: { id, label, cascadeRole }, position: { x: 0, y: 0 } })) });
         if (pathname === '/api/cascade/links' && !method) return response(url, { links: [], topologyRevision: 7, deployedRevision: 6 });
-        if (pathname === previewPath) return response(url, { allowed: !protectedChanged, nodes, previewId: reportId });
+        if (pathname === previewPath) return response(url, { allowed, nodes, previewId: reportId });
         assert.ok(pathname === removePath && method === 'DELETE' || pathname === deployPath && method === 'POST');
         return response(url, { executionMode: 'rebuild', deleted: linkId, status: 'succeeded' });
     }, { onDialog: native ? opened.resolve : undefined, confirm: () => approve });
@@ -504,10 +508,10 @@ for (const view of ['nodes', 'network']) for (const [lang, expected] of Object.e
         const ui = await mountPreview(view, lang, { exitImpact: 'lost' });
         const action = ui.context._cascadeDelete(linkId);
         const dialog = await openedBy(ui, action);
-        const currentAsset = require('node:crypto').createHash('sha256').update(readFileSync(path.join(root, 'public/js/network.js'))).digest('hex').slice(0, 16);
-        assert.deepEqual(ui.resources.filter(src => src.startsWith('/js/network')),
-            ['/js/network.js?v=' + currentAsset]);
+        assert.deepEqual(ui.resources.filter(src => /^\/js\/(rebuild-preview|network)\.js\?/.test(src)),
+            [assetUrl('rebuild-preview.js'), assetUrl('network.js')]);
         assert.ok(dialog.open);
+        assert.equal([...ui.html.matchAll(/<dialog[^>]*id="rebuildPreview"/g)].length, 1);
         assert.match(ui.html, /<dialog[^>]*id="rebuildPreview"[^>]*aria-labelledby="rebuildPreviewTitle"[^>]*>/);
         assert.match(ui.html, /id="rebuildPreviewWarning"[\s\S]*id="rebuildPreviewDetails"[\s\S]*id="rebuildPreviewCancel"[^>]*autofocus/);
         assert.equal(ui.get('Warning').hidden, false);
@@ -553,7 +557,7 @@ for (const [lang, expected] of Object.entries(copy)) {
     });
 
     test(`Deploy (${lang}): protected settings refuse Apply; exit warning is Remove-only`, async () => {
-        const ui = await mountPreview('nodes', lang, { exitImpact: 'lost', protectedChanged: true });
+        const ui = await mountPreview('nodes', lang, { exitImpact: 'lost', protectedChanged: true, allowed: true });
         const action = ui.context._cascadeDeploy(linkId);
         await openedBy(ui, action);
         assert.equal(ui.get('Title').textContent, expected.refused);
@@ -565,6 +569,7 @@ for (const [lang, expected] of Object.entries(copy)) {
         ui.get('Cancel').onclick();
         await action;
         assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
+        assert.equal(ui.toast(), expected.refused);
     });
 
     test(`Remove (${lang}): text-only fallback puts the warning first and respects Cancel`, async () => {
@@ -582,6 +587,41 @@ test('a missing Preview ID cannot be approved or sent', async () => {
     await ui.context._cascadeDelete(linkId);
     assert.deepEqual(ui.writes().map(call => call.pathname), [previewPath]);
     assert.equal(ui.confirmations.length, 0);
+    assert.equal(ui.toast(), t('network.rebuildPreview.unavailable', 'en'));
+});
+
+test('modern nodes share one report dialog and refuse malformed reports without prompting', async () => {
+    const opened = Promise.withResolvers();
+    const ui = mount('nodes', 'ru', 'fixture', true, () => assert.fail('shared preview must not fetch'),
+        { useModernMap: true, onDialog: opened.resolve });
+    assert.equal([...ui.html.matchAll(/<dialog[^>]*id="rebuildPreview"/g)].length, 1);
+    assert.deepEqual(ui.resources.filter(src => src.startsWith('/js/rebuild-preview')), [assetUrl('rebuild-preview.js')]);
+    const { confirmReport, showRefusal } = ui.context.C3RebuildPreview;
+    const request = { removing: true, lookupNode: () => ({ label: 'Modern Portal', role: 'portal' }) };
+    const good = { allowed: true, previewId, nodes: [{ nodeId: portalId, exitImpact: 'lost', profiles: [profile('main', [])] }] };
+    for (const report of [null, { ...good, previewId: previewId + '\n' }, { ...good, allowed: 'true' },
+        { ...good, nodes: [null] }, { ...good, nodes: [{ nodeId: portalId, profiles: [null] }] },
+        { ...good, nodes: [{ nodeId: portalId, profiles: [profile('main', [], { protectedChanged: 'false' })] }] }]) {
+        assert.equal(await confirmReport({ ...request, report }), null);
+    }
+    const get = suffix => ui.document.getElementById('rebuildPreview' + suffix);
+    assert.equal(get('').open, undefined);
+    const accepted = confirmReport({ ...request, report: good });
+    assert.equal(await openedBy({ ...ui, opened: opened.promise }, accepted), get(''));
+    assert.match(get('Warning').textContent, /у портала Modern Portal/);
+    assert.match(get('Details').textContent, /Modern Portal — портал: без изменений/);
+    assert.equal(get('Cancel').textContent, t('common.cancel', 'ru'));
+    get('Apply').onclick();
+    assert.equal(await accepted, previewId);
+    const refused = showRefusal('Fixture refusal <not-a-tag>');
+    assert.equal(get('').open, true);
+    assert.equal(get('Title').textContent, copy.ru.refused);
+    assert.equal(get('Warning').textContent, 'Fixture refusal <not-a-tag>');
+    assert.equal(get('Warning').innerHTML, undefined);
+    assert.equal(get('Apply').hidden, true);
+    assert.equal(get('Cancel').textContent, t('common.close', 'ru'));
+    get('Cancel').onclick();
+    await refused;
 });
 
 test('a concurrent preview cannot replace the warning or send a second write', async () => {

@@ -14,6 +14,8 @@ const cascadeService = require('../services/cascadeService');
 const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
+const { requirePanelCsrf } = require('./panel/csrf');
+const { parsePositionsBody } = require('../utils/cascadeTopology');
 const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
 const { isReverse, hasKcpStatus, projectLinkHealth, observationSelect } = require('../services/rebuildReverseLinkHealth');
 
@@ -158,17 +160,20 @@ router.get('/topology', requireScope('nodes:read'), async (req, res) => {
     }
 });
 
+function requirePositionsCsrf(req, res, next) {
+    // Preserve the classic layout client and the scoped API-key contract.
+    return isRebuildEnabled() && !req.apiKey ? requirePanelCsrf(req, res, next) : next();
+}
+
 /**
  * POST /cascade/topology/positions — save node positions from the map editor
  */
-router.post('/topology/positions', requireScope('nodes:write'), async (req, res) => {
-    try {
-        const { positions } = req.body;
-        if (!Array.isArray(positions)) {
-            return res.status(400).json({ error: 'positions must be an array' });
-        }
+router.post('/topology/positions', requireScope('nodes:write'), requirePositionsCsrf, async (req, res) => {
+    const parsed = parsePositionsBody(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
 
-        await cascadeService.savePositions(positions);
+    try {
+        await cascadeService.savePositions(parsed.positions);
         res.json({ success: true });
     } catch (error) {
         logger.error(`[Cascade API] Positions error: ${error.message}`);

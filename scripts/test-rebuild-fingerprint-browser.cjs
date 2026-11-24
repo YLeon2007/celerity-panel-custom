@@ -107,6 +107,15 @@ async function main() {
             const asset = await fetch(url);
             assert.equal(asset.status, 200);
             assert.equal(sha(Buffer.from(await asset.arrayBuffer())), diskHash);
+            const graphAssets = await browser.evaluate(`Array.from(document.scripts, s => s.src)
+                .filter(src => src.includes('/js/rebuild-preview.js?') || src.includes('/js/network.js?'))`);
+            const sharedHash = sha(readFileSync(path.join(root, 'public/js/rebuild-preview.js')));
+            const sharedUrl = `${origin}/js/rebuild-preview.js?v=${sharedHash.slice(0, 16)}`;
+            assert.deepEqual(graphAssets, [sharedUrl, url]);
+            const sharedAsset = await fetch(sharedUrl);
+            assert.equal(sharedAsset.status, 200);
+            assert.equal(sha(Buffer.from(await sharedAsset.arrayBuffer())), sharedHash);
+            assert.equal(await browser.evaluate('document.querySelectorAll("dialog#rebuildPreview").length'), 1);
             await browser.wait("typeof fixtureTapEdge === 'function' && !document.querySelector('.network-loading')");
             await browser.click('#btnAddLink');
             await browser.wait("document.getElementById('addLinkModal').classList.contains('active')");

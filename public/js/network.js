@@ -338,117 +338,33 @@
         throw new TopologyCsrfRejection(message + ' (' + payload.code + ')');
     }
 
-    const previewRoles = ['portal', 'bridge', 'relay', 'standalone'];
-    const previewSections = ['inbounds', 'outbounds', 'routing', 'reverse', 'log', 'api', 'stats', 'policy', 'dns', 'observatory'];
-    // In Russian the verb can agree with the first named section.
-    const pluralPreviewSections = new Set(['routing', 'reverse', 'policy']);
-    const exitWarningKeys = new Map([['lost', 'exitLost'], ['blocked', 'exitBlocked'], ['default-lost', 'defaultExitLost']]);
-    let previewDialogPending = false;
-
-    function rebuildPreviewText(nodes, removing) {
-        const labels = previewLabels;
-        const details = [], warnings = [];
-        let protectedChanged = false;
-        const listFormat = typeof Intl.ListFormat === 'function' ? new Intl.ListFormat(labels.lang) : null;
-        nodes.forEach((node, index) => {
-            const inventory = _allNodes.get(node.nodeId);
-            // Render the name as a single line even in the plain-text fallback.
-            const label = inventory?.label?.replace(/[\s\p{Cc}\p{Bidi_Control}]+/gu, ' ').trim();
-            const name = label && label !== node.nodeId ? label : labels.unknownNode.replace('{number}', index + 1);
-            const role = previewRoles.includes(node.role) ? node.role : inventory?.role || 'standalone';
-            const changed = node.profiles.filter(profile => profile.change !== 'unchanged');
-            const sections = new Set(changed.flatMap(profile => profile.sections));
-            const namedSections = previewSections.filter(section => sections.has(section));
-            const sectionLabels = namedSections.map(section => labels[section]);
-            const changes = pluralPreviewSections.has(namedSections[0]) ? labels.changesPlural : labels.changes;
-            const summary = sectionLabels.length
-                ? changes.replace('{sections}', listFormat?.format(sectionLabels) ?? sectionLabels.join(', '))
-                : changed.length ? labels.otherChanges : labels.unchanged;
-            const settingsChanged = node.profiles.some(profile => profile.protectedChanged === true);
-            protectedChanged ||= settingsChanged;
-            const lines = [name + ' — ' + labels[role] + ': ' + summary,
-                settingsChanged ? labels.settingsChanged : labels.settingsUnchanged];
-            if (node.profiles.some(profile => profile.tunnelMigration === 'legacy-to-vless-reverse')) lines.push(labels.migration);
-            details.push(lines.join('\n'));
-            const warningKey = removing && exitWarningKeys.get(node.exitImpact);
-            if (warningKey) warnings.push(labels[warningKey].replace('{name}', () => name));
-        });
-        return { details: details.join('\n\n'), warning: warnings.join('\n\n'), protectedChanged };
-    }
-
-    async function showRebuildPreview({ title, warning, details, allowed, applyLabel }) {
-        const dialog = document.getElementById('rebuildPreview');
-        // Never replace a pending question with a different Preview.
-        if (previewDialogPending || dialog?.open) return false;
-        if (typeof dialog?.showModal !== 'function') {
-            const text = [warning, title, details].filter(Boolean).join('\n\n');
-            if (!allowed) { window.alert(text); return false; }
-            return window.confirm(text);
-        }
-        const get = suffix => document.getElementById('rebuildPreview' + suffix);
-        const warningElement = get('Warning'), apply = get('Apply'), cancel = get('Cancel');
-        get('Title').textContent = title;
-        get('Details').textContent = details;
-        warningElement.textContent = warning;
-        warningElement.hidden = !warning;
-        apply.textContent = applyLabel;
-        apply.hidden = !allowed;
-        cancel.textContent = allowed ? previewLabels.cancel : previewLabels.close;
-        previewDialogPending = true;
-        try {
-            const approved = new Promise(resolve => {
-                let accepted = false;
-                dialog.onclose = () => resolve(accepted);
-                cancel.onclick = () => dialog.close();
-                apply.onclick = () => {
-                    if (!allowed || !dialog.open) return;
-                    accepted = true;
-                    dialog.close();
-                };
-                dialog.showModal();
-                get('Body').scrollTop = 0;
-            });
-            return await approved;
-        } finally {
-            dialog.onclose = apply.onclick = cancel.onclick = null;
-            previewDialogPending = false;
-        }
-    }
-
     async function rebuildPreview(payload, report, sessionToken) {
         const unavailable = previewLabels?.unavailable || 'Preview unavailable.';
-        if (!previewLabels) throw new RebuildPreviewStopped(unavailable);
-        if (!report) {
+        const preview = window.C3RebuildPreview;
+        if (!previewLabels || !preview) throw new RebuildPreviewStopped(unavailable);
+        if (report === undefined) {
             const response = await fetchTopologyWrite('/api/cascade/rebuild/preview', { method: 'POST',
                 headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }, sessionToken);
-            report = await response.json();
+            report = await response.json().catch(() => null);
             if (!response.ok) {
                 const neighbor = neighborRefusal(response.status, report?.error);
                 if (neighbor) {
-                    await showRebuildPreview({ title: previewLabels.refused, warning: neighbor, details: '', allowed: false,
-                        applyLabel: previewLabels.apply });
+                    await preview.showRefusal(neighbor);
                     throw new RebuildPreviewStopped(neighbor);
                 }
                 const refusal = fingerprintRefusal(response.status, report);
                 if (refusal) {
-                    await showRebuildPreview({ title: previewLabels.refused, warning: refusal, details: '', allowed: false,
-                        applyLabel: previewLabels.apply });
+                    await preview.showRefusal(refusal);
                     throw new RebuildFingerprintRefusal(refusal);
                 }
-                throw new RebuildPreviewStopped(cascadeSettingsErrorText(report.error?.code) || report.error?.code || unavailable);
+                const code = report?.error?.code;
+                throw new RebuildPreviewStopped(cascadeSettingsErrorText(code) || code || unavailable);
             }
         }
-        const removing = payload.remove === true;
-        const { previewId } = report;
-        const text = rebuildPreviewText(report.nodes, removing);
-        const allowed = report.allowed === true && !text.protectedChanged;
-        if (allowed && (typeof previewId !== 'string' || !/^(?:[a-f0-9]{64}|[a-f0-9]{128})$/.test(previewId))) {
-            throw new RebuildPreviewStopped(unavailable);
-        }
-        const title = allowed ? (removing ? previewLabels.removeTitle : previewLabels.deployTitle) : previewLabels.refused;
-        const applyLabel = removing ? previewLabels.remove : previewLabels.apply;
-        const accepted = await showRebuildPreview({ title, ...text, allowed, applyLabel });
-        if (!allowed || accepted !== true) throw new RebuildPreviewStopped(allowed ? previewLabels.cancelled : title);
+        let stopped;
+        const previewId = await preview.confirmReport({ report, removing: payload.remove === true,
+            lookupNode: id => _allNodes.get(id) }, message => { stopped = message; });
+        if (previewId === null) throw new RebuildPreviewStopped(stopped || unavailable);
         return previewId;
     }
 
@@ -772,7 +688,7 @@
         if (rebuild) {
             _allNodes = new Map((data.nodes || []).filter(node => typeof node?.data?.id === 'string').map(({ data }) => [data.id, {
                 label: typeof data.label === 'string' ? data.label : '',
-                role: previewRoles.includes(data.cascadeRole) ? data.cascadeRole : 'standalone',
+                role: data.cascadeRole,
             }]));
         }
         // Link mutations reload the graph, but must not discard the positions
@@ -1484,17 +1400,30 @@
     }
 
     async function saveAllPositions() {
-        const positions = cy.nodes().map(function (n) {
-            const p = n.position();
-            return { id: n.data('id'), x: Math.round(p.x), y: Math.round(p.y) };
-        });
+        const failed = i18n.positionsSaveFailed || 'Saving map positions was not confirmed.';
         try {
-            await fetch('/api/cascade/topology/positions', {
+            const positions = new Map();
+            cy.nodes().forEach(n => {
+                const id = n.id();
+                if (n.data('type') === 'cdn' || n.data('cascadeRole') === 'cdn') return;
+                if (id !== 'internet' && (typeof id !== 'string' || !/^[0-9a-f]{24}(?![\s\S])/i.test(id))) return;
+                const { x, y } = n.position();
+                if (![x, y].every(v => Number.isFinite(v) && Math.abs(v) <= 1e6)) throw new Error('Invalid coordinates');
+                const key = id.toLowerCase();
+                positions.set(key, { id: key, x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 });
+            });
+            if (!positions.size) return;
+            if (positions.size > 1000) throw new Error('Too many positions');
+            const response = await fetchTopologyWrite('/api/cascade/topology/positions', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ positions }),
+                body: JSON.stringify({ positions: Array.from(positions.values()) }),
             });
-        } catch (_) {}
+            if (response.status !== 200 || !response.ok || response.redirected || !isJson(response)
+                || (await response.json())?.success !== true) throw new Error('Position save not acknowledged');
+        } catch (error) {
+            showToast(error instanceof TopologyCsrfRejection ? failed + ' ' + error.message : failed, 'error');
+        }
     }
 
     // ==================== ADD LINK MODAL ====================

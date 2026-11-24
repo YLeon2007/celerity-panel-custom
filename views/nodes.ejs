@@ -2,7 +2,7 @@
 const modernMap = typeof useModernMap !== 'undefined' && useModernMap;
 const openMap = typeof nodesMapQuery !== 'undefined' && Boolean(nodesMapQuery);
 const rebuildClassicMap = typeof c3Rebuild !== 'undefined' && c3Rebuild && !modernMap && openMap;
-const mapAssetRevision = 'a39f0c18a3def999';
+const mapAssetRevision = '3dc866708d11d4d0';
 const nodeMetaLabels = {
     transportTitle: t('nodes.nodeMetaTransport'),
     securityTitle: t('nodes.nodeMetaSecurity'),
@@ -939,6 +939,7 @@ function nodeMetaFor(node) {
 </style>
 
 <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+<% // Both map implementations use this single page-level dialog and script. %>
 <%- include('partials/rebuild-preview') %>
 <% if (nodes.some(node => node.cascadeRole === 'relay')) { %>
 <%- include('partials/rebuild-relay-retire') %>
@@ -1272,6 +1273,7 @@ window._networkI18n = {
     csrfOriginInvalid: <%- JSON.stringify(t('network.csrfOriginInvalid')) %>,
     csrfSavedDraft: <%- JSON.stringify(t('network.csrfSavedDraft')) %>,
     <% } %>
+    positionsSaveFailed: <%- JSON.stringify(t('network.positionsSaveFailed')) %>,
     deployQueued: <%- JSON.stringify(t('network.deployQueued')) %>,
     deployInProgress: <%- JSON.stringify(t('network.deployInProgress')) %>,
     operationApplied: <%- JSON.stringify(t('network.operationApplied')) %>,
@@ -1393,7 +1395,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=56ac1f773cd644f9' : '/js/network.min.js?v=ed888b4c279134a0'
+        window._c3Rebuild ? '/js/network.js?v=8329b7bb8c0b511d' : '/js/network.min.js?v=ceb598cb633c877f'
     ];
 
     let idx = 0;

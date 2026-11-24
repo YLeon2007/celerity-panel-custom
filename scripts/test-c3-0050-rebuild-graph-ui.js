@@ -76,7 +76,7 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         function changed() { if (observers.has(el)) queueMicrotask(observers.get(el)); }
         return el;
     }
-    for (const tag of tags(html.split('<script')[0])) {
+    for (const tag of tags(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, ''))) {
         const id = attr(tag, 'id');
         if (id) elements.set(id, element(tag));
     }
@@ -113,7 +113,7 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
             return match ? get('addLinkForm')[match[1]] : null; // no canvas animation or loading decoration
         },
         body: { appendChild(script) {
-            if (script.src.startsWith('/js/')) assetUrl = script.src;
+            if (/^\/js\/network(?:\.min)?\.js\?/.test(script.src)) assetUrl = script.src;
             script.onload(); // resolve external graph library loading without network
         } },
     };
@@ -165,7 +165,14 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         assert.deepEqual(errors, []);
     });
     const labels = html.match(/window\._networkRebuildPreviewI18n = [^\n]+/);
-    if (labels) vm.runInContext(labels[0], context);
+    const previewAsset = html.match(/src="(\/js\/rebuild-preview\.js\?v=[a-f0-9]{16})"/)?.[1];
+    if (rebuild) {
+        assert.ok(get('rebuildPreview') && labels && previewAsset, 'render the real shared Preview and its labels');
+        vm.runInContext(labels[0], context);
+        vm.runInContext(read('public' + previewAsset.split('?')[0]), context, { filename: previewAsset });
+    } else {
+        assert.equal(previewAsset, undefined);
+    }
     if (view === 'nodes') {
         const start = html.indexOf('window._networkCsrfToken =');
         const end = html.indexOf('// Restore network view after page load', start);

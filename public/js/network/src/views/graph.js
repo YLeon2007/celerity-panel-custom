@@ -1,5 +1,5 @@
 /**
- * Graph view: free-form read-only topology. Drag and layout are local to this view.
+ * Graph view: drag and layout stay local unless the operator saves positions.
  * Cytoscape owns positions, pan/zoom, node dragging and the dagre layout;
  * cards are an HTML overlay and edges an SVG overlay so they share the look
  * of the chains view (horizontal S-curves with status pills).
@@ -8,8 +8,9 @@
 import cytoscape from 'cytoscape';
 import cytoscapeDagre from 'cytoscape-dagre';
 import model from '../core/model.js';
+import { createRebuildClient, isObjectId, RebuildRequestError, SessionChanged } from '../core/api.js';
 import { t } from '../core/i18n.js';
-import { h, svg, icon, clear, tip } from '../ui/dom.js';
+import { h, svg, icon, clear, tip, toast } from '../ui/dom.js';
 import { ROLE_ORDER, roleName, roleTag, dot, pillContent, linkTip, nodeTip } from '../ui/format.js';
 
 let dagreRegistered = false;
@@ -36,7 +37,7 @@ const ROLE_VAR = {
     cdn: 'var(--nm-cdn)',
 };
 
-export function mount(el, { store, toolbar }) {
+export function mount(el, { store, toolbar, canSavePositions }) {
     ensureDagre();
     el.className = 'nmg';
 
@@ -100,12 +101,17 @@ export function mount(el, { store, toolbar }) {
     const fit = () => cy.animate({ fit: { eles: cy.nodes(':visible'), padding: 60 } }, { duration: 300 });
 
     const zoomBtn = (name, label, fn) => h('button', { type: 'button', title: label, 'aria-label': label, on: { click: fn } }, icon(name));
+    let savingPositions = false;
+    let layoutsInFlight = 0;
+    const saveBtn = canSavePositions === true ? zoomBtn('device-floppy', t('map.savePositions'), savePositions) : null;
+    if (saveBtn) saveBtn.disabled = true;
     el.append(h('div.nm-float.nm-zoom', null,
         zoomBtn('plus', t('map.zoomIn'), () => zoomAt(1.25)),
         zoomBtn('minus', t('map.zoomOut'), () => zoomAt(1 / 1.25)),
         h('hr'),
         zoomBtn('focus-centered', t('map.fitView'), fit),
-        zoomBtn('sitemap', t('map.autoLayout'), () => runLayout(true))));
+        zoomBtn('sitemap', t('map.autoLayout'), () => runLayout(true)),
+        saveBtn));
 
     el.append(h('div.nm-float.nm-legend', null,
         h('span', null, h('span.ln', { style: { borderColor: '#4ade80' } }), t('map.status.online')),
@@ -222,14 +228,19 @@ export function mount(el, { store, toolbar }) {
         renderChips();
         el.classList.toggle('nm-calm', index.links.size > MAX_ANIMATED);
         applyClasses();
+        updateSaveButton();
     }
 
     function runLayout(animate) {
         const layout = cy.layout({ ...LAYOUT, animate: !!animate, animationDuration: 350, fit: true });
+        layoutsInFlight++;
+        updateSaveButton();
         layout.one('layoutstop', () => {
+            layoutsInFlight--;
             cy.nodes().forEach(n => n.data('placed', true));
             needsFit = cy.width() === 0;
             renderOverlay();
+            updateSaveButton();
         });
         layout.run();
     }
@@ -239,6 +250,42 @@ export function mount(el, { store, toolbar }) {
         cy.fit(cy.nodes(':visible'), 60);
         if (cy.zoom() > 1.2) cy.zoom({ level: 1.2, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
         needsFit = false;
+    }
+
+    function isPersistable(n) {
+        return n.data('role') !== 'cdn' && (n.id() === model.INTERNET_ID || isObjectId(n.id()));
+    }
+
+    function updateSaveButton() {
+        if (saveBtn && !destroyed) saveBtn.disabled = savingPositions || layoutsInFlight > 0 || !cy.nodes().some(isPersistable);
+    }
+
+    async function savePositions() {
+        if (!saveBtn || saveBtn.disabled || destroyed) return;
+        savingPositions = true;
+        updateSaveButton();
+        try {
+            const positions = cy.nodes().filter(isPersistable).map(n => {
+                const { x, y } = n.position();
+                return { id: n.id(), x, y };
+            });
+            await createRebuildClient().savePositions(positions);
+            toast(t('positionsSaved'));
+        } catch (error) {
+            let detail = '';
+            if (error instanceof SessionChanged) detail = t('positionsSaveSessionChanged');
+            if (error instanceof RebuildRequestError && error.csrfRejected) {
+                detail = t({
+                    CSRF_TOKEN_INVALID: 'positionsSaveSessionChanged',
+                    CSRF_AUTH_REQUIRED: 'csrfAuthRequired',
+                    CSRF_ORIGIN_INVALID: 'csrfOriginInvalid',
+                }[error.body.code]);
+            }
+            toast(t('positionsSaveFailed') + (detail ? ` ${detail}` : ''), 'error');
+        } finally {
+            savingPositions = false;
+            updateSaveButton();
+        }
     }
 
     // ==================== CARDS ====================

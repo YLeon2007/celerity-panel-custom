@@ -1672,6 +1672,9 @@
     "csrfAuthRequired": "Sign in to the panel again, reopen the topology, then retry manually.",
     "csrfOriginInvalid": "Open the topology at the panel’s configured address before retrying. If this persists, check the proxy scheme and host.",
     "csrfSavedDraft": "The link was saved. Use Deploy on that link instead of saving it again.",
+    "positionsSaved": "Map positions saved.",
+    "positionsSaveFailed": "Saving map positions was not confirmed.",
+    "positionsSaveSessionChanged": "Reload the topology page, sign in again if needed, then save manually.",
     "deployQueued": "Topology deployment queued",
     "deployInProgress": "Deployment in progress",
     "operationApplied": "Configuration applied",
@@ -1935,6 +1938,7 @@
       "zoomOut": "Zoom out",
       "fitView": "Fit to screen (F)",
       "autoLayout": "Auto layout",
+      "savePositions": "Save map positions",
       "legendInactive": "Inactive / unverified",
       "layerCascades": "Cascades",
       "layerSolo": "Standalone",
@@ -1945,10 +1949,32 @@
       "noGeoHint": "These nodes have no country flag, so they are not on the map.",
       "geoApproxHint": "Locations are approximate — based on the node flag country",
       "readOnlyNotice": "This map is read-only. Use the classic map to make changes.",
+      "rebuild": {
+        "previewUnavailable": "A valid Rebuild preview is unavailable. Nothing was applied.",
+        "previewChanged": "The topology or configuration changed. Review the map and request a new preview.",
+        "sessionChanged": "This panel session could not authorize the action. Reload the map and sign in again if needed.",
+        "kcpRefused": "mKCP settings were rejected. Check the transport settings.",
+        "writeUnconfirmed": "The Rebuild result is unconfirmed. Check the topology before taking another action.",
+        "saveUnconfirmed": "Draft save is unconfirmed. Check the topology before submitting again.",
+        "draftSaved": "Draft saved. Deployment was not confirmed.",
+        "applied": "Rebuild changes applied.",
+        "removed": "Link removed.",
+        "healthStatus": "Current link status: {status}",
+        "healthStaged": "Staged",
+        "healthUnavailable": "Could not check the link status."
+      },
+      "linkEditNotice": "Use the classic map to create or edit links.",
+      "linkActions": {
+        "deploy": "Apply link",
+        "deployChain": "Apply chain",
+        "checkHealth": "Check connection",
+        "remove": "Delete link",
+        "reconnectHint": "Edit the link and apply the changes."
+      },
       "portalExitSettings": "Exits in subscription",
       "tunnelUnknown": "Connection is unconfirmed",
       "openClassic": "Open classic map",
-      "openModern": "Open read-only map"
+      "openModern": "Open modern map"
     }
   },
   "mcp": {

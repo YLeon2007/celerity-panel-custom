@@ -30,6 +30,8 @@ export function createStore({ isVisible }) {
     let pollTimer = null;
     let observationTimer = null;
     let inflight = null;
+    let queuedRefresh = null;
+    let generation = 0;
 
     function on(evt, fn) {
         if (!listeners.has(evt)) listeners.set(evt, new Set());
@@ -66,10 +68,12 @@ export function createStore({ isVisible }) {
 
     async function fetchTopology({ silent } = {}) {
         if (inflight) return inflight;
+        const started = generation;
         if (!silent) { state.loading = true; emit('loading', true); }
         inflight = (async () => {
             try {
                 const topo = await getTopology();
+                if (started !== generation) return;
                 const index = model.buildIndex(topo);
                 const key = model.structureKey(index);
                 const structural = !state.loaded || key !== state.key;
@@ -84,13 +88,27 @@ export function createStore({ isVisible }) {
                 }
                 emit('data', { structural });
             } catch (err) {
-                emit('error', err);
+                if (started === generation) emit('error', err);
             } finally {
                 inflight = null;
                 if (!silent) { state.loading = false; emit('loading', false); }
             }
         })();
         return inflight;
+    }
+
+    function refreshAfterWrite() {
+        // A poll started before the mutation settled is not a fresh readback.
+        // Drop its result, then fetch after the write, even on a hidden map.
+        generation++;
+        if (!inflight) return fetchTopology({ silent: true });
+        if (!queuedRefresh) {
+            queuedRefresh = inflight.then(() => {
+                queuedRefresh = null;
+                return fetchTopology({ silent: true });
+            });
+        }
+        return queuedRefresh;
     }
 
     function selectionExists(sel) {
@@ -166,6 +184,7 @@ export function createStore({ isVisible }) {
         emit,
         load: () => fetchTopology(),
         refresh: () => fetchTopology({ silent: true }),
+        refreshAfterWrite,
         startPolling,
         stopPolling,
         resume,

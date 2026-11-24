@@ -1678,6 +1678,14 @@
     "rebuildCoreTooOld": "所选拓扑中有节点的 Xray 核心版本过旧。请升级相关节点后再应用。",
     "rebuildCoreVersionUnknown": "无法验证所选拓扑中的 Xray 核心版本。请检查相关节点后再应用。",
     "editLink": "编辑链路",
+    "csrfTokenInvalid": "无法刷新会话令牌。请重新加载拓扑页面，必要时重新登录，然后手动重试。",
+    "csrfTokenRefreshed": "会话令牌已刷新。请检查拓扑，然后手动重试。",
+    "csrfAuthRequired": "请重新登录面板，打开拓扑页面，然后手动重试。",
+    "csrfOriginInvalid": "请通过面板配置的地址打开拓扑页面后重试。如果问题仍然存在，请检查代理的协议和主机名。",
+    "csrfSavedDraft": "链路已保存。请应用此链路，无需再次保存。",
+    "positionsSaved": "地图位置已保存。",
+    "positionsSaveFailed": "未能确认地图位置已保存。",
+    "positionsSaveSessionChanged": "请重新加载拓扑页面，必要时重新登录，然后手动保存。",
     "tunnelSecurity": "安全",
     "tunnelEncryption": "VLESS 隧道加密",
     "tunnelEncryptionHint": "如果服务商限制或阻断节点之间的加密流量，请关闭此选项。",
@@ -1929,6 +1937,7 @@
       "zoomOut": "缩小",
       "fitView": "适应屏幕 (F)",
       "autoLayout": "自动布局",
+      "savePositions": "保存地图位置",
       "legendInactive": "不活跃 / 未验证",
       "layerCascades": "级联",
       "layerSolo": "独立节点",
@@ -1939,10 +1948,32 @@
       "noGeoHint": "这些节点没有国家旗帜，因此不在地图上显示。",
       "geoApproxHint": "位置为近似值，基于节点旗帜的国家",
       "readOnlyNotice": "此地图仅供查看。如需修改，请打开经典地图。",
+      "rebuild": {
+        "previewUnavailable": "无法取得有效的 Rebuild 预览。未应用更改。",
+        "previewChanged": "拓扑或配置已更改。请检查地图并重新预览。",
+        "sessionChanged": "当前面板会话未能授权此操作。请刷新地图，必要时重新登录。",
+        "kcpRefused": "mKCP 设置被拒绝。请检查传输参数。",
+        "writeUnconfirmed": "Rebuild 结果未确认。请先检查拓扑，再执行其他操作。",
+        "saveUnconfirmed": "无法确认草稿是否已保存。请先检查拓扑，不要直接重复提交。",
+        "draftSaved": "草稿已保存。部署尚未确认。",
+        "applied": "Rebuild 更改已应用。",
+        "removed": "连接已删除。",
+        "healthStatus": "当前连接状态：{status}",
+        "healthStaged": "等待部署",
+        "healthUnavailable": "无法检查连接状态。"
+      },
+      "linkEditNotice": "请在经典地图中创建或编辑链路。",
+      "linkActions": {
+        "deploy": "应用链路",
+        "deployChain": "应用整条级联链",
+        "checkHealth": "检查连接",
+        "remove": "删除链路",
+        "reconnectHint": "编辑链路并应用更改。"
+      },
       "portalExitSettings": "订阅中的出口",
       "tunnelUnknown": "连接状态未经确认",
       "openClassic": "打开经典地图",
-      "openModern": "打开只读地图"
+      "openModern": "打开新版地图"
     }
   },
   "mcp": {

@@ -1,4 +1,4 @@
-# Network map 4(a): read-only frontend build
+# Network map: offline frontend build
 
 Use `npm run build:network` and `npm run build:vendor` in a developer checkout with the locked dev dependencies. Neither command runs in the production image. Commit the resulting `public/js/network/dist/` as a unit, remove obsolete chunks, and set the entry and CSS cache keys in the nodes templates to the first 16 characters of the corresponding SHA-256 digests. The mounted loader test checks the keys against the actual files.
 
@@ -10,4 +10,4 @@ To reproduce these particular checked-in bytes without network, export that upst
 node docs/network-map-build/replay-dist.cjs /path/to/upstream /path/to/candidate /path/to/tools/node_modules
 ```
 
-The replay checks SHA-256 of both renderer inputs, their bindings, and the absence of external JS imports. On TEST use `/panel/nodes?map=modern` or `/panel/nodes?map=classic`; the latter opens the original Rebuild map. The upstream action and form sources are retained but not imported by the entry or lazy views. The client has no write methods; enabling Rebuild actions and its link editor belongs to the next deliveries.
+The replay checks SHA-256 of both renderer inputs, their bindings, and the absence of external JS imports. On TEST use `/panel/nodes?map=modern` or `/panel/nodes?map=classic`; the latter opens the original Rebuild map. In stage 4(b), real links use the existing Rebuild Preview and explicit confirmation for deploy, chain deploy and removal. Opening the map does not submit writes. Saving graph coordinates is separate from applying node configuration. The modern link form is deferred to 4(c).

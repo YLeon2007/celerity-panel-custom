@@ -1,5 +1,5 @@
 /**
- * Read-only Rebuild network map entry point (loaded as an ES module the first time the
+ * Rebuild network map entry point (loaded as an ES module the first time the
  * "Network map" tab is opened on the nodes page).
  *
  * Views share one store and one inspector and implement:
@@ -8,6 +8,7 @@
  */
 
 import { createStore } from './core/store.js';
+import { createActions } from './core/actions.js';
 import { t } from './core/i18n.js';
 import { h, icon, clear, toast } from './ui/dom.js';
 import { createToolbar } from './ui/toolbar.js';
@@ -28,6 +29,7 @@ function boot() {
 
     const isVisible = () => viewRoot && viewRoot.style.display !== 'none';
     const store = createStore({ isVisible });
+    const actions = root.dataset.linkActions === 'true' ? createActions(store) : null;
 
     const barEl = root.querySelector('.nm-bar');
     const stageEl = root.querySelector('.nm-stage');
@@ -41,7 +43,7 @@ function boot() {
     const focusInView = sel => { if (view && view.focus) view.focus(sel); };
 
     const toolbar = createToolbar(barEl, { store, onGoto: focusInView });
-    const inspector = createInspector(inspEl, { store, onGoto: focusInView });
+    const inspector = createInspector(inspEl, { store, actions, onGoto: focusInView });
 
     // ==================== STATE OVERLAY ====================
 
@@ -99,7 +101,7 @@ function boot() {
 
         const el = h('div');
         stageEl.appendChild(el);
-        view = mod.mount(el, { store, toolbar });
+        view = mod.mount(el, { store, toolbar, canSavePositions: root.dataset.savePositions === 'true' });
         if (store.state.loaded) view.update({ type: 'data', structural: true });
         const sel = store.state.selection;
         if (sel) focusInView(sel);
