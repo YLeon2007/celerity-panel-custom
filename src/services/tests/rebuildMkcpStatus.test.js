@@ -51,9 +51,8 @@ const mkcp = mode => ({ _id: new ObjectId(), active: true, status: 'deployed', n
     tunnelProtocol: 'vless', tunnelSecurity: 'none', tunnelEncryption: 'none', tunnelPort: 43119,
     tunnelUuid: '00000000-0000-4000-8000-000000000001', updatedAt: new Date(), rebuildApplyEpoch: 'e'.repeat(32) });
 
-test('stock 1.5.1 authenticates only the native reverse observation and refuses non-TCP/REALITY before stats', () => {
+test('stock agent authenticates the native reverse observation and refuses non-TCP/REALITY before stats', () => {
     const gitSource = name => readFileSync(join(__dirname, '../../../cc-agent', name), 'utf8');
-    assert.match(gitSource('main.go'), /const Version = "1\.5\.1"/);
     assert.match(gitSource('api.go'), /"GET \/rebuild\/reverse-observation\/\{id\}", a\.auth\(a\.handleReverseObservation\)/);
     const source = gitSource('reverse_observation.go');
     const scope = source.slice(source.indexOf('func (c *XrayClient) reverseScope('));

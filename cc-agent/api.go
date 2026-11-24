@@ -39,6 +39,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /users/{email}", a.auth(a.denyHTTPMutation(a.handleRemoveUser)))
 	mux.HandleFunc("GET /stats", a.auth(a.handleStats))
 	mux.HandleFunc("GET /online", a.auth(a.handleOnline))
+	mux.HandleFunc("GET /online-ips", a.auth(a.handleOnlineIPs))
 	mux.HandleFunc("GET /rebuild/reverse-observation/{id}", a.auth(a.handleReverseObservation))
 	mux.HandleFunc("POST /restart", a.auth(a.denyHTTPMutation(a.handleRestart)))
 }
