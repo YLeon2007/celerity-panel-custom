@@ -5,6 +5,28 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.5.0 — Reality Guard, VLESS Encryption, mKCP и карта Rebuild / Reality Guard, VLESS Encryption, mKCP and the Rebuild map
+
+### RU
+
+- **Reality Guard:** уведомляет о подтверждённых сбоях публичных целей REALITY на подходящих клиентских нодах `standalone` и `portal`. По умолчанию выключен глобально и на каждой ноде; цели автоматически не меняются.
+- **VLESS Encryption:** включается отдельно для клиентских входов Xray. Для аутентификации сервера доступны X25519 и, при наличии поддержки, ML-KEM-768. Без включения подписки не меняются. Сохранение ноды и Apply не меняют шифрование защищённых входов Rebuild.
+- **Связи mKCP в Rebuild:** UDP, Xray 26.6.1+ на обоих концах, защита `none` или TLS, не REALITY. Сохраните черновик, проверьте Preview и подтвердите Apply. `cc-agent` 1.5.1 не подтверждает работу mKCP.
+- **Карта Rebuild:** Цепочки, Граф и Карта. Новая связь сначала сохраняется как черновик; отмена Preview его не удаляет. Применение только по явному подтверждению. Статус «не проверено» отличается от ошибки и онлайн. Правка существующих связей — через `?map=classic`.
+- **Firefox и CSRF:** `Referrer-Policy: same-origin` не передаёт реферер вовне. Защищённые операции записи с `Origin: null` требуют `Sec-Fetch-Site: same-origin` и действительный CSRF-токен.
+
+[Памятка оператора](docs/release-v1.5.0.ru.md).
+
+### EN
+
+- **Reality Guard:** reports confirmed failures of public REALITY targets on eligible `standalone` and `portal` client nodes. Off globally and on every node by default; targets are never replaced automatically.
+- **VLESS Encryption:** opt-in per Xray client inbound, with X25519 and, where supported, ML-KEM-768 for server authentication. Existing subscriptions stay unchanged when it is off. Node Save and Apply do not change encryption on protected Rebuild inbounds.
+- **mKCP links in Rebuild:** UDP, Xray 26.6.1+ at both endpoints, `none` or TLS security, not REALITY. Save the draft, review Preview, and confirm Apply. `cc-agent` 1.5.1 cannot verify mKCP at runtime.
+- **Rebuild map:** Chains, Graph, and Map views. New links are saved as drafts; canceling Preview keeps the draft. Apply requires explicit confirmation. Unverified is distinct from error and online. Edit existing links with `?map=classic`.
+- **Firefox and CSRF:** `Referrer-Policy: same-origin` keeps referrers off external requests. Protected writes with `Origin: null` require `Sec-Fetch-Site: same-origin` and a valid CSRF token.
+
+[Operator release notes](docs/release-v1.5.0.md).
+
 ## v1.4.2 — Rebuild, L2TP, API и MCP / Rebuild, L2TP, API and MCP
 
 ### RU
