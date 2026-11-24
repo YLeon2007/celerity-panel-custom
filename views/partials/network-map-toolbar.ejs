@@ -1,0 +1,11 @@
+<div class="filters-bar" role="group" aria-label="<%= t('network.map.viewSwitch') %>">
+    <% for (const [view, label, icon] of [['chains', 'Chains', 'route'], ['graph', 'Graph', 'topology-star-3'], ['geo', 'Geo', 'world']]) { %>
+        <button type="button" class="btn btn-sm" data-nm-view="<%= view %>" title="<%= t(`network.map.view${label}Hint`) %>" aria-pressed="false">
+            <i class="ti ti-<%= icon %>" aria-hidden="true"></i> <%= t(`network.map.view${label}`) %>
+            <% if (view === 'geo') { %><span class="nm-view-hint"><%= t('network.map.overview') %></span><% } %>
+        </button>
+    <% } %>
+    <button type="button" class="btn btn-sm" id="btnNetworkRefresh" title="<%= t('network.refresh') %>" aria-label="<%= t('network.refresh') %>">
+        <i class="ti ti-refresh" aria-hidden="true"></i>
+    </button>
+</div>

@@ -234,6 +234,10 @@ router.get('/', async (req, res) => {
 
 // ==================== NODES ====================
 
+function mapVariant(value) {
+    return value === 'classic' || value === 'modern' ? value : null;
+}
+
 // GET /panel/nodes - Node list
 router.get('/nodes', async (req, res) => {
     try {
@@ -251,6 +255,8 @@ router.get('/nodes', async (req, res) => {
         const ipProtocolCount = {};
         nodes.forEach(n => { ipProtocolCount[n.ip] = (ipProtocolCount[n.ip] || 0) + 1; });
 
+        const variant = mapVariant(req.query.map);
+        const nodesMapQuery = variant ? `map=${variant}` : req.query.view === 'network' ? 'view=network' : '';
         render(res, 'nodes', {
             title: res.locals.locales.nodes.title,
             page: 'nodes',
@@ -262,6 +268,8 @@ router.get('/nodes', async (req, res) => {
             panelDomain: config.PANEL_DOMAIN || '',
             buildNodeUiMeta,
             realityGuardView: realityGuardView(guardEnabled, rawNodes),
+            useModernMap: res.locals.c3Rebuild === true && variant !== 'classic',
+            nodesMapQuery,
         });
     } catch (error) {
         res.status(500).send('Error: ' + error.message);
@@ -1383,7 +1391,8 @@ router.get('/nodes/:id/terminal', async (req, res) => {
 
 // GET /panel/network - Redirect to nodes page (network map is a tab there)
 router.get('/network', (req, res) => {
-    res.redirect('/panel/nodes');
+    const variant = mapVariant(req.query.map);
+    res.redirect(`/panel/nodes?${variant ? `map=${variant}` : 'view=network'}`);
 });
 
 // ==================== STATS ====================

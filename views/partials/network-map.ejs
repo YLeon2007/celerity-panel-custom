@@ -1,0 +1,31 @@
+<%
+// Match the client namespace (no leading `network.`) without shipping the legacy action strings.
+const readLabels = [
+    'refresh', 'loadingTopology', 'noNodesOrLinks', 'networkError', 'openNode', 'routePath',
+    'mkcpAppliedUnverified', 'mkcpRuntimeUnsupported', 'mkcpApplyUnconfirmed',
+];
+const networkI18n = Object.fromEntries(readLabels.map(key => [key, t(`network.${key}`)]));
+networkI18n.portalExitSettings = t('network.map.portalExitSettings');
+networkI18n.tunnelUnknown = t('network.map.tunnelUnknown');
+networkI18n.terminal = t('nodes.terminal');
+networkI18n.sshNotConfigured = t('nodes.sshNotConfigured');
+networkI18n.map = locales.network.map;
+const json = JSON.stringify(networkI18n).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+%>
+<link rel="stylesheet" href="/css/network-map.css?v=fa65def33febe72a">
+<script type="application/json" id="networkI18n"><%- json %></script>
+<div class="nm-read-only-note">
+    <p><%= t('network.map.readOnlyNotice') %></p>
+    <a class="btn btn-sm" href="/panel/nodes?map=classic"><%= t('network.map.openClassic') %></a>
+</div>
+<div class="network-page" id="networkRoot" data-read-only="true">
+    <div class="nm-bar"></div>
+    <div class="nm-body">
+        <div class="nm-stage"></div>
+        <aside class="nm-insp" aria-label="<%= t('network.map.inspector') %>"></aside>
+        <div class="nm-state" role="status">
+            <i class="ti ti-loader-2 nm-spin" aria-hidden="true"></i>
+            <p><%= t('network.loadingTopology') %></p>
+        </div>
+    </div>
+</div>

@@ -1,4 +1,8 @@
 <%
+const modernMap = typeof useModernMap !== 'undefined' && useModernMap;
+const openMap = typeof nodesMapQuery !== 'undefined' && Boolean(nodesMapQuery);
+const rebuildClassicMap = typeof c3Rebuild !== 'undefined' && c3Rebuild && !modernMap && openMap;
+const mapAssetRevision = 'a39f0c18a3def999';
 const nodeMetaLabels = {
     transportTitle: t('nodes.nodeMetaTransport'),
     securityTitle: t('nodes.nodeMetaSecurity'),
@@ -25,18 +29,18 @@ function nodeMetaFor(node) {
 <div class="page-header sticky-header">
     <div class="page-header-left">
         <div class="view-tabs">
-            <button class="view-tab active" id="tabList" onclick="switchNodesView('list')">
+            <button class="view-tab<%= openMap ? '' : ' active' %>" id="tabList" onclick="switchNodesView('list')">
                 <i class="ti ti-list"></i> <%= t('nodes.title') %>
                 <span class="tab-badge"><%= nodes.length %></span>
             </button>
-            <button class="view-tab" id="tabNetwork" onclick="switchNodesView('network')">
+            <button class="view-tab<%= openMap ? ' active' : '' %>" id="tabNetwork" onclick="switchNodesView('network')">
                 <i class="ti ti-topology-star-3"></i> <%= t('network.title') %>
                 <span class="beta-badge" style="margin-left:4px"><%= t('network.betaBadge') %></span>
                 <% if (linksCount) { %><span class="tab-badge"><%= linksCount %></span><% } %>
             </button>
         </div>
     </div>
-    <div class="page-header-center" id="listFilters">
+    <div class="page-header-center" id="listFilters"<% if (openMap) { %> style="display:none"<% } %>>
         <div class="filters-bar">
             <select id="filterStatus" class="filter-select" onchange="applyFilters()">
                 <option value=""><%= t('nodes.allStatuses') %></option>
@@ -60,7 +64,10 @@ function nodeMetaFor(node) {
             <span id="resultsCount" class="filter-count"></span>
         </div>
     </div>
-    <div class="page-header-center" id="networkToolbar" style="display:none">
+    <div class="page-header-center" id="networkToolbar"<% if (modernMap) { %> data-network-map="modern"<% } %><% if (!openMap) { %> style="display:none"<% } %>>
+        <% if (modernMap) { %>
+        <%- include('partials/network-map-toolbar') %>
+        <% } else { %>
         <div class="filters-bar">
             <button class="btn btn-sm" id="btnAutoLayout" title="<%= t('network.autoLayout') %>">
                 <i class="ti ti-layout-distribute-horizontal"></i> <%= t('network.autoLayout') %>
@@ -72,17 +79,23 @@ function nodeMetaFor(node) {
                 <i class="ti ti-refresh"></i>
             </button>
         </div>
+        <% } %>
     </div>
-    <div class="page-header-right" id="listActions">
+    <div class="page-header-right" id="listActions"<% if (openMap) { %> style="display:none"<% } %>>
         <a href="/panel/broadcast-terminal" target="_blank" class="btn"><i class="ti ti-broadcast"></i> <%= t('nodes.broadcastTerminal') %></a>
         <a href="/panel/nodes/add" class="btn btn-primary"><i class="ti ti-server-2"></i> <%= t('nodes.addNode') %></a>
     </div>
-    <div class="page-header-right" id="networkActions" style="display:none">
+    <% if (!modernMap) { %>
+    <div class="page-header-right" id="networkActions"<% if (!openMap) { %> style="display:none"<% } %>>
+        <% if (rebuildClassicMap) { %>
+        <a class="btn" href="/panel/nodes?map=modern"><%= t('network.map.openModern') %></a>
+        <% } %>
         <button class="btn btn-primary" id="btnAddLink"><i class="ti ti-plus"></i> <%= t('network.addLink') %></button>
     </div>
+    <% } %>
 </div>
 
-<div id="viewList">
+<div id="viewList"<% if (openMap) { %> style="display:none"<% } %>>
 <div class="card">
     <div class="card-body no-padding">
         <div class="table-wrapper">
@@ -385,8 +398,11 @@ function nodeMetaFor(node) {
 </div>
 </div><!-- /viewList -->
 
-<!-- Network Map View (hidden by default, loaded on demand) -->
-<div id="viewNetwork" style="display:none">
+<!-- Network Map View (scripts load when the tab opens) -->
+<div id="viewNetwork"<% if (modernMap) { %> data-network-map="modern"<% } %><% if (!openMap) { %> style="display:none"<% } %>>
+    <% if (modernMap) { %>
+    <%- include('partials/network-map') %>
+    <% } else { %>
     <link rel="stylesheet" href="/css/network.min.css">
     <div class="network-page">
         <div id="topologyReentryNotice" hidden>
@@ -750,6 +766,7 @@ function nodeMetaFor(node) {
             </div>
         </div>
     </div>
+    <% } %>
 </div><!-- /viewNetwork -->
 
 <div id="toast" class="toast"></div>
@@ -1166,8 +1183,11 @@ async function deleteNode(id) {
 // ==================== View Tabs ====================
 
 // Auto-restore network tab if navigated from node-form (set by node-form.ejs)
-const _restoreNetworkView = sessionStorage.getItem('nodesView') === 'network';
-if (_restoreNetworkView) sessionStorage.removeItem('nodesView');
+let _restoreNetworkView = false;
+try {
+    _restoreNetworkView = sessionStorage.getItem('nodesView') === 'network';
+    if (_restoreNetworkView) sessionStorage.removeItem('nodesView');
+} catch (_) { /* session storage can be disabled */ }
 
 let networkLoaded = false;
 
@@ -1189,7 +1209,7 @@ function switchNodesView(view) {
         listFilters.style.display = 'none';
         networkToolbar.style.display = '';
         listActions.style.display = 'none';
-        networkActions.style.display = '';
+        if (networkActions) networkActions.style.display = '';
 
         if (!networkLoaded) {
             loadNetworkScripts();
@@ -1206,10 +1226,11 @@ function switchNodesView(view) {
         listFilters.style.display = '';
         networkToolbar.style.display = 'none';
         listActions.style.display = '';
-        networkActions.style.display = 'none';
+        if (networkActions) networkActions.style.display = 'none';
     }
 }
 
+<% if (!modernMap) { %>
 window._networkCsrfToken = <%- JSON.stringify(csrfToken || '') %>;
 window._networkI18n = {
     selectPortal: <%- JSON.stringify(t('network.selectPortal')) %>,
@@ -1386,9 +1407,17 @@ function loadNetworkScripts() {
     }
     next();
 }
+<% } else { %>
+function loadNetworkScripts() {
+    const script = document.createElement('script');
+    script.type = 'module';
+    script.src = '/js/network/dist/index.js?v=<%= mapAssetRevision %>';
+    document.body.appendChild(script);
+}
+<% } %>
 
 // Restore network view after page load
-if (_restoreNetworkView) {
+if (<%= openMap ? 'true' : 'false' %> || _restoreNetworkView) {
     switchNodesView('network');
 }
 

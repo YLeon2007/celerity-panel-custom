@@ -97,8 +97,7 @@ async function main() {
         }` });
         for (const lang of ['en', 'ru']) {
             writes.length = 0;
-            await browser.navigate(origin + '/panel/nodes?lang=' + lang);
-            await browser.click('#tabNetwork');
+            await browser.navigate(origin + '/panel/nodes?map=classic&lang=' + lang);
             const assetExpression = `Array.from(document.scripts, s => s.src).find(src => src.includes('/js/network.js?'))`;
             await browser.wait(assetExpression);
             const url = await browser.evaluate(assetExpression);
