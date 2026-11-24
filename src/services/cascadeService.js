@@ -21,10 +21,11 @@ const cache = require('./cacheService');
 const logger = require('../utils/logger');
 const webhook = require('./webhookService');
 const { isRebuildEnabled } = require('./rebuildMode');
-const { clearOldReverseHealth, projectReverseHealth, observationSelect, createReverseObserver } = require('./rebuildReverseLinkHealth');
+const { CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE, assertClassicTunnelTransport } = require('../utils/cascadeTransport');
+const { clearOldReverseHealth, hasKcpStatus, projectLinkHealth, observationSelect, createReverseObserver } = require('./rebuildReverseLinkHealth');
 const { trackLegacyCascadeUndeploy } = require('../modules/relay-l2tp/services/legacyCascadeUndeploy');
 
-const TOPOLOGY_CACHE_KEY = 'c3:cascade:topology';
+const TOPOLOGY_CACHE_KEY = 'c3:cascade:topology:kcp-status-v1';
 const TOPOLOGY_CACHE_TTL = 15;
 const reverseObserver = createReverseObserver({ Link: CascadeLink, Node: HyNode,
     request: (...args) => require('./syncService').readRebuildReverseObservation(...args) });
@@ -186,6 +187,7 @@ class CascadeService {
                 await scopedExecutionContext.verify();
             }
             const initial = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
+            assertClassicTunnelTransport(initial);
             if (!initial || initial.active !== true || (initial.mode || 'reverse') !== 'reverse') {
                 throw scopedFailure('CLASSIC_SCOPED_REVERSE_LINK_REQUIRED');
             }
@@ -208,6 +210,9 @@ class CascadeService {
             return result;
         } catch (error) {
             // Never forward transport, generated config, credential or journal text.
+            if (error?.code === CLASSIC_KCP_REBUILD_ONLY) {
+                throw phase.failure(Object.assign(new Error(CLASSIC_KCP_MESSAGE), { code: CLASSIC_KCP_REBUILD_ONLY }));
+            }
             const code = typeof error?.code === 'string'
                 && /^(CLASSIC_SCOPED_[A-Z0-9_]+|CLASSIC_CONFIG_WRITE_[A-Z_]+|NODE_OPERATION_LOCK_CONFLICT)$/.test(error.code)
                 ? error.code : 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN';
@@ -259,6 +264,7 @@ class CascadeService {
                 }
             }
             const confirmed = rows.filter(row => selected.has(scopedId(row)));
+            assertClassicTunnelTransport(target, ...confirmed);
             if (!target || target.active !== true || (target.mode || 'reverse') !== 'reverse'
                 || !['pending', 'error', ...SCOPED_PRESERVED_STATUSES].includes(target.status)
                 || !Number.isSafeInteger(target.tunnelPort) || target.tunnelPort < 1 || target.tunnelPort > 65535
@@ -753,6 +759,7 @@ class CascadeService {
      * @returns {Promise<{success: boolean, error?: string}>}
      */
     async deployLink(link) {
+        if (hasKcpStatus(link)) return { success: false, code: CLASSIC_KCP_REBUILD_ONLY, error: CLASSIC_KCP_MESSAGE };
         const linkId = link._id;
         logger.info(`[Cascade] Deploying ${link.mode || 'reverse'} link ${link.name} (${linkId})`);
 
@@ -838,6 +845,7 @@ class CascadeService {
      * (remove cascade inbound) if it's an existing Xray node, or stop xray-bridge.
      */
     async undeployLink(link) {
+        assertClassicTunnelTransport(link);
         return trackLegacyCascadeUndeploy(() => this._undeployLinkWithCompletion(link));
     }
 
@@ -923,6 +931,9 @@ class CascadeService {
 
         if (orderedLinks.length === 0) {
             return { success: true, deployed: 0, errors: [], message: 'No active links found' };
+        }
+        if (orderedLinks.some(hasKcpStatus)) {
+            return { success: false, code: CLASSIC_KCP_REBUILD_ONLY, deployed: 0, errors: [CLASSIC_KCP_MESSAGE] };
         }
 
         logger.info(`[Cascade] Chain has ${orderedNodes.length} nodes, ${orderedLinks.length} links`);
@@ -1290,15 +1301,16 @@ class CascadeService {
      * Forward: verify TCP connectivity to Bridge's tunnel port.
      */
     async healthCheckLink(link) {
+        if (hasKcpStatus(link)) return false;
         const isForward = link.mode === 'forward';
         const rebuild = isRebuildEnabled();
         if (rebuild && !isForward) {
             await clearOldReverseHealth(CascadeLink, link._id);
             return reverseObserver.manual(link._id);
         }
-        // A rebuild forward observation must not overwrite a concurrently
-        // edited reverse draft or a retiring link. Classic is unchanged.
-        const filter = { _id: link._id };
+        // Do not publish an in-flight TCP sample after a switch to mKCP, even
+        // in Classic. Rebuild also fences concurrent draft/retirement edits.
+        const filter = { _id: link._id, tunnelTransport: { $ne: 'kcp' }, rebuildKcpApplied: { $exists: false } };
         if (rebuild) {
             if (!link.active || link.rebuildDelete || link.lifecycle
                 || !['deployed', 'online', 'offline'].includes(link.status)) return false;
@@ -1331,7 +1343,7 @@ class CascadeService {
                 },
             });
 
-            if (rebuild && result.matchedCount !== 1) return false;
+            if (result.matchedCount !== 1) return false;
             if (prevStatus !== newStatus) {
                 const event = healthy ? 'cascade.online' : 'cascade.offline';
                 webhook.emit(event, { linkId: link._id, name: link.name });
@@ -1357,6 +1369,7 @@ class CascadeService {
         const links = await CascadeLink.find({
             active: true,
             status: { $in: ['deployed', 'online', 'offline'] },
+            tunnelTransport: { $ne: 'kcp' }, rebuildKcpApplied: { $exists: false },
             ...(rebuild ? { mode: 'forward' } : {}),
         });
 
@@ -1392,7 +1405,7 @@ class CascadeService {
         }
 
         const linkQuery = CascadeLink.find({ active: true });
-        if (rebuild) linkQuery.select(observationSelect);
+        linkQuery.select(rebuild ? observationSelect : '+rebuildKcpApplied');
         const [allNodes, allLinks] = await Promise.all([
             // Virtual nodes have no IP/country and don't participate in the cascade.
             HyNode.find({ active: true, type: { $ne: 'virtual' } })
@@ -1424,7 +1437,7 @@ class CascadeService {
                 : undefined,
         }));
 
-        const visibleLinks = rebuild ? allLinks.map(link => projectReverseHealth(link)) : allLinks;
+        const visibleLinks = allLinks.map(link => projectLinkHealth(link, rebuild));
         const edges = visibleLinks.map(l => ({
             data: {
                 id: `link-${l._id}`,
@@ -1433,6 +1446,7 @@ class CascadeService {
                 target: String(l.bridgeNode?._id || l.bridgeNode),
                 label: l.name,
                 status: l.status,
+                ...(l.tunnelVerification ? { tunnelState: l.tunnelState, tunnelVerification: l.tunnelVerification } : {}),
                 ...(l.observationExpiresAt && rebuild ? { observationExpiresAt: l.observationExpiresAt } : {}),
                 tunnelPort: l.tunnelPort,
                 latencyMs: l.latencyMs,

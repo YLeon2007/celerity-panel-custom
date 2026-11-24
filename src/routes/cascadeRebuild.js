@@ -5,6 +5,10 @@ const {issuePanelCsrfToken, originMatchesHost, requirePanelCsrf}=require('./pane
 const {createRebuildService}=require('../services/rebuildService');
 const {componentFor,previewForError}=require('../services/rebuildCoordinator');
 const {neighborRefusalForError}=require('../services/rebuildNeighborRefusal');
+const {operationRefusalForError}=require('../services/rebuildKcpAdmission');
+const {detectLanguage,t}=require('../middleware/i18n');
+const {CASCADE_TRANSPORTS}=require('../utils/cascadeTransport');
+const {INVALID_KCP_LINK_SETTINGS,readKcpFields,assertKcpSecurity}=require('../services/cascadeDraftTransport');
 const fail=code=>Object.assign(new Error(code),{code});
 const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
 const objectId=id=>typeof id==='string'&&/^[a-f\d]{24}$/i.test(id);
@@ -31,6 +35,27 @@ function fingerprintIssueForError(error,code){
             fingerprint:publicFingerprints.has(fingerprint)?fingerprint:'unknown',allowed};
     }catch{return undefined;}
 }
+// API and panel clients use the same localized, plain-text refusal. Only typed
+// data from the admission policy is included, never raw runtime/driver errors.
+const udpPortCopy={
+    en:'Node {nodeName}: UDP port {port} is already reserved. Choose a different mKCP port.',
+    ru:'Нода {nodeName}: UDP-порт {port} уже занят. Выберите другой порт для mKCP.',
+    'zh-CN':'节点 {nodeName}：UDP 端口 {port} 已被占用。请选择其他 mKCP 端口。',
+};
+function formatOperationRefusal(req,res,error){
+    const refusal=operationRefusalForError(error);
+    if(!refusal)return;
+    const lang=res.locals.lang||detectLanguage(req);
+    const copy=(template,values)=>template.replace(/\{(\w+)\}/g,(_,key)=>values[key]??'');
+    const versionCopy=key=>t(`network.rebuildKcpVersion${key}`,lang);
+    const {code,minimumVersion}=refusal;
+    if(!refusal.issues)return {code,message:versionCopy('PreviewChanged')};
+    const transportCopy=code==='REBUILD_L2TP_KCP_LISTENER_UNSUPPORTED'
+        ?t('network.rebuildKcpL2tpListenerUnsupported',lang):(udpPortCopy[lang]||udpPortCopy.en);
+    const issues=refusal.issues.map(issue=>({ ...issue,message:copy(minimumVersion
+        ?versionCopy(issue.reason==='too_old'?'TooOld':'Unknown'):transportCopy, {...issue,minimumVersion}) }));
+    return {code,...(minimumVersion&&{minimumVersion}),issues,message:issues.map(issue=>issue.message).join(' ')};
+}
 const fields=('name mode tunnelPort tunnelProtocol tunnelSecurity tunnelEncryption tunnelTransport tunnelDomain tcpFastOpen tcpKeepAlive tcpNoDelay wsPath wsHost grpcServiceName xhttpPath xhttpHost xhttpMode muxEnabled muxConcurrency geoRouting priority autoDeploy realityDest realitySni realityShortIds').split(' ');
 
 // Mounted ONLY in rebuild, behind regular requireAuth. API key credentials are
@@ -41,11 +66,11 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     const outcome={};
     try{res.json(await fn(req,outcome));}catch(e){
         const rawCode=errorField(e,'code');
-        const refusal=neighborRefusalForError(e);
-        const code=typeof rawCode==='string'&&rawCode!=='REBUILD_RETIRE_NEIGHBOR_REFUSED'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(rawCode)?rawCode:'REBUILD_FAILED';
+        const refusal=formatOperationRefusal(req,res,e)??neighborRefusalForError(e);
+        const code=rawCode===INVALID_KCP_LINK_SETTINGS?rawCode:typeof rawCode==='string'&&rawCode!=='REBUILD_RETIRE_NEIGHBOR_REFUSED'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(rawCode)?rawCode:'REBUILD_FAILED';
         const preview=previewForError(e);
         const fingerprintIssue=fingerprintIssueForError(e,code);
-        res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:code==='REBUILD_INVALID_REQUEST'?400:409)
+        res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:(code==='REBUILD_INVALID_REQUEST'||code===INVALID_KCP_LINK_SETTINGS)?400:409)
             .json({error:refusal??{code},...(outcome.linkId?{desiredSaved:true,linkId:outcome.linkId}:{}),...(preview?{preview}:{}),...(fingerprintIssue?{fingerprintIssue}:{})});
     }
  };
@@ -82,12 +107,14 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     const source=b.portalNodeId??old[0],target=b.bridgeNodeId??old[1];
     if(!objectId(source)||!objectId(target)||source===target)throw fail('REBUILD_INVALID_REQUEST');
     if(editing&&(source!==old[0]||target!==old[1]))throw fail('REBUILD_REPLACE_WITH_DELETE_CREATE');
-    const inventory=await Node.find({_id:{$in:[source,target]},active:true,type:'xray'}).select('_id cascadeRole xray.realitySni xray.realityDest').lean();
+    const inventory=await Node.find({_id:{$in:[source,target]},active:true,type:'xray'}).select('_id cascadeRole xray.realitySni xray.realityDest ip').lean();
     const from=inventory.find(n=>String(n._id)===source),to=inventory.find(n=>String(n._id)===target);
     if(!from||!to||!['portal','relay'].includes(from.cascadeRole)||!['relay','bridge'].includes(to.cascadeRole))throw fail('REBUILD_INVALID_EDGE_ROLE');
     if(Object.hasOwn(b,'tunnelSecurity')&&!['none','tls','reality'].includes(b.tunnelSecurity))throw fail('REBUILD_INVALID_REQUEST');
     if(Object.hasOwn(b,'tunnelEncryption')&&!['vless-enc','none'].includes(b.tunnelEncryption))throw fail('REBUILD_INVALID_REQUEST');
-    if(!editing&&!Object.hasOwn(b,'tunnelSecurity'))link.tunnelSecurity='reality';
+    if(!editing&&!Object.hasOwn(b,'tunnelSecurity'))link.tunnelSecurity=b.tunnelTransport==='kcp'?'none':'reality';
+    const kcpFields=readKcpFields(b);
+    if(Object.hasOwn(b,'tunnelTransport')&&!CASCADE_TRANSPORTS.includes(b.tunnelTransport))throw fail('REBUILD_INVALID_REQUEST');
     for(const field of fields){
         if(!Object.hasOwn(b,field))continue;
         // Blank form controls are not a request to discard stored settings.
@@ -102,6 +129,8 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
         }
         link.set(field,value);
     }
+    assertKcpSecurity(link.tunnelTransport,link.tunnelSecurity);
+    for(const [key,value] of Object.entries(kcpFields))link.set(key,value);
     if(link.tunnelEncryption==='none'&&(link.tunnelSecurity!=='none'||(link.mode==='forward'&&link.tunnelProtocol!=='vless'))){
         if(b.tunnelEncryption==='none')throw fail('REBUILD_INVALID_REQUEST');
         // Leaving the applicable mode cancels the opt-out; a later edit must opt out again.
@@ -126,6 +155,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
         Object.assign(link,settings);
     }else if(Object.hasOwn(b,'realityFingerprint'))link.realityFingerprint=b.realityFingerprint;
     if(!Number.isInteger(link.tunnelPort)||link.tunnelPort<1||link.tunnelPort>65535||!Number.isSafeInteger(link.priority)||typeof link.name!=='string'||!link.name.trim())throw fail('REBUILD_INVALID_REQUEST');
+    if(link.tunnelTransport==='kcp')await service.verifyDraftKcp(link.toObject(),inventory,verify);
     if(link.tunnelSecurity==='tls')await service.verifyDraftTls(link.toObject(),verify);
     if(link.tunnelSecurity==='reality')link.realityFingerprint=await service.verifyDraftRealityFingerprint(link.toObject(),verify);
     await verify();link.status='pending';

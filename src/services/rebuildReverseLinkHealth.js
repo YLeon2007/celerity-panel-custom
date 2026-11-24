@@ -5,9 +5,11 @@ const { performance } = require('node:perf_hooks');
 
 const appliedStatuses = ['deployed', 'online', 'offline'];
 const isReverse = link => (link.mode ?? 'reverse') === 'reverse';
+const isKcp = link => link.tunnelTransport === 'kcp';
+const hasKcpStatus = link => isKcp(link) || link.rebuildKcpApplied !== undefined;
 const noObservation = { lastHealthCheck: null, latencyMs: null };
 const unverified = Object.freeze({ status: 'deployed', ...noObservation, lastError: '' });
-const observationSelect = '+rebuildApplied +rebuildApplyEpoch +rebuildReverseObservation';
+const observationSelect = '+rebuildApplied +rebuildApplyEpoch +rebuildReverseObservation +rebuildKcpApplied';
 const maxAgeMs = 90_000;
 const timeoutMs = 2_000; // Mongo reads/writes.
 // Agent samples the native heartbeat for 11s, with a 13s handler deadline.
@@ -17,16 +19,57 @@ const batchSize = 50;
 const sha256 = input => createHash('sha256').update(input).digest('hex');
 const id = value => String(value?._id ?? value);
 const objectId = value => /^[a-f0-9]{24}$/.test(value);
+
+// The existing applied tuple is relay authority and does not encode transport
+// or security. Keep that receipt unchanged. This separate display-only stamp
+// is written by Rebuild settlement, never by an observer or a draft writer.
+function kcpApplyFingerprint(link, epoch) {
+    return sha256(JSON.stringify(['rebuild-kcp-apply-v1', epoch, id(link._id), id(link.portalNode), id(link.bridgeNode),
+        link.mode, link.tunnelProtocol ?? 'vless', link.tunnelTransport, link.tunnelSecurity ?? 'none',
+        link.tunnelPort, link.tunnelUuid, link.tunnelEncryption, link.rebuildTlsServerName,
+        link.kcpHeader, link.kcpMtu, link.kcpTti, link.kcpUplinkCapacity, link.kcpDownlinkCapacity]));
+}
+
+function hasCurrentKcpApply(link) {
+    const { rebuildApplied: receipt, rebuildApplyEpoch: epoch, rebuildKcpApplied: stamp } = link;
+    const { mode = 'reverse', tunnelPort, tunnelUuid } = link;
+    const protocol = mode === 'reverse' ? 'vless' : (link.tunnelProtocol ?? 'vless');
+    return isKcp(link) && link.active === true && !link.rebuildDelete && !link.lifecycle
+        && ['none', 'tls'].includes(link.tunnelSecurity ?? 'none')
+        && ['forward', 'reverse'].includes(mode) && ['vless', 'vmess'].includes(protocol)
+        && [link._id, link.portalNode, link.bridgeNode].map(id).every(objectId) && id(link.portalNode) !== id(link.bridgeNode)
+        && Number.isInteger(tunnelPort) && tunnelPort >= 1 && tunnelPort <= 65535
+        && typeof tunnelUuid === 'string' && /^\S+$/.test(tunnelUuid)
+        && receipt && Object.keys(receipt).length === 5 && receipt.mode === mode && receipt.protocol === protocol
+        && receipt.port === tunnelPort && receipt.uuid === tunnelUuid
+        && id(receipt.listener) === id(mode === 'reverse' ? link.portalNode : link.bridgeNode)
+        && typeof epoch === 'string' && /^[a-f0-9]{32}$/.test(epoch) && stamp === kcpApplyFingerprint(link, epoch);
+}
+
+function projectLinkHealth(row, rebuild) {
+    if (!hasKcpStatus(row)) return rebuild ? projectReverseHealth(row) : row;
+    const { rebuildKcpApplied, rebuildApplied, rebuildApplyEpoch, rebuildReverseObservation,
+        observationExpiresAt, tunnelVerification, applicationState, routeState, clientReadiness,
+        xrayReadiness, pppReadiness, ...link } = typeof row.toObject === 'function' ? row.toObject() : row;
+    const applied = appliedStatuses.includes(link.status);
+    const proved = applied && rebuild && hasCurrentKcpApply(row);
+    // cc-agent 1.5.1's authenticated observation only supports the native
+    // reverse TCP/REALITY receiver. A success applying mKCP isn't a probe.
+    return { ...link, ...noObservation, tunnelState: 'unknown',
+        ...(applied ? { lastError: '', status: proved ? 'deployed' : 'pending',
+            tunnelVerification: proved ? 'mkcp_runtime_unsupported' : 'mkcp_apply_unconfirmed' } : {}) };
+}
+
 const tupleFilter = {
     active: true, mode: 'reverse', lifecycle: null, rebuildDelete: { $ne: true },
     status: { $in: appliedStatuses }, tunnelProtocol: 'vless', tunnelTransport: 'tcp', tunnelSecurity: 'reality',
-    'rebuildApplied.mode': 'reverse', 'rebuildApplied.protocol': 'vless',
+    'rebuildApplied.mode': 'reverse', 'rebuildApplied.protocol': 'vless', rebuildKcpApplied: { $exists: false },
 };
 
 function subject(link) {
     const { rebuildApplied: receipt, rebuildApplyEpoch: epoch, updatedAt, tunnelUuid, tunnelPort } = link;
     const linkId = id(link._id), listener = id(link.portalNode), dialer = id(link.bridgeNode);
-    if (!receipt || Object.keys(receipt).length !== 5 || link.active !== true || link.rebuildDelete || link.lifecycle
+    if (!receipt || Object.keys(receipt).length !== 5 || hasKcpStatus(link) || link.active !== true || link.rebuildDelete || link.lifecycle
         || !appliedStatuses.includes(link.status) || link.mode !== 'reverse'
         || link.tunnelSecurity !== 'reality' || link.tunnelProtocol !== 'vless' || link.tunnelTransport !== 'tcp'
         // The rebuild composer only enables VLESS decryption for security=none.
@@ -155,6 +198,7 @@ async function clearOldReverseHealth(Link, id) {
     const filter = {
         ...(id === undefined ? {} : { _id: id }),
         mode: { $in: ['reverse', null] }, // includes old rows without a mode
+        tunnelTransport: { $ne: 'kcp' }, rebuildKcpApplied: { $exists: false },
         active: true,
         rebuildDelete: { $ne: true },
         lifecycle: null,
@@ -171,4 +215,5 @@ async function clearOldReverseHealth(Link, id) {
     return oldDraft.modifiedCount + other.modifiedCount;
 }
 
-module.exports = { isReverse, projectReverseHealth, clearOldReverseHealth, unverified, observationSelect, createReverseObserver };
+module.exports = { isReverse, isKcp, hasKcpStatus, kcpApplyFingerprint, projectLinkHealth, clearOldReverseHealth,
+    unverified, observationSelect, createReverseObserver };

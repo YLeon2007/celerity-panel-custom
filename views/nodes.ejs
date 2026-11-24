@@ -509,6 +509,7 @@ function nodeMetaFor(node) {
                             <option value="ws">WebSocket</option>
                             <option value="grpc">gRPC</option>
                             <option value="splithttp">SplitHTTP</option>
+                            <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %><option value="kcp"><%= t('network.kcpTransport') %></option><% } %>
                         </select>
                     </div>
                     <div class="form-group">
@@ -574,6 +575,12 @@ function nodeMetaFor(node) {
                         </div>
                     </div>
                 </div>
+
+                <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+                    <%- include('partials/network-kcp') %>
+                <% } else { %>
+                    <p class="form-hint"><%= t('network.classicKcpRebuildOnly') %></p>
+                <% } %>
 
                 <!-- Advanced Options -->
                 <details class="form-details">
@@ -1232,6 +1239,12 @@ window._networkI18n = {
     reconnectFailed: <%- JSON.stringify(t('network.reconnectFailed')) %>,
     deployFailed: <%- JSON.stringify(t('network.deployFailed')) %>,
     <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
+    kcpTransport: <%- JSON.stringify(t('network.kcpTransport')) %>,
+    kcpInvalidLink: <%- JSON.stringify(t('network.kcpInvalidLink')) %>,
+    classicKcpRebuildOnly: <%- JSON.stringify(t('network.classicKcpRebuildOnly')) %>,
+    rebuildCoreTooOld: <%- JSON.stringify(t('network.rebuildCoreTooOld')) %>,
+    rebuildCoreVersionUnknown: <%- JSON.stringify(t('network.rebuildCoreVersionUnknown')) %>,
+    editLink: <%- JSON.stringify(t('network.editLink')) %>,
     csrfTokenInvalid: <%- JSON.stringify(t('network.csrfTokenInvalid')) %>,
     csrfTokenRefreshed: <%- JSON.stringify(t('network.csrfTokenRefreshed')) %>,
     csrfAuthRequired: <%- JSON.stringify(t('network.csrfAuthRequired')) %>,
@@ -1309,6 +1322,9 @@ window._networkI18n = {
     tunnelConnected: <%- JSON.stringify(t('network.tunnelConnected')) %>,
     tunnelDisconnected: <%- JSON.stringify(t('network.tunnelDisconnected')) %>,
     tunnelUnknown: <%- JSON.stringify(t('network.tunnelUnknown')) %>,
+    mkcpAppliedUnverified: <%- JSON.stringify(t('network.mkcpAppliedUnverified')) %>,
+    mkcpRuntimeUnsupported: <%- JSON.stringify(t('network.mkcpRuntimeUnsupported')) %>,
+    mkcpApplyUnconfirmed: <%- JSON.stringify(t('network.mkcpApplyUnconfirmed')) %>,
     operationProgress: <%- JSON.stringify(t('network.operationProgress')) %>,
     operationNode: <%- JSON.stringify(t('network.operationNode')) %>,
     phaseWaiting: <%- JSON.stringify(t('network.phaseWaiting')) %>,
@@ -1356,7 +1372,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=11d8e418581bae4a' : '/js/network.min.js?v=8c1440573d630ba3'
+        window._c3Rebuild ? '/js/network.js?v=56ac1f773cd644f9' : '/js/network.min.js?v=ed888b4c279134a0'
     ];
 
     let idx = 0;

@@ -1,5 +1,7 @@
 'use strict';
 
+const { assertKcpSecurity } = require('../../../services/cascadeDraftTransport');
+
 const { isDeepStrictEqual } = require('node:util');
 const {
     cascadePathIngressPort,
@@ -156,6 +158,7 @@ function buildCandidate(snapshot, mutation) {
                 linkId,
             });
         }
+        assertKcpSecurity(mutation.document.tunnelTransport, mutation.document.tunnelSecurity === undefined ? 'none' : mutation.document.tunnelSecurity);
         links = [...links, mutation.document];
     } else if (mutation.kind === 'link.update') {
         const linkId = entityId(mutation.id);
@@ -172,7 +175,9 @@ function buildCandidate(snapshot, mutation) {
             // still require a dedicated replacement contract. No in-use flag.
             assertLinkNotInInstalledRoute(snapshot, groups, linkId);
         }
-        links[linkIndex] = applyDraftLinkChanges(links[linkIndex], mutation.changes || {});
+        const updated = applyDraftLinkChanges(links[linkIndex], mutation.changes || {});
+        assertKcpSecurity(updated.tunnelTransport, updated.tunnelSecurity === undefined ? 'none' : updated.tunnelSecurity);
+        links[linkIndex] = updated;
     } else if (mutation.kind === 'link.delete') {
         const linkId = entityId(mutation.id);
         const linkIndex = links.findIndex(link => entityId(link) === linkId);

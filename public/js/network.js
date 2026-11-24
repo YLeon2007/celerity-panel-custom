@@ -93,6 +93,15 @@
         return TOPOLOGY_CAUSE_TEXT_RU[code] || null;
     }
 
+    function cascadeSettingsErrorText(causeCode) {
+        const labels = typeof window !== 'undefined' && window._networkI18n;
+        return causeCode === 'CLASSIC_KCP_REBUILD_ONLY'
+            ? labels?.classicKcpRebuildOnly || 'mKCP (UDP) is supported only in Rebuild. Use Rebuild Preview and Apply.'
+            : causeCode === 'INVALID_KCP_LINK_SETTINGS' ? labels?.kcpInvalidLink
+            : causeCode === 'REBUILD_XRAY_VERSION_TOO_OLD' ? labels?.rebuildCoreTooOld
+            : causeCode === 'REBUILD_XRAY_VERSION_UNKNOWN' ? labels?.rebuildCoreVersionUnknown : '';
+    }
+
     // Free-form backend messages can contain short credentials, not just long
     // key-like tokens. Show only known diagnostics or a bounded machine code.
     function describeTopologyError(payload, fallback) {
@@ -106,6 +115,8 @@
             || validationCode
             || (err && err.code)
             || null;
+        const localized = cascadeSettingsErrorText(causeCode);
+        if (localized) return localized;
         const mapped = topologyCauseText(causeCode);
         if (mapped) return mapped + ' (' + causeCode + ')';
         if (typeof causeCode === 'string' && /^[A-Z][A-Z0-9_]{1,64}$/.test(causeCode)) {
@@ -212,6 +223,7 @@
     const rebuild = window._c3Rebuild === true;
     const previewLabels = window._networkRebuildPreviewI18n;
     const fingerprintLabels = previewLabels?.fingerprint;
+    const kcpFields = ['kcpMtu', 'kcpTti', 'kcpUplinkCapacity', 'kcpDownlinkCapacity', 'kcpHeader'];
     const csrfMessages = new Map([
         ['CSRF_TOKEN_INVALID', i18n.csrfTokenInvalid || 'Reload the topology page, sign in again if needed, then retry manually.'],
         ['CSRF_AUTH_REQUIRED', i18n.csrfAuthRequired || 'Sign in to the panel again, reopen the topology, then retry manually.'],
@@ -423,7 +435,7 @@
                         applyLabel: previewLabels.apply });
                     throw new RebuildFingerprintRefusal(refusal);
                 }
-                throw new RebuildPreviewStopped(report.error?.code || unavailable);
+                throw new RebuildPreviewStopped(cascadeSettingsErrorText(report.error?.code) || report.error?.code || unavailable);
             }
         }
         const removing = payload.remove === true;
@@ -668,22 +680,8 @@
         if (rebuild) document.querySelector('#addLinkForm [name="tunnelProtocol"]')
             ?.addEventListener('change', updateLinkFormWarnings);
 
-        // Transport change -> disable REALITY for ws + refresh warnings
-        var transSel = document.getElementById('selectTransport');
-        if (transSel) transSel.addEventListener('change', function () {
-            var secSelect = document.getElementById('selectSecurity');
-            if (!secSelect) return;
-            var realityOpt = secSelect.querySelector('option[value="reality"]');
-            if (!realityOpt) return;
-            if (this.value === 'ws' && !rebuild) {
-                realityOpt.disabled = true;
-                if (secSelect.value === 'reality') {
-                    secSelect.value = 'none';
-                    secSelect.dispatchEvent(new Event('change'));
-                }
-            } else {
-                realityOpt.disabled = false;
-            }
+        document.getElementById('selectTransport')?.addEventListener('change', function () {
+            syncLinkTransportControls(document.getElementById('addLinkForm'));
             updateLinkFormWarnings();
         });
 
@@ -838,6 +836,21 @@
             if (link) for (const key of ['applicationState', 'routeState', 'tunnelState', 'pppReadiness',
                 'xrayReadiness', 'clientReadiness', 'appliedOperationId', 'desiredVersion', 'lifecycle']) projection[key] = link[key];
             let edgeData = { ...e.data, ...projection, progress: linkProgress.get(e.data.linkId) };
+            if (rebuild && !edgeData.isInternetEdge && (edgeData.tunnelTransport === 'kcp' || link?.tunnelTransport === 'kcp'
+                || edgeData.tunnelVerification || link?.tunnelVerification)) {
+                // The parallel map/list reads can straddle a transport edit.
+                // Neither old TCP health nor client proof applies to mKCP.
+                const applied = edgeData.tunnelVerification === 'mkcp_runtime_unsupported'
+                    && link?.tunnelVerification === 'mkcp_runtime_unsupported';
+                if (applied) edgeData.status = 'deployed';
+                else if (['online', 'offline', 'deployed'].includes(edgeData.status)) edgeData.status = 'pending';
+                edgeData.applicationState = applied ? 'applied' : link?.applicationState === 'deleting' ? 'deleting'
+                    : edgeData.status === 'error' ? 'reconcile_required' : 'not_applied';
+                edgeData.tunnelVerification = applied ? 'mkcp_runtime_unsupported'
+                    : edgeData.tunnelVerification || link?.tunnelVerification ? 'mkcp_apply_unconfirmed' : undefined;
+                Object.assign(edgeData, { tunnelState: 'unknown', routeState: 'unknown', latencyMs: null,
+                    observationExpiresAt: undefined, clientReadiness: undefined, xrayReadiness: undefined, appliedOperationId: undefined });
+            }
             if (rebuild && !edgeData.isInternetEdge && edgeData.mode !== 'forward' && edgeData.status === 'online') {
                 // Two parallel reads can straddle a cut or edit. Both must
                 // still say online; use the earlier of the two deadlines.
@@ -1296,6 +1309,7 @@
         const link = _allLinks.find(link => String(link._id) === linkId);
         if (!link) return topologyCauseText('SCOPE_LINK_MISSING');
         if (rebuild) return null;
+        if (link.tunnelTransport === 'kcp') return cascadeSettingsErrorText('CLASSIC_KCP_REBUILD_ONLY');
         if (link.active === false) return 'Связь отключена — включите её перед синхронизацией домена';
         return ['deployed', 'online', 'staged'].includes(link.status)
             ? null : topologyCauseText('SCOPE_LINK_UNCONFIRMED');
@@ -1305,6 +1319,7 @@
         const d = rebuild ? expireReverseStatus(evt.target.data()) : evt.target.data();
         const sc = d.status || 'pending';
         const lid = d.linkId;
+        const rebuildOnly = !rebuild && d.tunnelTransport === 'kcp';
 
         if (d.isInternetEdge) {
             const html =
@@ -1344,14 +1359,15 @@
                 '<div class="info-status ' + sc + '"' + (rebuild && Number.isSafeInteger(d.observationExpiresAt)
                     ? ' data-reverse-expires="' + d.observationExpiresAt + '" data-reverse-link="' + escHtml(lid)
                         + '" data-reverse-fallback="● deployed"' : '')
-                    + '>\u25CF ' + (d.status || 'pending') + '</div>') +
+                    + '>\u25CF ' + escHtml(d.tunnelVerification === 'mkcp_runtime_unsupported'
+                        ? (i18n.mkcpAppliedUnverified || 'Applied — runtime unverified') : (d.status || 'pending')) + '</div>') +
             linkStateFields(d) +
             (d.xrayReadiness === undefined ? field('ti-shield-check', 'Готовность клиента',
                 escHtml(clientReadinessMessage(d.clientReadiness, topologyRevision, deployedRevision))) : '') +
             field(i18n.linkMode || 'Mode', modeLabel) +
             field('ti-plug',           i18n.drawerTunnelPort        || 'Tunnel Port',         d.tunnelPort || '—') +
             field('ti-arrows-exchange',i18n.drawerProtocolTransport || 'Protocol / Transport',
-                (d.tunnelProtocol || 'vless').toUpperCase() + ' / ' + (d.tunnelTransport || 'tcp') + ' / ' + secLabel) +
+                (d.tunnelProtocol || 'vless').toUpperCase() + ' / ' + (d.tunnelTransport === 'kcp' ? escHtml(i18n.kcpTransport || 'mKCP (UDP)') : (d.tunnelTransport || 'tcp')) + ' / ' + secLabel) +
             field('ti-clock',          i18n.drawerLatency           || 'Latency',
                 d.latencyMs != null ? d.latencyMs + ' ms' : '—') +
             (extras.length > 0
@@ -1359,6 +1375,7 @@
                 : '') +
             '</div>' +
             '<div class="info-actions">' +
+            (rebuildOnly ? '' : (
             (!rebuild || document.getElementById('linkIdInput')
                 ? '<button class="btn btn-sm btn-outline" id="btnEdit" onclick="window._cascadeEdit(\'' + lid + '\')">' +
                     '<i class="ti ti-edit"></i> ' + (i18n.edit || 'Edit') + '</button>' : '') +
@@ -1370,7 +1387,7 @@
                 '<button class="btn btn-sm btn-outline" id="btnUndeploy" onclick="window._cascadeUndeploy(\'' + lid + '\')">' +
                 '<i class="ti ti-player-stop"></i> ' + (i18n.undeployLink || 'Undeploy') + '</button>') +
             '<button class="btn btn-sm btn-danger" id="btnDelete" onclick="window._cascadeDelete(\'' + lid + '\')">' +
-            '<i class="ti ti-trash"></i> ' + (i18n.delete || 'Delete') + '</button>' +
+            '<i class="ti ti-trash"></i> ' + (i18n.delete || 'Delete') + '</button>')) +
             '</div>';
 
         openInfoModal(d.label || 'Cascade Link', html +
@@ -1390,6 +1407,10 @@
             unknown: i18n.routeUnknown || 'Целостность маршрута не подтверждена' };
         const tunnels = { connected: i18n.tunnelConnected || 'Соединён', disconnected: i18n.tunnelDisconnected || 'Не соединён',
             unknown: i18n.tunnelUnknown || 'Соединение не подтверждено' };
+        const tunnelHint = d.tunnelVerification === 'mkcp_runtime_unsupported'
+            ? (i18n.mkcpRuntimeUnsupported || 'Automatic mKCP verification is unavailable. Check client traffic through this route.')
+            : d.tunnelVerification === 'mkcp_apply_unconfirmed' && d.applicationState !== 'deleting'
+                ? (i18n.mkcpApplyUnconfirmed || 'No matching mKCP Apply receipt. Review the saved link in Rebuild before applying it.') : '';
         const verified = i18n.readinessVerified || 'Подтверждено';
         const unverified = i18n.clientReadinessUnverified || CLIENT_READINESS_UNVERIFIED;
         const xrayVerified = d.xrayReadiness === 'verified' && d.applicationState === 'applied'
@@ -1400,7 +1421,7 @@
             + field(i18n.tunnelStateLabel || 'Туннель', rebuild && Number.isSafeInteger(d.observationExpiresAt) && d.tunnelState === 'connected'
                 ? '<span data-reverse-expires="' + d.observationExpiresAt + '" data-reverse-link="' + escHtml(d.linkId)
                     + '" data-reverse-fallback="' + escHtml(tunnels.unknown) + '">' + escHtml(tunnels.connected) + '</span>'
-                : escHtml(tunnels[d.tunnelState] || tunnels.unknown))
+                : escHtml(tunnelHint || tunnels[d.tunnelState] || tunnels.unknown))
             + field('PPP/L2TP', escHtml(d.pppReadiness === 'verified' ? verified : unverified))
             + field('Xray/VLESS/REALITY', escHtml(xrayVerified ? verified : unverified))
             + (d.progress ? field(i18n.operationProgress || 'Задание / фаза / причина / следующее действие', escHtml(progressMessage(d.progress))) : '');
@@ -1504,6 +1525,21 @@
         select.value = value;
     }
 
+    function syncLinkTransportControls(form) {
+        const transport = form.tunnelTransport.value;
+        const kcp = transport === 'kcp';
+        const section = document.getElementById('kcpSection');
+        if (section) section.hidden = section.disabled = !kcp;
+        const security = form.tunnelSecurity;
+        const reality = [...(security.options || [])].find(option => option.value === 'reality');
+        const blocked = kcp || (!rebuild && transport === 'ws');
+        if (reality) reality.disabled = blocked;
+        if (blocked && security.value === 'reality') security.value = 'none';
+        const realitySection = document.getElementById('realitySection');
+        if (realitySection) realitySection.style.display = security.value === 'reality' ? '' : 'none';
+    }
+
+    let oldMapEditSecurityOption;
     async function openAddLinkModal({ editing = false } = {}) {
         const generation = ++linkModalGeneration;
         resetPortWarning('main');
@@ -1526,8 +1562,7 @@
             form.tunnelSecurity.value = 'reality';
             if (form.tunnelEncryption) form.tunnelEncryption.checked = true;
         }
-        const realitySection = document.getElementById('realitySection');
-        if (realitySection) realitySection.style.display = form.tunnelSecurity.value === 'reality' ? '' : 'none';
+        syncLinkTransportControls(form);
         updateLinkSubmitIntent();
         // A brand-new link starts from Chrome, not an earlier edit's choice.
         var createFp = document.querySelector('#addLinkForm [name="realityFingerprint"]');
@@ -1586,8 +1621,12 @@
         if (!res.ok) throw new Error('Failed to load link');
         const link = await res.json();
         if (generation !== linkModalGeneration) return;
+        if (!rebuild && link.tunnelTransport === 'kcp') {
+            showToast(cascadeSettingsErrorText('CLASSIC_KCP_REBUILD_ONLY'), 'error');
+            return;
+        }
         linkModalMode = 'edit';
-        if (title) title.textContent = (i18n.edit || 'Edit') + ' Link';
+        if (title) title.textContent = i18n.editLink || 'Edit link';
         if (submit) submit.textContent = i18n.save || 'Save';
         if (linkIdInput) linkIdInput.value = linkId;
 
@@ -1597,13 +1636,29 @@
         form.bridgeNodeId.value = link.bridgeNode?._id || link.bridgeNode || '';
         form.tunnelPort.value = link.tunnelPort || 10086;
         form.tunnelProtocol.value = link.tunnelProtocol || 'vless';
-        form.tunnelTransport.value = link.tunnelTransport === 'splithttp' ? 'xhttp' : (link.tunnelTransport || 'tcp');
-        form.tunnelSecurity.value = link.tunnelSecurity || 'none';
+        const transport = link.tunnelTransport || 'tcp';
+        const transportOptions = form.tunnelTransport.options;
+        form.tunnelTransport.value = !transportOptions || [...transportOptions].some(option => option.value === transport)
+            ? transport : transport === 'splithttp' ? 'xhttp' : transport === 'xhttp' ? 'splithttp' : transport;
+        const security = form.tunnelSecurity;
+        if (link.tunnelSecurity === 'reality' && security.options && ![...security.options].some(opt => opt.value === 'reality')) {
+            // The classic old map does not offer REALITY on create; it can
+            // still preserve that security on a link created elsewhere.
+            const option = document.createElement('option');
+            option.value = 'reality';
+            option.textContent = 'REALITY';
+            security.appendChild(option);
+            oldMapEditSecurityOption = option;
+        }
+        security.value = link.tunnelSecurity || 'none';
+        for (const key of kcpFields) {
+            if (form[key]) form[key].value = link[key] ?? form[key].defaultValue ?? (key === 'kcpHeader' ? 'none' : '');
+        }
         if (rebuild && form.tunnelEncryption) form.tunnelEncryption.checked = link.tunnelEncryption !== 'none';
-        form.tunnelDomain.value = link.tunnelDomain || 'reverse.tunnel.internal';
-        form.muxEnabled.checked = !!link.muxEnabled;
-        form.muxConcurrency.value = link.muxConcurrency || 8;
-        form.priority.value = link.priority ?? 100;
+        if (form.tunnelDomain) form.tunnelDomain.value = link.tunnelDomain || 'reverse.tunnel.internal';
+        if (form.muxEnabled) form.muxEnabled.checked = !!link.muxEnabled;
+        if (form.muxConcurrency) form.muxConcurrency.value = link.muxConcurrency || 8;
+        if (form.priority) form.priority.value = link.priority ?? 100;
         // The saved preference is metadata, not consent to deploy on this edit.
         form.autoDeploy.checked = false;
         updateLinkSubmitIntent();
@@ -1630,8 +1685,7 @@
         if (geoDomains) geoDomains.value = Array.isArray(link.geoRouting?.domains) ? link.geoRouting.domains.join(', ') : '';
         if (geoGeoip) geoGeoip.value = Array.isArray(link.geoRouting?.geoip) ? link.geoRouting.geoip.join(', ') : '';
 
-        var realitySec = document.getElementById('realitySection');
-        if (realitySec) realitySec.style.display = form.tunnelSecurity.value === 'reality' ? '' : 'none';
+        syncLinkTransportControls(form);
         var domGroup = document.getElementById('tunnelDomainGroup');
         if (domGroup) domGroup.style.display = form.mode.value === 'forward' ? 'none' : '';
         var hint = document.getElementById('modeHint');
@@ -1654,7 +1708,11 @@
         ++linkModalGeneration;
         resetPortWarning('main');
         document.getElementById('addLinkModal').classList.remove('active');
-        document.getElementById('addLinkForm').reset();
+        const form = document.getElementById('addLinkForm');
+        oldMapEditSecurityOption?.remove();
+        oldMapEditSecurityOption = undefined;
+        form.reset();
+        syncLinkTransportControls(form);
         linkModalMode = 'create';
         updateLinkSubmitIntent();
         var title = document.getElementById('linkModalTitle');
@@ -1807,6 +1865,10 @@
         // particular, never fall back to an unscoped full-topology deploy.
         const error = snapshot?.autoDeployError
             || { code: snapshot?.autoDeployCauseCode || snapshot?.autoDeployStatus };
+        if (error.code === 'CLASSIC_KCP_REBUILD_ONLY') {
+            showToast(cascadeSettingsErrorText(error.code), 'error');
+            return;
+        }
         if (error.code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
             showToast(topologyCauseText(error.code), 'error');
             return;
@@ -1865,9 +1927,9 @@
             // regardless of the link's persisted autoDeploy preference.
             autoDeploy:     linkId ? (form.autoDeploy?.checked ? true : undefined)
                 : !!form.autoDeploy?.checked,
-            muxEnabled:     form.muxEnabled?.checked || false,
-            muxConcurrency: parseInt(form.muxConcurrency?.value) || 8,
-            priority:       Number(form.priority?.value || 100),
+            ...(form.muxEnabled ? { muxEnabled: form.muxEnabled.checked } : {}),
+            ...(form.muxConcurrency ? { muxConcurrency: parseInt(form.muxConcurrency.value) || 8 } : {}),
+            ...(form.priority ? { priority: Number(form.priority.value || 100) } : {}),
         };
         if (canSetTunnelEncryption(form)) data.tunnelEncryption = form.tunnelEncryption.checked ? 'vless-enc' : 'none';
 
@@ -1876,17 +1938,32 @@
             data.tunnelDomain = form.tunnelDomain.value;
         }
 
+        if (data.tunnelTransport === 'kcp') {
+            if (!rebuild) {
+                showToast(cascadeSettingsErrorText('CLASSIC_KCP_REBUILD_ONLY'), 'error');
+                return;
+            }
+            if (data.tunnelSecurity !== 'none' && data.tunnelSecurity !== 'tls') {
+                showToast(i18n.kcpInvalidLink || 'mKCP requires None or TLS security.', 'error');
+                return;
+            }
+            for (const key of kcpFields) {
+                const value = form[key]?.value;
+                if (value !== '' && value !== undefined) data[key] = key === 'kcpHeader' ? value : Number(value);
+            }
+        }
+
         // REALITY fields
         if (data.tunnelSecurity === 'reality') {
             if (rebuild && data.tunnelTransport === 'ws') {
                 showToast(i18n.realityWsUnsupported || 'REALITY несовместим с WebSocket. Выберите другой транспорт или режим защиты.', 'error');
                 return;
             }
-            data.realityDest = form.realityDest?.value || '';
-            data.realitySni = form.realitySni?.value || '';
-            data.realityPrivateKey = form.realityPrivateKey?.value || '';
-            data.realityPublicKey = form.realityPublicKey?.value || '';
-            data.realityShortIds = form.realityShortIds?.value || '';
+            if (form.realityDest) data.realityDest = form.realityDest.value;
+            if (form.realitySni) data.realitySni = form.realitySni.value;
+            if (form.realityPrivateKey) data.realityPrivateKey = form.realityPrivateKey.value;
+            if (form.realityPublicKey) data.realityPublicKey = form.realityPublicKey.value;
+            if (form.realityShortIds) data.realityShortIds = form.realityShortIds.value;
             const fingerprint = linkId
                 ? fingerprintForLinkEdit(linkModalSavedFingerprint, form.realityFingerprint?.value)
                 : resolveRealityFingerprint(form.realityFingerprint?.value, 'create');
@@ -1897,7 +1974,7 @@
         const geoEnabled = document.getElementById('geoRoutingEnabled');
         const domStr = (document.getElementById('geoRoutingDomains')?.value || '').trim();
         const ipStr  = (document.getElementById('geoRoutingGeoip')?.value || '').trim();
-        data.geoRouting = {
+        if (geoEnabled) data.geoRouting = {
             enabled: !!geoEnabled?.checked,
             domains: domStr ? domStr.split(/[,\s]+/).filter(Boolean) : [],
             geoip:   ipStr  ? ipStr.split(/[,\s]+/).filter(Boolean)  : [],
@@ -2459,15 +2536,18 @@
         const nodeId = mode === 'forward' ? bridge : portal;
         const port = /^\d+$/.test(rawPort) ? Number(rawPort) : NaN;
         const modal = document.getElementById(quick ? 'quickLinkModal' : 'addLinkModal');
-        const valid = modal?.classList.contains('active') && /^[a-f0-9]{24}$/i.test(nodeId)
+        // The classic check inspects TCP only. Never block a UDP link on
+        // that result; the existing apply admission owns listener checks.
+        const tunnelTransport = quick ? 'tcp' : (form?.tunnelTransport?.value || 'tcp');
+        const valid = tunnelTransport !== 'kcp' && modal?.classList.contains('active') && /^[a-f0-9]{24}$/i.test(nodeId)
             && (!linkId || /^[a-f0-9]{24}$/i.test(linkId))
             && Number.isInteger(port) && port >= 1 && port <= 65535;
-        return { nodeId, port, linkId, key: valid ? JSON.stringify([nodeId, port, linkId, mode, portal, bridge]) : null };
+        return { nodeId, port, linkId, tunnelTransport, key: valid ? JSON.stringify([nodeId, port, linkId, mode, portal, bridge, tunnelTransport]) : null };
     }
 
     function cachedPortConflict(context) {
         return context.key && _allLinks.find(link => {
-            if (!link?.active || String(link._id) === context.linkId) return false;
+            if (!link?.active || link.tunnelTransport === 'kcp' || String(link._id) === context.linkId) return false;
             // Each existing link has its own listening side, even in mixed modes.
             const ref = link[link.mode === 'forward' ? 'bridgeNode' : 'portalNode'];
             const nodeId = ref && typeof ref === 'object' ? ref._id : ref;
@@ -2488,13 +2568,13 @@
         const status = conflict ? 'occupied' : state.status;
         hint.style.display = context.key ? '' : 'none';
         hint.textContent = !context.key ? '' : status === 'occupied'
-            ? portWarningText('portCheckOccupied', 'Port {port} is already in use on listening node {node}. Choose another port before deploying. Saving without deployment is still possible.', context)
+            ? portWarningText('portCheckOccupied', 'TCP port {port} is already in use on listening node {node}. Choose another port before deploying. Saving without deployment is still possible.', context)
                 + (conflict ? ' (' + (conflict.name || 'link') + ')' : '')
             : status === 'available'
-                ? portWarningText('portCheckAvailable', 'Port {port} is available on listening node {node}. It will be checked again when saving or deploying.', context)
+                ? portWarningText('portCheckAvailable', 'TCP port {port} is available on listening node {node}. It will be checked again when saving or deploying.', context)
                 : status === 'unknown'
-                    ? portWarningText('portCheckUnknown', 'Could not check port {port} on listening node {node}. Availability is unknown; saving or deploying will check again.', context)
-                    : portWarningText('portCheckChecking', 'Checking port {port} on listening node {node}…', context);
+                    ? portWarningText('portCheckUnknown', 'Could not check TCP port {port} on listening node {node}. Availability is unknown; saving or deploying will check again.', context)
+                    : portWarningText('portCheckChecking', 'Checking TCP port {port} on listening node {node}…', context);
     }
 
     function resetPortWarning(kind) {
@@ -2533,6 +2613,7 @@
             }, 10000);
             try {
                 const query = new URLSearchParams({ nodeId: context.nodeId, port: String(context.port) });
+                if (context.tunnelTransport && context.tunnelTransport !== 'tcp') query.set('tunnelTransport', context.tunnelTransport);
                 if (context.linkId) query.set('linkId', context.linkId);
                 const response = await fetch('/api/cascade/links/port-check?' + query.toString(), {
                     signal: controller.signal, cache: 'no-store', credentials: 'same-origin',
@@ -2565,7 +2646,7 @@
             : document.getElementById('addLinkForm')?.autoDeploy?.checked;
         if (deploying && context.key && (cachedPortConflict(context) || portWarnings[kind].status === 'occupied')) {
             showToast(portWarningText('portCheckOccupied',
-                'Port {port} is already in use on listening node {node}. Choose another port before deploying. Saving without deployment is still possible.', context), 'error');
+                'TCP port {port} is already in use on listening node {node}. Choose another port before deploying. Saving without deployment is still possible.', context), 'error');
             return true;
         }
         // Unknown/checking is advisory, not a new save-only restriction. The

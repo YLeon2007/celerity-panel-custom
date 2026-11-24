@@ -2143,6 +2143,41 @@ test('fresh Install refuses missing or unproved links and live MAIN before reser
     }
 });
 
+test('fresh Install refuses mKCP listeners on this relay before DIRECT or reservation', async t => {
+    for (const kind of ['forward', 'reverse', 'still applied', 'forward vmess']) await t.test(kind, async child => {
+        const f = fixture(child);
+        const [exitLink] = f.links;
+        const portal = { _id: oid('d'.repeat(24)), active: true, type: 'xray', cascadeRole: 'portal', ip: '192.0.2.29' };
+        f.nodes.push(portal);
+        const link = kind === 'forward' || kind === 'forward vmess'
+            ? { ...exitLink, _id: oid('2'.repeat(24)), portalNode: portal._id, bridgeNode: oid(id), tunnelPort: 21444 }
+            : exitLink;
+        if (link !== exitLink) f.links.push(link);
+        else link.mode = 'reverse';
+        if (kind === 'forward vmess') link.tunnelProtocol = 'vmess';
+        link.tunnelTransport = kind === 'still applied' ? 'tcp' : 'kcp';
+        pinApplied(link, exitLink.rebuildAppliedMainSha256);
+        if (kind === 'still applied') link.rebuildKcpApplied = '8'.repeat(64);
+        const before = f.links.map(copy);
+        await assert.rejects(f.create().installRelay(id), { code: 'REBUILD_L2TP_KCP_LISTENER_UNSUPPORTED',
+            outcome: 'refused', check: 'KCP_LISTENER_UNSUPPORTED' });
+        assert.deepEqual([f.states, f.users, f.progress, f.locks, f.events], [[], [], [], [], []]);
+        assert.deepEqual(f.links, before);
+    });
+});
+
+test('fresh Install does not treat an mKCP dialer as a retained listener', async t => {
+    const f = fixture(t);
+    const [link] = f.links;
+    link.tunnelTransport = 'kcp'; // forward: the listener is on the bridge, not this relay
+    link.rebuildKcpApplied = '8'.repeat(64);
+    const pins = [];
+    f.hooks.proveAppliedMain = async pin => { pins.push(pin); return true; };
+    assert.equal((await f.create().installRelay(id)).status, 'installed');
+    assert.deepEqual(pins, Array(2).fill(link.rebuildAppliedMainSha256));
+    assert.equal(f.events.filter(event => event === 'install').length, 1);
+});
+
 test('Install progress is fenced, secret-free, and cannot settle or break row CAS', async t => {
     for (const result of ['success', 'restore', 'unknown', 'telemetry failure']) await t.test(result, async child => {
         const f = fixture(child);

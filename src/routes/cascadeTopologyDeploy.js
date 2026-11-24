@@ -26,6 +26,7 @@ const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyI
 const { nodeActivation: normalizeNodeActivation, selectedDesiredVersion } = require('../modules/relay-l2tp/services/topologyNodeActivation');
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
+const { CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE, assertClassicTunnelTransport } = require('../utils/cascadeTransport');
 
 const DEFAULT_MODELS = Object.freeze({
     HyNode,
@@ -282,6 +283,10 @@ function publicError(error) {
 }
 
 function sendError(res, error, routeLogger = logger, context = {}) {
+    if (error?.code === CLASSIC_KCP_REBUILD_ONLY) {
+        return res.status(409).json({ error: { code: CLASSIC_KCP_REBUILD_ONLY,
+            message: res.locals.t?.('network.classicKcpRebuildOnly') ?? CLASSIC_KCP_MESSAGE } });
+    }
     if (context.action) logTopologyTestFailure({ ...context, error });
     const status = ERROR_STATUS_BY_CODE.get(error?.code);
     if (context.nativeIntent) {
@@ -475,6 +480,7 @@ function createCascadeTopologyDeployRouter({
                     const requestKey = req.get('Idempotency-Key');
                     if (typeof requestKey !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestKey)) throw new TopologyDeployRequestError('INVALID_IDEMPOTENCY_KEY', 'A valid Idempotency-Key is required');
                     const selected = await models.CascadeLink.findById(input.linkId).lean();
+                    assertClassicTunnelTransport(selected);
                     const existing = !selected || selected.lifecycle || selected.active === false
                         ? await readPersistedIntent(service, models.CascadeLink, requestKey) : null;
                     if (existing && (existing.version !== 2 || existing.kind !== 'link.apply' || String(existing.linkId) !== input.linkId)) throw new TopologyDeployRequestError('TOPOLOGY_INTENT_KEY_CONFLICT', 'The request key belongs to different content');
@@ -500,13 +506,14 @@ function createCascadeTopologyDeployRouter({
                     // pinned snapshot before applying. This read only selects
                     // candidate baseline ids; it cannot authorize a stale edge.
                     const links = await models.CascadeLink.find({})
-                        .select('_id portalNode bridgeNode active status')
+                        .select('_id portalNode bridgeNode active status tunnelTransport')
                         .lean();
                     const linkId = input.linkId || input.domainLinkId;
                     const selected = links.find(link => String(link._id) === linkId);
                     if (!selected) {
                         throw new TopologyDeployRequestError('CASCADE_LINK_NOT_FOUND', 'Cascade link not found');
                     }
+                    assertClassicTunnelTransport(selected);
                     if (selected.active === false) {
                         throw new TopologyDeployRequestError('CASCADE_LINK_DISABLED', 'Cascade link is disabled');
                     }

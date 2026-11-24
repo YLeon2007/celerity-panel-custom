@@ -5,16 +5,19 @@ const { matchesTopologyExecutionContext, topologyExecutionContext } = require('.
 const QUEUE_ID = 'create-v1'; // One counter/order namespace for legacy and versioned intents.
 const INTENT_KINDS = new Set(['link.create', 'link.apply', 'link.delete']);
 const { nodeActivation: normalizeNodeActivation, selectedDesiredVersion } = require('./topologyNodeActivation');
+const { KCP_INPUT_FIELDS, assertClassicTunnelTransport } = require('../../../utils/cascadeTransport');
+const { assertKcpSecurity, readKcpFields } = require('../../../services/cascadeDraftTransport');
 // Health, timestamps, lifecycle markers and applied proofs are not desired config.
 const DESIRED_LINK_FIELDS = Object.freeze(['name', 'mode', 'portalNode', 'bridgeNode',
     'tunnelUuid', 'tunnelPort', 'tunnelDomain', 'tunnelProtocol', 'tunnelSecurity', 'tunnelTransport',
     'tcpFastOpen', 'tcpKeepAlive', 'tcpNoDelay', 'wsPath', 'wsHost', 'grpcServiceName',
     'xhttpPath', 'xhttpHost', 'xhttpMode', 'realityDest', 'realitySni', 'realityPrivateKey',
     'realityPublicKey', 'realityShortIds', 'realityFingerprint', 'muxEnabled', 'muxConcurrency',
-    'geoRouting', 'priority', 'active']);
+    'geoRouting', 'priority', 'active', ...KCP_INPUT_FIELDS]);
 function desiredLinkPayload(link) {
     return JSON.parse(JSON.stringify(Object.fromEntries(DESIRED_LINK_FIELDS
-        .filter(key => link[key] !== undefined).map(key => [key, link[key]]))));
+        .filter(key => link[key] !== undefined && (link.tunnelTransport === 'kcp' || !KCP_INPUT_FIELDS.includes(key)))
+        .map(key => [key, link[key]]))));
 }
 // Content-addressed desired version: ordinary updateOne does not increment __v.
 function linkDesiredVersion(link) { return digest(desiredLinkPayload(link)); }
@@ -201,6 +204,7 @@ class TopologyIntentService {
             // Fixed placeholder prevents even ObjectId generation before persisted-key lookup.
             normalized = desiredLinkPayload(new this.CascadeLink({ ...link,
                 _id: link._id ?? '000000000000000000000000', active: true }).toObject());
+            Object.assign(normalized, readKcpFields(link));
             if (link._id !== undefined) normalized._id = String(link._id);
         } else {
             if (link !== undefined || typeof linkId !== 'string' || !/^[a-f0-9]{24}$/.test(linkId)
@@ -242,6 +246,8 @@ class TopologyIntentService {
                     throw intentError('TOPOLOGY_INTENT_DRAFT_TRANSACTION_UNAVAILABLE');
                 }
                 if (typeof this.dependencies.resolveIntentResources !== 'function') throw intentError('TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE');
+                const savedTarget = kind === 'link.create' ? null : await this.CascadeLink.findById(linkId).session(session).lean();
+                assertClassicTunnelTransport(normalized, normalizedChanges, savedTarget);
                 const state = await this.CascadeTopologyState.findOneAndUpdate(
                     { _id: 'singleton', revision: expectedTopologyRevision }, { $inc: { stateTransitionRevision: 1 } },
                     { new: true, session, upsert: false }).lean();
@@ -262,6 +268,7 @@ class TopologyIntentService {
                         ? await this.dependencies.prepareLink({ ...normalized })
                         : { ...normalized, tunnelUuid: normalized.tunnelUuid || randomUUID() };
                     const document = new this.CascadeLink({ ...prepared, active: true, status: 'pending', autoDeploy: true });
+                    assertKcpSecurity(document.tunnelTransport, document.tunnelSecurity);
                     await document.validate();
                     target = JSON.parse(JSON.stringify(document.toObject()));
                     let saved;
@@ -284,11 +291,12 @@ class TopologyIntentService {
                     linkId = String(target._id);
                     desiredVersion = linkDesiredVersion(target);
                 } else {
-                    target = await this.CascadeLink.findById(linkId).session(session).lean();
+                    target = savedTarget;
                     if (!target) throw intentError('CASCADE_LINK_NOT_FOUND');
                     if (editing) {
                         if (target.lifecycle?.state === 'deleting') throw intentError('CASCADE_LINK_DELETING');
                         let candidate = applyLinkChanges(target, normalizedChanges);
+                        assertKcpSecurity(candidate.tunnelTransport, candidate.tunnelSecurity === undefined ? 'none' : candidate.tunnelSecurity);
                         if (candidate.tunnelSecurity === 'reality' && candidate.tunnelTransport === 'ws') throw intentError('INVALID_TOPOLOGY_INTENT');
                         if (candidate.tunnelSecurity === 'reality' && typeof this.dependencies.prepareLink !== 'function') {
                             throw intentError('TOPOLOGY_INTENT_PREPARATION_UNAVAILABLE');
@@ -312,6 +320,10 @@ class TopologyIntentService {
                         const previous = desiredLinkPayload(target);
                         const delta = Object.fromEntries(Object.entries(desiredLinkPayload(candidate))
                             .filter(([key, value]) => !isDeepStrictEqual(previous[key], value)));
+                        for (const key of KCP_INPUT_FIELDS) {
+                            if (Object.hasOwn(normalizedChanges, key) && candidate.tunnelTransport !== 'kcp'
+                                && !isDeepStrictEqual(target[key], candidate[key])) delta[key] = candidate[key];
+                        }
                         const saved = await this.dependencies.intentDraftWriter.updateLink({
                             expectedTopologyRevision, linkId, changes: { ...delta, autoDeploy: true }, session,
                         });
@@ -352,6 +364,7 @@ class TopologyIntentService {
         }
     }
     async acceptLegacy({ expectedTopologyRevision, requestKey = randomUUID(), link, payloadHash } = {}) {
+        assertClassicTunnelTransport(link);
         if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) throw intentError('INVALID_TOPOLOGY_REVISION');
         if (typeof requestKey !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestKey)) throw intentError('INVALID_IDEMPOTENCY_KEY');
         const document = new this.CascadeLink({ ...link, active: true, status: 'pending', autoDeploy: true });

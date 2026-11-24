@@ -255,7 +255,9 @@ for (const [view, lang, actionCopy] of [['network', 'ru', /Повторите д
 
     test(`${view}: stock still selects the minified graph without rebuild recovery`, () => {
         const ui = mount(view, lang, 'fixture', false, () => assert.fail('unexpected fetch'));
-        assert.ok(ui.resources.includes('/js/network.min.js?v=8c1440573d630ba3'));
+        const version = require('node:crypto').createHash('sha256')
+            .update(readFileSync(path.join(root, 'public/js/network.min.js'))).digest('hex').slice(0, 16);
+        assert.ok(ui.resources.includes('/js/network.min.js?v=' + version));
         assert.ok(!ui.resources.some(src => src.startsWith('/js/network.js?')));
         assert.equal(ui.document.getElementById('rebuildPreview'), null);
     });

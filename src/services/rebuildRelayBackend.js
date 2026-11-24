@@ -22,7 +22,7 @@ const eligible = (node, id, listMode) => String(node?._id) === id && node.type =
 async function readTopology(Node, Link, node, panelDomain) {
     const id = String(node._id);
     const links = await read(Link.find({ $or: [{ active: true }, { rebuildDelete: true }] })
-        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelPort tunnelUuid rebuildApplied rebuildApplyEpoch +rebuildAppliedMainSha256'));
+        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelTransport tunnelPort tunnelUuid rebuildApplied rebuildApplyEpoch +rebuildAppliedMainSha256 +rebuildKcpApplied'));
     // Offline also describes an applied link whose tunnel is unconfirmed.
     const applied = link => link.active === true && !link.rebuildDelete && !link.lifecycle && ['deployed', 'online', 'offline'].includes(link.status);
     const notApplied = () => fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
@@ -43,6 +43,12 @@ async function readTopology(Node, Link, node, panelDomain) {
     try { ({ byNodeId } = compileRebuildGraph({ nodes, links: scoped, affectedNodeIds: [...ids] })); }
     catch { throw notApplied(); }
     const relay = byNodeId.get(id);
+    // Match the listener in MAIN, not every link incident to the relay. Use
+    // the mKCP stamp only to refuse a still-applied listener, never as proof.
+    if (scoped.some(link => (link.tunnelTransport === 'kcp' && String(appliedLink(link).listener) === id)
+        || (link.rebuildKcpApplied != null && String(link.rebuildApplied?.listener) === id))) {
+        throw fail('REBUILD_L2TP_KCP_LISTENER_UNSUPPORTED');
+    }
     const ready = relay.outgoing.filter(edge => byNodeId.get(edge.target).role === 'bridge').map(({ id, link, target }) => {
         const expected = appliedLink(link), saved = link.rebuildApplied;
         if (!Number.isInteger(expected.port) || expected.port < 1 || expected.port > 65535

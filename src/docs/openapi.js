@@ -1,3 +1,16 @@
+const { KCP_DEFAULTS, KCP_HEADERS, KCP_LIMITS } = require('../utils/cascadeTransport');
+
+const kcpNumber = ({ min, max }, defaultValue, description) => ({ type: 'integer', minimum: min, maximum: max, default: defaultValue, description });
+const CASCADE_KCP_PROPERTIES = {
+    kcpMtu: kcpNumber(KCP_LIMITS.mtu, KCP_DEFAULTS.mtu, 'mKCP MTU, bytes'),
+    kcpTti: kcpNumber(KCP_LIMITS.tti, KCP_DEFAULTS.tti, 'mKCP transmission interval, ms'),
+    kcpUplinkCapacity: kcpNumber(KCP_LIMITS.capacity, KCP_DEFAULTS.uplinkCapacity, 'mKCP uplink capacity, MB/s'),
+    kcpDownlinkCapacity: kcpNumber(KCP_LIMITS.capacity, KCP_DEFAULTS.downlinkCapacity, 'mKCP downlink capacity, MB/s'),
+    kcpHeader: { type: 'string', enum: KCP_HEADERS, default: KCP_DEFAULTS.header, description: 'mKCP packet header' },
+};
+const CASCADE_KCP_UPDATE_PROPERTIES = Object.fromEntries(Object.entries(CASCADE_KCP_PROPERTIES)
+    .map(([key, { default: _createDefault, ...schema }]) => [key, schema]));
+
 const VLESS_ENCRYPTION_PROPERTIES = {
     vlessEncryption: { type: 'boolean', default: false, description: 'Requires a stored Xray health version of at least 25.9.5. Incompatible with fallbackDest. sing-box subscriptions omit encrypted inbounds unless explicitly opted in.' },
     vlessEncryptionAuth: { type: 'string', enum: ['x25519', 'mlkem768'], default: 'x25519', description: 'Changing the key type generates a new key.' },
@@ -178,7 +191,7 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
         CascadeLinkCreate: {
             type: 'object',
             required: ['name', 'portalNodeId', 'bridgeNodeId'],
-            description: 'Payload for creating a cascade tunnel between two Xray nodes.',
+            description: 'Payload for creating a cascade tunnel between two Xray nodes. mKCP (UDP) is Rebuild-only and supports none or TLS security, not REALITY.',
             properties: {
                 name: { type: 'string', example: 'DE portal to NL bridge' },
                 portalNodeId: { type: 'string', example: '64a1b2c3d4e5f6a7b8c9d0e1' },
@@ -187,12 +200,13 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
                 tunnelPort: { type: 'integer', example: 10086 },
                 tunnelProtocol: { type: 'string', enum: ['vless', 'vmess'], default: 'vless' },
                 tunnelSecurity: { type: 'string', enum: ['none', 'tls', 'reality'], default: 'none' },
-                tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'], default: 'tcp' },
+                tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp', 'kcp'], default: 'tcp' },
+                ...CASCADE_KCP_PROPERTIES,
             },
         },
         CascadeLinkUpdate: {
             type: 'object',
-            description: 'Partial cascade link update payload.',
+            description: 'Partial cascade link update payload. mKCP links can only be edited in Rebuild, where omitted mKCP settings are preserved and security must be none or TLS.',
             properties: {
                 name: { type: 'string' },
                 mode: { type: 'string', enum: ['reverse', 'forward'] },
@@ -200,7 +214,8 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
                 tunnelDomain: { type: 'string' },
                 tunnelProtocol: { type: 'string', enum: ['vless', 'vmess'] },
                 tunnelSecurity: { type: 'string', enum: ['none', 'tls', 'reality'] },
-                tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'] },
+                tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp', 'kcp'] },
+                ...CASCADE_KCP_UPDATE_PROPERTIES,
                 active: { type: 'boolean' },
                 priority: { type: 'integer' },
             },
@@ -1246,7 +1261,8 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     tunnelDomain: { type: 'string', example: 'reverse.tunnel.internal' },
                     tunnelProtocol: { type: 'string', enum: ['vless', 'vmess'] },
                     tunnelSecurity: { type: 'string', enum: ['none', 'tls', 'reality'] },
-                    tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'] },
+                    tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp', 'kcp'] },
+                    ...CASCADE_KCP_PROPERTIES,
                     active: { type: 'boolean' },
                     status: { type: 'string', enum: ['pending', 'staged', 'deployed', 'online', 'offline', 'error'] },
                     lastError: { type: 'string' },
@@ -2466,7 +2482,8 @@ See the request body examples panel for both flavours.`,
                                     tunnelPort: { type: 'integer', default: 10086 },
                                     tunnelProtocol: { type: 'string', enum: ['vless', 'vmess'], default: 'vless' },
                                     tunnelSecurity: { type: 'string', enum: ['none', 'tls', 'reality'], default: 'none' },
-                                    tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'], default: 'tcp' },
+                                    tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp', 'kcp'], default: 'tcp' },
+                                    ...CASCADE_KCP_PROPERTIES,
                                 },
                             },
                         },
@@ -2498,7 +2515,7 @@ See the request body examples panel for both flavours.`,
             put: {
                 tags: ['Cascade'],
                 summary: 'Update cascade link',
-                requestBody: { required: true, content: { 'application/json': { schema: { type: 'object' } } } },
+                requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/CascadeLinkUpdate' } } } },
                 responses: {
                     200: { description: 'Updated link', content: { 'application/json': { schema: { $ref: '#/components/schemas/CascadeLink' } } } },
                     400: { description: 'Invalid link settings' },

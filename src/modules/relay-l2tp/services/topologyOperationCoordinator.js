@@ -1,6 +1,7 @@
 'use strict';
 
 const { createHash, randomUUID } = require('node:crypto');
+const { assertClassicTunnelTransport } = require('../../../utils/cascadeTransport');
 const { compileConfiguredTopology: compileTopology, primaryReservePolicies } = require('../domain/primaryReservePolicy');
 const {
     projectGroups,
@@ -863,6 +864,9 @@ class TopologyOperationCoordinator {
                 expectedRevision: expectedTopologyRevision,
                 ...(joinedSession ? { session: joinedSession } : {}),
                 prepare: async (snapshot, session) => {
+                    const requestedLinks = scope ? new Set([...scope.linkIds, scope.linkId, scope.oldLinkId]) : null;
+                    assertClassicTunnelTransport(...snapshot.links.filter(link => requestedLinks
+                        ? requestedLinks.has(entityId(link)) : link.active !== false));
                     // Legacy full-sync finalization marks every active link
                     // deployed. Never let it silently claim an unrelated
                     // pending draft alongside already deployed links.
@@ -925,6 +929,9 @@ class TopologyOperationCoordinator {
                     }
                     const topology = replacement ? replacement.topology
                         : attach ? attach.topology : scopedTopology || projected;
+                    // Repository-derived selected/retained edges may extend the request's declared scope.
+                    const effectiveIds = new Set(topology.links.map(entityId));
+                    assertClassicTunnelTransport(...snapshot.links.filter(link => effectiveIds.has(entityId(link))));
                     if (scope?.kind === 'link.replace'
                         && (topology.links.length !== scope.linkIds.length
                             || topology.links.some(link => !scope.linkIds.includes(link.id)))) {

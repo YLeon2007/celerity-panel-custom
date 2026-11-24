@@ -29,7 +29,7 @@ const logger = require('../../utils/logger');
 const vless = require('../../utils/vlessEncryption');
 const { isRebuildEnabled } = require('../../services/rebuildMode');
 const { assertRebuildVlessEditAllowed } = require('../../services/rebuildClientConfigOwnership');
-const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
+const { projectLinkHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
 const { relayRoleBlock, withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
 const { runtimeForeignChange, isNetworkNotReady, networkObservationRequired } = require('../../services/rebuildRelayRuntimeRefusal');
@@ -624,7 +624,8 @@ router.get('/nodes/:id', async (req, res) => {
         const linkQuery = CascadeLink.find({
             $or: [{ portalNode: req.params.id }, { bridgeNode: req.params.id }],
         });
-        if (rebuild) linkQuery.select(observationSelect).lean();
+        linkQuery.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+        if (rebuild) linkQuery.lean();
         const [node, groups, cascadeLinks, settings, guardEnabled, candidateNodes] = await Promise.all([
             HyNode.findById(req.params.id)
                 .select('+xray.manualKey')
@@ -714,7 +715,7 @@ router.get('/nodes/:id', async (req, res) => {
             nodeConfigPreview,
             groups,
             candidateNodes,
-            cascadeLinks: rebuild ? (cascadeLinks || []).map(link => projectReverseHealth(link)) : (cascadeLinks || []),
+            cascadeLinks: (cascadeLinks || []).map(link => projectLinkHealth(link, rebuild)),
             error: req.query.error || null,
             panelDomain: config.PANEL_DOMAIN || '',
             panelAcmeEmail: config.ACME_EMAIL || '',

@@ -5,6 +5,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'public/js/network.js'), 'utf8');
+const nodesView = path.join(__dirname, '..', 'views', 'nodes.ejs');
 const LINK_ID = '507f1f77bcf86cd799439011';
 const OP_ID = '507f1f77bcf86cd799439022';
 const PORTAL_ID = '507f1f77bcf86cd799439055';
@@ -267,11 +268,11 @@ test('the real link form renders an accessible localized checkbox only in rebuil
     const start = view.indexOf('<form id="addLinkForm"');
     const template = view.slice(start, view.indexOf('</form>', start) + 7);
     const ejs = require('ejs');
-    assert.doesNotMatch(ejs.render(template, { t: k => k }), /name="tunnelEncryption"/);
+    assert.doesNotMatch(ejs.render(template, { t: k => k }, { filename: nodesView }), /name="tunnelEncryption"/);
     for (const locale of ['ru', 'en', 'zh-CN']) {
         const labels = require('../src/locales/' + locale + '.json').network;
         const t = key => labels[key.split('.')[1]] ?? key;
-        const html = ejs.render(template, { t, c3Rebuild: true });
+        const html = ejs.render(template, { t, c3Rebuild: true }, { filename: nodesView });
         assert.match(html, /<input type="checkbox" name="tunnelEncryption" aria-describedby="tunnelEncryptionHint" checked>/);
         assert.ok(labels.tunnelEncryption && html.includes(labels.tunnelEncryption));
         assert.ok(labels.tunnelEncryptionHint && html.includes(labels.tunnelEncryptionHint));
@@ -351,7 +352,7 @@ test('both actual form templates expose accessible localized port status beside 
     for (const [formId, input, hint] of [['addLinkForm', 'name="tunnelPort"', 'portConflictHint'],
         ['quickLinkForm', 'id="quickTunnelPort"', 'quickPortConflictHint']]) {
         const start = view.indexOf('<form id="' + formId + '"');
-        const html = ejs.render(view.slice(start, view.indexOf('</form>', start) + 7), { t: key => key });
+        const html = ejs.render(view.slice(start, view.indexOf('</form>', start) + 7), { t: key => key }, { filename: nodesView });
         assert.match(html, new RegExp('<input[^>]*' + input + '[^>]*aria-describedby="[^"]*' + hint));
         assert.match(html, new RegExp('id="' + hint + '"[^>]*role="status"[^>]*aria-live="polite"'));
     }

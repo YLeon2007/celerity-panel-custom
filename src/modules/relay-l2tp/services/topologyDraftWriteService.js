@@ -1,5 +1,7 @@
 'use strict';
 
+const { assertClassicTunnelTransport } = require('../../../utils/cascadeTransport');
+
 const { buildCandidate, TopologyDraftError } = require('../domain/topologyDraft');
 const { compileTopology } = require('../domain/topologyCompiler');
 const { validateTopology } = require('../domain/topologyValidator');
@@ -49,6 +51,11 @@ class TopologyDraftWriteService {
         const result = await this.repository.commitDraft({
             expectedRevision: expectedTopologyRevision,
             prepare: async snapshot => {
+                if (mutation.kind === 'link.create') assertClassicTunnelTransport(mutation.document);
+                if (mutation.kind === 'link.update') {
+                    const current = (snapshot.links || []).find(link => String(link._id ?? link.id) === String(mutation.id));
+                    assertClassicTunnelTransport(current, mutation.changes);
+                }
                 let prepared;
                 try {
                     prepared = buildCandidate(snapshot, mutation);

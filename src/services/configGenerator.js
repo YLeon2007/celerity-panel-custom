@@ -5,8 +5,10 @@
 const yaml = require('yaml');
 const fs = require('fs');
 const path = require('path');
+const { hkdfSync } = require('node:crypto');
 const { composeXrayConfig } = require('../modules/relay-l2tp/services/xrayConfigComposer');
 const { buildServerDecryption } = require('../utils/vlessEncryption');
+const { normalizeTransport, isKcpSecurity, sanitizeKcpInput, KCP_INPUT_FIELDS, KCP_DEFAULTS, assertClassicTunnelTransport } = require('../utils/cascadeTransport');
 
 // Descriptor-only generation must not load dotenv or open the panel's logs.
 const panelDomainFromConfig = () => require('../../config').PANEL_DOMAIN;
@@ -1065,7 +1067,7 @@ function applyReversePortal(config, portalLinks, clientInboundTags, options = {}
             port: link.tunnelPort || 10086,
             protocol,
             settings,
-            streamSettings: buildCascadeTunnelStreamSettings(link, { ...options, server: true }),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(link, { ...options, server: true }),
         };
 
         config.inbounds.push(inbound);
@@ -1173,7 +1175,7 @@ function applyReverseBridge(config, links, egressTag = 'freedom', { scopeControl
                     users: [buildOutboundUser(link.tunnelUuid, protocol)],
                 }],
             },
-            streamSettings: buildCascadeTunnelStreamSettings(link, { panelTls }),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(link, { panelTls }),
         };
         if (link.muxEnabled) {
             tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
@@ -1242,7 +1244,7 @@ function generateBridgeConfig(link, portalNode) {
                 users: [buildOutboundUser(link.tunnelUuid, protocol)],
             }],
         },
-        streamSettings: buildCascadeTunnelStreamSettings(link),
+        streamSettings: buildClassicCascadeTunnelStreamSettings(link),
     };
     if (link.muxEnabled) {
         tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
@@ -1361,7 +1363,7 @@ function generateCombinedBridgeConfig(links, options = {}) {
                     users: [buildOutboundUser(link.tunnelUuid, protocol)],
                 }],
             },
-            streamSettings: buildCascadeTunnelStreamSettings(link),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(link),
         };
         if (link.muxEnabled) {
             tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
@@ -1469,7 +1471,7 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
                 users: [buildOutboundUser(upstreamLink.tunnelUuid, upProtocol)],
             }],
         },
-        streamSettings: buildCascadeTunnelStreamSettings(upstreamLink),
+        streamSettings: buildClassicCascadeTunnelStreamSettings(upstreamLink),
     };
     if (upstreamLink.muxEnabled) {
         tunnelUpOutbound.mux = { enabled: true, concurrency: upstreamLink.muxConcurrency || 8 };
@@ -1520,7 +1522,7 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
             port: downLink.tunnelPort || 10086,
             protocol: downProtocol,
             settings: downSettings,
-            streamSettings: buildCascadeTunnelStreamSettings(downLink, { server: true }),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(downLink, { server: true }),
         });
 
         // Rule: connector + domain → portal (handshake)
@@ -1644,9 +1646,46 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
     return JSON.stringify(config, null, 2);
 }
 
+// The legacy profile generators have no versioned UDP admission. Only the
+// Rebuild composer uses the shared wire primitive directly.
+function buildClassicCascadeTunnelStreamSettings(link, options) {
+    assertClassicTunnelTransport(link);
+    return buildCascadeTunnelStreamSettings(link, options);
+}
+
+const kcpError = code => Object.assign(new Error(code), { code });
+
+function deriveKcpPassword(link) {
+    const key = link._id ?? link.id;
+    const id = key?.toHexString?.() ?? key;
+    if (typeof id !== 'string' || !id || /[^A-Za-z0-9_-]/.test(id)) throw kcpError('CASCADE_KCP_LINK_ID_INVALID');
+    // Same required root policy as rebuildLinkKeys, with a distinct domain.
+    // Editable public fields, including the tunnel UUID, are not key material.
+    const root = process.env.ENCRYPTION_KEY;
+    if (typeof root !== 'string' || root.trim().length < 32) throw kcpError('CASCADE_KCP_KEY_UNAVAILABLE');
+    const bytes = Buffer.from(hkdfSync('sha256', root, 'celerity/cascade/mkcp/v1', id, 16));
+    try { return bytes.toString('hex'); } finally { bytes.fill(0); }
+}
+
+function buildKcpStreamFields(link, redactSecrets) {
+    // Link may be a hydrated Mongoose document; copy only the allowed paths.
+    const { fields, error } = sanitizeKcpInput(Object.fromEntries(KCP_INPUT_FIELDS.map(key => [key, link[key]])));
+    if (error) throw kcpError('CASCADE_KCP_INPUT_INVALID');
+    const {
+        kcpMtu: mtu = KCP_DEFAULTS.mtu, kcpTti: tti = KCP_DEFAULTS.tti,
+        kcpUplinkCapacity: uplinkCapacity = KCP_DEFAULTS.uplinkCapacity,
+        kcpDownlinkCapacity: downlinkCapacity = KCP_DEFAULTS.downlinkCapacity, kcpHeader: header = KCP_DEFAULTS.header,
+    } = fields;
+    const password = redactSecrets === true ? '<redacted>' : deriveKcpPassword(link);
+    // The first layer is innermost: encrypt, then add the optional header.
+    const udp = [{ type: 'mkcp-legacy', settings: { header: '', value: password } }];
+    if (header !== 'none') udp.push({ type: 'mkcp-legacy', settings: { header, value: '' } });
+    return { kcpSettings: { mtu, tti, uplinkCapacity, downlinkCapacity }, finalmask: { udp } };
+}
+
 /**
  * Build streamSettings for the cascade tunnel connection between Portal and Bridge.
- * Supports tcp/ws/grpc/xhttp transports and none/tls/reality security.
+ * Supports tcp/ws/grpc/xhttp/kcp transports. mKCP supports none or TLS only.
  *
  * Note: Xray-core 25.x+ renamed splithttp to xhttp; old DB rows storing
  * 'splithttp' are normalized to 'xhttp' here for forward compatibility.
@@ -1654,12 +1693,13 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
  * @param {Object} link - CascadeLink document
  * @param {Object} [opts] - Options
  * @param {boolean} [opts.server] - true to build server-side (inbound) settings
+ * @param {boolean} [opts.redactSecrets] - replace the mKCP password for display only
  * @returns {Object} streamSettings
  */
 function buildCascadeTunnelStreamSettings(link, opts = {}) {
-    const rawTransport = link.tunnelTransport || 'tcp';
-    const transport = rawTransport === 'splithttp' ? 'xhttp' : rawTransport;
+    const transport = normalizeTransport(link.tunnelTransport);
     const security = link.tunnelSecurity || 'none';
+    if (transport === 'kcp' && !isKcpSecurity(link.tunnelSecurity ?? 'none')) throw kcpError('CASCADE_KCP_SECURITY_INVALID');
     const realityServerNames = link.realitySni?.length ? link.realitySni : ['www.google.com'];
     const realityServerName = realityServerNames[0] || 'www.google.com';
 
@@ -1750,6 +1790,8 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
             host: link.xhttpHost || '',
             mode: link.xhttpMode || 'auto',
         };
+    } else if (transport === 'kcp') {
+        Object.assign(stream, buildKcpStreamFields(link, opts.redactSecrets));
     }
 
     return stream;
@@ -1837,7 +1879,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                     users: [buildOutboundUser(link.tunnelUuid, fwdProto)],
                 }],
             },
-            streamSettings: buildCascadeTunnelStreamSettings(link, options),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(link, options),
         };
 
         if (link.muxEnabled) {
@@ -1875,7 +1917,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                     users: [buildOutboundUser(branchLink.tunnelUuid, branchProto)],
                 }],
             },
-            streamSettings: buildCascadeTunnelStreamSettings(branchLink, options),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(branchLink, options),
         };
         if (branchLink.muxEnabled) {
             outbound.mux = { enabled: true, concurrency: branchLink.muxConcurrency || 8 };
@@ -1972,7 +2014,7 @@ function generateForwardHopConfig(linkOrLinks) {
             port: link.tunnelPort || 10086,
             protocol: hopProto,
             settings: hopSettings,
-            streamSettings: buildCascadeTunnelStreamSettings(link, { server: true }),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(link, { server: true }),
             sniffing: {
                 enabled: true,
                 destOverride: ['http', 'tls', 'quic'],
@@ -2030,7 +2072,7 @@ function applyForwardHopInbound(config, hopLinks, { transitOnly = false, panelTl
             port: link.tunnelPort || 10086,
             protocol: hopProto,
             settings: hopSettings,
-            streamSettings: buildCascadeTunnelStreamSettings(link, { server: true, panelTls }),
+            streamSettings: buildClassicCascadeTunnelStreamSettings(link, { server: true, panelTls }),
             sniffing: {
                 enabled: true,
                 destOverride: ['http', 'tls', 'quic'],

@@ -4,6 +4,7 @@
 // No install, staging, config writes, firewall changes or lock acquisition here.
 const { randomBytes } = require('node:crypto');
 const net = require('node:net');
+const { assertClassicTunnelTransport, xrayListenerProtocols } = require('../utils/cascadeTransport');
 const MAIN = '/usr/local/etc/xray/config.json';
 const TRANSIT = '/usr/local/etc/xray-bridge/config.json';
 const unavailable = () => Object.assign(new Error('Tunnel port inspection unavailable'), { code: 'TUNNEL_PORT_CHECK_UNAVAILABLE' });
@@ -74,11 +75,13 @@ function ownsFragment(main, target, node) {
     });
 }
 
-async function inspectTunnelPort({ node, port, target = null }, exec) {
+async function inspectTunnelPort({ node, port, target = null, tunnelTransport }, exec) {
+    assertClassicTunnelTransport({ tunnelTransport }, target);
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw unavailable();
     const read = file => exec(`# C3_READ_CONFIG\nif test -e ${file}; then\n test -f ${file} && test ! -L ${file} && test "$(stat -c %s ${file})" -le 1048576 && cat ${file}\nelse\n printf C3_CONFIG_ABSENT\nfi`);
     const main = config(await read(MAIN)), transit = config(await read(TRANSIT));
-    const inbounds = profile => (profile.inbounds || []).filter(row => includesPort(row?.port, port));
+    const inbounds = profile => (profile.inbounds || []).filter(row => includesPort(row?.port, port)
+        && xrayListenerProtocols(row).join(',') !== 'udp');
     const mainHits = inbounds(main), transitHits = inbounds(transit);
     const own = target?.tunnelPort === port && mainHits.length === 1 && ownsFragment(main, target, node);
     if (transitHits.length || (mainHits.length && !own)) throw occupied();
@@ -100,6 +103,7 @@ async function inspectTunnelPort({ node, port, target = null }, exec) {
 }
 
 async function preflightTunnelPort(input, { NodeSSH, timeoutMs = 15000 } = {}) {
+    assertClassicTunnelTransport(input, input.target);
     let ssh, expired = false, timer;
     const deadline = performance.now() + timeoutMs;
     const guard = () => { if (expired || performance.now() >= deadline) throw unavailable(); };

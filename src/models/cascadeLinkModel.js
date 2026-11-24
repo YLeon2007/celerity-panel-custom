@@ -6,6 +6,7 @@
  */
 
 const mongoose = require('mongoose');
+const { CASCADE_TRANSPORTS, KCP_HEADERS, KCP_NUMERIC_FIELDS, isKcpSecurity, sanitizeKcpInput } = require('../utils/cascadeTransport');
 
 const lifecycleSchema = new mongoose.Schema({
     state: { type: String, enum: ['deleting'], required: true },
@@ -29,13 +30,28 @@ const reverseObservationSchema = new mongoose.Schema({
 }, { _id: false, versionKey: false, strict: 'throw' });
 
 function hideRebuildSecrets(_doc, row) {
+    delete row.kcpPassword;
     delete row.rebuildVlessKeyEnvelope;
     delete row._rebuildVless;
     delete row.rebuildApplied;
     delete row.rebuildApplyEpoch;
     delete row.rebuildAppliedMainSha256;
     delete row.rebuildReverseObservation;
+    delete row.rebuildKcpApplied;
     return row;
+}
+
+function kcpField(field, options) {
+    return {
+        ...options,
+        // Mongoose's default casts would accept e.g. true -> 1 or '0x14' -> 20.
+        cast: value => {
+            const { fields, error } = sanitizeKcpInput({ [field]: value });
+            if (error) throw new mongoose.Error.CastError(options.type.name, value, field);
+            return fields[field];
+        },
+        validate: value => value !== null,
+    };
 }
 
 const cascadeLinkSchema = new mongoose.Schema({
@@ -67,7 +83,17 @@ const cascadeLinkSchema = new mongoose.Schema({
     tunnelEncryption: { type: String, enum: ['vless-enc', 'none'] },
     // Rebuild-only SNI; Classic tunnel generation/CRUD do not consume it.
     rebuildTlsServerName: { type: String, default: undefined },
-    tunnelTransport: { type: String, enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'], default: 'tcp' },
+    tunnelTransport: {
+        type: String, enum: CASCADE_TRANSPORTS, default: 'tcp',
+        validate: {
+            // Partial query updates are checked against the effective pair at
+            // the management boundary; a document has both fields here.
+            validator(value) {
+                return value !== 'kcp' || !(this instanceof mongoose.Document) || isKcpSecurity(this.tunnelSecurity);
+            },
+            message: 'mKCP requires none or TLS security',
+        },
+    },
 
     // TCP settings
     tcpFastOpen: { type: Boolean, default: true },
@@ -85,6 +111,12 @@ const cascadeLinkSchema = new mongoose.Schema({
     xhttpPath: { type: String, default: '/cascade' },
     xhttpHost: { type: String, default: '' },
     xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up', 'stream-one'], default: 'auto' },
+
+    // Sparse, public tuning only. Apply defaults on the wire so existing
+    // non-mKCP rows/documents do not acquire extra fields on save.
+    ...Object.fromEntries(Object.entries(KCP_NUMERIC_FIELDS).map(([field, bounds]) =>
+        [field, kcpField(field, { type: Number, ...bounds })])),
+    kcpHeader: kcpField('kcpHeader', { type: String, enum: KCP_HEADERS }),
 
     // REALITY security settings (used when tunnelSecurity = 'reality')
     realityDest: { type: String, default: '' },
@@ -118,6 +150,7 @@ const cascadeLinkSchema = new mongoose.Schema({
     rebuildApplyEpoch: { type: String, select: false, match: /^[a-f0-9]{32}$/ },
     rebuildAppliedMainSha256: { type: String, select: false, match: /^[a-f0-9]{64}$/ },
     rebuildReverseObservation: { type: reverseObservationSchema, select: false },
+    rebuildKcpApplied: { type: String, select: false, match: /^[a-f0-9]{64}$/ },
     // Metadata only. Startup must never infer a fresh deploy from this flag.
     autoDeploy: { type: Boolean, default: false },
     // The old descriptor remains intact until operation-owned cleanup/readback

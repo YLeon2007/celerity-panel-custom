@@ -24,9 +24,9 @@ const [portal, bridge] = nodes;
 const linkId = '000000000000000000000003';
 const link = { _id: linkId, name: 'Existing link', active: true, status: 'deployed', mode: 'reverse',
     portalNode: portal._id, bridgeNode: bridge._id, tunnelPort: 10086 };
-const render = (view, c3Rebuild) => ejs.render(read('views/' + view + '.ejs'), {
+const render = (view, c3Rebuild, locale = en) => ejs.render(read('views/' + view + '.ejs'), {
     c3Rebuild, csrfToken, nodes: [], groups: [], nodesCount: 2, linksCount: 1, loadBalancingEnabled: false,
-    t: key => key.split('.').reduce((value, part) => value?.[part], en) ?? key,
+    t: key => key.split('.').reduce((value, part) => value?.[part], locale) ?? key,
 }, { filename: path.join(root, 'views', `${view}.ejs`) });
 const attr = (tag, name) => tag.match(new RegExp('(?:^|\\s)' + name + '="([^"]*)"'))?.[1];
 const tags = html => [...html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<[a-z][\w-]*(?:[^'"<>]|"[^"]*"|'[^']*')*>/gi)].map(m => m[0]);
@@ -35,8 +35,8 @@ const reply = (body, status = 200, url) => ({ ok: status < 300, status, url, asy
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 async function graphUI(t, { rebuild = true, confirmations = [], preview = { allowed: true },
-    inventory = nodes, savedLink = link, responses = {} } = {}) {
-    const html = render('nodes', rebuild);
+    inventory = nodes, savedLink = link, responses = {}, view = 'nodes', locale = en } = {}) {
+    const html = render(view, rebuild, locale);
     const requests = [], errors = [], unexpected = [], timers = new Map(), observers = new Map(), toasts = [];
     const elements = new Map(), taps = new Map();
     let sequence = 0, assetUrl, entries = [], rows = [link];
@@ -57,7 +57,8 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
     };
     function element(tag = '') {
         const listeners = new Map(), classes = new Set((attr(tag, 'class') || '').split(' '));
-        const el = { tag, value: attr(tag, 'value') ?? '', checked: /\schecked(?=\s|>)/.test(tag),
+        const el = { tag, value: attr(tag, 'value') ?? '', defaultValue: attr(tag, 'value') ?? '',
+            hidden: /\shidden(?=\s|>)/.test(tag), disabled: /\sdisabled(?=\s|>)/.test(tag), checked: /\schecked(?=\s|>)/.test(tag),
             style: { display: attr(tag, 'style')?.match(/display:\s*([^;]+)/)?.[1] ?? '' },
             innerHTML: '', textContent: '', options: [], appendChild(option) {
                 this.options.push(option);
@@ -81,8 +82,9 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
     }
     const get = id => elements.get(id) ?? null;
     for (const [formId, switcherId] of [['addLinkForm', 'modeSwitcher'], ['quickLinkForm', 'quickModeSwitcher']]) {
-        const formHtml = html.match(new RegExp('<form id="' + formId + '"[\\s\\S]*?</form>'))[0];
         const form = get(formId);
+        if (!form) continue;
+        const formHtml = html.match(new RegExp('<form id="' + formId + '"[\\s\\S]*?</form>'))[0];
         const formTags = tags(formHtml);
         const field = tag => get(attr(tag, 'id')) || element(tag);
         for (const tag of formTags.filter(tag => attr(tag, 'name'))) form[attr(tag, 'name')] = field(tag);
@@ -94,7 +96,10 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         const submit = field(formTags.find(tag => attr(tag, 'type') === 'submit'));
         form.querySelector = selector => selector === '[type="submit"]' ? submit : null;
         const modeButtons = formTags.filter(tag => attr(tag, 'data-mode')).map(element);
-        get(switcherId).querySelectorAll = selector => selector === '.mode-btn' ? modeButtons : [];
+        if (get(switcherId)) get(switcherId).querySelectorAll = selector => selector === '.mode-btn' ? modeButtons : [];
+        const controls = formTags.filter(tag => attr(tag, 'name')).map(tag => form[attr(tag, 'name')]);
+        const initial = controls.map(field => field.value);
+        form.reset = () => controls.forEach((field, i) => { field.value = initial[i]; });
     }
     const refusals = [];
     const confirm = () => confirmations.shift() ?? true;
@@ -102,7 +107,7 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         confirm,
         crypto: { randomUUID: require('node:crypto').randomUUID }, showToast: (...args) => toasts.push(args) };
     const document = {
-        readyState: 'complete', getElementById: get, createElement: () => element(),
+        readyState: 'complete', getElementById: get, createElement: () => element(), addEventListener() {},
         querySelector(selector) {
             const match = selector.match(/^#addLinkForm \[name="([^"]+)"\]$/);
             return match ? get('addLinkForm')[match[1]] : null; // no canvas animation or loading decoration
@@ -145,8 +150,8 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
                 if (rebuild) return reply({ error: { code: 'REBUILD_STRICT_DISABLED' } }, 409);
                 return reply({ available: false, port: 10087, code: 'TUNNEL_PORT_IN_USE' });
             }
-            if (method === 'PUT' && url === linksUrl + '/' + linkId) return reply({ executionMode: 'rebuild',
-                status: 'saved', desiredSaved: true, linkId }, 200, absolute.href);
+            if (method === 'PUT' && url === linksUrl + '/' + linkId) return rebuild ? reply({ executionMode: 'rebuild',
+                status: 'saved', desiredSaved: true, linkId }, 200, absolute.href) : reply(snapshot());
             if (method === 'POST' && url === linksUrl) return rebuild
                 ? reply({ executionMode: 'rebuild', desiredSaved: true, linkId: '000000000000000000000004',
                     status: 'awaiting_preview', preview: { allowed: false, nodes: [] } }, 201, absolute.href)
@@ -159,12 +164,18 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
         assert.deepEqual(unexpected, []);
         assert.deepEqual(errors, []);
     });
-    const start = html.indexOf('window._networkCsrfToken =');
-    const end = html.indexOf('// Restore network view after page load', start);
-    assert.ok(start >= 0 && end > start, 'load the real nodes graph script and UI bindings');
     const labels = html.match(/window\._networkRebuildPreviewI18n = [^\n]+/);
     if (labels) vm.runInContext(labels[0], context);
-    vm.runInContext(html.slice(start, end) + '\nloadNetworkScripts();', context);
+    if (view === 'nodes') {
+        const start = html.indexOf('window._networkCsrfToken =');
+        const end = html.indexOf('// Restore network view after page load', start);
+        assert.ok(start >= 0 && end > start, 'load the real nodes graph script and UI bindings');
+        vm.runInContext(html.slice(start, end) + '\nloadNetworkScripts();', context);
+    } else {
+        const bootstrap = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].find(([, code]) => code.includes('window._networkCsrfToken ='));
+        vm.runInContext(bootstrap[1], context);
+        assetUrl = html.match(/src="(\/js\/network(?:\.min)?\.js\?v=[a-f0-9]{16})"/)[1];
+    }
     assert.match(assetUrl, rebuild ? /^\/js\/network\.js\?v=.+$/ : /^\/js\/network\.min\.js\?v=[a-f0-9]{16}$/);
     vm.runInContext(read('public' + assetUrl.split('?')[0]), context, { filename: assetUrl });
     async function flush(delay) {
@@ -174,7 +185,7 @@ async function graphUI(t, { rebuild = true, confirmations = [], preview = { allo
     }
     await flush(30); // initial graph load from the normal init() path
     const info = get('nodeInfoBody');
-    return { get, graph, window, assetUrl, flush, toasts, refusals,
+    return { get, graph, window, assetUrl, flush, toasts, refusals, html,
         checks: () => requests.filter(req => req.url.startsWith(portCheckUrl)),
         writes: () => requests.filter(req => req.method !== 'GET'),
         tapEdge() { taps.get('tap:edge')({ target: graph.getElementById('link-' + linkId) }); },
@@ -209,7 +220,7 @@ async function openCreate(ui, kind) {
     const port = quick ? ui.get('quickTunnelPort') : form.tunnelPort;
     const auto = quick ? ui.get('quickAutoDeploy') : form.autoDeploy;
     const switcher = ui.get(quick ? 'quickModeSwitcher' : 'modeSwitcher');
-    const mode = value => switcher.querySelectorAll('.mode-btn').find(btn => btn.getAttribute('data-mode') === value).dispatch('click');
+    const mode = value => switcher?.querySelectorAll('.mode-btn').find(btn => btn.getAttribute('data-mode') === value).dispatch('click');
     port.value = '10087';
     await port.dispatch('input');
     await mode('forward');
@@ -405,3 +416,81 @@ test('a fingerprint refusal on Apply after the draft save never reports deployme
     assert.match(ui.toasts.at(-1)[0], /The link was saved.*not applied.*Bridge.*26\.11\.9.*chrome, firefox, safari/);
     assert.equal(ui.toasts.at(-1)[1], 'error');
 });
+
+const kcp = { kcpMtu: 1460, kcpTti: 32, kcpUplinkCapacity: 80, kcpDownlinkCapacity: 300, kcpHeader: 'wireguard' };
+for (const view of ['nodes', 'network']) for (const rebuild of [true, false]) {
+    const setup = (t, options = {}) => graphUI(t, { view, rebuild, ...options });
+    test(`${view}/${rebuild ? 'source mKCP round trip' : 'minified mKCP refusal'}`, async t => {
+        const ui = await setup(t, { savedLink: { ...link, ...kcp, tunnelTransport: 'kcp', tunnelSecurity: 'tls' } });
+        const { form, auto } = await openCreate(ui, 'main');
+        const section = ui.get('kcpSection');
+        if (!rebuild) {
+            assert.ok(!section);
+            assert.ok(!form.tunnelTransport.options.some(opt => opt.value === 'kcp'));
+            form.tunnelTransport.value = 'kcp';
+            await form.dispatch('submit');
+            assert.equal(ui.writes().length, 0);
+            assert.deepEqual(ui.toasts.at(-1), [en.network.classicKcpRebuildOnly, 'error']);
+            return;
+        }
+        assert.equal(section.hidden, true);
+        assert.equal(section.disabled, true);
+        const reality = form.tunnelSecurity.options.find(opt => opt.value === 'reality');
+        if (reality) form.tunnelSecurity.value = 'reality';
+        form.tunnelTransport.value = 'kcp';
+        await form.tunnelTransport.dispatch('change');
+        assert.equal(section.hidden, false);
+        assert.equal(section.disabled, false);
+        if (reality) assert.equal(reality.disabled, true);
+        assert.equal(form.tunnelSecurity.value, 'none');
+        assert.deepEqual(form.kcpHeader.options.map(opt => opt.value), ['none', 'wechat', 'dtls', 'srtp', 'wireguard']);
+        for (const [key, value] of Object.entries(kcp)) form[key].value = String(value);
+        auto.checked = false;
+        await form.dispatch('submit');
+        const [create] = ui.writes();
+        assert.equal(create.method, 'POST');
+        assert.equal(create.body.tunnelTransport, 'kcp');
+        for (const [key, value] of Object.entries(kcp)) assert.equal(create.body[key], value);
+        assert.ok(!Object.hasOwn(create.body, 'kcpPassword'));
+        assert.equal(section.hidden, true, 'closing the modal restores the TCP default');
+
+        ui.tapEdge();
+        await ui.clickAction('btnEdit');
+        assert.equal(form.tunnelTransport.value, 'kcp');
+        assert.equal(form.tunnelSecurity.value, 'tls');
+        assert.equal(form.kcpMtu.value, kcp.kcpMtu);
+        assert.equal(form.kcpHeader.value, 'wireguard');
+        form.kcpTti.value = '';
+        await form.dispatch('submit');
+        const edit = ui.writes()[1];
+        assert.equal(edit.method, 'PUT');
+        assert.ok(!Object.hasOwn(edit.body, 'kcpTti'), 'an empty edit is not a reset');
+        assert.equal(edit.body.kcpMtu, kcp.kcpMtu);
+        assert.equal(edit.body.kcpHeader, kcp.kcpHeader);
+
+        await openCreate(ui, 'main');
+        auto.checked = false;
+        await form.dispatch('submit');
+        const nonKcp = ui.writes()[2];
+        assert.equal(nonKcp.body.tunnelTransport, 'tcp');
+        for (const key of Object.keys(kcp)) assert.ok(!Object.hasOwn(nonKcp.body, key));
+    });
+}
+
+for (const view of ['nodes', 'network']) for (const lang of ['en', 'ru', 'zh-CN']) {
+    const locale = require('../src/locales/' + lang + '.json');
+    test(`${view}/${lang} version refusal explains the failure and sends no Apply`, async t => {
+        const ui = await graphUI(t, { view, locale, responses: { ['POST ' + previewUrl]: {
+            status: 409, body: { error: { code: 'REBUILD_XRAY_VERSION_TOO_OLD', message: 'private diagnostic' } },
+        } } });
+        await ui.window._cascadeDeploy(linkId);
+        assert.deepEqual(ui.writes().map(call => call.url), [previewUrl]);
+        assert.equal(ui.toasts.at(-1)[0], locale.network.rebuildCoreTooOld);
+        assert.ok(ui.html.includes(locale.network.kcpHint));
+        assert.ok(ui.html.includes(locale.network.kcpHeaderWechat));
+        for (const [key, min, max, def] of [['kcpMtu', 576, 1460, 1350], ['kcpTti', 10, 100, 20],
+            ['kcpUplinkCapacity', 1, 1000, 100], ['kcpDownlinkCapacity', 1, 1000, 100]]) {
+            assert.match(ui.html, new RegExp(`name="${key}"[^>]*value="${def}" min="${min}" max="${max}" step="1"`));
+        }
+    });
+}

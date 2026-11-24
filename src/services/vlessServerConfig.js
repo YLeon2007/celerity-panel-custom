@@ -1,5 +1,6 @@
 'use strict';
 
+const { redactKcpConfigValue } = require('../utils/cascadeTransport');
 const { PRIVATE_KEY_SELECT, hasEnabledInbound } = require('../utils/vlessEncryption');
 
 const KEY = 'vlessEncryptionPrivateKey';
@@ -52,7 +53,7 @@ function redactXrayConfig(text) {
     return JSON.stringify(config, (key, value) => {
         const field = key.toLowerCase();
         if (field === 'vlessencryptionprivatekey' || (field === 'decryption' && value !== 'none')) return '<redacted>';
-        return redactVlessDiagnostics(value);
+        return redactVlessDiagnostics(redactKcpConfigValue(key, value));
     }, 2);
 }
 

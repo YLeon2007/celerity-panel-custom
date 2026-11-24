@@ -2,6 +2,7 @@
 
 const { randomUUID } = require('node:crypto');
 const { entityId } = require('../domain/topologyDraft');
+const { KCP_INPUT_FIELDS } = require('../../../utils/cascadeTransport');
 const { partitionRebuildL2tpStates } = require('../domain/l2tpRoutingSelection');
 
 // Include old and new endpoints, and every path changed by dependency cleanup.
@@ -129,7 +130,7 @@ const ACTIVE_ROUTE_GROUP_FILTER = Object.freeze({
     ]),
 });
 const NODE_SELECT = '_id cascadeRole';
-const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled lifecycle';
+const LINK_SELECT = `_id portalNode bridgeNode mode active status geoRouting.enabled lifecycle tunnelTransport tunnelSecurity ${KCP_INPUT_FIELDS.join(' ')}`;
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status node activePathKey appliedTopologyRevision secretRevision';
 const FOLLOW_RELAY_STATE_SELECT = `${ROUTE_GROUP_REFERENCE_SELECT} desiredState installedRouteGroup routingMode routingVersion tproxyPort`;

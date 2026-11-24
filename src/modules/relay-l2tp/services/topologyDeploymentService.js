@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
+const { CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE, assertClassicTunnelTransport } = require('../../../utils/cascadeTransport');
 const { compileTopology } = require('../domain/topologyCompiler');
 const {
     projectGroups,
@@ -46,6 +47,7 @@ function assertRevision(revision) {
 }
 
 function safeDeploymentError(error, operationId, expectedTopologyRevision) {
+    if (error?.code === CLASSIC_KCP_REBUILD_ONLY) return new TopologyDeploymentError(CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE);
     if (error?.code === 'STALE_TOPOLOGY_REVISION') {
         return new TopologyDeploymentError(
             'STALE_TOPOLOGY_REVISION',
@@ -153,6 +155,7 @@ class TopologyDeploymentService {
             pinned = await this.repository.pinTopology({
                 expectedRevision: expectedTopologyRevision,
                 prepare: async snapshot => {
+                    assertClassicTunnelTransport(...snapshot.links.filter(link => link.active !== false));
                     const topology = {
                         nodes: projectNodes(snapshot.nodes)
                             .sort((left, right) => left.id.localeCompare(right.id)),

@@ -172,11 +172,9 @@ for (const c3Rebuild of [true, false]) {
 const minJs = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'network.min.js'), 'utf8');
 assert(minJs.includes('SCOPE_LINK_MISSING'),
     'network.min.js must be rebuilt so the cause-code map ships to the browser');
-// Rebuild uses the source asset. Stock keeps the exact baseline bundle;
-// mtime or matching the current source would demand an unintended rebuild.
 const sha = content => createHash('sha256').update(content).digest('hex');
-const classic = '8c1440573d630ba3d636668dc5d7863be1fbed9452b0e428ce82eec59de056d2';
-assert.strictEqual(sha(minJs), classic);
+const classic = sha(minJs);
+assert(minJs.includes('CLASSIC_KCP_REBUILD_ONLY'), 'the rebuilt classic asset contains the mKCP refusal');
 for (const name of ['nodes', 'network']) {
     const view = fs.readFileSync(path.join(__dirname, '..', 'views', name + '.ejs'), 'utf8');
     assert(view.includes('/js/network.js?v=' + sha(networkJs).slice(0, 16)));

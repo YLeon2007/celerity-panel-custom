@@ -139,7 +139,7 @@
                     </td>
                     <td><code><%= link.tunnelPort %></code></td>
                     <td>
-                        <span class="badge badge-<%= statusClass %>"<% if (link.observationExpiresAt) { %> data-cascade-observation-expires="<%= link.observationExpiresAt %>"<% } %>><%= link.status %></span>
+                        <span class="badge badge-<%= statusClass %>"<% if (link.observationExpiresAt) { %> data-cascade-observation-expires="<%= link.observationExpiresAt %>"<% } %><% if (link.tunnelVerification === 'mkcp_runtime_unsupported') { %> title="<%= t('network.mkcpRuntimeUnsupported') %>"<% } else if (link.tunnelVerification === 'mkcp_apply_unconfirmed' && !link.rebuildDelete && !link.lifecycle) { %> title="<%= t('network.mkcpApplyUnconfirmed') %>"<% } %>><%= link.tunnelVerification === 'mkcp_runtime_unsupported' ? t('network.mkcpAppliedUnverified') : link.status %></span>
                     </td>
                     <td>
                         <div class="cascade-link-actions">

@@ -15,7 +15,7 @@ const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
 const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
-const { isReverse, projectReverseHealth, observationSelect } = require('../services/rebuildReverseLinkHealth');
+const { isReverse, hasKcpStatus, projectLinkHealth, observationSelect } = require('../services/rebuildReverseLinkHealth');
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -118,19 +118,20 @@ router.get('/links/:id/health', requireScope('nodes:read'), async (req, res) => 
             return res.status(400).json({ error: 'Invalid link ID' });
         }
 
-        const link = await CascadeLink.findById(req.params.id);
+        const link = await CascadeLink.findById(req.params.id).select('+rebuildKcpApplied');
         if (!link) return res.status(404).json({ error: 'Cascade link not found' });
 
         const healthy = await cascadeService.healthCheckLink(link);
-        const query = CascadeLink.findById(req.params.id);
-        const updated = await (rebuild ? query.select(observationSelect).lean() : query);
+        const updated = await CascadeLink.findById(req.params.id).select(rebuild ? observationSelect : '+rebuildKcpApplied').lean();
         if (!updated) return res.status(404).json({ error: 'Cascade link not found' });
         const reverse = rebuild && isReverse(updated);
-        const current = reverse ? projectReverseHealth(updated) : updated;
+        const kcp = hasKcpStatus(updated);
+        const current = projectLinkHealth(updated, rebuild);
 
         res.json({
-            healthy: reverse ? current.status === 'online' : healthy,
+            healthy: kcp ? false : reverse ? current.status === 'online' : healthy,
             status: current.status,
+            ...(kcp ? { tunnelState: current.tunnelState, tunnelVerification: current.tunnelVerification } : {}),
             ...(reverse && current.observationExpiresAt ? { observationExpiresAt: current.observationExpiresAt } : {}),
             lastHealthCheck: current.lastHealthCheck,
             latencyMs: current.latencyMs,

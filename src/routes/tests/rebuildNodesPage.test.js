@@ -52,7 +52,8 @@ for (const rebuild of [true, false]) test(`GET /panel/nodes selects the ${rebuil
     const asset = rebuild ? 'network.js' : 'network.min.js';
     const version = createHash('sha256').update(readFileSync(path.resolve(__dirname, '../../../public/js', asset))).digest('hex').slice(0, 16);
     assert.deepEqual(selected.filter(url => url.startsWith('/js/network')), [`/js/${asset}?v=${version}`]);
-    if (!rebuild) assert.equal(version, '8c1440573d630ba3');
+    assert.equal(/<option value="kcp">/.test(page.body), rebuild);
+    assert.equal(/name="kcpMtu"[^>]*min="576" max="1460"/.test(page.body), rebuild);
     if (rebuild) {
         const redirected = await request(app, '/panel/network', { method: 'GET', session });
         assert.equal(redirected.status, 302);

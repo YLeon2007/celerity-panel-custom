@@ -19,7 +19,7 @@ const {
 const { maintainAutoL2tpPaths } = require('../modules/relay-l2tp/services/autoL2tpPathMaintenance');
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 const { isRebuildEnabled, rejectRebuildRoute } = require('../services/rebuildMode');
-const { isReverse, projectReverseHealth, observationSelect } = require('../services/rebuildReverseLinkHealth');
+const { isReverse, hasKcpStatus, projectLinkHealth, observationSelect } = require('../services/rebuildReverseLinkHealth');
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const {
@@ -32,14 +32,23 @@ const { requirePanelCsrf } = require('./panel/csrf');
 const { issueClassicLifecycleGrant } = require('../services/classicLifecycleAuthorization');
 const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
 
+const { CASCADE_TRANSPORTS, CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE, assertClassicTunnelTransport } = require('../utils/cascadeTransport');
+const { detectLanguage, t } = require('../middleware/i18n');
+const { INVALID_KCP_LINK_SETTINGS, readKcpFields, assertKcpSecurity, publicCascadeLink } = require('../services/cascadeDraftTransport');
+
 const LINK_POPULATE_SELECT = 'name ip flag status';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
 const REALITY_KEY_RE = /^[A-Za-z0-9_\-+/]{43,44}=?$/;
 const REALITY_SHORT_ID_RE = /^[0-9a-fA-F]{0,16}$/;
 const TUNNEL_PROTOCOLS = new Set(['vless', 'vmess']);
+function sendClassicKcpRefusal(req, res) {
+    return res.status(409).json({ error: { code: CLASSIC_KCP_REBUILD_ONLY,
+        message: t('network.classicKcpRebuildOnly', res.locals.lang || detectLanguage(req)) } });
+}
 const ERROR_STATUS_BY_CODE = new Map([
     ['INVALID_TOPOLOGY_REVISION', 400],
     ['INVALID_REQUEST', 400],
+    [INVALID_KCP_LINK_SETTINGS, 400],
     ['INVALID_LINK_ID', 400],
     ['PORTAL_NODE_NOT_FOUND', 404],
     ['BRIDGE_NODE_NOT_FOUND', 404],
@@ -169,6 +178,7 @@ function selectLinkApplyBaselineLinkIds({ links, linkId, portalNodeId, bridgeNod
 }
 
 const SAFE_AUTO_DEPLOY_BLOCKED_CODES = new Set([
+    CLASSIC_KCP_REBUILD_ONLY,
     'INVALID_REQUEST',
     'INVALID_TOPOLOGY_REVISION',
     'STALE_TOPOLOGY_REVISION',
@@ -196,7 +206,7 @@ function autoDeployBlockedError(error) {
         : 'TOPOLOGY_OPERATION_QUEUE_FAILED';
     return {
         code,
-        message: code === 'CLASSIC_DEPLOY_NODE_BUSY'
+        message: code === CLASSIC_KCP_REBUILD_ONLY ? CLASSIC_KCP_MESSAGE : code === 'CLASSIC_DEPLOY_NODE_BUSY'
             ? 'A selected node is busy; retry after its operation finishes'
             : code === 'CLASSIC_DEPLOY_PREFLIGHT_FAILED'
                 ? 'Deployment preflight rejected the request before any remote write'
@@ -320,7 +330,7 @@ async function readPersistedIntent(service, Link, requestKey) {
 
 async function listLinks(Link, filter = {}, rebuild = false) {
     const query = Link.find(filter);
-    if (rebuild) query.select(observationSelect);
+    query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
     return query
         .populate('portalNode', LINK_POPULATE_SELECT)
         .populate('bridgeNode', LINK_POPULATE_SELECT)
@@ -330,18 +340,20 @@ async function listLinks(Link, filter = {}, rebuild = false) {
 
 function projectLinkLifecycle(link, rebuild = false) {
     const hasApplyReceipt = !!link.rebuildApplied;
-    if (rebuild) link = projectReverseHealth(link);
-    const { applicationState, routeState, tunnelState, clientReadiness, pppReadiness, xrayReadiness, ...publicLink } = link;
+    const kcp = hasKcpStatus(link);
+    link = projectLinkHealth(link, rebuild);
+    const { applicationState, routeState, tunnelState, clientReadiness, pppReadiness, xrayReadiness, ...publicLink } = publicCascadeLink(link);
     const deleting = link.lifecycle?.state === 'deleting' || (rebuild && link.rebuildDelete === true);
     const missingApplyReceipt = rebuild && isReverse(link) && link.status === 'deployed' && !hasApplyReceipt;
+    const applied = kcp ? link.tunnelVerification === 'mkcp_runtime_unsupported' : CONFIRMED_DEPLOYED_LINK_STATUSES.has(link.status);
     // Lifecycle status is not a fresh client/route proof. In particular, never
     // reconstruct a complete applied path from mutable desired neighbours.
     return { ...publicLink,
         desiredVersion: linkDesiredVersion({ ...link,
             portalNode: scopedLinkEntityId(link.portalNode), bridgeNode: scopedLinkEntityId(link.bridgeNode) }),
         applicationState: deleting ? 'deleting'
-            : missingApplyReceipt ? 'reconcile_required'
-                : CONFIRMED_DEPLOYED_LINK_STATUSES.has(link.status) ? 'applied'
+            : missingApplyReceipt || link.tunnelVerification === 'mkcp_apply_unconfirmed' ? 'reconcile_required'
+                : applied ? 'applied'
                     : ['offline', 'error'].includes(link.status) ? 'reconcile_required' : 'not_applied',
         routeState: 'unknown',
         tunnelState: link.status === 'online' ? 'connected' : link.status === 'offline' ? 'disconnected' : 'unknown',
@@ -350,8 +362,8 @@ function projectLinkLifecycle(link, rebuild = false) {
 
 async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
     revisions, filter = {}, includeClientReadiness = false, readLinkApplicationState, rebuild = false }) {
-    const displayStatus = rebuild ? filter.status : undefined;
-    if (displayStatus !== undefined) {
+    const displayStatus = filter.status;
+    if (displayStatus !== undefined && (rebuild || displayStatus === 'pending')) {
         filter = { ...filter };
         delete filter.status;
     }
@@ -368,7 +380,9 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
         topologyRevision = state?.revision ?? 0;
         deployedRevision = state?.deployedRevision ?? 0;
     }
-    let links = ((await linksPromise) || []).map(link => projectLinkLifecycle(link, rebuild));
+    const rows = (await linksPromise) || [];
+    const noRuntimeOverlay = new Set(rows.filter(link => hasKcpStatus(link) || (rebuild && isReverse(link))).map(link => String(link._id)));
+    let links = rows.map(link => projectLinkLifecycle(link, rebuild));
     if (displayStatus !== undefined) links = links.filter(link => link.status === displayStatus);
     if (includeClientReadiness && typeof readLinkApplicationState !== 'function') {
         // Never trust a link-local/legacy ready flag. Only a durable, successful
@@ -423,8 +437,8 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
         try {
             // Trusted repository seam must validate selected settled-owner/profile
             // pins. Neither request data nor a panel-wide revision can provide it.
-            const observable = rebuild ? links.filter(link => !isReverse(link)) : links;
-            const states = observable.length === 0 && rebuild ? [] : await readLinkApplicationState({ links: observable.map(link => ({
+            const observable = links.filter(link => !noRuntimeOverlay.has(String(link._id)));
+            const states = observable.length === 0 ? [] : await readLinkApplicationState({ links: observable.map(link => ({
                 linkId: String(link._id), desiredVersion: link.desiredVersion,
             })) });
             const byId = new Map();
@@ -434,7 +448,7 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
                 byId.set(state?.linkId, state);
             }
             links = links.map(link => {
-                if (rebuild && isReverse(link)) return link;
+                if (noRuntimeOverlay.has(String(link._id))) return link;
                 const state = byId.get(String(link._id));
                 if (!state || duplicates.has(String(link._id)) || state.desiredVersion !== link.desiredVersion
                     || typeof state.operationId !== 'string' || !/^[a-f0-9]{24}$/.test(state.operationId)
@@ -780,15 +794,17 @@ function createCascadeLinksRouter({
 
     router.get('/port-check', requireScope('nodes:read'), async (req, res) => {
         res.set('Cache-Control', 'no-store');
-        const { nodeId, port: rawPort, linkId } = req.query;
+        const { nodeId, port: rawPort, linkId, tunnelTransport } = req.query;
         const validId = value => typeof value === 'string' && /^[a-f0-9]{24}$/.test(value);
-        if (Object.keys(req.query).some(key => !['nodeId', 'port', 'linkId'].includes(key))
+        if (Object.keys(req.query).some(key => !['nodeId', 'port', 'linkId', 'tunnelTransport'].includes(key))
+            || (tunnelTransport !== undefined && !CASCADE_TRANSPORTS.includes(tunnelTransport))
             || !validId(nodeId) || typeof rawPort !== 'string' || !/^[1-9]\d{0,4}$/.test(rawPort)
             || Number(rawPort) > 65535 || (linkId !== undefined && !validId(linkId))) {
             return res.status(400).json({ error: { code: 'INVALID_REQUEST', message: 'Invalid tunnel port check request' } });
         }
         const port = Number(rawPort);
         try {
+            assertClassicTunnelTransport({ tunnelTransport });
             const read = { maxTimeMS: 5000, readPreference: 'primary', readConcern: { level: 'majority' } };
             const node = await Node.findById(nodeId).setOptions(read).lean();
             if (!node) return res.status(404).json({ error: { code: 'NODE_NOT_FOUND', message: 'Node was not found' } });
@@ -796,14 +812,16 @@ function createCascadeLinksRouter({
             if (linkId !== undefined) {
                 const link = await Link.findById(linkId).populate('portalNode bridgeNode').setOptions(read).lean();
                 if (!link) return res.status(404).json({ error: { code: 'CASCADE_LINK_NOT_FOUND', message: 'Link was not found' } });
+                assertClassicTunnelTransport(link);
                 if (!['reverse', 'forward'].includes(link.mode ?? 'reverse')) throw Error('Unsupported listener mode');
                 const listener = (link.mode ?? 'reverse') === 'reverse' ? link.portalNode : link.bridgeNode;
                 if (link.active === true && scopedLinkEntityId(listener) === nodeId && link.tunnelPort === port) target = link;
             }
             const { preflightTunnelPort } = require('../services/classicScopedPortPreflight');
-            await preflightTunnelPort({ node, port, target }, { NodeSSH: portCheckSSH });
+            await preflightTunnelPort({ node, port, target, tunnelTransport }, { NodeSSH: portCheckSSH });
             return res.json({ available: true, port, code: null });
         } catch (error) {
+            if (error?.code === CLASSIC_KCP_REBUILD_ONLY) return sendClassicKcpRefusal(req, res);
             if (error?.code === 'TUNNEL_PORT_IN_USE') return res.json({ available: false, port, code: 'TUNNEL_PORT_IN_USE' });
             // Unknown is not free, and transport/config text is never public.
             return res.status(503).json({ error: { code: 'TUNNEL_PORT_CHECK_UNAVAILABLE', message: 'Tunnel port inspection could not be completed' } });
@@ -821,10 +839,8 @@ function createCascadeLinksRouter({
             }
             const rebuild = isRebuildEnabled(deploymentEnv);
             const query = Link.findById(req.params.id);
-            if (rebuild) {
-                res.set('Cache-Control', 'no-store');
-                query.select(observationSelect);
-            }
+            if (rebuild) res.set('Cache-Control', 'no-store');
+            query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
             const link = await query.populate('portalNode', LINK_POPULATE_SELECT)
                 .populate('bridgeNode', LINK_POPULATE_SELECT)
                 .lean();
@@ -906,7 +922,11 @@ function createCascadeLinksRouter({
             }
             const security = tunnelSecurity || 'none';
             const transport = tunnelTransport || 'tcp';
+            if (!CASCADE_TRANSPORTS.includes(transport)) throw new RequestValidationError('Unsupported tunnelTransport');
+            assertClassicTunnelTransport({ tunnelTransport: transport });
             const protocol = tunnelProtocol || 'vless';
+            const kcpFields = readKcpFields(req.body);
+            assertKcpSecurity(transport, tunnelSecurity === undefined ? security : tunnelSecurity);
             if (!TUNNEL_PROTOCOLS.has(protocol)) {
                 throw new RequestValidationError('tunnelProtocol must be "vless" or "vmess"');
             }
@@ -963,6 +983,7 @@ function createCascadeLinksRouter({
                 tunnelProtocol: protocol,
                 tunnelSecurity: security,
                 tunnelTransport: transport,
+                ...kcpFields,
                 tcpFastOpen: tcpFastOpen !== false,
                 tcpKeepAlive: parseInt(tcpKeepAlive, 10) || 100,
                 tcpNoDelay: tcpNoDelay !== false,
@@ -1088,6 +1109,7 @@ function createCascadeLinksRouter({
             logger.info(`[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`);
             return res.status(201).json({ ...snapshot, createdLinkId: String(link._id), desiredSaved: true });
         } catch (error) {
+            if (error?.code === CLASSIC_KCP_REBUILD_ONLY) return sendClassicKcpRefusal(req, res);
             return sendError(res, error, 'Create', {
                 revision: req.body?.expectedTopologyRevision });
         }
@@ -1113,7 +1135,7 @@ function createCascadeLinksRouter({
                 'realityDest', 'realityPrivateKey', 'realityPublicKey',
                 'realityFingerprint',
             ];
-            const changes = {};
+            const changes = readKcpFields(req.body);
             for (const key of allowedFields) {
                 if (req.body?.[key] !== undefined) changes[key] = req.body[key];
             }
@@ -1138,6 +1160,10 @@ function createCascadeLinksRouter({
             if (changes.autoDeploy !== undefined) {
                 changes.autoDeploy = normalizeAutoDeploy(changes.autoDeploy);
             }
+            if (changes.tunnelTransport !== undefined && !CASCADE_TRANSPORTS.includes(changes.tunnelTransport)) {
+                throw new RequestValidationError('Unsupported tunnelTransport');
+            }
+            assertClassicTunnelTransport(changes);
             const durableAutoDeploy = changes.autoDeploy === true
                 && !isClassicProductionDeploymentConfigured(deploymentEnv);
             if (durableAutoDeploy) { getIntentService(); requireIntentKey(req); }
@@ -1176,7 +1202,7 @@ function createCascadeLinksRouter({
 
             if (changes.realityDest === null || (typeof changes.realityDest === 'string' && !changes.realityDest.trim())) delete changes.realityDest;
             if (requestedSni.length) changes.realitySni = requestedSni;
-            const needsCurrentLink = changes.tunnelPort !== undefined
+            const needsCurrentLink = changes.autoDeploy === true || changes.tunnelPort !== undefined
                 || changes.mode !== undefined
                 || changes.portalNode !== undefined
                 || changes.bridgeNode !== undefined
@@ -1200,6 +1226,7 @@ function createCascadeLinksRouter({
                 if (currentLink.lifecycle?.state === 'deleting') {
                     throw Object.assign(new Error('The cascade link is being deleted'), { code: 'CASCADE_LINK_DELETING' });
                 }
+                assertClassicTunnelTransport(currentLink);
             }
 
             if (changes.tunnelPort !== undefined) {
@@ -1223,6 +1250,10 @@ function createCascadeLinksRouter({
                 }
             }
 
+            if (currentLink && (changes.tunnelSecurity !== undefined || changes.tunnelTransport !== undefined)) {
+                assertKcpSecurity(changes.tunnelTransport === undefined ? currentLink.tunnelTransport : changes.tunnelTransport,
+                    changes.tunnelSecurity === undefined ? (currentLink.tunnelSecurity ?? 'none') : changes.tunnelSecurity);
+            }
             if (changes.tunnelSecurity === 'reality' || changes.tunnelTransport) {
                 const effectiveSecurity = changes.tunnelSecurity
                     || currentLink?.tunnelSecurity
@@ -1384,6 +1415,7 @@ function createCascadeLinksRouter({
             }
             return res.json(body);
         } catch (error) {
+            if (error?.code === CLASSIC_KCP_REBUILD_ONLY) return sendClassicKcpRefusal(req, res);
             return sendError(res, error, 'Update', {
                 revision: req.body?.expectedTopologyRevision, linkId: req.params.id });
         }
@@ -1446,6 +1478,7 @@ function createCascadeLinksRouter({
                 revisions: finalRevisions,
             }));
         } catch (error) {
+            if (error?.code === CLASSIC_KCP_REBUILD_ONLY) return sendClassicKcpRefusal(req, res);
             return sendError(res, error, 'Delete', {
                 revision: req.body?.expectedTopologyRevision, linkId: req.params.id });
         }

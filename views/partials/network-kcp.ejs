@@ -1,0 +1,34 @@
+<fieldset id="kcpSection" class="form-section" hidden disabled aria-describedby="kcpHint">
+    <legend class="form-section-title"><%= t('network.kcpTransport') %></legend>
+    <div class="form-hint" id="kcpHint"><%= t('network.kcpHint') %></div>
+    <div class="form-row">
+        <div class="form-group">
+            <label for="kcpMtu"><%= t('network.kcpMtu') %></label>
+            <input id="kcpMtu" type="number" name="kcpMtu" class="form-input" value="1350" min="576" max="1460" step="1">
+        </div>
+        <div class="form-group">
+            <label for="kcpTti"><%= t('network.kcpTti') %></label>
+            <input id="kcpTti" type="number" name="kcpTti" class="form-input" value="20" min="10" max="100" step="1">
+        </div>
+    </div>
+    <div class="form-row">
+        <div class="form-group">
+            <label for="kcpUplinkCapacity"><%= t('network.kcpUplinkCapacity') %></label>
+            <input id="kcpUplinkCapacity" type="number" name="kcpUplinkCapacity" class="form-input" value="100" min="1" max="1000" step="1">
+        </div>
+        <div class="form-group">
+            <label for="kcpDownlinkCapacity"><%= t('network.kcpDownlinkCapacity') %></label>
+            <input id="kcpDownlinkCapacity" type="number" name="kcpDownlinkCapacity" class="form-input" value="100" min="1" max="1000" step="1">
+        </div>
+    </div>
+    <div class="form-group">
+        <label for="kcpHeader"><%= t('network.kcpHeader') %></label>
+        <select id="kcpHeader" name="kcpHeader" class="form-input">
+            <option value="none"><%= t('network.kcpHeaderNone') %></option>
+            <option value="wechat"><%= t('network.kcpHeaderWechat') %></option>
+            <option value="dtls">DTLS 1.2</option>
+            <option value="srtp">SRTP</option>
+            <option value="wireguard">WireGuard</option>
+        </select>
+    </div>
+</fieldset>

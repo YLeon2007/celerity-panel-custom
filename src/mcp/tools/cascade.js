@@ -17,7 +17,9 @@ const {
 } = require('../../services/classicScopedCascadeDeploymentService');
 const { issueClassicLifecycleGrant } = require('../../services/classicLifecycleAuthorization');
 const { isRebuildEnabled, rebuildStrictDisabled } = require('../../services/rebuildMode');
-const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
+const { KCP_HEADERS, KCP_LIMITS, assertClassicTunnelTransport } = require('../../utils/cascadeTransport');
+const { INVALID_KCP_LINK_SETTINGS, readKcpFields, assertKcpSecurity, publicCascadeLink } = require('../../services/cascadeDraftTransport');
+const { projectLinkHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -48,7 +50,12 @@ const manageCascadeSchema = z.object({
         tunnelPort: z.number().int().min(1).max(65535).optional(),
         tunnelProtocol: z.enum(['vless', 'vmess']).optional(),
         tunnelSecurity: z.enum(['none', 'tls', 'reality']).optional(),
-        tunnelTransport: z.enum(['tcp', 'ws', 'grpc', 'splithttp']).optional(),
+        tunnelTransport: z.enum(['tcp', 'ws', 'grpc', 'splithttp', 'kcp']).optional(),
+        kcpMtu: z.number().int().min(KCP_LIMITS.mtu.min).max(KCP_LIMITS.mtu.max).optional(),
+        kcpTti: z.number().int().min(KCP_LIMITS.tti.min).max(KCP_LIMITS.tti.max).optional().describe('mKCP interval, ms'),
+        kcpUplinkCapacity: z.number().int().min(KCP_LIMITS.capacity.min).max(KCP_LIMITS.capacity.max).optional().describe('mKCP uplink capacity, MB/s'),
+        kcpDownlinkCapacity: z.number().int().min(KCP_LIMITS.capacity.min).max(KCP_LIMITS.capacity.max).optional().describe('mKCP downlink capacity, MB/s'),
+        kcpHeader: z.enum(KCP_HEADERS).optional(),
         mode: z.enum(['reverse', 'forward']).optional(),
         priority: z.number().int().optional(),
     }).optional(),
@@ -63,30 +70,32 @@ async function queryCascade(args) {
     const rebuild = isRebuildEnabled();
     if (parsed.id) {
         const query = CascadeLink.findById(parsed.id);
-        if (rebuild) query.select(observationSelect).lean();
+        query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+        if (rebuild) query.lean();
         const link = await query
             .populate('portalNode', 'name ip status')
             .populate('bridgeNode', 'name ip status');
         if (!link) return { error: `Cascade link '${parsed.id}' not found`, code: 404 };
-        return { link: rebuild ? projectReverseHealth(link) : link };
+        return { link: publicCascadeLink(projectLinkHealth(link, rebuild)) };
     }
 
     const filter = {};
     if (parsed.filter?.active !== undefined) filter.active = parsed.filter.active;
-    if (!rebuild && parsed.filter?.status) filter.status = parsed.filter.status;
+    if (!rebuild && parsed.filter?.status && parsed.filter.status !== 'pending') filter.status = parsed.filter.status;
     if (parsed.filter?.nodeId) {
         filter.$or = [{ portalNode: parsed.filter.nodeId }, { bridgeNode: parsed.filter.nodeId }];
     }
 
     const query = CascadeLink.find(filter);
-    if (rebuild) query.select(observationSelect).lean();
+    query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+    if (rebuild) query.lean();
     const links = await query
         .populate('portalNode', 'name ip status')
         .populate('bridgeNode', 'name ip status')
         .sort({ createdAt: -1 });
 
-    return { links: rebuild ? links.map(link => projectReverseHealth(link))
-        .filter(link => !parsed.filter?.status || parsed.filter.status === link.status) : links };
+    return { links: links.map(link => projectLinkHealth(link, rebuild))
+        .filter(link => !parsed.filter?.status || parsed.filter.status === link.status).map(publicCascadeLink) };
 }
 
 let draftWriteService;
@@ -122,6 +131,7 @@ async function manageCascade(args, emit) {
     if (isRebuildEnabled()) throw rebuildStrictDisabled();
     const parsed = manageCascadeSchema.parse(args);
     const { action, id, data = {}, expectedTopologyRevision } = parsed;
+    if (action === 'create' || action === 'update') assertClassicTunnelTransport(data);
     if (['create', 'update', 'delete'].includes(action)
         && !Number.isSafeInteger(expectedTopologyRevision)) {
         throw Object.assign(new Error('An explicit expectedTopologyRevision is required for draft writes'), {
@@ -150,6 +160,7 @@ async function manageCascade(args, emit) {
             const sec = data.tunnelSecurity || 'none';
             const trans = data.tunnelTransport || 'tcp';
 
+            try { assertKcpSecurity(trans, sec); } catch (error) { return { error: error.message, code: 400 }; }
             if (sec === 'reality' && trans === 'ws') {
                 return { error: 'REALITY is not compatible with WebSocket transport', code: 400 };
             }
@@ -174,6 +185,7 @@ async function manageCascade(args, emit) {
                 tunnelProtocol: data.tunnelProtocol || 'vless',
                 tunnelSecurity: sec,
                 tunnelTransport: trans,
+                ...readKcpFields(data),
                 priority: data.priority || 100,
                 tcpFastOpen: true,
                 tcpKeepAlive: 100,
@@ -198,24 +210,28 @@ async function manageCascade(args, emit) {
                 .populate('portalNode', 'name ip status')
                 .populate('bridgeNode', 'name ip status');
 
-            return { success: true, link: populated, topologyRevision: revisions.revision, deployedRevision: revisions.deployedRevision };
+            return { success: true, link: publicCascadeLink(populated), topologyRevision: revisions.revision, deployedRevision: revisions.deployedRevision };
         }
 
         case 'update': {
             if (!id) throw new Error('id is required for update');
             const allowed = ['name', 'tunnelPort', 'tunnelProtocol', 'tunnelSecurity', 'tunnelTransport', 'mode', 'priority'];
-            const updates = {};
+            const updates = readKcpFields(data);
             for (const k of allowed) {
                 if (data[k] !== undefined) updates[k] = data[k];
             }
-            const revisions = await getDraftWriteService().updateLink({
-                expectedTopologyRevision, linkId: id, changes: updates,
-            });
+            let revisions;
+            try {
+                revisions = await getDraftWriteService().updateLink({ expectedTopologyRevision, linkId: id, changes: updates });
+            } catch (error) {
+                if (error.code !== INVALID_KCP_LINK_SETTINGS) throw error;
+                return { error: error.message, code: 400 };
+            }
             const link = await CascadeLink.findById(id)
                 .populate('portalNode', 'name ip status')
                 .populate('bridgeNode', 'name ip status');
             await invalidateCascadeCache();
-            return { success: true, link, topologyRevision: revisions.revision, deployedRevision: revisions.deployedRevision };
+            return { success: true, link: publicCascadeLink(link), topologyRevision: revisions.revision, deployedRevision: revisions.deployedRevision };
         }
 
         case 'delete': {
@@ -301,7 +317,7 @@ async function manageCascade(args, emit) {
 async function getTopology() {
     const rebuild = isRebuildEnabled();
     const query = CascadeLink.find({});
-    if (rebuild) query.select(observationSelect);
+    query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
     const [state, nodes, links] = await Promise.all([
         CascadeTopologyState.findById('singleton').select('revision deployedRevision').lean(),
         HyNode.find({ active: true }).select('name ip status cascadeRole country type').lean(),
@@ -316,11 +332,12 @@ async function getTopology() {
         deployedRevision: state?.deployedRevision ?? 0,
         nodes,
         links: links.map(row => {
-            const l = rebuild ? projectReverseHealth(row) : row;
+            const l = projectLinkHealth(row, rebuild);
             return {
                 _id: l._id,
                 name: l.name,
                 status: l.status,
+                ...(l.tunnelVerification ? { tunnelState: l.tunnelState, tunnelVerification: l.tunnelVerification } : {}),
                 ...(rebuild && l.observationExpiresAt ? { observationExpiresAt: l.observationExpiresAt } : {}),
                 mode: l.mode,
                 tunnelPort: l.tunnelPort,

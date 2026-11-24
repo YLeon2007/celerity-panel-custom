@@ -4,6 +4,7 @@ const {createHmac,randomBytes}=require('node:crypto');
 const {linkSnapshotBytes}=require('./rebuildLinkSnapshot');
 const {addRemoveExitImpacts}=require('./rebuildPreviewExitImpact');
 const {hasReverseObservationEmail}=require('./rebuildReverseIdentity');
+const {refuseStaleKcpPreview}=require('./rebuildKcpAdmission');
 // The preview fingerprint is opaque and expires when the panel restarts.
 const previewKey=randomBytes(32);
 const fail = code => Object.assign(new Error(code), {code});
@@ -139,7 +140,8 @@ async function runGraph(d, req, retire = false) {
         const lockedNodes=retirement?.nodes ?? componentFor(inventory,anchor?ends(anchor):[req.nodeId]);
         const nodes=retire&&req.mode==='abandon'?lockedNodes.filter(n=>n!==req.nodeId):lockedNodes;
         return d.withNodes(lockedNodes,async()=>{
-            const scope=new Set(nodes), links=retirement?.links ?? inventory.filter(row=>ends(row).every(n=>scope.has(n)));
+            const scope=new Set(nodes), scopedRows=rows=>rows.filter(row=>ends(row).every(n=>scope.has(n)));
+            const links=retirement?.links ?? scopedRows(inventory);
             // Bind both the working rows and the profiles to the opaque token.
             // Separate digests let Apply identify row drift before composing.
             const linkVersion=fingerprintLinks(links);
@@ -152,7 +154,7 @@ async function runGraph(d, req, retire = false) {
             const removed=retirement?.incident ?? links.filter(row=>row.rebuildDelete===true || req.remove && id(row)===req.linkId);
             const removedSet=new Set(removed);
             const desired=links.filter(row=>!removedSet.has(row)&&row.active!==false&&(!retire||row.rebuildDelete!==true));
-            const {candidates,coreIdentities}=await d.build(nodes,desired,retirement);
+            const {candidates,coreIdentities,kcpVersions}=await d.build(nodes,desired,retirement);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
             const pairs=new Map(), report=[], observedMain=req.remove&&d.nodeRole?new Map():null, fingerprint=createHmac('sha256',previewKey);
             const survivor=retire?createHmac('sha256',previewKey):null;
@@ -166,6 +168,12 @@ async function runGraph(d, req, retire = false) {
                 const identities=nodes.filter(id=>coreIdentities.has(id)).map(id=>[id,...coreIdentities.get(id)]);
                 fingerprint.update(JSON.stringify(identities));
                 survivor?.update(JSON.stringify(identities.filter(([id])=>id!==req.nodeId)));
+            }
+            // Stored endpoint versions are not configuration fields: bind them
+            // independently even when supported upgrades leave identical JSON.
+            if(kcpVersions?.length){
+                fingerprint.update(JSON.stringify(['mkcp-health-versions',kcpVersions]));
+                survivor?.update(JSON.stringify(['mkcp-health-versions',kcpVersions]));
             }
             for(const nodeId of nodes){
                 const pair=candidates.filter(p=>p.nodeId===nodeId); pairs.set(nodeId,pair);
@@ -193,14 +201,29 @@ async function runGraph(d, req, retire = false) {
             if(survivor)result.survivorPreview=linkVersion+survivor.digest('hex');
             const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;
             if(observedMain&&(req.preview||!result.allowed||stale))addRemoveExitImpacts(report,links,observedMain,candidates,d.nodeRole);
+            async function checkKcpSnapshot(){
+                if(!kcpVersions?.length)return;
+                const fresh=await d.links();
+                const freshRetirement=retire?retirementScope(fresh,req.nodeId):null;
+                const scopeNow=freshRetirement?.nodes??componentFor(fresh,ends(anchor));
+                const rows=freshRetirement?.links??scopedRows(fresh);
+                if(!equal(scopeNow,lockedNodes)||fingerprintLinks(rows)!==linkVersion)throw fail('REBUILD_LINK_CHANGED');
+                await d.checkKcpAdmission();
+            }
             if(req.preview){
+                await checkKcpSnapshot();
                 if(d.checkActivation){await verify(); await d.checkActivation(nodes,retirement);}
+                await checkKcpSnapshot();
                 return result;
             }
             if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);
+            if(stale&&kcpVersions?.length)refuseStaleKcpPreview();
             if(stale)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();
+            await checkKcpSnapshot();
             await d.checkActivation?.(nodes,retirement);
+            // Re-read after potentially slow host checks, before stage writes.
+            await checkKcpSnapshot();
             if(d.stagePair) for(const [nodeId,pair] of pairs) { await verify(); await d.stagePair(nodeId,pair); }
             await d.prepareActivation?.(nodes);
             await verify();

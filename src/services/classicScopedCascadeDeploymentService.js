@@ -2,12 +2,14 @@
 
 const { randomUUID } = require('node:crypto');
 const { hasClassicLifecycleGrant } = require('./classicLifecycleAuthorization');
+const { CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE, assertClassicTunnelTransport } = require('../utils/cascadeTransport');
 const { resolveL2tpExecutionAuthorization } = require('../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
 const ID = /^[0-9a-f]{24}$/i;
 // Health-offline is not evidence that an established physical tunnel is absent.
 const APPLIED = new Set(['deployed', 'online', 'staged', 'offline']);
 const READ = Object.freeze({ readPreference: 'primary', readConcern: { level: 'majority' }, maxTimeMS: 5000 });
 const MESSAGES = Object.freeze({
+    [CLASSIC_KCP_REBUILD_ONLY]: CLASSIC_KCP_MESSAGE,
     CLASSIC_DEPLOY_UNSUPPORTED: 'Classic deployment supports only an existing active reverse link.apply',
     CLASSIC_DEPLOY_BUSY: 'Classic deployment requires an initialized, quiescent topology',
     CLASSIC_DEPLOY_NODE_BUSY: 'A node in this Portal-to-Bridge component is busy; retry when its operation completes',
@@ -375,6 +377,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
             }
             const selected = links.find(link => entityId(link._id) === linkId);
+            assertClassicTunnelTransport(selected);
             if (!selected || selected.active !== true || selected.mode !== 'reverse') throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
             if (!allowlisted && !(allowUnlistedPending && env.CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED !== 'true')
                 && !hasClassicLifecycleGrant(selected, env)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
@@ -383,6 +386,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
             }
             const baselineLinkIds = baselineIds(links, selected);
+            assertClassicTunnelTransport(...links.filter(link => baselineLinkIds.includes(entityId(link._id))));
             if (links.some(link => baselineLinkIds.includes(entityId(link._id))
                 && (link.mode ?? 'reverse') !== 'reverse')) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
             if (requestedIds && !sameList([...baselineLinkIds, linkId].sort(), requestedIds)) {

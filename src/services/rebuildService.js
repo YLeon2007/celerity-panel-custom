@@ -8,6 +8,7 @@ const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTo
 const {createTransport,createBoundRelayTransport,profileBytes,profileSha256}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {assertRealityFingerprint,realityDialerId}=require('./rebuildRealityFingerprint');
+const {readKcpAdmission,kcpListenerId,hasDirectLifecycle,assertKcpVersionsUnchanged}=require('./rebuildKcpAdmission');
 const {prepareLinks}=require('./rebuildLinkKeys');
 const {fullLinkRead}=require('./rebuildLinkSnapshot');
 const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
@@ -18,7 +19,7 @@ const {assertNoPendingRelayAccounts}=require('./rebuildRelayAccountsStore');
 const {resolveRelayBinding,relayInstallEnabled}=require('./rebuildRelayAuthorization');
 const {readRelayAuthority,captureRelayEffect,identityChanged}=require('./rebuildRelayEffectAuthority');
 const {appliedLink}=require('./rebuildAppliedLink');
-const {isReverse,unverified}=require('./rebuildReverseLinkHealth');
+const {isReverse,isKcp,kcpApplyFingerprint,unverified}=require('./rebuildReverseLinkHealth');
 const {transactOnce,AcknowledgedCommitCleanupError}=require('./rebuildRelayInstallTransaction');
 const {createPrivateKey,createPublicKey,randomBytes}=require('node:crypto');
 const {PRIVATE_KEY_SELECT}=require('../utils/vlessEncryption');
@@ -138,7 +139,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             const state=states.get(id);
             // Old route-group rows without a DIRECT receipt are not eligible
             // for the owned-unit transition. Keep their existing Apply path.
-            const direct=state?.rebuildInstallToken!=null || state?.rebuildMachineId!=null;
+            const direct=hasDirectLifecycle(state);
             const transport=createBoundRelayTransport(node,binding,verifyLock,direct?state:undefined,()=>verifyBinding(id,binding));
             transports.set(id,transport);
             await preflight(id,()=>transport.attest());
@@ -158,6 +159,16 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         const results=await Promise.allSettled([...transports.values()].map(async t=>t.close()));
         transports.clear();
         if(results.some(x=>x.status==='rejected'))throw fail('REBUILD_TRANSPORT_CLEANUP_FAILED');
+    }
+    async function verifyDraftKcp(link,nodes,alreadyHeld){
+        gate();
+        return underApply(alreadyHeld,async verify=>{
+            const listener=kcpListenerId(link);
+            const installed=nodes.some(n=>String(n._id)===listener&&n.cascadeRole==='relay')
+                ?await installedStates([listener]):undefined;
+            await readKcpAdmission(Node,[link],nodes,installed);
+            await verify();
+        });
     }
     async function verifyDraftTls(link,alreadyHeld){
         gate();const ids=[link.portalNode,link.bridgeNode];
@@ -217,6 +228,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     async function runGraph(req,alreadyHeld,retire=false){
         gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock,verifyBinding,settlementSession;
         const baseline=new Map(), inventoryNames=new Map();
+        let kcpAdmission;
         const keyRoot=retire?env.ENCRYPTION_KEY:undefined;
         // Keep the existing preparation/validation and envelope format. For
         // retirement only, join its missing-envelope write to final settlement
@@ -291,6 +303,14 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 }
                 if(req.remove)for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
                 states=await installedStates(ids);
+                const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
+                let kcpVersions;
+                if(kcpLinks.length){
+                    const observe=()=>readKcpAdmission(Node,kcpLinks,nodes,states);
+                    kcpVersions=await observe();
+                    kcpAdmission=async()=>assertKcpVersionsUnchanged(kcpVersions,
+                        await readKcpAdmission(Node,kcpLinks,nodes,await installedStates(ids)));
+                }
                 if(retire&&!req.preview&&states.has(req.nodeId))throw fail('REBUILD_L2TP_STATE_TRANSITION');
                 verifyBinding=await openTransports(nodes,states,transports,bindings,verifyLock,preflight);
                 // Read peers before the core helper (which deliberately
@@ -337,7 +357,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 }
                 await verifyTunnelTrust(prepared,panelTls,transports);
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
-                return {coreIdentities,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
+                return {coreIdentities,kcpVersions,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
             },
             nodeRole:id=>roles.get(id),
             async read(id,p,before,expected){
@@ -351,11 +371,16 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             },
             persistKeys:retire?undefined:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
             markDelete:async id=>{if(bindings.size)await verifyApply();const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
+            checkKcpAdmission:()=>kcpAdmission(),
             async checkActivation(ids,retirement){
                 if(retire)await checkLinks(retirement);
                 for(const id of ids)await preflight(id,()=>transports.get(id).verifyIdentity?.());
                 for(const id of ids){
-                    try{await preflight(id,()=>transports.get(id).checkActivation?.({readOnly:!!req.preview,reattestRuntime:true}));}
+                    // An mKCP refusal must not follow even a runtime metadata
+                    // repair. Make the existing relay preflight read-only until admission passes.
+                    try{await preflight(id,()=>transports.get(id).checkActivation?.({
+                        readOnly:!!req.preview||!!kcpAdmission,reattestRuntime:!kcpAdmission,
+                    }));}
                     catch(error){
                         if(req.preview&&(!retire||id!==req.nodeId)&&inventoryNames.has(id)){
                             throw checkNeighborRefusal(error,inventoryNames.get(id));
@@ -393,10 +418,12 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                         const result=await State.updateOne({_id:state._id,status:'installed',desiredState:'installed',secretRevision:state.secretRevision,tproxyPort:state.tproxyPort,routeGroup:state.routeGroup??null},{$set:{routingMode:'follow-relay',routingVersion:1}},{session});if(result.matchedCount!==1||retire&&result.acknowledged!==true)throw fail('REBUILD_L2TP_STATE_TRANSITION');
                     }
                     for(const link of desired){
+                        const epoch=randomBytes(16).toString('hex'),kcp=isKcp(link);
                         const result=await Link.updateOne({_id:link._id,active:{$ne:false},rebuildDelete:{$ne:true}},
-                            {$set:{...(isReverse(link)?unverified:{status:'deployed',lastError:''}),rebuildApplied:appliedLink(link),
-                                rebuildApplyEpoch:randomBytes(16).toString('hex'),rebuildAppliedMainSha256:mainPins.get(String(link.portalNode))},
-                            $unset:{rebuildReverseObservation:''}},{session,runValidators:true});
+                            {$set:{...(isReverse(link)||kcp?unverified:{status:'deployed',lastError:''}),rebuildApplied:appliedLink(link),
+                                rebuildApplyEpoch:epoch,rebuildAppliedMainSha256:mainPins.get(String(link.portalNode)),
+                                ...(kcp?{rebuildKcpApplied:kcpApplyFingerprint(link,epoch)}:{})},
+                            $unset:{rebuildReverseObservation:'',...(!kcp?{rebuildKcpApplied:''}:{})}},{session,runValidators:true});
                         if(result.acknowledged!==true||result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');
                     }
                     if(removed.length){const result=await Link.deleteMany({_id:{$in:removed.map(l=>l._id)},...(!retire&&{rebuildDelete:true})},{session});if(result.deletedCount!==removed.length||retire&&result.acknowledged!==true)throw fail('REBUILD_LINK_CHANGED');}
@@ -427,7 +454,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const relayRetire=createRebuildRelayRetire({Link,Node,State,L2tpUser,env,sync,relayGrantStore,locks:guardedLocks,gate,
         retireGraph,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
-    return {execute,retireGraph,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,recoverRelayInstall,...relayRemoval,...relayRetire,
+    return {execute,retireGraph,verifyDraftKcp,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,recoverRelayInstall,...relayRemoval,...relayRetire,
         createRelayAccount: input=>relayAccounts().create(input),
         disableRelayAccount: input=>relayAccounts().disable(input),
         deleteRelayAccount: input=>relayAccounts().delete(input),

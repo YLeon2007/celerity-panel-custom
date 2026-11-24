@@ -88,7 +88,8 @@ async function runFreshRelayInstall(id, deps) {
                 try { reservation = await deps.reserve(inventory, backupId, deps.verifyTopology ? topologyGuard : checkAuthority, preparePackages ? host.packagePreparation : undefined); }
                 catch (error) {
                     unsettled = error instanceof ReservationOutcomeUnknownError || error instanceof AcknowledgedCommitCleanupError;
-                    if (isIdentityChanged(error) || error?.code === 'REBUILD_L2TP_TOPOLOGY_NOT_APPLIED') throw error;
+                    if (isIdentityChanged(error) || ['REBUILD_L2TP_TOPOLOGY_NOT_APPLIED',
+                        'REBUILD_L2TP_KCP_LISTENER_UNSUPPORTED'].includes(error?.code)) throw error;
                     // No host dispatch without both a checked commit and a
                     // clean handoff, even when the reservation is durable.
                     throw fail(error instanceof AcknowledgedCommitCleanupError

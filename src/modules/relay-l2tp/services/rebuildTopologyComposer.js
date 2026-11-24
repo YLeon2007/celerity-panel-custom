@@ -5,7 +5,7 @@ const { tunnelSettings } = require('../../../services/rebuildLinkKeys');
 const { tunnelName } = require('../../../services/rebuildTunnelTls');
 const { assertRealityFingerprint } = require('../../../services/rebuildRealityFingerprint');
 const { reverseObservationEmail } = require('../../../services/rebuildReverseIdentity');
-const { composeXrayConfig } = require('./xrayConfigComposer');
+const { CASCADE_TRANSPORTS, isKcpTransport, isKcpSecurity, xrayListenerProtocols } = require('../../../utils/cascadeTransport');
 const { compileRebuildGraph, rebuildId, requireRebuild } = require('../domain/rebuildTopologyCompiler');
 
 const REBUILD_POLICY_RULE_PREFIX = 'rebuild-policy-';
@@ -24,6 +24,7 @@ function projectLinks(graph, options, dialerVersions) {
         const reverse = entry.mode === 'reverse';
         const server = graph.byNodeId.get(reverse ? entry.source : entry.target).node;
         const security = link.tunnelSecurity ?? 'none';
+        const transport = link.tunnelTransport ?? 'tcp';
         const { tunnelEncryption = 'vless-enc' } = link;
         const port = link.tunnelPort;
         const id = link.tunnelUuid;
@@ -32,7 +33,8 @@ function projectLinks(graph, options, dialerVersions) {
         requireRebuild(validPort(port) && typeof id === 'string' && /^\S+$/.test(id)
             && ['none', 'tls', 'reality'].includes(security)
             && ['vless-enc', 'none'].includes(tunnelEncryption)
-            && ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'].includes(link.tunnelTransport ?? 'tcp'), 'REBUILD_INVALID_TUNNEL');
+            && CASCADE_TRANSPORTS.includes(transport)
+            && (!isKcpTransport(transport) || isKcpSecurity(security)), 'REBUILD_INVALID_TUNNEL');
         if (security === 'reality') {
             const dialerVersion = dialerVersions?.get(reverse ? entry.target : entry.source);
             const fingerprint = assertRealityFingerprint({ mode: entry.mode, portalNode: entry.source,
@@ -168,13 +170,17 @@ function addSharedPolicy(config, tags, entry, graph) {
 }
 
 function assertProfileOwnership(main, bridge) {
-    const ports = new Set();
-    // The generators use only TCP listeners, either wildcard or loopback.
-    // A wildcard also owns the corresponding loopback port across profiles.
-    for (const { port } of [...main.inbounds, ...bridge.inbounds]) {
-        requireRebuild(validPort(port), 'REBUILD_INVALID_LISTENER');
-        requireRebuild(!ports.has(port), 'REBUILD_LISTENER_COLLISION');
-        ports.add(port);
+    const sockets = new Set();
+    // Generated listeners are wildcard or loopback, so the wildcard owns the
+    // corresponding loopback socket even across MAIN and BRIDGE processes.
+    for (const inbound of [...main.inbounds, ...bridge.inbounds]) {
+        const protocols = xrayListenerProtocols(inbound);
+        requireRebuild(validPort(inbound.port) && protocols.length, 'REBUILD_INVALID_LISTENER');
+        for (const protocol of protocols) {
+            const socket = `${protocol}:${inbound.port}`;
+            requireRebuild(!sockets.has(socket), 'REBUILD_LISTENER_COLLISION');
+            sockets.add(socket);
+        }
     }
     for (const config of [main, bridge]) {
         const inbounds = new Set(config.inbounds.map(inbound => inbound.tag));
@@ -184,6 +190,8 @@ function assertProfileOwnership(main, bridge) {
             .map(client => client.reverse?.tag).filter(Boolean));
         requireRebuild(reverseIngress.every(tag => !inbounds.has(tag))
             && reverseEgress.every(tag => !outbounds.has(tag)), 'REBUILD_TUNNEL_TAG_COLLISION');
+        requireRebuild(inbounds.size === config.inbounds.length, 'DUPLICATE_INBOUND_TAG');
+        requireRebuild(outbounds.size === config.outbounds.length, 'DUPLICATE_OUTBOUND_TAG');
     }
 }
 
@@ -229,8 +237,11 @@ function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}
                 policy: [...subscriberDenies, ...main.routing.rules.filter(rule => rule.ruleTag?.startsWith(REBUILD_POLICY_RULE_PREFIX))] });
         }
         assertProfileOwnership(main, bridge);
-        profiles.push({ nodeId, profile: 'main', config: composeXrayConfig(main, []) },
-            { nodeId, profile: 'bridge', config: composeXrayConfig(bridge, []) });
+        // These are complete generated profiles, not fragment merges. Their
+        // ownership check above knows the socket protocol, unlike the classic
+        // fragment composer's address/port-only duplicate check.
+        profiles.push({ nodeId, profile: 'main', config: structuredClone(main) },
+            { nodeId, profile: 'bridge', config: structuredClone(bridge) });
     }
     return profiles;
 }
