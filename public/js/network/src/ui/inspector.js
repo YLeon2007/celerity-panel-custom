@@ -12,7 +12,7 @@ import {
     hasUnappliedChanges,
 } from './format.js';
 
-export function createInspector(el, { store, actions, onGoto, loadForm, isVisible = () => true }) {
+export function createInspector(el, { store, actions, onGoto, loadForm, isVisible = () => true, clientConnections }) {
     let mode = null;
     let formSession = null;
     let editLoad = null;
@@ -21,6 +21,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
     let awaitingLink = null;
 
     function close() {
+        clientConnections?.dismiss(el);
         mode = null;
         el.classList.remove('open');
         clear(el);
@@ -156,8 +157,9 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
             alert = unknownNodeAlert(detail);
         }
 
+        const online = detail.status === 'unknown' ? '—' : String(n.onlineUsers || 0);
         const kpis = h('div.nm-kpis', null,
-            kpi('users', t('map.kpi.online'), detail.status === 'unknown' ? '—' : String(n.onlineUsers || 0)),
+            kpi('users', t('map.kpi.online'), clientConnections?.focusable(clientConnections.count(n, 'span', online)) ?? online),
             kpi('link', t('map.kpi.links'), String(outs.length + ins.length), t('map.kpi.inOut', { in: ins.length, out: outs.length })),
             kpi('cpu', t('map.kpi.type'), typeName(n.type), n.port ? `:${n.port}` : ''),
             kpi('clock', t('map.kpi.sync'), ago(n.lastSync) || '—'));
@@ -397,6 +399,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
     }
 
     function openForm(renderForm, options) {
+        clientConnections?.dismiss();
         awaitingLink = null;
         const session = {};
         formSession = session;
@@ -458,6 +461,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
         const prevBody = el.querySelector('.nm-insp-body');
         const scroll = prevBody ? prevBody.scrollTop : 0;
         const sameTarget = mode === `${sel.kind}:${sel.id}`;
+        clientConnections?.dismiss(el);
         clear(el);
         content.forEach(part => part && el.appendChild(part));
         mode = `${sel.kind}:${sel.id}`;

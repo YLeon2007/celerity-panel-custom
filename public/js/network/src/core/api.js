@@ -31,6 +31,22 @@ export function isObjectId(id) {
     return typeof id === 'string' && /^[0-9a-f]{24}(?![\s\S])/i.test(id);
 }
 
+export async function fetchClientConnections(id, signal) {
+    const query = new URLSearchParams({ nodeId: id });
+    const res = await fetch(`${CASCADE}/topology/clients?${query}`, {
+        method: 'GET', mode: 'same-origin', credentials: 'same-origin', redirect: 'error',
+        cache: 'no-store', headers: { Accept: 'application/json' }, signal,
+    });
+    if (res.status === 401 || res.status === 403) return { state: 'forbidden' };
+    if (!res.ok) return { state: 'unavailable' };
+    const state = res.headers.get('x-client-connections-state');
+    if (state === 'old-agent') return { state };
+    if (state !== 'ready') return { state: 'unavailable' };
+    if (signal.aborted) return { state: 'unavailable' };
+    const rows = await res.json();
+    return Array.isArray(rows) ? { state, rows } : { state: 'unavailable' };
+}
+
 export function linkIdOf(edgeId) {
     const id = typeof edgeId === 'string' && edgeId.startsWith('link-') ? edgeId.slice(5) : '';
     return isObjectId(id) ? id : null;

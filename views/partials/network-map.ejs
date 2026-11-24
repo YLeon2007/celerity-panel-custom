@@ -15,7 +15,7 @@ networkI18n.sshNotConfigured = t('nodes.sshNotConfigured');
 networkI18n.map = locales.network.map;
 const scriptJson = value => JSON.stringify(value).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 %>
-<link rel="stylesheet" href="/css/network-map.css?v=5e3e810a1d641e83">
+<link rel="stylesheet" href="/css/network-map.css?v=e28ab6d09e346fe3">
 <script type="application/json" id="networkI18n"><%- scriptJson(networkI18n) %></script>
 <% if (canManageLinks) { %>
 <script>window._networkCsrfToken = <%- scriptJson(panelToken) %>;</script>
@@ -26,7 +26,7 @@ const scriptJson = value => JSON.stringify(value).replace(/</g, '\\u003c').repla
     <% } %>
     <a class="btn btn-sm btn-primary" href="/panel/nodes?map=classic"><%= t('network.map.openClassic') %></a>
 </div>
-<div class="network-page" id="networkRoot"<% if (canManageLinks) { %> data-link-actions="true" data-save-positions="true"<% } else { %> data-read-only="true"<% } %>>
+<div class="network-page" id="networkRoot"<% if (canManageLinks) { %> data-link-actions="true" data-save-positions="true" data-client-connections="true"<% } else { %> data-read-only="true"<% } %>>
     <div class="nm-bar"></div>
     <div class="nm-body">
         <div class="nm-stage"></div>

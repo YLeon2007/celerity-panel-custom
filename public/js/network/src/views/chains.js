@@ -20,7 +20,7 @@ const MAX_CARDS_PER_LANE = 200;
 /** Above this many animated connectors the flow animation is switched off. */
 const MAX_ANIMATED = 80;
 
-export function mount(el, { store, toolbar }) {
+export function mount(el, { store, toolbar, clientConnections }) {
     el.className = 'nmc';
     const side = h('div.nmc-side-list');
     const main = h('div.nmc-main');
@@ -42,6 +42,7 @@ export function mount(el, { store, toolbar }) {
     function setAllCollapsed(value) {
         for (const lane of lanes) {
             if (lane.rootId === 'solo') continue;
+            if (value) clientConnections?.dismiss(lane.body);
             if (value) collapsed.add(lane.rootId); else collapsed.delete(lane.rootId);
             lane.el.classList.toggle('collapsed', value);
         }
@@ -94,6 +95,15 @@ export function mount(el, { store, toolbar }) {
 
     // ==================== RENDER ====================
 
+    function countFor(node, spec, ...content) {
+        return clientConnections?.count(node, spec, ...content) ?? h(spec, null, ...content);
+    }
+
+    function focusableCount(node, spec, ...content) {
+        const count = countFor(node, spec, ...content);
+        return clientConnections?.focusable(count) ?? count;
+    }
+
     function card(node, isRoot, lane) {
         const role = model.roleOf(node);
         const status = model.attentionStatus('node', node);
@@ -104,15 +114,16 @@ export function mount(el, { store, toolbar }) {
             class: isMatch(node) ? 'match' : '',
             on: {
                 click: () => store.select({ kind: 'node', id: node.id }),
-                mouseenter: e => { hoverOn({ kind: 'node', id: node.id }); tip.show(e.clientX, e.clientY, nodeTip(node)); },
-                mousemove: e => tip.show(e.clientX, e.clientY, nodeTip(node)),
+                mouseenter: e => { hoverOn({ kind: 'node', id: node.id }); if (!e.target.querySelector('.nm-client-count:hover')) tip.show(e.clientX, e.clientY, nodeTip(node)); },
+                mousemove: e => { if (!e.target.closest('.nm-client-count')) tip.show(e.clientX, e.clientY, nodeTip(node)); },
                 mouseleave: hoverOff,
             },
         },
         shared ? h('span.shared', { title: t('map.sharedHint') }, t('map.shared')) : null,
         h('div.row1', null, h('span.flag', null, node.flag || '🖥️'), h('span.nm', null, node.label || node.ip || ''), dot(status)),
         h('div.row2', null, roleTag(role),
-            node.onlineUsers ? h('span', null, icon('users'), ` ${node.onlineUsers}`) : h('span.mono', null, node.ip || '')));
+            node.onlineUsers || clientConnections?.eligible(node)
+                ? countFor(node, 'span', icon('users'), ` ${node.onlineUsers || 0}`) : h('span.mono', null, node.ip || '')));
         lane.cards.push(el);
         return el;
     }
@@ -221,7 +232,7 @@ export function mount(el, { store, toolbar }) {
             .filter(n => n && n.type !== 'cdn' && model.outLinks(index(), n.id).length === 0 && n.id !== root.id);
         const cdns = model.cdnFor(index(), root.id);
 
-        const clients = h('div.nmc-clients', null, icon('users'), h('b', null, String(root.onlineUsers || 0)), h('small', null, t('map.clients')),
+        const clients = h('div.nmc-clients', null, icon('users'), focusableCount(root, 'b', String(root.onlineUsers || 0)), h('small', null, t('map.clients')),
             cdns.map(c => h('button.cdn', {
                 type: 'button',
                 title: c.domain || c.label,
@@ -251,7 +262,7 @@ export function mount(el, { store, toolbar }) {
                 toggle,
                 h('div.ttl', null, h('span', null, root.flag || ''), h('span.nm', null, root.label || ''), roleTag(model.roleOf(root))),
                 h('div.meta', null,
-                    h('span', null, icon('users'), t('map.onlineN', { n: root.onlineUsers || 0 })),
+                    focusableCount(root, 'span', icon('users'), t('map.onlineN', { n: root.onlineUsers || 0 })),
                     h('span', null, icon('door-exit'), count(exits.length, 'map.exitsPlural')),
                     summaryBadge(summary))),
             body);
@@ -290,7 +301,8 @@ export function mount(el, { store, toolbar }) {
                 },
                 h('div.row1', null, h('span.flag', null, n.flag || '🖥️'), h('span.nm', null, n.label || n.ip || ''), dot(status)),
                 h('div.row2', null,
-                    h('span', null, n.onlineUsers ? [icon('users'), ` ${n.onlineUsers} · `] : null, h('span.mono', null, n.ip || ''))));
+                    h('span', null, n.onlineUsers || clientConnections?.eligible(n)
+                        ? [countFor(n, 'span', icon('users'), ` ${n.onlineUsers || 0}`), ' · '] : null, h('span.mono', null, n.ip || ''))));
                 lane.cards.push(c);
                 return c;
             })));
@@ -305,7 +317,7 @@ export function mount(el, { store, toolbar }) {
             const root = model.nodeOf(index(), lane.rootId);
             side.append(sideRow(lane.rootId, { kind: 'node', id: root.id }, true, 0,
                 dot(lane.summary.status === 'unknown' ? 'pending' : lane.summary.status), nodeTitle(root),
-                h('span.ms', null, String(root.onlineUsers || 0), ' ', icon('users')), sel));
+                countFor(root, 'span.ms', String(root.onlineUsers || 0), ' ', icon('users')), sel));
             const walk = (id, depth, seen) => {
                 if (depth > 8) return;
                 for (const l of model.outLinks(index(), id)) {
@@ -325,7 +337,7 @@ export function mount(el, { store, toolbar }) {
             side.append(h('div.nmc-group', null, t('map.noCascade')));
             for (const n of solos) {
                 side.append(sideRow('solo', { kind: 'node', id: n.id }, false, 0, dot(model.attentionStatus('node', n)), nodeTitle(n),
-                    h('span.ms', null, n.onlineUsers ? String(n.onlineUsers) : ''), sel));
+                    countFor(n, 'span.ms', n.onlineUsers || clientConnections?.eligible(n) ? String(n.onlineUsers || 0) : ''), sel));
             }
         }
     }
@@ -348,6 +360,7 @@ export function mount(el, { store, toolbar }) {
     }
 
     function render() {
+        clientConnections?.dismiss(el);
         sharedCache = null;
         const scrollTop = main.scrollTop;
         const f = store.state.filter;
@@ -476,6 +489,7 @@ export function mount(el, { store, toolbar }) {
 
     function toggleLane(lane) {
         const now = !lane.el.classList.contains('collapsed');
+        if (now) clientConnections?.dismiss(lane.body);
         lane.el.classList.toggle('collapsed', now);
         lane.toggle.setAttribute('aria-expanded', now ? 'false' : 'true');
         if (now) collapsed.add(lane.rootId); else collapsed.delete(lane.rootId);
@@ -513,7 +527,7 @@ export function mount(el, { store, toolbar }) {
     function dataSignature() {
         const idx = index();
         const parts = [];
-        for (const n of idx.nodes.values()) parts.push(n.id, n.status, n.onlineUsers || 0, n.label, n.flag, n.lastError || '');
+        for (const n of idx.nodes.values()) parts.push(n.id, n.type, n.cascadeRole, n.status, n.onlineUsers || 0, n.label, n.flag, n.lastError || '');
         for (const l of idx.links.values()) parts.push(l.id, model.attentionStatus('link', l), l.status, l.latencyMs, l.label,
             l.mode, l.tunnelPort, l.tunnelTransport, l.tunnelVerification, l.tunnelState, l.lastError || '', hasUnappliedChanges(l));
         return parts.join('|');

@@ -13,6 +13,7 @@ import { t } from './core/i18n.js';
 import { h, icon, clear, toast } from './ui/dom.js';
 import { createToolbar } from './ui/toolbar.js';
 import { createInspector } from './ui/inspector.js';
+import { createClientConnections } from './ui/client-connections.js';
 import * as chainsView from './views/chains.js';
 
 const VIEWS = {
@@ -38,6 +39,8 @@ function boot() {
     const isVisible = () => viewRoot && viewRoot.style.display !== 'none';
     const store = createStore({ isVisible });
     const actions = root.dataset.linkActions === 'true' ? createActions(store) : null;
+    const clientConnections = root.dataset.clientConnections === 'true'
+        ? createClientConnections(root, { store, isVisible }) : null;
 
     const barEl = root.querySelector('.nm-bar');
     const stageEl = root.querySelector('.nm-stage');
@@ -51,9 +54,11 @@ function boot() {
     const focusInView = sel => { if (view && view.focus) view.focus(sel); };
 
     const toolbar = createToolbar(barEl, { store, onGoto: focusInView });
-    const inspector = createInspector(inspEl, { store, actions, onGoto: focusInView, loadForm, isVisible });
+    const inspector = createInspector(inspEl, { store, actions, onGoto: focusInView, loadForm, isVisible, clientConnections });
     viewRoot?.addEventListener('network:hide', inspector.hide);
+    viewRoot?.addEventListener('network:hide', () => clientConnections?.dismiss());
     window.addEventListener?.('pagehide', e => {
+        clientConnections?.dismiss();
         if (e.persisted) inspector.hide();
         else inspector.dispose();
     });
@@ -90,6 +95,7 @@ function boot() {
         const token = ++switchToken;
         setHeaderActive(name);
         if (name === viewName && view) return;
+        clientConnections?.dismiss();
         inspector.cancelEditLoad();
 
         let mod;
@@ -104,6 +110,7 @@ function boot() {
         }
         if (token !== switchToken) return;
 
+        clientConnections?.dismiss(); // Also invalidate anything opened while the chunk was loading.
         if (view) {
             try { view.destroy(); } catch (err) { console.error('[network]', err); }
         }
@@ -115,7 +122,7 @@ function boot() {
 
         const el = h('div');
         stageEl.appendChild(el);
-        view = mod.mount(el, { store, toolbar, canSavePositions: root.dataset.savePositions === 'true' });
+        view = mod.mount(el, { store, toolbar, canSavePositions: root.dataset.savePositions === 'true', clientConnections });
         if (store.state.loaded) view.update({ type: 'data', structural: true });
         const sel = store.state.selection;
         if (sel) focusInView(sel);
@@ -135,12 +142,15 @@ function boot() {
         toolbar.update();
         if (view) view.update({ type: 'data', structural: change.structural });
         inspector.render();
+        clientConnections?.reconcile();
     });
     store.on('select', () => {
+        clientConnections?.dismiss();
         if (view) view.update({ type: 'select' });
         inspector.render();
     });
     store.on('filter', () => {
+        clientConnections?.dismiss();
         if (view) view.update({ type: 'filter' });
     });
 
@@ -182,6 +192,7 @@ function boot() {
         if (!isVisible()) return;
         const typing = e.target.closest && e.target.closest('input, select, textarea, [contenteditable="true"]');
         if (e.key === 'Escape') {
+            if (clientConnections?.escape()) return;
             toolbar.closePopover();
             if (typing) return;
             store.select(null);

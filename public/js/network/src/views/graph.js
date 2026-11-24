@@ -37,7 +37,7 @@ const ROLE_VAR = {
     cdn: 'var(--nm-cdn)',
 };
 
-export function mount(el, { store, toolbar, canSavePositions }) {
+export function mount(el, { store, toolbar, canSavePositions, clientConnections }) {
     ensureDagre();
     el.className = 'nmg';
 
@@ -291,7 +291,7 @@ export function mount(el, { store, toolbar, canSavePositions }) {
     // ==================== CARDS ====================
 
     function cardSig(node, role) {
-        return [role, node.status, node.label, node.flag, node.onlineUsers, node.domain, node.ip].join('|');
+        return [role, node.cascadeRole, node.status, node.label, node.flag, node.onlineUsers, node.domain, node.ip].join('|');
     }
 
     function syncCards() {
@@ -315,10 +315,19 @@ export function mount(el, { store, toolbar, canSavePositions }) {
             rec.sig = sig;
             const status = model.attentionStatus('node', node);
             rec.el.className = `nmg-card r-${role} s-${status}${role === 'internet' ? ' internet' : ''}`;
+            clientConnections?.dismiss(rec.el);
             clear(rec.el);
             if (role === 'internet') {
                 rec.el.append(h('div.flag', null, '🌐'), h('div.nm', null, t('map.internet')));
                 return;
+            }
+            const users = node.onlineUsers || clientConnections?.eligible(node)
+                ? clientConnections?.count(node, 'span.users', icon('users'), String(node.onlineUsers || 0))
+                    ?? h('span.users', null, icon('users'), String(node.onlineUsers)) : null;
+            if (users && clientConnections?.eligible(node)) {
+                clientConnections.focusable(users);
+                users.addEventListener('click', () => store.select({ kind: 'node', id }));
+                forwardWheel(users);
             }
             rec.el.append(
                 h('div.flag', null, node.flag || '🖥️'),
@@ -326,12 +335,12 @@ export function mount(el, { store, toolbar, canSavePositions }) {
                     h('div.nm', null, node.label || node.ip || ''),
                     h('div.meta', null,
                         roleTag(role),
-                        node.onlineUsers ? h('span.users', null, icon('users'), String(node.onlineUsers)) : null,
+                        users,
                         role === 'cdn' ? h('span', null, node.domain || '') : null)),
                 h('span.st', null, dot(status)));
         });
         for (const [id, rec] of cards) {
-            if (!seen.has(id)) { rec.el.remove(); cards.delete(id); }
+            if (!seen.has(id)) { clientConnections?.dismiss(rec.el); rec.el.remove(); cards.delete(id); }
         }
     }
 
@@ -623,6 +632,7 @@ export function mount(el, { store, toolbar, canSavePositions }) {
         applyClasses();
     });
     cy.on('grab', 'node', () => tip.hide());
+    cy.on('pan zoom grab', () => clientConnections?.dismiss(el));
 
     // ==================== KEYBOARD / RESIZE ====================
 

@@ -4,7 +4,7 @@ const openMap = typeof nodesMapQuery !== 'undefined' && Boolean(nodesMapQuery);
 const rebuildClassicMap = typeof c3Rebuild !== 'undefined' && c3Rebuild && !modernMap && openMap;
 const panelToken = typeof csrfToken === 'string' ? csrfToken : '';
 const canManageLinks = Boolean(modernMap && typeof c3Rebuild !== 'undefined' && c3Rebuild === true && panelToken);
-const mapAssetRevision = 'e68bf28f9ea78fd0';
+const mapAssetRevision = '79380c14839699bb';
 const nodeMetaLabels = {
     transportTitle: t('nodes.nodeMetaTransport'),
     securityTitle: t('nodes.nodeMetaSecurity'),
