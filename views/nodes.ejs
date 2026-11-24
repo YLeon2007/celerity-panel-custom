@@ -2,7 +2,9 @@
 const modernMap = typeof useModernMap !== 'undefined' && useModernMap;
 const openMap = typeof nodesMapQuery !== 'undefined' && Boolean(nodesMapQuery);
 const rebuildClassicMap = typeof c3Rebuild !== 'undefined' && c3Rebuild && !modernMap && openMap;
-const mapAssetRevision = '3dc866708d11d4d0';
+const panelToken = typeof csrfToken === 'string' ? csrfToken : '';
+const canManageLinks = Boolean(modernMap && typeof c3Rebuild !== 'undefined' && c3Rebuild === true && panelToken);
+const mapAssetRevision = '309942c61cd101e6';
 const nodeMetaLabels = {
     transportTitle: t('nodes.nodeMetaTransport'),
     securityTitle: t('nodes.nodeMetaSecurity'),
@@ -66,7 +68,7 @@ function nodeMetaFor(node) {
     </div>
     <div class="page-header-center" id="networkToolbar"<% if (modernMap) { %> data-network-map="modern"<% } %><% if (!openMap) { %> style="display:none"<% } %>>
         <% if (modernMap) { %>
-        <%- include('partials/network-map-toolbar') %>
+        <%- include('partials/network-map-toolbar', { canManageLinks }) %>
         <% } else { %>
         <div class="filters-bar">
             <button class="btn btn-sm" id="btnAutoLayout" title="<%= t('network.autoLayout') %>">
@@ -401,7 +403,7 @@ function nodeMetaFor(node) {
 <!-- Network Map View (scripts load when the tab opens) -->
 <div id="viewNetwork"<% if (modernMap) { %> data-network-map="modern"<% } %><% if (!openMap) { %> style="display:none"<% } %>>
     <% if (modernMap) { %>
-    <%- include('partials/network-map') %>
+    <%- include('partials/network-map', { canManageLinks, panelToken }) %>
     <% } else { %>
     <link rel="stylesheet" href="/css/network.min.css">
     <div class="network-page">

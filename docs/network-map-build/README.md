@@ -10,4 +10,8 @@ To reproduce these particular checked-in bytes without network, export that upst
 node docs/network-map-build/replay-dist.cjs /path/to/upstream /path/to/candidate /path/to/tools/node_modules
 ```
 
-The replay checks SHA-256 of both renderer inputs, their bindings, and the absence of external JS imports. On TEST use `/panel/nodes?map=modern` or `/panel/nodes?map=classic`; the latter opens the original Rebuild map. In stage 4(b), real links use the existing Rebuild Preview and explicit confirmation for deploy, chain deploy and removal. Opening the map does not submit writes. Saving graph coordinates is separate from applying node configuration. The modern link form is deferred to 4(c).
+The replay checks SHA-256 of both renderer inputs, their bindings, and the absence of external JS imports.
+
+In Rebuild, `/panel/nodes?map=modern` opens the modern map. An authorized session can use **Add Link** to open the new-link editor. Opening or canceling the editor, switching map views, and polling do not save a link. Submitting saves a draft; applying it requires the shared Rebuild Preview and explicit confirmation. Canceling that preview leaves an acknowledged draft saved. A draft save that could not be confirmed is not retried automatically. The editor keeps its entered values on refresh and selection changes.
+
+Existing-link edits remain available through `/panel/nodes?map=classic`, the original Rebuild map. Modern deploy, chain deploy and removal still require the shared Rebuild Preview and explicit confirmation. Saving graph coordinates is separate from applying node configuration. A read-only modern map does not expose link actions or position saving.

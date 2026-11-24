@@ -3,7 +3,7 @@
  */
 
 import model from '../core/model.js';
-import { linkIdOf } from '../core/api.js';
+import { isObjectId, linkIdOf } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { h, icon, clear, toast } from './dom.js';
 import {
@@ -13,6 +13,8 @@ import {
 
 export function createInspector(el, { store, actions, onGoto }) {
     let mode = null;
+    let createSession = null;
+    let awaitingLink = null;
 
     function close() {
         mode = null;
@@ -286,8 +288,63 @@ export function createInspector(el, { store, actions, onGoto }) {
 
     // ==================== RENDER ====================
 
-    function render() {
+    function openCreate(renderCreateForm) {
+        if (!actions || createSession) return;
+        awaitingLink = null;
         const sel = store.state.selection;
+        const node = sel?.kind === 'node' ? store.index.nodes.get(sel.id) : null;
+        const source = node && isObjectId(node.id) && model.roleOf(node) !== 'cdn' ? node.id : undefined;
+        const session = {};
+        createSession = session;
+        clear(el);
+        el.classList.add('open');
+
+        function leave() {
+            if (createSession !== session) return false;
+            createSession = null;
+            session.dispose?.();
+            close();
+            return true;
+        }
+
+        try {
+            // Only the form owns and displays an unconfirmed save; no host callback resets it.
+            session.dispose = renderCreateForm(el, {
+                store, actions, source,
+                onCancel() { if (leave()) render(); },
+                onCreated(linkId) {
+                    if (!leave()) return;
+                    const id = isObjectId(linkId) ? `link-${linkId}` : linkIdOf(linkId) ? linkId : null;
+                    if (id && store.index.links.has(id)) {
+                        goto({ kind: 'link', id });
+                    } else {
+                        store.select(null);
+                        // Wait for a later read of that exact saved edge; never submit again.
+                        awaitingLink = id;
+                    }
+                    if (!mode) render(); // Selection may already have been on this edge.
+                },
+            });
+        } catch (err) {
+            if (leave()) render();
+            throw err;
+        }
+    }
+
+    function render() {
+        // Keep the actual form (including its in-flight or unknown outcome)
+        // alive on topology refreshes and map selection changes.
+        if (createSession) return;
+        const sel = store.state.selection;
+        if (awaitingLink) {
+            if (sel) awaitingLink = null;
+            else if (store.index.links.has(awaitingLink)) {
+                const id = awaitingLink;
+                awaitingLink = null;
+                goto({ kind: 'link', id });
+                return;
+            }
+        }
         if (!sel) { if (mode) close(); return; }
         const content = sel.kind === 'node' ? nodeView(sel.id) : linkView(sel.id);
         if (!content) { store.select(null); return; }
@@ -302,5 +359,5 @@ export function createInspector(el, { store, actions, onGoto }) {
         if (body && sameTarget) body.scrollTop = scroll;
     }
 
-    return { render };
+    return { render, openCreate };
 }

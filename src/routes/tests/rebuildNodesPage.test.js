@@ -7,9 +7,10 @@ const { createHash } = require('node:crypto');
 const vm = require('node:vm');
 const { test, after } = require('node:test');
 const express = require('express');
+const { escapeXML } = require('ejs');
 const { request } = require('../../services/tests/helpers/rebuildPanelRequest');
 const nodes = require('../panel/nodes');
-const { i18nMiddleware } = require('../../middleware/i18n');
+const { i18nMiddleware, t: translate } = require('../../middleware/i18n');
 const { requireAuth } = require('../panel/helpers');
 const auth = require('../../middleware/auth');
 const { issuePanelCsrfToken } = require('../panel/csrf');
@@ -157,7 +158,11 @@ test('Rebuild defaults to modern with its session CSRF and the shared preview di
     assert.ok(tagId(page.body, 'rebuildPreviewCancel'));
     assert.ok(scripts(page.body).some(js => /^\s*window\._networkRebuildPreviewI18n\s*=/.test(js)));
     for (const part of ['nm-bar', 'nm-body', 'nm-stage', 'nm-insp', 'nm-state']) assert.match(page.body, new RegExp(`class="${part}"`));
-    for (const id of ['btnAddLink', 'addLinkForm', 'addLinkModal', 'btnAutoLayout']) assert.equal(tagId(page.body, id), '');
+    const toolbar = page.body.match(/<div\b[^>]*id="networkToolbar"[^]*?(?=<div\b[^>]*id="listActions")/)?.[0] ?? '';
+    assert.match(tagId(toolbar, 'btnAddLink'), /^<button\b[^>]*\btype="button"[^>]*\bdisabled\b/);
+    assert.doesNotMatch(tagId(toolbar, 'btnAddLink'), /\s(?:hidden\b|onclick=|style=)/);
+    assert.equal([...page.body.matchAll(/\bid="btnAddLink"/g)].length, 1);
+    for (const id of ['addLinkForm', 'addLinkModal', 'btnAutoLayout']) assert.equal(tagId(page.body, id), '');
     assert.deepEqual([...page.body.matchAll(/data-nm-view="([^"]+)"/g)].map(m => m[1]), ['chains', 'graph', 'geo']);
     assert.equal(boot(page.body, { restore: true }).mapOpen(), true);
     assert.equal(boot(page.body, { blockedStorage: true }).mapOpen(), false);
@@ -224,11 +229,13 @@ test('modern locale payload is limited, translated, and safe inside an HTML scri
             assert.equal(typeof network[key], 'string', `${lang}: ${key} is explicitly translated`);
             assert.equal(data[key], network[key]);
         }
-        assert.ok(page.body.includes(map.linkEditNotice));
+        const notice = escapeXML(translate('network.map.editExistingLinkNotice', lang));
+        assert.ok(page.body.includes(`<p>${notice}</p>`));
+        if (map.linkEditNotice) assert.ok(!page.body.includes(`<p>${escapeXML(map.linkEditNotice)}</p>`));
+        const add = page.body.match(/<button\b[^>]*id="btnAddLink"[^>]*>([^]*?)<\/button>/)?.[1] ?? '';
+        assert.ok(add.trim().endsWith(escapeXML(network.addLink)));
         assert.ok(page.body.includes(map.openClassic));
-        assert.equal(data.map.create, undefined);
         assert.equal(data.confirmUndeploy, undefined);
-        assert.equal(data.kcpMtu, undefined);
     }
     const adversarial = await get('/panel/nodes?fixture=1');
     assert.equal(adversarial.status, 200);
@@ -246,7 +253,9 @@ test('a tokenless modern mount is read-only and emits no CSRF bootstrap', async 
     const page = await get('/panel/nodes?map=modern');
     assert.equal(page.status, 200);
     assert.match(tagId(page.body, 'networkRoot'), /data-read-only="true"/);
-    assert.doesNotMatch(tagId(page.body, 'networkRoot'), /data-link-actions/);
+    assert.doesNotMatch(tagId(page.body, 'networkRoot'), /data-link-actions|data-save-positions/);
+    assert.equal(tagId(page.body, 'btnAddLink'), '');
+    assert.ok(page.body.includes(`<p>${escapeXML(translate('network.map.readOnlyNotice'))}</p>`));
     assert.equal(boot(page.body).window._networkCsrfToken, undefined);
 });
 

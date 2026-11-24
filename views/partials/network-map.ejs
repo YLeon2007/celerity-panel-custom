@@ -14,19 +14,17 @@ networkI18n.terminal = t('nodes.terminal');
 networkI18n.sshNotConfigured = t('nodes.sshNotConfigured');
 networkI18n.map = locales.network.map;
 const scriptJson = value => JSON.stringify(value).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
-const panelToken = typeof csrfToken === 'string' ? csrfToken : '';
-const canSavePositions = typeof c3Rebuild !== 'undefined' && c3Rebuild === true && panelToken;
 %>
 <link rel="stylesheet" href="/css/network-map.css?v=fa65def33febe72a">
 <script type="application/json" id="networkI18n"><%- scriptJson(networkI18n) %></script>
-<% if (panelToken) { %>
+<% if (canManageLinks) { %>
 <script>window._networkCsrfToken = <%- scriptJson(panelToken) %>;</script>
 <% } %>
 <div class="nm-read-only-note">
-    <p><%= t(panelToken ? 'network.map.linkEditNotice' : 'network.map.readOnlyNotice') %></p>
+    <p><%= t(canManageLinks ? 'network.map.editExistingLinkNotice' : 'network.map.readOnlyNotice') %></p>
     <a class="btn btn-sm btn-primary" href="/panel/nodes?map=classic"><%= t('network.map.openClassic') %></a>
 </div>
-<div class="network-page" id="networkRoot"<% if (panelToken) { %> data-link-actions="true"<% } else { %> data-read-only="true"<% } %><% if (canSavePositions) { %> data-save-positions="true"<% } %>>
+<div class="network-page" id="networkRoot"<% if (canManageLinks) { %> data-link-actions="true" data-save-positions="true"<% } else { %> data-read-only="true"<% } %>>
     <div class="nm-bar"></div>
     <div class="nm-body">
         <div class="nm-stage"></div>

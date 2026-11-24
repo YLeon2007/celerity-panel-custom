@@ -8,4 +8,9 @@
     <button type="button" class="btn btn-sm" id="btnNetworkRefresh" title="<%= t('network.refresh') %>" aria-label="<%= t('network.refresh') %>">
         <i class="ti ti-refresh" aria-hidden="true"></i>
     </button>
+    <% if (canManageLinks) { %>
+    <button type="button" class="btn btn-sm btn-primary" id="btnAddLink" disabled>
+        <i class="ti ti-plus" aria-hidden="true"></i> <%= t('network.addLink') %>
+    </button>
+    <% } %>
 </div>

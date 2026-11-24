@@ -143,8 +143,27 @@ function boot() {
             refreshBtn.disabled = false;
         });
     }
-    const addBtn = document.getElementById('btnAddLink');
-    if (addBtn) addBtn.hidden = true;
+    const addBtn = document.getElementById('networkToolbar')?.querySelector('#btnAddLink');
+    if (actions && addBtn) {
+        // Wait for the first inventory before capturing the editor's endpoints.
+        const stopWaitingForInventory = store.on('data', () => {
+            addBtn.disabled = false;
+            stopWaitingForInventory();
+        });
+        addBtn.addEventListener('click', async () => {
+            if (addBtn.disabled || !isVisible()) return;
+            addBtn.disabled = true;
+            try {
+                const { renderCreateForm } = await import('./ui/create-form.js');
+                if (isVisible()) inspector.openCreate(renderCreateForm);
+            } catch (err) {
+                console.warn('[network] create editor failed to open:', err.message);
+                toast(t('networkError'), 'error');
+            } finally {
+                addBtn.disabled = false;
+            }
+        });
+    }
 
     document.addEventListener('keydown', e => {
         if (!isVisible()) return;
