@@ -197,15 +197,26 @@ export function nodeStatusDetail(node) {
         synced: when ? t('map.lastSync', { when }) : '' };
 }
 
-export function nodeTip(node) {
+export function portalRouteText(index, route) {
+    const key = route.kind === 'unknown' ? 'unknown' : route.kind === 'missing' ? 'unavailable'
+        : !route.main ? 'noDefault' : route.kind === 'shared' ? 'sharedVia' : 'explicitVia';
+    const target = link => nodeTitle(model.nodeOf(index, link.target));
+    const primary = t(`map.portalExit.${key}`, route.main ? { name: target(route.main) } : undefined);
+    return route.geo.length ? `${primary} · ${t('map.portalExit.geoVia', { names: [...new Set(route.geo.map(target))].join(', ') })}` : primary;
+}
+
+export function nodeTip(node, index) {
     const role = model.roleOf(node);
     const detail = nodeStatusDetail(node);
+    const portalRoutes = index && role === 'portal' ? model.outLinks(index, node.id)
+        .map(link => model.portalRoute(index, link)?.actual).filter(Boolean) : [];
     return [
         h('div.t', null, nodeTitle(node)),
         h('div.m', null,
             `${roleName(role)} · ${statusName(detail.status)}${detail.status === 'online' && node.onlineUsers ? ` · ${t('map.onlineN', { n: node.onlineUsers })}` : ''}`,
             detail.description ? h('div', null, detail.description) : null,
             detail.description && detail.synced ? h('div', null, detail.synced) : null,
-            node.ip ? [h('br'), h('span.mono', null, node.ip)] : null),
+            node.ip ? [h('br'), h('span.mono', null, node.ip)] : null,
+            portalRoutes.slice(0, 5).map(route => h('div', null, portalRouteText(index, route)))),
     ];
 }

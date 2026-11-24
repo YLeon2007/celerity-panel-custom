@@ -1565,6 +1565,12 @@
       "unset": "(no saved preset)"
     },
     "rebuildPreview": {
+      "portalExitRelayGeoOn": "RU traffic will use the relay gateway.",
+      "portalExitRelayGeoOff": "RU traffic will no longer use the relay gateway.",
+      "portalExitChange": "Default exit: {before} → {after}.",
+      "portalExitGeo": "Geo routes",
+      "noPortalExit": "no exit",
+      "unknownPortalExit": "unknown exit",
       "deployTitle": "Apply the changes shown here?",
       "removeTitle": "Remove this cascade link and apply the changes shown here?",
       "apply": "Apply",
@@ -2060,6 +2066,24 @@
         "checkHealth": "Check connection",
         "remove": "Delete link",
         "reconnectHint": "Edit the link and apply the changes."
+      },
+      "portalExit": {
+        "title": "Exit for this portal",
+        "shared": "Shared relay exit (default)",
+        "relayGeo": "Route RU traffic through the relay gateway",
+        "geo": "Geo gateway",
+        "unavailable": "Selected exit node is unavailable",
+        "unknown": "The applied exit route is unknown",
+        "noDefault": "No default exit",
+        "sharedVia": "Shared exit via {name}",
+        "explicitVia": "Selected exit via {name}",
+        "geoVia": "Matching RU traffic via {names}",
+        "actual": "Current route: {route}",
+        "draft": "Draft (not applied): {route}",
+        "badExit": "The selected node is not an eligible exit for this portal and relay. Choose an available exit node.",
+        "unsupported": "A separate portal exit is not supported by this routing policy.",
+        "inUse": "This change would leave one or more portals without their selected exit node. Change those portals’ exits first.",
+        "inUseNamed": "This change would leave these portals without their selected exit node: {names}. Change those portals’ exits first."
       },
       "portalExitSettings": "Exits in subscription",
       "tunnelUnknown": "Connection is unconfirmed",

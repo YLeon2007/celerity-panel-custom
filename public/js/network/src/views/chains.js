@@ -150,7 +150,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
         return el;
     }
 
-    function tree(nodeId, isRoot, path, lane, branch = '') {
+    function tree(nodeId, isRoot, path, lane, branch = '', incoming = null) {
         const node = model.nodeOf(index(), nodeId);
         if (!node) return null;
         if (lane.cardCount >= MAX_CARDS_PER_LANE) {
@@ -160,18 +160,22 @@ export function mount(el, { store, toolbar, clientConnections }) {
         lane.cardCount++;
         const c = card(node, isRoot, lane, branch);
         const wrap = h('div.nmc-tn', null, c);
-        const kids = model.outLinks(index(), nodeId).filter(l => !path.includes(l.target));
+        const kids = model.chainSteps(index(), nodeId, incoming).filter(l => !path.includes(l.target));
 
         if (kids.length) {
             const box = h('div.nmc-tkids');
             for (const l of kids) {
-                const sub = tree(l.target, false, path.concat(l.target), lane, `${branch}/${l.id}`);
+                const sub = tree(l.target, false, path.concat(l.target), lane, `${branch}/${l.id}`, l);
                 if (!sub) continue;
                 const childCard = sub.querySelector('.nmc-card');
                 lane.pairs.push({ a: c, b: childCard, link: l, pill: pill(l, lane) });
                 box.appendChild(h('div.nmc-tkid', null, sub));
             }
             wrap.appendChild(box);
+        } else if (model.portalRoute(index(), incoming)) {
+            const { actual } = model.portalRoute(index(), incoming);
+            const reason = actual.kind === 'unknown' ? 'unknown' : actual.kind === 'missing' ? 'unavailable' : 'noDefault';
+            wrap.appendChild(h('div.hint', null, t(`map.portalExit.${reason}`)));
         } else {
             const ok = model.attention('node', node) === 'ok';
             const inet = h(`div.nmc-inet${ok ? '' : '.off'}`, null, `🌐 ${t('map.internet')}`);
@@ -529,8 +533,8 @@ export function mount(el, { store, toolbar, clientConnections }) {
         const parts = [];
         for (const n of idx.nodes.values()) parts.push(n.id, n.type, n.cascadeRole, n.status, n.onlineUsers || 0, n.label, n.flag, n.lastError || '');
         for (const l of idx.links.values()) parts.push(l.id, model.attentionStatus('link', l), l.status, l.latencyMs, l.label,
-            l.mode, l.tunnelPort, l.tunnelTransport, l.tunnelVerification, l.tunnelState, l.lastError || '', hasUnappliedChanges(l));
-        return parts.join('|');
+            l.mode, l.tunnelPort, l.tunnelTransport, l.tunnelVerification, l.tunnelState, l.lastError || '', hasUnappliedChanges(l), model.routeKey(l));
+        return JSON.stringify(parts);
     }
 
     // ==================== VIEW API ====================

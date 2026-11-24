@@ -415,7 +415,7 @@ export function mount(el, { store, toolbar, canSavePositions, clientConnections 
         bindEdge(hit, id);
         let pill = null;
         if (!id.startsWith('internet-')) {
-            pill = h('div.nm-pill', { role: 'button', tabindex: '0' });
+            pill = h('div.nm-pill', { role: 'button', tabindex: '0', 'data-link': id });
             pillsLayer.appendChild(pill);
             bindEdge(pill, id);
             pill.addEventListener('keydown', ev => {
@@ -620,11 +620,11 @@ export function mount(el, { store, toolbar, canSavePositions, clientConnections 
         hover = { kind: 'node', id: e.target.id() };
         applyClasses();
         const node = model.nodeOf(store.index, e.target.id());
-        if (node && node.id !== model.INTERNET_ID && e.originalEvent) tip.show(e.originalEvent.clientX, e.originalEvent.clientY, nodeTip(node));
+        if (node && node.id !== model.INTERNET_ID && e.originalEvent) tip.show(e.originalEvent.clientX, e.originalEvent.clientY, nodeTip(node, store.index));
     });
     cy.on('mousemove', 'node', e => {
         const node = model.nodeOf(store.index, e.target.id());
-        if (node && node.id !== model.INTERNET_ID && e.originalEvent) tip.show(e.originalEvent.clientX, e.originalEvent.clientY, nodeTip(node));
+        if (node && node.id !== model.INTERNET_ID && e.originalEvent) tip.show(e.originalEvent.clientX, e.originalEvent.clientY, nodeTip(node, store.index));
     });
     cy.on('mouseout', 'node', () => {
         hover = null;

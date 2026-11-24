@@ -52,6 +52,16 @@ function refusalInfo(err, editing = false) {
     if (err instanceof RebuildRequestError && err.status === 400 && code === 'INVALID_KCP_LINK_SETTINGS') {
         return { message: t('map.rebuild.kcpRefused'), notSaved: true };
     }
+    if (err instanceof RebuildRequestError && [400, 409].includes(err.status)) {
+        if (code === 'REBUILD_PORTAL_EXIT_INVALID' || code === 'REBUILD_INVALID_EXIT') {
+            return { message: t('map.portalExit.badExit'), notSaved: true };
+        }
+        if (code === 'REBUILD_PORTAL_EXIT_UNSUPPORTED') return { message: t('map.portalExit.unsupported'), notSaved: true };
+        if (code === 'REBUILD_EXIT_IN_USE') {
+            const names = portalNames(error, err.body.details);
+            return { message: names ? t('map.portalExit.inUseNamed', { names }) : t('map.portalExit.inUse'), notSaved: true };
+        }
+    }
     if (editing && err instanceof RebuildRequestError) {
         if ((err.status === 404 || err.status === 409) && editUnavailable.has(code)) {
             return { message: t('map.edit.unavailable'), notSaved: true, reloadEdit: true };
@@ -65,6 +75,16 @@ function refusalInfo(err, editing = false) {
 
 function publicText(value) {
     return typeof value === 'string' && value.trim().length > 0 && !/[\p{Cc}\p{Bidi_Control}]/u.test(value);
+}
+
+function portalNames(error, details) {
+    const lists = [error.portals, error.portalNames, error.details?.portals, error.details?.portalNames,
+        error.details, details?.portals, details?.portalNames, details];
+    const names = lists.filter(Array.isArray).flatMap(rows => rows.slice(0, 100)).map(row => {
+        const name = typeof row === 'string' ? row : row?.name;
+        return publicText(name) && !/[<>\u2028\u2029]/u.test(name) && !isObjectId(name.trim()) ? name.trim().slice(0, 120) : '';
+    }).filter(Boolean);
+    return [...new Set(names)].slice(0, 10).join(', ');
 }
 
 async function showRefusal(message) {
@@ -131,7 +151,8 @@ export function createActions(store) {
                 openedEdit = { edgeId, client, edit };
                 return edit;
             } catch (err) {
-                await refuse(refusalInfo(err).message || t('map.edit.unavailable'));
+                await refuse(err instanceof InvalidEditFields && err.key === 'badExit' ? t('map.portalExit.badExit')
+                    : refusalInfo(err).message || t('map.edit.unavailable'));
                 return null;
             }
         }, null);
@@ -276,7 +297,7 @@ export function createActions(store) {
                 patch = editPatch(binding.edit, changes);
             } catch (err) {
                 if (err instanceof SessionChanged) openedEdit = null;
-                await refuse(err instanceof InvalidEditFields ? t(`map.create.${err.key}`)
+                await refuse(err instanceof InvalidEditFields ? t(err.key === 'badExit' ? 'map.portalExit.badExit' : `map.create.${err.key}`)
                     : refusalInfo(err).message || t('map.edit.unavailable'));
                 return draftResult('not_saved');
             }

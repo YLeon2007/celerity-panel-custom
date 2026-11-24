@@ -6,6 +6,16 @@ const previewKeys = [
     'migration', 'settingsUnchanged', 'settingsChanged', 'exitLost', 'defaultExitLost', 'exitBlocked',
 ];
 const previewLabels = Object.fromEntries(previewKeys.map(key => [key, t('network.rebuildPreview.' + key)]));
+for (const key of ['noPortalExit', 'unknownPortalExit']) previewLabels[key] = t('network.rebuildPreview.' + key);
+previewLabels.portalExitChannelChange = t('network.rebuildPreview.portalExitChange');
+const geoKey = 'network.rebuildPreview.portalExitGeo';
+const geoLabel = t(geoKey);
+previewLabels.portalExitGeo = geoLabel && geoLabel !== geoKey ? geoLabel : `Geo (${previewLabels.routing})`;
+if (typeof modernMap !== 'undefined' && modernMap) {
+    for (const key of ['portalExitChange', 'portalExitRelayGeoOn', 'portalExitRelayGeoOff']) {
+        previewLabels[key] = t('network.rebuildPreview.' + key);
+    }
+}
 previewLabels.fingerprint = Object.fromEntries([
     'known', 'limited', 'unknown', 'mismatch', 'serverMismatch', 'refused', 'savedNotApplied', 'unknownVersion', 'unset',
 ].map(key => [key, t('network.rebuildFingerprint.' + key)]));
@@ -65,4 +75,4 @@ previewLabels.close = t('common.close');
 <script>
 window._networkRebuildPreviewI18n = <%- JSON.stringify(previewLabels).replace(/</g, '\\u003c') %>;
 </script>
-<script src="/js/rebuild-preview.js?v=0283648239829e60"></script>
+<script src="/js/rebuild-preview.js?v=6cb5cbe848490793"></script>

@@ -9,7 +9,7 @@ import { h, icon, clear, toast } from './dom.js';
 import {
     roleName, roleDesc, statusName, nodeTitle, ms, typeName, ago,
     roleTag, statusPill, dot, modeIcon, linkStatusDetail, nodeStatusDetail, lastErrorText,
-    hasUnappliedChanges,
+    hasUnappliedChanges, portalRouteText,
 } from './format.js';
 
 export function createInspector(el, { store, actions, onGoto, loadForm, isVisible = () => true, clientConnections }) {
@@ -100,7 +100,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
             const cur = curLinkId && (chain.links[i - 1] === curLinkId || chain.links[i] === curLinkId);
             items.push(h(`button.nm-hop${cur ? '.cur' : ''}`, { type: 'button', on: { click: () => goto({ kind: 'node', id: nid }) } }, nodeTitle(n)));
         });
-        items.push(h('span.nm-hop-arrow', null, icon('arrow-narrow-right')), h('span.nm-hop.ext', null, `🌐 ${t('map.internet')}`));
+        if (!chain.noInternet) items.push(h('span.nm-hop-arrow', null, icon('arrow-narrow-right')), h('span.nm-hop.ext', null, `🌐 ${t('map.internet')}`));
         return h('div.nm-path', null, items);
     }
 
@@ -123,6 +123,17 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
                         type: 'button', on: { click: () => goto({ kind: 'node', id: x.id }) },
                     }, dot(model.attentionStatus('node', x)), h('span.lbl', null, nodeTitle(x)), roleTag(model.roleOf(x))))))),
         ];
+    }
+
+    function exitSection(links) {
+        const index = store.index;
+        const routes = links.map(link => [link, model.portalRoute(index, link)]).filter(([, route]) => route);
+        if (!routes.length) return null;
+        return h('div', null, h('div.nm-sec-title', null, t('map.portalExit.title')),
+            routes.map(([link, route]) => h('div.nm-alert.muted', null, icon('route'), h('div.msg', null,
+                h('b', null, nodeTitle(model.nodeOf(index, link.target))),
+                h('div', null, t('map.portalExit.actual', { route: portalRouteText(index, route.actual) })),
+                route.draft ? h('div', null, t('map.portalExit.draft', { route: portalRouteText(index, route.draft) })) : null))));
     }
 
     function nodeView(id) {
@@ -178,7 +189,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
                         h('span.lbl', null, `${c.nodes.map(x => {
                             const xn = model.nodeOf(index, x);
                             return `${xn && xn.flag ? `${xn.flag} ` : ''}${model.shortName(xn)}`;
-                        }).join(' → ')} → 🌐`),
+                        }).join(' → ')}${c.noInternet ? '' : ' → 🌐'}`),
                         h('span.ms', null, sum.status === 'online' ? ms(sum.latencyMs) : statusName(sum.status)));
                 })))
             : h('div.nm-alert.muted', null, icon('route-off'), h('div.msg', null, t('map.notInCascade')));
@@ -188,6 +199,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
             h('div.nm-insp-body', null,
                 alert,
                 kpis,
+                role === 'portal' ? exitSection(outs) : null,
                 chainsBlock,
                 h('div.nm-props', null,
                     prop('info-circle', t('map.prop.role'), roleName(role), roleDesc(role)),
@@ -338,6 +350,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
                 hasUnappliedChanges(l) ? h('div.nm-alert.warn.nm-insp-unapplied', null,
                     icon('pencil'), h('div.msg', null, t('map.edit.unapplied'))) : null,
                 alert,
+                exitSection([l]),
                 h('div', null, h('div.nm-sec-title', null, t('routePath')), hops(chain, l.id, now)),
                 h('div.nm-props', null,
                     prop('route', t('map.prop.mode'), isFwd ? 'Forward' : 'Reverse',

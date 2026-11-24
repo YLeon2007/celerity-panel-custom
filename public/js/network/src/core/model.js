@@ -7,6 +7,8 @@
  */
 'use strict';
 
+const portalExit = require('./portal-exit');
+
 const INTERNET_ID = 'internet';
 const MAX_OBSERVATION_MS = 90_000;
 
@@ -134,7 +136,7 @@ function buildIndex(topology) {
 
     return {
         nodes, links, unmappedLinks, cdnEdges, out, in: inc, cdnByOrigin, originByCdn, internet,
-        _chains: null, _chainsByNode: null, _chainsByLink: null,
+        _chains: null, _chainsByNode: null, _chainsByLink: null, portalRoutes: new Map(),
     };
 }
 
@@ -190,6 +192,14 @@ function compareNodes(a, b) {
     return String(a.label || '').localeCompare(String(b.label || '')) || (a.id < b.id ? -1 : 1);
 }
 
+// Keep physical inventory separate from the portal's effective continuation.
+// Unused relay edges remain inspectable as their own chains.
+function chainSteps(index, nodeId, incoming) {
+    const route = portalExit.portalRoute(index, incoming);
+    if (!route) return outLinks(index, nodeId);
+    return [...new Set([route.actual.main, ...route.actual.geo].filter(Boolean))];
+}
+
 /**
  * All root-to-leaf paths through cascade links: [{ nodes: [ids], links: [edgeIds] }].
  * Links that are only reachable through a cycle get their source treated as an extra root,
@@ -202,9 +212,12 @@ function chains(index) {
 
     function walk(nodeId, pathNodes, pathLinks) {
         if (res.length >= MAX_CHAINS) return;
-        const next = outLinks(index, nodeId).filter(l => !pathNodes.includes(l.target));
+        const incoming = index.links.get(pathLinks[pathLinks.length - 1]);
+        const next = chainSteps(index, nodeId, incoming).filter(l => !pathNodes.includes(l.target));
         if (!next.length) {
-            res.push({ nodes: pathNodes.slice(), links: pathLinks.slice() });
+            const c = { nodes: pathNodes.slice(), links: pathLinks.slice() };
+            if (portalExit.portalRoute(index, incoming)) c.noInternet = true;
+            res.push(c);
             pathLinks.forEach(id => covered.add(id));
             return;
         }
@@ -248,15 +261,15 @@ function chainSummary(index, chain, now = Date.now()) {
             .map(n => attentionStatus('node', n, now)),
         ...links.map(l => attentionStatus('link', l, now)),
     ];
-    const status = statuses.length ? worstStatus(statuses) : 'unknown';
+    const status = worstStatus(chain.noInternet ? [...statuses, 'unknown'] : statuses);
     let latency = 0;
-    let measured = links.length > 0;
+    let measured = !chain.noInternet && links.length > 0;
     for (const l of links) {
         const ms = l ? measuredLatency(l, now) : null;
         if (ms != null) latency += ms;
         else measured = false;
     }
-    return { status, latencyMs: measured ? latency : null };
+    return { status: statuses.length ? status : 'unknown', latencyMs: measured ? latency : null };
 }
 
 /**
@@ -472,6 +485,11 @@ module.exports = {
     roots,
     soloNodes,
     chains,
+    chainSteps,
+    readPortalExit: portalExit.readExit,
+    samePortalExit: portalExit.sameExit,
+    portalRoute: portalExit.portalRoute,
+    routeKey: portalExit.routeKey,
     chainsThrough,
     chainSummary,
     related,

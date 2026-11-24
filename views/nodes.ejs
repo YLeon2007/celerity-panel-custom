@@ -4,7 +4,7 @@ const openMap = typeof nodesMapQuery !== 'undefined' && Boolean(nodesMapQuery);
 const rebuildClassicMap = typeof c3Rebuild !== 'undefined' && c3Rebuild && !modernMap && openMap;
 const panelToken = typeof csrfToken === 'string' ? csrfToken : '';
 const canManageLinks = Boolean(modernMap && typeof c3Rebuild !== 'undefined' && c3Rebuild === true && panelToken);
-const mapAssetRevision = '2714a43368eb29df';
+const mapAssetRevision = 'a8d3a2b28c9437bf';
 const nodeMetaLabels = {
     transportTitle: t('nodes.nodeMetaTransport'),
     securityTitle: t('nodes.nodeMetaSecurity'),
@@ -942,7 +942,7 @@ function nodeMetaFor(node) {
 
 <% if (typeof c3Rebuild !== 'undefined' && c3Rebuild) { %>
 <% // Both map implementations use this single page-level dialog and script. %>
-<%- include('partials/rebuild-preview') %>
+<%- include('partials/rebuild-preview', { modernMap }) %>
 <% if (nodes.some(node => node.cascadeRole === 'relay')) { %>
 <%- include('partials/rebuild-relay-retire') %>
 <% } %>

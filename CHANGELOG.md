@@ -5,6 +5,11 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.6.38 — Свой выход портала / Per-portal exits
+
+- На одном общем Rebuild-релее каждый портал может выбрать свой бридж и решить, использовать ли шлюз РФ. Выбор сохраняется по ноде, а канал определяется приоритетом. [Заметки о выпуске](docs/release-v1.6.38.ru.md).
+- Portals sharing one Rebuild relay can select their own exit node and opt in or out of the relay’s geo routes. The active link is selected by priority. [Release notes](docs/release-v1.6.38.md).
+
 ## v1.6.37 — Длительные подключения Xray / Long-lived Xray connections
 
 - Открытые подключения не исчезают по возрасту последнего подключения. cc-agent 1.6.1 отличает пустой список клиентов портала от отсутствия данных учёта. [Заметки о выпуске](docs/release-v1.6.37.ru.md).

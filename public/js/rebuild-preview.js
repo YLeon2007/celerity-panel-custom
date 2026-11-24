@@ -8,6 +8,20 @@
     const exitWarningKeys = new Map([['lost', 'exitLost'], ['blocked', 'exitBlocked'], ['default-lost', 'defaultExitLost']]);
     let previewDialogPending = false;
 
+    const publicId = value => typeof value === 'string' && value.length === 24 && /^[a-f0-9]+$/i.test(value);
+    const oneLine = value => typeof value === 'string' ? value.replace(/[\s\p{Cc}\p{Bidi_Control}]+/gu, ' ').trim().slice(0, 120) : '';
+
+    function exitName(exit, lookupNode, labels) {
+        if (exit === null) return labels.noPortalExit;
+        if (!publicId(exit?.nodeId)) return labels.unknownPortalExit;
+        const name = [exit.name, lookupNode(exit.nodeId)?.label].map(oneLine)
+            .find(value => value && value.toLowerCase() !== exit.nodeId.toLowerCase()) || labels.unknownPortalExit;
+        if (!publicId(exit.linkId)) return name;
+        const label = oneLine(exit.linkName);
+        const shortId = '#' + exit.linkId.slice(-8);
+        return `${name} (${label ? `${label} · ${shortId}` : shortId})`;
+    }
+
     function rebuildPreviewText(nodes, removing, lookupNode, labels) {
         const details = [], warnings = [];
         let protectedChanged = false;
@@ -33,6 +47,32 @@
             const lines = [name + ' — ' + labels[role] + ': ' + summary,
                 settingsChanged ? labels.settingsChanged : labels.settingsUnchanged];
             if (node.profiles.some(profile => profile.tunnelMigration === 'legacy-to-vless-reverse')) lines.push(labels.migration);
+            const exitChange = node.portalExitChange;
+            const hasChannels = publicId(exitChange?.before?.linkId) && publicId(exitChange?.after?.linkId);
+            const defaultLabel = labels.portalExitChange || (hasChannels && labels.portalExitChannelChange);
+            if (defaultLabel && role === 'portal' && exitChange
+                && Object.hasOwn(exitChange, 'before') && Object.hasOwn(exitChange, 'after')) {
+                const exits = Object.fromEntries(['before', 'after'].map(key => [key, exitName(exitChange[key], lookupNode, labels)]));
+                if (exitChange.before?.nodeId !== exitChange.after?.nodeId || exits.before !== exits.after
+                    || (hasChannels && exitChange.before.linkId !== exitChange.after.linkId)) {
+                    lines.push(defaultLabel.replace(/\{(before|after)\}/g, (_, key) => exits[key]));
+                }
+                const geo = node.portalExitRelayGeoChange;
+                if (labels.portalExitChange && typeof geo?.before === 'boolean' && typeof geo.after === 'boolean' && geo.before !== geo.after) {
+                    lines.push(geo.after ? labels.portalExitRelayGeoOn : labels.portalExitRelayGeoOff);
+                }
+            }
+            const geo = node.portalExitGeoChange;
+            if (role === 'portal' && labels.portalExitGeo && Array.isArray(geo?.before) && Array.isArray(geo.after)) {
+                const format = exits => {
+                    const names = exits.map(exit => exitName(exit, lookupNode, labels));
+                    return names.length ? (listFormat?.format(names) ?? names.join(', ')) : '—';
+                };
+                const before = format(geo.before), after = format(geo.after);
+                // The matcher changed even if the safe exit labels are identical.
+                const summary = before === after ? labels.changesPlural.replace('{sections}', () => labels.routing) : `${before} → ${after}`;
+                lines.push(`${labels.portalExitGeo}: ${summary}`);
+            }
             details.push(lines.join('\n'));
             const warningKey = removing && exitWarningKeys.get(node.exitImpact);
             if (warningKey) warnings.push(labels[warningKey].replace('{name}', () => name));

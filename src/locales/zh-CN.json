@@ -1645,6 +1645,14 @@
     "diskThresholdsHint": "发送 host.disk_low / host.disk_critical / host.disk_recovered 事件。"
   },
   "network": {
+    "rebuildPreview": {
+      "portalExitRelayGeoOn": "俄罗斯流量将经由中继的网关。",
+      "portalExitRelayGeoOff": "俄罗斯流量将不再经由中继的网关。",
+      "portalExitChange": "默认出口：{before} → {after}。",
+      "portalExitGeo": "地理路由",
+      "noPortalExit": "无出口",
+      "unknownPortalExit": "出口未知"
+    },
     "rebuildKcpVersionTooOld": "节点 {nodeName}：Xray {version}，mKCP 需要 Xray {minimumVersion} 或更高版本。",
     "rebuildKcpVersionUnknown": "节点 {nodeName}：Xray 版本未知，mKCP 需要 Xray {minimumVersion} 或更高版本。",
     "rebuildKcpVersionPreviewChanged": "包含 mKCP 的重建预览已变化。应用前请重新预览。",
@@ -2059,6 +2067,24 @@
         "checkHealth": "检查连接",
         "remove": "删除链路",
         "reconnectHint": "编辑链路并应用更改。"
+      },
+      "portalExit": {
+        "title": "此门户的出口",
+        "shared": "中继的共享出口（默认）",
+        "relayGeo": "俄罗斯流量经由中继的网关",
+        "geo": "地理路由网关",
+        "unavailable": "所选出口节点不可用",
+        "unknown": "已应用的出口路由未知",
+        "noDefault": "无默认出口",
+        "sharedVia": "共享出口经由 {name}",
+        "explicitVia": "所选出口经由 {name}",
+        "geoVia": "匹配的俄罗斯流量经由 {names}",
+        "actual": "当前路由：{route}",
+        "draft": "草稿（未应用）：{route}",
+        "badExit": "所选节点不能作为此门户和中继的出口。请选择可用的出口节点。",
+        "unsupported": "此路由策略不支持为门户指定独立出口。",
+        "inUse": "此更改会导致一个或多个门户无法使用所选出口节点。请先更改这些门户的出口。",
+        "inUseNamed": "此更改会导致以下门户无法使用所选出口节点：{names}。请先更改这些门户的出口。"
       },
       "portalExitSettings": "订阅中的出口",
       "tunnelUnknown": "连接状态未经确认",

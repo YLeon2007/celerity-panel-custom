@@ -1,5 +1,7 @@
 // The details route returns a lean row, so persisted values and model defaults
 // are distinct. Defaults below are for display/comparison, never a PUT template.
+import model from './model.js';
+
 export const DEFAULT_PORT = 10086;
 export const TRANSPORTS = [['tcp', 'TCP'], ['ws', 'WebSocket'], ['grpc', 'gRPC'], ['xhttp', 'XHTTP / SplitHTTP'], ['kcp', 'mKCP (UDP)']];
 export const KCP_HEADERS = ['none', 'wechat', 'dtls', 'srtp', 'wireguard'];
@@ -58,6 +60,11 @@ export function projectEditFields(row) {
         fields[key] = value;
     }
     if (!fields.name?.trim()) throw new InvalidEditFields();
+    if (Object.hasOwn(row, 'rebuildExit')) {
+        const exit = model.readPortalExit(row.rebuildExit);
+        if (exit === undefined) throw new InvalidEditFields('badExit');
+        fields.rebuildExit = exit && Object.freeze(exit);
+    }
     return fields;
 }
 
@@ -104,8 +111,15 @@ export function editPatch(edit, proposed) {
         const value = trim && typeof raw === 'string' ? raw.trim() : raw;
         if (value !== (trim ? before[key].trim() : before[key])) patch[key] = value;
     }
-    if (!Object.keys(patch).length) return patch;
+    let exitPatch;
+    if (Object.hasOwn(proposed, 'rebuildExit')) {
+        const exit = model.readPortalExit(proposed.rebuildExit);
+        if (exit === undefined) throw new InvalidEditFields('badExit');
+        if (!model.samePortalExit(edit.rebuildExit, exit)) exitPatch = exit ?? { nodeId: null, relayGeo: true };
+    }
+    if (!Object.keys(patch).length && exitPatch === undefined) return patch;
     const result = writableEditFields(patch);
+    if (exitPatch !== undefined) result.rebuildExit = exitPatch;
     if ((security === 'reality' && !allowsReality(transport))
         || (submitted('tunnelProtocol') === 'vmess' && !allowsVmess(submitted('mode'), security))) throw new InvalidEditFields();
     if (security === 'tls' && !tlsNameOK(result.tlsServerName ?? before.tlsServerName)) {

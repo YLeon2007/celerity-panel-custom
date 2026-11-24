@@ -2,6 +2,7 @@ import { isObjectId } from '../core/api.js';
 import { DEFAULT_PORT, TRANSPORTS, KCP_HEADERS, KCP_NUMBERS, allowsReality, allowsVmess, inRange,
     tlsNameOK, editValues, editPatch, InvalidEditFields } from '../core/edit-fields.js';
 import { t } from '../core/i18n.js';
+import portalExit from '../core/portal-exit.js';
 import { h, icon } from './dom.js';
 import { nodeTitle, roleName } from './format.js';
 
@@ -9,6 +10,7 @@ const FROM_ROLES = ['portal', 'relay'];
 const TO_ROLES = ['relay', 'bridge'];
 const label = (key, vars) => t(`map.create.${key}`, vars);
 const editLabel = key => t(`map.edit.${key}`);
+const exitLabel = key => t(`map.portalExit.${key}`);
 
 // Shared with the legacy link modal. Rebuild uses its own server-side port
 // admission (including UDP reservations); the map cannot infer a free port.
@@ -80,6 +82,11 @@ export function renderCreateForm(container, { store, actions, source, target, ed
     const tls = h('input.nm-input', { name: 'tlsServerName', type: 'text', maxlength: 253, required: true,
         autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' });
     const tlsField = field('tlsServerName', tls, h('div.hint', null, label('tlsHint')));
+    const exit = h('select.nm-input', { name: 'rebuildExitNodeId' });
+    const geo = h('input', { name: 'relayGeo', type: 'checkbox', checked: true });
+    const exitField = h('div.nm-field', { hidden: true },
+        h('label', null, h('span', null, exitLabel('title')), exit),
+        h('label', null, geo, ' ', exitLabel('relayGeo')));
     const kcpInputs = Object.fromEntries(Object.entries(KCP_NUMBERS).map(([key, args]) => [key, numberInput(key, ...args)]));
     const headerNames = [label('kcpHeaderNone'), label('kcpHeaderWechat'), 'DTLS 1.2', 'SRTP', 'WireGuard'];
     const header = select('kcpHeader', KCP_HEADERS.map((value, i) => option(value, headerNames[i])));
@@ -96,7 +103,7 @@ export function renderCreateForm(container, { store, actions, source, target, ed
             ? h('div.hint', { id: 'nm-edit-endpoints-hint' }, editLabel('endpointsHint')) : availability,
         h('div.nm-field', null, h('div', null, label('how')),
             h('div.nm-seg', { role: 'group', 'aria-label': label('how') }, modeButtons), mode, modeHint),
-        advanced, status);
+        exitField, advanced, status);
     const submit = h('button.nm-btn.primary.block', { type: 'submit' });
     const close = h('button.nm-btn.ghost.icon.sm', { type: 'button', 'aria-label': t('map.close') }, icon('x'));
     const cancel = h('button.nm-btn.ghost', { type: 'button' }, label('cancel'));
@@ -108,9 +115,35 @@ export function renderCreateForm(container, { store, actions, source, target, ed
     container.append(form);
 
     let optionKey;
+    let exitPair, exitKey;
+    let chosenExit = edit?.rebuildExit?.nodeId ?? '';
+    let relayGeo = edit?.rebuildExit?.relayGeo ?? true;
+    let validExits = new Set();
     let canChoose = false;
     const attached = () => !closed && form.parentNode === container && form.isConnected;
     const nodeLabel = node => node?.label || node?.ip || '';
+
+    function syncExit(sourceId, targetId) {
+        const index = store.index;
+        const pair = portalExit.selectablePortalHop(index, sourceId, targetId) ? `${sourceId}:${targetId}` : '';
+        if (!editing && exitPair !== pair) { chosenExit = ''; relayGeo = true; }
+        exitPair = pair;
+        exitField.hidden = exit.disabled = !pair;
+        if (!pair) { geo.disabled = true; return; }
+        const choices = portalExit.exitChoiceNodes(index, targetId).map(node => [node.id, node.label || ''])
+            .sort(([a, nameA], [b, nameB]) => nameA.localeCompare(nameB) || a.localeCompare(b));
+        validExits = new Set(choices.map(([id]) => id));
+        const unavailable = chosenExit && !validExits.has(chosenExit) ? chosenExit : null;
+        const key = JSON.stringify([choices, unavailable]);
+        if (key !== exitKey) {
+            exitKey = key;
+            exit.replaceChildren(option('', exitLabel('shared')), ...choices.map(args => option(...args)));
+            if (unavailable) exit.append(h('option', { value: unavailable, disabled: true }, exitLabel('unavailable')));
+        }
+        exit.value = chosenExit;
+        geo.checked = relayGeo;
+        geo.disabled = !chosenExit || !validExits.has(chosenExit);
+    }
 
     function syncEndpoints(sourceId = from.value, targetId = to.value) {
         if (editing) {
@@ -121,6 +154,7 @@ export function renderCreateForm(container, { store, actions, source, target, ed
             from.value = displayEndpoint(edit.portalNode);
             to.value = displayEndpoint(edit.bridgeNode);
             canChoose = isObjectId(edit._id) && store.index.links.get(edgeId)?.canEdit === true;
+            syncExit(edit.portalNode, edit.bridgeNode);
             updateDirection();
             updateControls();
             return;
@@ -141,6 +175,7 @@ export function renderCreateForm(container, { store, actions, source, target, ed
         }
         from.value = sourceValue;
         to.value = targetValue;
+        syncExit(sourceValue, targetValue);
         canChoose = sources.some(node => targets.length > 1 || (targets[0] && targets[0].id !== node.id));
         availability.hidden = canChoose;
         if (!nameTouched) name.value = sourceValue && targetValue
@@ -182,7 +217,7 @@ export function renderCreateForm(container, { store, actions, source, target, ed
     }
 
     function showStatus(key) {
-        const localize = editing && (key === 'noChanges' || key === 'unknown') ? editLabel : label;
+        const localize = key === 'badExit' ? exitLabel : editing && (key === 'noChanges' || key === 'unknown') ? editLabel : label;
         status.textContent = key ? localize(key) : '';
         status.hidden = !key;
     }
@@ -196,6 +231,13 @@ export function renderCreateForm(container, { store, actions, source, target, ed
             if (control === tls && tls.disabled) continue;
             if ((control === header || Object.hasOwn(kcpInputs, key)) && kcpFields.disabled) continue;
             values[key] = control.type === 'number' ? control.valueAsNumber : control.value;
+        }
+        if (exitPair) {
+            const before = edit.rebuildExit?.nodeId ?? '';
+            if (before !== chosenExit || (chosenExit && relayGeo !== edit.rebuildExit?.relayGeo)) {
+                if (chosenExit && !validExits.has(chosenExit)) return showStatus('badExit');
+                values.rebuildExit = { nodeId: chosenExit || null, relayGeo: chosenExit ? relayGeo : true };
+            }
         }
         try { return editPatch(edit, values); } catch (err) {
             advanced.open = true;
@@ -238,6 +280,10 @@ export function renderCreateForm(container, { store, actions, source, target, ed
                 if (!inRange(value, min, max)) return showStatus('badKcp');
                 body[key] = value;
             }
+        }
+        if (exitPair && chosenExit) {
+            if (!validExits.has(chosenExit)) return showStatus('badExit');
+            body.rebuildExit = { nodeId: chosenExit, relayGeo };
         }
         return body;
     }
@@ -309,6 +355,12 @@ export function renderCreateForm(container, { store, actions, source, target, ed
         if (pending || finished) return;
         if (event.target === name) nameTouched = true;
         if (event.target === from || event.target === to) syncEndpoints();
+        if (event.target === exit) {
+            if (!chosenExit || !exit.value) relayGeo = true;
+            chosenExit = exit.value;
+            syncEndpoints();
+        }
+        if (event.target === geo && !geo.disabled) relayGeo = geo.checked;
         if (event.target === transport || event.target === security) updateTransport();
         showStatus();
     }, eventOptions);
