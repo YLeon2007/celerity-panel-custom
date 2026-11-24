@@ -159,7 +159,7 @@ export function createInspector(el, { store, actions, onGoto, loadForm, isVisibl
 
         const online = detail.status === 'unknown' ? '—' : String(n.onlineUsers || 0);
         const kpis = h('div.nm-kpis', null,
-            kpi('users', t('map.kpi.online'), clientConnections?.focusable(clientConnections.count(n, 'span', online)) ?? online),
+            kpi('users', t('map.kpi.online'), clientConnections?.focusable(clientConnections.count(n, 'inspector', 'span', online)) ?? online),
             kpi('link', t('map.kpi.links'), String(outs.length + ins.length), t('map.kpi.inOut', { in: ins.length, out: outs.length })),
             kpi('cpu', t('map.kpi.type'), typeName(n.type), n.port ? `:${n.port}` : ''),
             kpi('clock', t('map.kpi.sync'), ago(n.lastSync) || '—'));

@@ -5,6 +5,11 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.6.36 — Счётчик клиентов на карте / Map client count
+
+- Новая карта обновляет топологию каждые 10 с на видимой вкладке и сразу сверяет счётчик с открытым списком клиентов. [Заметки о выпуске](docs/release-v1.6.36.ru.md).
+- The modern map polls every 10 s while visible and updates the count immediately from the open client list. [Release notes](docs/release-v1.6.36.md).
+
 ## v1.6.35 — IP подключённых клиентов на карте / Client IPs on the map
 
 - Администратор видит IP, регион и организацию ASN при наведении на счётчик клиентской Xray-ноды. Нужны cc-agent 1.6.0 и политика `statsUserOnline`. [Заметки о выпуске](docs/release-v1.6.35.ru.md).

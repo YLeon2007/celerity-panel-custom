@@ -12,7 +12,7 @@
 import model from './model.js';
 import { fetchTopology as getTopology } from './api.js';
 
-const POLL_INTERVAL_MS = 30000;
+const POLL_INTERVAL_MS = 10000;
 
 export function createStore({ isVisible }) {
     const listeners = new Map();
@@ -141,7 +141,14 @@ export function createStore({ isVisible }) {
     /** Called when the map tab becomes visible again. */
     function resume() {
         expireObservations(true);
-        if (Date.now() - state.lastFetch > POLL_INTERVAL_MS) fetchTopology({ silent: true });
+        if (canPoll() && Date.now() - state.lastFetch >= POLL_INTERVAL_MS) fetchTopology({ silent: true });
+    }
+
+    function setOnlineUsers(id, count) {
+        const node = state.index.nodes.get(id);
+        if (!node || node.onlineUsers === count) return;
+        node.onlineUsers = count;
+        emit('data', { structural: false });
     }
 
     function select(sel) {
@@ -188,6 +195,7 @@ export function createStore({ isVisible }) {
         startPolling,
         stopPolling,
         resume,
+        setOnlineUsers,
         select,
         setFilter,
         toggleRole,

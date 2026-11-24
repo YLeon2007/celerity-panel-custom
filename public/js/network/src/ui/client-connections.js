@@ -2,6 +2,10 @@ import { fetchClientConnections, isObjectId } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { h, tip } from './dom.js';
 
+const REFRESH_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 10_000;
+const focusSelector = 'button, [tabindex]';
+
 const fields = ['username', 'ip', 'country', 'region', 'city', 'asn', 'isp', 'lastSeen'];
 const eligible = node => node && isObjectId(node.id) && node.type !== 'cdn' && node.type !== 'internet'
     && (node.cascadeRole === 'portal' || node.cascadeRole === 'standalone');
@@ -14,12 +18,14 @@ export function createClientConnections(root, { store, isVisible }) {
     let pointerFocus = false;
 
     function dismiss(scope) {
-        if (!active || (scope && !scope.contains(active.anchor))) return false;
-        const { ctrl, anchor, focusTarget, panel } = active;
-        clearTimeout(active.timer);
-        clearTimeout(active.expiry);
+        if (!active || (scope && (active.redrawing || !scope.contains(active.anchor)))) return false;
+        const { request, anchor, focusTarget, panel, refresh } = active;
         active = null; // Invalidate before aborting, even if transport ignores the signal.
-        ctrl.abort();
+        clearInterval(refresh);
+        if (request) {
+            clearTimeout(request.timeout);
+            request.ctrl.abort();
+        }
         anchor.removeAttribute('aria-describedby');
         focusTarget?.removeAttribute('aria-describedby');
         panel.replaceChildren();
@@ -28,7 +34,7 @@ export function createClientConnections(root, { store, isVisible }) {
     }
 
     function current(s) {
-        return active === s && isVisible() && root.contains(s.anchor) && s.anchor.getClientRects().length > 0
+        return active === s && !document.hidden && isVisible() && root.contains(s.anchor) && s.anchor.getClientRects().length > 0
             && eligible(store.index.nodes.get(s.id));
     }
 
@@ -41,6 +47,8 @@ export function createClientConnections(root, { store, isVisible }) {
     }
 
     function status(s, state, rows = []) {
+        // Replace the contents atomically, not the panel, and retain its scroll.
+        const left = s.body.scrollLeft, top = s.body.scrollTop;
         if (state === 'ready' && rows.length) {
             const table = h('table', null,
                 h('thead', null, h('tr', null, fields.map(key => h('th', { scope: 'col' }, t(`map.connections.${key}`))))),
@@ -49,11 +57,41 @@ export function createClientConnections(root, { store, isVisible }) {
         } else {
             s.body.replaceChildren(h('p', { role: 'status' }, t(`map.connections.${state === 'ready' ? 'empty' : state}`)));
         }
+        s.body.scrollLeft = left;
+        s.body.scrollTop = top;
         place(s);
     }
 
+    async function refresh(s) {
+        if (!current(s)) { if (active === s) dismiss(); return; }
+        if (s.request) return;
+        const ctrl = new AbortController();
+        const timeout = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+        s.request = { ctrl, timeout };
+        try {
+            const result = await fetchClientConnections(s.id, ctrl.signal);
+            if (!current(s)) return;
+            if (ctrl.signal.aborted) status(s, 'unavailable');
+            else if (result.state === 'forbidden') dismiss();
+            else {
+                status(s, result.state, result.rows);
+                if (result.state === 'ready') {
+                    const users = new Set(result.rows.map(row => row?.username)
+                        .filter(name => typeof name === 'string' && name.length));
+                    store.setOnlineUsers(s.id, users.size);
+                }
+            }
+        } catch {
+            if (current(s)) status(s, 'unavailable');
+        } finally {
+            clearTimeout(timeout);
+            s.request = null;
+            if (active === s && !current(s)) dismiss();
+        }
+    }
+
     function show(anchor, id, source, focusTarget = null) {
-        if (!isVisible() || !root.contains(anchor) || !anchor.getClientRects().length || !eligible(store.index.nodes.get(id))) return;
+        if (document.hidden || !isVisible() || !root.contains(anchor) || !anchor.getClientRects().length || !eligible(store.index.nodes.get(id))) return;
         if (active?.anchor === anchor) {
             active[source] = true;
             if (focusTarget) {
@@ -70,16 +108,16 @@ export function createClientConnections(root, { store, isVisible }) {
         }, 'IP Geolocation by DB-IP');
         const panel = h('div.nm-client-popover', { id: 'networkClientConnections', role: 'region', 'aria-label': t('map.connections.title') },
             h('strong', null, t('map.connections.title')), body, h('footer', null, link));
-        const s = { id, anchor, focusTarget, panel, body, link, ctrl: new AbortController(), [source]: true };
+        const s = { id, slot: anchors.get(anchor).slot, anchor, focusTarget, panel, body, link, [source]: true };
         active = s;
         panel.addEventListener('pointerenter', () => { s.pointerInPanel = true; });
         panel.addEventListener('pointerleave', e => {
             s.pointerInPanel = false;
-            if (anchor.contains(e.relatedTarget)) s.hover = true;
-            if (!s.hover && !s.focus && !panel.contains(document.activeElement)) dismiss();
+            if (s.anchor.contains(e.relatedTarget)) s.hover = true;
+            if (active === s && !s.hover && !s.focus && !panel.contains(document.activeElement)) dismiss();
         });
         panel.addEventListener('focusout', e => {
-            if (!panel.contains(e.relatedTarget) && e.relatedTarget !== s.focusTarget && !s.hover && !s.pointerInPanel) dismiss();
+            if (active === s && !panel.contains(e.relatedTarget) && e.relatedTarget !== s.focusTarget && !s.hover && !s.pointerInPanel) dismiss();
         });
         panel.addEventListener('keydown', e => {
             if (e.key !== 'Tab' || !s.focusTarget?.isConnected) return;
@@ -91,44 +129,56 @@ export function createClientConnections(root, { store, isVisible }) {
         document.body.append(panel);
         (focusTarget || anchor).setAttribute('aria-describedby', panel.id);
         status(s, 'loading');
-        s.timer = setTimeout(() => s.ctrl.abort(), 10000);
-        (async () => {
-            try {
-                const result = await fetchClientConnections(id, s.ctrl.signal);
-                if (!current(s)) return;
-                if (s.ctrl.signal.aborted) status(s, 'unavailable');
-                else if (result.state === 'forbidden') dismiss();
-                else {
-                    status(s, result.state, result.rows);
-                    if (result.rows?.length) s.expiry = setTimeout(() => {
-                        if (active === s) dismiss();
-                    }, 60_000);
-                }
-            } catch {
-                if (current(s)) status(s, 'unavailable');
-            } finally {
-                clearTimeout(s.timer);
-                if (active === s && !current(s)) dismiss();
-            }
-        })();
+        s.refresh = setInterval(() => refresh(s), REFRESH_MS);
+        refresh(s);
     }
 
-    function count(node, spec, ...content) {
+    function count(node, slot, spec, ...content) {
         const anchor = h(spec, null, ...content);
         if (!eligible(node)) return anchor;
         anchor.classList.add('nm-client-count');
-        anchors.set(anchor, node.id);
+        anchors.set(anchor, { id: node.id, slot });
+        if (active?.redrawing && active.id === node.id && active.slot === slot) active.replacement = anchor;
         anchor.addEventListener('pointerenter', e => {
             if (e.pointerType !== 'touch') show(anchor, node.id, 'hover');
         });
         anchor.addEventListener('pointerleave', e => {
             const s = active;
-            if (s?.anchor !== anchor) return;
+            if (s?.anchor !== anchor || s.redrawing) return;
             s.hover = false;
             if (s.panel.contains(e.relatedTarget)) s.pointerInPanel = true;
             if (!s.focus && !s.pointerInPanel && !s.panel.contains(document.activeElement)) dismiss();
         });
         return anchor;
+    }
+
+    // Chains, Graph cards and the inspector can replace their DOM on a poll.
+    // Follow only the same node and display slot; never reopen or refetch here.
+    function preserve(render) {
+        const s = active;
+        if (!s) return render();
+        const restore = document.activeElement === s.focusTarget;
+        s.redrawing = true;
+        try { render(); }
+        finally {
+            s.redrawing = false;
+            if (active === s) {
+                if (!root.contains(s.anchor) && s.replacement && root.contains(s.replacement)) {
+                    s.anchor.removeAttribute('aria-describedby');
+                    s.focusTarget?.removeAttribute('aria-describedby');
+                    s.anchor = s.replacement;
+                    s.focusTarget = s.focusTarget ? s.anchor.closest(focusSelector) : null;
+                    (s.focusTarget || s.anchor).setAttribute('aria-describedby', s.panel.id);
+                    if (restore) {
+                        restoringFocus = true;
+                        try { s.focusTarget?.focus({ preventScroll: true }); } finally { restoringFocus = false; }
+                    }
+                }
+                s.replacement = null;
+                if (current(s)) place(s);
+                else dismiss();
+            }
+        }
     }
 
     function focusAnchor(target) {
@@ -143,11 +193,11 @@ export function createClientConnections(root, { store, isVisible }) {
     root.addEventListener('focusin', e => {
         if (restoringFocus || pointerFocus) return;
         const anchor = focusAnchor(e.target);
-        if (anchors.has(anchor)) show(anchor, anchors.get(anchor), 'focus', e.target);
+        if (anchors.has(anchor)) show(anchor, anchors.get(anchor).id, 'focus', e.target);
     });
     root.addEventListener('focusout', e => {
         const s = active;
-        if (s?.focusTarget !== e.target) return;
+        if (s?.focusTarget !== e.target || s.redrawing) return;
         s.focus = false;
         if (!s.panel.contains(e.relatedTarget) && !s.hover && !s.pointerInPanel) dismiss();
     });
@@ -157,6 +207,15 @@ export function createClientConnections(root, { store, isVisible }) {
             active.link.focus({ preventScroll: true });
         }
     });
+    // If a redraw moved the anchor out from under a stationary pointer,
+    // the old anchor cannot deliver pointerleave on the next mouse movement.
+    document.addEventListener('pointermove', e => {
+        const s = active;
+        if (!s?.hover || s.anchor.contains(e.target) || s.panel.contains(e.target)) return;
+        s.hover = false;
+        if (!s.focus && !s.pointerInPanel && !s.panel.contains(document.activeElement)) dismiss();
+    });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) dismiss(); });
     window.addEventListener('blur', () => dismiss());
     window.addEventListener('resize', () => dismiss());
     document.addEventListener('scroll', e => {
@@ -173,9 +232,7 @@ export function createClientConnections(root, { store, isVisible }) {
         eligible,
         count,
         dismiss,
-        reconcile() {
-            if (active && !current(active)) dismiss();
-        },
+        preserve,
         escape() {
             const target = active?.panel.contains(document.activeElement) ? active.focusTarget : null;
             if (!dismiss()) return false;

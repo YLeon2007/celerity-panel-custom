@@ -322,7 +322,7 @@ export function mount(el, { store, toolbar, canSavePositions, clientConnections 
                 return;
             }
             const users = node.onlineUsers || clientConnections?.eligible(node)
-                ? clientConnections?.count(node, 'span.users', icon('users'), String(node.onlineUsers || 0))
+                ? clientConnections?.count(node, 'graph', 'span.users', icon('users'), String(node.onlineUsers || 0))
                     ?? h('span.users', null, icon('users'), String(node.onlineUsers)) : null;
             if (users && clientConnections?.eligible(node)) {
                 clientConnections.focusable(users);

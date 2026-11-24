@@ -137,12 +137,15 @@ function boot() {
         if (!store.state.loaded) showState('error');
         else console.warn('[network] refresh failed:', err.message);
     });
-    store.on('data', change => {
+    function renderData(change) {
         showState(store.index.nodes.size ? null : 'empty');
         toolbar.update();
         if (view) view.update({ type: 'data', structural: change.structural });
         inspector.render();
-        clientConnections?.reconcile();
+    }
+    store.on('data', change => {
+        if (clientConnections) clientConnections.preserve(() => renderData(change));
+        else renderData(change);
     });
     store.on('select', () => {
         clientConnections?.dismiss();

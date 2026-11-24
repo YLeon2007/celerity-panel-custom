@@ -95,16 +95,16 @@ export function mount(el, { store, toolbar, clientConnections }) {
 
     // ==================== RENDER ====================
 
-    function countFor(node, spec, ...content) {
-        return clientConnections?.count(node, spec, ...content) ?? h(spec, null, ...content);
+    function countFor(node, slot, spec, ...content) {
+        return clientConnections?.count(node, slot, spec, ...content) ?? h(spec, null, ...content);
     }
 
-    function focusableCount(node, spec, ...content) {
-        const count = countFor(node, spec, ...content);
+    function focusableCount(node, slot, spec, ...content) {
+        const count = countFor(node, slot, spec, ...content);
         return clientConnections?.focusable(count) ?? count;
     }
 
-    function card(node, isRoot, lane) {
+    function card(node, isRoot, lane, branch) {
         const role = model.roleOf(node);
         const status = model.attentionStatus('node', node);
         const shared = !isRoot && lane.sharedCount(node.id) > 1;
@@ -123,7 +123,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
         h('div.row1', null, h('span.flag', null, node.flag || '🖥️'), h('span.nm', null, node.label || node.ip || ''), dot(status)),
         h('div.row2', null, roleTag(role),
             node.onlineUsers || clientConnections?.eligible(node)
-                ? countFor(node, 'span', icon('users'), ` ${node.onlineUsers || 0}`) : h('span.mono', null, node.ip || '')));
+                ? countFor(node, `chains:card:${lane.rootId}:${branch}`, 'span', icon('users'), ` ${node.onlineUsers || 0}`) : h('span.mono', null, node.ip || '')));
         lane.cards.push(el);
         return el;
     }
@@ -150,7 +150,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
         return el;
     }
 
-    function tree(nodeId, isRoot, path, lane) {
+    function tree(nodeId, isRoot, path, lane, branch = '') {
         const node = model.nodeOf(index(), nodeId);
         if (!node) return null;
         if (lane.cardCount >= MAX_CARDS_PER_LANE) {
@@ -158,14 +158,14 @@ export function mount(el, { store, toolbar, clientConnections }) {
             return null;
         }
         lane.cardCount++;
-        const c = card(node, isRoot, lane);
+        const c = card(node, isRoot, lane, branch);
         const wrap = h('div.nmc-tn', null, c);
         const kids = model.outLinks(index(), nodeId).filter(l => !path.includes(l.target));
 
         if (kids.length) {
             const box = h('div.nmc-tkids');
             for (const l of kids) {
-                const sub = tree(l.target, false, path.concat(l.target), lane);
+                const sub = tree(l.target, false, path.concat(l.target), lane, `${branch}/${l.id}`);
                 if (!sub) continue;
                 const childCard = sub.querySelector('.nmc-card');
                 lane.pairs.push({ a: c, b: childCard, link: l, pill: pill(l, lane) });
@@ -232,7 +232,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
             .filter(n => n && n.type !== 'cdn' && model.outLinks(index(), n.id).length === 0 && n.id !== root.id);
         const cdns = model.cdnFor(index(), root.id);
 
-        const clients = h('div.nmc-clients', null, icon('users'), focusableCount(root, 'b', String(root.onlineUsers || 0)), h('small', null, t('map.clients')),
+        const clients = h('div.nmc-clients', null, icon('users'), focusableCount(root, 'chains:lane-count', 'b', String(root.onlineUsers || 0)), h('small', null, t('map.clients')),
             cdns.map(c => h('button.cdn', {
                 type: 'button',
                 title: c.domain || c.label,
@@ -262,7 +262,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
                 toggle,
                 h('div.ttl', null, h('span', null, root.flag || ''), h('span.nm', null, root.label || ''), roleTag(model.roleOf(root))),
                 h('div.meta', null,
-                    focusableCount(root, 'span', icon('users'), t('map.onlineN', { n: root.onlineUsers || 0 })),
+                    focusableCount(root, 'chains:lane-head', 'span', icon('users'), t('map.onlineN', { n: root.onlineUsers || 0 })),
                     h('span', null, icon('door-exit'), count(exits.length, 'map.exitsPlural')),
                     summaryBadge(summary))),
             body);
@@ -302,7 +302,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
                 h('div.row1', null, h('span.flag', null, n.flag || '🖥️'), h('span.nm', null, n.label || n.ip || ''), dot(status)),
                 h('div.row2', null,
                     h('span', null, n.onlineUsers || clientConnections?.eligible(n)
-                        ? [countFor(n, 'span', icon('users'), ` ${n.onlineUsers || 0}`), ' · '] : null, h('span.mono', null, n.ip || ''))));
+                        ? [countFor(n, 'chains:solo', 'span', icon('users'), ` ${n.onlineUsers || 0}`), ' · '] : null, h('span.mono', null, n.ip || ''))));
                 lane.cards.push(c);
                 return c;
             })));
@@ -317,7 +317,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
             const root = model.nodeOf(index(), lane.rootId);
             side.append(sideRow(lane.rootId, { kind: 'node', id: root.id }, true, 0,
                 dot(lane.summary.status === 'unknown' ? 'pending' : lane.summary.status), nodeTitle(root),
-                countFor(root, 'span.ms', String(root.onlineUsers || 0), ' ', icon('users')), sel));
+                countFor(root, 'chains:side-root', 'span.ms', String(root.onlineUsers || 0), ' ', icon('users')), sel));
             const walk = (id, depth, seen) => {
                 if (depth > 8) return;
                 for (const l of model.outLinks(index(), id)) {
@@ -337,7 +337,7 @@ export function mount(el, { store, toolbar, clientConnections }) {
             side.append(h('div.nmc-group', null, t('map.noCascade')));
             for (const n of solos) {
                 side.append(sideRow('solo', { kind: 'node', id: n.id }, false, 0, dot(model.attentionStatus('node', n)), nodeTitle(n),
-                    countFor(n, 'span.ms', n.onlineUsers || clientConnections?.eligible(n) ? String(n.onlineUsers || 0) : ''), sel));
+                    countFor(n, 'chains:side-solo', 'span.ms', n.onlineUsers || clientConnections?.eligible(n) ? String(n.onlineUsers || 0) : ''), sel));
             }
         }
     }
