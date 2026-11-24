@@ -137,7 +137,7 @@
             <div class="form-row">
                 <div class="form-group">
                     <label><%= t('nodes.xrayRealityDest') %></label>
-                    <input type="text" name="xray_extra_realityDest" value="<%= e.realityDest || 'www.google.com:443' %>" placeholder="www.google.com:443">
+                    <input type="text" name="xray_extra_realityDest" value="<%= e.realityDest ?? 'www.google.com:443' %>" placeholder="www.google.com:443">
                 </div>
                 <div class="form-group">
                     <label><%= t('nodes.xrayRealitySni') %></label>

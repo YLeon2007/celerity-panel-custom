@@ -5,6 +5,9 @@
 const express = require('express');
 const router = express.Router();
 const HyNode = require('../models/hyNodeModel');
+const { MODE_PATH, PROFILE_FIELDS, RealityGuardInputError, readXrayPolicy, rejectDottedGuard,
+    RealityGuardConflictError, guardModeCAS, guardRoleOnUpdate, assertGuardModeAllowed,
+    saveGuardMode, withNewRealityGuard } = require('../models/realityGuardPolicy');
 const HyUser = require('../models/hyUserModel');
 const ServerGroup = require('../models/serverGroupModel');
 const cryptoService = require('../services/cryptoService');
@@ -250,6 +253,7 @@ router.post('/:id/disable', requireScope('nodes:write'), (req, res) => setNodeAc
  */
 router.post('/', requireScope('nodes:write'), async (req, res) => {
     try {
+        rejectDottedGuard(req.body, 'xray.realityGuard');
         const {
             name, ip, domain, sni, port, portRange, statsPort,
             groups, ssh, paths, settings, rankingCoefficient,
@@ -366,7 +370,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             if (value !== undefined) nodeData[key] = value;
         }
 
-        const node = new HyNode(nodeData);
+        const node = new HyNode(withNewRealityGuard(nodeData, xray));
         await node.save();
 
         await invalidateNodesCache();
@@ -375,6 +379,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 
         res.status(201).json(node);
     } catch (error) {
+        if (error instanceof RealityGuardInputError) return res.status(400).json({ error: error.message });
         logger.error(`[Nodes API] Create node error: ${error.message}`);
         res.status(500).json({ error: error.message });
     }
@@ -385,6 +390,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
  */
 router.put('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
+        rejectDottedGuard(req.body, 'xray.realityGuard');
         const allowedUpdates = [
             'name', 'domain', 'sni', 'port', 'portRange', 'statsPort',
             'groups', 'paths', 'settings', 'active', 'rankingCoefficient',
@@ -408,6 +414,20 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             }
         }
 
+        // A guard-only update is leaf-local. Other API Xray payloads retain
+        // the existing replacement semantics, but cannot wipe guard state.
+        let guardMode;
+        const hasGuard = Object.hasOwn(updates.xray || {}, 'realityGuard');
+        if (updates.xray !== undefined) {
+            if (!updates.xray || typeof updates.xray !== 'object' || Array.isArray(updates.xray)) {
+                return res.status(400).json({ error: 'xray must be an object' });
+            }
+            const { realityGuard, ...xray } = updates.xray;
+            ({ mode: guardMode } = readXrayPolicy(updates.xray));
+            if (realityGuard !== undefined && !Object.keys(xray).length) delete updates.xray;
+            else updates.xray = xray;
+        }
+
         // Patch individual fields on both nodes; a partial SSH object is not a replacement.
         const ssh = req.body.ssh;
         const sshUpdates = {};
@@ -419,11 +439,17 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         }
         Object.assign(updates, sshUpdates);
 
-        // findByIdAndUpdate bypasses pre('validate') hooks even with runValidators,
-        // so enforce type-specific invariants explicitly here. We need the existing
-        // doc to know the resulting type when only one of {type,virtual} is sent.
+        if (hasGuard && !Object.keys(updates).length) {
+            const node = await saveGuardMode(req.params.id, guardMode);
+            return node ? res.json(node) : res.status(404).json({ error: 'Node not found' });
+        }
+        // findByIdAndUpdate bypasses pre('validate') hooks, so enforce the
+        // type-specific invariants against the resulting node explicitly.
         const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
-            const existing = current ?? await HyNode.findById(req.params.id).select('type ip virtual').lean();
+            const bindGuard = !!updates.xray || guardMode !== undefined;
+            const guardFields = updates.xray ? ' xray.realityGuard' : guardMode !== undefined ? ` ${MODE_PATH}` : '';
+            const projection = `type ip virtual${guardMode !== undefined ? ' ' + PROFILE_FIELDS : ''}${guardFields}`;
+            const existing = (bindGuard ? null : current) ?? await HyNode.findById(req.params.id).select(projection).lean();
             if (!existing) {
                 return null;
             }
@@ -445,10 +471,23 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                 return { invalid: `Node type ${nextType} requires ip` };
             }
 
+            if (guardMode !== undefined) {
+                assertGuardModeAllowed(guardMode, { type: nextType, cascadeRole: guardRoleOnUpdate(existing.cascadeRole, updates.cascadeRole),
+                    role: existing.role, useCustomConfig: existing.useCustomConfig, xray: updates.xray ?? existing.xray });
+            }
+            if (updates.xray) {
+                const stored = existing.xray?.realityGuard;
+                if (guardMode !== undefined) updates.xray.realityGuard = { ...stored, mode: guardMode };
+                else if (stored !== undefined) updates.xray.realityGuard = stored;
+            } else if (guardMode !== undefined) updates[MODE_PATH] = guardMode;
+
             await assertNodeEditAllowed(current, updates, sshUpdates);
             await verify();
-            const node = await HyNode.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, ...options })
-                .select('-ssh.password -ssh.privateKey').populate('groups', 'name color');
+            const write = bindGuard
+                ? HyNode.findOneAndUpdate({ _id: req.params.id, ...guardModeCAS(existing) }, { $set: updates }, { new: true, ...options })
+                : HyNode.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, ...options });
+            const node = await write.select('-ssh.password -ssh.privateKey').populate('groups', 'name color');
+            if (bindGuard && !node) return { stale: true };
             // SSH is host-local. Never propagate a move at either address.
             if (existing.ip && existing.ip === node?.ip && Object.keys(sshUpdates).length) {
                 await verify();
@@ -456,12 +495,14 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             }
             return { node };
         });
+        if (result?.stale) throw new RealityGuardConflictError();
         if (result?.invalid) return res.status(400).json({ error: result.invalid });
         const node = result?.node;
         if (!node) return res.status(404).json({ error: 'Node not found' });
 
         // Auto-push config to the node if any config-affecting field changed.
-        require('../services/syncService').schedulePush(node._id, updates);
+        const configUpdates = Object.fromEntries(Object.entries(updates).filter(([key]) => key !== MODE_PATH));
+        if (Object.keys(configUpdates).length) require('../services/syncService').schedulePush(node._id, configUpdates);
 
         // Инвалидируем кэш
         await invalidateNodesCache();
@@ -472,6 +513,8 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
     } catch (error) {
         if (sendNodeWriteConflict(res, error)) return;
         // Casting and persistence errors can contain the submitted values.
+        if (error instanceof RealityGuardConflictError) return res.status(409).json({ error: error.message });
+        if (error instanceof RealityGuardInputError) return res.status(400).json({ error: error.message });
         logger.error('[Nodes API] Update node failed');
         res.status(500).json({ error: 'Failed to update node' });
     }

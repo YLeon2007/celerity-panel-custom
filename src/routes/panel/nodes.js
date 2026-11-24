@@ -3,6 +3,10 @@ const { isDeepStrictEqual } = require('node:util');
 const router = express.Router();
 
 const HyNode = require('../../models/hyNodeModel');
+const { MODE_PATH, effectiveMode, supportsGuard, destState, isGloballyEnabled,
+    RealityGuardInputError, RealityGuardConflictError, guardModeCAS, guardRoleOnUpdate,
+    readPolicy, assertGuardModeAllowed, saveGuardMode } = require('../../models/realityGuardPolicy');
+const { getRealityGuardObservation, forgetRealityGuardObservation } = require('../../services/realityGuardService');
 const HyUser = require('../../models/hyUserModel');
 const ServerGroup = require('../../models/serverGroupModel');
 const Settings = require('../../models/settingsModel');
@@ -49,6 +53,44 @@ const {
 } = require('./helpers');
 
 const sniScanner = require('../../services/sniScanner');
+const { requirePanelCsrf } = require('./csrf');
+
+function requireGuardFormCsrf(req, res, next) {
+    if (Object.keys(req.body || {}).some(key => key.startsWith('xray.realityGuard.'))) {
+        return requirePanelCsrf(req, res, next);
+    }
+    next();
+}
+
+const guardAvailable = state => state === 'public' || state === 'mixed';
+
+const guardFormMode = body => readPolicy(Object.hasOwn(body, MODE_PATH) ? { mode: body[MODE_PATH] } : undefined).mode;
+
+function realityGuardView(enabled, rows = []) {
+    const raw = new Map(rows.map(row => [String(row._id), row]));
+    const supports = node => supportsGuard(node._id ? raw.get(String(node._id)) : node);
+    return { supportsGuard: supports, destState, guardAvailable, effectiveMode, enabled,
+        observation: node => enabled ? getRealityGuardObservation(raw.get(String(node._id))) : undefined,
+        showingStatus: node => enabled && node.active === true && supports(node)
+            && effectiveMode(node.xray?.realityGuard?.mode) === 'notify' && guardAvailable(destState(node.xray)),
+        status: observation => observation?.status ?? 'not_checked',
+        statusText(guard, t) {
+            switch (this.status(guard)) {
+                case 'not_checked': return t('nodes.realityGuardNotChecked');
+                case 'ok': return t('nodes.realityGuardStatusOk');
+                case 'dead': return t('nodes.realityGuardStatusDead');
+                case 'failing': return t('nodes.realityGuardStatusFailing').replace('{n}', guard.failCount || 0).replace('{max}', 3);
+                default: return t('nodes.realityGuardStatusUnknown');
+            }
+        },
+    };
+}
+
+function withoutGuard(xray) {
+    if (!xray) return xray;
+    const { realityGuard, ...runtime } = xray;
+    return runtime;
+}
 
 /**
  * Parse virtual-node form fields and apply them to nodeData.
@@ -173,14 +215,16 @@ router.get('/', async (req, res) => {
 router.get('/nodes', async (req, res) => {
     try {
         const CascadeLink = require('../../models/cascadeLinkModel');
-        const [nodes, groups, linksCount, settings] = await Promise.all([
-            HyNode.find().populate('groups', 'name color').sort({ rankingCoefficient: 1, name: 1 }),
+        const [rawNodes, groups, linksCount, settings, guardEnabled] = await Promise.all([
+            HyNode.find().populate('groups', 'name color').sort({ rankingCoefficient: 1, name: 1 }).lean(),
             getActiveGroups(),
             CascadeLink.countDocuments({ active: true }),
             Settings.get(),
+            isGloballyEnabled(),
         ]);
 
         // Build a map of IP → protocol count so the template can show dual-protocol badges
+        const nodes = rawNodes.map(row => HyNode.hydrate(row, null, { hydratedPopulatedDocs: true }));
         const ipProtocolCount = {};
         nodes.forEach(n => { ipProtocolCount[n.ip] = (ipProtocolCount[n.ip] || 0) + 1; });
 
@@ -194,6 +238,7 @@ router.get('/nodes', async (req, res) => {
             loadBalancingEnabled: !!(settings?.loadBalancing?.enabled),
             panelDomain: config.PANEL_DOMAIN || '',
             buildNodeUiMeta,
+            realityGuardView: realityGuardView(guardEnabled, rawNodes),
         });
     } catch (error) {
         res.status(500).send('Error: ' + error.message);
@@ -205,9 +250,10 @@ router.get('/nodes', async (req, res) => {
 // and automatically switch to the opposite protocol type.
 router.get('/nodes/add', async (req, res) => {
     try {
-        const [groups, settings, candidateNodes] = await Promise.all([
+        const [groups, settings, guardEnabled, candidateNodes] = await Promise.all([
             getActiveGroups(),
             Settings.get(),
+            isGloballyEnabled(),
             // Source candidates for virtual nodes — exclude virtual to prevent cycles.
             HyNode.find({ type: { $ne: 'virtual' } })
                 .select('_id name flag type active')
@@ -230,6 +276,7 @@ router.get('/nodes/add', async (req, res) => {
                     country: source.country || '',
                     groups: source.groups || [],
                     type: source.type === 'xray' ? 'hysteria' : 'xray',
+                    cascadeRole: 'standalone',
                 };
             }
         }
@@ -245,6 +292,7 @@ router.get('/nodes/add', async (req, res) => {
             page: 'nodes',
             node: prefillNode,
             defaultRealityKeys,
+            realityGuardView: realityGuardView(guardEnabled),
             groups,
             candidateNodes,
             cascadeLinks: [],
@@ -304,7 +352,7 @@ router.patch('/nodes/reorder', async (req, res) => {
 });
 
 // POST /panel/nodes - Create node
-router.post('/nodes', async (req, res) => {
+router.post('/nodes', requireGuardFormCsrf, async (req, res) => {
     try {
         const { name } = req.body;
         const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
@@ -390,8 +438,11 @@ router.post('/nodes', async (req, res) => {
             ssh: resolvedSsh,
         };
 
+        const guardMode = guardFormMode(req.body);
         if (nodeType === 'xray') {
             nodeData.xray = parseXrayFormFields(req.body);
+            assertGuardModeAllowed(guardMode, { ...nodeData, xray: { security: 'reality', realityDest: 'www.google.com:443', ...nodeData.xray } });
+            if (guardMode !== undefined) nodeData.xray.realityGuard = { mode: guardMode };
             const xrayError = validateXrayFormFields(nodeData.xray, nodeData);
             if (xrayError) {
                 return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(xrayError)}`);
@@ -421,6 +472,9 @@ router.post('/nodes', async (req, res) => {
         await invalidateNodesCache();
         res.redirect(`/panel/nodes/${newNode._id}`);
     } catch (error) {
+        if (error instanceof RealityGuardInputError) {
+            return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(res.locals.t(error.localeKey))}`);
+        }
         logger.error(`[Panel] Create node error: ${error.message}`);
         res.redirect(`/panel/nodes/add?error=${encodeURIComponent(error.message)}`);
     }
@@ -546,15 +600,16 @@ router.get('/nodes/:id', async (req, res) => {
             $or: [{ portalNode: req.params.id }, { bridgeNode: req.params.id }],
         });
         if (rebuild) linkQuery.select(observationSelect).lean();
-        const [node, groups, cascadeLinks, settings, candidateNodes] = await Promise.all([
+        const [rawNode, groups, cascadeLinks, settings, guardEnabled, candidateNodes] = await Promise.all([
             HyNode.findById(req.params.id)
                 .select('+xray.manualKey')
-                .populate('groups', 'name color'),
+                .populate('groups', 'name color').lean(),
             getActiveGroups(),
             linkQuery.populate('portalNode', 'name ip flag')
               .populate('bridgeNode', 'name ip flag')
               .sort({ createdAt: -1 }),
             Settings.get(),
+            isGloballyEnabled(),
             // Source candidates for virtual nodes — exclude virtual nodes (anti-cycle)
             // and the current node itself.
             HyNode.find({ type: { $ne: 'virtual' }, _id: { $ne: req.params.id } })
@@ -563,9 +618,10 @@ router.get('/nodes/:id', async (req, res) => {
                 .lean(),
         ]);
 
-        if (!node) {
+        if (!rawNode) {
             return res.redirect('/panel/nodes');
         }
+        const node = HyNode.hydrate(rawNode, null, { hydratedPopulatedDocs: true });
 
         let nodeConfigPreview = '';
         if (node.type === 'hysteria') {
@@ -584,6 +640,7 @@ router.get('/nodes/:id', async (req, res) => {
         // PEM replaced by ***SET*** (or empty). Sibling fields are unchanged.
         const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
         renderNode.xray = sanitizeXrayForRender(node.xray);
+        renderNode.cascadeRole = rawNode.cascadeRole;
         const preview = canPreviewRemoval(req);
         if (preview || rebuild) res.set('Cache-Control', 'no-store');
         let reviewIdentity = false, unconfirmedRemoval = false, runtimeBlock = null;
@@ -623,6 +680,7 @@ router.get('/nodes/:id', async (req, res) => {
             title: `${res.locals.t('nodes.editNode')}: ${node.name}`,
             page: 'nodes',
             node: renderNode,
+            realityGuardView: realityGuardView(guardEnabled, [rawNode]),
             l2tpRoleBlock: roleBlock ? describeRoleError(roleBlock, res.locals.t).message : '',
             rebuildRemoval: removal,
             nodeConfigPreview,
@@ -639,14 +697,30 @@ router.get('/nodes/:id', async (req, res) => {
     }
 });
 
+router.post('/nodes/:id/reality-guard', requirePanelCsrf, async (req, res) => {
+    const path = `/panel/nodes/${req.params.id}`;
+    try {
+        const node = await saveGuardMode(req.params.id, guardFormMode(req.body));
+        return node ? res.redirect(path) : res.redirect('/panel/nodes');
+    } catch (error) {
+        if (error instanceof RealityGuardConflictError) return res.status(409).send(error.message);
+        const key = error instanceof RealityGuardInputError ? error.localeKey : 'nodes.realityGuardInvalidPolicy';
+        return res.redirect(`${path}?error=${encodeURIComponent(res.locals.t(key))}`);
+    }
+});
+
 // POST /panel/nodes/:id - Update node
-router.post('/nodes/:id', async (req, res) => {
+router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
     const nodeId = req.params.id;
     try {
+        const guardMode = guardFormMode(req.body);
         // Both private Xray fields must survive the full subdocument merge below.
         const result = await withNodeWrite(nodeId, async (options, current, verify) => {
-            const existingNode = current ?? await HyNode.findById(nodeId)
-                .select('+xray.manualKey +xray.accessLogs.ingestTokenEncrypted');
+            const read = () => HyNode.findById(nodeId).select('+xray.manualKey +xray.accessLogs.ingestTokenEncrypted');
+            // Capture the raw policy before constructing the form update. The
+            // hydrated document is still used for validation and the same save.
+            const raw = guardMode === undefined ? null : await read().lean();
+            const existingNode = guardMode === undefined ? current ?? await read() : raw && HyNode.hydrate(raw);
             if (!existingNode) {
                 return { redirect: '/panel/nodes' };
             }
@@ -693,9 +767,9 @@ router.post('/nodes/:id', async (req, res) => {
                     : '',
                 initScript: req.body.initScript || '',
             };
-            // In rebuild an omitted role must not overwrite a concurrent role edit.
-            if (cascadeRole !== undefined) updates.cascadeRole = cascadeRole;
-            else if (!isRebuildEnabled()) updates.cascadeRole = existingNode.cascadeRole || 'standalone';
+            // Older cards may have no stored role; an empty or omitted picker
+            // value is not a request to persist the hydrated default.
+            if (cascadeRole !== undefined && cascadeRole !== '') updates.cascadeRole = cascadeRole;
 
             if (req.body.statsSecret) {
                 updates.statsSecret = req.body.statsSecret;
@@ -712,6 +786,13 @@ router.post('/nodes/:id', async (req, res) => {
                     ...existingXray,
                     ...parsedXray,
                 };
+                if (guardMode !== undefined) {
+                    const role = guardRoleOnUpdate(raw.cascadeRole, updates.cascadeRole);
+                    assertGuardModeAllowed(guardMode, { ...updates, cascadeRole: role, role: raw.role });
+                }
+                if (guardMode !== undefined && guardMode !== effectiveMode(raw.xray?.realityGuard?.mode)) {
+                    updates.xray.realityGuard = { mode: guardMode };
+                }
                 const portForValidate = parseInt(req.body.port, 10) || existingNode.port;
                 const domainForValidate = String(req.body.domain || '').trim();
                 const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate, domain: domainForValidate });
@@ -762,10 +843,35 @@ router.post('/nodes/:id', async (req, res) => {
             await verify();
             // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
             const before = existingNode.toObject({ depopulate: true });
-            existingNode.set(updates);
+            // Diff guard leaves separately so a policy-only edit does not
+            // replace the Xray block or stale check/rotation state.
+            const saveFields = { ...updates };
+            if (saveFields.xray && before.xray) {
+                const { realityGuard: nextGuard, ...xray } = saveFields.xray;
+                delete saveFields.xray;
+                for (const [key, value] of Object.entries(xray)) {
+                    if (!isDeepStrictEqual(before.xray[key], value)) saveFields[`xray.${key}`] = value;
+                }
+                for (const [key, value] of Object.entries(nextGuard || {})) {
+                    if (!isDeepStrictEqual(before.xray.realityGuard?.[key], value)) {
+                        saveFields[`xray.realityGuard.${key}`] = value;
+                    }
+                }
+            }
+            existingNode.set(saveFields);
             // Mongoose hydrates schema defaults on older cards. An omitted role is not a role write.
             if (!Object.hasOwn(updates, 'cascadeRole')) existingNode.$ignore('cascadeRole');
-            await existingNode.save(options);
+            // Ordinary edits patch Xray leaves. If there was no Xray block,
+            // creation of the whole block must also fence an absent policy.
+            const bindGuard = guardMode !== undefined || Object.hasOwn(saveFields, 'xray');
+            if (bindGuard) existingNode.$where = { ...existingNode.$where, ...guardModeCAS(raw ?? {}) };
+            try {
+                await existingNode.save(options);
+            } catch (error) {
+                if (bindGuard && ['DocumentNotFoundError', 'VersionError'].includes(error.name)) return { stale: true };
+                throw error;
+            }
+            if (Object.hasOwn(saveFields, MODE_PATH) || before.active !== existingNode.active) forgetRealityGuardObservation(nodeId);
             const after = existingNode.toObject({ depopulate: true });
             if (before.ip && before.ip === after.ip && Object.keys(sshUpdates).length) {
                 await verify();
@@ -773,13 +879,15 @@ router.post('/nodes/:id', async (req, res) => {
             }
             return { before, after, updates };
         }, { select: '+xray.manualKey +xray.accessLogs.ingestTokenEncrypted' });
+        if (result?.stale) return res.status(409).send(new RealityGuardConflictError().message);
         if (!result || result.redirect) return res.redirect(result?.redirect ?? '/panel/nodes');
         const { before, after, updates } = result;
 
-        // The form always submits config defaults and replaces xray. Classify
-        // the actual schema-cast saved delta, not the presence of those fields.
+        // Classify the actual schema-cast delta; guard policy/state is not
+        // Xray core config and must not cause an otherwise unnecessary push.
         const changedUpdates = Object.fromEntries(Object.entries(updates).filter(([key]) => {
             const root = key.split('.')[0];
+            if (root === 'xray') return !isDeepStrictEqual(withoutGuard(before.xray), withoutGuard(after.xray));
             return !isDeepStrictEqual(before[root], after[root]);
         }));
         // Ordinary SSH pool entries are keyed by node ID, not endpoint. Retire
@@ -791,12 +899,17 @@ router.post('/nodes/:id', async (req, res) => {
         // unlike cosmetic edits they can change which runtime is managed.
         const lifecycleChanged = before.type !== after.type || before.cascadeRole !== after.cascadeRole
             || before.active !== after.active;
-        syncService.schedulePush(nodeId, lifecycleChanged ? updates : changedUpdates);
+        if (lifecycleChanged || Object.keys(changedUpdates).length) {
+            syncService.schedulePush(nodeId, lifecycleChanged ? updates : changedUpdates);
+        }
 
         // Invalidate active-nodes, subscription, and dashboard caches so ranking/config changes apply immediately
         await invalidateNodesCache();
         res.redirect('/panel/nodes');
     } catch (error) {
+        if (error instanceof RealityGuardInputError) {
+            return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(res.locals.t(error.localeKey))}`);
+        }
         const conflict = describeRoleError(error, res.locals.t);
         if (conflict) return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(conflict.message)}`);
         // Casting and persistence errors can contain the submitted values.

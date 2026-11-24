@@ -110,6 +110,7 @@ Object.assign(locals, {
     </div>
     <div class="card-body">
         <form id="nodeForm" method="POST" action="/panel/nodes<%= node?._id ? '/' + node._id : '' %>" class="form">
+            <% if (locals.csrfToken) { %><input type="hidden" name="_csrf" value="<%= csrfToken %>"><% } %>
             <input type="hidden" name="useTlsFiles" value="<%= node?.useTlsFiles ? '1' : '0' %>">
 
             <%- include('partials/node-form/basic') %>
@@ -187,6 +188,12 @@ Object.assign(locals, {
                 <a href="/panel/nodes" class="btn"><%= t('common.cancel') %></a>
             </div>
         </form>
+        <% if (node?._id && locals.realityGuardView?.supportsGuard(node)) { %>
+        <form method="POST" action="/panel/nodes/<%= node._id %>/reality-guard" class="form">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+            <%- include('partials/node-form/reality-guard') %>
+        </form>
+        <% } %>
         <% if (typeof rebuildRemoval !== 'undefined' && rebuildRemoval) { %>
         <details class="form-section" id="rebuild-l2tp-remove"<% if (rebuildRemoval.runtimeBlock) { %> open<% } %>>
             <summary><%= t('nodes.rebuildRemoveOpen') %></summary>

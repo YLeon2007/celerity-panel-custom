@@ -133,6 +133,23 @@
         </div>
     </div>
 
+    <div class="card" style="margin-top: 16px;">
+        <div class="card-header">
+            <h2><i class="ti ti-shield-check"></i> <%= t('settings.realityGuardTitle') %></h2>
+        </div>
+        <div class="card-body">
+            <form method="POST" action="/panel/settings/reality-guard">
+                <input type="hidden" name="_csrf" value="<%= locals.csrfToken || '' %>">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="realityGuard.enabled" <%= locals.realityGuardEnabled === true ? 'checked' : '' %>>
+                    <span><%= t('settings.realityGuardEnabled') %></span>
+                </label>
+                <p class="hint"><%= t('settings.realityGuardHint') %></p>
+                <button type="submit" class="btn btn-primary btn-sm"><i class="ti ti-device-floppy"></i> <%= t('common.save') %></button>
+            </form>
+        </div>
+    </div>
+
     <%
         const hp = locals.homepageInfo || { mode: 'nginx', hasCustom: false, customSize: 0, maxBytes: 262144 };
         const hpMaxKB = Math.round(hp.maxBytes / 1024);

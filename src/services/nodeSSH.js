@@ -123,9 +123,24 @@ class NodeSSH {
 
     /** One pinned admission, including time spent in the direct-slot queue. */
     async connectDirectOnce(timeout) {
+        return this.#connectDirectOnce(timeout, true);
+    }
+
+    // Health checks on ordinary cards use the existing node credential policy,
+    // but never use pooled credentials, retry authentication, or submit stdin.
+    async connectObserverOnce(allow) {
+        if (typeof allow !== 'function') throw new Error('SSH observation requires an admission check');
+        const exec = await this.#connectDirectOnce(10000, false, allow);
+        // The caller owns the command allowlist; do not expose stdin or a
+        // verifier override on this bounded observer channel.
+        return command => exec(command, { timeout: 8500, maxOutputBytes: 8192 });
+    }
+
+    async #connectDirectOnce(timeout, requirePin, allow) {
         sshPool.hostKeyOptions(this.node, this.#hostKeyOptions);
-        if (this.usePool || !this.#hostKeyOptions || this.#pendingDirect || this.directClient) {
-            throw new Error('SSH one-shot admission requires a fresh pinned direct client');
+        if (this.usePool || (requirePin && !this.#hostKeyOptions) || this.#pendingDirect || this.directClient) {
+            throw new Error(requirePin ? 'SSH one-shot admission requires a fresh pinned direct client'
+                : 'SSH one-shot observation requires a fresh direct client');
         }
         const controller = this.#pendingDirect = new AbortController();
         const { signal } = controller;
@@ -143,6 +158,8 @@ class NodeSSH {
         try {
             await NodeSSH._acquireDirectSlot(signal);
             acquired = true;
+            checkDeadline();
+            if (allow && await allow() !== true) throw new Error('SSH observation is no longer admitted');
             checkDeadline();
             opening = true;
             client = await this._openDirectClient(signal);

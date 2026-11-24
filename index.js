@@ -1121,6 +1121,23 @@ function setupWebSocketServer(server) {
 
 function setupCronJobs() {
     if (classicCronStopping) return;
+
+    // Join every admitted Reality Guard tick before closing its dependencies.
+    // The guard checks only explicitly configured nodes and owns no startup timer.
+    scheduleCronJob('*/15 * * * *', async () => {
+        try {
+            if (await require('./src/models/realityGuardPolicy').isGloballyEnabled() !== true) {
+                realityGuard?.pause();
+                return;
+            }
+            if (classicCronStopping) return;
+            realityGuard ??= require('./src/services/realityGuardService').createRuntimeRealityGuard();
+            await realityGuard.checkAll();
+        } catch {
+            realityGuard?.pause();
+            logger.warn('[Cron] Reality Guard unavailable');
+        }
+    });
     // Independent of the legacy minute health chain: node checks must not
     // delay reverse evidence or cause it to inherit any write/SSH fallback.
     if (rebuildEnabled) scheduleCronJob('15,45 * * * * *', async () => {
@@ -1339,6 +1356,7 @@ const classicCronRuns = new Set();
 let classicCronStopping = false;
 let classicCronStopPromise;
 let initialCheckTimer;
+let realityGuard;
 function runCronJob(work) {
     if (classicCronStopping) return Promise.resolve();
     const run = Promise.resolve().then(work);
@@ -1357,6 +1375,7 @@ function stopCronJobs() {
     clearTimeout(initialCheckTimer);
     // All stop attempts and admitted callbacks settle before a failure escapes.
     classicCronStopPromise = Promise.allSettled([
+        Promise.resolve().then(() => realityGuard?.drain()),
         ...[...classicCronTasks].map(task => Promise.resolve().then(() => task.stop())),
         ...classicCronRuns,
     ]).then(results => {

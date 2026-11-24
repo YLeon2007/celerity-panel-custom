@@ -187,6 +187,10 @@ const settingsSchema = new mongoose.Schema({
         },
     },
 
+    realityGuard: {
+        enabled: { type: Boolean }, // Absent means off; never seed this opt-in.
+    },
+
     homepage: {
         mode: { type: String, enum: ['nginx', 'custom'], default: 'nginx' },
         customHtml: { type: Buffer, default: null },

@@ -39,6 +39,7 @@ const EVENTS = {
     NODE_ONLINE: 'node.online',
     NODE_OFFLINE: 'node.offline',
     NODE_ERROR: 'node.error',
+    NODE_REALITY_DEST_DEAD: 'node.reality_dest_dead',
     SYNC_COMPLETED: 'sync.completed',
     /** Panel host free disk space dropped below the warning threshold. */
     HOST_DISK_LOW: 'host.disk_low',
@@ -75,12 +76,26 @@ async function getWebhookSettings() {
  * @param {string} event  - One of EVENTS.*
  * @param {object} data   - Event payload
  */
-async function send(event, data) {
+async function send(event, data, { beforeDispatch, signal } = {}) {
+    const realityEvent = event === EVENTS.NODE_REALITY_DEST_DEAD;
     let webhookSettings;
     try {
-        webhookSettings = await getWebhookSettings();
+        if (realityEvent) {
+            if (signal?.aborted || typeof beforeDispatch !== 'function') return;
+            // The generic settings getter can create the singleton or warm
+            // the cache. The monitor must only read this narrow projection.
+            const Settings = require('../models/settingsModel');
+            const row = await Settings.collection.collection?.findOne({ _id: 'settings' }, {
+                projection: { _id: 0, 'webhook.enabled': 1, 'webhook.url': 1, 'webhook.secret': 1, 'webhook.events': 1 },
+                readPreference: 'primary', readConcern: { level: 'majority' }, timeoutMS: WEBHOOK_TIMEOUT_MS,
+            });
+            webhookSettings = row?.webhook;
+            if (webhookSettings?.enabled !== true) return;
+        } else {
+            webhookSettings = await getWebhookSettings();
+        }
     } catch (err) {
-        logger.error(`[Webhook] Failed to load settings: ${err.message}`);
+        logger.error(realityEvent ? '[Webhook] Failed to load Reality Guard settings' : `[Webhook] Failed to load settings: ${err.message}`);
         return;
     }
 
@@ -101,8 +116,12 @@ async function send(event, data) {
     const signature = sign(secret, timestamp, payload);
 
     try {
+        if (realityEvent && (signal?.aborted || await beforeDispatch() !== true || signal?.aborted)) return;
         await axios.post(webhookSettings.url, payload, {
             timeout: WEBHOOK_TIMEOUT_MS,
+            ...(realityEvent ? { maxRedirects: 0, signal: signal
+                ? AbortSignal.any([signal, AbortSignal.timeout(WEBHOOK_TIMEOUT_MS)])
+                : AbortSignal.timeout(WEBHOOK_TIMEOUT_MS) } : {}),
             headers: {
                 'Content-Type': 'application/json',
                 'X-Webhook-Event': event,
@@ -111,10 +130,10 @@ async function send(event, data) {
                 'User-Agent': 'C3-Celerity-Webhook/1.0',
             },
         });
-        logger.debug(`[Webhook] Sent ${event} to ${webhookSettings.url}`);
+        logger.debug(realityEvent ? `[Webhook] Sent ${event}` : `[Webhook] Sent ${event} to ${webhookSettings.url}`);
     } catch (err) {
         const status = err.response?.status;
-        logger.warn(`[Webhook] Delivery failed for ${event}: ${status ? `HTTP ${status}` : err.message}`);
+        logger.warn(`[Webhook] Delivery failed for ${event}: ${status ? `HTTP ${status}` : realityEvent ? 'transport error' : err.message}`);
     }
 }
 
@@ -163,6 +182,10 @@ const _SAMPLE_BUILDERS = {
     'node.online': () => ({ nodeId: 'sample-node', name: 'Sample Node' }),
     'node.offline': () => ({ nodeId: 'sample-node', name: 'Sample Node', lastError: 'connection refused' }),
     'node.error': () => ({ nodeId: 'sample-node', name: 'Sample Node', error: 'sample error' }),
+    'node.reality_dest_dead': () => ({
+        nodeId: 'sample-node', name: 'Sample Node', dest: 'old.example.com:443',
+        reason: 'cert_expired', cause: 'notify_mode',
+    }),
     'sync.completed': () => ({ ok: 1, failed: 0, totalUsers: 1 }),
     'host.disk_low': () => ({ path: '/', freeBytes: 2147483648, totalBytes: 53687091200, usedPct: 96, level: 'low' }),
     'host.disk_critical': () => ({ path: '/', freeBytes: 1073741824, totalBytes: 53687091200, usedPct: 98, level: 'critical' }),

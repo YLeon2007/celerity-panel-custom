@@ -226,7 +226,7 @@
                         <div class="form-group">
                             <label for="xrayRealityDest"><%= t('nodes.xrayRealityDest') %></label>
                             <input type="text" id="xrayRealityDest" name="xray.realityDest"
-                                   value="<%= node?.xray?.realityDest || 'www.google.com:443' %>"
+                                   value="<%= node?.xray?.realityDest ?? 'www.google.com:443' %>"
                                    placeholder="www.google.com:443">
                             <small><%= t('nodes.xrayRealityDestHint') %></small>
                         </div>
@@ -278,6 +278,10 @@
                         <small><%= t('nodes.xraySpiderXHint') %></small>
                     </div>
                 </div>
+
+                <% if (locals.realityGuardView && !node?._id) { %>
+                    <%- include('reality-guard') %>
+                <% } %>
 
                 <%# SNI Scanner modal (Reality only) %>
                 <div id="sniScanModal" class="sni-modal-overlay" style="display:none" role="dialog" aria-modal="true">

@@ -541,6 +541,7 @@ function switchProto(proto) {
 
     [labelHysteria, labelXray, labelVirtual].forEach(l => l && l.classList.remove('active'));
 
+    updateRealityGuardUI();
     if (proto === 'virtual') {
         if (xraySection) xraySection.style.display = 'none';
         if (cascadeSection) cascadeSection.style.display = 'none';
@@ -624,6 +625,7 @@ function onCascadeRoleChange() {
     const role = document.getElementById('cascadeRole').value;
     const isBridge = role === 'bridge';
     const isPortal = role === 'portal';
+    updateRealityGuardUI();
 
     var bridgeHint = document.getElementById('cascadeBridgeHint');
     var portalHint = document.getElementById('cascadePortalHint');
@@ -683,7 +685,46 @@ function updateXrayFingerprintModeUI() {
     document.querySelectorAll('input.xray-fp-pool-cb').forEach(cb => { cb.disabled = mode !== 'pool'; });
 }
 
+<% if (locals.realityGuardView && !node?._id) { %>
+<%- include('../../../src/models/realityGuardDest.js') %>
+<% } %>
+function updateRealityGuardUI() {
+    const group = document.getElementById('xrayRealityGuardGroup');
+    if (!group || group.form?.id !== 'nodeForm') return;
+    const proto = document.querySelector('input[name="type"]:checked')?.value;
+    const role = document.getElementById('cascadeRole')?.value;
+    const custom = document.getElementById('useCustomConfig')?.checked;
+    const destinations = [];
+    if (document.getElementById('xraySecurity')?.value === 'reality') {
+        destinations.push(document.getElementById('xrayRealityDest')?.value);
+    }
+    for (const extra of document.querySelectorAll('#extraInboundsContainer .extra-inbound-card')) {
+        if (extra.querySelector('[name="xray_extra_security"]')?.value === 'reality') {
+            destinations.push(extra.querySelector('[name="xray_extra_realityDest"]')?.value);
+        }
+    }
+    const state = realityGuardDests.summarizeRealityGuardDests(destinations);
+    const visible = proto === 'xray' && ['standalone', 'portal'].includes(role) && !custom && state !== 'none';
+    const available = visible && (state === 'public' || state === 'mixed');
+    const modes = [...group.querySelectorAll('[name="xray.realityGuard.mode"]')];
+    if (!group.disabled) group.dataset.selectedMode = modes.find(input => input.checked)?.value || 'off';
+    const selected = modes.find(input => input.value === (available ? group.dataset.selectedMode : 'off'));
+    if (selected) selected.checked = true;
+    group.hidden = !visible;
+    group.disabled = !available;
+    for (const hint of group.querySelectorAll('[data-rg-hint]')) hint.hidden = !visible || hint.dataset.rgHint !== state;
+    for (const section of group.querySelectorAll('[data-rg-public]')) section.hidden = !available;
+}
+
+if (document.getElementById('xrayRealityGuardGroup')?.form?.id === 'nodeForm') {
+    document.getElementById('nodeForm').addEventListener('input', ({ target }) => {
+        if (target.id === 'xrayRealityDest' || target.name === 'xray_extra_realityDest') updateRealityGuardUI();
+    });
+    document.getElementById('useCustomConfig')?.addEventListener('change', updateRealityGuardUI);
+}
+
 function updateXraySecurityUI() {
+    updateRealityGuardUI();
     const security = document.getElementById('xraySecurity').value;
     document.getElementById('realityFields').style.display = security === 'reality' ? '' : 'none';
     document.getElementById('alpnGroup').style.display = security === 'tls' ? '' : 'none';
@@ -1847,6 +1888,7 @@ function applySniResult(domain) {
     const sniInput  = document.getElementById('xrayRealitySni');
     if (destInput) destInput.value = `${domain}:443`;
     if (sniInput)  sniInput.value  = domain;
+    updateRealityGuardUI();
     closeSniScanner();
 }
 </script>

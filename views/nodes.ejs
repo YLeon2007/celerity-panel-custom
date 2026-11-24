@@ -242,6 +242,16 @@ function nodeMetaFor(node) {
                                 <span class="node-info-badge badge-agent-<%= node.agentStatus || 'unknown' %>" title="<%= t('nodes.agentStatus') %>">
                                     <i class="ti ti-cpu"></i> <%= node.agentStatus || 'unknown' %>
                                 </span>
+                                <% const rgView = locals.realityGuardView;
+                                   if (rgView?.showingStatus(node)) {
+                                       const observation = rgView.observation(node) || {};
+                                       const status = rgView.status(observation), text = rgView.statusText(observation, t); %>
+                                <span class="node-info-badge<%= status === 'dead' ? ' badge-danger' : observation.warning ? ' badge-warning' : '' %>"
+                                      data-reality-guard-badge="<%= status || 'unknown' %>"
+                                      title="<%= t('nodes.realityGuardTitle') %><%= observation.warning ? ' — ' + t('nodes.realityGuardWarningTitle') : '' %>">
+                                    <i class="ti ti-shield-check"></i> <%= text %>
+                                </span>
+                                <% } %>
                             <% } else { %>
                                 <span class="text-muted">—</span>
                             <% } %>

@@ -3,6 +3,7 @@
  */
 
 const mongoose = require('mongoose');
+const { MODES } = require('./realityGuardPolicy');
 
 // API/MCP callers may send an empty field instead of omitting it. Defaults
 // apply only to undefined; hydration of saved nodes must remain unchanged.
@@ -252,6 +253,26 @@ const xrayConfigSchema = new mongoose.Schema({
         droppedEvents: { type: Number, default: 0 },
         lastReconcileAt: { type: Date, default: null },
     },
+
+    realityGuard: {
+        mode: { type: String, validate: function(value) {
+            // Keep an untouched legacy value; explicit writes must use a known mode.
+            return MODES.includes(value) || (this?.$isNew === false && !this.isModified('realityGuard.mode'));
+        } },
+        // Retain historical values without defaults or normalization; not editable policy.
+        reserveSnis: mongoose.Schema.Types.Mixed,
+        allowedCidr: mongoose.Schema.Types.Mixed,
+        status: { type: String, enum: ['ok', 'failing', 'dead', 'no_candidate'] },
+        failCount: Number,
+        lastCheckAt: Date,
+        lastError: { type: String, maxlength: 300 },
+        lastRotatedAt: mongoose.Schema.Types.Mixed,
+        lastRotatedFrom: mongoose.Schema.Types.Mixed,
+        lastRotatedTo: mongoose.Schema.Types.Mixed,
+        warning: { type: String, maxlength: 300 },
+        nodeConfirmedAt: Date,
+        reserveFailed: mongoose.Schema.Types.Mixed,
+    },
 }, { _id: false });
 
 // Virtual node: a balancer entry that aggregates other nodes into a single
@@ -399,6 +420,11 @@ hyNodeSchema.index({ status: 1 });
 // a non-empty sources list (manual) or a sourceGroup (group mode), and must not
 // reference another virtual node (anti-cycle).
 hyNodeSchema.pre('validate', function(next) {
+    // The embedded Xray schema also exists on other card types and may be cast
+    // before the parent's type is set. Seed only after the real type is known.
+    if (this.$isNew && this.type === 'xray' && this.xray && this.get('xray.realityGuard.mode') === undefined) {
+        this.set('xray.realityGuard.mode', 'off');
+    }
     if (this.type === 'virtual') {
         const v = this.virtual || {};
         if (v.selectMode === 'manual' && (!v.sources || v.sources.length === 0)) {

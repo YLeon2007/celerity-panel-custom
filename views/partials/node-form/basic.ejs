@@ -41,7 +41,7 @@
                 <% } %>
 
                 <%# Hidden input carries the actual value %>
-                <input type="hidden" id="cascadeRole" name="cascadeRole" value="<%= node?.cascadeRole || 'standalone' %>"<% if (roleBlocked) { %> data-l2tp-role-blocked="true"<% } %>>
+                <input type="hidden" id="cascadeRole" name="cascadeRole" value="<%= node?._id ? (node.cascadeRole ?? '') : (node?.cascadeRole || 'standalone') %>"<% if (roleBlocked) { %> data-l2tp-role-blocked="true"<% } %>>
 
                 <div class="cascade-role-picker">
                     <label class="role-card <%= (node?.cascadeRole || 'standalone') === 'standalone' ? 'active' : '' %>"

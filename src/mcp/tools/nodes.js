@@ -6,6 +6,9 @@
 const { z } = require('zod');
 const { Client } = require('ssh2');
 const HyNode = require('../../models/hyNodeModel');
+const { MODES, MODE_PATH, PROFILE_FIELDS, RealityGuardInputError, readPolicy, rejectDottedGuard,
+    RealityGuardConflictError, guardModeCAS, guardRoleOnUpdate, assertGuardModeAllowed,
+    saveGuardMode, withNewRealityGuard } = require('../../models/realityGuardPolicy');
 const HyUser = require('../../models/hyUserModel');
 const cache = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
@@ -87,6 +90,9 @@ const xrayConfigZ = z.object({
     agentToken: z.string().optional(),
     agentTls: z.boolean().optional(),
     extraInbounds: z.array(xrayExtraInboundZ).optional(),
+    realityGuard: z.object({
+        mode: z.enum(MODES).optional().describe('Off or notify only; automatic replacement is unavailable'),
+    }).optional(),
 });
 
 const manageNodeSchema = z.object({
@@ -307,6 +313,8 @@ async function manageNode(args, emit) {
     try {
         return await manageNodeAction(args, emit);
     } catch (error) {
+        if (error instanceof RealityGuardConflictError) return { error: error.message, code: 409 };
+        if (error instanceof RealityGuardInputError) return { error: error.message, code: 400 };
         const conflict = describeRoleError(error);
         if (!conflict) throw error;
         const { status, message, code, ...details } = conflict;
@@ -315,6 +323,8 @@ async function manageNode(args, emit) {
 }
 
 async function manageNodeAction(args, emit) {
+    rejectDottedGuard(args?.data, 'xray.realityGuard');
+    rejectDottedGuard(args?.data?.xray, 'realityGuard');
     const parsed = manageNodeSchema.parse(args);
     const { action, id, data = {}, setupOptions } = parsed;
 
@@ -412,7 +422,7 @@ async function manageNodeAction(args, emit) {
             if (data.rankingCoefficient !== undefined) nodeData.rankingCoefficient = data.rankingCoefficient;
             if (typeof data.comment === 'string') nodeData.comment = data.comment.trim().slice(0, 500);
 
-            const node = new HyNode(nodeData);
+            const node = new HyNode(withNewRealityGuard(nodeData, data.xray));
             await node.save();
             await invalidateNodesCache();
             logger.info(`[MCP] Created ${nodeType} node ${data.name} (${nodeType === 'virtual' ? 'virtual' : data.ip})`);
@@ -444,16 +454,22 @@ async function manageNodeAction(args, emit) {
 
             // Xray: partial update via dot-paths so unsent secrets (realityPrivateKey,
             // realityPublicKey, manualKey) are preserved instead of wiped by a full $set.
-            if (data.xray && typeof data.xray === 'object') {
-                for (const [k, v] of Object.entries(data.xray)) {
-                    updates[`xray.${k}`] = v;
-                }
+            const guard = data.xray?.realityGuard;
+            const { mode: guardMode } = readPolicy(guard);
+            for (const [key, value] of Object.entries(data.xray || {})) {
+                if (key !== 'realityGuard') updates[`xray.${key}`] = value;
+            }
+            if (guard && !Object.keys(updates).length) {
+                const node = await saveGuardMode(id, guardMode);
+                return node ? { success: true, node } : { error: `Node '${id}' not found`, code: 404 };
             }
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
             const result = await withNodeWrite(id, async (options, current, verify) => {
-                const existing = current ?? await HyNode.findById(id).select('type ip virtual').lean();
+                const bindGuard = guardMode !== undefined;
+                const projection = 'type ip virtual' + (bindGuard ? ` ${PROFILE_FIELDS} ${MODE_PATH}` : '');
+                const existing = (bindGuard ? null : current) ?? await HyNode.findById(id).select(projection).lean();
                 if (!existing) return { error: `Node '${id}' not found`, code: 404 };
 
                 const nextType = updates.type || existing.type;
@@ -473,10 +489,19 @@ async function manageNodeAction(args, emit) {
                     return { error: `Node type ${nextType} requires ip`, code: 400 };
                 }
 
+                if (guardMode !== undefined) {
+                    assertGuardModeAllowed(guardMode, { type: nextType, cascadeRole: guardRoleOnUpdate(existing.cascadeRole, updates.cascadeRole),
+                        role: existing.role, useCustomConfig: existing.useCustomConfig,
+                        xray: { ...existing.xray, ...data.xray } });
+                    updates[MODE_PATH] = guardMode;
+                }
                 await assertNodeEditAllowed(current, updates);
                 await verify();
-                const node = await HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true, ...options })
-                    .populate('groups', 'name color');
+                const write = bindGuard
+                    ? HyNode.findOneAndUpdate({ _id: id, ...guardModeCAS(existing) }, { $set: updates }, { new: true, ...options })
+                    : HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true, ...options });
+                const node = await write.populate('groups', 'name color');
+                if (bindGuard && !node) return { error: new RealityGuardConflictError().message, code: 409 };
                 return { node };
             });
             if (result?.error) return result;
@@ -487,7 +512,8 @@ async function manageNodeAction(args, emit) {
             // Auto-push config to the node if any config-affecting field changed.
             // Virtual nodes have no remote service to push to — schedulePush will
             // simply emit a no-op via the existing type guards in syncService.
-            getSyncService().schedulePush(node._id, updates);
+            const configUpdates = Object.fromEntries(Object.entries(updates).filter(([key]) => key !== MODE_PATH));
+            if (Object.keys(configUpdates).length) getSyncService().schedulePush(node._id, configUpdates);
 
             logger.info(`[MCP] Updated node ${node.name}`);
             return { success: true, node };

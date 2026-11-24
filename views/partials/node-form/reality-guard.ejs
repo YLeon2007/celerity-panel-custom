@@ -1,0 +1,46 @@
+<%
+    const view = locals.realityGuardView;
+    const guard = node?.xray?.realityGuard || {};
+    const mode = view.effectiveMode(guard.mode);
+    const state = view.destState(node?.xray || { security: 'reality', realityDest: 'www.google.com:443' });
+    const visible = node && view.supportsGuard(node) && state !== 'none';
+    const available = visible && view.guardAvailable(state);
+    const modeKeys = { off: 'Off', notify: 'Notify', auto: 'Auto' };
+    const fmt = d => new Date(d).toLocaleString(locals.dateLocale, { dateStyle: 'short', timeStyle: 'short' });
+    const reason = value => String(value || '').split('; ').filter(Boolean).map(entry => {
+        const offset = entry.lastIndexOf(': ');
+        const prefix = offset > 0 ? entry.slice(0, offset) + ' — ' : '';
+        const key = 'nodes.realityGuardReason.' + (offset > 0 ? entry.slice(offset + 2) : entry);
+        const translated = t(key);
+        return prefix + (translated !== key ? translated : t('nodes.realityGuardUnknownReason'));
+    }).join('; ');
+%>
+<fieldset id="xrayRealityGuardGroup" class="form-group" data-selected-mode="<%= mode %>" <%= available ? '' : 'disabled' %> <%= visible ? '' : 'hidden' %>>
+    <legend><i class="ti ti-shield-check"></i> <%= t('nodes.realityGuardTitle') %></legend>
+    <p class="hint" data-rg-hint="local" <%= visible && state === 'local' ? '' : 'hidden' %>><%= t('nodes.realityGuardLocal') %></p>
+    <p class="hint" data-rg-hint="unknown" <%= visible && state === 'unknown' ? '' : 'hidden' %>><%= t('nodes.realityGuardUnknownDest') %></p>
+    <p class="hint" data-rg-hint="mixed" <%= visible && state === 'mixed' ? '' : 'hidden' %>><%= t('nodes.realityGuardMixed') %></p>
+    <% if (!view.enabled) { %><p class="hint" data-rg-public <%= available ? '' : 'hidden' %>><%= t('nodes.realityGuardPaused') %></p><% } %>
+    <div class="form-group radio-group" role="radiogroup" aria-label="<%= t('nodes.realityGuardTitle') %>">
+        <% for (const value of Object.keys(modeKeys)) { %>
+        <label class="radio-row">
+            <input type="radio" name="xray.realityGuard.mode" value="<%= value %>" <%= value === 'auto' ? 'disabled' : (available ? mode : 'off') === value ? 'checked' : '' %>>
+            <span class="radio-label">
+                <strong><%= t('nodes.realityGuardMode' + modeKeys[value]) %></strong>
+                <small class="radio-hint"><%= t('nodes.realityGuardMode' + modeKeys[value] + 'Hint') %></small>
+            </span>
+        </label>
+        <% } %>
+    </div>
+    <% if (node?._id && view.showingStatus(node)) { const observation = view.observation(node) || {}; %>
+        <div class="form-group" data-rg-status>
+            <strong><%= t('nodes.realityGuardStatus') %>:</strong> <span><%= view.statusText(observation, t) %></span>
+            <% if (observation.lastCheckAt != null) { %><div><%= t('nodes.realityGuardLastCheck') %>: <%= fmt(observation.lastCheckAt) %></div><% } %>
+            <% if (observation.lastError) { %><div><%= t('nodes.realityGuardLastError') %>: <%= reason(observation.lastError) %></div><% } %>
+            <% if (observation.warning) { %><div><%= t('nodes.realityGuardWarningTitle') %>: <%= reason(observation.warning) %></div><% } %>
+        </div>
+    <% } %>
+    <% if (node?._id && available) { %>
+        <button type="submit" class="btn btn-sm"><%= t('common.save') %></button>
+    <% } %>
+</fieldset>

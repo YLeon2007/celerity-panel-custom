@@ -6,11 +6,14 @@ const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
+const { requirePanelCsrf } = require('./csrf');
 
 const HyUser = require('../../models/hyUserModel');
 const HyNode = require('../../models/hyNodeModel');
 const ServerGroup = require('../../models/serverGroupModel');
 const Settings = require('../../models/settingsModel');
+const { isGloballyEnabled } = require('../../models/realityGuardPolicy');
+const { clearRealityGuardObservations } = require('../../services/realityGuardService');
 const Admin = require('../../models/adminModel');
 const ApiKey = require('../../models/apiKeyModel');
 const cryptoService = require('../../services/cryptoService');
@@ -85,11 +88,12 @@ router.get('/settings', async (req, res) => {
             domain: config.PANEL_DOMAIN || null,
         };
 
-        const [admin, settingsDoc, apiKeys, migrationGroups] = await Promise.all([
+        const [admin, settingsDoc, apiKeys, migrationGroups, realityGuardEnabled] = await Promise.all([
             Admin.findOne({ username: req.session.adminUsername }),
             Settings.get(),
             ApiKey.listKeys(),
             ServerGroup.find({ active: true }).select('_id name color').lean(),
+            isGloballyEnabled(),
         ]);
 
         // Convert to plain object before mutating to avoid Mongoose change tracking
@@ -162,6 +166,7 @@ router.get('/settings', async (req, res) => {
             ssl,
             admin,
             settings,
+            realityGuardEnabled,
             apiKeys,
             validScopes: ApiKey.VALID_SCOPES,
             webhookEvents: Object.values(webhookService.EVENTS),
@@ -540,6 +545,21 @@ router.post('/settings', async (req, res) => {
     } catch (error) {
         logger.error('[Panel] Settings save error:', error.message);
         res.redirect('/panel/settings?error=' + encodeURIComponent(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`));
+    }
+});
+
+// Save this card independently of all other Security settings.
+router.post('/settings/reality-guard', requirePanelCsrf, async (req, res) => {
+    try {
+        const enabled = req.body['realityGuard.enabled'] === 'on';
+        await Settings.findByIdAndUpdate('settings', { $set: { 'realityGuard.enabled': enabled } },
+            { upsert: true, setDefaultsOnInsert: false, timestamps: false });
+        if (!enabled) clearRealityGuardObservations();
+        await invalidateSettingsCache();
+        return redirectSettingsSecurity(res, { message: res.locals.t('settings.saved') });
+    } catch {
+        logger.error('[Panel] Reality Guard settings save failed');
+        return redirectSettingsSecurity(res, { error: res.locals.t('settings.realityGuardSaveError') });
     }
 });
 
