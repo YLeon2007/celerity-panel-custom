@@ -6,7 +6,7 @@ const HyNode = require('../../models/hyNodeModel');
 const { MODE_PATH, effectiveMode, supportsGuard, destState, isGloballyEnabled,
     RealityGuardInputError, RealityGuardConflictError, guardModeCAS, guardRoleOnUpdate,
     readPolicy, assertGuardModeAllowed, saveGuardMode } = require('../../models/realityGuardPolicy');
-const { getRealityGuardObservation, forgetRealityGuardObservation } = require('../../services/realityGuardService');
+const { getRealityGuardObservation, forgetRealityGuardObservation, profileProjection } = require('../../services/realityGuardService');
 const HyUser = require('../../models/hyUserModel');
 const ServerGroup = require('../../models/serverGroupModel');
 const Settings = require('../../models/settingsModel');
@@ -66,9 +66,25 @@ const guardAvailable = state => state === 'public' || state === 'mixed';
 
 const guardFormMode = body => readPolicy(Object.hasOwn(body, MODE_PATH) ? { mode: body[MODE_PATH] } : undefined).mode;
 
+// The page's populated documents are the rendering contract. Only the
+// observation fingerprint needs pre-cast fields, and only for opted-in cards.
+async function readGuardProfiles(enabled, nodes) {
+    if (enabled !== true) return [];
+    const ids = nodes.filter(n => n.active === true && supportsGuard(n) && n.xray?.realityGuard?.mode === 'notify')
+        .map(n => n._id);
+    if (!ids.length) return [];
+    try {
+        return await HyNode.find({ _id: { $in: ids }, 'xray.realityGuard.mode': 'notify' })
+            .select({ ...profileProjection }).lean();
+    } catch {
+        // An unavailable observation is not a reason to hide the node list.
+        return [];
+    }
+}
+
 function realityGuardView(enabled, rows = []) {
     const raw = new Map(rows.map(row => [String(row._id), row]));
-    const supports = node => supportsGuard(node._id ? raw.get(String(node._id)) : node);
+    const supports = node => !node.$isDefault?.('cascadeRole') && supportsGuard(node);
     return { supportsGuard: supports, destState, guardAvailable, effectiveMode, enabled,
         observation: node => enabled ? getRealityGuardObservation(raw.get(String(node._id))) : undefined,
         showingStatus: node => enabled && node.active === true && supports(node)
@@ -215,16 +231,16 @@ router.get('/', async (req, res) => {
 router.get('/nodes', async (req, res) => {
     try {
         const CascadeLink = require('../../models/cascadeLinkModel');
-        const [rawNodes, groups, linksCount, settings, guardEnabled] = await Promise.all([
-            HyNode.find().populate('groups', 'name color').sort({ rankingCoefficient: 1, name: 1 }).lean(),
+        const [nodes, groups, linksCount, settings, guardEnabled] = await Promise.all([
+            HyNode.find().populate('groups', 'name color').sort({ rankingCoefficient: 1, name: 1 }),
             getActiveGroups(),
             CascadeLink.countDocuments({ active: true }),
             Settings.get(),
             isGloballyEnabled(),
         ]);
 
+        const rawNodes = await readGuardProfiles(guardEnabled, nodes);
         // Build a map of IP → protocol count so the template can show dual-protocol badges
-        const nodes = rawNodes.map(row => HyNode.hydrate(row, null, { hydratedPopulatedDocs: true }));
         const ipProtocolCount = {};
         nodes.forEach(n => { ipProtocolCount[n.ip] = (ipProtocolCount[n.ip] || 0) + 1; });
 
@@ -600,10 +616,10 @@ router.get('/nodes/:id', async (req, res) => {
             $or: [{ portalNode: req.params.id }, { bridgeNode: req.params.id }],
         });
         if (rebuild) linkQuery.select(observationSelect).lean();
-        const [rawNode, groups, cascadeLinks, settings, guardEnabled, candidateNodes] = await Promise.all([
+        const [node, groups, cascadeLinks, settings, guardEnabled, candidateNodes] = await Promise.all([
             HyNode.findById(req.params.id)
                 .select('+xray.manualKey')
-                .populate('groups', 'name color').lean(),
+                .populate('groups', 'name color'),
             getActiveGroups(),
             linkQuery.populate('portalNode', 'name ip flag')
               .populate('bridgeNode', 'name ip flag')
@@ -618,10 +634,10 @@ router.get('/nodes/:id', async (req, res) => {
                 .lean(),
         ]);
 
-        if (!rawNode) {
+        if (!node) {
             return res.redirect('/panel/nodes');
         }
-        const node = HyNode.hydrate(rawNode, null, { hydratedPopulatedDocs: true });
+        const guardRows = await readGuardProfiles(guardEnabled, [node]);
 
         let nodeConfigPreview = '';
         if (node.type === 'hysteria') {
@@ -640,7 +656,7 @@ router.get('/nodes/:id', async (req, res) => {
         // PEM replaced by ***SET*** (or empty). Sibling fields are unchanged.
         const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
         renderNode.xray = sanitizeXrayForRender(node.xray);
-        renderNode.cascadeRole = rawNode.cascadeRole;
+        if (node.$isDefault?.('cascadeRole')) delete renderNode.cascadeRole;
         const preview = canPreviewRemoval(req);
         if (preview || rebuild) res.set('Cache-Control', 'no-store');
         let reviewIdentity = false, unconfirmedRemoval = false, runtimeBlock = null;
@@ -680,7 +696,7 @@ router.get('/nodes/:id', async (req, res) => {
             title: `${res.locals.t('nodes.editNode')}: ${node.name}`,
             page: 'nodes',
             node: renderNode,
-            realityGuardView: realityGuardView(guardEnabled, [rawNode]),
+            realityGuardView: realityGuardView(guardEnabled, guardRows),
             l2tpRoleBlock: roleBlock ? describeRoleError(roleBlock, res.locals.t).message : '',
             rebuildRemoval: removal,
             nodeConfigPreview,

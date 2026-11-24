@@ -124,6 +124,7 @@ function matches(doc, filter) {
             return isDeepStrictEqual(get(doc, field.slice(1)), $literal);
         }
         const actual = get(doc, key);
+        if (value?.$in) return value.$in.some(v => String(actual) === String(v));
         if (value?.$exists !== undefined) return (actual !== undefined) === value.$exists;
         if (value?.$elemMatch) return actual?.some(row => matches(row, value.$elemMatch));
         if (value?.$ne !== undefined) return String(actual) !== String(value.$ne);
@@ -135,6 +136,16 @@ function project(row, projection = {}) {
     if (Object.values(projection).includes(1)) {
         const obj = { _id: row._id };
         for (const [key, value] of Object.entries(projection)) {
+            const prefix = 'xray.extraInbounds.';
+            if (value === 1 && key.startsWith(prefix) && Array.isArray(row.xray?.extraInbounds)) {
+                obj.xray ??= {};
+                const extras = obj.xray.extraInbounds ??= row.xray.extraInbounds.map(() => ({}));
+                const field = key.slice(prefix.length);
+                row.xray.extraInbounds.forEach((extra, i) => {
+                    if (field in extra) extras[i][field] = extra[field];
+                });
+                continue;
+            }
             if (value === 1 && get(row, key) !== undefined) set(obj, key, get(row, key));
         }
         return bson(obj);
@@ -234,6 +245,51 @@ function translated(html, lang, key) { assert.ok(html.includes(t(lang, key)), ke
 const put = data => request('/api/nodes/' + id, { method: 'PUT', data });
 const mcpUpdate = data => mcp.manageNode({ action: 'update', id: String(id), data });
 const policy = mode => ({ xray: { realityGuard: { mode } } });
+
+test('list and edit keep populated documents and only read Guard profiles when enabled', async ctx => {
+    const Group = require('../../models/serverGroupModel');
+    const group = { _id: new mongoose.Types.ObjectId(), name: 'Fixture group', color: '#123456' };
+    reset({ ...legacy, _id: id, active: true, groups: [group._id],
+        xray: { security: 'reality', realityDest: publicDest, realityGuard: { mode: 'notify' } } });
+    ctx.mock.method(Group.collection.collection, 'find', async () => ({ toArray: async () => [bson(group)] }));
+    const calls = [], rendered = [];
+    const exec = HyNode.Query.prototype.exec, render = app.response.render;
+    ctx.mock.method(HyNode.Query.prototype, 'exec', async function(...args) {
+        const result = await exec.apply(this, args);
+        calls.push({ result, filter: this.getFilter(), projection: this.projection(), lean: !!this.mongooseOptions().lean });
+        return result;
+    });
+    ctx.mock.method(app.response, 'render', function(view, locals, ...rest) {
+        rendered.push(locals);
+        return render.call(this, view, locals, ...rest);
+    });
+    for (const enabled of [false, true, false]) {
+        settingsRows[0].realityGuard = { enabled };
+        for (const list of [true, false]) {
+            calls.length = rendered.length = 0;
+            assert.equal((await request(list ? '/panel/nodes' : nodePath)).code, 200);
+            // List has one inventory read; edit also fetches virtual source candidates.
+            assert.equal(calls.length, (list ? 1 : 2) + Number(enabled));
+            const primary = calls.find(q => !q.lean);
+            const doc = list ? primary?.result[0] : primary?.result;
+            assert.ok(doc instanceof HyNode && doc.groups[0] instanceof Group);
+            assert.equal(doc.groups[0].get('name'), group.name);
+            if (list) assert.equal(rendered[0].nodes[0], doc);
+            else {
+                assert.equal(Object.getPrototypeOf(rendered[0].node), Object.prototype);
+                assert.equal(rendered[0].node.groups[0].name, group.name);
+            }
+            const profiles = calls.filter(q => q.filter['xray.realityGuard.mode'] === 'notify');
+            assert.equal(profiles.length, Number(enabled));
+            if (enabled) {
+                assert.ok(profiles[0].lean);
+                assert.deepEqual(profiles[0].filter._id.$in.map(String), [String(id)]);
+                assert.equal(profiles[0].projection['xray.realityDest'], 1);
+            }
+        }
+    }
+    assert.deepEqual(writes, []);
+});
 
 test('ordinary non-Xray cards round-trip without persisting any guard defaults', async () => {
     for (const type of [undefined, 'hysteria', 'virtual', 'xray']) {

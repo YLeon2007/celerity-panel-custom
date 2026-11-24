@@ -426,6 +426,6 @@ function createRuntimeRealityGuard() {
     });
 }
 
-module.exports = { createRealityGuard, createRuntimeRealityGuard, collectRealityTargets,
+module.exports = { createRealityGuard, createRuntimeRealityGuard, collectRealityTargets, profileProjection,
     parseDest, tlsHandshake, nodeCheckCommand, classifyNodeCheck,
     getRealityGuardObservation, clearRealityGuardObservations, forgetRealityGuardObservation };
