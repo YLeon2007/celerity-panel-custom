@@ -33,7 +33,6 @@ const https = require('https');
 const { performance } = require('node:perf_hooks');
 const config = require('../../config');
 const webhook = require('./webhookService');
-const { extractXrayOnlineUserIds } = require('../utils/userClientStats');
 const nodeSetup = require('./nodeSetup');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 const {
@@ -46,6 +45,7 @@ const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
 
 // Mark node offline after this many consecutive health check failures (1 check/min)
 const HEALTH_FAILURE_THRESHOLD = 3;
+const XRAY_TRAFFIC_ONLINE_WINDOW_MS = 90_000;
 
 // Fields whose change requires regenerating the runtime config on the node.
 // Anything not listed here (name, groups, flag, rankingCoefficient, ssh.*, ...)
@@ -239,9 +239,9 @@ class SyncService {
     constructor() {
         this.isSyncing = false;
         this.lastSyncTime = null;
-        this.xrayUserStatsSnapshots = new Map();
         this.xrayNodeOnlineUsers = new Map();
-        this.xrayNodeUserLastActive = new Map();
+        this.xrayTrafficLastActive = new Map();
+        this.xrayOnlinePublication = Promise.resolve();
     }
 
     /**
@@ -439,8 +439,7 @@ class SyncService {
         }
         if (previous && (status === 'offline' || status === 'unknown')) {
             const key = String(node._id);
-            this.xrayUserStatsSnapshots.delete(key);
-            this.xrayNodeUserLastActive.delete(key);
+            this.xrayTrafficLastActive.delete(key);
             // Reject in-flight online samples taken before confirmed demotion.
             this.xrayNodeOnlineUsers.set(key, { ids: [], observedAt: performance.now() });
         }
@@ -1004,61 +1003,27 @@ class SyncService {
                 return { onlineUserIds: [], nodeKey, ok: false };
             }
 
-            let agentOnlineUserIds = [];
-            let agentOnlineAvailable = false;
-            try {
-                const onlineResponse = await this._agentRequest(node, 'GET', '/online');
-                agentOnlineUserIds = extractAgentOnlineUserIds(onlineResponse.data || {});
-                agentOnlineAvailable = true;
-            } catch (_) {
-                logger.debug(`[Agent Online] ${node.name}: /online unavailable, falling back to traffic deltas`);
-            }
-            const now = new Date();
-            const snapshotKey = nodeKey;
-            const previousUsers = this.xrayUserStatsSnapshots.get(snapshotKey) || {};
-            const trafficActiveUserIds = extractXrayOnlineUserIds(users, {
-                previousUsersStats: previousUsers,
-                requireTrafficChange: true,
-            });
-            const activeUserIds = agentOnlineAvailable
-                ? agentOnlineUserIds
-                : trafficActiveUserIds;
-            this.xrayUserStatsSnapshots.set(snapshotKey, users);
-
-            let onlineWindowUserIds;
-            if (agentOnlineAvailable) {
-                // /online already applies the agent-side 45s timeout. Do not add
-                // another panel-side grace window, otherwise disconnect becomes
-                // ~90s+ stale.
-                onlineWindowUserIds = agentOnlineUserIds.map(String);
-                this.xrayNodeUserLastActive.set(snapshotKey, new Map(onlineWindowUserIds.map(userId => [userId, now.getTime()])));
-            } else {
-                const activityWindowMs = 90 * 1000;
-                const nodeLastActive = this.xrayNodeUserLastActive.get(snapshotKey) || new Map();
-                activeUserIds.forEach(userId => nodeLastActive.set(String(userId), now.getTime()));
-                for (const [userId, lastActiveAt] of nodeLastActive.entries()) {
-                    if (now.getTime() - lastActiveAt > activityWindowMs) nodeLastActive.delete(userId);
+            // /stats resets the Xray counters on every read (as in upstream).
+            // A positive value is already a delta for this poll, even if it is
+            // smaller than the previous interval or the user is newly seen.
+            const trafficLastActive = this.xrayTrafficLastActive.get(nodeKey) || new Map();
+            for (const [userId, traffic] of Object.entries(users)) {
+                if (userId && (traffic?.tx > 0 || traffic?.rx > 0) && observedAt > (trafficLastActive.get(userId) ?? -Infinity)) {
+                    trafficLastActive.set(userId, observedAt);
                 }
-                this.xrayNodeUserLastActive.set(snapshotKey, nodeLastActive);
-                onlineWindowUserIds = [...nodeLastActive.keys()];
             }
+            if (trafficLastActive.size) this.xrayTrafficLastActive.set(nodeKey, trafficLastActive);
 
-            await this.#storeXrayCounters(node, users, nodeTx, nodeRx, now);
-
-            // Online = users with explicit live/growing traffic observed recently.
-            // cc-agent traffic events can be sparse/unstable between polls, so keep
-            // a short per-node activity window to avoid flicker while still clearing
-            // disconnected clients quickly.
-            const activeUsers = onlineWindowUserIds.length;
-            const { matchedCount } = await HyNode.updateOne({ _id: node._id, active: true, status: 'online' }, {
-                $set: { onlineUsers: activeUsers },
-            });
-            if (!matchedCount) return { onlineUserIds: [], nodeKey, ok: false };
-
-            if (nodeTx > 0 || nodeRx > 0 || activeUsers > 0) {
-                logger.info(`[Agent Stats] ${node.name}: ${activeUsers} online, node ↑${(nodeTx / 1024 / 1024).toFixed(1)}MB ↓${(nodeRx / 1024 / 1024).toFixed(1)}MB`);
+            try {
+                await this.#pollXrayAgentOnline(node);
+            } catch (_) {
+                logger.debug(`[Agent Online] ${node.name}: /online unavailable, using recent traffic`);
             }
-            return { onlineUserIds: onlineWindowUserIds, nodeKey: snapshotKey, observedAt, ok: true };
+            await this.#storeXrayCounters(node, users, nodeTx, nodeRx, new Date());
+            if (nodeTx > 0 || nodeRx > 0) {
+                logger.info(`[Agent Stats] ${node.name}: node ↑${(nodeTx / 1024 / 1024).toFixed(1)}MB ↓${(nodeRx / 1024 / 1024).toFixed(1)}MB`);
+            }
+            return { nodeKey, ok: true };
         } catch (_) {
             logger.error(`[Agent Stats] ${node.name} collection failed`);
             return { onlineUserIds: [], nodeKey, ok: false };
@@ -1469,50 +1434,71 @@ class SyncService {
         }
     }
 
-    /**
-     * Collect log-derived online state from Xray agents only.
-     * This is intentionally separate from /stats traffic accounting so the UI
-     * lamp is not delayed by slower node traffic polls or gRPC stats resets.
-     */
+    async #pollXrayAgentOnline(node) {
+        const key = node._id?.toString?.() || node.id || node.name;
+        const observedAt = performance.now();
+        const response = await this._agentRequest(node, 'GET', '/online');
+        if (this.xrayNodeOnlineUsers.get(key)?.observedAt > observedAt) return;
+        // A successful empty reply clears log evidence. A refused request does
+        // not refresh it, and traffic never extends the agent's own idle window.
+        this.xrayNodeOnlineUsers.set(key, { ids: extractAgentOnlineUserIds(response.data || {}), observedAt });
+    }
+
+    /** Refresh log evidence without another resetting /stats read. */
     async collectXrayAgentOnlineStates() {
         const nodes = await HyNode.find({ type: 'xray', active: true, status: 'online', 'xray.agentToken': { $exists: true, $ne: '' } });
-        const activeXrayNodeKeys = new Set(nodes.map(node => node._id?.toString?.() || node.id || node.name));
         const CONCURRENCY = 8;
-
         for (let i = 0; i < nodes.length; i += CONCURRENCY) {
-            const batch = nodes.slice(i, i + CONCURRENCY);
-            const results = await Promise.allSettled(batch.map(async (node) => {
-                const observedAt = performance.now();
-                const response = await this._agentRequest(node, 'GET', '/online');
-                return {
-                    ok: true,
-                    nodeKey: node._id?.toString?.() || node.id || node.name,
-                    onlineUserIds: extractAgentOnlineUserIds(response.data || {}),
-                    observedAt,
-                };
-            }));
-            this.#recordOnlineSamples(results);
+            await Promise.allSettled(nodes.slice(i, i + CONCURRENCY).map(node => this.#pollXrayAgentOnline(node)));
         }
-
-        await this.#publishOnlineSamples(activeXrayNodeKeys, 10);
+        await this.#publishOnlineSamples(10);
     }
 
-    #recordOnlineSamples(results) {
+    #publishOnlineSamples(ttl) {
+        // The fast /online job and slower stats job can overlap. Serialize only
+        // publication, so a slow count write cannot leave Redis with an older set.
+        const publish = this.xrayOnlinePublication.catch(() => {}).then(() => this.#writeOnlineSamples(ttl));
+        this.xrayOnlinePublication = publish;
+        return publish;
+    }
+
+    async #writeOnlineSamples(ttl) {
+        const filter = { type: 'xray', active: true, status: 'online', 'xray.agentToken': { $exists: true, $ne: '' } };
+        const nodes = await HyNode.find(filter).select('onlineUsers').lean();
+        const keys = new Set(nodes.map(node => String(node._id)));
+        const now = performance.now();
+        const { contributions } = mergeNodeOnlineContributions(this.xrayNodeOnlineUsers, keys, now);
+        this.xrayNodeOnlineUsers = contributions;
+        for (const key of this.xrayTrafficLastActive.keys()) {
+            if (!keys.has(key)) this.xrayTrafficLastActive.delete(key);
+        }
+
+        const results = await Promise.allSettled(nodes.map(async node => {
+            const key = String(node._id);
+            const ids = new Set(contributions.get(key)?.ids);
+            const lastActive = this.xrayTrafficLastActive.get(key);
+            if (lastActive) {
+                for (const [userId, stamp] of lastActive) {
+                    if (now - stamp >= XRAY_TRAFFIC_ONLINE_WINDOW_MS) lastActive.delete(userId);
+                    else ids.add(userId);
+                }
+                if (!lastActive.size) this.xrayTrafficLastActive.delete(key);
+            }
+            if (node.onlineUsers !== ids.size) {
+                const { matchedCount } = await HyNode.updateOne({ _id: node._id, ...filter }, { $set: { onlineUsers: ids.size } });
+                if (!matchedCount) return [];
+            }
+            return ids;
+        }));
+        const userIds = new Set();
         for (const result of results) {
-            if (result.status !== 'fulfilled') continue;
-            const sample = result.value;
-            if (sample?.ok !== true || !sample.nodeKey || !Array.isArray(sample.onlineUserIds)
-                || !Number.isFinite(sample.observedAt)) continue;
-            const previous = this.xrayNodeOnlineUsers.get(sample.nodeKey);
-            if (previous && previous.observedAt > sample.observedAt) continue;
-            this.xrayNodeOnlineUsers.set(sample.nodeKey, { ids: sample.onlineUserIds, observedAt: sample.observedAt });
+            if (result.status === 'fulfilled') {
+                for (const id of result.value) userIds.add(id);
+            } else {
+                logger.warn('[Agent Online] Failed to persist a node online count');
+            }
         }
-    }
-
-    async #publishOnlineSamples(activeXrayNodeKeys, ttl) {
-        const merged = mergeNodeOnlineContributions(this.xrayNodeOnlineUsers, activeXrayNodeKeys, performance.now());
-        this.xrayNodeOnlineUsers = merged.contributions;
-        await cache.setXrayOnlineUsers([...merged.userIds], ttl);
+        await cache.setXrayOnlineUsers([...userIds], ttl);
     }
 
     /**
@@ -1520,24 +1506,20 @@ class SyncService {
      */
     async collectAllStats() {
         const nodes = await HyNode.find({ active: true });
-        const activeXrayNodeKeys = new Set(nodes
-            .filter(node => node.type === 'xray' && node.status === 'online')
-            .map(node => node._id?.toString?.() || node.id || node.name));
         
         // Parallel processing with concurrency limit
         const CONCURRENCY = 5;
         for (let i = 0; i < nodes.length; i += CONCURRENCY) {
             const batch = nodes.slice(i, i + CONCURRENCY);
-            const results = await Promise.allSettled(
+            await Promise.allSettled(
                 batch.flatMap(node => [
                     this.collectTrafficStats(node),
                     ...(node.type === 'xray' ? [] : [this.getOnlineUsers(node)])
                 ])
             );
-            this.#recordOnlineSamples(results);
         }
 
-        await this.#publishOnlineSamples(activeXrayNodeKeys, Math.max(45, cache.ttl.ONLINE_SESSIONS || 10));
+        await this.#publishOnlineSamples(Math.max(45, cache.ttl.ONLINE_SESSIONS || 10));
         
         // Update last stats collection time
         this.lastSyncTime = new Date();

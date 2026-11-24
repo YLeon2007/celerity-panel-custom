@@ -8,9 +8,11 @@ const { test, after } = require('node:test');
 
 const express = require('express');
 const HyNode = require('../../models/hyNodeModel');
+const HyUser = require('../../models/hyUserModel');
 const NodeSSH = require('../nodeSSH');
 const sync = require('../syncService');
 const cache = require('../cacheService');
+const statsService = require('../statsService');
 const webhook = require('../webhookService');
 const nodes = require('../../routes/nodes');
 const requireAuth = require('../../middleware/auth');
@@ -34,8 +36,8 @@ async function listen(t, listener) {
     return server.address().port;
 }
 
-async function fixture(t, { status = 'online', agent = true, ssh = false } = {}) {
-    const wire = { health: 'offline', requests: [], stats: ZERO_STATS, online: {}, holdInfo: null, healthObserved: null };
+async function fixture(t, { status = 'online', agent = true, ssh = false, readOnlineCache = false } = {}) {
+    const wire = { health: 'offline', requests: [], stats: ZERO_STATS, online: {}, holdOnline: null, holdInfo: null, healthObserved: null };
     const port = await listen(t, async (req, res) => {
         wire.requests.push(`${req.method} ${req.url}`);
         const authorized = req.headers.authorization === `Bearer ${TOKEN}`;
@@ -54,8 +56,14 @@ async function fixture(t, { status = 'online', agent = true, ssh = false } = {})
             else result = { xray_status: wire.health };
             wire.healthObserved?.(result?.xray_status);
         } else if (req.url === '/stats') result = wire.stats;
-        else if (req.url === '/online') result = { users: wire.online };
-        else if (req.url === '/sync') result = { added: 0, removed: 0, errors: 0, total: 0 };
+        else if (req.url === '/online') {
+            const online = wire.online;
+            const hold = wire.holdOnline;
+            wire.holdOnline = null;
+            if (hold) await hold();
+            if (online === null) code = 404;
+            else result = { users: online };
+        } else if (req.url === '/sync') result = { added: 0, removed: 0, errors: 0, total: 0 };
         else if (req.url === '/restart') result = { status: 'ok' };
         else code = 404;
         res.writeHead(code, { 'content-type': 'application/json' });
@@ -121,7 +129,19 @@ async function fixture(t, { status = 'online', agent = true, ssh = false } = {})
         t.mock.method(cache, key, async () => { invalidations.push(key); });
     }
     const published = [];
-    t.mock.method(cache, 'setXrayOnlineUsers', async ids => { published.push(ids); });
+    if (readOnlineCache) {
+        // Keep both cache methods and serialization real, with a private Redis driver fixture.
+        const kv = new Map();
+        const redis = cache.redis;
+        cache.redis = {
+            async setex(key, ttl, value) { kv.set(key, value); },
+            async get(key) { return kv.get(key) ?? null; },
+        };
+        t.after(() => { cache.redis = redis; });
+        t.mock.method(cache, 'isConnected', () => true);
+    } else {
+        t.mock.method(cache, 'setXrayOnlineUsers', async ids => { published.push(ids); });
+    }
     const events = [];
     t.mock.method(webhook, 'emit', (...args) => events.push(args));
     const read = () => HyNode.findById(stored._id).lean();
@@ -147,6 +167,83 @@ async function mountedApi(t, f) {
         return { status: res.status, body: res.headers.get('content-type')?.includes('json') ? JSON.parse(text) : null };
     };
 }
+
+test('both Xray polling jobs publish the same online users to hynodes and the cache', async t => {
+    async function setup(t) {
+        const f = await fixture(t, { readOnlineCache: true });
+        const started = performance.now();
+        let elapsed = 0;
+        t.mock.method(performance, 'now', () => started + elapsed);
+        t.mock.method(HyUser, 'bulkWrite', async operations => ({ modifiedCount: operations.length }));
+        t.mock.method(HyUser, 'aggregate', async () => []);
+        t.mock.method(sync, 'enforceTrafficLimit', async () => {});
+        return {
+            wire: f.wire,
+            async poll(method, at, expected) {
+                elapsed = at;
+                const firstRequest = f.wire.requests.length;
+                await sync[method]();
+                assert.deepEqual(Object.keys(await cache.getXrayOnlineUsers()).sort(), [...expected].sort(), `${method} at ${at}ms: cache IDs`);
+                assert.equal((await f.read()).onlineUsers, expected.length, `${method} at ${at}ms: persisted onlineUsers`);
+                assert.equal((await statsService.collectSnapshot()).online, expected.length, `${method} at ${at}ms: chart/dashboard count`);
+                const requests = f.wire.requests.slice(firstRequest);
+                assert.deepEqual(requests, method === 'collectAllStats' ? ['GET /stats', 'GET /online'] : ['GET /online']);
+            },
+        };
+    }
+    await t.test('empty /online, reset counters and 90s expiry without another traffic poll', async t => {
+        const { wire, poll } = await setup(t);
+        wire.stats = { users: { stream: { tx: 100, rx: 5 } } };
+        await poll('collectAllStats', 0, ['stream']);
+        await poll('collectXrayAgentOnlineStates', 5_000, ['stream']);
+        // /stats resets on each GET: even less than the previous poll is new traffic.
+        wire.stats = { users: { stream: { tx: 1, rx: 0 } } };
+        await poll('collectAllStats', 30_000, ['stream']);
+        wire.stats = ZERO_STATS;
+        await poll('collectAllStats', 60_000, ['stream']);
+        await poll('collectXrayAgentOnlineStates', 119_999, ['stream']);
+        await poll('collectXrayAgentOnlineStates', 120_000, []);
+    });
+    await t.test('union is deduplicated and a successful empty /online clears log-only users immediately', async t => {
+        const { wire, poll } = await setup(t);
+        wire.online = { journal: { online: true }, shared: { online: true }, stale: { online: false } };
+        wire.stats = { users: { shared: { tx: 5 }, traffic: { rx: 7 }, idle: { tx: 0, rx: 0 } } };
+        await poll('collectAllStats', 0, ['journal', 'shared', 'traffic']);
+        await poll('collectXrayAgentOnlineStates', 5_000, ['journal', 'shared', 'traffic']);
+        wire.online = {};
+        await poll('collectXrayAgentOnlineStates', 10_000, ['shared', 'traffic']);
+    });
+    await t.test('unavailable /online preserves the traffic fallback; a refusal does not extend a prior log sample', async t => {
+        const { wire, poll } = await setup(t);
+        wire.online = { journal: { online: true } };
+        await poll('collectXrayAgentOnlineStates', 0, ['journal']);
+        wire.online = null;
+        wire.stats = { users: { stream: { tx: 1 } } };
+        await poll('collectAllStats', 30_000, ['journal', 'stream']);
+        wire.stats = ZERO_STATS;
+        await poll('collectXrayAgentOnlineStates', 45_000, ['stream']);
+        await poll('collectAllStats', 90_000, ['stream']);
+        await poll('collectAllStats', 120_000, []);
+    });
+    await t.test('an older in-flight /online reply cannot erase new log or traffic evidence', async t => {
+        const { wire, poll } = await setup(t);
+        let arrived, release;
+        const firstRequest = new Promise(resolve => { arrived = resolve; });
+        const reply = new Promise(resolve => { release = resolve; });
+        wire.holdOnline = async () => { arrived(); await reply; };
+        const olderPoll = sync.collectXrayAgentOnlineStates();
+        try {
+            await firstRequest;
+            wire.online = { journal: { online: true } };
+            wire.stats = { users: { stream: { tx: 1 } } };
+            await poll('collectAllStats', 5_000, ['journal', 'stream']);
+        } finally {
+            release();
+            await olderPoll;
+        }
+        assert.deepEqual(Object.keys(await cache.getXrayOnlineUsers()).sort(), ['journal', 'stream']);
+    });
+});
 
 test('periodic refresh demotes live cc-agent with dead Xray, then proves idle recovery', async t => {
     const f = await fixture(t);

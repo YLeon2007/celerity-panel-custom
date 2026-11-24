@@ -1148,8 +1148,8 @@ function setupCronJobs() {
             logger.warn('[Cron] Rebuild reverse observation sweep failed');
         }
     });
-    // Poll lightweight cc-agent /online every 5s. The agent itself applies the
-    // 45s no-event timeout, so this cron only mirrors node state into Redis for UI.
+    // Refresh log evidence every 5s without resetting traffic counters. Publish
+    // the union with recent traffic to both the node counts and the users cache.
     scheduleCronJob('*/5 * * * * *', async () => {
         try {
             await syncService.collectXrayAgentOnlineStates();
