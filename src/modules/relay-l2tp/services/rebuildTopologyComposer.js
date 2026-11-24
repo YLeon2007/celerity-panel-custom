@@ -149,24 +149,24 @@ function addLinkArtifacts(config, entry, projected) {
     }
 }
 
-function addSharedPolicy(config, tags, entry, graph) {
+function addPolicy(config, tags, { geoLinks, defaultLink }, graph, prefix) {
+    const rules = [];
     function add(suffix, outboundTag, selector) {
-        config.routing.rules.push({ type: 'field', ruleTag: `${REBUILD_POLICY_RULE_PREFIX}${suffix}`,
-            inboundTag: tags.slice(), outboundTag, ...selector });
+        const rule = { type: 'field', ruleTag: `${prefix}${suffix}`,
+            inboundTag: tags.slice(), outboundTag, ...selector };
+        config.routing.rules.push(rule);
+        rules.push(rule);
     }
-    // In an entirely closed component there is no reason to enable geo DNS
-    // resolution. If other exits exist, a dead geo edge blocks its matches.
-    if (entry.hasExit) {
-        for (const [index, link] of entry.geoLinks.entries()) {
-            const tag = graph.byNodeId.get(link.target).hasExit ? egressTag(link) : 'block';
-            if (link.domains.length) add(`geo-${index}-domain`, tag, { domain: link.domains });
-            if (link.geoip.length) {
-                add(`geo-${index}-ip`, tag, { ip: link.geoip });
-                config.routing.domainStrategy = 'IPOnDemand';
-            }
+    for (const [index, link] of geoLinks.entries()) {
+        const tag = graph.byNodeId.get(link.target).hasExit ? egressTag(link) : 'block';
+        if (link.domains.length) add(`geo-${index}-domain`, tag, { domain: link.domains });
+        if (link.geoip.length) {
+            add(`geo-${index}-ip`, tag, { ip: link.geoip });
+            config.routing.domainStrategy = 'IPOnDemand';
         }
     }
-    add('default', entry.defaultLink ? egressTag(entry.defaultLink) : 'block');
+    add('default', defaultLink ? egressTag(defaultLink) : 'block');
+    return rules;
 }
 
 function assertProfileOwnership(main, bridge) {
@@ -208,6 +208,7 @@ function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}
         const { config: main, tags, subscriberDenies } = mainProfile(entry, users.has(nodeId) ? users.get(nodeId) : [], options, bridgesWithClientInbound.has(nodeId));
         const bridge = blackholeProfile();
         const transit = entry.incoming.map(ingressTag);
+        let sharedPolicy = [];
         if (entry.isExit) {
             bridge.log = generator.buildXrayLogSection(entry.node);
             addLinkArtifacts(bridge, entry, projected);
@@ -227,14 +228,23 @@ function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}
                     if (inbound.sniffing?.enabled) inbound.sniffing.routeOnly = false;
                 }
             }
-            if (tags.length || transit.length) addSharedPolicy(main, [...tags, ...transit], entry, graph);
+            for (const incoming of entry.incoming) {
+                if (incoming.portalExit) addPolicy(main, [ingressTag(incoming)], incoming.portalExit, graph,
+                    `${REBUILD_POLICY_RULE_PREFIX}portal-${short(incoming)}-`);
+            }
+            // Keep the shared rules (including their transit tags) unchanged.
+            // In an entirely closed component omit geo DNS; otherwise a dead
+            // geo edge blocks its matches. PPP joins only these rule objects.
+            if (tags.length || transit.length) sharedPolicy = addPolicy(main, [...tags, ...transit], {
+                geoLinks: entry.hasExit ? entry.geoLinks : [], defaultLink: entry.defaultLink,
+            }, graph, REBUILD_POLICY_RULE_PREFIX);
         }
         const installed = followRelayStates.filter(state => rebuildId(state.node) === nodeId);
         if (installed.length) {
             requireRebuild(entry.role === 'relay' && installed.length === 1, 'REBUILD_L2TP_STATE_AMBIGUOUS');
             require('./l2tpFollowRelay').attachLocalFollowRelay({ nodeId, state: installed[0], main, bridge,
                 controlPlaneAddresses, carryDomain: entry.carryDomain,
-                policy: [...subscriberDenies, ...main.routing.rules.filter(rule => rule.ruleTag?.startsWith(REBUILD_POLICY_RULE_PREFIX))] });
+                policy: [...subscriberDenies, ...sharedPolicy] });
         }
         assertProfileOwnership(main, bridge);
         // These are complete generated profiles, not fragment merges. Their
@@ -246,4 +256,4 @@ function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}
     return profiles;
 }
 
-module.exports = { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX, egressTag };
+module.exports = { composeRebuildProfiles, REBUILD_POLICY_RULE_PREFIX, ingressTag, egressTag };

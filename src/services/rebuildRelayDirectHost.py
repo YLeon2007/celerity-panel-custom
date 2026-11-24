@@ -2672,6 +2672,53 @@ def follow_relay_guard(rule, scope):
     return selector, values
 
 
+def validate_portal_rules(current, rules, shared_scope, targets):
+    # Same narrow shape as the stock install validator. None of these rules
+    # may lose a scope or otherwise change during subtraction.
+    bad = 'CANDIDATE_INVALID'
+    seen = set()
+    pending = None
+    for rule in rules:
+        label = rule['ruleTag']
+        match = re.fullmatch(r'rebuild-policy-portal-([0-9a-f]{8})-(?:default|geo-(?:0|[1-9][0-9]*)-(ip|domain))', label)
+        need(match is not None, bad)
+        suffix, geo = match.groups()
+        scope, out = rule.get('inboundTag'), rule.get('outboundTag')
+        keys = {'type', 'ruleTag', 'inboundTag', 'outboundTag'}
+        if geo:
+            keys.add(geo)
+            values = rule.get(geo)
+            need(type(values) is list and values and all(type(v) is str and v for v in values), bad)
+        need(rule.get('type') == 'field' and set(rule) == keys and type(scope) is list and len(scope) == 1
+             and scope[0] in shared_scope and type(out) is str and not follow_relay_refs(rule), bad)
+
+        forward_tag, native_tag = 'fwd-hop-' + suffix, 'rebuild-rp-ingress-' + suffix
+        forward = next((i for i in current['inbounds'] if i['tag'] == forward_tag), None)
+        native = [o for o in current['outbounds'] if o.get('settings', {}).get('reverse', {}).get('tag') == native_tag]
+        if scope == [forward_tag] and forward is not None:
+            clients = forward.get('settings', {}).get('clients')
+            need(not native and forward.get('protocol') in ('vless', 'vmess') and type(clients) is list
+                 and len(clients) == 1 and type(clients[0]) is dict and set(clients[0]) == {'id'}
+                 and type(clients[0]['id']) is str and re.fullmatch(r'\S+', clients[0]['id']), bad)
+        else:
+            need(scope == [native_tag] and forward is None and all(i['tag'] != native_tag for i in current['inbounds'])
+                 and len(native) == 1 and native[0].get('protocol') == 'vless'
+                 and native[0]['tag'] == 'rebuild-rp-dial-' + suffix, bad)
+
+        kind = targets.get(out)
+        reverse = re.fullmatch(r'rebuild-rp-egress-([0-9a-f]{8})', out)
+        need((geo and out == 'block' and kind == 'blackhole')
+             or (kind in ('vless', 'vmess') and re.fullmatch(r'fwd-[0-9a-f]{8}', out)
+                 and 'reverse' not in next(o for o in current['outbounds'] if o['tag'] == out).get('settings', {}))
+             or (kind == 'native' and reverse and any(i['tag'] == 'rebuild-rp-conn-' + reverse[1]
+                 and i.get('protocol') == 'vless' and len(i.get('settings', {}).get('clients', [])) == 1
+                 and i['settings']['clients'][0].get('reverse', {}).get('tag') == out for i in current['inbounds'])), bad)
+        need(pending in (None, suffix) and label not in seen and f'rebuild-policy-portal-{suffix}-default' not in seen, bad)
+        seen.add(label)
+        pending = suffix if geo else None
+    need(pending is None, bad)
+
+
 def subtract_follow_relay(main, current, side, node_id, tproxy):
     # Inverse of attachLocalFollowRelay, against CURRENT, not the install
     # preimage. Recognize the two fixed listeners, two outbounds and precisely
@@ -2707,6 +2754,7 @@ def subtract_follow_relay(main, current, side, node_id, tproxy):
 
     guards = {ppp: [], socks: []}
     policy = {}
+    portal = []
     kept = []
     handoff = 0
     plain = {'type', 'inboundTag', 'outboundTag'}
@@ -2733,7 +2781,11 @@ def subtract_follow_relay(main, current, side, node_id, tproxy):
         need(scope == [] or strings(scope), bad)
         label = rule.get('ruleTag', '')
         need(type(label) is str, bad)
-        if scope == [ppp] and target == hop:
+        if label.startswith('rebuild-policy-portal-'):
+            need(not policy, bad)
+            portal.append(rule)
+            kept.append(rule)
+        elif scope == [ppp] and target == hop:
             need(set(rule) == plain and rule['type'] == 'field', bad)
             handoff += 1
         elif scope in ([ppp], [socks]) and target == block:
@@ -2761,6 +2813,11 @@ def subtract_follow_relay(main, current, side, node_id, tproxy):
             kept.append(rule)
     need(handoff == 1 and guards[ppp] == guards[socks] and [key for key, _ in guards[ppp]] in (['ip'], ['domain', 'ip'])
          and 'rebuild-policy-default' in policy and all(v == policy['rebuild-policy-default'] for v in policy.values()), bad)
+    if portal:
+        # Match the install suffix after removing the appended PPP handoff.
+        need(list(policy)[-1] == 'rebuild-policy-default'
+             and [rule.get('ruleTag') for rule in kept[-len(policy):]] == list(policy), bad)
+        validate_portal_rules(current, portal, policy['rebuild-policy-default'], targets)
     current['routing']['rules'] = kept
     # Also catch reserved tag references outside the routing rules, e.g.
     # dialerProxy, native reverse tags, or other inbounds with a PPP tag.

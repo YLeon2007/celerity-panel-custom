@@ -7,6 +7,7 @@
 
 const mongoose = require('mongoose');
 const { CASCADE_TRANSPORTS, KCP_HEADERS, KCP_NUMERIC_FIELDS, isKcpSecurity, sanitizeKcpInput } = require('../utils/cascadeTransport');
+const { normalizeRebuildExitNodeId } = require('../modules/relay-l2tp/domain/rebuildPortalExit');
 
 const lifecycleSchema = new mongoose.Schema({
     state: { type: String, enum: ['deleting'], required: true },
@@ -27,6 +28,23 @@ const reverseObservationSchema = new mongoose.Schema({
     generation: { type: String, match: /^[a-f0-9]{64}$/, required: true },
     observedAt: { type: Date, required: true },
     established: { type: Boolean, required: true },
+}, { _id: false, versionKey: false, strict: 'throw' });
+
+const rebuildExitSchema = new mongoose.Schema({
+    nodeId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'HyNode',
+        cast: value => new mongoose.Types.ObjectId(normalizeRebuildExitNodeId(value)),
+    },
+    relayGeo: {
+        type: Boolean,
+        default: true,
+        cast: value => {
+            if (typeof value !== 'boolean') throw new TypeError('relayGeo must be a boolean');
+            return value;
+        },
+        validate: value => value !== null,
+    },
 }, { _id: false, versionKey: false, strict: 'throw' });
 
 function hideRebuildSecrets(_doc, row) {
@@ -84,6 +102,8 @@ const cascadeLinkSchema = new mongoose.Schema({
     tunnelEncryption: { type: String, enum: ['vless-enc', 'none'] },
     // Rebuild-only SNI; Classic tunnel generation/CRUD do not consume it.
     rebuildTlsServerName: { type: String, default: undefined },
+    // Rebuild selects a node; the scoped graph resolves the current tunnel.
+    rebuildExit: { type: rebuildExitSchema, default: undefined, validate: value => value === null || value.nodeId !== undefined },
     tunnelTransport: {
         type: String, enum: CASCADE_TRANSPORTS, default: 'tcp',
         validate: {
@@ -147,6 +167,8 @@ const cascadeLinkSchema = new mongoose.Schema({
     rebuildDelete: { type: Boolean, default: undefined },
     // null = a newly created Rebuild draft; absent = legacy, not proof of a
     // never-applied draft. Only successful Apply readback writes a descriptor.
+    rebuildAppliedExit: { type: rebuildExitSchema, select: false, default: undefined,
+        validate: value => value === null || value?.nodeId != null },
     rebuildApplied: { type: appliedLinkSchema, select: false, default: undefined },
     // Display-only: a saved Rebuild edit not yet settled by Apply.
     rebuildDesiredEdited: { type: Boolean, select: false },
