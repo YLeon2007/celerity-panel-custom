@@ -46,8 +46,8 @@ function makeApp(previewFailure, deployFailure) {
     app.use((req, res, next) => {
         // Model the entry's CORS header and the already-resolved authentication state.
         res.set('Access-Control-Allow-Origin', 'https://cors.example.invalid');
-        if (req.headers.cookie === 'fixture=session') req.session = browser;
-        if (req.headers.cookie === 'fixture=api') req.apiKey = { scopes: ['nodes:read'] };
+        if (['fixture=session', 'fixture=both'].includes(req.headers.cookie)) req.session = browser;
+        if (['fixture=api', 'fixture=both'].includes(req.headers.cookie)) req.apiKey = { scopes: ['nodes:read'] };
         next();
     });
     app.use('/api/cascade', (req, res, next) => req.apiKey ? next() : auth(req, res, next),
@@ -282,6 +282,34 @@ test('rebuild token route is session-only, non-cacheable and not CORS-readable',
         assert.equal(denied.status, 403);
         assert.equal(await denied.text(), 'Forbidden');
     }
+});
+
+test('mounted rebuild token GET accepts literal null Origin only with exact same-origin metadata', async () => {
+    const app = makeApp();
+    for (const [site, status] of [[undefined, 403], ['same-site', 403], ['cross-site', 403],
+        ['none', 403], ['Same-Origin', 403], ['same-origin, same-origin', 403], ['same-origin', 200]]) {
+        const res = await app.request(refreshPath, { headers: {
+            cookie: 'fixture=session', origin: 'null', ...(site === undefined ? {} : { 'sec-fetch-site': site }),
+        } });
+        assert.equal(res.status, status, `Sec-Fetch-Site: ${site}`);
+        assert.equal(res.headers.get('cache-control'), 'no-store');
+        assert.equal(res.headers.get('access-control-allow-origin'), null);
+        if (status === 200) {
+            assert.deepEqual(await res.json(), { csrfRequired: true, csrfToken: app.stale });
+        } else {
+            assert.equal(await res.text(), 'Forbidden');
+        }
+    }
+    for (const [cookie, status] of [[undefined, 401], ['fixture=api', 403], ['fixture=both', 403]]) {
+        const res = await app.request(refreshPath, { headers: { cookie, origin: 'null', 'sec-fetch-site': 'same-origin' } });
+        assert.equal(res.status, status);
+        if (status === 403) {
+            assert.equal(res.headers.get('cache-control'), 'no-store');
+            assert.equal(res.headers.get('access-control-allow-origin'), null);
+            assert.equal(await res.text(), 'Forbidden');
+        }
+    }
+    assert.deepEqual(app.calls, []);
 });
 
 for (const [code, copy] of [['CSRF_AUTH_REQUIRED', /Sign in to the panel again/],

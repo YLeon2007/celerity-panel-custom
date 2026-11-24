@@ -143,6 +143,7 @@ test('requirePanelCsrf rejects a valid token sent from a cross-origin page', () 
         headers: {
             host: 'panel.example.test',
             origin: 'https://attacker.example.test',
+            'sec-fetch-site': 'same-origin',
         },
         session: { authenticated: true },
     };
@@ -200,6 +201,35 @@ test('requirePanelCsrf accepts a matching Origin, scheme, and Host', () => {
     assert.equal(nextCalls, 1);
     assert.equal(response.statusCode, null);
 });
+
+for (const [label, origin, fetchHeaders, code] of [
+    ['exact same-origin', 'null', { 'sec-fetch-site': 'same-origin' }, null],
+    ['missing metadata', 'null', {}, 'CSRF_ORIGIN_INVALID'],
+    ...['same-site', 'cross-site', 'none', 'Same-Origin', 'same-origin ', 'same-origin, same-origin', ['same-origin']]
+        .map(site => [JSON.stringify(site), 'null', { 'sec-fetch-site': site }, 'CSRF_ORIGIN_INVALID']),
+    ['noncanonical header key', 'null', { 'Sec-Fetch-Site': 'same-origin' }, 'CSRF_ORIGIN_INVALID'],
+    ['nonstring Origin value', null, { 'sec-fetch-site': 'same-origin' }, 'CSRF_ORIGIN_INVALID'],
+    ['uppercase Origin value', 'NULL', { 'sec-fetch-site': 'same-origin' }, 'CSRF_ORIGIN_INVALID'],
+    ['Origin with trailing space', 'null ', { 'sec-fetch-site': 'same-origin' }, 'CSRF_ORIGIN_INVALID'],
+    ['bad token', 'null', { 'sec-fetch-site': 'same-origin' }, 'CSRF_TOKEN_INVALID'],
+]) {
+    test(`requirePanelCsrf checks opaque Origin on an authenticated POST: ${label}`, () => {
+        const request = {
+            method: 'POST',
+            protocol: 'https',
+            headers: { host: 'panel.example.test', origin, ...fetchHeaders },
+            session: { authenticated: true },
+        };
+        const token = issuePanelCsrfToken(request);
+        request.headers['x-csrf-token'] = label === 'bad token' ? 'A'.repeat(token.length - 1) + '!' : token;
+        const response = createResponse();
+        let nextCalls = 0;
+        requirePanelCsrf(request, response, () => { nextCalls += 1; });
+        assert.equal(response.statusCode, code ? 403 : null);
+        assert.equal(response.body?.code ?? null, code);
+        assert.equal(nextCalls, code ? 0 : 1);
+    });
+}
 
 test('requirePanelCsrf rejects a token copied from another authenticated session', () => {
     const firstRequest = { session: { authenticated: true } };

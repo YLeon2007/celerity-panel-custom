@@ -34,6 +34,8 @@ function rejectCsrf(res, code) {
 function originMatchesHost(req) {
     const origin = req.headers?.origin;
     if (origin === undefined) return true;
+    // Some same-origin browser requests send an opaque Origin.
+    if (origin === 'null') return req.headers['sec-fetch-site'] === 'same-origin';
 
     const host = req.headers?.host;
     if (typeof origin !== 'string' || typeof host !== 'string') return false;
