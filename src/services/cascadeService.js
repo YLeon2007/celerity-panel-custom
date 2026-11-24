@@ -1654,7 +1654,8 @@ class CascadeService {
         const syncService = require('./syncService');
         const users = await syncService._getUsersForNode(portalNode);
 
-        const configStr = configGenerator.generateXrayConfigWithApi(portalNode, users);
+        const generationNode = await require('./vlessServerConfig').loadVlessServerKeys(portalNode);
+        const configStr = configGenerator.generateXrayConfigWithApi(generationNode, users);
         const config = JSON.parse(configStr);
 
         const excludeSet = new Set((opts.excludeLinkIds || []).map(String));

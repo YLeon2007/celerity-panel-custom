@@ -23,6 +23,8 @@ const { finishClassicConfigRouting } = require('./classicL2tpConfigComposition')
 const { resolveL2tpExecutionAuthorization } = require('../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
 const NodeSSH = require('./nodeSSH');
 const configGenerator = require('./configGenerator');
+const { versionError } = require('../utils/vlessEncryption');
+const { loadVlessServerKeys, redactVlessDiagnostics } = require('./vlessServerConfig');
 const cache = require('./cacheService');
 const { invalidateNodesCache, invalidateUserCache } = require('../utils/helpers');
 const logger = require('../utils/logger');
@@ -618,10 +620,7 @@ class SyncService {
         if (require('./rebuildMode').isRebuildEnabled()) {
             const { withNode } = require('./rebuildLocks');
             const { withNodeWrite, nodeWriteVerifier, assertRelaySetupAllowed } = require('./rebuildRelayRoleGuard');
-            const manages = async current => !!(current.cascadeRole && current.cascadeRole !== 'standalone'
-                || await require('../models/cascadeLinkModel').exists({
-                    $or: [{ portalNode: current._id }, { bridgeNode: current._id }], active: true,
-                }));
+            const { rebuildManagesClientConfig: manages } = require('./rebuildClientConfigOwnership');
             const sync = (current, topologyManaged) => this.#updateXrayNodeConfig(current, {
                 topologyManaged, allowedStatuses: undefined, fenced: true,
             });
@@ -698,14 +697,19 @@ class SyncService {
 
         const users = await this._getUsersForNode(node);
 
-        // Bail out early on cert-availability errors only when classic Sync
+        // Bail out early on config errors only when classic Sync
         // owns the config; topology-managed nodes still sync users via agent.
         let configContent;
         if (!topologyManaged) {
             try {
-                configContent = configGenerator.generateXrayConfigWithApi(node, users);
+                // xrayVersion is the last authenticated /info observation.
+                const incompatible = versionError(node.xray, node.xrayVersion);
+                if (incompatible) throw Object.assign(new Error(incompatible), { code: 'VLESS_ENCRYPTION_VERSION_UNSUPPORTED' });
+                const generationNode = await loadVlessServerKeys(node);
+                configContent = configGenerator.generateXrayConfigWithApi(generationNode, users);
             } catch (genErr) {
-                if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
+                if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE'
+                    || genErr.code === 'VLESS_ENCRYPTION_KEY_INVALID' || genErr.code === 'VLESS_ENCRYPTION_VERSION_UNSUPPORTED') {
                     logger.error(`[Xray Sync] Node ${node.name}: skipping push — ${genErr.message}`);
                     await HyNode.updateOne({ _id: node._id }, {
                         $set: {
@@ -807,7 +811,7 @@ class SyncService {
                 } catch (cascadeErr) {
                     // Never degrade an unknown baseline into a base-only push.
                     if (!allowedStatuses || fenced) throw cascadeErr;
-                    logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${cascadeErr.message}`);
+                    logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${redactVlessDiagnostics(cascadeErr.message)}`);
                 }
 
                 // L2TP relays: the regenerated base config has no L2TP-managed
@@ -885,7 +889,7 @@ class SyncService {
             } catch (error) {
                 if (error?.code?.startsWith('CLASSIC_APPLIED_')) throw error;
                 if (!allowedStatuses || fenced) return false;
-                logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${error.message}`);
+                logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${redactVlessDiagnostics(error.message)}`);
             } finally {
                 ssh.disconnect();
             }
@@ -911,10 +915,11 @@ class SyncService {
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via agent`);
             } catch (error) {
                 if (fenced) return false;
-                logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${error.message}`);
+                const detail = redactVlessDiagnostics(error.message);
+                logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${detail}`);
                 if (error.code === 'AGENT_HTTP_ERROR') {
                     await HyNode.updateOne({ _id: node._id }, {
-                        $set: { status: 'error', lastSync: new Date(), lastError: `Agent restart failed: ${error.message}`, healthFailures: 0 },
+                        $set: { status: 'error', lastSync: new Date(), lastError: `Agent restart failed: ${detail}`, healthFailures: 0 },
                     });
                     await invalidateNodesCache();
                     return false;
@@ -928,7 +933,7 @@ class SyncService {
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via SSH`);
             } catch (error) {
                 if (fenced) return false;
-                logger.warn(`[Xray Sync] Node ${node.name}: SSH restart failed: ${error.message}`);
+                logger.warn(`[Xray Sync] Node ${node.name}: SSH restart failed: ${redactVlessDiagnostics(error.message)}`);
             } finally {
                 ssh.disconnect();
             }
@@ -948,10 +953,11 @@ class SyncService {
                 logger.info(`[Xray Sync] Node ${node.name}: synced ${userPayload.length} users via agent`);
             } catch (error) {
                 if (fenced) return false;
-                logger.warn(`[Xray Sync] Node ${node.name}: agent sync failed: ${error.message}`);
+                const detail = redactVlessDiagnostics(error.message);
+                logger.warn(`[Xray Sync] Node ${node.name}: agent sync failed: ${detail}`);
                 if (topologyManaged || error.code === 'AGENT_HTTP_ERROR') {
                     await HyNode.updateOne({ _id: node._id }, {
-                        $set: { status: 'error', lastSync: new Date(), lastError: `Agent user sync failed: ${error.message}`, healthFailures: 0 },
+                        $set: { status: 'error', lastSync: new Date(), lastError: `Agent user sync failed: ${detail}`, healthFailures: 0 },
                     });
                     await invalidateNodesCache();
                     return false;

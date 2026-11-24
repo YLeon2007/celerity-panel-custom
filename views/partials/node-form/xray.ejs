@@ -210,7 +210,7 @@
                 </div>
 
                 <%# VLESS fallbacks[].dest — TCP+TLS only %>
-                <% var _fallbackVisible = (node?.xray?.transport === 'tcp' || !node?.xray?.transport) && node?.xray?.security === 'tls'; %>
+                <% var _fallbackVisible = (node?.xray?.transport === 'tcp' || !node?.xray?.transport) && node?.xray?.security === 'tls' && node?.xray?.vlessEncryption !== true; %>
                 <div class="form-group" id="xrayFallbackGroup" style="<%= _fallbackVisible ? '' : 'display:none' %>">
                     <label for="xrayFallbackDest"><%= t('nodes.xrayFallbackDestLabel') %></label>
                     <input type="text" id="xrayFallbackDest" name="xray.fallbackDest"
@@ -218,6 +218,13 @@
                            placeholder="<%= t('nodes.xrayFallbackDestPlaceholder') %>"
                            maxlength="253" autocomplete="off" spellcheck="false">
                     <small><%= t('nodes.xrayFallbackDestHint') %></small>
+                </div>
+
+                <div id="xrayVlessEncryption">
+                    <%- include('vless-encryption', { inbound: node?.xray || {}, isExtra: false, encryptionAvailable: node?.xrayEncryptionAvailable === true, t }) %>
+                    <% if (node?.xrayEncryptionRebuild) { %>
+                        <p class="hint"><%= t('nodes.xrayVlessEncRebuildScope') %></p>
+                    <% } %>
                 </div>
 
                 <%# Reality-specific fields %>
@@ -423,13 +430,13 @@
 
                     <div id="extraInboundsContainer">
                         <% (node?.xray?.extraInbounds || []).forEach(function(extra, idx) { %>
-                            <%- include('xray-extra-inbound', { extra: extra, idx: idx, t: t }) %>
+                            <%- include('xray-extra-inbound', { extra: extra, idx: idx, encryptionAvailable: node?.xrayEncryptionAvailable === true, t }) %>
                         <% }); %>
                     </div>
 
                     <%# Hidden template cloned client-side by addExtraInbound() %>
                     <template id="extraInboundTemplate">
-                        <%- include('xray-extra-inbound', { extra: {}, idx: 0, t: t }) %>
+                        <%- include('xray-extra-inbound', { extra: {}, idx: 0, encryptionAvailable: node?.xrayEncryptionAvailable === true, t }) %>
                     </template>
                 </div>
             </div>

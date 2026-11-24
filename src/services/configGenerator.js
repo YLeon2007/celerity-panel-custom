@@ -6,6 +6,7 @@ const yaml = require('yaml');
 const fs = require('fs');
 const path = require('path');
 const { composeXrayConfig } = require('../modules/relay-l2tp/services/xrayConfigComposer');
+const { buildServerDecryption } = require('../utils/vlessEncryption');
 
 // Descriptor-only generation must not load dotenv or open the panel's logs.
 const panelDomainFromConfig = () => require('../../config').PANEL_DOMAIN;
@@ -719,14 +720,15 @@ function buildXrayClients(users, inbound) {
  * main inbound and each item in `extraInbounds[]`.
  */
 function buildVlessInbound(inbound, users, node, options) {
+    const decryption = buildServerDecryption(inbound, options);
     const settings = {
         clients: buildXrayClients(users, inbound),
-        decryption: 'none',
+        decryption,
     };
 
-    // VLESS fallbacks: TCP+TLS only per Xray spec.
+    // Xray permits VLESS fallbacks only for TCP+TLS without VLESS Encryption.
     const fallbackDest = (inbound.fallbackDest || '').trim();
-    if (fallbackDest && inbound.transport === 'tcp' && inbound.security === 'tls') {
+    if (fallbackDest && decryption === 'none' && inbound.transport === 'tcp' && inbound.security === 'tls') {
         settings.fallbacks = [{ dest: fallbackDest }];
     }
 
@@ -751,6 +753,7 @@ function buildVlessInbound(inbound, users, node, options) {
  * @param {Array} users - Array of user documents (with xrayUuid)
  * @param {Object} [options] - Additional generation options
  * @param {Array<Object>} [options.fragments] - Canonical Xray config fragments
+ * @param {boolean} [options.redactSecrets] - Redact client-facing VLESS decryption keys
  * @returns {string} JSON string
  */
 function generateXrayConfig(node, users, options = {}) {
@@ -778,6 +781,12 @@ function generateXrayConfig(node, users, options = {}) {
         xhttpHost: xray.xhttpHost,
         xhttpMode: xray.xhttpMode,
         fallbackDest: xray.fallbackDest,
+        vlessEncryption: xray.vlessEncryption,
+        vlessEncryptionAuth: xray.vlessEncryptionAuth,
+        vlessEncryptionMode: xray.vlessEncryptionMode,
+        vlessEncryptionTicket: xray.vlessEncryptionTicket,
+        vlessEncryptionPrivateKey: xray.vlessEncryptionPrivateKey,
+        vlessEncryptionPublicKey: xray.vlessEncryptionPublicKey,
     };
 
     const extraInbounds = Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [];

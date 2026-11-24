@@ -26,7 +26,10 @@ const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers')
 const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
+const vless = require('../../utils/vlessEncryption');
+const editXraySelect = `+xray.manualKey +xray.accessLogs.ingestTokenEncrypted ${vless.PRIVATE_KEY_SELECT}`;
 const { isRebuildEnabled } = require('../../services/rebuildMode');
+const { assertRebuildVlessEditAllowed } = require('../../services/rebuildClientConfigOwnership');
 const { projectReverseHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
 const { relayRoleBlock, withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../../services/rebuildRelayRoleGuard');
 const { formatRelayCounts } = require('../../services/rebuildRelayCounts');
@@ -38,6 +41,11 @@ const { identityChanged } = require('./rebuildRelayAdmission');
 const {
     render,
     parseXrayFormFields,
+    clientEncryptionProfile,
+    hasEncryptionState,
+    settleVlessEncryption,
+    vlessEditCAS,
+    vlessEditConflict,
     validateXrayFormFields,
     ensureExtraInboundRealityKeys,
     resolveManualKeyPlaceholder,
@@ -459,7 +467,9 @@ router.post('/nodes', requireGuardFormCsrf, async (req, res) => {
             nodeData.xray = parseXrayFormFields(req.body);
             assertGuardModeAllowed(guardMode, { ...nodeData, xray: { security: 'reality', realityDest: 'www.google.com:443', ...nodeData.xray } });
             if (guardMode !== undefined) nodeData.xray.realityGuard = { mode: guardMode };
-            const xrayError = validateXrayFormFields(nodeData.xray, nodeData);
+            const xrayError = validateXrayFormFields(nodeData.xray, nodeData)
+                || await settleVlessEncryption(nodeData.xray, null, nodeData, undefined,
+                    vless.takeRegenerateIds(nodeData.xray), res.locals.t);
             if (xrayError) {
                 return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(xrayError)}`);
             }
@@ -656,6 +666,9 @@ router.get('/nodes/:id', async (req, res) => {
         // PEM replaced by ***SET*** (or empty). Sibling fields are unchanged.
         const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
         renderNode.xray = sanitizeXrayForRender(node.xray);
+        renderNode.xrayEncryptionRebuild = rebuild;
+        renderNode.xrayEncryptionAvailable = clientEncryptionProfile(renderNode) && !vless.versionError(
+            { vlessEncryption: true }, node.xrayVersion, node.name);
         if (node.$isDefault?.('cascadeRole')) delete renderNode.cascadeRole;
         const preview = canPreviewRemoval(req);
         if (preview || rebuild) res.set('Cache-Control', 'no-store');
@@ -732,7 +745,7 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
         const guardMode = guardFormMode(req.body);
         // Both private Xray fields must survive the full subdocument merge below.
         const result = await withNodeWrite(nodeId, async (options, current, verify) => {
-            const read = () => HyNode.findById(nodeId).select('+xray.manualKey +xray.accessLogs.ingestTokenEncrypted');
+            const read = () => HyNode.findById(nodeId).select(editXraySelect);
             // Capture the raw policy before constructing the form update. The
             // hydrated document is still used for validation and the same save.
             const raw = guardMode === undefined ? null : await read().lean();
@@ -744,6 +757,10 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
             const { name, cascadeRole } = req.body;
             const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
             const ip = req.body.ip || '';
+            if (nodeType !== 'xray' && vless.hasEnabledInbound(existingNode.xray)) {
+                const message = vless.message(res.locals.t, 'DisableBeforeTypeChange');
+                return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent(message)}` };
+            }
 
             if (!name) {
                 return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent('Name is required')}` };
@@ -811,10 +828,16 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
                 }
                 const portForValidate = parseInt(req.body.port, 10) || existingNode.port;
                 const domainForValidate = String(req.body.domain || '').trim();
-                const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate, domain: domainForValidate });
+                const profile = { ...updates, cascadeRole: updates.cascadeRole ?? existingNode.cascadeRole,
+                    role: existingNode.get('role'), name: existingNode.name };
+                const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate, domain: domainForValidate })
+                    || await settleVlessEncryption(updates.xray, existingXray, profile,
+                        ip === existingNode.ip && existingNode.type === 'xray' ? existingNode.xrayVersion : undefined,
+                        vless.takeRegenerateIds(updates.xray), res.locals.t);
                 if (xrayError) {
                     return { redirect: `/panel/nodes/${nodeId}?error=${encodeURIComponent(xrayError)}` };
                 }
+                await assertRebuildVlessEditAllowed(current, existingXray, updates.xray, profile);
                 ensureExtraInboundRealityKeys(updates.xray);
                 if ((req.body.cascadeRole || 'standalone') !== 'bridge' && !updates.xray.agentToken) {
                     updates.xray.agentToken = nodeSetup.generateAgentToken();
@@ -834,6 +857,9 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
                 Object.assign(updates, hyFields);
             }
 
+            if (existingNode.xrayVersion && (updates.ip !== existingNode.ip || updates.type !== existingNode.type)) {
+                updates.xrayVersion = '';
+            }
             const sshUpdates = {};
             if (req.body['ssh.port'] !== undefined) {
                 sshUpdates['ssh.port'] = parseInt(req.body['ssh.port'], 10) || 22;
@@ -880,11 +906,16 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
             // Ordinary edits patch Xray leaves. If there was no Xray block,
             // creation of the whole block must also fence an absent policy.
             const bindGuard = guardMode !== undefined || Object.hasOwn(saveFields, 'xray');
+            const bindEncryption = hasEncryptionState(before.xray) || hasEncryptionState(updates.xray);
+            if (bindEncryption) existingNode.$where = { ...existingNode.$where, ...vlessEditCAS(before) };
             if (bindGuard) existingNode.$where = { ...existingNode.$where, ...guardModeCAS(raw ?? {}) };
             try {
                 await existingNode.save(options);
             } catch (error) {
-                if (bindGuard && ['DocumentNotFoundError', 'VersionError'].includes(error.name)) return { stale: true };
+                if (['DocumentNotFoundError', 'VersionError'].includes(error.name)) {
+                    if (bindEncryption) return { staleEncryption: true };
+                    if (bindGuard) return { stale: true };
+                }
                 throw error;
             }
             if (Object.hasOwn(saveFields, MODE_PATH) || before.active !== existingNode.active) forgetRealityGuardObservation(nodeId);
@@ -894,8 +925,9 @@ router.post('/nodes/:id', requireGuardFormCsrf, async (req, res) => {
                 await HyNode.updateMany({ ip: before.ip, _id: { $ne: existingNode._id } }, { $set: sshUpdates }, options);
             }
             return { before, after, updates };
-        }, { select: '+xray.manualKey +xray.accessLogs.ingestTokenEncrypted' });
+        }, { select: editXraySelect });
         if (result?.stale) return res.status(409).send(new RealityGuardConflictError().message);
+        if (result?.staleEncryption) return res.status(409).send(vlessEditConflict(res.locals.t));
         if (!result || result.redirect) return res.redirect(result?.redirect ?? '/panel/nodes');
         const { before, after, updates } = result;
 
@@ -1155,17 +1187,26 @@ router.get('/nodes/:id/get-config', async (req, res) => {
             return res.status(400).json({ success: false, error: 'SSH данные не настроены' });
         }
         
-        const conn = await nodeSetup.connectSSH(node);
-        const configPath = node.type === 'xray'
-            ? '/usr/local/etc/xray/config.json'
-            : (node.paths?.config || '/etc/hysteria/config.yaml');
-        const result = await nodeSetup.execSSH(conn, `cat ${configPath}`);
-        conn.end();
-        
-        if (result.success) {
-            res.json({ success: true, config: result.output });
-        } else {
-            res.json({ success: false, error: result.error || 'Не удалось прочитать конфиг' });
+        const xray = node.type === 'xray';
+        if (xray) res.set('Cache-Control', 'no-store');
+        const failure = 'Не удалось прочитать конфиг';
+        try {
+            const conn = await nodeSetup.connectSSH(node);
+            const configPath = xray ? '/usr/local/etc/xray/config.json' : (node.paths?.config || '/etc/hysteria/config.yaml');
+            let result;
+            try { result = await nodeSetup.execSSH(conn, `cat ${configPath}`); }
+            finally { conn.end(); }
+            if (!result.success) return res.json({ success: false, error: (!xray && result.error) || failure });
+            if (!xray) return res.json({ success: true, config: result.output });
+            try {
+                const config = require('../../services/vlessServerConfig').redactXrayConfig(result.output);
+                return res.json({ success: true, config });
+            } catch {
+                // Malformed upstream data is not a displayable config. Parser errors can contain key material.
+                return res.status(502).json({ success: false, error: failure });
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, error: xray ? failure : error.message });
         }
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });

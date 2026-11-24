@@ -21,6 +21,7 @@ const {appliedLink}=require('./rebuildAppliedLink');
 const {isReverse,unverified}=require('./rebuildReverseLinkHealth');
 const {transactOnce,AcknowledgedCommitCleanupError}=require('./rebuildRelayInstallTransaction');
 const {createPrivateKey,createPublicKey,randomBytes}=require('node:crypto');
+const {PRIVATE_KEY_SELECT}=require('../utils/vlessEncryption');
 const fail=code=>Object.assign(new Error(code),{code});
 const networkErrors=new Set(['ECONNREFUSED','ECONNRESET','ETIMEDOUT','EHOSTUNREACH','ENETUNREACH','ENOTFOUND','EAI_AGAIN']);
 // A no-install retirement must not adopt or overwrite unexplained PPP or
@@ -266,7 +267,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         }),withNodes:(ids,fn)=>withNodes(ids,()=>usingTransports(transports,fn)),
             links:retire?observedLinks:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]},null,fullLinkRead).lean(),
             async build(ids,links,retirement){
-                const nodes=ids.length?await Node.find({_id:{$in:ids}}).select('+xray.manualKey').lean():[];
+                const nodes=ids.length?await Node.find({_id:{$in:ids}}).select(`+xray.manualKey ${PRIVATE_KEY_SELECT}`).lean():[];
                 if(nodes.length!==ids.length||nodes.some(n=>n.type!=='xray'||!n.active||n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
                 if(req.preview)for(const node of nodes)inventoryNames.set(String(node._id),node.name);
                 if(retire){

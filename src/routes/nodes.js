@@ -3,6 +3,7 @@
  */
 
 const express = require('express');
+const { isDeepStrictEqual } = require('node:util');
 const router = express.Router();
 const HyNode = require('../models/hyNodeModel');
 const { MODE_PATH, PROFILE_FIELDS, RealityGuardInputError, readXrayPolicy, rejectDottedGuard,
@@ -16,6 +17,11 @@ const { requireScope } = require('../middleware/auth');
 const { invalidateNodesCache } = require('../utils/helpers');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
+const vless = require('../utils/vlessEncryption');
+const { assertRebuildVlessEditAllowed } = require('../services/rebuildClientConfigOwnership');
+const { checkVlessEncryption, hasEncryptionState, sanitizeEncryptionInput, settleVlessEncryption,
+    vlessEditCAS, vlessEditConflict } = require('./panel/helpers');
+const { redactNode } = vless;
 const { isXrayBridge, setupXrayForRole } = require('../services/xrayNodeAutoSetup');
 const { withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../services/rebuildRelayRoleGuard');
 
@@ -102,12 +108,14 @@ async function setNodeActive(req, res, active) {
 
                 return reply(200, {
                     success: true,
-                    node: disabledNode,
+                    node: redactNode(disabledNode),
                     runtime,
                     ...(warning ? { warning } : {}),
                 });
             }
 
+            const encryptionError = checkVlessEncryption(node, node.xrayVersion);
+            if (encryptionError) return reply(400, { error: encryptionError });
             let runtime;
             try {
                 runtime = await startNodeRuntime(node);
@@ -137,7 +145,7 @@ async function setNodeActive(req, res, active) {
                 logger.warn(`[Nodes API] Enable node ${node.name} failed: ${errorMessage}`);
                 return reply(500, {
                     error: errorMessage,
-                    node: failedNode,
+                    node: redactNode(failedNode),
                     runtime,
                 });
             }
@@ -161,7 +169,7 @@ async function setNodeActive(req, res, active) {
 
             logger.info(`[Nodes API] Enabled node ${node.name}`);
 
-            return reply(200, { success: true, node: enabledNode, runtime });
+            return reply(200, { success: true, node: redactNode(enabledNode), runtime });
         }, { requireRemoval: true });
         return result ? res.status(result.status).json(result.body) : res.status(404).json({ error: 'Node not found' });
     } catch (error) {
@@ -187,7 +195,7 @@ router.get('/', requireScope('nodes:read'), async (req, res) => {
             .populate('groups', 'name color')
             .sort({ name: 1 });
         
-        res.json(nodes);
+        res.json(nodes.map(redactNode));
     } catch (error) {
         logger.error(`[Nodes API] List error: ${error.message}`);
         res.status(500).json({ error: error.message });
@@ -229,7 +237,7 @@ router.get('/:id', requireScope('nodes:read'), async (req, res) => {
         });
         
         res.json({
-            ...node.toObject(),
+            ...redactNode(node),
             userCount,
         });
     } catch (error) {
@@ -341,6 +349,11 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
         };
 
         if (nodeType === 'xray' && xray) {
+            const invalid = sanitizeEncryptionInput(xray, res.locals.t);
+            if (invalid) return res.status(400).json({ error: invalid });
+            const encryptionError = await settleVlessEncryption(xray, null, nodeData, undefined,
+                vless.takeRegenerateIds(xray), res.locals.t);
+            if (encryptionError) return res.status(400).json({ error: encryptionError });
             nodeData.xray = xray;
         }
 
@@ -377,7 +390,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 
         logger.info(`[Nodes API] Created ${nodeType} node ${name} (${nodeType === 'virtual' ? 'virtual' : ip})`);
 
-        res.status(201).json(node);
+        res.status(201).json(redactNode(node));
     } catch (error) {
         if (error instanceof RealityGuardInputError) return res.status(400).json({ error: error.message });
         logger.error(`[Nodes API] Create node error: ${error.message}`);
@@ -416,7 +429,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
 
         // A guard-only update is leaf-local. Other API Xray payloads retain
         // the existing replacement semantics, but cannot wipe guard state.
-        let guardMode;
+        let guardMode, encryptionOnly;
         const hasGuard = Object.hasOwn(updates.xray || {}, 'realityGuard');
         if (updates.xray !== undefined) {
             if (!updates.xray || typeof updates.xray !== 'object' || Array.isArray(updates.xray)) {
@@ -424,6 +437,10 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             }
             const { realityGuard, ...xray } = updates.xray;
             ({ mode: guardMode } = readXrayPolicy(updates.xray));
+            const names = Object.keys(xray);
+            encryptionOnly = names.length && names.every(key => key.split('.').some(part => part.startsWith('vlessEncryption')));
+            const invalid = sanitizeEncryptionInput(xray, res.locals.t);
+            if (invalid) return res.status(400).json({ error: invalid });
             if (realityGuard !== undefined && !Object.keys(xray).length) delete updates.xray;
             else updates.xray = xray;
         }
@@ -441,15 +458,17 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
 
         if (hasGuard && !Object.keys(updates).length) {
             const node = await saveGuardMode(req.params.id, guardMode);
-            return node ? res.json(node) : res.status(404).json({ error: 'Node not found' });
+            return node ? res.json(redactNode(node)) : res.status(404).json({ error: 'Node not found' });
         }
         // findByIdAndUpdate bypasses pre('validate') hooks, so enforce the
         // type-specific invariants against the resulting node explicitly.
         const result = await withNodeWrite(req.params.id, async (options, current, verify) => {
             const bindGuard = !!updates.xray || guardMode !== undefined;
-            const guardFields = updates.xray ? ' xray.realityGuard' : guardMode !== undefined ? ` ${MODE_PATH}` : '';
-            const projection = `type ip virtual${guardMode !== undefined ? ' ' + PROFILE_FIELDS : ''}${guardFields}`;
-            const existing = (bindGuard ? null : current) ?? await HyNode.findById(req.params.id).select(projection).lean();
+            const profileEdit = updates.xray || ['type', 'cascadeRole', 'active'].some(key => Object.hasOwn(updates, key));
+            const projection = profileEdit
+                ? `type ip virtual name cascadeRole role useCustomConfig updatedAt xrayVersion xray +xray.manualKey +xray.accessLogs.ingestTokenEncrypted ${vless.PRIVATE_KEY_SELECT}`
+                : `type ip virtual${guardMode !== undefined ? ` ${PROFILE_FIELDS} ${MODE_PATH}` : ''}`;
+            const existing = (bindGuard || profileEdit ? null : current) ?? await HyNode.findById(req.params.id).select(projection).lean();
             if (!existing) {
                 return null;
             }
@@ -471,6 +490,37 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                 return { invalid: `Node type ${nextType} requires ip` };
             }
 
+            const profile = { ...existing, type: nextType, cascadeRole: updates.cascadeRole ?? existing.cascadeRole };
+            const patch = updates.xray;
+            const encryptionEdit = !!patch && (hasEncryptionState(patch) || hasEncryptionState(existing.xray));
+            const bindEncryption = encryptionEdit || (profileEdit && hasEncryptionState(existing.xray));
+            if (patch) {
+                const ids = vless.takeRegenerateIds(patch);
+                // Keep legacy replacement semantics. Encryption edits are partial
+                // so adding/rotating a key does not reset the listener or TLS.
+                const next = encryptionEdit ? { ...existing.xray, ...patch } : patch;
+                if (Array.isArray(next.extraInbounds)) next.extraInbounds = next.extraInbounds.map(extra => ({ ...extra }));
+                const encryptionError = await settleVlessEncryption(next, existing.xray, profile,
+                    existing.type === 'xray' ? existing.xrayVersion : undefined, ids, res.locals.t);
+                if (encryptionError) return { invalid: encryptionError };
+                for (const key of ['manualKey', 'accessLogs']) {
+                    if (!Object.hasOwn(next, key) && existing.xray?.[key] !== undefined) next[key] = existing.xray[key];
+                }
+                if (Object.hasOwn(next, 'accessLogs') && existing.xray?.accessLogs?.ingestTokenEncrypted) {
+                    next.accessLogs = { ...next.accessLogs, ingestTokenEncrypted: existing.xray.accessLogs.ingestTokenEncrypted };
+                }
+                await assertRebuildVlessEditAllowed(current, existing.xray, next, profile);
+                if ((encryptionOnly && !encryptionEdit) || (current && encryptionEdit && isDeepStrictEqual(existing.xray, next))) {
+                    delete updates.xray;
+                } else updates.xray = next;
+            } else if (profileEdit && hasEncryptionState(existing.xray)) {
+                await assertRebuildVlessEditAllowed(current, existing.xray, existing.xray, profile);
+                const encryptionError = checkVlessEncryption(profile, existing.xrayVersion, res.locals.t);
+                if (encryptionError && (updates.active !== false || nextType !== existing.type || updates.cascadeRole !== undefined)) {
+                    return { invalid: encryptionError };
+                }
+            }
+            if (existing.xrayVersion && nextType !== existing.type) updates.xrayVersion = '';
             if (guardMode !== undefined) {
                 assertGuardModeAllowed(guardMode, { type: nextType, cascadeRole: guardRoleOnUpdate(existing.cascadeRole, updates.cascadeRole),
                     role: existing.role, useCustomConfig: existing.useCustomConfig, xray: updates.xray ?? existing.xray });
@@ -483,10 +533,16 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
 
             await assertNodeEditAllowed(current, updates, sshUpdates);
             await verify();
-            const write = bindGuard
-                ? HyNode.findOneAndUpdate({ _id: req.params.id, ...guardModeCAS(existing) }, { $set: updates }, { new: true, ...options })
+            const predicates = { ...(bindGuard ? guardModeCAS(existing) : {}), ...(bindEncryption ? vlessEditCAS(existing) : {}) };
+            if (!Object.keys(updates).length) {
+                const node = await HyNode.findById(req.params.id).select('-ssh.password -ssh.privateKey').populate('groups', 'name color');
+                return { node };
+            }
+            const write = bindGuard || bindEncryption
+                ? HyNode.findOneAndUpdate({ _id: req.params.id, ...predicates }, { $set: updates }, { new: true, ...options })
                 : HyNode.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, ...options });
             const node = await write.select('-ssh.password -ssh.privateKey').populate('groups', 'name color');
+            if (bindEncryption && !node) return { staleEncryption: true };
             if (bindGuard && !node) return { stale: true };
             // SSH is host-local. Never propagate a move at either address.
             if (existing.ip && existing.ip === node?.ip && Object.keys(sshUpdates).length) {
@@ -496,20 +552,23 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             return { node };
         });
         if (result?.stale) throw new RealityGuardConflictError();
+        if (result?.staleEncryption) return res.status(409).json({ error: vlessEditConflict(res.locals.t) });
         if (result?.invalid) return res.status(400).json({ error: result.invalid });
         const node = result?.node;
         if (!node) return res.status(404).json({ error: 'Node not found' });
 
         // Auto-push config to the node if any config-affecting field changed.
         const configUpdates = Object.fromEntries(Object.entries(updates).filter(([key]) => key !== MODE_PATH));
-        if (Object.keys(configUpdates).length) require('../services/syncService').schedulePush(node._id, configUpdates);
+        if (Object.keys(configUpdates).length) {
+            syncService.schedulePush(node._id, configUpdates);
+        }
 
         // Инвалидируем кэш
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Updated node ${node.name}`);
         
-        res.json(node);
+        res.json(redactNode(node));
     } catch (error) {
         if (sendNodeWriteConflict(res, error)) return;
         // Casting and persistence errors can contain the submitted values.
@@ -711,7 +770,7 @@ router.post('/:id/groups', requireScope('nodes:write'), async (req, res) => {
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Added groups for node ${node.name}`);
-        res.json(node);
+        res.json(redactNode(node));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -736,7 +795,7 @@ router.delete('/:id/groups/:groupId', requireScope('nodes:write'), async (req, r
         await invalidateNodesCache();
         
         logger.info(`[Nodes API] Removed group ${req.params.groupId} from node ${node.name}`);
-        res.json(node);
+        res.json(redactNode(node));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

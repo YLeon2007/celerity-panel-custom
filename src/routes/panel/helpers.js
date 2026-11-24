@@ -18,6 +18,7 @@ const config = require('../../../config');
 const logger = require('../../utils/logger');
 const classicSettings = require('../../classicSettings');
 const { parseDurationSeconds } = require('../../utils/helpers');
+const vless = require('../../utils/vlessEncryption');
 const { version: appVersion } = require('../../../package.json');
 
 // Compiled template cache (production only)
@@ -130,6 +131,112 @@ function _parseFingerprintPool(raw) {
     return out;
 }
 
+const VLESS_DEFAULTS = {
+    vlessEncryption: false,
+    vlessEncryptionAuth: 'x25519',
+    vlessEncryptionMode: 'native',
+    vlessEncryptionTicket: '600s',
+};
+
+const encryptionInbounds = xray => [xray, ...(Array.isArray(xray?.extraInbounds) ? xray.extraInbounds : [])];
+const hasEncryptionState = xray => encryptionInbounds(xray).some(inbound => inbound && (
+    Object.entries(VLESS_DEFAULTS).some(([key, fallback]) => inbound[key] != null && inbound[key] !== '' && inbound[key] !== fallback)
+    || inbound.vlessEncryptionPrivateKey || inbound.vlessEncryptionPublicKey || inbound.vlessEncryptionRegenerate === true
+));
+function clientEncryptionProfile(node) {
+    const role = typeof node.get === 'function' ? node.get('role') : node.role;
+    const cascadeRole = node.cascadeRole ?? 'standalone';
+    return node.type === 'xray' && !node.useCustomConfig && ['standalone', 'portal'].includes(cascadeRole)
+        && (role === undefined || role === cascadeRole);
+}
+
+function checkVlessEncryption(node, trustedVersion, translate) {
+    if (!encryptionInbounds(node.xray).some(inbound => inbound?.vlessEncryption === true)) return null;
+    if (!clientEncryptionProfile(node)) return vless.message(translate, 'ClientOnly');
+    return vless.versionError(node.xray, trustedVersion, node.name, translate);
+}
+
+// Sanitize before Mongoose can cast a submitted value or interpret a path.
+function sanitizeEncryptionInput(xray, translate) {
+    if (!xray || typeof xray !== 'object' || Array.isArray(xray)) return vless.message(translate, 'XrayObjectInvalid');
+    if (xray.extraInbounds !== undefined && (!Array.isArray(xray.extraInbounds)
+        || xray.extraInbounds.some(extra => !extra || typeof extra !== 'object' || Array.isArray(extra)))) {
+        return vless.message(translate, 'ExtraArrayInvalid');
+    }
+    for (const inbound of encryptionInbounds(xray)) {
+        if (!inbound || typeof inbound !== 'object') continue;
+        for (const key of Object.keys(inbound)) {
+            if ((key.includes('.') && key.includes('vlessEncryption'))
+                || key === 'vlessEncryptionPrivateKey' || key === 'vlessEncryptionPublicKey') delete inbound[key];
+            else if (key.startsWith('$') || key.includes('.')) return vless.message(translate, 'NestedFieldsRequired');
+        }
+        if (Object.hasOwn(inbound, 'vlessEncryption') && typeof inbound.vlessEncryption !== 'boolean') {
+            return vless.message(translate, 'BooleanRequired');
+        }
+    }
+    return null;
+}
+
+const vlessEditConflict = translate => vless.message(translate, 'EditConflict');
+// Combine with the existing Guard predicate, without changing its BSON or
+// the query/document type. Do not retry a stale rotate or use stale health.
+function vlessEditCAS(node) {
+    const filter = { updatedAt: node.updatedAt ?? { $exists: false }, type: node.type, ip: node.ip };
+    if (node.xrayVersion) filter.xrayVersion = node.xrayVersion;
+    return filter;
+}
+
+async function settleVlessEncryption(next, previous, profile, trustedVersion, regenerateIds = [], translate) {
+    const extras = Array.isArray(next.extraInbounds) ? next.extraInbounds : [];
+    const priorExtras = Array.isArray(previous?.extraInbounds) ? previous.extraInbounds : [];
+    const stored = new Map(priorExtras.map(extra => [extra.id, extra]));
+    const inbounds = [next, ...extras];
+    const prior = [previous, ...extras.map(extra => stored.get(extra?.id))];
+    const flags = new Set(regenerateIds);
+    const managed = inbounds.map((inbound, index) => {
+        if (!inbound || typeof inbound !== 'object') return false;
+        const before = prior[index];
+        for (const key of Object.keys(VLESS_DEFAULTS)) {
+            if (!Object.hasOwn(inbound, key) && before?.[key] !== undefined) inbound[key] = before[key];
+        }
+        return hasEncryptionState({ ...inbound, extraInbounds: [] })
+            || hasEncryptionState({ ...before, extraInbounds: [] }) || flags.has(index === 0 ? 'main' : inbound.id);
+    });
+    if (managed.some(Boolean)) {
+        // IDs can identify a stored inbound of this same card; never use them as paths.
+        const ids = extras.map(extra => extra?.id);
+        if (ids.some(id => typeof id !== 'string' || id === 'main' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id))
+            || new Set(ids).size !== ids.length || new Set(priorExtras.map(extra => extra.id)).size !== priorExtras.length) {
+            return vless.message(translate, 'ExtraIdsInvalid');
+        }
+        const error = checkVlessEncryption({ ...profile, xray: next }, trustedVersion, translate);
+        if (error) return error;
+        if (inbounds.some(inbound => inbound?.vlessEncryption === true && String(inbound.fallbackDest || '').trim())) {
+            return vless.message(translate, 'FallbackConflict');
+        }
+        const candidate = { ...next, extraInbounds: extras.filter((_, i) => managed[i + 1]) };
+        const keyError = await vless.applyVlessEncryptionToXray(candidate, previous, regenerateIds, translate);
+        if (keyError) return keyError;
+        if (managed[0]) for (const key of vless.FIELDS) next[key] = candidate[key];
+    }
+    // Do not materialize feature defaults on legacy, untouched inbounds.
+    for (let i = 0; i < inbounds.length; i++) {
+        if (managed[i] || !inbounds[i] || typeof inbounds[i] !== 'object') continue;
+        for (const key of vless.FIELDS) {
+            if (prior[i]?.[key] === undefined) delete inbounds[i][key];
+            else inbounds[i][key] = prior[i][key];
+        }
+    }
+    return null;
+}
+
+function parseVlessFields(inbound, enabled, auth, mode, ticket) {
+    if (enabled || auth !== undefined) inbound.vlessEncryption = enabled;
+    if (auth !== undefined) inbound.vlessEncryptionAuth = _pickEnum(auth, vless.AUTH_VALUES, 'x25519');
+    if (mode !== undefined) inbound.vlessEncryptionMode = _pickEnum(mode, vless.MODE_VALUES, 'native');
+    if (ticket !== undefined) inbound.vlessEncryptionTicket = String(ticket).trim().slice(0, 32) || '600s';
+}
+
 /**
  * Parse the `xray.extraInbounds[]` array out of parallel form arrays
  * (xray_extra_id[], xray_extra_port[], xray_extra_*[]). Each index across the
@@ -172,6 +279,11 @@ function parseExtraInbounds(body) {
     const xhttpHosts = arr('xray_extra_xhttpHost');
     const xhttpModes = arr('xray_extra_xhttpMode');
     const fallbackDests = arr('xray_extra_fallbackDest');
+    const encryptionIds = new Set(arr('xray_extra_vlessEncryption'));
+    const regenerateIds = new Set(arr('xray_extra_vlessEncryptionRegenerate'));
+    const encryptionAuth = arr('xray_extra_vlessEncryptionAuth');
+    const encryptionMode = arr('xray_extra_vlessEncryptionMode');
+    const encryptionTicket = arr('xray_extra_vlessEncryptionTicket');
 
     const result = [];
     for (let i = 0; i < idArr.length; i++) {
@@ -218,6 +330,8 @@ function parseExtraInbounds(body) {
             xhttpMode: _pickEnum(xhttpModes[i], XRAY_XHTTP_MODE_VALUES, 'auto'),
             fallbackDest: String(fallbackDests[i] || '').trim().slice(0, 253),
         };
+        parseVlessFields(inbound, encryptionIds.has(id), encryptionAuth[i], encryptionMode[i], encryptionTicket[i]);
+        if (regenerateIds.has(id)) inbound.vlessEncryptionRegenerate = true;
         // Empty short-id list is invalid for Reality; restore the empty marker.
         if (inbound.realityShortIds.length === 0) inbound.realityShortIds = [''];
         result.push(inbound);
@@ -275,6 +389,10 @@ function parseXrayFormFields(body) {
     if (body['xray.fallbackDest'] !== undefined) {
         xray.fallbackDest = String(body['xray.fallbackDest']).trim().slice(0, 253);
     }
+
+    parseVlessFields(xray, body['xray.vlessEncryption'] === 'on', body['xray.vlessEncryptionAuth'],
+        body['xray.vlessEncryptionMode'], body['xray.vlessEncryptionTicket']);
+    if (body['xray.vlessEncryptionRegenerate'] === '1') xray.vlessEncryptionRegenerate = true;
 
     // TLS source / manual cert+key (only meaningful when security==='tls').
     // Parsed unconditionally so toggling security back to tls preserves prior
@@ -501,7 +619,7 @@ function sanitizeXrayForRender(xray) {
         plain.manualKeySet = false;
         plain.manualKey = '';
     }
-    return plain;
+    return vless.stripVlessEncryptionKeys(plain, { keepPublic: true });
 }
 
 /**
@@ -1213,6 +1331,13 @@ module.exports = {
     connectNodeSSH,
     parseXrayFormFields,
     parseExtraInbounds,
+    hasEncryptionState,
+    checkVlessEncryption,
+    vlessEditCAS,
+    vlessEditConflict,
+    clientEncryptionProfile,
+    sanitizeEncryptionInput,
+    settleVlessEncryption,
     validateXrayFormFields,
     ensureExtraInboundRealityKeys,
     resolveManualKeyPlaceholder,

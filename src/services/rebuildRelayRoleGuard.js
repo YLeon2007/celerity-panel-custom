@@ -7,6 +7,7 @@ const { readAccountCount, formatRelayCounts } = require('./rebuildRelayCounts');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 const { assertNoIncidentLinks, assertNoRelayEnrollment } = require('./rebuildNodeDeleteGuard');
 const { isPristine } = require('./rebuildRelayBackendStore');
+const { PROTECTED: VLESS_PROTECTED, UNAVAILABLE: VLESS_UNAVAILABLE } = require('./rebuildClientConfigOwnership');
 
 const BLOCKED = 'REBUILD_L2TP_ROLE_BLOCKED';
 const WRITE_BLOCKED = 'REBUILD_L2TP_NODE_WRITE_BLOCKED';
@@ -20,6 +21,8 @@ const reasons = Object.freeze({
     REBUILD_NODE_HAS_LINKS: 'nodes.rebuildNodeHasLinks',
     REBUILD_NODE_RETIRE_REQUIRED: 'nodes.rebuildNodeRetireRequired',
     REBUILD_NODE_DELETE_UNAVAILABLE: 'nodes.rebuildNodeDeleteUnavailable',
+    [VLESS_PROTECTED]: 'nodes.xrayVlessEncProtected',
+    [VLESS_UNAVAILABLE]: 'nodes.xrayVlessEncOwnershipUnavailable',
 });
 const fail = code => Object.assign(new Error(code), { code });
 const primary = query => query.read('primary').readConcern('majority').maxTimeMS(5000);
@@ -140,7 +143,7 @@ function describeRoleError(error, t = translate) {
             accountCount, activeSessions, activeIpsec };
     }
     if (!Object.hasOwn(reasons, code)) return null;
-    return { status: [UNAVAILABLE, 'REBUILD_NODE_DELETE_UNAVAILABLE'].includes(code) ? 503 : 409, code, message: t(reasons[code]),
+    return { status: [UNAVAILABLE, 'REBUILD_NODE_DELETE_UNAVAILABLE', VLESS_UNAVAILABLE].includes(code) ? 503 : 409, code, message: t(reasons[code]),
         ...(error.retryAllowed === false && { retryAllowed: false }) };
 }
 

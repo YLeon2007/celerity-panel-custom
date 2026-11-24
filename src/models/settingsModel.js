@@ -93,6 +93,8 @@ const settingsSchema = new mongoose.Schema({
         logoUrl:        { type: String, default: '' },
         pageTitle:      { type: String, default: '' },
         updateInterval: { type: Number, default: 12 },
+        // Stock sing-box rejects the encryption field; enable only for compatible forks.
+        singboxVlessEncryption: { type: Boolean, default: false },
         buttons: {
             type: [{
                 _id: false,

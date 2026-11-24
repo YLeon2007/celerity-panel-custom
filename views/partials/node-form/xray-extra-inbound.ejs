@@ -124,13 +124,15 @@
         </div>
 
         <%# VLESS fallbacks[].dest — TCP+TLS only %>
-        <div class="form-group extra-fallback-group" style="<%= (transport === 'tcp' && security === 'tls') ? '' : 'display:none' %>">
+        <div class="form-group extra-fallback-group" style="<%= (transport === 'tcp' && security === 'tls' && e.vlessEncryption !== true) ? '' : 'display:none' %>">
             <label><%= t('nodes.xrayFallbackDestLabel') %></label>
             <input type="text" name="xray_extra_fallbackDest" value="<%= e.fallbackDest || '' %>"
                    placeholder="<%= t('nodes.xrayFallbackDestPlaceholder') %>"
                    maxlength="253" autocomplete="off" spellcheck="false">
             <small><%= t('nodes.xrayFallbackDestHint') %></small>
         </div>
+
+        <%- include('vless-encryption', { inbound: e, isExtra: true, encryptionAvailable: typeof encryptionAvailable !== 'undefined' && encryptionAvailable, t }) %>
 
         <%# Reality-specific (extra) %>
         <div class="extra-reality-fields" style="<%= security === 'reality' ? '' : 'display:none' %>">

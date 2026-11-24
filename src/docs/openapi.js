@@ -1,3 +1,12 @@
+const VLESS_ENCRYPTION_PROPERTIES = {
+    vlessEncryption: { type: 'boolean', default: false, description: 'Requires a stored Xray health version of at least 25.9.5. Incompatible with fallbackDest. sing-box subscriptions omit encrypted inbounds unless explicitly opted in.' },
+    vlessEncryptionAuth: { type: 'string', enum: ['x25519', 'mlkem768'], default: 'x25519', description: 'Changing the key type generates a new key.' },
+    vlessEncryptionMode: { type: 'string', enum: ['native', 'xorpub', 'random'], default: 'native' },
+    vlessEncryptionTicket: { type: 'string', default: '600s', example: '300-600s', description: '0-RTT lifetime: Ns, A-Bs, or 0s (off), up to 86400s.' },
+    vlessEncryptionRegenerate: { type: 'boolean', writeOnly: true, description: 'Rotate the panel-generated key on this save; clients must refresh their subscriptions.' },
+    vlessEncryptionPublicKey: { type: 'string', readOnly: true, description: 'Client key published in subscriptions. Caller-supplied key material is ignored.' },
+};
+
 function applyReferenceDocsEnhancements(target) {
     addCommonSchemas(target);
     addCommonExamples(target);
@@ -96,6 +105,20 @@ Virtual nodes carry no IP/SSH/agent and never run health checks themselves.`,
                 },
             },
         },
+        NodeXrayConfig: {
+            type: 'object',
+            description: 'Client-facing Xray configuration. VLESS Encryption is opt-in and cannot be enabled during creation, before the node has a stored Xray health version. Encryption edits merge the main Xray fields; a supplied extraInbounds array replaces the list.',
+            properties: {
+                ...VLESS_ENCRYPTION_PROPERTIES,
+                extraInbounds: {
+                    type: 'array',
+                    items: { type: 'object', properties: {
+                        id: { type: 'string', description: 'Stable inbound ID. Keep it to retain the panel-generated key.' },
+                        ...VLESS_ENCRYPTION_PROPERTIES,
+                    } },
+                },
+            },
+        },
         NodeCreate: {
             type: 'object',
             required: ['name'],
@@ -115,7 +138,7 @@ For \`virtual\` you must additionally pass a non-empty \`virtual\` object.`,
                 groups: { type: 'array', items: { type: 'string' }, example: ['64a1b2c3d4e5f6a7b8c9d0e1'], description: 'Server group ObjectIds.' },
                 maxOnlineUsers: { type: 'integer', example: 0, description: '0 = unlimited.' },
                 ssh: { type: 'object', description: 'SSH credentials. Password or privateKey can be provided. Ignored for virtual nodes.' },
-                xray: { type: 'object', description: 'Xray-specific settings when `type=xray`.' },
+                xray: { $ref: '#/components/schemas/NodeXrayConfig' },
                 virtual: { $ref: '#/components/schemas/VirtualConfig' },
                 cascadeRole: { type: 'string', enum: ['standalone', 'portal', 'bridge'], default: 'standalone', description: 'Always forced to `standalone` for virtual nodes.' },
                 country: { type: 'string', example: 'DE' },
@@ -144,7 +167,7 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
                 active: { type: 'boolean' },
                 rankingCoefficient: { type: 'number' },
                 type: { type: 'string', enum: ['hysteria', 'xray', 'virtual'] },
-                xray: { type: 'object' },
+                xray: { $ref: '#/components/schemas/NodeXrayConfig' },
                 virtual: { $ref: '#/components/schemas/VirtualConfig' },
                 cascadeRole: { type: 'string' },
                 country: { type: 'string' },

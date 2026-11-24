@@ -506,13 +506,14 @@ async function runRuntimeServiceCommand(node, action, buildCommand) {
 
     let conn;
     const failures = [];
+    const redact = node.type === 'xray' ? require('./vlessServerConfig').redactVlessDiagnostics : value => value;
     try {
         conn = await connectSSH(node);
 
         for (const service of candidates) {
             const command = buildCommand(service);
             const result = await execSSH(conn, command);
-            const output = (result.output || '').trim();
+            const output = redact((result.output || '').trim());
             const missing = result.code === 3 || output.includes(`SERVICE_MISSING ${service}`);
 
             if (missing && candidates.length > 1) {
@@ -527,11 +528,11 @@ async function runRuntimeServiceCommand(node, action, buildCommand) {
             failures.push({
                 service,
                 output,
-                error: result.error || `${action} failed`,
+                error: redact(result.error) || `${action} failed`,
             });
         }
     } catch (error) {
-        failures.push({ error: error.message });
+        failures.push({ error: redact(error.message) });
     } finally {
         if (conn) conn.end();
     }
@@ -1166,7 +1167,8 @@ async function setupXrayNode(node, options = {}) {
         const users = await syncService._getUsersForNode(node);
         let configContent;
         try {
-            configContent = configGenerator.generateXrayConfigWithApi(node, users);
+            const generationNode = await require('./vlessServerConfig').loadVlessServerKeys(node);
+            configContent = configGenerator.generateXrayConfigWithApi(generationNode, users);
         } catch (genErr) {
             if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
                 const human = genErr.code === 'PANEL_CERT_UNAVAILABLE'
@@ -1291,16 +1293,17 @@ async function checkXrayNodeStatus(node) {
  * Get Xray node logs via SSH
  */
 async function getXrayNodeLogs(node, lines = 50) {
+    const { redactVlessDiagnostics } = require('./vlessServerConfig');
     try {
         const conn = await connectSSH(node);
         try {
             const result = await execSSH(conn, `journalctl -u xray -n ${lines} --no-pager`);
-            return { success: true, logs: result.output };
+            return { success: true, logs: redactVlessDiagnostics(result.output) };
         } finally {
             conn.end();
         }
     } catch (error) {
-        return { success: false, error: error.message };
+        return { success: false, error: redactVlessDiagnostics(error.message) };
     }
 }
 

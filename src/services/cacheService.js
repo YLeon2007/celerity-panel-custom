@@ -33,7 +33,7 @@ const PREFIX = {
     USER: 'user:',           // user:{userId}
     DEVICES: 'devices:',     // devices:{userId} - Hash with device IPs
     ONLINE: 'online',        // online (stores all sessions) - legacy
-    NODES: 'nodes:active',   // nodes:active
+    NODES: 'nodes:active:subscriber-v1', // only client-facing Xray metadata
     SETTINGS: 'settings',    // settings
     TRAFFIC_STATS: 'traffic:stats', // Total traffic stats
     XRAY_ONLINE_USERS: 'xray:online:users', // { userId: lastActiveIso }
@@ -460,7 +460,7 @@ class CacheService {
         if (!this.isConnected()) return;
         
         try {
-            await this.redis.del(PREFIX.NODES);
+            await this.redis.del(PREFIX.NODES, 'nodes:active');
             logger.debug('[Cache] INVALIDATE nodes');
         } catch (err) {
             logger.error(`[Cache] invalidateNodes error: ${err.message}`);

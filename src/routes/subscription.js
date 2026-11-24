@@ -13,6 +13,7 @@ const router = express.Router();
 const QRCode = require('qrcode');
 const HyUser = require('../models/hyUserModel');
 const HyNode = require('../models/hyNodeModel');
+const { createHash } = require('node:crypto');
 const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
@@ -22,6 +23,8 @@ const uaStats = require('../services/uaStatsService');
 const { extractHwidHeaders } = require('../utils/hwidHeaders');
 const hwidDeviceService = require('../services/hwidDeviceService');
 const webhookService = require('../services/webhookService');
+const { buildClientEncryption } = require('../utils/vlessEncryption');
+const { projectSubscriptionXray } = require('../utils/subscriptionNodeProjection');
 
 // ==================== HELPERS ====================
 
@@ -161,8 +164,9 @@ async function getActiveNodesWithCache() {
     const nodes = await HyNode.find({ active: true })
         .select('name type flag ip domain sni port portRange hopInterval portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray cascadeRole virtual')
         .lean();
-    await cache.setActiveNodes(nodes);
-    return nodes;
+    const projected = nodes.map(node => node.xray ? { ...node, xray: projectSubscriptionXray(node.xray) } : node);
+    await cache.setActiveNodes(projected);
+    return projected;
 }
 
 async function getActiveNodes(user, withPublicationVersion = false) {
@@ -431,6 +435,10 @@ function pickFingerprint(fingerprint, pool) {
     return fingerprint || 'chrome';
 }
 
+// Absent/false is legacy. Unexpected non-null values must not downgrade a row
+// with damaged encryption metadata to a plain client profile.
+const encryptionRequested = inbound => inbound?.vlessEncryption != null && inbound.vlessEncryption !== false;
+
 /**
  * Build the list of inbound descriptors to advertise in the subscription.
  * The first entry is the main inbound (port = node.port, name = node label),
@@ -441,10 +449,12 @@ function pickFingerprint(fingerprint, pool) {
  * @param {Object} node - Node document with xray sub-object
  * @returns {Array<Object>} Inbound descriptors with `{port, nameSuffix, ...inboundFields}`
  */
-function getXrayPublishedInbounds(node) {
+function getXrayPublishedInbounds(node, { mainOnly = false } = {}) {
     if (node.type !== 'xray') return [];
     const xray = node.xray || {};
+    const mainEncryption = buildClientEncryption(xray);
     const main = {
+        vlessEncryption: mainEncryption,
         port: node.port || 443,
         nameSuffix: '',
         transport: xray.transport,
@@ -464,9 +474,14 @@ function getXrayPublishedInbounds(node) {
         xhttpMode: xray.xhttpMode,
     };
 
-    const extras = (Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [])
-        .filter(i => i && i.port)
-        .map(i => ({
+    const published = encryptionRequested(xray) && !mainEncryption ? [] : [main];
+    if (mainOnly || !Array.isArray(xray.extraInbounds)) return published;
+    for (const i of xray.extraInbounds) {
+        if (!i?.port) continue;
+        const encryption = buildClientEncryption(i);
+        if (encryptionRequested(i) && !encryption) continue;
+        published.push({
+            vlessEncryption: encryption,
             port: i.port,
             // Use a stable, human-readable suffix to disambiguate names inside
             // the client UI (clients keep server names unique). Prefer the
@@ -492,9 +507,9 @@ function getXrayPublishedInbounds(node) {
             xhttpPath: i.xhttpPath,
             xhttpHost: i.xhttpHost,
             xhttpMode: i.xhttpMode,
-        }));
-
-    return [main, ...extras];
+        });
+    }
+    return published;
 }
 
 /**
@@ -564,6 +579,7 @@ function generateVlessURIForInbound(user, node, inbound) {
     // clients and silently falls back to tcp, breaking the connection.
     params.set('type', transport);
     params.set('security', security);
+    if (inbound.vlessEncryption) params.set('encryption', inbound.vlessEncryption);
 
     if (security === 'reality') {
         if (inbound.flow && transport === 'tcp') params.set('flow', inbound.flow);
@@ -627,8 +643,8 @@ function generateVlessURIs(user, node) {
  * helpers) keep working unchanged. New callers should use generateVlessURIs.
  */
 function generateVlessURI(user, node) {
-    const uris = generateVlessURIs(user, node);
-    return uris.length > 0 ? uris[0] : null;
+    const [main] = getXrayPublishedInbounds(node, { mainOnly: true });
+    return main ? generateVlessURIForInbound(user, node, main) : null;
 }
 
 // ==================== ROUTING RULE CONVERTERS ====================
@@ -1036,6 +1052,15 @@ function generateURIList(user, nodes) {
     return uris.join('\n');
 }
 
+// Upstream emits this field for Mihomo >= 1.19.13. A Clash or Stash
+// name, an alias, or an unknown Mihomo version does not prove support.
+function supportsClashVlessEncryption(userAgent) {
+    const version = /(?:^|[ (;])mihomo\/v?(\d+)\.(\d+)\.(\d+)(?=$|[ );])/i.exec(userAgent);
+    if (!version) return false;
+    const [major, minor, patch] = version.slice(1).map(Number);
+    return major > 1 || (major === 1 && (minor > 19 || (minor === 19 && patch >= 13)));
+}
+
 function _buildClashVlessProxyForInbound(user, node, inbound) {
     const host = node.domain || node.ip;
     const transport = inbound.transport || 'tcp';
@@ -1049,6 +1074,7 @@ function _buildClashVlessProxyForInbound(user, node, inbound) {
     port: ${inbound.port || node.port || 443}
     uuid: "${user.xrayUuid}"
     udp: true`;
+    if (inbound.vlessEncryption) proxy += `\n    encryption: "${inbound.vlessEncryption}"`;
 
     if (security === 'reality') {
         const sni = inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : host;
@@ -1106,12 +1132,13 @@ function _buildClashVlessProxyForInbound(user, node, inbound) {
  * Build Clash proxies for every published inbound of an Xray node.
  * Returns an array of `{name, proxy}` items.
  */
-function _buildClashVlessProxies(user, node) {
+function _buildClashVlessProxies(user, node, allowEncrypted) {
     return getXrayPublishedInbounds(node)
+        .filter(inbound => allowEncrypted || !inbound.vlessEncryption)
         .map(inbound => _buildClashVlessProxyForInbound(user, node, inbound));
 }
 
-function generateClashYAML(user, nodes, routing) {
+function generateClashYAML(user, nodes, routing, allowEncrypted = false) {
     const auth = `${user.userId}:${user.password}`;
     const proxies = [];
     const proxyNames = [];
@@ -1128,7 +1155,7 @@ function generateClashYAML(user, nodes, routing) {
         const beforeIdx = proxyNames.length;
         if (node.type === 'xray') {
             if (!user.xrayUuid) return;
-            _buildClashVlessProxies(user, node).forEach(({ name, proxy }) => {
+            _buildClashVlessProxies(user, node, allowEncrypted).forEach(({ name, proxy }) => {
                 if (!proxy) return;
                 proxyNames.push(name);
                 proxies.push(proxy);
@@ -1228,6 +1255,7 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
         server_port: inbound.port || node.port || 443,
         uuid: user.xrayUuid,
     };
+    if (inbound.vlessEncryption) outbound.encryption = inbound.vlessEncryption;
 
     if (transport === 'tcp' && (security === 'reality' || security === 'tls')) {
         outbound.flow = inbound.flow || 'xtls-rprx-vision';
@@ -1290,8 +1318,9 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
 /**
  * Build sing-box outbounds for every published inbound of an Xray node.
  */
-function _buildSingboxVlessOutbounds(user, node) {
+function _buildSingboxVlessOutbounds(user, node, singboxVlessEncryption) {
     return getXrayPublishedInbounds(node)
+        .filter(inbound => singboxVlessEncryption || !inbound.vlessEncryption)
         .map(inbound => _buildSingboxVlessOutboundForInbound(user, node, inbound));
 }
 
@@ -1365,7 +1394,7 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride) {
                 };
             }
 
-            const vnextUser = { id: user.xrayUuid, encryption: 'none' };
+            const vnextUser = { id: user.xrayUuid, encryption: inbound.vlessEncryption || 'none' };
             if (transport === 'tcp' && (security === 'reality' || security === 'tls') && inbound.flow) {
                 vnextUser.flow = inbound.flow;
             }
@@ -1641,7 +1670,7 @@ function generateXrayJSON(user, nodes, routing) {
     return profiles;
 }
 
-function generateSingboxJSON(user, nodes, routing) {
+function generateSingboxJSON(user, nodes, routing, singboxVlessEncryption = false) {
     const auth = `${user.userId}:${user.password}`;
     const proxyOutbounds = [];
     const tags = [];
@@ -1657,7 +1686,7 @@ function generateSingboxJSON(user, nodes, routing) {
         const beforeIdx = tags.length;
         if (node.type === 'xray') {
             if (!user.xrayUuid) return;
-            _buildSingboxVlessOutbounds(user, node).forEach(({ tag, outbound }) => {
+            _buildSingboxVlessOutbounds(user, node, singboxVlessEncryption).forEach(({ tag, outbound }) => {
                 if (!outbound) return;
                 tags.push(tag);
                 proxyOutbounds.push(outbound);
@@ -2866,6 +2895,33 @@ async function runHwidSubscriptionGate(req, res, user, settings, format) {
 
 // ==================== SHARED PIPELINE ====================
 
+// Bind cached bodies to the actual encryption state, including enabled but
+// unusable inbounds. An in-flight render from an earlier state must not serve
+// after a settings update or a key change/repair.
+function encryptionCacheSuffix(nodes) {
+    const inbounds = [];
+    for (const node of nodes) {
+        if (node.type !== 'xray' || !node.xray) continue;
+        const extras = Array.isArray(node.xray.extraInbounds) ? node.xray.extraInbounds : [];
+        [node.xray, ...extras].forEach((inbound, index) => {
+            if (encryptionRequested(inbound)) {
+                inbounds.push([String(node._id), index, index ? inbound.port : node.port, buildClientEncryption(inbound)]);
+            }
+        });
+    }
+    return inbounds.length ? `+enc:${createHash('sha256').update(JSON.stringify(inbounds)).digest('hex')}` : '';
+}
+
+function hasCompatibleEndpoint(user, nodes, allowEncrypted) {
+    return nodes.some(node => {
+        if (node.type === 'virtual') return false;
+        if (node.type === 'xray') {
+            return user.xrayUuid && getXrayPublishedInbounds(node).some(inbound => allowEncrypted || !inbound.vlessEncryption);
+        }
+        return getNodeConfigs(node).length > 0;
+    });
+}
+
 /**
  * Render the subscription response for an already-loaded, already-validated
  * user. Exposed so the Marzban-compat route can reuse the entire HWID/cache/
@@ -2898,6 +2954,9 @@ async function serveSubscription(req, res, ctx) {
         const nodes = await getActiveNodes(user);
         if (nodes.length === 0) {
             return res.status(503).type('text/plain').send('# No servers available');
+        }
+        if (encryptionCacheSuffix(nodes) && !hasCompatibleEndpoint(user, nodes, true)) {
+            return res.status(503).type('text/plain').send('# No compatible servers available');
         }
         const html = await generateHTML(user, nodes, cacheToken, baseUrl, settings, res.locals.lang);
         return res
@@ -2938,8 +2997,19 @@ async function serveSubscription(req, res, ctx) {
         logger.error(`[Sub] NO SERVERS for user ${user.userId}! Check nodes in panel.`);
         return res.status(503).type('text/plain').send('# No servers available');
     }
+    const isSingbox = format === 'singbox' || format === 'json';
+    const isClash = format === 'clash' || format === 'yaml';
+    const allowEncrypted = isSingbox ? settings?.subscription?.singboxVlessEncryption === true
+        : !isClash || supportsClashVlessEncryption(userAgent);
+    const encryptionState = encryptionCacheSuffix(nodes);
+    if (encryptionState && !hasCompatibleEndpoint(user, nodes, allowEncrypted)) {
+        return res.status(503).type('text/plain').send('# No compatible servers available');
+    }
+    // Do not reuse bodies generated before this publication policy existed.
+    const clientCompatibility = (isSingbox || isClash) && allowEncrypted ? '+client-enc' : '';
+    const scopedFormat = `${cacheFormat}+vless-v1${clientCompatibility}${encryptionState}`;
     const publicationCacheFormat = publicationVersion
-        ? `${cacheFormat}+applied:${publicationVersion}:${nodes.map(n => String(n._id)).join(',')}` : cacheFormat;
+        ? `${scopedFormat}+applied:${publicationVersion}:${nodes.map(n => String(n._id)).join(',')}` : scopedFormat;
     const cached = await cache.getSubscription(cacheToken, publicationCacheFormat);
     if (cached) {
         logger.debug(`[Sub] Cache HIT: ${cacheToken}:${cacheFormat}`);
@@ -2950,7 +3020,8 @@ async function serveSubscription(req, res, ctx) {
 
     logger.debug(`[Sub] Serving ${nodes.length} nodes to user ${user.userId}`);
 
-    const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent, settings?.subscription?.happProviderId || '', routingSelection.routing);
+    const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent,
+        settings?.subscription?.happProviderId || '', routingSelection.routing, allowEncrypted);
     subscriptionData.routingVariant = routingSelection.variant;
     await cache.setSubscription(cacheToken, publicationCacheFormat, subscriptionData);
     return sendCachedSubscription(res, subscriptionData, format, userAgent, settings, hwidHeaders);
@@ -3005,7 +3076,7 @@ router.get('/files/:token', async (req, res) => {
 /**
  * Generate subscription data for caching
  */
-function generateSubscriptionData(user, nodes, format, userAgent, happProviderId = '', routing = null) {
+function generateSubscriptionData(user, nodes, format, userAgent, happProviderId, routing, allowEncrypted) {
     let content;
     let needsBase64 = false;
     // Effective format may differ from requested when we transparently upgrade
@@ -3021,11 +3092,11 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
             break;
         case 'clash':
         case 'yaml':
-            content = generateClashYAML(user, nodes, routing);
+            content = generateClashYAML(user, nodes, routing, allowEncrypted);
             break;
         case 'singbox':
         case 'json':
-            content = JSON.stringify(generateSingboxJSON(user, nodes, routing), null, 2);
+            content = JSON.stringify(generateSingboxJSON(user, nodes, routing, allowEncrypted), null, 2);
             break;
         case 'v2ray-json':
             content = JSON.stringify(generateV2rayJSON(user, nodes, routing), null, 2);

@@ -85,7 +85,7 @@ const TOOLS = {
     },
 
     manage_node: {
-        description: 'Manage Hysteria/Xray/virtual nodes: create, update, delete, sync, auto-setup via SSH, reset status, update config, setup port hopping, generate Xray Reality keys. "virtual" nodes are load-balancer entries over real sibling nodes. For type="xray" pass the full "xray" object (transport, security/reality, fingerprint + fingerprintPool, alpn, ws/grpc/xhttp, extraInbounds); on update the xray object is merged per-field, so omit realityPrivateKey/realityPublicKey/manualKey to keep generated values.',
+        description: 'Manage Hysteria/Xray/virtual nodes: create, update, delete, sync, auto-setup via SSH, reset status, update config, setup port hopping, generate Xray Reality keys. "virtual" nodes are load-balancer entries over real sibling nodes. For type="xray" pass the full "xray" object (transport, security/reality, fingerprint + fingerprintPool, alpn, ws/grpc/xhttp, extraInbounds); on update the xray object is merged per-field, so omit realityPrivateKey/realityPublicKey/manualKey to keep generated values. VLESS Encryption (main and extra client inbounds) requires a stored Xray health version of at least 25.9.5 and no fallbackDest. Create first, then enable after health is known. Key material is panel-owned.',
         requiredScope: 'nodes:write',
         inputSchema: zodToInputSchema(nodesTools.schemas.manageNode),
     },
@@ -200,7 +200,7 @@ function listTools(apiKey) {
  * Dispatch a tool call. Emitter fn receives (event, data).
  * Returns final result object.
  */
-async function callTool(name, args, apiKey, emit) {
+async function callTool(name, args, apiKey, emit, translate) {
     const def = TOOLS[name];
     if (!def) {
         throw Object.assign(new Error(`Unknown tool: ${name}`), { code: 404 });
@@ -255,7 +255,7 @@ async function callTool(name, args, apiKey, emit) {
             return await usersTools.manageHwidDevices(args, emit);
 
         case 'manage_node':
-            return await nodesTools.manageNode(args, emit);
+            return await nodesTools.manageNode(args, emit, translate);
 
         case 'manage_group':
             return await groupsTools.manageGroup(args);

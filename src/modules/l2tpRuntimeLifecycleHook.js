@@ -57,6 +57,11 @@ const CANDIDATE_NODE_XRAY_PROJECTION = Object.freeze([
     'xray.xhttpHost',
     'xray.xhttpMode',
     'xray.fallbackDest',
+    'xray.vlessEncryption',
+    'xray.vlessEncryptionAuth',
+    'xray.vlessEncryptionMode',
+    'xray.vlessEncryptionTicket',
+    'xray.vlessEncryptionPublicKey',
     'xray.extraInbounds',
     'xray.tlsSource',
     'xray.manualCert',
@@ -196,11 +201,12 @@ function createL2tpRootHostDependencies({
     }
 
     const configWriteEnv = Object.freeze({ ...env });
-    const resolvedCandidateNodeResolver = candidateNodeResolver ?? (async ({ nodeId } = {}) => (
-        HyNode.findById(nodeId)
+    const resolvedCandidateNodeResolver = candidateNodeResolver ?? (async ({ nodeId } = {}) => {
+        const node = await HyNode.findById(nodeId)
             .select(CANDIDATE_NODE_XRAY_PROJECTION.join(' '))
-            .lean()
-    ));
+            .lean();
+        return require('../services/vlessServerConfig').loadVlessServerKeys(node, HyNode);
+    });
     const resolvedCandidateUserResolver = candidateUserResolver ?? (async node => {
         const users = await syncService._getUsersForNode(node);
         if (!Array.isArray(users)) return users;

@@ -81,9 +81,10 @@ function startHeartbeat(req, res) {
  * @param {object}   rpc      - parsed JSON-RPC body
  * @param {object}   apiKey   - req.apiKey or null (admin session)
  * @param {Function} emitProg - (event, data) for progress/log events on SSE stream
+ * @param {Function} translate - request-local i18n translator
  * @returns {{ sync: boolean, result?: object, error?: object }}
  */
-async function dispatch(rpc, apiKey, emitProg) {
+async function dispatch(rpc, apiKey, emitProg, translate) {
     const { id, method, params = {} } = rpc;
 
     // ── initialize ──────────────────────────────────────────────────────────
@@ -122,7 +123,7 @@ async function dispatch(rpc, apiKey, emitProg) {
             return { sync: true, result: jsonRpcErr(id, -32602, 'Missing params.name') };
         }
         try {
-            const toolResult = await mcpService.callTool(toolName, toolArgs, apiKey, emitProg);
+            const toolResult = await mcpService.callTool(toolName, toolArgs, apiKey, emitProg, translate);
             if (toolResult && toolResult.error) {
                 // Soft error from handler (e.g. not found)
                 return {
@@ -213,7 +214,7 @@ router.post('/', async (req, res) => {
         const emitProg = (event, data) => sseEvent(res, event, data);
 
         try {
-            const { result } = await dispatch(rpc, apiKey, emitProg);
+            const { result } = await dispatch(rpc, apiKey, emitProg, res.locals.t);
             if (result !== null) {
                 sseMessage(res, result);
             }
@@ -229,7 +230,7 @@ router.post('/', async (req, res) => {
 
     // Sync JSON response (initialize, ping, tools/list, prompts/list, etc.)
     try {
-        const { result } = await dispatch(rpc, apiKey, () => {});
+        const { result } = await dispatch(rpc, apiKey, () => {}, res.locals.t);
         if (result === null) return res.status(202).end(); // notification
         return res.json(result);
     } catch (err) {
@@ -287,7 +288,7 @@ router.post('/messages', async (req, res) => {
     const emitProg = (event, data) => sseEvent(sseRes, event, data);
 
     try {
-        const { result } = await dispatch(rpc, apiKey, emitProg);
+        const { result } = await dispatch(rpc, apiKey, emitProg, res.locals.t);
         if (result !== null) {
             sseMessage(sseRes, result);
         }

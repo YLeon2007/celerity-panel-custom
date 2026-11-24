@@ -4,6 +4,7 @@
  */
 
 const { z } = require('zod');
+const { isDeepStrictEqual } = require('node:util');
 const { Client } = require('ssh2');
 const HyNode = require('../../models/hyNodeModel');
 const { MODES, MODE_PATH, PROFILE_FIELDS, RealityGuardInputError, readPolicy, rejectDottedGuard,
@@ -30,6 +31,10 @@ function getSyncService() {
 const sshSessions = new Map();
 
 // Fields excluded from all node queries returned to MCP clients
+const vless = require('../../utils/vlessEncryption');
+const { assertRebuildVlessEditAllowed, PROTECTED, UNAVAILABLE } = require('../../services/rebuildClientConfigOwnership');
+const { checkVlessEncryption, hasEncryptionState, settleVlessEncryption, vlessEditCAS, vlessEditConflict } = require('../../routes/panel/helpers');
+const { redactNode } = vless;
 const NODE_SAFE_SELECT = '-ssh.password -ssh.privateKey -xray.realityPrivateKey -statsSecret';
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
@@ -67,6 +72,11 @@ const xrayInboundCommonZ = {
     xhttpHost: z.string().optional(),
     xhttpMode: z.enum(['auto', 'packet-up', 'stream-up', 'stream-one']).optional(),
     fallbackDest: z.string().optional().describe('VLESS fallbacks[].dest — emitted only on tcp+tls'),
+    vlessEncryption: z.boolean().optional().describe('Client inbounds only. Requires stored Xray health version 25.9.5+; cannot be enabled at creation or combined with fallbackDest'),
+    vlessEncryptionAuth: z.enum(['x25519', 'mlkem768']).optional(),
+    vlessEncryptionMode: z.enum(['native', 'xorpub', 'random']).optional(),
+    vlessEncryptionTicket: z.string().max(32).optional().describe('0-RTT lifetime: 600s (default), 300-600s, or 0s (off)'),
+    vlessEncryptionRegenerate: z.boolean().optional().describe('Rotate the panel-owned key on save; clients must refresh subscriptions'),
 };
 
 const xrayExtraInboundZ = z.object({
@@ -282,7 +292,7 @@ async function queryNodes(args) {
         const node = await HyNode.findById(parsed.id).select(NODE_SAFE_SELECT).populate('groups', 'name color');
         if (!node) return { error: `Node '${parsed.id}' not found`, code: 404 };
 
-        const result = { ...node.toObject() };
+        const result = redactNode(node);
 
         if (parsed.includeUsers) {
             result.users = await HyUser.find({ nodes: node._id, enabled: true })
@@ -306,26 +316,53 @@ async function queryNodes(args) {
     if (parsed.filter?.status) filter.status = parsed.filter.status;
 
     const nodes = await HyNode.find(filter).select(NODE_SAFE_SELECT).populate('groups', 'name color').sort({ name: 1 });
-    return { nodes };
+    return { nodes: nodes.map(redactNode) };
 }
 
-async function manageNode(args, emit) {
+async function manageNode(args, emit, translate) {
     try {
-        return await manageNodeAction(args, emit);
+        return await manageNodeAction(args, emit, translate);
     } catch (error) {
         if (error instanceof RealityGuardConflictError) return { error: error.message, code: 409 };
         if (error instanceof RealityGuardInputError) return { error: error.message, code: 400 };
-        const conflict = describeRoleError(error);
+        const conflict = describeRoleError(error, [PROTECTED, UNAVAILABLE].includes(error?.code) ? translate : undefined);
         if (!conflict) throw error;
         const { status, message, code, ...details } = conflict;
         return { error: message, code: status, reason: code, ...details };
     }
 }
 
-async function manageNodeAction(args, emit) {
+const vlessArgumentKeys = {
+    vlessEncryption: 'BooleanRequired',
+    vlessEncryptionAuth: 'AuthInvalid',
+    vlessEncryptionMode: 'ModeInvalid',
+    vlessEncryptionTicket: 'TicketInputInvalid',
+    vlessEncryptionRegenerate: 'RegenerateInvalid',
+};
+
+function parseManageNode(args, translate) {
+    const parsed = manageNodeSchema.safeParse(args);
+    if (parsed.success) return parsed.data;
+    if (translate) {
+        const errors = [];
+        for (const { path } of parsed.error.issues) {
+            if (path[0] !== 'data' || path[1] !== 'xray') continue;
+            if (path.length !== 3 && !(path.length === 5 && path[2] === 'extraInbounds' && Number.isInteger(path[3]))) continue;
+            const field = path.at(-1);
+            if (Object.hasOwn(vlessArgumentKeys, field)) {
+                errors.push(`${path.join('.')}: ${vless.message(translate, vlessArgumentKeys[field])}`);
+            }
+        }
+        // Keep the MCP text error envelope, but never echo the rejected values.
+        if (errors.length) throw new Error(vless.message(translate, 'ArgumentsInvalid', { message: errors.join('; ') }));
+    }
+    throw parsed.error;
+}
+
+async function manageNodeAction(args, emit, translate) {
     rejectDottedGuard(args?.data, 'xray.realityGuard');
     rejectDottedGuard(args?.data?.xray, 'realityGuard');
-    const parsed = manageNodeSchema.parse(args);
+    const parsed = parseManageNode(args, translate);
     const { action, id, data = {}, setupOptions } = parsed;
 
     switch (action) {
@@ -415,7 +452,12 @@ async function manageNodeAction(args, emit) {
             }
 
             // Xray + remaining common fields, mirroring routes/nodes.js POST.
-            if (nodeType === 'xray' && data.xray) nodeData.xray = data.xray;
+            if (nodeType === 'xray' && data.xray) {
+                const error = await settleVlessEncryption(data.xray, null, nodeData, undefined,
+                    vless.takeRegenerateIds(data.xray), translate);
+                if (error) return { error, code: 400 };
+                nodeData.xray = data.xray;
+            }
             if (data.statsPort !== undefined) nodeData.statsPort = data.statsPort;
             if (data.paths !== undefined) nodeData.paths = data.paths;
             if (data.settings !== undefined) nodeData.settings = data.settings;
@@ -426,7 +468,7 @@ async function manageNodeAction(args, emit) {
             await node.save();
             await invalidateNodesCache();
             logger.info(`[MCP] Created ${nodeType} node ${data.name} (${nodeType === 'virtual' ? 'virtual' : data.ip})`);
-            return { success: true, node };
+            return { success: true, node: redactNode(node) };
         }
 
         case 'update': {
@@ -456,20 +498,23 @@ async function manageNodeAction(args, emit) {
             // realityPublicKey, manualKey) are preserved instead of wiped by a full $set.
             const guard = data.xray?.realityGuard;
             const { mode: guardMode } = readPolicy(guard);
-            for (const [key, value] of Object.entries(data.xray || {})) {
-                if (key !== 'realityGuard') updates[`xray.${key}`] = value;
-            }
-            if (guard && !Object.keys(updates).length) {
+            const { realityGuard: _guard, ...patch } = data.xray || {};
+            const ids = vless.takeRegenerateIds(patch);
+            const xrayEdit = !!(ids.length || Object.keys(patch).length);
+            if (guard && !xrayEdit && !Object.keys(updates).length) {
                 const node = await saveGuardMode(id, guardMode);
-                return node ? { success: true, node } : { error: `Node '${id}' not found`, code: 404 };
+                return node ? { success: true, node: redactNode(node) } : { error: `Node '${id}' not found`, code: 404 };
             }
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
             const result = await withNodeWrite(id, async (options, current, verify) => {
                 const bindGuard = guardMode !== undefined;
-                const projection = 'type ip virtual' + (bindGuard ? ` ${PROFILE_FIELDS} ${MODE_PATH}` : '');
-                const existing = (bindGuard ? null : current) ?? await HyNode.findById(id).select(projection).lean();
+                const profileEdit = xrayEdit || ['type', 'cascadeRole', 'active'].some(key => Object.hasOwn(updates, key));
+                const projection = profileEdit
+                    ? `type ip virtual name cascadeRole role useCustomConfig updatedAt xrayVersion xray ${vless.PRIVATE_KEY_SELECT}`
+                    : 'type ip virtual' + (bindGuard ? ` ${PROFILE_FIELDS} ${MODE_PATH}` : '');
+                const existing = (bindGuard || profileEdit ? null : current) ?? await HyNode.findById(id).select(projection).lean();
                 if (!existing) return { error: `Node '${id}' not found`, code: 404 };
 
                 const nextType = updates.type || existing.type;
@@ -489,18 +534,53 @@ async function manageNodeAction(args, emit) {
                     return { error: `Node type ${nextType} requires ip`, code: 400 };
                 }
 
+                const profile = { ...existing, type: nextType, cascadeRole: updates.cascadeRole ?? existing.cascadeRole };
+                const encryptionEdit = xrayEdit && (ids.length > 0 || hasEncryptionState(patch) || hasEncryptionState(existing.xray));
+                const bindEncryption = encryptionEdit || (profileEdit && hasEncryptionState(existing.xray));
+                const next = { ...existing.xray, ...patch };
+                if (xrayEdit) {
+                    if (Array.isArray(next.extraInbounds)) next.extraInbounds = next.extraInbounds.map(extra => ({ ...extra }));
+                    const error = await settleVlessEncryption(next, existing.xray, profile,
+                        existing.type === 'xray' ? existing.xrayVersion : undefined, ids, translate);
+                    if (error) return { error, code: 400 };
+                    await assertRebuildVlessEditAllowed(current, existing.xray, next, profile);
+                    for (const key of Object.keys(patch)) {
+                        if (next[key] !== undefined && !vless.FIELDS.includes(key)
+                            && !(current && encryptionEdit && isDeepStrictEqual(existing.xray?.[key], next[key]))) {
+                            updates[`xray.${key}`] = next[key];
+                        }
+                    }
+                    for (const key of vless.FIELDS) {
+                        if (next[key] !== existing.xray?.[key] && next[key] !== undefined) updates[`xray.${key}`] = next[key];
+                    }
+                } else if (profileEdit && hasEncryptionState(existing.xray)) {
+                    await assertRebuildVlessEditAllowed(current, existing.xray, existing.xray, profile);
+                    const error = checkVlessEncryption(profile, existing.xrayVersion, translate);
+                    if (error && (updates.active !== false || nextType !== existing.type || updates.cascadeRole !== undefined)) return { error, code: 400 };
+                }
+                if (existing.xrayVersion && nextType !== existing.type) updates.xrayVersion = '';
                 if (guardMode !== undefined) {
                     assertGuardModeAllowed(guardMode, { type: nextType, cascadeRole: guardRoleOnUpdate(existing.cascadeRole, updates.cascadeRole),
                         role: existing.role, useCustomConfig: existing.useCustomConfig,
-                        xray: { ...existing.xray, ...data.xray } });
+                        xray: next });
                     updates[MODE_PATH] = guardMode;
                 }
                 await assertNodeEditAllowed(current, updates);
                 await verify();
-                const write = bindGuard
-                    ? HyNode.findOneAndUpdate({ _id: id, ...guardModeCAS(existing) }, { $set: updates }, { new: true, ...options })
+                if (!Object.keys(updates).length) return { node: await HyNode.findById(id).populate('groups', 'name color') };
+                const predicates = { ...(bindGuard ? guardModeCAS(existing) : {}), ...(bindEncryption ? vlessEditCAS(existing) : {}) };
+                const write = bindGuard || bindEncryption
+                    ? HyNode.findOneAndUpdate({ _id: id, ...predicates }, { $set: updates }, { new: true, ...options })
                     : HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true, ...options });
-                const node = await write.populate('groups', 'name color');
+                let node;
+                try {
+                    node = await write.populate('groups', 'name color');
+                } catch (error) {
+                    // Database/casting diagnostics may include a write payload.
+                    if (bindEncryption && !describeRoleError(error)) return { error: vless.message(translate, 'UpdateFailed'), code: 500 };
+                    throw error;
+                }
+                if (bindEncryption && !node) return { error: vlessEditConflict(translate), code: 409 };
                 if (bindGuard && !node) return { error: new RealityGuardConflictError().message, code: 409 };
                 return { node };
             });
@@ -513,10 +593,12 @@ async function manageNodeAction(args, emit) {
             // Virtual nodes have no remote service to push to — schedulePush will
             // simply emit a no-op via the existing type guards in syncService.
             const configUpdates = Object.fromEntries(Object.entries(updates).filter(([key]) => key !== MODE_PATH));
-            if (Object.keys(configUpdates).length) getSyncService().schedulePush(node._id, configUpdates);
+            if (Object.keys(configUpdates).length) {
+                getSyncService().schedulePush(node._id, configUpdates);
+            }
 
             logger.info(`[MCP] Updated node ${node.name}`);
-            return { success: true, node };
+            return { success: true, node: redactNode(node) };
         }
 
         case 'delete': {

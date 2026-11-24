@@ -4,6 +4,7 @@
 
 const mongoose = require('mongoose');
 const { MODES } = require('./realityGuardPolicy');
+const vlessEncryption = require('../utils/vlessEncryption');
 
 // API/MCP callers may send an empty field instead of omitting it. Defaults
 // apply only to undefined; hydration of saved nodes must remain unchanged.
@@ -112,6 +113,33 @@ const quicSchema = new mongoose.Schema({
     disablePathMTUDiscovery: { type: Boolean, default: false },
 }, { _id: false });
 
+function vlessEncryptionFields() {
+    // No defaults: legacy/off nodes and extras must remain sparse.
+    const boolError = 'VLESS Encryption enabled must be a boolean.';
+    return {
+        vlessEncryption: {
+            type: Boolean,
+            cast: [value => {
+                if (typeof value !== 'boolean') throw new Error(boolError);
+                return value;
+            }, boolError],
+            validate: { validator: value => typeof value === 'boolean', message: boolError },
+        },
+        vlessEncryptionAuth: { type: String, enum: vlessEncryption.AUTH_VALUES },
+        vlessEncryptionMode: { type: String, enum: vlessEncryption.MODE_VALUES },
+        vlessEncryptionTicket: { type: String, match: /^\d{1,5}(-\d{1,5})?s$/ },
+        vlessEncryptionPrivateKey: { type: String, select: false },
+        vlessEncryptionPublicKey: { type: String, match: /^[A-Za-z0-9_-]+$/ },
+    };
+}
+
+// select:false covers queries, not unsaved/just-saved/explicitly selected
+// documents. JSON serialization must never expose the private envelope.
+function hideVlessKey(_doc, plain) {
+    delete plain.vlessEncryptionPrivateKey;
+    return plain;
+}
+
 // Per-inbound stream/security settings shared by the main inbound and extras.
 // Extras add `id`, `label`, `port` and reuse their own `inboundTag` instead of
 // the node-level fields.
@@ -154,7 +182,8 @@ const xrayExtraInboundSchema = new mongoose.Schema({
 
     // VLESS fallbacks[].dest — emitted only on tcp+tls; empty = no fallback.
     fallbackDest: { type: String, default: '', trim: true, maxlength: 253 },
-}, { _id: false });
+    ...vlessEncryptionFields(),
+}, { _id: false, toJSON: { transform: hideVlessKey } });
 
 const xrayConfigSchema = new mongoose.Schema({
     // Transport: tcp, ws, grpc, xhttp (splithttp)
@@ -195,6 +224,7 @@ const xrayConfigSchema = new mongoose.Schema({
 
     // VLESS fallbacks[].dest — emitted only on tcp+tls; empty = no fallback.
     fallbackDest: { type: String, default: '', trim: true, maxlength: 253 },
+    ...vlessEncryptionFields(),
 
     // TLS provisioning strategy (security==='tls'):
     //   panel       — inline panel's LE cert (PANEL_DOMAIN); no node files.
@@ -273,7 +303,7 @@ const xrayConfigSchema = new mongoose.Schema({
         nodeConfirmedAt: Date,
         reserveFailed: mongoose.Schema.Types.Mixed,
     },
-}, { _id: false });
+}, { _id: false, toJSON: { transform: hideVlessKey } });
 
 // Virtual node: a balancer entry that aggregates other nodes into a single
 // subscription record. Carries no transport/server fields itself — only the
@@ -437,6 +467,24 @@ hyNodeSchema.pre('validate', function(next) {
     }
     if (!this.ip) {
         return next(new Error(`Node type ${this.type} requires ip`));
+    }
+    if ((this.$isNew || this.isModified('xray')) && vlessEncryption.hasEnabledInbound(this.xray)) {
+        // A create's document field is not a health observation. A trusted
+        // caller doing a fresh health read may pass it out-of-band via $locals.
+        // Query-based writers must run versionError against their held preimage.
+        const trustedVersion = this.$locals.vlessEncryptionXrayVersion
+            ?? (!this.$isNew && !this.isModified('xrayVersion') ? this.xrayVersion : undefined);
+        const error = vlessEncryption.versionError(this.xray, trustedVersion);
+        if (error) return next(new Error(error));
+        try {
+            for (const inbound of [this.xray, ...(this.xray.extraInbounds || [])]) {
+                if (inbound?.vlessEncryption !== true) continue;
+                if (!vlessEncryption.buildClientEncryption(inbound)) throw new Error();
+                vlessEncryption.buildServerDecryption(inbound);
+            }
+        } catch {
+            return next(new Error('VLESS Encryption keys must be prepared by the panel.'));
+        }
     }
     return next();
 });

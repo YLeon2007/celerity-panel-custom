@@ -1,15 +1,16 @@
 'use strict';
 
 const {
-    createCipheriv, createDecipheriv, createHmac, createPrivateKey, createPublicKey, hkdfSync, randomBytes,
+    createCipheriv, createDecipheriv, createHmac, hkdfSync, randomBytes,
 } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
 
 const { linkSnapshot, keyEnvelopeField: FIELD, fullLinkRead } = require('./rebuildLinkSnapshot');
+const { deriveX25519PublicKey, formatDecryption, formatEncryption } = require('../utils/xrayVlessWire');
 const DOMAIN = 'celerity/rebuild/link-vless/v1';
-const SERVER = 'mlkem768x25519plus.native.600s.';
-const CLIENT = 'mlkem768x25519plus.native.0rtt.';
-const PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex');
+const MODE = 'native', TICKET = '600s';
+const SERVER = formatDecryption(MODE, TICKET);
+const CLIENT = formatEncryption(MODE);
 const batches = new WeakMap();
 const missing = Symbol('no envelope');
 
@@ -69,16 +70,10 @@ function keyFor(keys, id, envelope) {
 }
 
 function xraySettings(seed) {
-    const der = Buffer.concat([PKCS8_PREFIX, seed]);
-    try {
-        const priv = createPrivateKey({ key: der, type: 'pkcs8', format: 'der' });
-        return Object.freeze({
-            decryption: SERVER + seed.toString('base64url'),
-            encryption: CLIENT + createPublicKey(priv).export({ format: 'jwk' }).x,
-        });
-    } finally {
-        der.fill(0);
-    }
+    return Object.freeze({
+        decryption: formatDecryption(MODE, TICKET, seed.toString('base64url')),
+        encryption: formatEncryption(MODE, deriveX25519PublicKey(seed)),
+    });
 }
 
 function tunnelSettings(link) {

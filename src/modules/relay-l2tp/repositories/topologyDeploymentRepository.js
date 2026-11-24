@@ -9,6 +9,7 @@ const { linkDesiredVersion } = require('../services/topologyIntentService');
 const { nodeActivation: normalizeNodeActivation, nodeDesiredVersion } = require('../services/topologyNodeActivation');
 const { verifyImportedProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
 const { primaryReservePolicies } = require('../domain/primaryReservePolicy');
+const { projectSubscriptionXray } = require('../../../utils/subscriptionNodeProjection');
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
 const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +fullTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -529,7 +530,7 @@ class TopologyDeploymentRepository {
             const { baseline, owners } = await this.readVerifiedBaseline({ snapshot, executionContext, session, catalog, resources,
                 desiredTopology: { nodes: rows.map(row => ({ id: String(row._id), role: row.cascadeRole })) } });
             const nodes = baseline.nodes.filter(node => nodeIds.includes(node.id)).map(node => ({
-                nodeId: node.id, ip: node.ip, domain: node.domain, sni: node.sni, port: node.port, xray: plain(node.xray || {}),
+                nodeId: node.id, ip: node.ip, domain: node.domain, sni: node.sni, port: node.port, xray: plain(projectSubscriptionXray(node.xray || {})),
                 ...(typeof node.profileConfig === 'string' ? { candidateHash: createHash('sha256').update(node.profileConfig).digest('hex') } : {}),
             }));
             // These pointers change atomically in the existing settled publication
