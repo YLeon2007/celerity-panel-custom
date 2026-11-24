@@ -6,6 +6,7 @@ const { t: translate } = require('../middleware/i18n');
 const { readAccountCount, formatRelayCounts } = require('./rebuildRelayCounts');
 const { assertNoPendingRelayAccounts } = require('./rebuildRelayAccountsStore');
 const { assertNoIncidentLinks, assertNoRelayEnrollment } = require('./rebuildNodeDeleteGuard');
+const { assertExitsUnused, assertPortalSourceExitsUnused, exitRefusalForError } = require('./rebuildExit');
 const { isPristine } = require('./rebuildRelayBackendStore');
 const { PROTECTED: VLESS_PROTECTED, UNAVAILABLE: VLESS_UNAVAILABLE } = require('./rebuildClientConfigOwnership');
 
@@ -110,6 +111,18 @@ function changesIdentityField(node, key, value) {
     return (value == null ? value : node.schema.path(key).cast(value)) !== node.get(key);
 }
 
+async function assertNodeExitsUnused(node) {
+    if (!node) return;
+    const Link = require('../models/cascadeLinkModel');
+    const Node = require('../models/hyNodeModel');
+    if (node.cascadeRole === 'portal') {
+        await assertPortalSourceExitsUnused({ Link, Node, nodeId: node._id });
+    } else if (['relay', 'bridge'].includes(node.cascadeRole)) {
+        const links = await primary(Link.find({ $or: [{ portalNode: node._id }, { bridgeNode: node._id }] }).select('_id')).lean();
+        await assertExitsUnused({ Link, Node, removedIds: links.map(link => link._id) });
+    }
+}
+
 // Only invalidate L2TP ownership on a real change. In particular, the panel
 // always resubmits the SSH port and username when saving a cosmetic edit.
 async function assertNodeEditAllowed(node, updates, sshUpdates = {}) {
@@ -120,6 +133,11 @@ async function assertNodeEditAllowed(node, updates, sshUpdates = {}) {
         || (Object.hasOwn(updates, 'ssh') && sshKeys.some(key => changesIdentityField(node, `ssh.${key}`, updates.ssh?.[key])))) {
         await assertRelayNodeWritable(node._id);
     }
+
+    const invalidatesEndpoint = (changed('active') && node.schema.path('active').cast(updates.active) !== true)
+        || (changed('useCustomConfig') && node.schema.path('useCustomConfig').cast(updates.useCustomConfig) === true)
+        || changed('type') || changed('cascadeRole');
+    if (invalidatesEndpoint) await assertNodeExitsUnused(node);
 
     // A same-address edit also writes the sibling cards. Check them *before*
     // the primary edit, including when its own submitted SSH values are a no-op.
@@ -136,6 +154,8 @@ async function assertNodeEditAllowed(node, updates, sshUpdates = {}) {
 
 function describeRoleError(error, t = translate) {
     const code = error?.code;
+    const exit = exitRefusalForError(error);
+    if (exit) return { status: 409, ...exit, message: `Exit is in use by: ${exit.portalNames.join(', ')}` };
     if (code === BLOCKED || code === WRITE_BLOCKED) {
         const { accountCount, activeSessions, activeIpsec } = error.counts;
         const key = code === BLOCKED ? 'nodes.rebuildRoleBlocked' : 'nodes.rebuildNodeWriteBlocked';
@@ -147,4 +167,4 @@ function describeRoleError(error, t = translate) {
         ...(error.retryAllowed === false && { retryAllowed: false }) };
 }
 
-module.exports = { relayRoleBlock, withNodeWriterFence, withNodeWrite, nodeWriteVerifier, assertNodeEditAllowed, assertRelaySetupAllowed, describeRoleError };
+module.exports = { relayRoleBlock, withNodeWriterFence, withNodeWrite, nodeWriteVerifier, assertNodeEditAllowed, assertNodeExitsUnused, assertRelaySetupAllowed, describeRoleError };

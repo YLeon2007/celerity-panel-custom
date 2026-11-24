@@ -155,7 +155,7 @@ async function observeAgent(sync, node) {
 }
 
 function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, relayGrantStore, locks,
-    gate, retireGraph, verifyLinks, sameProtectedTarget, removal, guard }) {
+    gate, retireGraph, checkRetireExits = async () => {}, verifyLinks, sameProtectedTarget, removal, guard }) {
     let store;
     const target = () => store ??= createRetireStore({ Link, Node, State, L2tpUser, env });
 
@@ -231,6 +231,7 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
         if (!validId(nodeId)) throw fail('REBUILD_INVALID_REQUEST');
         const { estimate, resume } = await locks.run(async (verify, retain) => {
             if (typeof retain !== 'function') throw fail('REBUILD_LOCK_LOST');
+            await checkRetireExits(nodeId, verify);
             const data = await initial(nodeId);
             const { mode, unavailableSince } = await classify(nodeId, data);
             const graph = await retireGraph({ nodeId, mode, preview: true }, verify);
@@ -262,6 +263,7 @@ function createRebuildRelayRetire({ Link, Node, State, L2tpUser, env, sync, rela
                 try {
                     fresh();
                     await snapshotStill(data.snapshot);
+                    await checkRetireExits(nodeId, verify);
                     await verifyLinks(nodeId, original.previewId);
                     // Abandon is an explicit relinquishment, even if the
                     // target is back. Only local evidence and survivors apply.

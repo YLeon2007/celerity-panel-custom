@@ -147,6 +147,7 @@ async function prepareLinks(Link, links, { persist = false, verify, env = proces
                 const copy = { ...link };
                 delete copy[FIELD];
                 delete copy.rebuildApplied;
+                delete copy.rebuildAppliedExit;
                 delete copy.classicLifecycleGrant;
                 if (needsKey(link)) {
                     const { id, envelope: stored } = rows[i];

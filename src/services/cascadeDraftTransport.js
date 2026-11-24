@@ -29,7 +29,8 @@ function assertKcpSecurity(transport, security) {
 
 function publicCascadeLink(link) {
     if (!link) return link;
-    const { kcpPassword: _serverOwned, ...fields } = typeof link.toJSON === 'function' ? link.toJSON() : link;
+    // Exit selectors are projected explicitly by Rebuild-aware callers.
+    const { kcpPassword: _serverOwned, rebuildExit: _desiredExit, rebuildAppliedExit: _appliedExit, ...fields } = typeof link.toJSON === 'function' ? link.toJSON() : link;
     return fields;
 }
 

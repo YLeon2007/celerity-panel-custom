@@ -4,6 +4,7 @@ const { randomBytes } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { requireAuth } = require('./helpers');
 const { validNodeId, validActor } = require('./rebuildRelayAdmission');
+const { exitRefusalForError } = require('../../services/rebuildExit');
 const { neighborRefusalForError } = require('../../services/rebuildNeighborRefusal');
 
 const retirePath = /^\/rebuild\/relays\/[^/]+\/retire\/(?:preview|confirm)$/;
@@ -80,7 +81,7 @@ async function sendPreview(req, res, nodeId, replacing = false) {
         return res.status(replacing ? 409 : 200).type('application/json').end(JSON.stringify(body));
     } catch (error) {
         if (isRefreshableChange(error)) return respondError(res, 409, changed);
-        const refusal = neighborRefusalForError(error);
+        const refusal = exitRefusalForError(error) ?? neighborRefusalForError(error);
         if (refusal) return res.status(409).json({ error: refusal });
         const code = safeRefusal(error);
         if (code) return respondError(res, 409, code);
@@ -114,7 +115,7 @@ async function confirm(req, res, nodeId) {
         if (isRefreshableChange(error)) {
             return entry.decision === 'abandon' ? respondError(res, 409, changed) : sendPreview(req, res, nodeId, true);
         }
-        const refusal = neighborRefusalForError(error);
+        const refusal = exitRefusalForError(error) ?? neighborRefusalForError(error);
         if (refusal) return res.status(409).json({ error: refusal });
         const code = safeRefusal(error);
         if (code) return respondError(res, 409, code);

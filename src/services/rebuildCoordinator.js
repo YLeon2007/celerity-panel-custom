@@ -2,7 +2,7 @@
 const { isDeepStrictEqual: equal } = require('node:util');
 const {createHmac,randomBytes}=require('node:crypto');
 const {linkSnapshotBytes}=require('./rebuildLinkSnapshot');
-const {addRemoveExitImpacts}=require('./rebuildPreviewExitImpact');
+const {addExitImpacts}=require('./rebuildPreviewExitImpact');
 const {hasReverseObservationEmail}=require('./rebuildReverseIdentity');
 const {refuseStaleKcpPreview}=require('./rebuildKcpAdmission');
 // The preview fingerprint is opaque and expires when the panel restarts.
@@ -135,13 +135,18 @@ async function runGraph(d, req, retire = false) {
     return d.global(async(verify = async()=>{})=>{
         const inventory=await d.links(), anchor=inventory.find(row=>id(row)===req.linkId);
         const confirmedLinks=!req.preview && req.expectedPreview?.length===128;
-        if (!anchor && !req.nodeId) throw fail(confirmedLinks?'REBUILD_LINK_CHANGED':'REBUILD_LINK_NOT_FOUND');
+        if (!anchor && !req.nodeId) {
+            if(req.remove&&req.linkId)await d.assertExitsUnused?.([req.linkId]);
+            throw fail(confirmedLinks?'REBUILD_LINK_CHANGED':'REBUILD_LINK_NOT_FOUND');
+        }
         const retirement=retire?retirementScope(inventory,req.nodeId):null;
         const lockedNodes=retirement?.nodes ?? componentFor(inventory,anchor?ends(anchor):[req.nodeId]);
         const nodes=retire&&req.mode==='abandon'?lockedNodes.filter(n=>n!==req.nodeId):lockedNodes;
         return d.withNodes(lockedNodes,async()=>{
             const scope=new Set(nodes), scopedRows=rows=>rows.filter(row=>ends(row).every(n=>scope.has(n)));
             const links=retirement?.links ?? scopedRows(inventory);
+            const removed=retirement?.incident ?? links.filter(row=>row.rebuildDelete===true || req.remove && id(row)===req.linkId);
+            if(removed.length)await d.assertExitsUnused?.(removed.map(id),retire?req.nodeId:undefined);
             // Bind both the working rows and the profiles to the opaque token.
             // Separate digests let Apply identify row drift before composing.
             const linkVersion=fingerprintLinks(links);
@@ -151,12 +156,11 @@ async function runGraph(d, req, retire = false) {
             }
             if(links.some(row=>row.lifecycle)) throw fail('REBUILD_CONFLICTING_LINK_LIFECYCLE');
             if(retire)checkRetirementLinks(links);
-            const removed=retirement?.incident ?? links.filter(row=>row.rebuildDelete===true || req.remove && id(row)===req.linkId);
             const removedSet=new Set(removed);
             const desired=links.filter(row=>!removedSet.has(row)&&row.active!==false&&(!retire||row.rebuildDelete!==true));
             const {candidates,coreIdentities,kcpVersions}=await d.build(nodes,desired,retirement);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
-            const pairs=new Map(), report=[], observedMain=req.remove&&d.nodeRole?new Map():null, fingerprint=createHmac('sha256',previewKey);
+            const pairs=new Map(), report=[], observedMain=d.nodeRole?new Map():null, fingerprint=createHmac('sha256',previewKey);
             const survivor=retire?createHmac('sha256',previewKey):null;
             const binding=[linkVersion,req.linkId,!!req.remove,removed.map(id).sort(),desired.map(id).sort()];
             if(retire)binding.push('retire',req.nodeId,req.mode);
@@ -200,7 +204,7 @@ async function runGraph(d, req, retire = false) {
             const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
             if(survivor)result.survivorPreview=linkVersion+survivor.digest('hex');
             const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;
-            if(observedMain&&(req.preview||!result.allowed||stale))addRemoveExitImpacts(report,links,observedMain,candidates,d.nodeRole);
+            if(observedMain&&(req.preview||!result.allowed||stale))addExitImpacts(report,links,observedMain,candidates,d.nodeRole,d.nodeName,!!req.remove);
             async function checkKcpSnapshot(){
                 if(!kcpVersions?.length)return;
                 const fresh=await d.links();

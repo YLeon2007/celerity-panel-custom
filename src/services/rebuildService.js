@@ -5,6 +5,7 @@ const {runRebuild,runRetireGraph,retirementScope,fingerprintLinks,hasProtectedCl
 const {checkNeighborRefusal}=require('./rebuildNeighborRefusal');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
+const {compileRebuildGraph}=require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
 const {createTransport,createBoundRelayTransport,profileBytes,profileSha256}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {assertRealityFingerprint,realityDialerId}=require('./rebuildRealityFingerprint');
@@ -19,6 +20,7 @@ const {assertNoPendingRelayAccounts}=require('./rebuildRelayAccountsStore');
 const {resolveRelayBinding,relayInstallEnabled}=require('./rebuildRelayAuthorization');
 const {readRelayAuthority,captureRelayEffect,identityChanged}=require('./rebuildRelayEffectAuthority');
 const {appliedLink}=require('./rebuildAppliedLink');
+const {assertExitsUnused,storedExit,plainName}=require('./rebuildExit');
 const {isReverse,isKcp,kcpApplyFingerprint,unverified}=require('./rebuildReverseLinkHealth');
 const {transactOnce,AcknowledgedCommitCleanupError}=require('./rebuildRelayInstallTransaction');
 const {createPrivateKey,createPublicKey,randomBytes}=require('node:crypto');
@@ -212,6 +214,12 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         const fresh=retirementScope(await observedLinks(session),nodeId);
         if(!version.startsWith(fingerprintLinks(fresh.links)))throw fail('REBUILD_LINK_CHANGED');
     };
+    const checkExitRemoval=(removedIds,retiredNodeId)=>assertExitsUnused({Link,Node,removedIds,retiredNodeId});
+    // Check before reachability classification; the coordinator also protects direct calls.
+    const checkRetireExits=(nodeId,verify)=>underApply(verify,async()=>{
+        const {incident}=retirementScope(await observedLinks(),nodeId);
+        await checkExitRemoval(incident.map(row=>row._id),nodeId);
+    });
     // Orchestration only. Compare survivorPreview across online L2TP Remove,
     // then confirm with the new full previewId, never with survivorPreview.
     async function retireGraph(input,heldVerify){
@@ -278,10 +286,11 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             return fn(verifyApply);
         }),withNodes:(ids,fn)=>withNodes(ids,()=>usingTransports(transports,fn)),
             links:retire?observedLinks:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]},null,fullLinkRead).lean(),
+            assertExitsUnused:checkExitRemoval,
             async build(ids,links,retirement){
                 const nodes=ids.length?await Node.find({_id:{$in:ids}}).select(`+xray.manualKey ${PRIVATE_KEY_SELECT}`).lean():[];
                 if(nodes.length!==ids.length||nodes.some(n=>n.type!=='xray'||!n.active||n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
-                if(req.preview)for(const node of nodes)inventoryNames.set(String(node._id),node.name);
+                for(const node of nodes)inventoryNames.set(String(node._id),node.name);
                 if(retire){
                     // Abandon only reads the target card identity/role. No
                     // target credentials, state, binding or profiles are needed.
@@ -301,7 +310,10 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     }
                     if(!ids.length){states=new Map();return {candidates:[]};}
                 }
-                if(req.remove)for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
+                for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
+                // Route edits on other rows can invalidate a saved pick. Refuse
+                // from the fresh desired scope before opening host transports.
+                if(links.some(link=>link.rebuildExit!=null))compileRebuildGraph({nodes,links,affectedNodeIds:ids});
                 states=await installedStates(ids);
                 const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
                 let kcpVersions;
@@ -360,6 +372,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 return {coreIdentities,kcpVersions,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
             },
             nodeRole:id=>roles.get(id),
+            nodeName:id=>plainName(inventoryNames.get(id)),
             async read(id,p,before,expected){
                 if(!retire||!before)return readProfile(id,p,p==='main'&&expected?profileSha256(profileBytes(expected)):undefined);
                 // The early read established reachability and drove bridge
@@ -419,11 +432,16 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     }
                     for(const link of desired){
                         const epoch=randomBytes(16).toString('hex'),kcp=isKcp(link);
+                        const portalIngress=roles.get(String(link.portalNode))==='portal'&&roles.get(String(link.bridgeNode))==='relay';
+                        const exit=portalIngress?storedExit(link.rebuildExit)??null:undefined;
                         const result=await Link.updateOne({_id:link._id,active:{$ne:false},rebuildDelete:{$ne:true}},
                             {$set:{...(isReverse(link)||kcp?unverified:{status:'deployed',lastError:''}),rebuildApplied:appliedLink(link),
                                 rebuildApplyEpoch:epoch,rebuildAppliedMainSha256:mainPins.get(String(link.portalNode)),
-                                ...(kcp?{rebuildKcpApplied:kcpApplyFingerprint(link,epoch)}:{})},
-                            $unset:{rebuildReverseObservation:'',rebuildDesiredEdited:'',...(!kcp?{rebuildKcpApplied:''}:{})}},{session,runValidators:true});
+                                ...(exit!==undefined?{rebuildAppliedExit:exit}:{}),
+                                 ...(kcp?{rebuildKcpApplied:kcpApplyFingerprint(link,epoch)}:{})},
+                            $unset:{rebuildReverseObservation:'',rebuildDesiredEdited:'',
+                                 ...(!portalIngress&&Object.hasOwn(link,'rebuildAppliedExit')?{rebuildAppliedExit:''}:{}),
+                                 ...(!kcp?{rebuildKcpApplied:''}:{})}},{session,runValidators:true});
                         if(result.acknowledged!==true||result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');
                     }
                     if(removed.length){const result=await Link.deleteMany({_id:{$in:removed.map(l=>l._id)},...(!retire&&{rebuildDelete:true})},{session});if(result.deletedCount!==removed.length||retire&&result.acknowledged!==true)throw fail('REBUILD_LINK_CHANGED');}
@@ -452,7 +470,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     };
     const relayRemoval=createRebuildRelayRemove({Link,Node,State,L2tpUser,locks:guardedLocks,withHeldLock,env,relayGrantStore,createRelayDirect});
     const relayRetire=createRebuildRelayRetire({Link,Node,State,L2tpUser,env,sync,relayGrantStore,locks:guardedLocks,gate,
-        retireGraph,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
+        retireGraph,checkRetireExits,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
     return {execute,retireGraph,verifyDraftKcp,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,recoverRelayInstall,...relayRemoval,...relayRetire,
         createRelayAccount: input=>relayAccounts().create(input),

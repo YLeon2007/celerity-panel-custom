@@ -2,6 +2,11 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { addExitImpacts } = require('../rebuildPreviewExitImpact');
+const ejs = require('ejs');
 const express = require('express');
 const { issuePanelCsrfToken } = require('../../routes/panel/csrf');
 const { routerForRebuild } = require('../../routes/cascadeRebuild');
@@ -182,4 +187,149 @@ test('Remove warns when a legacy default is replaced with a blocked policy', asy
     generator.applyReversePortal(main, [populated], [nodes[0].xray.inboundTag]);
     observed.find(p => p.nodeId === portal && p.profile === 'main').config = main;
     assert.deepEqual(impact(await fixture(t, [reversed], observed)(reversed)), { [portal]: 'blocked' });
+});
+
+const previewNodes = nodes.map((node, index) => ({ ...node, _id: `a${String(index).padStart(23, '0')}`,
+    name: ['Portal', 'Relay', 'Gateway', 'Other gateway', 'Shared portal'][index] }));
+const [p, r, a, b, sibling] = previewNodes.map(n => n._id);
+const inlet = link(10, p, r, { mode: 'forward' });
+const siblingInlet = link(11, sibling, r);
+const first = link(12, r, a, { mode: 'forward', name: 'Main channel' });
+const second = link(13, r, a);
+const geoRule = { enabled: true, domains: ['full:PRIVATE_MATCHER.fixture.invalid'] };
+const geoEdge = link(14, r, b, { geoRouting: geoRule });
+const sharedDefault = link(15, r, b, { priority: 1 });
+
+function images(links, { scoped = false, geo = true } = {}) {
+    return composeRebuildProfiles({ nodes: previewNodes,
+        links: links.map(edge => scoped && edge._id === inlet._id
+            ? { ...edge, rebuildExit: { nodeId: a, relayGeo: geo } } : edge) });
+}
+
+const publicTarget = (edge, name) => ({ nodeId: edge.bridgeNode, name, linkId: edge._id,
+    ...(edge.name && { linkName: edge.name }) });
+
+function exitReport(links, before, after, remove = false) {
+    const result = previewNodes.map(({ _id: nodeId }) => ({ nodeId }));
+    addExitImpacts(result, links, new Map(before.filter(row => row.profile === 'main').map(row => [row.nodeId, row.config])),
+        after, id => previewNodes.find(node => node._id === id)?.cascadeRole,
+        id => previewNodes.find(node => node._id === id)?.name, remove);
+    return result;
+}
+
+test('Remove reports the observed forward channel switching to a reverse channel on the same gateway', () => {
+    const links = [inlet, first, second, sharedDefault];
+    const [result] = exitReport([{ ...inlet, mode: 'reverse', rebuildExit: { nodeId: b } },
+        { ...first, mode: 'reverse' }, second, sharedDefault],
+        images(links, { scoped: true }), images([inlet, second, sharedDefault], { scoped: true }), true);
+    assert.deepEqual(result.portalExitChange, { before: publicTarget(first, 'Gateway'), after: publicTarget(second, 'Gateway') });
+    assert.equal(result.exitImpact, undefined);
+});
+
+test('Geo-only portal reports the scoped gateway switch without inventing a default or exposing matchers', () => {
+    const geoInlet = { ...inlet, geoRouting: geoRule };
+    const links = [geoInlet, first, second, siblingInlet, sharedDefault];
+    const report = exitReport(links, images([geoInlet, first, siblingInlet, sharedDefault], { scoped: true }),
+        images([geoInlet, second, siblingInlet, sharedDefault], { scoped: true }));
+    assert.deepEqual(report[0].portalExitGeoChange, { before: [publicTarget(first, 'Gateway')], after: [publicTarget(second, 'Gateway')] });
+    assert.equal(report[0].portalExitChange, undefined);
+    assert.equal(report.at(-1).portalExitGeoChange, undefined);
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_MATCHER|fwd-hop|rebuild-policy/);
+});
+
+test('Scoped geo change with the same default reports ordered targets only for the matching portal ingress', () => {
+    const geoTwo = { ...second, geoRouting: { enabled: true, geoip: ['ru'] } };
+    const links = [inlet, siblingInlet, first, geoEdge, geoTwo];
+    const before = images(links, { scoped: true });
+    const after = images(links.map(edge => edge === geoEdge ? { ...edge, priority: 1 } : edge), { scoped: true });
+    const report = exitReport(links, before, after);
+    assert.deepEqual(report[0].portalExitGeoChange, {
+        before: [publicTarget(geoTwo, 'Gateway'), publicTarget(geoEdge, 'Other gateway')],
+        after: [publicTarget(geoEdge, 'Other gateway'), publicTarget(geoTwo, 'Gateway')],
+    });
+    assert.ok(report.every(node => node.portalExitChange === undefined));
+    assert.equal(report.at(-1).portalExitGeoChange, undefined);
+});
+
+test('Compare scoped geo match edits privately, and ignore pure shared relay geo repairs', () => {
+    const links = [inlet, siblingInlet, first, geoEdge];
+    const edited = links.map(edge => edge === geoEdge ? { ...edge, geoRouting: { enabled: true, domains: ['full:NEW_PRIVATE_MATCHER.invalid'] } } : edge);
+    const before = images(links, { scoped: true });
+    const report = exitReport(links, before, images(edited, { scoped: true }));
+    const target = [publicTarget(geoEdge, 'Other gateway')];
+    assert.deepEqual(report[0].portalExitGeoChange, { before: target, after: target });
+    assert.equal(report.at(-1).portalExitGeoChange, undefined);
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_MATCHER/);
+    const shared = exitReport(links, images([inlet, siblingInlet, first]), images(links));
+    assert.ok(shared.every(node => !Object.keys(node).some(key => key.startsWith('portalExit'))));
+});
+
+test('Scoped relay geo policy can change its target or disappear while the observed default stays put', () => {
+    const moved = { ...second, geoRouting: geoRule };
+    const links = [inlet, siblingInlet, first, geoEdge, moved];
+    const before = images([inlet, siblingInlet, first, geoEdge], { scoped: true });
+    const after = images([inlet, siblingInlet, first, moved], { scoped: true });
+    const [retargeted] = exitReport(links, before, after);
+    assert.deepEqual(retargeted.portalExitGeoChange, {
+        before: [publicTarget(geoEdge, 'Other gateway')], after: [publicTarget(moved, 'Gateway')],
+    });
+    const [disabled] = exitReport(links, before, images([inlet, siblingInlet, first, geoEdge], { scoped: true, geo: false }));
+    assert.deepEqual(disabled.portalExitGeoChange, { before: [publicTarget(geoEdge, 'Other gateway')], after: [] });
+    assert.equal(retargeted.portalExitChange, undefined);
+    assert.equal(disabled.portalExitChange, undefined);
+});
+
+test('A scoped default terminates geo lookup before any later shared or foreign-ingress branches', () => {
+    const links = [inlet, siblingInlet, first, geoEdge];
+    const before = images(links, { scoped: true, geo: false });
+    const after = images(links, { scoped: true, geo: false });
+    const rules = after.find(row => row.nodeId === r && row.profile === 'main').config.routing.rules;
+    const sharedGeo = rules.find(rule => rule.ruleTag === 'rebuild-policy-geo-0-domain');
+    sharedGeo.domain = ['full:SHARED_REPAIR.fixture.invalid'];
+    const suffix = inlet._id.slice(-8);
+    // The prefix alone doesn't prove the rule applies to our portal's ingress.
+    const scopedDefault = rules.findIndex(rule => rule.ruleTag === `rebuild-policy-portal-${suffix}-default`);
+    rules.splice(scopedDefault, 0, { ...sharedGeo, ruleTag: `rebuild-policy-portal-${suffix}-geo-0-domain`,
+        inboundTag: [`rebuild-rp-ingress-${siblingInlet._id.slice(-8)}`] });
+    assert.ok(exitReport(links, before, after).every(node => !Object.keys(node).some(key => key.startsWith('portalExit'))));
+});
+
+const project = path.join(__dirname, '../../..');
+async function previewDisplay(fields, modernMap, lang = 'en') {
+    const messages = require(`../../locales/${lang}.json`);
+    const t = key => key.split('.').reduce((obj, segment) => obj?.[segment], messages) ?? key;
+    const html = await ejs.renderFile(path.join(project, 'views/partials/rebuild-preview.ejs'), { t, lang, modernMap });
+    let text;
+    const window = { confirm: message => { text = message; return false; } };
+    const context = vm.createContext({ window, document: { getElementById: () => null } });
+    vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context);
+    vm.runInContext(fs.readFileSync(path.join(project, 'public/js/rebuild-preview.js'), 'utf8'), context);
+    await window.C3RebuildPreview.confirmReport({ removing: false,
+        lookupNode: () => ({ label: 'Portal', role: 'portal' }), report: { allowed: true, previewId: 'a'.repeat(64), nodes: [
+            { nodeId: p, profiles: [{ change: 'replace', protectedChanged: false, sections: ['routing'] }], ...fields },
+        ] } });
+    return text;
+}
+
+test('Preview text names both channels even with the same gateway name and keeps legacy default-only output unchanged', async () => {
+    const channel = { before: publicTarget(first, 'Gateway'), after: publicTarget(second, 'Gateway') };
+    for (const modern of [false, true]) {
+        assert.match(await previewDisplay({ portalExitChange: channel }, modern),
+            /Default exit: Gateway \(Main channel · #00000012\) → Gateway \(#00000013\)/);
+    }
+    const ordinary = { before: { nodeId: a, name: 'Gateway' }, after: { nodeId: b, name: 'Other gateway' } };
+    assert.equal(await previewDisplay({ portalExitChange: ordinary }, false), await previewDisplay({}, false));
+    assert.match(await previewDisplay({ portalExitChange: ordinary }, true), /Default exit: Gateway → Other gateway/);
+});
+
+test('Preview text reports geo-only target and private matcher changes independently of a default change', async () => {
+    const old = publicTarget(geoEdge, 'Other gateway');
+    const swap = { before: [old], after: [publicTarget(second, 'Gateway')] };
+    const geoText = await previewDisplay({ portalExitGeoChange: swap }, true);
+    assert.match(geoText, /(?:Geo routes|Geo \(routing\)): Other gateway \(#00000014\) → Gateway \(#00000013\)/);
+    assert.doesNotMatch(geoText, /Default exit/);
+    const matcherOnly = { before: [old], after: [old] };
+    const ru = await previewDisplay({ portalExitGeoChange: matcherOnly }, false, 'ru');
+    assert.match(ru, /(?:Геомаршруты|Geo \(маршруты\)): меняются маршруты/);
+    assert.doesNotMatch(ru, /PRIVATE_MATCHER|network\.rebuildPreview/);
 });

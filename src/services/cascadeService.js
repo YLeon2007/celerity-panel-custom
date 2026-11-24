@@ -28,6 +28,7 @@ const { trackLegacyCascadeUndeploy } = require('../modules/relay-l2tp/services/l
 
 // Only reuse Classic entries produced by this version's public projection.
 const TOPOLOGY_CACHE_KEY = 'c3:cascade:topology:public-v2';
+const { exitDto } = require('./rebuildExit');
 const TOPOLOGY_CACHE_TTL = 15;
 const TOPOLOGY_NODE_SELECT = 'name ip domain flag type status onlineUsers cascadeRole mapPosition.x mapPosition.y '
     + 'country port ssh.password ssh.privateKey lastError lastSync';
@@ -36,7 +37,8 @@ const TOPOLOGY_LINK_SELECT = 'name portalNode bridgeNode status mode tunnelPort 
 // Private inputs for Rebuild write eligibility, Apply history and health.
 const TOPOLOGY_REBUILD_LINK_SELECT = 'active rebuildDelete lifecycle updatedAt tunnelUuid tunnelEncryption '
     + 'rebuildTlsServerName kcpHeader kcpMtu kcpTti kcpUplinkCapacity kcpDownlinkCapacity '
-    + 'rebuildApplied rebuildApplyEpoch rebuildReverseObservation rebuildDesiredEdited';
+    + 'rebuildApplied rebuildApplyEpoch rebuildReverseObservation rebuildDesiredEdited rebuildExit rebuildAppliedExit '
+    + 'priority geoRouting.enabled';
 
 const MAP_ERROR_MESSAGES = new Set([
     'Xray health unknown: no agent token configured',
@@ -1511,7 +1513,13 @@ class CascadeService {
                     lastError: topologyError(l.lastError),
                     lastHealthCheck: topologyTime(l.lastHealthCheck),
                     rebuildApplied: applied,
-                    ...(rebuild && { canEdit, hasUnappliedChanges }),
+                    ...(rebuild && { canEdit, hasUnappliedChanges, ...exitDto(row, true),
+                        // Mirror the compiler: only an absent priority defaults;
+                        // a malformed stored number is not a selectable default.
+                        priority: row.priority === undefined ? CascadeLink.schema.path('priority').defaultValue
+                            : Number.isFinite(row.priority) ? row.priority : null,
+                        geoRouting: { enabled: row.geoRouting?.enabled === true },
+                    }),
                 },
             };
         });

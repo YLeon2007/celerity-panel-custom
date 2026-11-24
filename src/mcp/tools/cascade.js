@@ -20,6 +20,20 @@ const { isRebuildEnabled, rebuildStrictDisabled } = require('../../services/rebu
 const { KCP_HEADERS, KCP_LIMITS, assertClassicTunnelTransport } = require('../../utils/cascadeTransport');
 const { INVALID_KCP_LINK_SETTINGS, readKcpFields, assertKcpSecurity, publicCascadeLink } = require('../../services/cascadeDraftTransport');
 const { projectLinkHealth, observationSelect } = require('../../services/rebuildReverseLinkHealth');
+const { inputExit, exitDto, exitRefusalForError, PORTAL_EXIT_INVALID } = require('../../services/rebuildExit');
+const { previewForError } = require('../../services/rebuildCoordinator');
+const { saveRebuildDraft } = require('../../services/rebuildDraftLink');
+const readSelect = rebuild => rebuild ? `${observationSelect} +rebuildAppliedExit` : '+rebuildKcpApplied';
+
+function projectPublicLink(row, rebuild) {
+    if (!rebuild) return publicCascadeLink(projectLinkHealth(row, false));
+    const link = projectLinkHealth(row, true);
+    return { _id: link._id, name: link.name, portalNode: link.portalNode, bridgeNode: link.bridgeNode,
+        active: link.active, status: link.status, mode: link.mode, tunnelPort: link.tunnelPort,
+        tunnelProtocol: link.tunnelProtocol, tunnelTransport: link.tunnelTransport, tunnelSecurity: link.tunnelSecurity,
+        tunnelState: link.tunnelState, tunnelVerification: link.tunnelVerification, observationExpiresAt: link.observationExpiresAt,
+        ...exitDto(row, true) };
+}
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -61,6 +75,18 @@ const manageCascadeSchema = z.object({
     }).optional(),
 });
 
+const rebuildManageSchema = manageCascadeSchema.extend({
+    expectedPreview: z.string().regex(/^(?:[a-f0-9]{64}|[a-f0-9]{128})(?![\s\S])/).optional()
+        .describe('Preview ID required for checked Rebuild deletion, obtained from action preview_remove'),
+    action: z.enum(['create', 'update', 'delete', 'preview_remove']),
+    data: manageCascadeSchema.shape.data.unwrap().extend({
+        active: z.boolean().optional(),
+        rebuildExit: z.object({ nodeId: z.string().regex(/^[a-f0-9]{24}(?![\s\S])/i).nullable(),
+            relayGeo: z.boolean().optional() }).strict().nullable().optional()
+            .describe('Select an exit node reached from the relay; null restores shared policy'),
+    }).strict().optional(),
+}).strict();
+
 const getTopologySchema = z.object({});
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -70,13 +96,13 @@ async function queryCascade(args) {
     const rebuild = isRebuildEnabled();
     if (parsed.id) {
         const query = CascadeLink.findById(parsed.id);
-        query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+        query.select(readSelect(rebuild));
         if (rebuild) query.lean();
         const link = await query
             .populate('portalNode', 'name ip status')
             .populate('bridgeNode', 'name ip status');
         if (!link) return { error: `Cascade link '${parsed.id}' not found`, code: 404 };
-        return { link: publicCascadeLink(projectLinkHealth(link, rebuild)) };
+        return { link: projectPublicLink(link, rebuild) };
     }
 
     const filter = {};
@@ -87,15 +113,15 @@ async function queryCascade(args) {
     }
 
     const query = CascadeLink.find(filter);
-    query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+    query.select(readSelect(rebuild));
     if (rebuild) query.lean();
     const links = await query
         .populate('portalNode', 'name ip status')
         .populate('bridgeNode', 'name ip status')
         .sort({ createdAt: -1 });
 
-    return { links: links.map(link => projectLinkHealth(link, rebuild))
-        .filter(link => !parsed.filter?.status || parsed.filter.status === link.status).map(publicCascadeLink) };
+    return { links: links.map(link => projectPublicLink(link, rebuild))
+        .filter(link => !parsed.filter?.status || parsed.filter.status === link.status) };
 }
 
 let draftWriteService;
@@ -127,8 +153,38 @@ function getClassicTopologyCoordinator() {
     return classicTopologyCoordinator;
 }
 
+async function manageRebuildCascade(args) {
+    if (!['create', 'update', 'delete', 'preview_remove'].includes(args?.action)
+        || (args.action !== 'create' && !args.id)) throw rebuildStrictDisabled();
+    const outcome = {};
+    try {
+        // Validate original keys before parsing, including rejected dotted aliases.
+        if (args.data !== undefined) inputExit(args.data);
+        const { action, id, data = {}, expectedPreview } = rebuildManageSchema.parse(args);
+        if (id !== undefined && !/^[a-f0-9]{24}(?![\s\S])/i.test(id)) throw Object.assign(new Error('Invalid link ID'), { code: 'REBUILD_INVALID_REQUEST' });
+        const linkId = id?.toLowerCase();
+        const service = require('../../services/rebuildService').createRebuildService();
+        if (action === 'create' || action === 'update') {
+            if (action === 'create' && id !== undefined) throw Object.assign(new Error('Invalid create ID'), { code: 'REBUILD_INVALID_REQUEST' });
+            return { success: true, ...await saveRebuildDraft({ service, Link: CascadeLink, Node: HyNode, linkId, body: data }, outcome) };
+        }
+        if (action === 'preview_remove') return { preview: await service.execute({ linkId, remove: true, preview: true }) };
+        if (!expectedPreview) return { error: 'REBUILD_PREVIEW_REQUIRED', code: 'REBUILD_PREVIEW_REQUIRED', status: 428 };
+        return { success: true, executionMode: 'rebuild', deleted: linkId,
+            ...await service.execute({ linkId, remove: true, expectedPreview }) };
+    } catch (error) {
+        const code = error?.name === 'ZodError' ? 'REBUILD_INVALID_REQUEST'
+            : typeof error?.code === 'string' && /^(?:REBUILD_[A-Z0-9_]+|INVALID_KCP_LINK_SETTINGS)(?![\s\S])/.test(error.code)
+                ? error.code : 'REBUILD_FAILED';
+        const preview = previewForError(error);
+        return { error: code, code, status: ['REBUILD_INVALID_REQUEST', PORTAL_EXIT_INVALID, INVALID_KCP_LINK_SETTINGS].includes(code)
+            ? 400 : code === 'REBUILD_LINK_NOT_FOUND' ? 404 : code === 'REBUILD_PREVIEW_REQUIRED' ? 428 : 409,
+        ...exitRefusalForError(error), ...(outcome.linkId && { desiredSaved: true, linkId: outcome.linkId }), ...(preview && { preview }) };
+    }
+}
+
 async function manageCascade(args, emit) {
-    if (isRebuildEnabled()) throw rebuildStrictDisabled();
+    if (isRebuildEnabled()) return manageRebuildCascade(args);
     const parsed = manageCascadeSchema.parse(args);
     const { action, id, data = {}, expectedTopologyRevision } = parsed;
     if (action === 'create' || action === 'update') assertClassicTunnelTransport(data);
@@ -317,7 +373,7 @@ async function manageCascade(args, emit) {
 async function getTopology() {
     const rebuild = isRebuildEnabled();
     const query = CascadeLink.find({});
-    query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+    query.select(readSelect(rebuild));
     const [state, nodes, links] = await Promise.all([
         CascadeTopologyState.findById('singleton').select('revision deployedRevision').lean(),
         HyNode.find({ active: true }).select('name ip status cascadeRole country type').lean(),
@@ -334,6 +390,7 @@ async function getTopology() {
         links: links.map(row => {
             const l = projectLinkHealth(row, rebuild);
             return {
+                ...exitDto(row, rebuild),
                 _id: l._id,
                 name: l.name,
                 status: l.status,
@@ -354,7 +411,7 @@ module.exports = {
     getTopology,
     schemas: {
         queryCascade: queryCascadeSchema,
-        manageCascade: manageCascadeSchema,
+        get manageCascade() { return isRebuildEnabled() ? rebuildManageSchema : manageCascadeSchema; },
         getTopology: getTopologySchema,
     },
 };

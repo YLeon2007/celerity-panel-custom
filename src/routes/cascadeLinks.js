@@ -36,6 +36,7 @@ const { CASCADE_TRANSPORTS, CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE, asser
 const { detectLanguage, t } = require('../middleware/i18n');
 const { INVALID_KCP_LINK_SETTINGS, readKcpFields, assertKcpSecurity, publicCascadeLink } = require('../services/cascadeDraftTransport');
 
+const { exitDto } = require('../services/rebuildExit');
 const LINK_POPULATE_SELECT = 'name ip flag status';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
 const REALITY_KEY_RE = /^[A-Za-z0-9_\-+/]{43,44}=?$/;
@@ -330,7 +331,7 @@ async function readPersistedIntent(service, Link, requestKey) {
 
 async function listLinks(Link, filter = {}, rebuild = false) {
     const query = Link.find(filter);
-    query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+    query.select(rebuild ? `${observationSelect} +rebuildAppliedExit` : '+rebuildKcpApplied');
     return query
         .populate('portalNode', LINK_POPULATE_SELECT)
         .populate('bridgeNode', LINK_POPULATE_SELECT)
@@ -339,6 +340,7 @@ async function listLinks(Link, filter = {}, rebuild = false) {
 }
 
 function projectLinkLifecycle(link, rebuild = false) {
+    const exit = exitDto(link, rebuild);
     const hasApplyReceipt = !!link.rebuildApplied;
     const kcp = hasKcpStatus(link);
     link = projectLinkHealth(link, rebuild);
@@ -348,7 +350,7 @@ function projectLinkLifecycle(link, rebuild = false) {
     const applied = kcp ? link.tunnelVerification === 'mkcp_runtime_unsupported' : CONFIRMED_DEPLOYED_LINK_STATUSES.has(link.status);
     // Lifecycle status is not a fresh client/route proof. In particular, never
     // reconstruct a complete applied path from mutable desired neighbours.
-    return { ...publicLink,
+    return { ...publicLink, ...exit,
         desiredVersion: linkDesiredVersion({ ...link,
             portalNode: scopedLinkEntityId(link.portalNode), bridgeNode: scopedLinkEntityId(link.bridgeNode) }),
         applicationState: deleting ? 'deleting'
@@ -591,7 +593,7 @@ function createCascadeLinksRouter({
     if (isRebuildEnabled(deploymentEnv)) {
         router.use('/auto-deploy-jobs', rejectRebuildRoute);
         router.get('/port-check', rejectRebuildRoute);
-        // Transitional refusal: parent wires dedicated rebuild mutation handlers.
+        // Rebuild CRUD is mounted ahead of this separate, classic-only writer.
         router.post('/', rejectRebuildRoute);
         router.put('/:id', rejectRebuildRoute);
         router.delete('/:id', rejectRebuildRoute);
@@ -840,7 +842,7 @@ function createCascadeLinksRouter({
             const rebuild = isRebuildEnabled(deploymentEnv);
             const query = Link.findById(req.params.id);
             if (rebuild) res.set('Cache-Control', 'no-store');
-            query.select(rebuild ? observationSelect : '+rebuildKcpApplied');
+            query.select(rebuild ? `${observationSelect} +rebuildAppliedExit` : '+rebuildKcpApplied');
             const link = await query.populate('portalNode', LINK_POPULATE_SELECT)
                 .populate('bridgeNode', LINK_POPULATE_SELECT)
                 .lean();

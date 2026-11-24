@@ -31,7 +31,10 @@ test('Rebuild POST and PUT save mKCP settings under the existing lock; invalid e
     class Link {
         constructor(value) { Object.assign(this, { _id: id, mode: 'reverse', priority: 100, tunnelPort: 10086 }, value); }
         static findById() { return thenable(stored && new Link(stored)); }
+        get(key) { return this[key]; }
         set(key, value) { this[key] = value; }
+        modifiedPaths() { return Object.keys(this).filter(key => !require('node:util').isDeepStrictEqual(this[key], stored?.[key])); }
+        isModified() { return this.modifiedPaths().length > 0; }
         toObject() { return { ...this }; }
         markModified() {}
         async save() { assert.ok(locked && verified); stored = this.toObject(); saves++; }

@@ -24,6 +24,8 @@ const router = express.Router();
 const mcpService = require('../services/mcpService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
+const { isRebuildEnabled } = require('../services/rebuildMode');
+const { requirePanelCsrf } = require('./panel/csrf');
 
 const SERVER_INFO = { name: 'celerity', version: '1.0.0' };
 const PROTOCOL_VERSION = '2024-11-05';
@@ -34,6 +36,18 @@ const sseSessions = new Map();
 
 // All MCP requests require mcp:enabled scope (admin session bypasses it)
 router.use(requireScope('mcp:enabled'));
+
+// The parent mount authenticates both transports. Trust only its validated
+// req.apiKey, never the presence of a caller-supplied authorization header.
+function guardRebuildCascadeWrite(req, res, next) {
+    const rpc = req.body;
+    if (!req.apiKey && isRebuildEnabled() && rpc?.method === 'tools/call'
+        && rpc.params?.name === 'manage_cascade'
+        && ['create', 'update', 'delete'].includes(rpc.params.arguments?.action)) {
+        return requirePanelCsrf(req, res, next);
+    }
+    return next();
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -194,7 +208,7 @@ async function dispatch(rpc, apiKey, emitProg, translate) {
 
 // ─── 1. Streamable HTTP transport ─────────────────────────────────────────────
 
-router.post('/', async (req, res) => {
+router.post('/', guardRebuildCascadeWrite, async (req, res) => {
     const rpc = req.body;
 
     if (!rpc || !rpc.method) {
@@ -268,7 +282,7 @@ router.get('/sse', (req, res) => {
  * POST /api/mcp/messages?sessionId=<id>
  * Receives JSON-RPC from legacy SSE clients, sends response over the SSE stream.
  */
-router.post('/messages', async (req, res) => {
+router.post('/messages', guardRebuildCascadeWrite, async (req, res) => {
     const { sessionId } = req.query;
     const sseRes = sseSessions.get(sessionId);
 

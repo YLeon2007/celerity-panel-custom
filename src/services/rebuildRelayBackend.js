@@ -13,6 +13,7 @@ const { createStore, read } = require('./rebuildRelayBackendStore');
 const { makeDesired } = require('./rebuildRelayBackendDesired');
 const { resolveAccountSources } = require('./rebuildRelayAccountInventory');
 const { compileRebuildGraph } = require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
+const { storedExit, sameExit } = require('./rebuildExit');
 const { grantIdentity, validActor } = require('./rebuildRelayInstallRecoveryStore');
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -22,7 +23,7 @@ const eligible = (node, id, listMode) => String(node?._id) === id && node.type =
 async function readTopology(Node, Link, node, panelDomain) {
     const id = String(node._id);
     const links = await read(Link.find({ $or: [{ active: true }, { rebuildDelete: true }] })
-        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelTransport tunnelPort tunnelUuid rebuildApplied rebuildApplyEpoch +rebuildAppliedMainSha256 +rebuildKcpApplied'));
+        .select('portalNode bridgeNode active rebuildDelete lifecycle status geoRouting priority mode tunnelProtocol tunnelTransport tunnelPort tunnelUuid rebuildApplied rebuildApplyEpoch rebuildExit rebuildAppliedExit +rebuildAppliedMainSha256 +rebuildKcpApplied'));
     // Offline also describes an applied link whose tunnel is unconfirmed.
     const applied = link => link.active === true && !link.rebuildDelete && !link.lifecycle && ['deployed', 'online', 'offline'].includes(link.status);
     const notApplied = () => fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
@@ -39,6 +40,15 @@ async function readTopology(Node, Link, node, panelDomain) {
         throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
     }
     const nodes = [node, ...peers];
+    // Status and the five-key tunnel receipt do not attest the portal policy.
+    // Legacy shared rows may omit both selectors; an explicit pick must match
+    // a separately published Apply selector before the existing MAIN proof.
+    for (const row of scoped) {
+        const desired = storedExit(row.rebuildExit), applied = storedExit(row.rebuildAppliedExit);
+        if ((row.rebuildExit !== undefined && desired === undefined)
+            || (row.rebuildAppliedExit !== undefined && (applied === undefined || row.rebuildApplied == null))
+            || !sameExit(desired, applied)) throw notApplied();
+    }
     let byNodeId;
     try { ({ byNodeId } = compileRebuildGraph({ nodes, links: scoped, affectedNodeIds: [...ids] })); }
     catch { throw notApplied(); }
@@ -70,7 +80,8 @@ async function readTopology(Node, Link, node, panelDomain) {
         topologyWitness: { ready, peers: peers.map(({ _id, ip, domain, cascadeRole }) => [String(_id), ip, domain, cascadeRole])
             .sort((a, b) => a[0].localeCompare(b[0])), relay: [node.ip, node.domain],
             links: scoped.map(l => [String(l._id), String(l.portalNode), String(l.bridgeNode), l.mode, l.tunnelProtocol,
-                l.tunnelPort, l.tunnelUuid, l.priority, l.geoRouting, l.rebuildApplied, l.rebuildApplyEpoch])
+                l.tunnelPort, l.tunnelUuid, l.priority, l.geoRouting, l.rebuildApplied, l.rebuildApplyEpoch,
+                l.rebuildExit, l.rebuildAppliedExit])
                 .sort((a, b) => a[0].localeCompare(b[0])) },
         controlPlaneAddresses: [...new Set([panelDomain, ...nodes.flatMap(n => [n.ip, n.domain])].filter(Boolean))].sort(),
         carryDomain: relay.carryDomain,

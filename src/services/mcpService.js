@@ -19,6 +19,8 @@ const usersTools = require('../mcp/tools/users');
 const nodesTools = require('../mcp/tools/nodes');
 const groupsTools = require('../mcp/tools/groups');
 const cascadeTools = require('../mcp/tools/cascade');
+const { isRebuildEnabled } = require('./rebuildMode');
+const rebuild = isRebuildEnabled();
 const systemTools = require('../mcp/tools/system');
 const statsTools = require('../mcp/tools/stats');
 const logsTools = require('../mcp/tools/logs');
@@ -46,14 +48,15 @@ function zodToInputSchema(schema) {
 
 const TOOLS = {
     query: {
-        description: 'Query data from the panel. Supports: users, nodes, groups, stats, topology, logs. Use resource to specify what to fetch.',
+        description: 'Query data from the panel. Supports: users, nodes, groups, stats, topology, logs.'
+            + (rebuild ? ' Rebuild cascade links are available as resource cascade.' : '') + ' Use resource to specify what to fetch.',
         requiredScope: null, // scope checked per resource in handler
         inputSchema: {
             type: 'object',
             properties: {
                 resource: {
                     type: 'string',
-                    enum: ['users', 'nodes', 'groups', 'stats', 'logs'],
+                    enum: ['users', 'nodes', 'groups', 'stats', 'logs', ...(rebuild ? ['cascade'] : [])],
                     description: 'What to query',
                 },
                 id: { type: 'string', description: 'Specific item ID (userId for users, MongoDB _id for nodes/groups/cascade)' },
@@ -97,7 +100,8 @@ const TOOLS = {
     },
 
     manage_cascade: {
-        description: 'Manage cascade links between portal and bridge nodes: create, update, delete, deploy, undeploy, reconnect.',
+        description: rebuild ? 'Save Rebuild drafts with create/update, or use preview_remove then delete with expectedPreview. Draft writes do not Apply.'
+            : 'Manage cascade links between portal and bridge nodes: create, update, delete, deploy, undeploy, reconnect.',
         requiredScope: 'nodes:write',
         inputSchema: zodToInputSchema(cascadeTools.schemas.manageCascade),
     },
@@ -168,6 +172,7 @@ function queryScopeFor(resource) {
     const map = {
         users: 'users:read',
         nodes: 'nodes:read',
+        ...(rebuild ? { cascade: 'nodes:read' } : {}),
         groups: 'stats:read',
         stats: 'stats:read',
         logs: 'stats:read',
@@ -216,7 +221,8 @@ async function callTool(name, args, apiKey, emit, translate) {
         );
     }
 
-    logger.info(`[MCP] tool=${name} args=${JSON.stringify(args).slice(0, 200)}`);
+    if (rebuild && name === 'manage_cascade') logger.info('[MCP] tool=manage_cascade rebuild');
+    else logger.info(`[MCP] tool=${name} args=${JSON.stringify(args).slice(0, 200)}`);
 
     switch (name) {
         // ── query ──────────────────────────────────────────────────────────
@@ -239,6 +245,9 @@ async function callTool(name, args, apiKey, emit, translate) {
                     return await nodesTools.queryNodes(args);
                 case 'groups':
                     return await groupsTools.queryGroups(args);
+                case 'cascade':
+                    if (rebuild) return await cascadeTools.queryCascade(args);
+                    throw new Error('Unknown resource: cascade');
                 case 'stats':
                     return await statsTools.queryStats(args.filter || args);
                 case 'logs':

@@ -72,7 +72,8 @@ function fixture(t, rebuild) {
         };
         return row;
     }
-    const live = observed('fresh', { lastHealthCheck: historical, lastError: sentinel });
+    const live = observed('fresh', { lastHealthCheck: historical, lastError: sentinel, priority: 0,
+        geoRouting: { enabled: true, domains: [sentinel], geoip: [sentinel] } });
     observed('deleting', { lifecycle: { state: 'deleting', desiredVersion: 'f'.repeat(64) } });
     const wrongEpoch = observed('changed generation');
     wrongEpoch.rebuildApplyEpoch = 'd'.repeat(32);
@@ -91,7 +92,7 @@ function fixture(t, rebuild) {
     add('offline forward', { mode: 'forward', status: 'offline', latencyMs: 7,
         lastHealthCheck: historical, lastError: 'Bridge unreachable on tunnel port' });
     add('failed forward', { mode: 'forward', status: 'error', lastError: { nested: sentinel }, lastHealthCheck: sentinel });
-    add('unknown forward', { mode: 'forward', status: 'unknown', lastError: sentinel });
+    add('unknown forward', { mode: 'forward', status: 'unknown', lastError: sentinel, priority: sentinel });
     add('inactive link', { active: false });
 
     const calls = [];
@@ -152,7 +153,7 @@ function assertProjection(calls, rebuild) {
         `name portalNode bridgeNode status mode tunnelPort latencyMs tunnelProtocol tunnelTransport muxEnabled
         tunnelSecurity lastError lastHealthCheck rebuildKcpApplied ${rebuild ? `active rebuildDelete rebuildDesiredEdited lifecycle updatedAt
         tunnelUuid tunnelEncryption rebuildTlsServerName kcpHeader kcpMtu kcpTti kcpUplinkCapacity kcpDownlinkCapacity
-        rebuildApplied rebuildApplyEpoch rebuildReverseObservation` : ''}`);
+        rebuildApplied rebuildApplyEpoch rebuildReverseObservation rebuildExit rebuildAppliedExit priority geoRouting.enabled` : ''}`);
     for (const { projection } of calls.filter(call => call.filter._id?.$in)) assert.deepEqual(projection, { _id: 1 });
     expected('settings', query => query._id === 'settings', 'networkMap.internetPosition.x networkMap.internetPosition.y');
 }
@@ -175,6 +176,9 @@ test('mounted Rebuild topology exposes safe inspector fields and conservative KP
     assert.equal(Object.hasOwn(graph.edges.find(row => row.data.isInternetEdge).data, 'lastHealthCheck'), false);
 
     const fresh = edge(graph, 'fresh');
+    assert.deepEqual([fresh.priority, fresh.geoRouting], [0, { enabled: true }]);
+    assert.deepEqual([edge(graph, 'legacy').priority, edge(graph, 'legacy').geoRouting], [100, { enabled: false }]);
+    assert.equal(edge(graph, 'unknown forward').priority, null);
     assert.deepEqual([fresh.status, fresh.lastHealthCheck, fresh.observationExpiresAt, fresh.lastError, fresh.rebuildApplied],
         ['online', observedAt.toISOString(), expiresAt, '', true]);
     assert.deepEqual([edge(graph, 'draft').status, edge(graph, 'draft').rebuildApplied], ['pending', false]);
@@ -264,7 +268,8 @@ test('mounted Classic topology caches only its public projection, not Rebuild ob
     assert.equal(edge(first, 'legacy').status, 'online');
     assert.equal(edge(first, 'current kcp').status, 'pending');
     assert.equal(edge(first, 'legacy').lastHealthCheck, historical.toISOString());
-    assert.ok(first.edges.every(({ data }) => ['rebuildApplied', 'observationExpiresAt', 'canEdit', 'hasUnappliedChanges']
+    assert.ok(first.edges.every(({ data }) => ['rebuildApplied', 'observationExpiresAt', 'canEdit', 'hasUnappliedChanges',
+        'priority', 'geoRouting', 'rebuildExit', 'appliedRebuildExit']
         .every(field => !Object.hasOwn(data, field))));
     const readCount = calls.length;
     assert.deepEqual(await get(), first);

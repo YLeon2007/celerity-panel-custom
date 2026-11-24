@@ -23,7 +23,7 @@ const { checkVlessEncryption, hasEncryptionState, sanitizeEncryptionInput, settl
     vlessEditCAS, vlessEditConflict } = require('./panel/helpers');
 const { redactNode } = vless;
 const { isXrayBridge, setupXrayForRole } = require('../services/xrayNodeAutoSetup');
-const { withNodeWrite, assertNodeEditAllowed, describeRoleError } = require('../services/rebuildRelayRoleGuard');
+const { withNodeWrite, assertNodeEditAllowed, assertNodeExitsUnused, describeRoleError } = require('../services/rebuildRelayRoleGuard');
 
 function sendNodeWriteConflict(res, error) {
     const conflict = describeRoleError(error, res.locals.t);
@@ -86,6 +86,8 @@ async function setNodeActive(req, res, active) {
             }
 
             if (!active) {
+                await assertNodeExitsUnused(current);
+                await verify();
                 const runtime = await disableNodeRuntime(node);
                 await verify();
                 const disabledNode = await HyNode.findByIdAndUpdate(
@@ -131,7 +133,9 @@ async function setNodeActive(req, res, active) {
                     req.params.id,
                     {
                         $set: {
-                            active: false,
+                            // A failed Rebuild start is not authority to disable
+                            // an already active endpoint in the desired graph.
+                            ...(current ? {} : { active: false }),
                             status: 'offline',
                             onlineUsers: 0,
                             lastError: errorMessage,

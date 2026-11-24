@@ -57,7 +57,7 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
         { id: relayId, name: 'Relay', type: 'xray', cascadeRole: 'relay', xray: { agentToken: 'fixture' } },
     ].map(({ id, ...row }) => ({ ...row, _id: new mongoose.Types.ObjectId(id), ip, active: true, ssh: { port: 22, username: 'root', password: 'fixture' } }));
     let held, pending = true, inRebuild = true, expectUserSync = false, relayState = 'installed';
-    let incident, grant, replica;
+    let incident, grant, replica, selectedExit, portalIngress;
     const effects = [];
     const lockStore = {
         async insertOne(row) { if (held) throw Object.assign(new Error('busy'), { code: 11000 }); held = row; },
@@ -92,7 +92,8 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
         if (options && inRebuild && !expectUserSync) assert.equal(options.writeConcern?.w, 'majority');
     };
     const matching = ({ _id, ip, type, cascadeRole }) => rows.filter(row => (
-        (!_id || (_id.$ne ? String(row._id) !== String(_id.$ne) : String(row._id) === String(_id)))
+        (!_id || (_id.$in ? _id.$in.some(id => String(row._id) === String(id))
+            : _id.$ne ? String(row._id) !== String(_id.$ne) : String(row._id) === String(_id)))
         && (!ip || row.ip === ip) && (!type || row.type === type) && (!cascadeRole || row.cascadeRole === cascadeRole)
     ));
     function fixture(model, collection) {
@@ -133,16 +134,29 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     fixture(require('../../models/serverGroupModel'), {
         async findOneAndUpdate() { effects.push('starter group'); assert.fail('no starter bundle after refusal'); },
     });
-    fixture(require('../../models/cascadeLinkModel'), { async findOne(filter, options) {
-        if (!incident) return null;
-        assert.ok(held, 'incident check holds the same lock as deletion');
-        assert.equal(options.readConcern.level, 'majority');
-        assert.equal(options.readPreference, 'primary');
-        assert.deepEqual(filter, { $or: ['portalNode', 'bridgeNode', 'source', 'target', 'rebuildApplied.listener'].map(field => ({
-            [field]: { $in: [rows[1]._id, relayId] },
-        })) });
-        return incident;
-    } });
+    fixture(require('../../models/cascadeLinkModel'), {
+        find(filter, options) {
+            assert.ok(held, 'exit dependency reads must hold Apply');
+            assert.equal(options.readConcern.level, 'majority');
+            const matches = (row, query) => Object.entries(query).every(([key, want]) => {
+                if (key === '$or') return want.some(branch => matches(row, branch));
+                const actual = key.split('.').reduce((value, part) => value?.[part], row);
+                if (want?.$in) return want.$in.some(value => String(actual) === String(value));
+                return want instanceof mongoose.Types.ObjectId ? want.equals(actual) : actual === want;
+            });
+            return { toArray: async () => [selectedExit, portalIngress].filter(row => row && matches(row, filter)) };
+        },
+        async findOne(filter, options) {
+            if (!incident) return null;
+            assert.ok(held, 'incident check holds the same lock as deletion');
+            assert.equal(options.readConcern.level, 'majority');
+            assert.equal(options.readPreference, 'primary');
+            assert.deepEqual(filter, { $or: ['portalNode', 'bridgeNode', 'source', 'target', 'rebuildApplied.listener'].map(field => ({
+                [field]: { $in: [rows[1]._id, relayId] },
+            })) });
+            return incident;
+        },
+    });
     const { createPanelRouter } = require('../../routes/panel');
 
     const app = express();
@@ -239,6 +253,39 @@ test('mounted rebuild node writers cooperate with the real Apply lock and pendin
     assert.equal((await api('PUT', relayId, '', { name: 'still editable' })).status, 200);
     effects.length = 0;
     incident = null;
+    await t.test('dedicated disable and generic edits cannot invalidate a selected exit', async () => {
+        const bridge = new mongoose.Types.ObjectId();
+        selectedExit = { _id: new mongoose.Types.ObjectId(), portalNode: rows[1]._id, bridgeNode: bridge, active: true };
+        portalIngress = { _id: new mongoose.Types.ObjectId(), portalNode: rows[0]._id, bridgeNode: rows[1]._id,
+            active: true, rebuildExit: { nodeId: bridge } };
+        rows[0].name = 'Portal<\u202e> name';
+        for (const writer of ['REST disable', 'REST PUT without role', 'MCP update']) {
+            await writers[writer]('REBUILD_EXIT_IN_USE');
+            assert.deepEqual(effects, []);
+            assert.equal(held, null);
+        }
+        const reply = await api('POST', relayId, '/disable');
+        assert.deepEqual(reply.body.portalNames, ['Portal name']);
+        selectedExit = portalIngress = undefined;
+    });
+    await t.test('portal source role and disable preserve desired and still-applied pins', async () => {
+        Object.assign(rows[0], { type: 'xray', cascadeRole: 'portal' });
+        portalIngress = { _id: new mongoose.Types.ObjectId(), portalNode: rows[0]._id, bridgeNode: rows[1]._id,
+            active: true, rebuildExit: { nodeId: new mongoose.Types.ObjectId() } };
+        try {
+            await http(() => api('PUT', id, '', { cascadeRole: 'bridge' }))('REBUILD_EXIT_IN_USE');
+            portalIngress.rebuildApplied = { listener: rows[0]._id, mode: 'reverse', protocol: 'vless', port: 42009, uuid: 'fixture' };
+            portalIngress.rebuildAppliedExit = portalIngress.rebuildExit;
+            portalIngress.rebuildExit = null;
+            await http(() => api('POST', id, '/disable'))('REBUILD_EXIT_IN_USE');
+            await tool(() => mcp('update', id, { active: false }))('REBUILD_EXIT_IN_USE');
+            assert.deepEqual(effects, []);
+            assert.equal(held, null);
+        } finally {
+            Object.assign(rows[0], { type: 'hysteria', cascadeRole: 'standalone' });
+            portalIngress = undefined;
+        }
+    });
     grant = true;
     await writers['REST delete']('REBUILD_NODE_RETIRE_REQUIRED');
     await writers['MCP delete']('REBUILD_NODE_RETIRE_REQUIRED');
