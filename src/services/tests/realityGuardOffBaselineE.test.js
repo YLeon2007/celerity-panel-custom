@@ -1,8 +1,8 @@
 'use strict';
 
 // (e): synthetic byte oracle from release 2946de17231502807150b3ecc1939614390807fe.
-// Generated with Node v22.23.1 against the release's stock modules. Run this
-// same file against both exports; the baseline has no create policy.
+// Generated with Node v22.23.1 against the release's stock modules. The only
+// allowed config change since that baseline is statsUserOnline on client MAIN.
 // No panel bootstrap, listeners, persistence, cron or transport is needed.
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -23,6 +23,12 @@ const frozen = {
     'created-off': '110252fb9070fa88407db741122bdea2a8fbff87cce6cde8c5194b287432a204',
     'explicit-off': '85112e3523cc4fb102c16efc9ff9b02a8557f57db25773b028853a208ff0bc9e',
     mixed: '76be9a71b117d5cefb3cf59d7509622875b8002b9fc53da37e5d94fba823754f',
+};
+const frozenSubscriptions = {
+    'legacy-absent': 'c2da3f18269741f6a9291c5a15b6fa98364ebdb9809a17f364959210c22f6af0',
+    'created-off': 'b61f70954e007471329b2da6abcaed77ae78612e1e8bd8bb6f631ad5a15cb563',
+    'explicit-off': '44bee124e35735fcb30ff9856c8558068faafc21e407815a1ccdbe8a747293d2',
+    mixed: '38b9f0af05669696535f44a42592d626be9bac28508cb501b64842fba76b325c',
 };
 const formats = { raw: 'Fixture/1', shadowrocket: 'Shadowrocket/1',
     'xray-json': 'Happ/1', 'v2ray-json': 'v2rayN/1', clash: 'Clash/1', singbox: 'sing-box/1' };
@@ -71,6 +77,22 @@ function request(app, format, token) {
             length: Number(res.getHeader('Content-Length')) }));
         app(req, res);
     });
+}
+
+function configBaselineBytes(bytes, { role, profile, serialize, name }) {
+    const config = JSON.parse(bytes);
+    const level = config.policy?.levels?.['0'];
+    const clientMain = profile === 'main' && ['portal', 'standalone'].includes(role);
+    if (!clientMain) {
+        assert.equal(Object.hasOwn(level ?? {}, 'statsUserOnline'), false, name);
+        return Buffer.from(bytes);
+    }
+    assert.equal(level?.statsUserOnline, true, `${name}: client MAIN must enable online stats`);
+    // Check exact serialization first, so projection cannot hide whitespace or
+    // duplicate keys. After deleting the field, all remaining bytes are pinned.
+    assert.ok(serialize(config) === bytes, `${name}: noncanonical config bytes`);
+    delete level.statsUserOnline;
+    return Buffer.from(serialize(config));
 }
 
 test('Reality Guard OFF: published /api/files and Xray config bytes against 2946de1', { timeout: 10000 }, async t => {
@@ -178,12 +200,15 @@ test('Reality Guard OFF: published /api/files and Xray config bytes against 2946
             }
             assert.equal(current.misses, Object.keys(formats).length);
             assert.equal(current.renders, current.misses, 'every response freshly generated, never served from Redis');
+            assert.equal(sha256(vectors.join('\n')), frozenSubscriptions[label], `${label}: /api/files byte drift from 2946de1`);
             for (const row of clientNodes) {
                 const config = generateXrayConfigWithApi(row, [user]);
                 const listener = JSON.parse(config).inbounds.find(inbound => inbound.tag === row.xray.inboundTag);
                 assert.ok(listener?.settings.clients.some(client => client.id === user.xrayUuid));
                 assert.ok(listener.streamSettings.realitySettings.dest === row.xray.realityDest, 'client REALITY target retained');
-                record(`classic/${row.name}/main`, Buffer.from(config));
+                const name = `classic/${row.name}/main`;
+                record(name, configBaselineBytes(config, { name, role: row.cascadeRole, profile: 'main',
+                    serialize: value => JSON.stringify(value, null, 2) }));
             }
             if (label === 'mixed') {
                 const profiles = composeRebuildProfiles({ nodes: rows, links,
@@ -192,11 +217,13 @@ test('Reality Guard OFF: published /api/files and Xray config bytes against 2946
                 assert.equal(profiles.length, 2 * rows.length);
                 assert.equal(new Set(profiles.map(p => `${p.nodeId}/${p.profile}`)).size, 2 * rows.length);
                 for (const { nodeId, profile, config } of profiles) {
-                    record(`rebuild/${rows.find(n => n._id === nodeId).name}/${profile}`, Buffer.from(profileBytes(config)));
+                    const row = rows.find(n => n._id === nodeId);
+                    const name = `rebuild/${row.name}/${profile}`;
+                    record(name, configBaselineBytes(profileBytes(config), { name, role: row.cascadeRole, profile, serialize: profileBytes }));
                 }
             }
             assert.equal(effects, 0);
-            assert.equal(sha256(vectors.join('\n')), frozen[label], `${label}: byte drift from 2946de1`);
+            assert.equal(sha256(vectors.join('\n')), frozen[label], `${label}: unexpected config byte drift from 2946de1`);
         });
     }
 });

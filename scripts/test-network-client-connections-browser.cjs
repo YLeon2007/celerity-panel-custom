@@ -216,7 +216,7 @@ test('client connections in shipped modern map (Firefox)', { timeout: 80000 }, a
             await browser.wait(hidden);
             requested('portal');
         });
-        await ctx.test('Chains standalone count and distinct RU old-agent / empty / unavailable / forbidden', async () => {
+        await ctx.test('Online portal with old agent: exact RU hint; standalone: empty / unavailable', async () => {
             const expected = {
                 'old-agent': 'Нет данных о подключениях (нужен агент 1.6.0)',
                 empty: 'Нет активных подключений', unavailable: 'Данные о подключениях недоступны',
@@ -224,7 +224,7 @@ test('client connections in shipped modern map (Firefox)', { timeout: 80000 }, a
             await textIs(standaloneCount, '0');
             for (const [mode, text] of Object.entries(expected)) {
                 app.use(mode);
-                await hover(browser, standaloneCount);
+                await hover(browser, mode === 'old-agent' ? chainCount : standaloneCount);
                 await textIs(`${panel} [role="status"]`, text);
                 await move(browser, 1, 1);
                 await browser.wait(hidden);
@@ -234,7 +234,7 @@ test('client connections in shipped modern map (Firefox)', { timeout: 80000 }, a
             await waitFor(() => app.clientReads.length === 5, 'HTTP 403 request not observed');
             await browser.wait(hidden);
             assert.equal(await browser.evaluate(`document.body.textContent.includes(${q(marker)})`), false);
-            requested('portal', 'standalone', 'standalone', 'standalone', 'portal');
+            requested('portal', 'portal', 'standalone', 'standalone', 'portal');
         });
         await ctx.test('Pointer leave aborts the real outstanding GET; does not leave records or DOM', async () => {
             const prior = app.clientReads.length;

@@ -17,6 +17,9 @@ const probe = String.raw`
     process.exit = code => { events.push('exit:' + code); };
     const flush = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
     const mongoose = require('mongoose');
+    // The simulated driver never becomes ready. Let real model init promises
+    // settle with DDL disabled, rather than leaving them on the driver's queue.
+    mongoose.connection.config = { autoCreate: false, autoIndex: false };
     mongoose.connect = () => new Promise(() => {});
     mongoose.disconnect = async () => { events.push('mongo-disconnect'); };
     // Any accidental real network connection fails the probe.
@@ -34,7 +37,8 @@ const probe = String.raw`
     const load = Module._load;
     Module._load = function(request, parent, isMain) {
         if (request === './src/modules/l2tpRuntimeLifecycleHook' && parent.filename.endsWith('/index.js')) {
-            return { createL2tpRootLifecycle: () => ({ stop() {
+            const stock = load.call(this, request, parent, isMain);
+            return { ...stock, createL2tpRootLifecycle: () => ({ stop() {
                 events.push('worker-stop'); return lifecycle.stop();
             } }) };
         }
@@ -43,6 +47,7 @@ const probe = String.raw`
     (async () => {
         // Do not preload the pool: exercise index -> syncService -> NodeSSH ->
         // singleton pool before index installs its own shutdown handlers.
+        assert.equal(require.cache[require.resolve('./src/services/sshPoolService')], undefined);
         require('./index.js');
         pool = require('./src/services/sshPoolService');
         assert.ok(require.cache[require.resolve('./src/services/nodeSSH')]);
@@ -66,6 +71,7 @@ const probe = String.raw`
         assert.equal(events.at(-1), 'exit:' + expectedCode, events.join(' -> '));
         assert.equal(events.filter(event => event === 'client-end').length, 1);
         assert.ok(events.indexOf('admission-closed') < events.indexOf('client-end'));
+        if (!expectedCode) assert.deepEqual(events.slice(-3), ['client-end', 'mongo-disconnect', 'exit:0']);
         if (!expectedCode) assert.ok(events.indexOf('remote-outcome-known') < events.indexOf('client-end'));
         console.log('SHUTDOWN_PROBE ' + JSON.stringify(events));
         clearTimeout(watchdog); exit(0);

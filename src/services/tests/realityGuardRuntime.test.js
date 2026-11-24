@@ -175,7 +175,7 @@ function fixture(options = {}) {
     const bindings = {
         rebuildEnabled, cron: { schedule: (expression, cb) => {
             schedules.push({ expression, cb });
-            return { stop: () => effects.push('task-stop') };
+            return { stop: () => effects.push(`task-stop:${expression}`) };
         } },
         require: id => {
             if (id === './src/models/realityGuardPolicy') return policy;
@@ -187,6 +187,7 @@ function fixture(options = {}) {
         setTimeout: (_cb, ms) => ({ ms }),
         process: Object.assign(new EventEmitter(), { exit: code => effects.push(`exit:${code}`) }),
         bootstrapSignalHandlers: [],
+        syncService: { clearXrayClientConnections: () => effects.push('client-connections-cleared') },
         mongoose: { models: {}, disconnect: async () => effects.push('db-close') },
         l2tpRootLifecycle: { stop: async () => {} },
         sshPool: { beginDrain: () => effects.push('ssh-drain'), closeAll: () => effects.push('ssh-close-all') },
@@ -218,7 +219,8 @@ test('(f) registered Guard callback reads only the flag when disabled or unreada
             const counters = { ...f.counts };
             await f.tick(); // still invoke the captured callback after task.stop()
             assert.deepEqual(f.counts, counters);
-            assert.deepEqual(f.effects.slice(-4), ['ssh-close-all', 'cache-close', 'db-close', 'exit:0']);
+            assert.equal(f.effects.filter(event => event === 'task-stop:*/15 * * * * *').length, 1);
+            assert.deepEqual(f.effects.slice(-5), ['client-connections-cleared', 'ssh-close-all', 'cache-close', 'db-close', 'exit:0']);
         }
     }
 });
@@ -368,10 +370,15 @@ test('shutdown joins an admitted observation and prevents late effects', async (
     await reached;
     const stop = f.shutdown();
     await flush();
-    assert.ok(!f.effects.includes('db-close'));
-    release();
+    try {
+        assert.ok(f.effects.includes('task-stop:*/15 * * * * *'));
+        for (const event of ['client-connections-cleared', 'ssh-close-all', 'cache-close', 'db-close']) {
+            assert.ok(!f.effects.includes(event), `${event} before Guard's admitted observation finished`);
+        }
+    } finally { release(); }
     await Promise.all([tick, stop]);
     assert.deepEqual(f.webhook, []);
     assert.equal(f.counts.writes, 0);
-    assert.ok(f.effects.indexOf('ssh-disconnect') < f.effects.indexOf('db-close'));
+    assert.deepEqual(f.effects.slice(-6), ['ssh-disconnect', 'client-connections-cleared', 'ssh-close-all',
+        'cache-close', 'db-close', 'exit:0']);
 });

@@ -133,8 +133,10 @@ if (process.argv[2] === '--fixture') {
                     leak: JSON.stringify({ logs, mongoWrites, cacheWrites }).includes(PEER) });
             } else if (msg === 'OLD') {
                 node.agentVersion = '1.5.1'; process.send('OLD');
+            } else if (msg === 'UNKNOWN') {
+                node.agentVersion = '1.4.0'; node.status = 'unknown'; process.send('UNKNOWN');
             } else if (msg === 'HOLD') {
-                node.agentVersion = '1.6.0';
+                node.agentVersion = '1.6.0'; node.status = 'online';
                 served = new Promise(resolve => { release = resolve; });
                 await tasks.get('*/15 * * * * *').run();
             } else if (msg === 'RELEASE') release();
@@ -218,6 +220,8 @@ if (process.argv[2] === '--fixture') {
         assert.equal(await mcpList(), mcpBefore);
         child.send('OLD'); await waitFor(msg => msg === 'OLD');
         assert.equal((await expect(url, admin, 200, 'old-agent')).body, '[]');
+        child.send('UNKNOWN'); await waitFor(msg => msg === 'UNKNOWN');
+        assert.equal((await expect(url, admin, 200, 'unavailable')).body, '[]');
         child.send('HOLD'); await waitFor(msg => msg === 'AGENT_HELD');
         child.kill('SIGTERM'); await waitFor(msg => msg === 'STOP */15 * * * * *');
         assert(!messages.includes('REDIS_QUIT') && !messages.includes('MONGO_CLOSE'));
