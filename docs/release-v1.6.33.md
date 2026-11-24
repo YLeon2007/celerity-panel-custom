@@ -1,6 +1,6 @@
-# v1.5.0 — operator release notes
+# v1.6.33 — operator release notes
 
-[Русский](release-v1.5.0.ru.md) · [Changelog](../CHANGELOG.md)
+[Русский](release-v1.6.33.ru.md) · [Changelog](../CHANGELOG.md)
 
 ## Reality Guard
 

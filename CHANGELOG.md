@@ -5,7 +5,10 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
-## v1.5.0 — Reality Guard, VLESS Encryption, mKCP и карта Rebuild / Reality Guard, VLESS Encryption, mKCP and the Rebuild map
+## v1.6.33 — Reality Guard, VLESS Encryption, mKCP и карта Rebuild / Reality Guard, VLESS Encryption, mKCP and the Rebuild map
+
+Нумерация: номер версии форка = последняя версия оригинала CELERITY, из которой перенесены функции, + 0.0.1. Эта версия основана на оригинале 1.6.32 (новая карта сети) и заменяет внутренний номер 1.5.0.
+Numbering: fork version = the latest upstream CELERITY version whose features were ported, + 0.0.1. This release is based on upstream 1.6.32 (new network map) and supersedes the internal number 1.5.0.
 
 ### RU
 
@@ -15,7 +18,7 @@
 - **Карта Rebuild:** Цепочки, Граф и Карта. Новая связь сначала сохраняется как черновик; отмена Preview его не удаляет. Применение только по явному подтверждению. Статус «не проверено» отличается от ошибки и онлайн. В инспекторе можно изменить активную связь. Отмена Preview оставляет правку на карте с пометкой «Есть неприменённые изменения».
 - **Firefox и CSRF:** `Referrer-Policy: same-origin` не передаёт реферер вовне. Защищённые операции записи с `Origin: null` требуют `Sec-Fetch-Site: same-origin` и действительный CSRF-токен.
 
-[Памятка оператора](docs/release-v1.5.0.ru.md).
+[Памятка оператора](docs/release-v1.6.33.ru.md).
 
 ### EN
 
@@ -25,7 +28,7 @@
 - **Rebuild map:** Chains, Graph, and Map views. New links are saved as drafts; canceling Preview keeps the draft. Apply requires explicit confirmation. Unverified is distinct from error and online. Edit active links in the inspector. Canceling Preview keeps the edit on the map as an unapplied change.
 - **Firefox and CSRF:** `Referrer-Policy: same-origin` keeps referrers off external requests. Protected writes with `Origin: null` require `Sec-Fetch-Site: same-origin` and a valid CSRF token.
 
-[Operator release notes](docs/release-v1.5.0.md).
+[Operator release notes](docs/release-v1.6.33.md).
 
 ## v1.4.2 — Rebuild, L2TP, API и MCP / Rebuild, L2TP, API and MCP
 

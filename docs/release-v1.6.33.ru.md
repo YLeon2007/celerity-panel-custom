@@ -1,6 +1,6 @@
-# v1.5.0 — памятка оператора
+# v1.6.33 — памятка оператора
 
-[English](release-v1.5.0.md) · [Список изменений](../CHANGELOG.md)
+[English](release-v1.6.33.md) · [Список изменений](../CHANGELOG.md)
 
 ## Reality Guard
 
