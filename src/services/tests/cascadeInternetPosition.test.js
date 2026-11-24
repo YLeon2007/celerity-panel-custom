@@ -18,7 +18,7 @@ const exits = [
 ];
 function stubGraph(t, setting) {
     t.mock.method(HyNode, 'find', () => ({ select: () => ({ lean: async () => exits }) }));
-    t.mock.method(CascadeLink, 'find', () => ({ populate: () => ({ populate: () => ({ lean: async () => [] }) }) }));
+    t.mock.method(CascadeLink, 'find', () => ({ select() { return this; }, populate() { return this; }, lean: async () => [] }));
     t.mock.method(Settings, 'findById', () => ({ select: () => ({ lean: async () => setting }) }));
 }
 

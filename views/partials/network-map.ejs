@@ -15,7 +15,7 @@ networkI18n.sshNotConfigured = t('nodes.sshNotConfigured');
 networkI18n.map = locales.network.map;
 const scriptJson = value => JSON.stringify(value).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 %>
-<link rel="stylesheet" href="/css/network-map.css?v=fa65def33febe72a">
+<link rel="stylesheet" href="/css/network-map.css?v=eceff90b594b1382">
 <script type="application/json" id="networkI18n"><%- scriptJson(networkI18n) %></script>
 <% if (canManageLinks) { %>
 <script>window._networkCsrfToken = <%- scriptJson(panelToken) %>;</script>

@@ -8,6 +8,7 @@
 'use strict';
 
 const INTERNET_ID = 'internet';
+const MAX_OBSERVATION_MS = 90_000;
 
 /** Upper bound for enumerated root-to-leaf paths; protects weak clients from path explosion. */
 const MAX_CHAINS = 400;
@@ -41,6 +42,44 @@ function worstStatus(statuses) {
     return worst;
 }
 
+function isSynthetic(kind, data) {
+    if (!data) return false;
+    if (kind === 'link') return !!(data.isCdnEdge || data.isInternetEdge);
+    const role = roleOf(data);
+    return role === 'cdn' || role === 'internet';
+}
+
+/** Expiry of projected reverse evidence, or null if missing, expired or out of bounds. */
+function observationExpiry(link, now = Date.now()) {
+    const until = link.observationExpiresAt;
+    return Number.isSafeInteger(until) && now < until && until - now <= MAX_OBSERVATION_MS ? until : null;
+}
+
+/** Map health, not deployment state. Synthetic mirrors contribute no attention. */
+function attention(kind, data, now = Date.now()) {
+    if (isSynthetic(kind, data)) return 'ok';
+    const status = data?.status;
+    if (status === 'error' || status === 'offline') return 'problem';
+    if (status !== 'online' || data.missingEndpoint) return 'unverified';
+    if (kind === 'link' && (data.tunnelTransport === 'kcp' || data.tunnelVerification === 'mkcp_runtime_unsupported'
+        || data.tunnelVerification === 'mkcp_apply_unconfirmed'
+        || (data.mode !== 'forward' && !observationExpiry(data, now)))) return 'unverified';
+    return 'ok';
+}
+
+/** Neutral presentation for unverified data, retaining distinct deployment/failure labels. */
+function attentionStatus(kind, data, now = Date.now()) {
+    if (attention(kind, data, now) !== 'unverified') return data.status;
+    const status = data?.status;
+    if (status === 'online' && !data.missingEndpoint) return data.tunnelVerification === 'mkcp_apply_unconfirmed' ? 'pending' : 'deployed';
+    return ['pending', 'deployed', 'syncing'].includes(status) ? status : 'unknown';
+}
+
+function measuredLatency(link, now) {
+    return attention('link', link, now) === 'ok' && Number.isFinite(link.latencyMs) && link.latencyMs >= 0
+        ? link.latencyMs : null;
+}
+
 /**
  * Build lookup tables. Cascade links, CDN edges and Internet edges are kept apart
  * because views treat them differently.
@@ -48,6 +87,7 @@ function worstStatus(statuses) {
 function buildIndex(topology) {
     const nodes = new Map();
     const links = new Map();
+    const unmappedLinks = new Map();
     const cdnEdges = new Map();
     const out = new Map();
     const inc = new Map();
@@ -71,7 +111,12 @@ function buildIndex(topology) {
         const data = raw && raw.data;
         if (!data || typeof data.id !== 'string') continue;
         if (data.isInternetEdge) continue;
-        if (!nodes.has(data.source) || !nodes.has(data.target)) continue;
+        if (!nodes.has(data.source) || !nodes.has(data.target)) {
+            // An omitted endpoint makes the link undrawable, not healthy. Keep
+            // its diagnostic in the global inventory without creating a fake node.
+            if (!data.isCdnEdge) unmappedLinks.set(data.id, { ...data, missingEndpoint: true });
+            continue;
+        }
         if (data.isCdnEdge) {
             cdnEdges.set(data.id, { ...data });
             if (!cdnByOrigin.has(data.target)) cdnByOrigin.set(data.target, []);
@@ -88,7 +133,7 @@ function buildIndex(topology) {
     for (const list of out.values()) list.sort(compareLinks);
 
     return {
-        nodes, links, cdnEdges, out, in: inc, cdnByOrigin, originByCdn, internet,
+        nodes, links, unmappedLinks, cdnEdges, out, in: inc, cdnByOrigin, originByCdn, internet,
         _chains: null, _chainsByNode: null, _chainsByLink: null,
     };
 }
@@ -196,13 +241,19 @@ function chainsThrough(index, kind, id) {
 }
 
 /** Status and summed latency of a chain. */
-function chainSummary(index, chain) {
-    const links = chain.links.map(id => index.links.get(id)).filter(Boolean);
-    const status = worstStatus(links.map(l => l.status));
+function chainSummary(index, chain, now = Date.now()) {
+    const links = chain.links.map(id => index.links.get(id));
+    const statuses = [
+        ...(chain.nodes || []).map(id => nodeOf(index, id)).filter(n => !isSynthetic('node', n))
+            .map(n => attentionStatus('node', n, now)),
+        ...links.map(l => attentionStatus('link', l, now)),
+    ];
+    const status = statuses.length ? worstStatus(statuses) : 'unknown';
     let latency = 0;
     let measured = links.length > 0;
     for (const l of links) {
-        if (typeof l.latencyMs === 'number') latency += l.latencyMs;
+        const ms = l ? measuredLatency(l, now) : null;
+        if (ms != null) latency += ms;
         else measured = false;
     }
     return { status, latencyMs: measured ? latency : null };
@@ -249,53 +300,104 @@ function related(index, kind, id) {
     return { nodes, links };
 }
 
-/**
- * Problems sorted errors first. Codes: nodeError, nodeOffline, linkError, linkOffline, linkPending.
- * CDN fronts mirror their origin status, so they are not reported separately.
- */
+/** Visit real topology entities once, optionally scoped to a lane. */
+function* healthEntries(index, scope, now = Date.now()) {
+    const collections = [['node', index.nodes, scope?.nodes], ['link', index.links, scope?.links]];
+    if (!scope && index.unmappedLinks) collections.push(['link', index.unmappedLinks]);
+    for (const [kind, map, ids] of collections) {
+        for (const id of ids || map.keys()) {
+            const data = map.get(id);
+            if (!data || isSynthetic(kind, data)) continue;
+            yield { kind, data, level: attention(kind, data, now) };
+        }
+    }
+}
+
+function attentionSummary(index, scope) {
+    const summary = { total: 0, problems: 0, unverified: 0, status: 'online' };
+    const now = Date.now();
+    for (const { kind, data, level } of healthEntries(index, scope, now)) {
+        summary.total++;
+        if (level === 'problem') summary.problems++;
+        if (level === 'unverified') summary.unverified++;
+        const status = attentionStatus(kind, data, now);
+        if (severity(status) > severity(summary.status)) summary.status = status;
+    }
+    if (!summary.total) summary.status = 'unknown';
+    return summary;
+}
+
+/** Popover rows: errors first, then confirmed offline, then unverified. */
+function attentionItems(index) {
+    const errors = [], offline = [], unverified = [];
+    for (const { kind, data, level } of healthEntries(index)) {
+        if (level === 'problem') {
+            const error = data.status === 'error';
+            (error ? errors : offline).push({ kind, id: data.id, sev: error ? 'error' : 'warn',
+                code: `${kind}${error ? 'Error' : 'Offline'}`, detail: data.lastError || '' });
+        } else if (level === 'unverified') {
+            unverified.push({ kind, id: data.id, sev: 'unverified', code: `${kind}Unverified`, detail: '' });
+        }
+    }
+    return errors.concat(offline, unverified);
+}
+
 function problems(index) {
-    const res = [];
-    for (const n of index.nodes.values()) {
-        if (n.type === 'cdn') continue;
-        if (n.status === 'error') res.push({ kind: 'node', id: n.id, sev: 'error', code: 'nodeError', detail: n.lastError || '' });
-        else if (n.status === 'offline') res.push({ kind: 'node', id: n.id, sev: 'warn', code: 'nodeOffline', detail: n.lastError || '' });
+    return attentionItems(index).filter(item => item.sev !== 'unverified');
+}
+
+/** Render all non-ok items and keep real endpoints of non-ok links as context. */
+function attentionScope(index) {
+    const nodes = new Set(), links = new Set();
+    for (const { kind, data, level } of healthEntries(index)) {
+        if (level === 'ok') continue;
+        if (kind === 'node') nodes.add(data.id);
+        else {
+            links.add(data.id);
+            nodes.add(data.source);
+            nodes.add(data.target);
+        }
     }
-    for (const l of index.links.values()) {
-        if (l.status === 'error') res.push({ kind: 'link', id: l.id, sev: 'error', code: 'linkError', detail: l.lastError || '' });
-        else if (l.status === 'offline') res.push({ kind: 'link', id: l.id, sev: 'warn', code: 'linkOffline', detail: l.lastError || '' });
-        else if (l.status === 'pending') res.push({ kind: 'link', id: l.id, sev: 'warn', code: 'linkPending', detail: '' });
-    }
-    return res.sort((a, b) => (a.sev === b.sev ? 0 : a.sev === 'error' ? -1 : 1));
+    return { nodes, links };
 }
 
 function stats(index) {
     let nodeCount = 0;
     let online = 0;
     let users = 0;
-    for (const n of index.nodes.values()) {
-        if (n.type === 'cdn') continue;
-        nodeCount++;
-        if (n.status === 'online') online++;
-        users += Number(n.onlineUsers) || 0;
-    }
+    let linkCount = 0;
     let linksOk = 0;
+    let problems = 0;
+    let unverified = 0;
     const lat = [];
-    for (const l of index.links.values()) {
-        if (l.status === 'online') linksOk++;
-        if (typeof l.latencyMs === 'number') lat.push(l.latencyMs);
+    const now = Date.now();
+    for (const { kind, data, level } of healthEntries(index, null, now)) {
+        if (level === 'problem') problems++;
+        if (level === 'unverified') unverified++;
+        if (kind === 'node') {
+            nodeCount++;
+            if (level === 'ok') online++;
+            users += Number(data.onlineUsers) || 0;
+        } else {
+            linkCount++;
+            if (level === 'ok') linksOk++;
+            const ms = measuredLatency(data, now);
+            if (ms != null) lat.push(ms);
+        }
     }
     const allChains = chains(index);
-    const chainsOk = allChains.filter(c => chainSummary(index, c).status === 'online').length;
+    const chainsOk = allChains.filter(c => chainSummary(index, c, now).status === 'online').length;
     return {
         nodes: nodeCount,
         online,
         users,
-        links: index.links.size,
+        links: linkCount,
         linksOk,
         chains: allChains.length,
         chainsOk,
         avgLatency: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null,
-        problems: problems(index).length,
+        problems,
+        unverified,
     };
 }
 
@@ -354,6 +456,12 @@ module.exports = {
     isExitNode,
     severity,
     worstStatus,
+    attention,
+    attentionStatus,
+    attentionSummary,
+    attentionItems,
+    attentionScope,
+    observationExpiry,
     buildIndex,
     nodeOf,
     edgeOf,

@@ -6,6 +6,7 @@
 
 import model from '../core/model.js';
 import { t } from '../core/i18n.js';
+import { attentionLabel } from '../ui/toolbar.js';
 import { h, svg, icon, clear, rafThrottle, tip } from '../ui/dom.js';
 import {
     statusName, nodeTitle, ms, count, roleTag, dot, pillContent, linkTip, nodeTip,
@@ -33,11 +34,9 @@ export function mount(el, { store, toolbar }) {
 
     // ==================== TOOLBAR ====================
 
-    const problemsBtn = h('button.nm-btn.sm', { type: 'button', on: { click: () => store.setFilter({ problemsOnly: !store.state.filter.problemsOnly }) } },
-        icon('alert-triangle'), h('span.lbl', null, t('map.problemsOnly')));
     const expandBtn = h('button.nm-btn.sm.icon', { type: 'button', title: t('map.expandAll'), 'aria-label': t('map.expandAll'), on: { click: () => setAllCollapsed(false) } }, icon('layout-navbar-expand'));
     const collapseBtn = h('button.nm-btn.sm.icon', { type: 'button', title: t('map.collapseAll'), 'aria-label': t('map.collapseAll'), on: { click: () => setAllCollapsed(true) } }, icon('layout-navbar-collapse'));
-    toolbar.slot.append(problemsBtn, expandBtn, collapseBtn);
+    toolbar.slot.append(expandBtn, collapseBtn);
 
     function setAllCollapsed(value) {
         for (const lane of lanes) {
@@ -52,9 +51,7 @@ export function mount(el, { store, toolbar }) {
 
     const index = () => store.index;
 
-    function laneProblems(rel) {
-        return model.problems(index()).filter(p => (p.kind === 'node' ? rel.nodes.has(p.id) : rel.links.has(p.id)));
-    }
+    const needsAttention = summary => !!(summary.problems || summary.unverified);
 
     /** Entry portals plus one representative per cyclic component that has no entry. */
     function laneRoots() {
@@ -98,8 +95,9 @@ export function mount(el, { store, toolbar }) {
 
     function card(node, isRoot, lane) {
         const role = model.roleOf(node);
+        const status = model.attentionStatus('node', node);
         const shared = !isRoot && lane.sharedCount(node.id) > 1;
-        const el = h(`button.nmc-card.r-${role}.s-${node.status}`, {
+        const el = h(`button.nmc-card.r-${role}.s-${status}`, {
             type: 'button',
             dataset: { node: node.id },
             class: isMatch(node) ? 'match' : '',
@@ -111,7 +109,7 @@ export function mount(el, { store, toolbar }) {
             },
         },
         shared ? h('span.shared', { title: t('map.sharedHint') }, t('map.shared')) : null,
-        h('div.row1', null, h('span.flag', null, node.flag || '🖥️'), h('span.nm', null, node.label || node.ip || ''), dot(node.status)),
+        h('div.row1', null, h('span.flag', null, node.flag || '🖥️'), h('span.nm', null, node.label || node.ip || ''), dot(status)),
         h('div.row2', null, roleTag(role),
             node.onlineUsers ? h('span', null, icon('users'), ` ${node.onlineUsers}`) : h('span.mono', null, node.ip || '')));
         lane.cards.push(el);
@@ -119,11 +117,12 @@ export function mount(el, { store, toolbar }) {
     }
 
     function pill(link, lane) {
-        const el = h(`div.nm-pill.nmc-pill.${link.status}`, {
+        const status = model.attentionStatus('link', link);
+        const el = h(`div.nm-pill.nmc-pill.${status}`, {
             dataset: { link: link.id },
             role: 'button',
             tabindex: '0',
-            'aria-label': `${link.label || ''}: ${statusName(link.status)}`,
+            'aria-label': `${link.label || ''}: ${statusName(status)}`,
             on: {
                 click: e => {
                     e.stopPropagation();
@@ -162,7 +161,7 @@ export function mount(el, { store, toolbar }) {
             }
             wrap.appendChild(box);
         } else {
-            const ok = node.status === 'online';
+            const ok = model.attention('node', node) === 'ok';
             const inet = h(`div.nmc-inet${ok ? '' : '.off'}`, null, `🌐 ${t('map.internet')}`);
             lane.pairs.push({ a: c, b: inet, kind: ok ? 'inet' : 'inet off' });
             wrap.appendChild(inet);
@@ -170,34 +169,45 @@ export function mount(el, { store, toolbar }) {
         return wrap;
     }
 
-    function renderKpis() {
+    function renderKpis(hasLanes) {
         const s = model.stats(index());
-        const problemsOnly = store.state.filter.problemsOnly;
+        const { problemsOnly, query } = store.state.filter;
+        const actionable = needsAttention(s);
+        const hasData = s.nodes + s.links > 0;
+        const noSearchMatch = !actionable && !!query && !hasLanes;
+        const level = s.problems ? 'problem' : s.unverified ? 'unverified' : hasData && !noSearchMatch ? 'ok' : 'empty';
         return h('div.nmc-kpis', null,
             h('div.nmc-kcard', null, h('div.k', null, icon('server-2'), t('map.kpi.nodesOnline')), h('div.v', null, String(s.online), ' ', h('small', null, t('map.ofN', { n: s.nodes })))),
             h('div.nmc-kcard', null, h('div.k', null, icon('users'), t('map.kpi.clients')), h('div.v', null, String(s.users))),
             h('div.nmc-kcard', null, h('div.k', null, icon('route'), t('map.kpi.chainsOk')), h('div.v', null, String(s.chainsOk), ' ', h('small', null, t('map.ofN', { n: s.chains })))),
             h('div.nmc-kcard', null, h('div.k', null, icon('clock'), t('map.kpi.avgLatency')), h('div.v', null, s.avgLatency != null ? [String(s.avgLatency), ' ', h('small', null, t('map.msUnit'))] : '—')),
-            h(`button.nmc-kcard${s.problems ? '.bad' : ''}${problemsOnly ? '.on' : ''}`, {
-                type: 'button',
-                on: { click: () => store.setFilter({ problemsOnly: !problemsOnly }) },
-            }, h('div.k', null, icon('alert-triangle'), t('map.kpi.problems')),
-            h('div.v', null, String(s.problems), ' ', h('small', null, s.problems ? (problemsOnly ? t('map.showAll') : t('map.show')) : t('map.allGood')))));
+            h(`${actionable ? 'button' : 'div'}.nmc-kcard${s.problems ? '.bad' : ''}${problemsOnly && actionable ? '.on' : ''}`, {
+                type: actionable ? 'button' : null,
+                dataset: { attention: level },
+                'aria-pressed': actionable ? String(problemsOnly) : null,
+                on: actionable ? { click: () => store.setFilter({ problemsOnly: !problemsOnly }) } : null,
+            }, h('div.k', null, icon('activity'), t('map.kpi.attention')),
+            h('div.v', null, h('small', null, attentionLabel(s, hasData, noSearchMatch)))));
     }
 
-    function renderLane(root, laneIdx) {
-        const rel = model.related(index(), 'node', root.id);
-        const probs = laneProblems(rel);
-        const hasErr = probs.some(p => p.sev === 'error');
+    function summaryBadge(summary) {
+        const glyph = summary.problems ? 'alert-triangle' : summary.unverified || !summary.total ? 'help' : 'circle-check';
+        const cls = summary.problems ? '.bad' : summary.unverified || !summary.total ? '' : '.ok';
+        return h(`span${cls}`, null, icon(glyph), attentionLabel(summary, summary.total > 0));
+    }
+
+    function renderLane({ root, rel, summary, laneIdx }) {
+        const hasErr = summary.status === 'error';
 
         if (!seenRoots.has(root.id)) {
             seenRoots.add(root.id);
-            if (laneIdx >= AUTO_EXPAND_LANES && !probs.length) collapsed.add(root.id);
+            if (laneIdx >= AUTO_EXPAND_LANES && !needsAttention(summary)) collapsed.add(root.id);
         }
 
         const lane = {
             rootId: root.id,
             rel,
+            summary,
             cards: [],
             pills: [],
             pairs: [],
@@ -242,9 +252,7 @@ export function mount(el, { store, toolbar }) {
                 h('div.meta', null,
                     h('span', null, icon('users'), t('map.onlineN', { n: root.onlineUsers || 0 })),
                     h('span', null, icon('door-exit'), count(exits.length, 'map.exitsPlural')),
-                    probs.length
-                        ? h('span.bad', null, icon('alert-triangle'), count(probs.length, 'map.problemsPlural'))
-                        : h('span.ok', null, icon('circle-check'), t('map.allWorks')))),
+                    summaryBadge(summary))),
             body);
         lane.body = body;
         lane.svg = svgEl;
@@ -261,13 +269,15 @@ export function mount(el, { store, toolbar }) {
 
     function renderSolos(list) {
         if (!list.length) return null;
+        const summary = model.attentionSummary(index(), { nodes: list.map(n => n.id), links: [] });
         const lane = { rootId: 'solo', cards: [], pills: [], pairs: [] };
         lane.el = h('section.nmc-lane', { dataset: { lane: 'solo' } },
             h('div.nmc-lane-head', null,
                 h('div.ttl', null, icon('server-2'), h('span.nm', null, t('map.noCascade'))),
-                h('div.meta', null, h('span', null, `${count(list.length, 'map.nodesPlural')} · ${t('map.directExit')}`))),
+                h('div.meta', null, h('span', null, `${count(list.length, 'map.nodesPlural')} · ${t('map.directExit')}`), summaryBadge(summary))),
             h('div.nmc-solo-grid', null, list.map(n => {
-                const c = h(`div.nmc-solo.s-${n.status}`, {
+                const status = model.attentionStatus('node', n);
+                const c = h(`div.nmc-solo.s-${status}`, {
                     dataset: { node: n.id },
                     role: 'button',
                     tabindex: '0',
@@ -277,7 +287,7 @@ export function mount(el, { store, toolbar }) {
                         keydown: e => { if (e.key === 'Enter') store.select({ kind: 'node', id: n.id }); },
                     },
                 },
-                h('div.row1', null, h('span.flag', null, n.flag || '🖥️'), h('span.nm', null, n.label || n.ip || ''), dot(n.status)),
+                h('div.row1', null, h('span.flag', null, n.flag || '🖥️'), h('span.nm', null, n.label || n.ip || ''), dot(status)),
                 h('div.row2', null,
                     h('span', null, n.onlineUsers ? [icon('users'), ` ${n.onlineUsers} · `] : null, h('span.mono', null, n.ip || ''))));
                 lane.cards.push(c);
@@ -292,9 +302,8 @@ export function mount(el, { store, toolbar }) {
         if (laneList.length) side.append(h('div.nmc-group', null, t('map.cascades')));
         for (const lane of laneList) {
             const root = model.nodeOf(index(), lane.rootId);
-            const hasErr = laneProblems(lane.rel).some(p => p.sev === 'error');
             side.append(sideRow(lane.rootId, { kind: 'node', id: root.id }, true, 0,
-                dot(hasErr ? 'error' : root.status), nodeTitle(root),
+                dot(lane.summary.status === 'unknown' ? 'pending' : lane.summary.status), nodeTitle(root),
                 h('span.ms', null, String(root.onlineUsers || 0), ' ', icon('users')), sel));
             const walk = (id, depth, seen) => {
                 if (depth > 8) return;
@@ -302,10 +311,10 @@ export function mount(el, { store, toolbar }) {
                     if (seen.includes(l.target)) continue;
                     const n = model.nodeOf(index(), l.target);
                     if (!n) continue;
-                    const bad = l.status !== 'online';
+                    const status = model.attentionStatus('link', l);
                     side.append(sideRow(lane.rootId, { kind: 'link', id: l.id }, false, depth,
-                        dot(bad ? l.status : n.status), nodeTitle(n),
-                        h(`span.ms${l.status === 'error' ? '.bad' : ''}`, null, l.status === 'online' ? ms(l.latencyMs) : statusName(l.status)), sel));
+                        dot(model.worstStatus([status, model.attentionStatus('node', n)])), nodeTitle(n),
+                        h(`span.ms${status === 'error' ? '.bad' : ''}`, null, status === 'online' ? ms(l.latencyMs) : statusName(status)), sel));
                     walk(n.id, depth + 1, seen.concat(n.id));
                 }
             };
@@ -314,7 +323,7 @@ export function mount(el, { store, toolbar }) {
         if (solos.length) {
             side.append(h('div.nmc-group', null, t('map.noCascade')));
             for (const n of solos) {
-                side.append(sideRow('solo', { kind: 'node', id: n.id }, false, 0, dot(n.status), nodeTitle(n),
+                side.append(sideRow('solo', { kind: 'node', id: n.id }, false, 0, dot(model.attentionStatus('node', n)), nodeTitle(n),
                     h('span.ms', null, n.onlineUsers ? String(n.onlineUsers) : ''), sel));
             }
         }
@@ -345,27 +354,29 @@ export function mount(el, { store, toolbar }) {
         currentRoots = allRoots;
         const solos = model.soloNodes(index());
 
-        let roots = allRoots;
-        if (f.problemsOnly) roots = roots.filter(r => laneProblems(model.related(index(), 'node', r.id)).length);
+        let roots = allRoots.map((root, laneIdx) => {
+            const rel = model.related(index(), 'node', root.id);
+            return { root, laneIdx, rel, summary: model.attentionSummary(index(), rel) };
+        });
+        if (f.problemsOnly) roots = roots.filter(r => needsAttention(r.summary));
         if (f.query) {
-            roots = roots.filter(r => Array.from(model.related(index(), 'node', r.id).nodes)
+            roots = roots.filter(r => Array.from(r.rel.nodes)
                 .some(id => model.matchesQuery(model.nodeOf(index(), id) || {}, f.query)));
         }
         let soloList = solos;
-        if (f.problemsOnly) soloList = soloList.filter(n => n.status !== 'online');
+        if (f.problemsOnly) soloList = soloList.filter(n => model.attention('node', n) !== 'ok');
         if (f.query) soloList = soloList.filter(n => model.matchesQuery(n, f.query));
 
-        problemsBtn.classList.toggle('on', !!f.problemsOnly);
-
-        lanes = roots.map(r => renderLane(r, allRoots.indexOf(r)));
+        lanes = roots.map(renderLane);
         const soloLane = renderSolos(soloList);
         if (soloLane) lanes.push(soloLane);
 
         clear(main);
-        main.append(renderKpis(), ...lanes.map(l => l.el));
+        main.append(renderKpis(lanes.length > 0), ...lanes.map(l => l.el));
         if (!lanes.length) {
-            main.append(h('div.nm-alert.muted.nmc-empty', null, icon(f.problemsOnly ? 'circle-check' : 'search'),
-                h('div.msg', null, f.problemsOnly ? t('map.noProblems') : f.query ? t('map.nothingFound') : t('noNodesOrLinks'))));
+            main.append(h('div.nm-alert.muted.nmc-empty', null, icon('search'),
+                h('div.msg', null, f.query ? t('map.nothingFound') : f.problemsOnly && (allRoots.length || solos.length)
+                    ? t('map.noProblems') : t('noNodesOrLinks'))));
         }
         main.scrollTop = scrollTop;
 
@@ -402,8 +413,8 @@ export function mount(el, { store, toolbar }) {
                 animated++;
                 continue;
             }
-            const st2 = p.link.status;
-            lane.svg.appendChild(svg('path', { class: `nm-conn ${st2}`, d, 'data-link': p.link.id }));
+            const st2 = model.attentionStatus('link', p.link);
+            lane.svg.appendChild(svg('path', { class: `nm-conn ${st2 === 'unknown' ? 'pending' : st2}`, d, 'data-link': p.link.id }));
             if (st2 === 'online') {
                 lane.svg.appendChild(svg('path', { class: 'nm-flow', d, 'data-link': p.link.id }));
                 animated++;
@@ -502,7 +513,8 @@ export function mount(el, { store, toolbar }) {
         const idx = index();
         const parts = [];
         for (const n of idx.nodes.values()) parts.push(n.id, n.status, n.onlineUsers || 0, n.label, n.flag, n.lastError || '');
-        for (const l of idx.links.values()) parts.push(l.id, l.status, l.latencyMs, l.label, l.mode, l.tunnelPort, l.lastError || '');
+        for (const l of idx.links.values()) parts.push(l.id, model.attentionStatus('link', l), l.status, l.latencyMs, l.label,
+            l.mode, l.tunnelPort, l.tunnelTransport, l.tunnelVerification, l.tunnelState, l.lastError || '');
         return parts.join('|');
     }
 

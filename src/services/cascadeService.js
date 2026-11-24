@@ -7,6 +7,7 @@
 
 const net = require('net');
 const { randomBytes, createHash } = require('node:crypto');
+const { Types: { ObjectId } } = require('mongoose');
 const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
 const Settings = require('../models/settingsModel');
@@ -22,11 +23,58 @@ const logger = require('../utils/logger');
 const webhook = require('./webhookService');
 const { isRebuildEnabled } = require('./rebuildMode');
 const { CLASSIC_KCP_REBUILD_ONLY, CLASSIC_KCP_MESSAGE, assertClassicTunnelTransport } = require('../utils/cascadeTransport');
-const { clearOldReverseHealth, hasKcpStatus, projectLinkHealth, observationSelect, createReverseObserver } = require('./rebuildReverseLinkHealth');
+const { clearOldReverseHealth, hasKcpStatus, projectLinkHealth, createReverseObserver } = require('./rebuildReverseLinkHealth');
 const { trackLegacyCascadeUndeploy } = require('../modules/relay-l2tp/services/legacyCascadeUndeploy');
 
-const TOPOLOGY_CACHE_KEY = 'c3:cascade:topology:kcp-status-v1';
+// Only reuse Classic entries produced by this version's public projection.
+const TOPOLOGY_CACHE_KEY = 'c3:cascade:topology:public-v2';
 const TOPOLOGY_CACHE_TTL = 15;
+const TOPOLOGY_NODE_SELECT = 'name ip domain flag type status onlineUsers cascadeRole mapPosition.x mapPosition.y '
+    + 'country port ssh.password ssh.privateKey lastError lastSync';
+const TOPOLOGY_LINK_SELECT = 'name portalNode bridgeNode status mode tunnelPort latencyMs tunnelProtocol '
+    + 'tunnelTransport muxEnabled tunnelSecurity lastError lastHealthCheck rebuildKcpApplied';
+// Private inputs used only to verify the current reverse observation or mKCP
+// application stamp. In particular, lifecycle's presence is a health veto.
+const TOPOLOGY_REBUILD_HEALTH_SELECT = 'active rebuildDelete lifecycle updatedAt tunnelUuid tunnelEncryption '
+    + 'rebuildTlsServerName kcpHeader kcpMtu kcpTti kcpUplinkCapacity kcpDownlinkCapacity '
+    + 'rebuildApplied rebuildApplyEpoch rebuildReverseObservation';
+
+const MAP_ERROR_MESSAGES = new Set([
+    'Xray health unknown: no agent token configured',
+    'Xray health unknown: node changed during check',
+    'Xray runtime API unavailable',
+    'Service not running after sync',
+    'CLASSIC_SCOPED_TUNNEL_UNCONFIRMED',
+    'Bridge unreachable on tunnel port',
+    'No ESTABLISHED tunnel connections',
+]);
+
+function topologyError(value) {
+    // Arbitrary stored driver/SSH/agent diagnostics may include credentials.
+    // Emit only short fixed copy (all <300 chars), never an excerpt of them.
+    if (typeof value !== 'string' || value === '') return '';
+    return MAP_ERROR_MESSAGES.has(value) ? value : 'Topology check failed';
+}
+
+const topologyTime = value => value instanceof Date && Number.isFinite(value.getTime()) ? value.toISOString() : null;
+const topologyPosition = p => Number.isFinite(p?.x) && Number.isFinite(p?.y) ? { x: p.x, y: p.y } : undefined;
+
+function topologyApplied(receipt) {
+    // A recorded Apply is historical metadata, not proof that the desired
+    // tuple still matches, nor that the tunnel is online. Legacy/malformed
+    // rows do not claim either a receipt or an explicit never-applied draft.
+    if (receipt === null) return false;
+    if (!receipt || typeof receipt !== 'object' || Object.keys(receipt).length !== 5) return undefined;
+    const { listener, mode, protocol, port, uuid } = receipt;
+    const listenerId = listener instanceof ObjectId ? listener.toHexString() : listener;
+    if (typeof listenerId !== 'string' || !/^[a-f0-9]{24}$/.test(listenerId) || !['reverse', 'forward'].includes(mode)
+        || (protocol !== 'vless' && !(mode === 'forward' && protocol === 'vmess'))
+        || !Number.isInteger(port) || port < 1 || port > 65535 || typeof uuid !== 'string' || !/^\S+$/.test(uuid)) {
+        return undefined;
+    }
+    return true;
+}
+
 const reverseObserver = createReverseObserver({ Link: CascadeLink, Node: HyNode,
     request: (...args) => require('./syncService').readRebuildReverseObservation(...args) });
 
@@ -1404,16 +1452,14 @@ class CascadeService {
             try { return JSON.parse(cached); } catch (_) {}
         }
 
-        const linkQuery = CascadeLink.find({ active: true });
-        linkQuery.select(rebuild ? observationSelect : '+rebuildKcpApplied');
         const [allNodes, allLinks] = await Promise.all([
             // Virtual nodes have no IP/country and don't participate in the cascade.
             HyNode.find({ active: true, type: { $ne: 'virtual' } })
-                .select('name ip domain flag type status onlineUsers cascadeRole mapPosition country port ssh')
+                .select(TOPOLOGY_NODE_SELECT)
                 .lean(),
-            linkQuery
-                .populate('portalNode', 'name ip')
-                .populate('bridgeNode', 'name ip')
+            CascadeLink.find({ active: true })
+                .select(rebuild ? `${TOPOLOGY_LINK_SELECT} ${TOPOLOGY_REBUILD_HEALTH_SELECT}` : TOPOLOGY_LINK_SELECT)
+                .populate('portalNode bridgeNode', '_id')
                 .lean(),
         ]);
 
@@ -1423,40 +1469,46 @@ class CascadeService {
                 label: n.name,
                 ip: n.ip,
                 domain: n.domain || '',
-                flag: n.flag || '',
+                flag: typeof n.flag === 'string' ? n.flag : '',
                 type: n.type,
                 status: n.status,
                 onlineUsers: n.onlineUsers || 0,
                 cascadeRole: n.cascadeRole || 'standalone',
-                country: n.country || '',
+                country: typeof n.country === 'string' ? n.country : '',
                 port: n.port,
                 sshConfigured: !!(n.ssh?.password || n.ssh?.privateKey),
+                lastError: topologyError(n.lastError),
+                lastSync: topologyTime(n.lastSync),
             },
-            position: (n.mapPosition?.x != null && n.mapPosition?.y != null)
-                ? { x: n.mapPosition.x, y: n.mapPosition.y }
-                : undefined,
+            position: topologyPosition(n.mapPosition),
         }));
 
-        const visibleLinks = allLinks.map(link => projectLinkHealth(link, rebuild));
-        const edges = visibleLinks.map(l => ({
-            data: {
-                id: `link-${l._id}`,
-                linkId: String(l._id),
-                source: String(l.portalNode?._id || l.portalNode),
-                target: String(l.bridgeNode?._id || l.bridgeNode),
-                label: l.name,
-                status: l.status,
-                ...(l.tunnelVerification ? { tunnelState: l.tunnelState, tunnelVerification: l.tunnelVerification } : {}),
-                ...(l.observationExpiresAt && rebuild ? { observationExpiresAt: l.observationExpiresAt } : {}),
-                tunnelPort: l.tunnelPort,
-                latencyMs: l.latencyMs,
-                tunnelProtocol: l.tunnelProtocol,
-                tunnelTransport: l.tunnelTransport,
-                mode: l.mode || 'reverse',
-                muxEnabled: l.muxEnabled || false,
-                tunnelSecurity: l.tunnelSecurity || 'none',
-            },
-        }));
+        const edges = allLinks.map(row => {
+            const l = projectLinkHealth(row, rebuild);
+            return {
+                data: {
+                    id: `link-${l._id}`,
+                    linkId: String(l._id),
+                    source: String(l.portalNode?._id || l.portalNode),
+                    target: String(l.bridgeNode?._id || l.bridgeNode),
+                    label: l.name,
+                    status: l.status,
+                    tunnelState: l.tunnelVerification ? l.tunnelState : undefined,
+                    tunnelVerification: l.tunnelVerification,
+                    observationExpiresAt: rebuild ? l.observationExpiresAt : undefined,
+                    tunnelPort: l.tunnelPort,
+                    latencyMs: l.latencyMs,
+                    tunnelProtocol: l.tunnelProtocol,
+                    tunnelTransport: l.tunnelTransport,
+                    mode: l.mode || 'reverse',
+                    muxEnabled: l.muxEnabled || false,
+                    tunnelSecurity: l.tunnelSecurity || 'none',
+                    lastError: topologyError(l.lastError),
+                    lastHealthCheck: topologyTime(l.lastHealthCheck),
+                    rebuildApplied: rebuild ? topologyApplied(row.rebuildApplied) : undefined,
+                },
+            };
+        });
 
         // Add virtual "Internet" node and edges from exit/standalone nodes
         const exitNodes = allNodes.filter(n =>
@@ -1464,7 +1516,8 @@ class CascadeService {
         );
 
         if (exitNodes.length > 0) {
-            const settings = await Settings.findById('settings').select('networkMap.internetPosition').lean();
+            const settings = await Settings.findById('settings')
+                .select('networkMap.internetPosition.x networkMap.internetPosition.y').lean();
             const saved = settings?.networkMap?.internetPosition;
             const positionedExits = exitNodes.map(n => n.mapPosition)
                 .filter(p => Number.isFinite(p?.x) && Number.isFinite(p?.y));

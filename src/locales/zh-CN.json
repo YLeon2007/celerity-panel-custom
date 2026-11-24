@@ -1815,12 +1815,15 @@
       "msUnit": "毫秒",
       "latencyValue": "延迟 {n} 毫秒",
       "port": "端口",
-      "allGood": "未显示问题",
+      "allGood": "没有问题",
+      "noStatusData": "暂无状态数据",
+      "unverifiedCount": "{n} 项未验证",
+      "countLabel": "{n}{label}",
       "allWorks": "未显示问题",
       "show": "显示",
       "showAll": "显示全部",
-      "problemsOnly": "仅显示问题",
-      "noProblems": "所选范围内未显示问题",
+      "problemsOnly": "需要关注",
+      "noProblems": "没有需要关注的项目",
       "nothingFound": "未找到结果",
       "expandAll": "全部展开",
       "collapseAll": "全部折叠",
@@ -1840,7 +1843,8 @@
       "kpi": {
         "nodesOnline": "在线节点",
         "clients": "客户端",
-        "chainsOk": "所有连接均在线的链路",
+        "chainsOk": "在线链路",
+        "attention": "健康状态",
         "avgLatency": "平均延迟",
         "problems": "问题",
         "online": "在线",
@@ -1885,7 +1889,9 @@
         "nodeOffline": "节点无响应",
         "linkError": "连接错误",
         "linkOffline": "连接无响应",
-        "linkPending": "连接的部署尚未确认"
+        "linkPending": "连接的部署尚未确认",
+        "nodeUnverified": "节点未验证",
+        "linkUnverified": "连接未验证"
       },
       "alert": {
         "nodeError": "节点报告错误",
@@ -2004,6 +2010,16 @@
         "cancel": "取消",
         "saved": "草稿已保存。部署尚未确认。",
         "applied": "Rebuild 更改已应用。"
+      },
+      "details": {
+        "unverifiedShort": "未验证",
+        "linkUnverifiedDesc": "地图没有此链路当前运行状态的验证结果。",
+        "linkObservationStaleDesc": "上次运行观测已过期，当前连接尚未验证。",
+        "linkObserved": "已观测到运行连接",
+        "linkObservedDesc": "已观测到连接，但这并不验证端到端的客户端流量。",
+        "observationExpires": "观测结果将在{when}过期",
+        "nodeUnknownDesc": "地图没有此节点的当前状态。这并不意味着节点已离线。",
+        "lastError": "上次错误：{message}"
       },
       "editExistingLinkNotice": "要编辑现有连接，请打开经典地图。",
       "linkEditNotice": "请在经典地图中创建或编辑链路。",

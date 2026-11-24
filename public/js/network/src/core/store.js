@@ -13,7 +13,6 @@ import model from './model.js';
 import { fetchTopology as getTopology } from './api.js';
 
 const POLL_INTERVAL_MS = 30000;
-const MAX_OBSERVATION_MS = 90000;
 
 export function createStore({ isVisible }) {
     const listeners = new Map();
@@ -53,13 +52,14 @@ export function createStore({ isVisible }) {
         let next = Infinity;
         let changed = false;
         for (const link of state.index.links.values()) {
-            if (link.mode === 'forward' || link.status !== 'online') continue;
-            const until = link.observationExpiresAt;
-            if (Number.isSafeInteger(until) && now < until && until - now <= MAX_OBSERVATION_MS) {
-                next = Math.min(next, until);
-            } else {
-                Object.assign(link, { status: 'deployed', latencyMs: null, tunnelState: 'unknown', lastHealthCheck: null });
+            if (link.status !== 'online') continue;
+            const status = model.attentionStatus('link', link, now);
+            if (status !== 'online') {
+                Object.assign(link, { status, latencyMs: null, tunnelState: 'unknown', lastHealthCheck: null, observationExpiresAt: null });
                 changed = true;
+            } else if (link.mode !== 'forward') {
+                const until = model.observationExpiry(link, now);
+                if (until != null) next = Math.min(next, until);
             }
         }
         if (Number.isFinite(next)) observationTimer = setTimeout(() => expireObservations(true), next - now);

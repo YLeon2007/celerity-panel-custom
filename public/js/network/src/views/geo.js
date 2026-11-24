@@ -196,6 +196,7 @@ export function mount(el, { store, toolbar }) {
     function render() {
         if (destroyed) return;
         const index = store.index;
+        const scope = store.state.filter.problemsOnly ? model.attentionScope(index) : null;
         computeBase();
         clear(markersG);
         clear(arcsG);
@@ -203,9 +204,9 @@ export function mount(el, { store, toolbar }) {
         arcs = new Map();
 
         for (const n of index.nodes.values()) {
-            if (!nodeShown(n)) continue;
+            if ((scope && !scope.nodes.has(n.id)) || !nodeShown(n)) continue;
             const role = model.roleOf(n);
-            const g = svg('g', { class: `mk ${role} s-${n.status}`, 'data-node': n.id });
+            const g = svg('g', { class: `mk ${role} s-${model.attentionStatus('node', n)}`, 'data-node': n.id });
             if (role === 'cdn') {
                 g.append(svg('rect', { x: -15, y: -9, width: 30, height: 18, rx: 6, fill: 'rgba(56,189,248,.15)', stroke: '#38bdf8' }));
                 const lbl = svg('text', { class: 'cnt', x: 0, y: 4, 'text-anchor': 'middle' });
@@ -228,14 +229,15 @@ export function mount(el, { store, toolbar }) {
         let animated = 0;
         const allEdges = [...index.links.values(), ...index.cdnEdges.values()];
         for (const l of allEdges) {
-            if (!markers.has(l.source) || !markers.has(l.target)) continue;
+            if ((scope && !scope.links.has(l.id)) || !markers.has(l.source) || !markers.has(l.target)) continue;
             const g = svg('g', { 'data-link': l.id });
-            const cls = l.isCdnEdge ? 'cdn' : l.status;
+            const status = model.attentionStatus('link', l);
+            const cls = l.isCdnEdge ? 'cdn' : status === 'unknown' ? 'pending' : status;
             const path = svg('path', { class: `arc ${cls}` });
             const hit = svg('path', { class: 'arc-hit' });
             g.append(path);
             let flow = null;
-            if (l.status === 'online' && !l.isCdnEdge) {
+            if (status === 'online' && !l.isCdnEdge) {
                 flow = svg('path', { class: 'arc-flow' });
                 g.append(flow);
                 animated++;
@@ -247,7 +249,7 @@ export function mount(el, { store, toolbar }) {
         }
         el.classList.toggle('nm-calm', animated > MAX_ANIMATED);
 
-        renderNoGeo();
+        renderNoGeo(scope);
         renderBadge();
         reposition();
         applyLabels();
@@ -278,9 +280,10 @@ export function mount(el, { store, toolbar }) {
         root.classList.toggle('labels-off', !(layers.names || transform.k >= LABEL_ZOOM));
     }
 
-    function renderNoGeo() {
+    function renderNoGeo(scope) {
         clear(noGeo);
-        const list = Array.from(store.index.nodes.values()).filter(n => n.type !== 'cdn' && !geoOf(n));
+        const list = Array.from(store.index.nodes.values()).filter(n => n.type !== 'cdn' && !geoOf(n)
+            && (!scope || scope.nodes.has(n.id)));
         noGeo.hidden = !list.length;
         if (!list.length) return;
         noGeo.append(
@@ -290,7 +293,7 @@ export function mount(el, { store, toolbar }) {
                 type: 'button',
                 dataset: { node: n.id },
                 on: { click: () => store.select({ kind: 'node', id: n.id }) },
-            }, dot(n.status), h('span.nm', null, nodeTitle(n)))));
+            }, dot(model.attentionStatus('node', n)), h('span.nm', null, nodeTitle(n)))));
     }
 
     function renderBadge() {
@@ -450,7 +453,7 @@ export function mount(el, { store, toolbar }) {
     return {
         update(change) {
             if (change.type === 'select') { applyDim(); return; }
-            if (change.type === 'filter') { applyDim(); return; }
+            if (change.type === 'filter') { render(); return; }
             if (!projection) { resize(); return; }
             if (change.structural) setupProjection();
             render();

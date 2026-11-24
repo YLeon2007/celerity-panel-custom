@@ -100,15 +100,17 @@ test('authenticated receiver observations alone drive fresh rebuild status, with
         assert.equal(Number.isSafeInteger(expires), expected === 'online');
         const map = await get('topology');
         const edge = map.edges.find(e => e.data.linkId === String(_id)).data;
+        assert.equal(edge.rebuildApplied, true);
         const mcpEdge = (await mcp.getTopology()).links.find(l => String(l._id) === String(_id));
         const detail = (await mcp.queryCascade({ id: String(_id) })).link;
         const mcpList = (await mcp.queryCascade({ filter: { status: expected } })).links;
         for (const entry of [links[0], edge, mcpEdge, detail, mcpList.find(l => String(l._id) === String(_id))]) {
             assert.equal(entry.status, expected);
             assert.equal(entry.observationExpiresAt, expires);
-            for (const key of ['rebuildApplied', 'rebuildApplyEpoch', 'rebuildReverseObservation']) {
+            for (const key of ['rebuildApplyEpoch', 'rebuildReverseObservation']) {
                 assert.equal(Object.hasOwn(entry, key), false, key);
             }
+            if (entry !== edge) assert.equal(Object.hasOwn(entry, 'rebuildApplied'), false);
         }
     };
     await cascade.healthCheckRebuildReverse();

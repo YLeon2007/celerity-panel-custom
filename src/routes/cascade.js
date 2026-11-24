@@ -154,9 +154,9 @@ router.get('/topology', requireScope('nodes:read'), async (req, res) => {
         if (isRebuildEnabled()) res.set('Cache-Control', 'no-store');
         const topology = await cascadeService.getTopology();
         res.json(topology);
-    } catch (error) {
-        logger.error(`[Cascade API] Topology error: ${error.message}`);
-        res.status(500).json({ error: error.message });
+    } catch {
+        logger.error('[Cascade API] Topology read failed');
+        res.status(500).json({ error: 'Unable to load topology' });
     }
 });
 

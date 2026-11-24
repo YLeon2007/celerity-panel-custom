@@ -8,7 +8,7 @@ import { t } from '../core/i18n.js';
 import { h, icon, clear, toast } from './dom.js';
 import {
     roleName, roleDesc, statusName, nodeTitle, ms, typeName, ago,
-    roleTag, statusPill, dot, modeIcon,
+    roleTag, statusPill, dot, modeIcon, linkStatusDetail, nodeStatusDetail, lastErrorText,
 } from './format.js';
 
 export function createInspector(el, { store, actions, onGoto }) {
@@ -76,17 +76,19 @@ export function createInspector(el, { store, actions, onGoto }) {
 
     // ==================== PATH ====================
 
-    function hops(chain, curLinkId) {
+    function hops(chain, curLinkId, now) {
         const index = store.index;
         const items = [h('span.nm-hop.ext', null, icon('users'), t('map.client')), h('span.nm-hop-arrow', null, icon('arrow-narrow-right'))];
         chain.nodes.forEach((nid, i) => {
             const n = model.nodeOf(index, nid);
             if (i > 0) {
                 const l = index.links.get(chain.links[i - 1]);
-                items.push(h(`span.nm-hop-arrow${l && l.status === 'error' ? '.error' : ''}`, null,
+                const detail = l && linkStatusDetail(l, now);
+                const status = detail?.status;
+                items.push(h(`span.nm-hop-arrow${status === 'error' ? '.error' : ''}`, null,
                     icon('arrow-narrow-right'),
-                    l && l.status === 'online' && typeof l.latencyMs === 'number' ? h('span.ms', null, ms(l.latencyMs))
-                        : l && l.status === 'error' ? icon('alert-triangle') : null));
+                    detail?.latencyMs != null ? h('span.ms', null, ms(detail.latencyMs))
+                        : status === 'error' ? icon('alert-triangle') : null));
             }
             const cur = curLinkId && (chain.links[i - 1] === curLinkId || chain.links[i] === curLinkId);
             items.push(h(`button.nm-hop${cur ? '.cur' : ''}`, { type: 'button', on: { click: () => goto({ kind: 'node', id: nid }) } }, nodeTitle(n)));
@@ -96,6 +98,11 @@ export function createInspector(el, { store, actions, onGoto }) {
     }
 
     // ==================== NODE ====================
+
+    function unknownNodeAlert(detail) {
+        return h('div.nm-alert.muted', null, icon('info-circle'), h('div.msg', null,
+            detail.description, detail.synced ? h('span.meta', null, detail.synced) : null));
+    }
 
     function internetView() {
         const index = store.index;
@@ -107,7 +114,7 @@ export function createInspector(el, { store, actions, onGoto }) {
                     h('div.nm-sec-title', null, t('map.exitPoints', { n: exits.length })),
                     h('div.nm-chain-list', null, exits.map(x => h('button.nm-chain-row', {
                         type: 'button', on: { click: () => goto({ kind: 'node', id: x.id }) },
-                    }, dot(x.status), h('span.lbl', null, nodeTitle(x)), roleTag(model.roleOf(x))))))),
+                    }, dot(model.attentionStatus('node', x)), h('span.lbl', null, nodeTitle(x)), roleTag(model.roleOf(x))))))),
         ];
     }
 
@@ -124,26 +131,30 @@ export function createInspector(el, { store, actions, onGoto }) {
         const chainList = model.chainsThrough(index, 'node', id);
         const cdns = model.cdnFor(index, id);
 
+        const detail = nodeStatusDetail(n);
+        const diagnostic = lastErrorText(n.lastError);
         let alert = null;
-        if (n.status === 'error') {
+        if (detail.status === 'error') {
             alert = h('div.nm-alert.error', null, icon('alert-octagon'), h('div.msg', null,
                 h('b', null, t('map.alert.nodeError')),
-                n.lastError ? [h('br'), n.lastError] : null,
-                n.lastSync ? h('span.meta', null, t('map.lastSync', { when: ago(n.lastSync) })) : null));
-        } else if (n.status === 'offline') {
+                diagnostic ? [h('br'), diagnostic] : null,
+                detail.synced ? h('span.meta', null, detail.synced) : null));
+        } else if (detail.status === 'offline') {
             alert = h('div.nm-alert.muted', null, icon('plug-connected-x'), h('div.msg', null,
                 h('b', null, t('map.alert.nodeOffline')),
-                n.lastSync ? h('span.meta', null, t('map.lastSync', { when: ago(n.lastSync) })) : null,
-                n.lastError ? h('span.meta', null, n.lastError) : null));
-        } else if (n.status === 'syncing') {
+                detail.synced ? h('span.meta', null, detail.synced) : null,
+                diagnostic ? h('span.meta', null, diagnostic) : null));
+        } else if (detail.status === 'syncing') {
             alert = h('div.nm-alert.warn', null, icon('loader-2', 'nm-spin'), h('div.msg', null, t('map.alert.nodeSyncing')));
+        } else if (detail.status === 'unknown') {
+            alert = unknownNodeAlert(detail);
         }
 
         const kpis = h('div.nm-kpis', null,
-            kpi('users', t('map.kpi.online'), String(n.onlineUsers || 0)),
+            kpi('users', t('map.kpi.online'), detail.status === 'unknown' ? '—' : String(n.onlineUsers || 0)),
             kpi('link', t('map.kpi.links'), String(outs.length + ins.length), t('map.kpi.inOut', { in: ins.length, out: outs.length })),
             kpi('cpu', t('map.kpi.type'), typeName(n.type), n.port ? `:${n.port}` : ''),
-            kpi('clock', t('map.kpi.sync'), n.lastSync ? ago(n.lastSync) : '—'));
+            kpi('clock', t('map.kpi.sync'), ago(n.lastSync) || '—'));
 
         const chainsBlock = chainList.length
             ? h('div', null,
@@ -165,7 +176,7 @@ export function createInspector(el, { store, actions, onGoto }) {
             : h('div.nm-alert.muted', null, icon('route-off'), h('div.msg', null, t('map.notInCascade')));
 
         return [
-            head(n.flag || icon('server-2'), role, n.label || n.ip || '', [statusPill(n.status), roleTag(role), copyChip(n.ip)]),
+            head(n.flag || icon('server-2'), role, n.label || n.ip || '', [statusPill(detail.status), roleTag(role), copyChip(n.ip)]),
             h('div.nm-insp-body', null,
                 alert,
                 kpis,
@@ -182,9 +193,11 @@ export function createInspector(el, { store, actions, onGoto }) {
         const index = store.index;
         const originId = index.originByCdn.get(n.id);
         const origin = originId ? model.nodeOf(index, originId) : null;
+        const detail = nodeStatusDetail(n);
         return [
-            head(icon('cloud'), 'cdn', n.label || n.domain || 'CDN', [statusPill(n.status), roleTag('cdn'), copyChip(n.domain)]),
+            head(icon('cloud'), 'cdn', n.label || n.domain || 'CDN', [statusPill(detail.status), roleTag('cdn'), copyChip(n.domain)]),
             h('div.nm-insp-body', null,
+                detail.description ? unknownNodeAlert(detail) : null,
                 h('div.nm-alert.muted', null, icon('info-circle'), h('div.msg', null, t('map.cdnNodeDesc'))),
                 h('div.nm-props', null,
                     prop('world-www', t('map.prop.domain'), h('span.mono', null, n.domain || '—')),
@@ -234,32 +247,28 @@ export function createInspector(el, { store, actions, onGoto }) {
         const sName = s ? s.label : '';
         const tName = tn ? tn.label : '';
 
-        let alert = null;
-        if (l.status === 'error') {
-            alert = h('div.nm-alert.error', null, icon('alert-octagon'), h('div.msg', null,
-                h('b', null, t('map.alert.linkError')),
-                l.lastError ? [h('br'), l.lastError] : null,
-                l.lastHealthCheck ? h('span.meta', null, t('map.lastCheck', { when: ago(l.lastHealthCheck) })) : null,
-                tn ? h('div.actions', null, inspectBtn('.sm', 'server-2', t('map.openName', { name: model.shortName(tn) }), () => goto({ kind: 'node', id: tn.id }))) : null));
-        } else if (l.status === 'pending') {
-            alert = h('div.nm-alert.muted', null, icon('cloud-upload'), h('div.msg', null,
-                h('b', null, t('map.alert.linkPending')), h('br'),
-                l.tunnelVerification === 'mkcp_apply_unconfirmed' ? t('mkcpApplyUnconfirmed') : t('map.alert.linkPendingDesc')));
-        } else if (l.status === 'offline') {
-            alert = h('div.nm-alert.warn', null, icon('plug-connected-x'), h('div.msg', null,
-                h('b', null, t('map.alert.linkOffline')),
-                l.lastError ? [h('br'), l.lastError] : null,
-                l.lastHealthCheck ? h('span.meta', null, t('map.lastCheck', { when: ago(l.lastHealthCheck) })) : null));
-        } else if (l.status === 'syncing') {
-            alert = h('div.nm-alert.warn', null, icon('loader-2', 'nm-spin'), h('div.msg', null, t('map.alert.linkSyncing')));
-        } else if (l.status === 'deployed' && l.tunnelVerification === 'mkcp_runtime_unsupported') {
-            alert = h('div.nm-alert.muted', null, icon('info-circle'), h('div.msg', null,
-                h('b', null, t('mkcpAppliedUnverified')), h('br'), t('mkcpRuntimeUnsupported')));
-        }
+        const now = Date.now();
+        const detail = linkStatusDetail(l, now);
+        const [style, glyph, title] = {
+            error: ['error', 'alert-octagon', 'map.alert.linkError'],
+            offline: ['warn', 'plug-connected-x', 'map.alert.linkOffline'],
+            syncing: ['warn', 'loader-2', 'map.alert.linkSyncing'],
+            pending: ['muted', 'cloud-upload', 'map.alert.linkPending'],
+        }[detail.status] || ['muted', 'info-circle'];
+        const alert = detail.status !== 'online' || detail.description
+            ? h(`div.nm-alert.${style}`, null, icon(glyph, detail.status === 'syncing' ? 'nm-spin' : ''), h('div.msg', null,
+                h('b', null, title ? t(title) : detail.title),
+                detail.description ? h('div', null, detail.description) : null,
+                detail.checked ? h('span.meta', null, detail.checked) : null,
+                detail.expires ? h('span.meta', null, detail.expires) : null,
+                detail.error ? h('div', null, detail.error) : null,
+                detail.status === 'error' && tn
+                    ? h('div.actions', null, inspectBtn('.sm', 'server-2', t('map.openName', { name: model.shortName(tn) }), () => goto({ kind: 'node', id: tn.id }))) : null))
+            : null;
 
         const sub = [
-            statusPill(l.status),
-            l.status === 'online' && typeof l.latencyMs === 'number' ? h('span.mono', null, ms(l.latencyMs)) : null,
+            statusPill(detail.status, detail.title),
+            detail.latencyMs !== null ? h('span.mono', null, ms(detail.latencyMs)) : null,
             l.publishedExit ? h('span.nm-role.cdn', null, t('map.inSubscription', { id: l.routeId })) : null,
         ];
 
@@ -267,7 +276,7 @@ export function createInspector(el, { store, actions, onGoto }) {
             head(icon(modeIcon(l.mode)), 'edge', l.label || `${sName} → ${tName}`, sub),
             h('div.nm-insp-body', null,
                 alert,
-                h('div', null, h('div.nm-sec-title', null, t('routePath')), hops(chain, l.id)),
+                h('div', null, h('div.nm-sec-title', null, t('routePath')), hops(chain, l.id, now)),
                 h('div.nm-props', null,
                     prop('route', t('map.prop.mode'), isFwd ? 'Forward' : 'Reverse',
                         isFwd ? t('map.modeForwardDesc', { a: sName, b: tName }) : t('map.modeReverseDesc', { a: sName, b: tName })),
@@ -281,7 +290,7 @@ export function createInspector(el, { store, actions, onGoto }) {
                     typeof l.publishedExit === 'boolean' ? prop('list-details', t('map.prop.subscription'),
                         l.publishedExit ? t('map.subPublished', { id: l.routeId })
                             : isFwd ? t('map.subForward') : t('map.subNotPublished')) : null,
-                    l.lastHealthCheck ? prop('stethoscope', t('map.prop.checked'), ago(l.lastHealthCheck)) : null)),
+                    !alert && detail.checked ? prop('stethoscope', t('map.prop.checked'), ago(l.lastHealthCheck, now)) : null)),
             linkActions(l),
         ];
     }

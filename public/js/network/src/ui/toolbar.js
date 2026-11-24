@@ -8,6 +8,15 @@ import { t, plural } from '../core/i18n.js';
 import { h, icon, clear, debounce } from './dom.js';
 import { nodeTitle } from './format.js';
 
+export function attentionLabel({ problems, unverified }, hasData, noSearchMatch = false) {
+    if (noSearchMatch) return t('map.nothingFound');
+    if (problems || unverified) {
+        return [problems && t('map.countLabel', { n: problems, label: plural(problems, 'map.problemsPlural') }),
+            unverified && t('map.unverifiedCount', { n: unverified })].filter(Boolean).join(' · ');
+    }
+    return t(hasData ? 'map.allGood' : 'map.noStatusData');
+}
+
 export function createToolbar(el, { store, onGoto }) {
     const searchInput = h('input.nm-input', {
         type: 'search',
@@ -19,7 +28,10 @@ export function createToolbar(el, { store, onGoto }) {
     });
     const slot = h('div.nm-bar-slot');
     const stats = h('div.nm-stats');
-    const probBtn = h('button.nm-btn.nm-problems.ok', { type: 'button', 'aria-haspopup': 'true', 'aria-expanded': 'false' });
+    const filterBtn = h('button.nm-btn.sm.nm-attention-filter', { type: 'button',
+        on: { click: () => store.setFilter({ problemsOnly: !store.state.filter.problemsOnly }) },
+    }, icon('filter'), h('span.lbl', null, t('map.problemsOnly')));
+    const probBtn = h('button.nm-btn.nm-attention', { type: 'button', 'aria-haspopup': 'true', 'aria-expanded': 'false' });
     const pop = h('div.nm-pop', { hidden: true, role: 'menu' });
 
     const applyQuery = debounce(() => store.setFilter({ query: searchInput.value.trim().slice(0, 100) }), 120);
@@ -42,7 +54,6 @@ export function createToolbar(el, { store, onGoto }) {
 
     probBtn.addEventListener('click', e => {
         e.stopPropagation();
-        if (!model.problems(store.index).length) return;
         setPop(pop.hidden);
     });
     document.addEventListener('click', e => {
@@ -52,6 +63,7 @@ export function createToolbar(el, { store, onGoto }) {
     el.append(
         h('div.nm-search', null, icon('search'), searchInput, h('span.nm-kbd', null, '/')),
         slot,
+        filterBtn,
         h('div.nm-spacer'),
         stats,
         probBtn,
@@ -66,16 +78,17 @@ export function createToolbar(el, { store, onGoto }) {
     function problemTitle(p) {
         const index = store.index;
         if (p.kind === 'node') return nodeTitle(model.nodeOf(index, p.id));
-        const l = index.links.get(p.id);
-        return l ? l.label || '' : '';
+        const l = index.links.get(p.id) || index.unmappedLinks?.get(p.id);
+        return l?.label || p.id;
     }
 
     function renderPop() {
-        const list = model.problems(store.index);
+        const list = model.attentionItems(store.index);
         clear(pop);
         pop.append(...list.slice(0, 100).map(p => h(`button.nm-prob.${p.sev}`, {
             type: 'button',
             role: 'menuitem',
+            disabled: p.kind === 'link' && !store.index.links.has(p.id),
             on: {
                 click: () => {
                     setPop(false);
@@ -83,7 +96,7 @@ export function createToolbar(el, { store, onGoto }) {
                     if (onGoto) onGoto({ kind: p.kind, id: p.id });
                 },
             },
-        }, icon(p.sev === 'error' ? 'alert-octagon' : 'alert-triangle'),
+        }, icon(p.sev === 'error' ? 'alert-octagon' : p.sev === 'warn' ? 'alert-triangle' : 'help'),
         h('div', null, h('div.t', null, problemTitle(p)), h('div.d', null, p.detail || t(`map.problem.${p.code}`))))));
     }
 
@@ -96,14 +109,28 @@ export function createToolbar(el, { store, onGoto }) {
             h('span.opt', { title: t('map.kpi.chainsOk') }, icon('route'), h('b', null, String(s.chainsOk)), `/${s.chains}`),
             s.avgLatency != null ? h('span.opt', { title: t('map.kpi.avgLatency') }, icon('clock'), h('b', null, String(s.avgLatency)), ` ${t('map.msUnit')}`) : null);
 
-        const n = s.problems;
-        probBtn.classList.toggle('ok', n === 0);
-        probBtn.replaceChildren(...(n
-            ? [h('span.nm-dot.error'), ` ${n} ${plural(n, 'map.problemsPlural')} `, icon('chevron-down')]
-            : [icon('circle-check'), ` ${t('map.allGood')}`]));
-        if (!n) setPop(false);
+        const { problemsOnly, query } = store.state.filter;
+        filterBtn.classList.toggle('on', problemsOnly);
+        filterBtn.setAttribute('aria-pressed', String(problemsOnly));
+        // Counts are global; suppress a green badge when a search has no results.
+        const actionable = s.problems > 0 || s.unverified > 0;
+        const noSearchMatch = !actionable && !!query && (problemsOnly
+            || !Array.from(store.index.nodes.values()).some(n => model.matchesQuery(n, query)));
+        const hasData = s.nodes + s.links > 0;
+        const level = s.problems ? 'problem' : s.unverified ? 'unverified' : hasData && !noSearchMatch ? 'ok' : 'empty';
+        probBtn.dataset.attention = level;
+        probBtn.classList.toggle('nm-problems', level === 'ok' || level === 'problem');
+        probBtn.classList.toggle('ok', level === 'ok');
+        probBtn.disabled = !actionable;
+        const glyph = { ok: 'circle-check', problem: 'alert-triangle', unverified: 'help', empty: 'search' }[level];
+        probBtn.replaceChildren(icon(glyph), ` ${attentionLabel(s, hasData, noSearchMatch)}`,
+            ...(actionable ? [icon('chevron-down')] : []));
+        if (!actionable) setPop(false);
         else if (!pop.hidden) renderPop();
     }
+
+    store.on('filter', update);
+    update();
 
     return {
         slot,

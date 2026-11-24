@@ -1816,12 +1816,15 @@
       "msUnit": "ms",
       "latencyValue": "Latency {n} ms",
       "port": "port",
-      "allGood": "No problems shown",
+      "allGood": "No problems",
+      "noStatusData": "No status data",
+      "unverifiedCount": "{n} unverified",
+      "countLabel": "{n} {label}",
       "allWorks": "no problems shown",
       "show": "show",
       "showAll": "show all",
-      "problemsOnly": "Problems only",
-      "noProblems": "No problems shown for this selection",
+      "problemsOnly": "Needs attention",
+      "noProblems": "Nothing needs attention",
       "nothingFound": "Nothing found",
       "expandAll": "Expand all",
       "collapseAll": "Collapse all",
@@ -1841,7 +1844,8 @@
       "kpi": {
         "nodesOnline": "Nodes online",
         "clients": "Clients",
-        "chainsOk": "Chains with all links online",
+        "chainsOk": "Chains online",
+        "attention": "Health",
         "avgLatency": "Average latency",
         "problems": "Problems",
         "online": "Online",
@@ -1886,7 +1890,9 @@
         "nodeOffline": "Node is not responding",
         "linkError": "Link error",
         "linkOffline": "Link is not responding",
-        "linkPending": "Link deployment is not confirmed"
+        "linkPending": "Link deployment is not confirmed",
+        "nodeUnverified": "Node unverified",
+        "linkUnverified": "Link unverified"
       },
       "alert": {
         "nodeError": "The node reports an error",
@@ -2005,6 +2011,16 @@
         "cancel": "Cancel",
         "saved": "Draft saved. Deployment was not confirmed.",
         "applied": "Rebuild changes applied."
+      },
+      "details": {
+        "unverifiedShort": "unverified",
+        "linkUnverifiedDesc": "The map has no current runtime verification for this link.",
+        "linkObservationStaleDesc": "The last runtime observation has expired. The current connection is not verified.",
+        "linkObserved": "Runtime connection observed",
+        "linkObservedDesc": "A connection was observed. This does not verify end-to-end client traffic.",
+        "observationExpires": "Observation expires {when}",
+        "nodeUnknownDesc": "The map has no current status for this node. This does not mean the node is offline.",
+        "lastError": "Last error: {message}"
       },
       "editExistingLinkNotice": "To edit an existing link, open the classic map.",
       "linkEditNotice": "Use the classic map to create or edit links.",

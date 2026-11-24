@@ -130,7 +130,7 @@ export function mount(el, { store, toolbar, canSavePositions }) {
                 id: `internet-${n.id}`,
                 source: n.id,
                 target: model.INTERNET_ID,
-                status: n.status === 'online' ? 'online' : 'offline',
+                status: model.attention('node', n) === 'ok' ? 'online' : 'offline',
                 isInternetEdge: true,
             });
         }
@@ -313,7 +313,8 @@ export function mount(el, { store, toolbar, canSavePositions }) {
             const sig = cardSig(node, role);
             if (sig === rec.sig) return;
             rec.sig = sig;
-            rec.el.className = `nmg-card r-${role} s-${node.status}${role === 'internet' ? ' internet' : ''}`;
+            const status = model.attentionStatus('node', node);
+            rec.el.className = `nmg-card r-${role} s-${status}${role === 'internet' ? ' internet' : ''}`;
             clear(rec.el);
             if (role === 'internet') {
                 rec.el.append(h('div.flag', null, '🌐'), h('div.nm', null, t('map.internet')));
@@ -327,7 +328,7 @@ export function mount(el, { store, toolbar, canSavePositions }) {
                         roleTag(role),
                         node.onlineUsers ? h('span.users', null, icon('users'), String(node.onlineUsers)) : null,
                         role === 'cdn' ? h('span', null, node.domain || '') : null)),
-                h('span.st', null, dot(node.status)));
+                h('span.st', null, dot(status)));
         });
         for (const [id, rec] of cards) {
             if (!seen.has(id)) { rec.el.remove(); cards.delete(id); }
@@ -354,7 +355,7 @@ export function mount(el, { store, toolbar, canSavePositions }) {
         const index = store.index;
         if (id.startsWith('internet-')) {
             const node = index.nodes.get(id.slice(9));
-            return node ? { id, source: node.id, status: node.status === 'online' ? 'online' : 'offline', isInternetEdge: true } : null;
+            return node ? { id, source: node.id, status: model.attention('node', node) === 'ok' ? 'online' : 'offline', isInternetEdge: true } : null;
         }
         return model.edgeOf(index, id);
     }
@@ -442,7 +443,8 @@ export function mount(el, { store, toolbar, canSavePositions }) {
 
     function drawEdges() {
         const z = cy.zoom();
-        const ps = Math.min(1, Math.max(0.75, z));
+        // Scale the badge with the cards even at minimum visible zoom.
+        const ps = Math.min(1, z);
         pillsLayer.classList.toggle('tiny', z < 0.45);
         const seen = new Set();
         const pills = [];
@@ -459,19 +461,21 @@ export function mount(el, { store, toolbar, canSavePositions }) {
 
             const st = classes.edges.get(id) || '';
             const geo = geometry(e);
-            const kind = info.isInternetEdge ? `inet${info.status === 'online' ? '' : ' off'}` : info.isCdnEdge ? 'cdn' : info.status;
+            const status = model.attentionStatus('link', info);
+            const tone = status === 'unknown' ? 'pending' : status;
+            const kind = info.isInternetEdge ? `inet${status === 'online' ? '' : ' off'}` : info.isCdnEdge ? 'cdn' : tone;
             rec.path.setAttribute('d', geo.d);
             rec.path.setAttribute('class', `nm-conn ${kind}${st}`);
             rec.hit.setAttribute('d', geo.d);
-            const flowing = info.status === 'online' && !info.isInternetEdge && !info.isCdnEdge;
+            const flowing = status === 'online' && !info.isInternetEdge && !info.isCdnEdge;
             rec.flow.style.display = flowing ? '' : 'none';
             if (flowing) {
                 rec.flow.setAttribute('d', geo.d);
                 rec.flow.setAttribute('class', `nm-flow${st.includes('faded') ? ' faded' : ''}`);
             }
             if (rec.pill) {
-                const key = `${info.status}|${info.latencyMs}|${info.mode}`;
-                rec.pill.className = `nm-pill ${info.isCdnEdge ? 'cdn' : info.status}${st}`;
+                const key = [status, info.status, info.latencyMs, info.mode, info.tunnelTransport, info.tunnelVerification, info.tunnelState].join('|');
+                rec.pill.className = `nm-pill ${info.isCdnEdge ? 'cdn' : status}${st}`;
                 if (key !== rec.key) {
                     rec.pill.replaceChildren();
                     rec.pill.append(...pillContent(info).map(c => (typeof c === 'string' ? document.createTextNode(c) : c)));
@@ -547,11 +551,12 @@ export function mount(el, { store, toolbar, canSavePositions }) {
         const f = store.state.filter;
         const sel = store.state.selection;
         const set = focusSet();
+        const scope = f.problemsOnly ? model.attentionScope(index) : null;
         const matches = id => {
             const n = index.nodes.get(id);
             return !!n && model.matchesQuery(n, f.query);
         };
-        const anyMatch = !!f.query && Array.from(index.nodes.keys()).some(matches);
+        const anyMatch = !!f.query && Array.from(index.nodes.keys()).some(id => (!scope || scope.nodes.has(id)) && matches(id));
         const anyExitVisible = Array.from(index.nodes.values()).some(n => n.type !== 'cdn' && model.isExitNode(n) && !f.roles.has(model.roleOf(n)));
 
         const next = { nodes: new Map(), edges: new Map() };
@@ -559,7 +564,7 @@ export function mount(el, { store, toolbar, canSavePositions }) {
             cy.nodes().forEach(n => {
                 const id = n.id();
                 const role = n.data('role');
-                const hidden = id === model.INTERNET_ID ? !anyExitVisible : f.roles.has(role);
+                const hidden = (scope && !scope.nodes.has(id)) || (id === model.INTERNET_ID ? !anyExitVisible : f.roles.has(role));
                 n.toggleClass('hidden', hidden);
                 let faded = false;
                 if (set) faded = !set.nodes.has(id);
@@ -568,7 +573,7 @@ export function mount(el, { store, toolbar, canSavePositions }) {
             });
             cy.edges().forEach(e => {
                 const id = e.id();
-                const hidden = e.source().hasClass('hidden') || e.target().hasClass('hidden');
+                const hidden = (scope && !scope.links.has(id)) || e.source().hasClass('hidden') || e.target().hasClass('hidden');
                 e.toggleClass('hidden', hidden);
                 let st = '';
                 if (set) st = set.links.has(id) ? ' hl' : ' faded';
