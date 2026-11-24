@@ -2,11 +2,12 @@
 
 const { BSON } = require('mongoose').mongo;
 const keyEnvelopeField = 'rebuildVlessKeyEnvelope';
-const fullLinkRead = Object.freeze({ schemaLevelProjections: false });
+const fullLinkRead = Object.freeze({ schemaLevelProjections: false, projection: Object.freeze({ rebuildDesiredEdited: 0 }) });
 
-// Only top-level fields written by health checks (including Mongoose's timestamp).
+// Ignore top-level health fields (including Mongoose's timestamp) and the edit badge.
 // Keep every other field, including unknown fields and nested objects, in the guard.
-function linkSnapshot({ status, lastHealthCheck, latencyMs, lastError, updatedAt, rebuildReverseObservation, ...working }) {
+function linkSnapshot({ status, lastHealthCheck, latencyMs, lastError, updatedAt, rebuildReverseObservation,
+    rebuildDesiredEdited, ...working }) {
     return working;
 }
 

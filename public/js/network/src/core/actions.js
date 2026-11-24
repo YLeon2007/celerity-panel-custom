@@ -1,4 +1,5 @@
 import { createRebuildClient, isObjectId, isPreviewId, linkIdOf, RebuildRequestError, SessionChanged } from './api.js';
+import { editPatch, InvalidEditFields } from './edit-fields.js';
 import { t } from './i18n.js';
 import { toast } from '../ui/dom.js';
 
@@ -6,6 +7,8 @@ const kcpRefusals = new Set([
     'REBUILD_KCP_XRAY_VERSION_UNSUPPORTED', 'REBUILD_KCP_UDP_PORT_CONFLICT', 'REBUILD_L2TP_KCP_LISTENER_UNSUPPORTED',
 ]);
 const stale = new Set(['REBUILD_PREVIEW_CHANGED', 'REBUILD_LINK_CHANGED', 'REBUILD_PREVIEW_REQUIRED']);
+const editUnavailable = new Set(['REBUILD_LINK_NOT_FOUND', 'REBUILD_DELETION_PENDING', 'REBUILD_INVALID_EDGE_ROLE', 'REBUILD_REPLACE_WITH_DELETE_CREATE']);
+const tlsRefusals = new Set(['REBUILD_TLS_SERVER_NAME_REQUIRED', 'REBUILD_TLS_NAME_MISMATCH', 'REBUILD_TLS_TRUST_UNVERIFIED', 'REBUILD_TLS_CERT_UNREADABLE']);
 const statuses = new Set(['pending', 'staged', 'deployed', 'online', 'offline', 'error']);
 const changes = new Set(['create', 'replace', 'unchanged']);
 const sections = new Set(['inbounds', 'outbounds', 'routing', 'reverse', 'log', 'api', 'stats', 'policy', 'dns', 'observatory']);
@@ -32,7 +35,7 @@ function allowsApply(report) {
         && report.nodes.every(node => clear(node) && node.profiles.every(p => p.protectedChanged === false));
 }
 
-function refusalInfo(err) {
+function refusalInfo(err, editing = false) {
     const error = err instanceof RebuildRequestError ? err.body?.error : null;
     const code = error?.code;
     if (err instanceof SessionChanged || err instanceof RebuildRequestError && err.status === 403) {
@@ -41,11 +44,20 @@ function refusalInfo(err) {
     if (err instanceof RebuildRequestError && err.status === 409 && kcpRefusals.has(code)) {
         // This route publishes localized plain text for typed mKCP refusals.
         // Never display a generic transport / exception message.
-        const issueMessages = Array.isArray(error.issues) ? error.issues.map(issue => issue?.message).filter(publicText) : [];
-        return { message: publicText(error.message) ? error.message : issueMessages.join(' ') || t('map.rebuild.kcpRefused'), notSaved: true };
+        const issues = Array.isArray(error.issues) ? error.issues.map(issue => issue?.message).filter(publicText).join(' ') : '';
+        const summary = publicText(error.message) ? error.message : '';
+        return { message: [summary, issues && !summary.includes(issues) ? issues : ''].filter(Boolean).join(' ')
+            || t('map.rebuild.kcpRefused'), notSaved: true };
     }
     if (err instanceof RebuildRequestError && err.status === 400 && code === 'INVALID_KCP_LINK_SETTINGS') {
         return { message: t('map.rebuild.kcpRefused'), notSaved: true };
+    }
+    if (editing && err instanceof RebuildRequestError) {
+        if ((err.status === 404 || err.status === 409) && editUnavailable.has(code)) {
+            return { message: t('map.edit.unavailable'), notSaved: true, reloadEdit: true };
+        }
+        if (err.status === 409 && tlsRefusals.has(code)) return { message: t('map.edit.tlsRefused'), notSaved: true };
+        if (err.status === 400 && code === 'REBUILD_INVALID_REQUEST') return { message: t('map.create.badSettings'), notSaved: true };
     }
     if (stale.has(code)) return { message: t('map.rebuild.previewChanged') };
     return { notSaved: err instanceof RebuildRequestError && err.status === 400 && code === 'REBUILD_INVALID_REQUEST' };
@@ -68,6 +80,9 @@ const draftResult = (status, linkId = null) => ({ status, desiredSaved: linkId !
 /** Rebuild-only controller. Callers own the buttons and form; construction is idle. */
 export function createActions(store) {
     let busy = false;
+    // At most one open edit. Keep the read's client and baseline private;
+    // neither caller-supplied fields nor a new token can rebind a save.
+    let openedEdit = null;
 
     async function run(task, onBusy) {
         if (busy) return onBusy;
@@ -95,15 +110,46 @@ export function createActions(store) {
         return store.index.links.has(edgeId) ? linkIdOf(edgeId) : null;
     }
 
+    function editableEdge(edgeId, edit) {
+        const edge = store.index.links.get(edgeId);
+        const id = linkIdOf(edgeId)?.toLowerCase();
+        if (!id || edge?.canEdit !== true || !isObjectId(edge.source) || !isObjectId(edge.target)
+            || edge.source.toLowerCase() === edge.target.toLowerCase()) return false;
+        if (edge.linkId != null && (!isObjectId(edge.linkId) || edge.linkId.toLowerCase() !== id)) return false;
+        return !edit || (edit._id === id && edit.portalNode === edge.source.toLowerCase()
+            && edit.bridgeNode === edge.target.toLowerCase());
+    }
+
+    async function loadEdit(edgeId) {
+        return run(async (_, refuse) => {
+            openedEdit = null;
+            try {
+                if (!editableEdge(edgeId)) throw new Error('Selected link is not editable');
+                const client = createRebuildClient();
+                const edit = await client.getEditLink(linkIdOf(edgeId).toLowerCase());
+                if (!editableEdge(edgeId, edit)) throw new Error('Selected link changed');
+                openedEdit = { edgeId, client, edit };
+                return edit;
+            } catch (err) {
+                await refuse(refusalInfo(err).message || t('map.edit.unavailable'));
+                return null;
+            }
+        }, null);
+    }
+
     function lookupNode(nodeId) {
         const node = store.index.nodes.get(nodeId);
         return node ? { label: node.label, role: store.model.roleOf(node) } : null;
     }
 
-    async function previewAndWrite(client, linkId, operation, markWrite, refuse) {
+    async function previewAndWrite(client, linkId, operation, markWrite, refuse, stillEditable) {
         const dialog = window.C3RebuildPreview;
         if (typeof dialog?.confirmReport !== 'function') {
             await refuse(t('map.rebuild.previewUnavailable'));
+            return false;
+        }
+        if (stillEditable && !stillEditable()) {
+            await refuse(t('map.edit.unavailable'));
             return false;
         }
         const removing = operation === 'remove';
@@ -135,6 +181,10 @@ export function createActions(store) {
             await refuse(t('map.rebuild.previewUnavailable'));
             return false;
         }
+        if (stillEditable && !stillEditable()) {
+            await refuse(t('map.edit.unavailable'));
+            return false;
+        }
         try {
             client.assertSession();
             markWrite();
@@ -164,34 +214,74 @@ export function createActions(store) {
         }, false);
     }
 
-    async function createAndDeploy(body) {
+    async function saveAndDeploy(body, markWrite, refuse, binding = null) {
+        if (typeof window.C3RebuildPreview?.confirmReport !== 'function') {
+            await refuse(t('map.rebuild.previewUnavailable'));
+            return draftResult('not_saved');
+        }
+        const expectedId = binding?.edit._id;
+        const matchingId = id => isObjectId(id) && (!binding || id.toLowerCase() === expectedId);
+        const stillEditable = binding && (() => editableEdge(binding.edgeId, binding.edit));
+        let client, reply;
+        try {
+            client = binding ? binding.client : createRebuildClient();
+            client.assertSession();
+            // Consume before a possible save. Only a definite, correctable
+            // pre-write refusal can leave this same baseline open for retry.
+            openedEdit = null;
+            markWrite();
+            reply = binding ? await client.updateDraft(expectedId, body) : await client.saveDraft(body);
+            if (reply?.executionMode !== 'rebuild' || reply.status !== 'saved' || Object.hasOwn(reply, 'error')
+                || reply.desiredSaved !== true || !matchingId(reply.linkId)) throw new Error('Unconfirmed draft save');
+        } catch (err) {
+            // An acknowledged draft can survive failed cleanup. Such a
+            // partial reply must match the target and cannot authorize Apply.
+            const partial = err instanceof RebuildRequestError && [400, 404, 409, 428].includes(err.status)
+                && typeof err.body?.error?.code === 'string' ? err.body : null;
+            const claimed = err instanceof RebuildRequestError && err.body
+                && (Object.hasOwn(err.body, 'desiredSaved') || Object.hasOwn(err.body, 'linkId'));
+            const linkId = partial?.desiredSaved === true && matchingId(partial.linkId) ? expectedId ?? partial.linkId : null;
+            const info = binding && claimed && !linkId ? {} : refusalInfo(err, !!binding);
+            if (binding && info.notSaved && !linkId && !info.reloadEdit && !(err instanceof SessionChanged) && !err.csrfRejected) {
+                try {
+                    client.assertSession();
+                    if (stillEditable()) openedEdit = binding;
+                } catch (_) { /* A changed session always needs a fresh load. */ }
+            } else if (binding) openedEdit = null;
+            await refuse(info.message || t('map.rebuild.saveUnconfirmed'));
+            if (linkId) toast(t('map.rebuild.draftSaved'), 'warning');
+            return linkId ? draftResult('saved', linkId) : draftResult(info.notSaved ? 'not_saved' : 'unknown');
+        }
+        const linkId = expectedId ?? reply.linkId;
+        if (await previewAndWrite(client, linkId, 'deploy', markWrite, refuse, stillEditable)) return draftResult('applied', linkId);
+        toast(t('map.rebuild.draftSaved'), 'warning');
+        return draftResult('saved', linkId);
+    }
+
+    function createAndDeploy(body) {
+        return run((markWrite, refuse) => saveAndDeploy(body, markWrite, refuse), draftResult('busy'));
+    }
+
+    async function editAndDeploy(edgeId, changes) {
         return run(async (markWrite, refuse) => {
-            if (typeof window.C3RebuildPreview?.confirmReport !== 'function') {
-                await refuse(t('map.rebuild.previewUnavailable'));
+            const binding = openedEdit;
+            if (!binding || binding.edgeId !== edgeId || !editableEdge(edgeId, binding.edit)) {
+                openedEdit = null;
+                await refuse(t('map.edit.unavailable'));
                 return draftResult('not_saved');
             }
-            let client, reply;
+            let patch;
             try {
-                client = createRebuildClient();
-                markWrite();
-                reply = await client.saveDraft(body);
-                if (reply?.executionMode !== 'rebuild' || reply.status !== 'saved' || Object.hasOwn(reply, 'error')
-                    || reply.desiredSaved !== true || !isObjectId(reply.linkId)) throw new Error('Unconfirmed draft save');
+                binding.client.assertSession();
+                patch = editPatch(binding.edit, changes);
             } catch (err) {
-                // The route latches an acknowledged draft even if lock cleanup
-                // subsequently fails. That reply cannot authorize preview/apply.
-                const partial = err instanceof RebuildRequestError && [400, 404, 409, 428].includes(err.status)
-                    && typeof err.body?.error?.code === 'string' ? err.body : null;
-                const linkId = partial?.desiredSaved === true && isObjectId(partial.linkId) ? partial.linkId : null;
-                const info = refusalInfo(err);
-                await refuse(info.message || t('map.rebuild.saveUnconfirmed'));
-                if (linkId) toast(t('map.rebuild.draftSaved'), 'warning');
-                return linkId ? draftResult('saved', linkId) : draftResult(info.notSaved ? 'not_saved' : 'unknown');
+                if (err instanceof SessionChanged) openedEdit = null;
+                await refuse(err instanceof InvalidEditFields ? t(`map.create.${err.key}`)
+                    : refusalInfo(err).message || t('map.edit.unavailable'));
+                return draftResult('not_saved');
             }
-            const { linkId } = reply;
-            if (await previewAndWrite(client, linkId, 'deploy', markWrite, refuse)) return draftResult('applied', linkId);
-            toast(t('map.rebuild.draftSaved'), 'warning');
-            return draftResult('saved', linkId);
+            if (!Object.keys(patch).length) return draftResult('unchanged');
+            return saveAndDeploy(patch, markWrite, refuse, binding);
         }, draftResult('busy'));
     }
 
@@ -223,5 +313,7 @@ export function createActions(store) {
         remove: edgeId => applySelection(edgeId, 'remove'),
         checkHealth,
         createAndDeploy,
+        loadEdit,
+        editAndDeploy,
     };
 }

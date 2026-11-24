@@ -423,7 +423,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                             {$set:{...(isReverse(link)||kcp?unverified:{status:'deployed',lastError:''}),rebuildApplied:appliedLink(link),
                                 rebuildApplyEpoch:epoch,rebuildAppliedMainSha256:mainPins.get(String(link.portalNode)),
                                 ...(kcp?{rebuildKcpApplied:kcpApplyFingerprint(link,epoch)}:{})},
-                            $unset:{rebuildReverseObservation:'',...(!kcp?{rebuildKcpApplied:''}:{})}},{session,runValidators:true});
+                            $unset:{rebuildReverseObservation:'',rebuildDesiredEdited:'',...(!kcp?{rebuildKcpApplied:''}:{})}},{session,runValidators:true});
                         if(result.acknowledged!==true||result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');
                     }
                     if(removed.length){const result=await Link.deleteMany({_id:{$in:removed.map(l=>l._id)},...(!retire&&{rebuildDelete:true})},{session});if(result.deletedCount!==removed.length||retire&&result.acknowledged!==true)throw fail('REBUILD_LINK_CHANGED');}

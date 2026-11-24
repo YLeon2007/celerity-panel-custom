@@ -160,6 +160,7 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     if(link.tunnelSecurity==='reality')link.realityFingerprint=await service.verifyDraftRealityFingerprint(link.toObject(),verify);
     await verify();link.status='pending';
     if(editing){
+        link.rebuildDesiredEdited=true;
         link.rebuildReverseObservation=undefined;
         // Unset even if an observation appeared after this draft was read.
         link.markModified('rebuildReverseObservation');

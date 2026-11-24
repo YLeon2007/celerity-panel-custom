@@ -11,7 +11,7 @@ import model from '../core/model.js';
 import { createRebuildClient, isObjectId, RebuildRequestError, SessionChanged } from '../core/api.js';
 import { t } from '../core/i18n.js';
 import { h, svg, icon, clear, tip, toast } from '../ui/dom.js';
-import { ROLE_ORDER, roleName, roleTag, dot, pillContent, linkTip, nodeTip } from '../ui/format.js';
+import { ROLE_ORDER, roleName, roleTag, dot, pillContent, linkTip, nodeTip, hasUnappliedChanges, linkPillLabel } from '../ui/format.js';
 
 let dagreRegistered = false;
 function ensureDagre() {
@@ -406,9 +406,14 @@ export function mount(el, { store, toolbar, canSavePositions }) {
         bindEdge(hit, id);
         let pill = null;
         if (!id.startsWith('internet-')) {
-            pill = h('div.nm-pill', { role: 'button', tabindex: '-1' });
+            pill = h('div.nm-pill', { role: 'button', tabindex: '0' });
             pillsLayer.appendChild(pill);
             bindEdge(pill, id);
+            pill.addEventListener('keydown', ev => {
+                if (ev.key !== 'Enter' && ev.key !== ' ') return;
+                ev.preventDefault();
+                store.select({ kind: 'link', id });
+            });
         }
         rec = { g, path, flow, hit, pill, key: '', w: 80 };
         edges.set(id, rec);
@@ -474,15 +479,18 @@ export function mount(el, { store, toolbar, canSavePositions }) {
                 rec.flow.setAttribute('class', `nm-flow${st.includes('faded') ? ' faded' : ''}`);
             }
             if (rec.pill) {
-                const key = [status, info.status, info.latencyMs, info.mode, info.tunnelTransport, info.tunnelVerification, info.tunnelState].join('|');
+                const key = [status, info.status, info.latencyMs, info.mode, info.tunnelTransport, info.tunnelVerification,
+                    info.tunnelState, hasUnappliedChanges(info), info.label].join('|');
                 rec.pill.className = `nm-pill ${info.isCdnEdge ? 'cdn' : status}${st}`;
                 if (key !== rec.key) {
+                    rec.pill.setAttribute('aria-label', linkPillLabel(info, status));
                     rec.pill.replaceChildren();
                     rec.pill.append(...pillContent(info).map(c => (typeof c === 'string' ? document.createTextNode(c) : c)));
                     rec.key = key;
-                    rec.w = rec.pill.offsetWidth || 80;
+                    rec.w = 0;
                 }
-                pills.push({ rec, x: geo.px, y: geo.py, w: rec.w * ps, h: 24 * ps });
+                if (!rec.w && z >= 0.45) rec.w = rec.pill.offsetWidth;
+                pills.push({ rec, x: geo.px, y: geo.py, w: (rec.w || 80) * ps, h: 24 * ps });
             }
         });
         placePills(pills, ps);

@@ -58,7 +58,7 @@ function boot(html, { restore = false, blockedStorage = false, failAt = -1 } = {
     const start = inline.indexOf('// ==================== View Tabs');
     const end = inline.indexOf('// ==================== DRAG-AND-DROP', start);
     assert.ok(end > start && start >= 0);
-    const selected = [], window = {}, elements = new Map();
+    const selected = [], events = [], window = {}, elements = new Map();
     const document = {
         createElement: () => ({}),
         body: { appendChild(script) {
@@ -70,6 +70,7 @@ function boot(html, { restore = false, blockedStorage = false, failAt = -1 } = {
             const tag = tagId(html, id);
             if (!tag) return null;
             if (!elements.has(id)) elements.set(id, {
+                dispatchEvent(event) { events.push([id, event.type]); return true; },
                 style: { display: tag.includes('display:none') ? 'none' : '' },
                 classList: new Set(tag.match(/class="([^"]+)"/)?.[1].split(' ') || []),
             });
@@ -82,12 +83,12 @@ function boot(html, { restore = false, blockedStorage = false, failAt = -1 } = {
         getItem() { if (blockedStorage) throw Error('Storage disabled'); return restore ? 'network' : null; },
         removeItem() {},
     };
-    const context = vm.createContext({ window, document, sessionStorage, setTimeout: () => {} });
+    const context = vm.createContext({ Event, window, document, sessionStorage, setTimeout: () => {} });
     for (const js of scripts(html)) {
         if (/^\s*window\._networkCsrfToken\s*=/.test(js)) vm.runInContext(js, context);
     }
     vm.runInContext(inline.slice(start, end), context);
-    return { selected, window, switchView: view => context.switchNodesView(view),
+    return { selected, events, window, switchView: view => context.switchNodesView(view),
         mapOpen: () => document.getElementById('viewNetwork').style.display !== 'none',
         listOpen: () => document.getElementById('viewList').style.display !== 'none' };
 }
@@ -138,6 +139,7 @@ test('Rebuild defaults to modern with its session CSRF and the shared preview di
     assert.deepEqual(ui.selected, []);
     ui.switchView('network');
     ui.switchView('list');
+    assert.deepEqual(ui.events, [['viewNetwork', 'network:hide']]);
     ui.switchView('network');
     assert.equal(ui.mapOpen(), true);
     assert.equal(ui.listOpen(), false);
@@ -229,8 +231,9 @@ test('modern locale payload is limited, translated, and safe inside an HTML scri
             assert.equal(typeof network[key], 'string', `${lang}: ${key} is explicitly translated`);
             assert.equal(data[key], network[key]);
         }
-        const notice = escapeXML(translate('network.map.editExistingLinkNotice', lang));
-        assert.ok(page.body.includes(`<p>${notice}</p>`));
+        assert.deepEqual(data.map.edit, map.edit);
+        for (const key of ['open', 'submit', 'endpointsHint', 'noChanges', 'unapplied', 'apply'])
+            assert.ok(map.edit[key], `${lang}: missing edit label ${key}`);
         if (map.linkEditNotice) assert.ok(!page.body.includes(`<p>${escapeXML(map.linkEditNotice)}</p>`));
         const add = page.body.match(/<button\b[^>]*id="btnAddLink"[^>]*>([^]*?)<\/button>/)?.[1] ?? '';
         assert.ok(add.trim().endsWith(escapeXML(network.addLink)));

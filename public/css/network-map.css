@@ -508,6 +508,17 @@ body:has(#networkRoot) > .nm-tip .nm-dot.unknown, body:has(#networkRoot) > .nm-t
 #networkRoot .nm-pill.syncing { color: #fde68a; border-color: rgba(234, 179, 8, 0.4); }
 #networkRoot .nm-pill.syncing i { color: #facc15; }
 #networkRoot .nm-pill.cdn { color: #7dd3fc; border-color: rgba(56, 189, 248, 0.35); }
+#networkRoot .nm-pill .nm-pill-unapplied {
+    display: inline-flex;
+    flex: none;
+    padding-inline-start: 5px;
+    border-inline-start: 1px solid currentColor;
+    color: #fde68a;
+}
+#networkRoot .nm-pill .nm-pill-unapplied i { color: inherit; }
+#networkRoot .nmx-unapplied { cursor: pointer; }
+#networkRoot .nmx-unapplied circle { fill: #18181b; stroke: #fde68a; }
+#networkRoot .nmx-unapplied path { fill: #fde68a; }
 #networkRoot .nm-pill .act {
     height: 18px;
     margin: 0 -5px 0 4px;

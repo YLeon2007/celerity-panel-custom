@@ -21,6 +21,14 @@ const VIEWS = {
     geo: () => import('./views/geo.js'),
 };
 
+let formModule;
+function loadForm() {
+    return formModule ??= import('./ui/create-form.js').then(mod => mod.renderCreateForm, err => {
+        formModule = null;
+        throw err;
+    });
+}
+
 function boot() {
     const viewRoot = document.getElementById('viewNetwork');
     const root = document.getElementById('networkRoot');
@@ -43,7 +51,12 @@ function boot() {
     const focusInView = sel => { if (view && view.focus) view.focus(sel); };
 
     const toolbar = createToolbar(barEl, { store, onGoto: focusInView });
-    const inspector = createInspector(inspEl, { store, actions, onGoto: focusInView });
+    const inspector = createInspector(inspEl, { store, actions, onGoto: focusInView, loadForm, isVisible });
+    viewRoot?.addEventListener('network:hide', inspector.hide);
+    window.addEventListener?.('pagehide', e => {
+        if (e.persisted) inspector.hide();
+        else inspector.dispose();
+    });
 
     // ==================== STATE OVERLAY ====================
 
@@ -77,6 +90,7 @@ function boot() {
         const token = ++switchToken;
         setHeaderActive(name);
         if (name === viewName && view) return;
+        inspector.cancelEditLoad();
 
         let mod;
         try {
@@ -154,8 +168,7 @@ function boot() {
             if (addBtn.disabled || !isVisible()) return;
             addBtn.disabled = true;
             try {
-                const { renderCreateForm } = await import('./ui/create-form.js');
-                if (isVisible()) inspector.openCreate(renderCreateForm);
+                await inspector.openCreate();
             } catch (err) {
                 console.warn('[network] create editor failed to open:', err.message);
                 toast(t('networkError'), 'error');

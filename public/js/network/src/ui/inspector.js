@@ -9,11 +9,15 @@ import { h, icon, clear, toast } from './dom.js';
 import {
     roleName, roleDesc, statusName, nodeTitle, ms, typeName, ago,
     roleTag, statusPill, dot, modeIcon, linkStatusDetail, nodeStatusDetail, lastErrorText,
+    hasUnappliedChanges,
 } from './format.js';
 
-export function createInspector(el, { store, actions, onGoto }) {
+export function createInspector(el, { store, actions, onGoto, loadForm, isVisible = () => true }) {
     let mode = null;
-    let createSession = null;
+    let formSession = null;
+    let editLoad = null;
+    let createLoad = null;
+    let disposed = false;
     let awaitingLink = null;
 
     function close() {
@@ -70,8 +74,10 @@ export function createInspector(el, { store, actions, onGoto }) {
             h('div.v', null, value, small ? [' ', h('small', null, small)] : null));
     }
 
-    function inspectBtn(cls, iconName, label, onClick) {
-        return h(`button.nm-btn${cls}`, { type: 'button', on: { click: onClick } }, icon(iconName), label);
+    function inspectBtn(cls, iconName, label, onClick, busy = false) {
+        return h(`button.nm-btn${cls}`, {
+            type: 'button', disabled: busy, 'aria-busy': busy ? 'true' : null, on: { click: onClick },
+        }, icon(iconName), label);
     }
 
     // ==================== PATH ====================
@@ -207,16 +213,68 @@ export function createInspector(el, { store, actions, onGoto }) {
     }
 
     // ==================== LINK ====================
+    function canEdit(link) {
+        return typeof actions?.loadEdit === 'function' && typeof loadForm === 'function'
+            && link?.canEdit === true && !link.isCdnEdge && !link.isInternetEdge && !!linkIdOf(link.id);
+    }
+
+    function selectedEditableLink(id) {
+        const sel = store.state.selection;
+        if (sel?.kind !== 'link' || sel.id !== id) return null;
+        const link = store.index.links.get(id);
+        return canEdit(link) ? link : null;
+    }
+
+    function editStillSelected(load) {
+        const link = selectedEditableLink(load.id);
+        return isVisible() && link && link.source === load.source && link.target === load.target
+            && hasUnappliedChanges(link) === load.unapplied;
+    }
+
+    async function openEdit(id) {
+        if (disposed || formSession || editLoad || !isVisible() || actions.isBusy?.()) return;
+        const link = selectedEditableLink(id);
+        if (!link) return;
+        createLoad = null; // A newer editor intent supersedes a pending Add Link import.
+        const load = { id, source: link.source, target: link.target, unapplied: hasUnappliedChanges(link) };
+        editLoad = load;
+        const current = () => editLoad === load && editStillSelected(load);
+        try {
+            render();
+            const projection = await actions.loadEdit(id);
+            if (!current()) return;
+            if (!projection) { toast(t('map.edit.loadFailed'), 'error'); return; }
+            const renderForm = await loadForm();
+            if (!current() || actions.isBusy?.()) return;
+            openForm(renderForm, { edit: projection });
+        } catch (_) {
+            if (current()) toast(t('map.edit.loadFailed'), 'error');
+        } finally {
+            if (editLoad === load) {
+                editLoad = null;
+                render();
+            }
+        }
+    }
+
     function linkActions(link) {
         if (!actions || link.isInternetEdge || !linkIdOf(link.id)) return null;
         const id = link.id;
+        const unapplied = hasUnappliedChanges(link);
+        const run = name => () => {
+            cancelEditLoad();
+            return actions[name](id);
+        };
         return h('div.nm-insp-foot.nm-link-actions', null,
             h('div.row', null,
-                inspectBtn('.primary', 'cloud-upload', t('map.linkActions.deploy'), () => actions.deploy(id)),
-                inspectBtn('', 'route', t('map.linkActions.deployChain'), () => actions.deployChain(id))),
+                inspectBtn(unapplied ? '.primary.nm-apply-btn' : '.primary', 'cloud-upload',
+                    t(unapplied ? 'map.edit.apply' : 'map.linkActions.deploy'), run('deploy')),
+                inspectBtn('', 'route', t('map.linkActions.deployChain'), run('deployChain'))),
             h('div.row', null,
-                inspectBtn('', 'stethoscope', t('map.linkActions.checkHealth'), () => actions.checkHealth(id)),
-                inspectBtn('.danger', 'trash', t('map.linkActions.remove'), () => actions.remove(id))),
+                inspectBtn('', 'stethoscope', t('map.linkActions.checkHealth'), run('checkHealth')),
+                inspectBtn('.danger', 'trash', t('map.linkActions.remove'), run('remove'))),
+            canEdit(link) && store.index.links.has(id) ? h('div.row', null,
+                inspectBtn('.block.nm-edit-btn', 'pencil', t('map.edit.open'), () => openEdit(id), editLoad?.id === id)) : null,
             h('small', null, t('map.linkActions.reconnectHint')));
     }
 
@@ -275,6 +333,8 @@ export function createInspector(el, { store, actions, onGoto }) {
         return [
             head(icon(modeIcon(l.mode)), 'edge', l.label || `${sName} → ${tName}`, sub),
             h('div.nm-insp-body', null,
+                hasUnappliedChanges(l) ? h('div.nm-alert.warn.nm-insp-unapplied', null,
+                    icon('pencil'), h('div.msg', null, t('map.edit.unapplied'))) : null,
                 alert,
                 h('div', null, h('div.nm-sec-title', null, t('routePath')), hops(chain, l.id, now)),
                 h('div.nm-props', null,
@@ -297,29 +357,63 @@ export function createInspector(el, { store, actions, onGoto }) {
 
     // ==================== RENDER ====================
 
-    function openCreate(renderCreateForm) {
-        if (!actions || createSession) return;
+    async function openCreate() {
+        if (!actions || disposed || formSession || createLoad || !isVisible()) return;
+        cancelEditLoad();
+        const load = {};
+        createLoad = load;
+        try {
+            const renderForm = await loadForm();
+            if (createLoad !== load || !isVisible()) return;
+            const sel = store.state.selection;
+            const node = sel?.kind === 'node' ? store.index.nodes.get(sel.id) : null;
+            const source = node && isObjectId(node.id) && model.roleOf(node) !== 'cdn' ? node.id : undefined;
+            openForm(renderForm, { source });
+        } catch (err) {
+            if (createLoad === load && isVisible()) throw err;
+        } finally {
+            if (createLoad === load) createLoad = null;
+        }
+    }
+
+    function cancelEditLoad() {
+        if (!editLoad) return;
+        editLoad = null;
+        render();
+    }
+
+    function hide() {
+        createLoad = null;
+        cancelEditLoad();
+    }
+
+    function dispose() {
+        disposed = true;
+        hide();
         awaitingLink = null;
-        const sel = store.state.selection;
-        const node = sel?.kind === 'node' ? store.index.nodes.get(sel.id) : null;
-        const source = node && isObjectId(node.id) && model.roleOf(node) !== 'cdn' ? node.id : undefined;
+        const session = formSession;
+        formSession = null;
+        try { session?.dispose?.(); } finally { close(); }
+    }
+
+    function openForm(renderForm, options) {
+        awaitingLink = null;
         const session = {};
-        createSession = session;
+        formSession = session;
         clear(el);
         el.classList.add('open');
 
         function leave() {
-            if (createSession !== session) return false;
-            createSession = null;
-            session.dispose?.();
-            close();
+            if (formSession !== session) return false;
+            formSession = null;
+            try { session.dispose?.(); } finally { close(); }
             return true;
         }
 
         try {
             // Only the form owns and displays an unconfirmed save; no host callback resets it.
-            session.dispose = renderCreateForm(el, {
-                store, actions, source,
+            const disposeForm = renderForm(el, {
+                store, actions, ...options,
                 onCancel() { if (leave()) render(); },
                 onCreated(linkId) {
                     if (!leave()) return;
@@ -334,6 +428,8 @@ export function createInspector(el, { store, actions, onGoto }) {
                     if (!mode) render(); // Selection may already have been on this edge.
                 },
             });
+            if (formSession === session) session.dispose = disposeForm;
+            else disposeForm?.(); // A synchronous completion may already have left this mount.
         } catch (err) {
             if (leave()) render();
             throw err;
@@ -341,9 +437,11 @@ export function createInspector(el, { store, actions, onGoto }) {
     }
 
     function render() {
+        if (disposed) return;
         // Keep the actual form (including its in-flight or unknown outcome)
         // alive on topology refreshes and map selection changes.
-        if (createSession) return;
+        if (formSession) return;
+        if (editLoad && !editStillSelected(editLoad)) editLoad = null;
         const sel = store.state.selection;
         if (awaitingLink) {
             if (sel) awaitingLink = null;
@@ -368,5 +466,5 @@ export function createInspector(el, { store, actions, onGoto }) {
         if (body && sameTarget) body.scrollTop = scroll;
     }
 
-    return { render, openCreate };
+    return { render, openCreate, cancelEditLoad, hide, dispose };
 }

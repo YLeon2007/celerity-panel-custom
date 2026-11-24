@@ -11,7 +11,7 @@ import { feature } from 'topojson-client';
 import model from '../core/model.js';
 import { t } from '../core/i18n.js';
 import { h, svg, icon, clear, rafThrottle, tip } from '../ui/dom.js';
-import { nodeTitle, dot, linkTip, nodeTip, count } from '../ui/format.js';
+import { nodeTitle, dot, linkTip, nodeTip, count, hasUnappliedChanges, linkPillLabel } from '../ui/format.js';
 import { COUNTRY_GEO } from './geo-data.js';
 
 const WORLD_URL = '/vendor/world-110m.json';
@@ -41,7 +41,7 @@ const reducedMotion = () => typeof window.matchMedia === 'function' && window.ma
 export function mount(el, { store, toolbar }) {
     el.className = 'nmo';
 
-    const root = svg('svg', { role: 'img', 'aria-label': t('map.viewGeo') });
+    const root = svg('svg', { role: 'group', 'aria-label': t('map.viewGeo') });
     const worldG = svg('g');
     const arcsG = svg('g');
     const markersG = svg('g');
@@ -243,9 +243,28 @@ export function mount(el, { store, toolbar }) {
                 animated++;
             }
             g.append(hit);
-            bindHover(hit, { kind: 'link', id: l.id }, () => linkTip(store.index, l));
+            const sel = { kind: 'link', id: l.id };
+            const tooltip = () => linkTip(store.index, l);
+            bindHover(hit, sel, tooltip);
+            let editMark = null;
+            if (hasUnappliedChanges(l)) {
+                hit.setAttribute('tabindex', '0');
+                hit.setAttribute('role', 'button');
+                hit.setAttribute('aria-label', linkPillLabel(l, status));
+                hit.addEventListener('keydown', e => {
+                    if (e.key !== 'Enter' && e.key !== ' ') return;
+                    e.preventDefault();
+                    store.select(sel);
+                });
+                editMark = svg('g', { class: 'nmx-unapplied', 'aria-hidden': 'true', visibility: 'hidden' });
+                const title = svg('title');
+                title.textContent = t('map.edit.unapplied');
+                editMark.append(title, svg('circle', { r: 8 }), svg('path', { d: 'M-4 4l1-3 5-5 2 2-5 5z' }));
+                bindHover(editMark, sel, tooltip);
+                g.append(editMark);
+            }
             arcsG.appendChild(g);
-            arcs.set(l.id, { g, path, hit, flow, source: l.source, target: l.target });
+            arcs.set(l.id, { g, path, hit, flow, editMark, source: l.source, target: l.target });
         }
         el.classList.toggle('nm-calm', animated > MAX_ANIMATED);
 
@@ -260,6 +279,7 @@ export function mount(el, { store, toolbar }) {
         if (destroyed) return;
         worldG.setAttribute('transform', transform.toString());
         const pos = screenPositions();
+        const occupied = [];
         for (const [id, g] of markers) {
             const p = pos.get(id);
             if (p) g.setAttribute('transform', `translate(${p[0]},${p[1]})`);
@@ -272,6 +292,23 @@ export function mount(el, { store, toolbar }) {
             a.path.setAttribute('d', d);
             a.hit.setAttribute('d', d);
             if (a.flow) a.flow.setAttribute('d', d);
+            if (a.editMark) {
+                // Try space on this arc before covering a node core or another mark.
+                // At dense zooms the edge itself still has the full tooltip/label.
+                const length = a.path.getTotalLength();
+                const spot = [0.5, 0.35, 0.65].find(f => {
+                    const p = a.path.getPointAtLength(length * f);
+                    const near = ([x, y], radius) => Math.hypot(p.x - x, p.y - y) < radius;
+                    for (const n of pos.values()) if (near(n, 24)) return false;
+                    return !occupied.some(n => near(n, 18));
+                });
+                a.editMark.setAttribute('visibility', spot ? 'visible' : 'hidden');
+                if (spot) {
+                    const p = a.path.getPointAtLength(length * spot);
+                    a.editMark.setAttribute('transform', `translate(${p.x},${p.y})`);
+                    occupied.push([p.x, p.y]);
+                }
+            }
         }
         applyLabels();
     });

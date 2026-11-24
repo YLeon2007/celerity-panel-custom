@@ -10,6 +10,7 @@ import { attentionLabel } from '../ui/toolbar.js';
 import { h, svg, icon, clear, rafThrottle, tip } from '../ui/dom.js';
 import {
     statusName, nodeTitle, ms, count, roleTag, dot, pillContent, linkTip, nodeTip,
+    hasUnappliedChanges, linkPillLabel,
 } from '../ui/format.js';
 
 /** Lanes after this many start collapsed unless they contain problems. */
@@ -122,7 +123,7 @@ export function mount(el, { store, toolbar }) {
             dataset: { link: link.id },
             role: 'button',
             tabindex: '0',
-            'aria-label': `${link.label || ''}: ${statusName(status)}`,
+            'aria-label': linkPillLabel(link, status),
             on: {
                 click: e => {
                     e.stopPropagation();
@@ -514,7 +515,7 @@ export function mount(el, { store, toolbar }) {
         const parts = [];
         for (const n of idx.nodes.values()) parts.push(n.id, n.status, n.onlineUsers || 0, n.label, n.flag, n.lastError || '');
         for (const l of idx.links.values()) parts.push(l.id, model.attentionStatus('link', l), l.status, l.latencyMs, l.label,
-            l.mode, l.tunnelPort, l.tunnelTransport, l.tunnelVerification, l.tunnelState, l.lastError || '');
+            l.mode, l.tunnelPort, l.tunnelTransport, l.tunnelVerification, l.tunnelState, l.lastError || '', hasUnappliedChanges(l));
         return parts.join('|');
     }
 

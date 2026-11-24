@@ -18,7 +18,7 @@ mKCP uses UDP and requires Xray **26.6.1 or newer on both endpoints**. Choose `n
 
 Switch between **Chains**, **Graph**, and the geographic **Map**. Compact edge badges summarize links; the tooltip and inspector show details such as protocol, transport, security, port, and status. Runtime **unverified** is distinct from both **error** and **online**.
 
-**Add Link** uses the session CSRF token and saves a draft before Preview. Canceling Preview leaves the saved draft in place. Opening the map, switching views, and saving a draft do not apply topology changes; Apply requires explicit confirmation. To edit an existing link, use `/panel/nodes?map=classic`.
+**Add Link** uses the session CSRF token and saves a draft before Preview. Canceling Preview leaves the saved draft in place. Opening the map, switching views, and saving a draft do not apply topology changes; Apply requires explicit confirmation. To edit an active link, select it on the map and choose **Edit**. The endpoints are read-only. Saving an unchanged form sends no request. After saving an edit, canceling Preview leaves the previously applied configuration untouched. The map flags the unapplied changes; choose **Apply** in the inspector to review them again. The classic map remains available with `?map=classic`.
 
 ## Firefox CSRF compatibility
 

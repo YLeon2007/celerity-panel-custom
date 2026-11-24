@@ -2021,7 +2021,21 @@
         "nodeUnknownDesc": "地图没有此节点的当前状态。这并不意味着节点已离线。",
         "lastError": "上次错误：{message}"
       },
-      "editExistingLinkNotice": "要编辑现有连接，请打开经典地图。",
+      "edit": {
+        "open": "编辑",
+        "apply": "应用",
+        "unapplied": "有未应用的更改",
+        "loadFailed": "无法打开连接编辑器。",
+        "title": "编辑连接",
+        "sub": "保存后，请在预览中检查更改。",
+        "endpointsHint": "如需更换节点，请删除此连接并创建新连接。",
+        "submit": "保存",
+        "saving": "正在保存…",
+        "noChanges": "没有更改",
+        "unavailable": "此连接已无法编辑。请刷新地图。",
+        "tlsRefused": "无法确认 TLS 设置。",
+        "unknown": "无法确认是否已保存。请先在地图上检查连接状态，再尝试编辑。"
+      },
       "linkEditNotice": "请在经典地图中创建或编辑链路。",
       "linkActions": {
         "deploy": "应用链路",

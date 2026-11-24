@@ -34,6 +34,7 @@ function hideRebuildSecrets(_doc, row) {
     delete row.rebuildVlessKeyEnvelope;
     delete row._rebuildVless;
     delete row.rebuildApplied;
+    delete row.rebuildDesiredEdited;
     delete row.rebuildApplyEpoch;
     delete row.rebuildAppliedMainSha256;
     delete row.rebuildReverseObservation;
@@ -147,6 +148,8 @@ const cascadeLinkSchema = new mongoose.Schema({
     // null = a newly created Rebuild draft; absent = legacy, not proof of a
     // never-applied draft. Only successful Apply readback writes a descriptor.
     rebuildApplied: { type: appliedLinkSchema, select: false, default: undefined },
+    // Display-only: a saved Rebuild edit not yet settled by Apply.
+    rebuildDesiredEdited: { type: Boolean, select: false },
     rebuildApplyEpoch: { type: String, select: false, match: /^[a-f0-9]{32}$/ },
     rebuildAppliedMainSha256: { type: String, select: false, match: /^[a-f0-9]{64}$/ },
     rebuildReverseObservation: { type: reverseObservationSchema, select: false },

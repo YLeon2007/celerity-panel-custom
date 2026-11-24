@@ -1,4 +1,6 @@
 /** Panel transport for the Rebuild map. No Classic API or retry path. */
+import { editPatch, projectEditFields } from './edit-fields.js';
+
 const TIMEOUT_MS = 20000;
 const CASCADE = '/api/cascade';
 
@@ -59,10 +61,27 @@ function linkPath(linkId) {
     return `/links/${linkId}`;
 }
 
+const normalizedId = value => isObjectId(value) ? value.toLowerCase() : null;
+const endpointId = value => normalizedId(value && typeof value === 'object' && !Array.isArray(value) ? value._id : value);
+
+function projectEditLink(row, id) {
+    const _id = normalizedId(row?._id);
+    const portalNode = endpointId(row?.portalNode), bridgeNode = endpointId(row?.bridgeNode);
+    // Check both the public lifecycle projection and any raw markers before
+    // dropping them. The GET need not expose the private deletion state.
+    if (!_id || _id !== normalizedId(id) || !portalNode || !bridgeNode || portalNode === bridgeNode
+        || row.active !== true || row.applicationState === 'deleting' || row.lifecycle != null
+        || (row.rebuildDelete != null && row.rebuildDelete !== false) || Object.hasOwn(row, 'error')) {
+        throw new Error('Link details are not editable');
+    }
+    return Object.freeze({ _id, portalNode, bridgeNode, active: true, ...projectEditFields(row) });
+}
+
 // Scope the token to one workflow. Do not reread/rotate it or retry a write.
 export function createRebuildClient() {
     const token = window._networkCsrfToken;
     if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}(?![\s\S])/.test(token)) throw new SessionChanged();
+    let editBaseline = null;
     const assertSession = () => {
         if (window._networkCsrfToken !== token) throw new SessionChanged();
     };
@@ -107,6 +126,30 @@ export function createRebuildClient() {
         },
         remove: (id, expectedPreview) => apply(linkPath(id), 'DELETE', expectedPreview),
         checkHealth: id => request(`${linkPath(id)}/health`, 'GET'),
+        async getEditLink(id) {
+            editBaseline = null;
+            const path = linkPath(id);
+            let row;
+            try {
+                row = await request(path, 'GET');
+            } catch (err) {
+                assertSession();
+                if (err instanceof RebuildRequestError && [401, 403].includes(err.status)) throw new SessionChanged();
+                // Never surface a raw details body, including on failed reads.
+                throw new Error('Link details unavailable');
+            }
+            assertSession();
+            editBaseline = projectEditLink(row, id);
+            return editBaseline;
+        },
+        updateDraft(id, changes) {
+            const path = linkPath(id);
+            assertSession();
+            if (!editBaseline || normalizedId(id) !== editBaseline._id) throw new Error('No matching edit read');
+            const fields = editPatch(editBaseline, changes);
+            if (!Object.keys(fields).length) throw new Error('Empty edit');
+            return request(path, 'PUT', fields);
+        },
         async savePositions(rows) {
             const positions = new Map();
             for (const { id, x, y } of rows) {

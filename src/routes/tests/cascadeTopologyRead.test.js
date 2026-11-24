@@ -129,13 +129,15 @@ function fixture(t, rebuild) {
         assert.equal(response.headers['cache-control'], rebuild ? 'no-store' : undefined);
         const json = JSON.parse(response.body);
         assert.equal(response.body.includes(sentinel), false, 'no private marker in the response');
+        assert.ok(json.edges.every(({ data }) => !Object.hasOwn(data, 'rebuildApplied')
+            || typeof data.rebuildApplied === 'boolean'));
         for (const field of ['tunnelUuid', 'ssh', 'profile', 'rebuildAppliedMainSha256', 'rebuildReverseObservation',
             'rebuildKcpApplied', 'rebuildApplyEpoch', 'lifecycle', 'mapPosition']) {
             assert.equal(response.body.includes(`"${field}":`), false, field);
         }
         return json;
     };
-    return { app, get, calls, cacheCalls, clock };
+    return { app, get, calls, cacheCalls, clock, add };
 }
 
 function assertProjection(calls, rebuild) {
@@ -148,7 +150,7 @@ function assertProjection(calls, rebuild) {
         ssh.password ssh.privateKey lastError lastSync`);
     expected('CascadeLink', query => query.active === true,
         `name portalNode bridgeNode status mode tunnelPort latencyMs tunnelProtocol tunnelTransport muxEnabled
-        tunnelSecurity lastError lastHealthCheck rebuildKcpApplied ${rebuild ? `active rebuildDelete lifecycle updatedAt
+        tunnelSecurity lastError lastHealthCheck rebuildKcpApplied ${rebuild ? `active rebuildDelete rebuildDesiredEdited lifecycle updatedAt
         tunnelUuid tunnelEncryption rebuildTlsServerName kcpHeader kcpMtu kcpTti kcpUplinkCapacity kcpDownlinkCapacity
         rebuildApplied rebuildApplyEpoch rebuildReverseObservation` : ''}`);
     for (const { projection } of calls.filter(call => call.filter._id?.$in)) assert.deepEqual(projection, { _id: 1 });
@@ -210,6 +212,50 @@ test('mounted Rebuild topology exposes safe inspector fields and conservative KP
     assert.deepEqual(cacheCalls, []);
 });
 
+test('Rebuild edge edit eligibility and unapplied changes use persisted state, not health', async t => {
+    const { get, add } = fixture(t, true);
+    const receipt = (name, fields) => {
+        const row = add(name, fields);
+        row.rebuildApplied = appliedLink(row);
+        return row;
+    };
+    receipt('name-only edit', { status: 'pending', lastHealthCheck: observedAt });
+    const older = receipt('pending older apply', { status: 'pending' });
+    delete older.rebuildApplyEpoch;
+    const kcp = receipt('mKCP tuning edit', { status: 'pending', mode: 'forward', tunnelTransport: 'kcp', tunnelSecurity: 'none', kcpTti: 30 });
+    kcp.rebuildKcpApplied = kcpApplyFingerprint({ ...kcp, kcpTti: 20 }, kcp.rebuildApplyEpoch);
+    receipt('projected pending only', { mode: 'forward', tunnelTransport: 'kcp', tunnelSecurity: 'none' });
+    receipt('pending legacy delete', { status: 'pending', rebuildDelete: true });
+    receipt('pending lifecycle', { status: 'pending', lifecycle: { state: 'deleting' } });
+    receipt('real error', { status: 'error' });
+    receipt('offline with receipt', { status: 'offline', mode: 'forward' });
+    add('pending without receipt', { status: 'pending', lastHealthCheck: observedAt });
+    add('new draft', { status: 'pending', rebuildApplied: null });
+    add('pending malformed receipt', { status: 'pending', rebuildApplied: { listener: portal } });
+
+    const graph = await get();
+    for (const name of ['name-only edit', 'pending older apply', 'mKCP tuning edit']) {
+        const { canEdit, hasUnappliedChanges, status, lastHealthCheck } = edge(graph, name);
+        assert.deepEqual([canEdit, hasUnappliedChanges, status, lastHealthCheck], [true, true, 'pending', null], name);
+    }
+    for (const name of ['pending legacy delete', 'pending lifecycle', 'deleting']) {
+        const { canEdit, hasUnappliedChanges } = edge(graph, name);
+        assert.deepEqual([canEdit, hasUnappliedChanges], [false, false], name);
+    }
+    for (const name of ['pending without receipt', 'new draft', 'pending malformed receipt', 'fresh', 'current kcp',
+        'stale kcp', 'projected pending only', 'edited since apply', 'real error', 'offline with receipt']) {
+        const { canEdit, hasUnappliedChanges } = edge(graph, name);
+        assert.deepEqual([canEdit, hasUnappliedChanges], [true, false], name);
+    }
+    assert.equal(edge(graph, 'projected pending only').status, 'pending');
+    assert.equal(edge(graph, 'real error').status, 'error');
+    assert.equal(edge(graph, 'offline with receipt').status, 'offline');
+    assert.ok(!graph.edges.some(({ data }) => data.label === 'inactive link'));
+    const internet = graph.edges.find(({ data }) => data.isInternetEdge).data;
+    assert.equal(Object.hasOwn(internet, 'canEdit'), false);
+    assert.equal(Object.hasOwn(internet, 'hasUnappliedChanges'), false);
+});
+
 test('mounted Classic topology caches only its public projection, not Rebuild observations', async t => {
     const { get, calls, cacheCalls } = fixture(t, false);
     const first = await get();
@@ -218,7 +264,8 @@ test('mounted Classic topology caches only its public projection, not Rebuild ob
     assert.equal(edge(first, 'legacy').status, 'online');
     assert.equal(edge(first, 'current kcp').status, 'pending');
     assert.equal(edge(first, 'legacy').lastHealthCheck, historical.toISOString());
-    assert.ok(first.edges.every(({ data }) => !Object.hasOwn(data, 'rebuildApplied') && !Object.hasOwn(data, 'observationExpiresAt')));
+    assert.ok(first.edges.every(({ data }) => ['rebuildApplied', 'observationExpiresAt', 'canEdit', 'hasUnappliedChanges']
+        .every(field => !Object.hasOwn(data, field))));
     const readCount = calls.length;
     assert.deepEqual(await get(), first);
     assert.equal(calls.length, readCount, 'no DB read on the cache hit');

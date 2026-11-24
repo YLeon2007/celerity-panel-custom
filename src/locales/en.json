@@ -2022,7 +2022,21 @@
         "nodeUnknownDesc": "The map has no current status for this node. This does not mean the node is offline.",
         "lastError": "Last error: {message}"
       },
-      "editExistingLinkNotice": "To edit an existing link, open the classic map.",
+      "edit": {
+        "open": "Edit",
+        "apply": "Apply",
+        "unapplied": "There are unapplied changes",
+        "loadFailed": "Could not open the link editor.",
+        "title": "Edit link",
+        "sub": "Review the changes in Preview after saving.",
+        "endpointsHint": "To change the nodes, delete this link and create a new one.",
+        "submit": "Save",
+        "saving": "Saving…",
+        "noChanges": "No changes",
+        "unavailable": "This link is no longer available to edit. Refresh the map.",
+        "tlsRefused": "The TLS settings could not be confirmed.",
+        "unknown": "Save was not confirmed. Check the link on the map before attempting another edit."
+      },
       "linkEditNotice": "Use the classic map to create or edit links.",
       "linkActions": {
         "deploy": "Apply link",

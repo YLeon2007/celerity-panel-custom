@@ -33,11 +33,10 @@ const TOPOLOGY_NODE_SELECT = 'name ip domain flag type status onlineUsers cascad
     + 'country port ssh.password ssh.privateKey lastError lastSync';
 const TOPOLOGY_LINK_SELECT = 'name portalNode bridgeNode status mode tunnelPort latencyMs tunnelProtocol '
     + 'tunnelTransport muxEnabled tunnelSecurity lastError lastHealthCheck rebuildKcpApplied';
-// Private inputs used only to verify the current reverse observation or mKCP
-// application stamp. In particular, lifecycle's presence is a health veto.
-const TOPOLOGY_REBUILD_HEALTH_SELECT = 'active rebuildDelete lifecycle updatedAt tunnelUuid tunnelEncryption '
+// Private inputs for Rebuild write eligibility, Apply history and health.
+const TOPOLOGY_REBUILD_LINK_SELECT = 'active rebuildDelete lifecycle updatedAt tunnelUuid tunnelEncryption '
     + 'rebuildTlsServerName kcpHeader kcpMtu kcpTti kcpUplinkCapacity kcpDownlinkCapacity '
-    + 'rebuildApplied rebuildApplyEpoch rebuildReverseObservation';
+    + 'rebuildApplied rebuildApplyEpoch rebuildReverseObservation rebuildDesiredEdited';
 
 const MAP_ERROR_MESSAGES = new Set([
     'Xray health unknown: no agent token configured',
@@ -1458,7 +1457,7 @@ class CascadeService {
                 .select(TOPOLOGY_NODE_SELECT)
                 .lean(),
             CascadeLink.find({ active: true })
-                .select(rebuild ? `${TOPOLOGY_LINK_SELECT} ${TOPOLOGY_REBUILD_HEALTH_SELECT}` : TOPOLOGY_LINK_SELECT)
+                .select(rebuild ? `${TOPOLOGY_LINK_SELECT} ${TOPOLOGY_REBUILD_LINK_SELECT}` : TOPOLOGY_LINK_SELECT)
                 .populate('portalNode bridgeNode', '_id')
                 .lean(),
         ]);
@@ -1484,6 +1483,12 @@ class CascadeService {
         }));
 
         const edges = allLinks.map(row => {
+            const canEdit = rebuild && row.active === true && !row.rebuildDelete && !row.lifecycle;
+            const applied = rebuild ? topologyApplied(row.rebuildApplied) : undefined;
+            // The saved edit is independent of health and receipt presence.
+            // Keep the historical pending + valid receipt fallback for older edits.
+            const hasUnappliedChanges = canEdit && (row.rebuildDesiredEdited === true
+                || (row.status === 'pending' && applied === true));
             const l = projectLinkHealth(row, rebuild);
             return {
                 data: {
@@ -1505,7 +1510,8 @@ class CascadeService {
                     tunnelSecurity: l.tunnelSecurity || 'none',
                     lastError: topologyError(l.lastError),
                     lastHealthCheck: topologyTime(l.lastHealthCheck),
-                    rebuildApplied: rebuild ? topologyApplied(row.rebuildApplied) : undefined,
+                    rebuildApplied: applied,
+                    ...(rebuild && { canEdit, hasUnappliedChanges }),
                 },
             };
         });

@@ -1,21 +1,14 @@
 import { isObjectId } from '../core/api.js';
+import { DEFAULT_PORT, TRANSPORTS, KCP_HEADERS, KCP_NUMBERS, allowsReality, allowsVmess, inRange,
+    tlsNameOK, editValues, editPatch, InvalidEditFields } from '../core/edit-fields.js';
 import { t } from '../core/i18n.js';
 import { h, icon } from './dom.js';
 import { nodeTitle, roleName } from './format.js';
 
-const DEFAULT_PORT = 10086;
-const TRANSPORTS = [['tcp', 'TCP'], ['ws', 'WebSocket'], ['grpc', 'gRPC'], ['xhttp', 'XHTTP / SplitHTTP'], ['kcp', 'mKCP (UDP)']];
-const KCP_HEADERS = ['none', 'wechat', 'dtls', 'srtp', 'wireguard'];
-// Keep in sync with cascadeTransport.js and partials/network-kcp.ejs.
-const KCP_NUMBERS = {
-    kcpMtu: [576, 1460, 1350],
-    kcpTti: [10, 100, 20],
-    kcpUplinkCapacity: [1, 1000, 100],
-    kcpDownlinkCapacity: [1, 1000, 100],
-};
 const FROM_ROLES = ['portal', 'relay'];
 const TO_ROLES = ['relay', 'bridge'];
 const label = (key, vars) => t(`map.create.${key}`, vars);
+const editLabel = key => t(`map.edit.${key}`);
 
 // Shared with the legacy link modal. Rebuild uses its own server-side port
 // admission (including UDP reservations); the map cannot infer a free port.
@@ -40,16 +33,6 @@ function eligible(node, roles) {
     return node?.type === 'xray' && node.active !== false && isObjectId(node.id) && roles.includes(node.cascadeRole);
 }
 
-function tlsNameOK(name) {
-    if (!name || name.length > 253) return false;
-    if (!name.includes(':')) return name.split('.').every(part => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(part));
-    if (!/^[\da-f:.]+$/i.test(name)) return false;
-    try { return Boolean(new URL(`http://[${name}]/`).hostname); } catch (_) { return false; }
-}
-
-const allowsReality = transport => transport !== 'kcp' && transport !== 'ws';
-const allowsVmess = (mode, security) => mode === 'forward' && security !== 'reality';
-const inRange = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
 const option = (value, text) => h('option', { value }, text);
 const select = (name, options) => h('select.nm-input', { name, required: true }, options);
 const field = (key, control, hint) => h('div.nm-field', null,
@@ -59,8 +42,11 @@ function numberInput(name, min, max, value) {
     return h('input.nm-input.mono', { name, type: 'number', min, max, value, step: 1, required: true, inputmode: 'numeric' });
 }
 
-/** Mount a create-only Rebuild form. The owner calls the returned disposer on unmount. */
-export function renderCreateForm(container, { store, actions, source, target, onCancel, onCreated, onUncertain }) {
+/** Edit uses the validated projection from actions.loadEdit. The owner disposes on unmount. */
+export function renderCreateForm(container, { store, actions, source, target, edit, onCancel, onCreated, onUncertain }) {
+    const editing = edit != null;
+    const edgeId = editing ? `link-${edit._id}` : null;
+    const formLabel = editing ? editLabel : label;
     let pending = false;
     let finished = false;
     let closed = false;
@@ -68,8 +54,12 @@ export function renderCreateForm(container, { store, actions, source, target, on
     const controller = new AbortController();
     const eventOptions = { signal: controller.signal };
 
-    const from = select('portalNodeId');
-    const to = select('bridgeNodeId');
+    // In edit mode these controls have no endpoint names or values to submit.
+    const endpoint = (fieldName) => editing
+        ? h('input.nm-input', { type: 'text', readonly: true, 'aria-describedby': 'nm-edit-endpoints-hint' })
+        : select(fieldName);
+    const from = endpoint('portalNodeId');
+    const to = endpoint('bridgeNodeId');
     const mode = h('input', { name: 'mode', type: 'hidden', value: 'reverse' });
     const modeButtons = ['forward', 'reverse'].map(value => h('button', {
         type: 'button', 'data-mode': value,
@@ -97,21 +87,23 @@ export function renderCreateForm(container, { store, actions, source, target, on
         h('legend', null, 'mKCP (UDP)'), h('div.hint', null, label('kcpHint')),
         field('kcpHeader', header),
         Object.entries(kcpInputs).map(([key, input]) => field(key, input)));
-    const advanced = h('details.nm-adv', null,
+    const advanced = h('details.nm-adv', { open: editing },
         h('summary', null, label('more')),
         field('name', name), field('port', port, portHint), field('protocol', protocol),
         field('transport', transport), field('security', security, wsHint), tlsField, kcpFields);
     const fields = h('fieldset.nm-insp-body', { style: { border: '0', margin: '0', minWidth: '0' } },
-        field('from', from), field('to', to), availability,
+        field('from', from), field('to', to), editing
+            ? h('div.hint', { id: 'nm-edit-endpoints-hint' }, editLabel('endpointsHint')) : availability,
         h('div.nm-field', null, h('div', null, label('how')),
             h('div.nm-seg', { role: 'group', 'aria-label': label('how') }, modeButtons), mode, modeHint),
         advanced, status);
     const submit = h('button.nm-btn.primary.block', { type: 'submit' });
     const close = h('button.nm-btn.ghost.icon.sm', { type: 'button', 'aria-label': t('map.close') }, icon('x'));
     const cancel = h('button.nm-btn.ghost', { type: 'button' }, label('cancel'));
-    const form = h('form', { 'data-nm-create': '', style: { display: 'flex', flexDirection: 'column', flex: '1', minHeight: '0' } },
-        h('div.nm-insp-head', null, h('div.nm-avatar.edge', null, icon('link-plus')),
-            h('div.nm-insp-title', null, h('h3', null, label('title')), h('div.sub', null, label('sub'))), close),
+    const form = h('form', { [editing ? 'data-nm-edit' : 'data-nm-create']: '', novalidate: editing,
+        style: { display: 'flex', flexDirection: 'column', flex: '1', minHeight: '0' } },
+        h('div.nm-insp-head', null, h('div.nm-avatar.edge', null, icon(editing ? 'edit' : 'link-plus')),
+            h('div.nm-insp-title', null, h('h3', null, formLabel('title')), h('div.sub', null, formLabel('sub'))), close),
         fields, h('div.nm-insp-foot', null, submit, cancel));
     container.append(form);
 
@@ -121,6 +113,18 @@ export function renderCreateForm(container, { store, actions, source, target, on
     const nodeLabel = node => node?.label || node?.ip || '';
 
     function syncEndpoints(sourceId = from.value, targetId = to.value) {
+        if (editing) {
+            const displayEndpoint = id => {
+                const node = store.index.nodes.get(id);
+                return node ? `${nodeTitle(node)} — ${roleName(node.cascadeRole)}` : id;
+            };
+            from.value = displayEndpoint(edit.portalNode);
+            to.value = displayEndpoint(edit.bridgeNode);
+            canChoose = isObjectId(edit._id) && store.index.links.get(edgeId)?.canEdit === true;
+            updateDirection();
+            updateControls();
+            return;
+        }
         const nodes = [...store.index.nodes.values()].sort((a, b) => nodeLabel(a).localeCompare(nodeLabel(b)) || a.id.localeCompare(b.id));
         const sources = nodes.filter(node => eligible(node, FROM_ROLES));
         const targets = nodes.filter(node => eligible(node, TO_ROLES));
@@ -152,8 +156,8 @@ export function renderCreateForm(container, { store, actions, source, target, on
             button.classList.toggle('active', active);
             button.setAttribute('aria-pressed', String(active));
         });
-        const a = nodeTitle(store.index.nodes.get(from.value)) || label('from');
-        const b = nodeTitle(store.index.nodes.get(to.value)) || label('to');
+        const a = nodeTitle(store.index.nodes.get(editing ? edit.portalNode : from.value)) || label('from');
+        const b = nodeTitle(store.index.nodes.get(editing ? edit.bridgeNode : to.value)) || label('to');
         const direction = t(forward ? 'map.modeForwardDesc' : 'map.modeReverseDesc', { a, b });
         portHint.textContent = t('map.listensOn', { name: forward ? b : a });
         modeHint.textContent = `${direction}. ${portHint.textContent}. ${label('trafficDirection')}`;
@@ -161,9 +165,9 @@ export function renderCreateForm(container, { store, actions, source, target, on
 
     function updateTransport() {
         reality.disabled = !allowsReality(transport.value);
-        if (reality.disabled && security.value === 'reality') security.value = 'none';
+        if (!editing && reality.disabled && security.value === 'reality') security.value = 'none';
         vmess.disabled = !allowsVmess(mode.value, security.value);
-        if (vmess.disabled && protocol.value === 'vmess') protocol.value = 'vless';
+        if (!editing && vmess.disabled && protocol.value === 'vmess') protocol.value = 'vless';
         wsHint.hidden = transport.value !== 'ws';
         tlsField.hidden = tls.disabled = security.value !== 'tls';
         kcpFields.hidden = kcpFields.disabled = transport.value !== 'kcp';
@@ -173,12 +177,31 @@ export function renderCreateForm(container, { store, actions, source, target, on
         fields.disabled = pending || finished;
         submit.disabled = pending || finished || !canChoose;
         close.disabled = cancel.disabled = pending;
-        submit.replaceChildren(icon(pending ? 'loader-2' : 'arrow-right', pending ? 'nm-spin' : ''), label(pending ? 'creating' : 'submit'));
+        submit.replaceChildren(icon(pending ? 'loader-2' : 'arrow-right', pending ? 'nm-spin' : ''),
+            formLabel(pending ? (editing ? 'saving' : 'creating') : 'submit'));
     }
 
     function showStatus(key) {
-        status.textContent = key ? label(key) : '';
+        const localize = editing && (key === 'noChanges' || key === 'unknown') ? editLabel : label;
+        status.textContent = key ? localize(key) : '';
         status.hidden = !key;
+    }
+
+    const editControls = { name, mode, tunnelPort: port, tunnelProtocol: protocol, tunnelTransport: transport,
+        tunnelSecurity: security, tlsServerName: tls, kcpHeader: header, ...kcpInputs };
+
+    function collectEdit() {
+        const values = {};
+        for (const [key, control] of Object.entries(editControls)) {
+            if (control === tls && tls.disabled) continue;
+            if ((control === header || Object.hasOwn(kcpInputs, key)) && kcpFields.disabled) continue;
+            values[key] = control.type === 'number' ? control.valueAsNumber : control.value;
+        }
+        try { return editPatch(edit, values); } catch (err) {
+            advanced.open = true;
+            showStatus(err instanceof InvalidEditFields ? err.key : 'badSettings');
+            if (err.key === 'badTlsName') tls.focus();
+        }
     }
 
     function collect() {
@@ -222,28 +245,29 @@ export function renderCreateForm(container, { store, actions, source, target, on
     async function onSubmit(event) {
         event.preventDefault();
         if (!attached() || pending || finished) return;
-        const body = collect();
+        const body = editing ? collectEdit() : collect();
         if (!body) return;
         showStatus();
         pending = true;
         updateControls();
         let result;
         try {
-            result = await actions.createAndDeploy(body);
+            result = editing ? await actions.editAndDeploy(edgeId, body) : await actions.createAndDeploy(body);
         } catch (_) {
-            // A thrown workflow/readback error does not prove the POST failed.
+            // A thrown workflow/readback error does not prove the save failed.
         }
         if (!attached()) return;
         const outcome = result?.status ?? result?.outcome;
         pending = false;
-        if (outcome === 'busy' || outcome === 'not_saved') {
+        if (outcome === 'busy' || outcome === 'not_saved' || outcome === 'unchanged') {
             syncEndpoints();
-            showStatus(outcome === 'busy' ? 'busy' : 'notSaved');
+            showStatus(outcome === 'busy' ? 'busy' : outcome === 'unchanged' ? 'noChanges' : 'notSaved');
             return;
         }
         finished = true; // Set before callbacks; never resubmit from this form.
         updateControls();
-        if ((outcome === 'saved' || outcome === 'applied') && isObjectId(result.linkId)) {
+        if ((outcome === 'saved' || outcome === 'applied') && isObjectId(result.linkId)
+            && (!editing || result.linkId === edit._id)) {
             showStatus(outcome === 'saved' ? 'saved' : 'applied');
             onCreated?.(result.linkId);
         } else {
@@ -292,6 +316,9 @@ export function renderCreateForm(container, { store, actions, source, target, on
         if (advanced.contains(event.target)) advanced.open = true;
     }, { ...eventOptions, capture: true });
     form.addEventListener('submit', onSubmit, eventOptions);
+    if (editing) {
+        for (const [key, value] of Object.entries(editValues(edit))) editControls[key].value = value;
+    }
     syncEndpoints(source, target);
     updateTransport();
     return dispose;

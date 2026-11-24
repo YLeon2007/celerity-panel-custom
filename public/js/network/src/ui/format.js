@@ -89,6 +89,16 @@ export function linkDisplayStatus(link, now) {
     return model.attentionStatus('link', link, now);
 }
 
+export function hasUnappliedChanges(link) {
+    return link.hasUnappliedChanges === true && !link.isCdnEdge && !link.isInternetEdge;
+}
+
+export function linkPillLabel(link, status) {
+    if (link.isCdnEdge) return t('map.cdnEntry');
+    const name = `${link.label || ''}: ${statusName(status)}`;
+    return hasUnappliedChanges(link) ? `${name} · ${t('map.edit.unapplied')}` : name;
+}
+
 function linkLatency(link, status) {
     return status === 'online' && Number.isFinite(link.latencyMs) && link.latencyMs >= 0 ? link.latencyMs : null;
 }
@@ -121,7 +131,8 @@ export function linkStatusDetail(link, now = Date.now()) {
         description = mkcpReason(link, 'pending', 'mkcp_apply_unconfirmed') ? t('mkcpApplyUnconfirmed') : t('map.alert.linkPendingDesc');
     } else if (status === 'deployed' || status === 'unknown') {
         // The retained timestamp can explain a reverse expiry; it does not set severity.
-        const expired = !link.missingEndpoint && link.mode !== 'forward' && link.tunnelTransport !== 'kcp' && !link.tunnelVerification
+        const expired = !hasUnappliedChanges(link) && !link.missingEndpoint && link.mode !== 'forward'
+            && link.tunnelTransport !== 'kcp' && !link.tunnelVerification
             && Number.isSafeInteger(expiry) && expiry <= now;
         description = t(expired ? 'map.details.linkObservationStaleDesc' : 'map.details.linkUnverifiedDesc');
     } else if (until !== null) {
@@ -142,18 +153,18 @@ export function pillContent(link, now) {
     if (link.isCdnEdge) return [icon('cloud'), ' CDN'];
     const m = modeIcon(link.mode);
     const status = linkDisplayStatus(link, now);
+    let health;
     switch (status) {
-        case 'error':
-            return [icon('alert-triangle'), ` ${t('map.pill.error')}`];
-        case 'syncing':
-            return [icon('loader-2', 'nm-spin'), ` ${t('map.pill.syncing')}`];
-        case 'offline':
-            return [icon(m), ` ${t('map.pill.offline')}`];
-        case 'online':
-            return [icon(m), h('span.ms', null, ms(linkLatency(link, status)))];
-        default:
-            return [icon(m), ` ${t('map.details.unverifiedShort')}`];
+        case 'error': health = [icon('alert-triangle'), ` ${t('map.pill.error')}`]; break;
+        case 'syncing': health = [icon('loader-2', 'nm-spin'), ` ${t('map.pill.syncing')}`]; break;
+        case 'offline': health = [icon(m), ` ${t('map.pill.offline')}`]; break;
+        case 'online': health = [icon(m), h('span.ms', null, ms(linkLatency(link, status)))]; break;
+        default: health = [icon(m), ` ${t('map.details.unverifiedShort')}`];
     }
+    if (hasUnappliedChanges(link)) health.push(h('span.nm-pill-unapplied', {
+        title: t('map.edit.unapplied'), 'aria-hidden': 'true',
+    }, icon('pencil')));
+    return health;
 }
 
 export function linkTip(index, link) {
@@ -170,6 +181,7 @@ export function linkTip(index, link) {
             h('br'),
             h('b', null, detail.title),
             detail.latencyMs !== null ? [' · ', t('map.latencyValue', { n: detail.latencyMs })] : null,
+            hasUnappliedChanges(link) ? h('div.nm-tip-unapplied', null, t('map.edit.unapplied')) : null,
             detail.description ? h('div', null, detail.description) : null,
             detail.checked ? h('div', null, detail.checked) : null,
             detail.expires ? h('div', null, detail.expires) : null,
