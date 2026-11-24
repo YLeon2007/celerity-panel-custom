@@ -367,7 +367,7 @@ class SyncService {
                 timeout: 8000, maxContentLength: CLIENT_CONNECTIONS_MAX_BYTES,
             });
             if (response.status !== 200 || typeof response.data !== 'string') return null;
-            return decodeClientConnections(JSON.parse(response.data), Date.now(), performance.now());
+            return decodeClientConnections(JSON.parse(response.data), Date.now(), performance.now(), node.agentVersion);
         } catch {
             // Never escape with the response, Axios error/transport, or JSON
             // parser exception (which can quote bytes from the private body).
@@ -1548,15 +1548,7 @@ class SyncService {
         clearTimeout(entry.timer);
         const now = performance.now();
         if (entry.expiresAt <= now) return this.#forgetClientConnections(key);
-        let next = entry.expiresAt;
-        for (const [id, ips] of entry.users) {
-            for (const [ip, row] of ips) {
-                if (row.expiresAt <= now) ips.delete(ip);
-                else next = Math.min(next, row.expiresAt);
-            }
-            if (!ips.size) entry.users.delete(id);
-        }
-        entry.timer = setTimeout(() => this.#pruneClientConnections(key, entry), Math.ceil(next - now)).unref();
+        entry.timer = setTimeout(() => this.#pruneClientConnections(key, entry), Math.ceil(entry.expiresAt - now)).unref();
     }
 
     #currentClientConnections(node, expected) {
@@ -1577,10 +1569,9 @@ class SyncService {
     }
 
     #clientRows(entry, user) {
-        const now = performance.now();
         const createdAt = user.createdAt == null ? -Infinity : new Date(user.createdAt).getTime();
         return [...(entry.users.get(user.userId)?.values() ?? [])]
-            .filter(row => row.expiresAt > now && row.seen >= createdAt);
+            .filter(row => row.seen >= createdAt);
     }
 
     async readXrayClientConnections(key, lookup) {
@@ -1590,7 +1581,7 @@ class SyncService {
         const entry = node && this.#currentClientConnections(node);
         const unavailable = { state: 'unavailable', rows: [] };
         if (!entry) return state === 'old-agent' ? { state, rows: [] } : unavailable;
-        if (!entry.users.size) return { state: 'ready', rows: [] };
+        if (!entry.users.size) return { state: entry.state, rows: [] };
 
         const initialUsers = await this.#clientConnectionUsers(node, entry);
         if (!this.#currentClientConnections(node, entry)) return unavailable;
@@ -1652,7 +1643,8 @@ class SyncService {
             }
             const sample = this.#currentClientConnections(node);
             let countFilter = { _id: node._id, ...filter };
-            if (sample) {
+            // A valid but unsupported sample says nothing about the count.
+            if (sample?.state === 'ready') {
                 const users = await this.#clientConnectionUsers(node, sample);
                 if (this.#currentClientConnections(node, sample)) {
                     const current = await this.#findClientConnectionsNode(key);

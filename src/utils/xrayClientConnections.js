@@ -10,13 +10,14 @@ const NODE_FIELDS = 'type active status cascadeRole createdAt agentVersion ip xr
 const NODE_ROLES = ['portal', 'standalone'];
 const NODE_ROLE_FILTER = { $or: [{ cascadeRole: { $in: NODE_ROLES } }, { cascadeRole: { $exists: false } }] };
 
-function agentVersionState(version) {
+function agentVersionState(version, minimumPatch = 0) {
     if (typeof version !== 'string' || version.length > 128) return 'unavailable';
     const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[\da-z-]+(?:\.[\da-z-]+)*)?(?:\+[\da-z-]+(?:\.[\da-z-]+)*)?$/i.exec(version);
     if (!match || match[0] !== version) return 'unavailable';
     const [major, minor, patch] = match.slice(1, 4).map(Number);
     if (![major, minor, patch].every(Number.isSafeInteger)) return 'unavailable';
-    const old = major < 1 || (major === 1 && (minor < 6 || (minor === 6 && patch === 0 && match[4])));
+    const old = major < 1 || (major === 1 && (minor < 6 || (minor === 6 &&
+        (patch < minimumPatch || (patch === minimumPatch && match[4])))));
     return old ? 'old-agent' : 'eligible';
 }
 
@@ -61,8 +62,10 @@ function isRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function decodeSnapshot(payload, wallTime, monotonicTime) {
-    if (!isRecord(payload) || payload.supported !== true || !isRecord(payload.users)) return null;
+function decodeSnapshot(payload, wallTime, monotonicTime, agentVersion) {
+    if (!isRecord(payload) || typeof payload.supported !== 'boolean' || !isRecord(payload.users)) return null;
+    const supported = payload.supported;
+    if (!supported && (agentVersionState(agentVersion, 1) !== 'eligible' || Object.keys(payload.users).length)) return null;
     const updatedAt = parseUtc(payload.updatedAt);
     const clockDelta = wallTime - updatedAt;
     if (!Number.isFinite(clockDelta) || clockDelta < -MAX_CLOCK_LEAD_MS || clockDelta >= TTL_MS) return null;
@@ -80,16 +83,15 @@ function decodeSnapshot(payload, wallTime, monotonicTime) {
             const family = isIP(row.ip);
             const seen = parseUtc(row.lastSeen);
             if (!family || !Number.isFinite(seen) || seen > updatedAt) return null;
-            const sampleAge = age + updatedAt - seen;
-            if (sampleAge >= TTL_MS) continue;
+            // Xray records the last open, not a heartbeat. Presence in the
+            // online map is authoritative for the lifetime of this snapshot.
             const ip = family === 4 ? row.ip : new URL(`http://[${row.ip}]`).hostname.slice(1, -1);
             if (seen <= (ips.get(ip)?.seen ?? -Infinity)) continue;
-            ips.set(ip, { ip, seen, lastSeen: new Date(seen).toISOString(),
-                expiresAt: monotonicTime + TTL_MS - sampleAge });
+            ips.set(ip, { ip, seen, lastSeen: new Date(seen).toISOString() });
         }
         if (ips.size) users.set(id, ips);
     }
-    return { expiresAt, updatedAt, users };
+    return { state: supported ? 'ready' : 'no-data', expiresAt, updatedAt, users };
 }
 
 function nullableText(value) {

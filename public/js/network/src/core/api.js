@@ -41,10 +41,11 @@ export async function fetchClientConnections(id, signal) {
     if (!res.ok) return { state: 'unavailable' };
     const state = res.headers.get('x-client-connections-state');
     if (state === 'old-agent') return { state };
-    if (state !== 'ready') return { state: 'unavailable' };
+    if (state !== 'ready' && state !== 'no-data') return { state: 'unavailable' };
     if (signal.aborted) return { state: 'unavailable' };
     const rows = await res.json();
-    return Array.isArray(rows) ? { state, rows } : { state: 'unavailable' };
+    return Array.isArray(rows) && (state === 'ready' || rows.length === 0)
+        ? { state, rows } : { state: 'unavailable' };
 }
 
 export function linkIdOf(edgeId) {

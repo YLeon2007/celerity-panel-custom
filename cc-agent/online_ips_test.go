@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +27,8 @@ func TestOnlineIPsHTTP(t *testing.T) {
 		bob   = "user>>>user-id>>>online"
 		ts    = 1704067201
 	)
+	reverse := "user>>>" + (reverseObservationSubject{linkID: observationFixtureID, identity: strings.Repeat("a", 64)}).email() + ">>>online"
+	reverseList := &stats.GetStatsOnlineIpListResponse{Name: reverse, Ips: map[string]int64{"192.0.2.77": ts}}
 	for _, tc := range []struct {
 		name       string
 		census     []string
@@ -38,18 +41,28 @@ func TestOnlineIPsHTTP(t *testing.T) {
 		wantLists  []string
 	}{
 		{
-			name: "multi-IP IPv4 and IPv6; keys deduplicated and not case-folded",
-			census: []string{alice, alice, bob, "", "inbound>>>bad>>>online", "user>>>>>>online", "user>>>" +
-				(reverseObservationSubject{linkID: observationFixtureID, identity: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}).email() + ">>>online"},
+			name:   "multi-IP IPv4 and IPv6; keys deduplicated and not case-folded",
+			census: []string{alice, alice, bob, "", "inbound>>>bad>>>online", "user>>>>>>online", reverse, reverse},
 			lists: map[string]*stats.GetStatsOnlineIpListResponse{
-				alice: {Name: alice, Ips: map[string]int64{"2001:db8::1": ts + 1, "192.0.2.2": ts}},
-				bob:   {Name: bob, Ips: map[string]int64{"192.0.2.3": ts - 1}},
+				alice:   {Name: alice, Ips: map[string]int64{"2001:db8::1": ts + 1, "192.0.2.2": ts}},
+				bob:     {Name: bob, Ips: map[string]int64{"192.0.2.3": ts - 1}},
+				reverse: reverseList,
 			},
-			wantCode: http.StatusOK, supported: true, wantLists: []string{alice, bob},
+			wantCode: http.StatusOK, supported: true, wantLists: []string{alice, bob, reverse},
 			wantUsers: map[string][]testOnlineIP{
 				"Alice@fixture.test": {{"192.0.2.2", "2024-01-01T00:00:01Z"}, {"2001:db8::1", "2024-01-01T00:00:02Z"}},
 				"user-id":            {{"192.0.2.3", "2024-01-01T00:00:00Z"}},
 			},
+		},
+		{
+			name:   "rproof alone proves support but exposes no IPs or user",
+			census: []string{reverse}, lists: map[string]*stats.GetStatsOnlineIpListResponse{reverse: reverseList},
+			wantCode: http.StatusOK, supported: true, wantLists: []string{reverse},
+		},
+		{
+			name:   "rproof map disappeared",
+			census: []string{reverse}, listCodes: map[string]codes.Code{reverse: codes.NotFound},
+			wantCode: http.StatusOK, wantLists: []string{reverse},
 		},
 		{name: "ambiguous empty census", wantCode: http.StatusOK},
 		{name: "legacy census RPC", censusCode: codes.Unimplemented, wantCode: http.StatusOK},

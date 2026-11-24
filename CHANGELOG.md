@@ -5,6 +5,11 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.6.37 — Длительные подключения Xray / Long-lived Xray connections
+
+- Открытые подключения не исчезают по возрасту последнего подключения. cc-agent 1.6.1 отличает пустой список клиентов портала от отсутствия данных учёта. [Заметки о выпуске](docs/release-v1.6.37.ru.md).
+- Open connections no longer expire based on their start time. cc-agent 1.6.1 distinguishes an empty portal client list from unavailable tracking data. [Release notes](docs/release-v1.6.37.md).
+
 ## v1.6.36 — Счётчик клиентов на карте / Map client count
 
 - Новая карта обновляет топологию каждые 10 с на видимой вкладке и сразу сверяет счётчик с открытым списком клиентов. [Заметки о выпуске](docs/release-v1.6.36.ru.md).

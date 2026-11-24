@@ -34,6 +34,7 @@ if (process.argv[2] === '--fixture') {
     const tasks = new Map();
     const cacheWrites = [];
     const mongoWrites = [];
+    let onlineIPMode = 'ready';
     let served;
     let release;
     const sessions = new Map(Object.entries({
@@ -52,8 +53,13 @@ if (process.argv[2] === '--fixture') {
             await served;
         }
         res.setHeader('Content-Type', 'application/json');
-        const now = new Date().toISOString();
-        res.end(JSON.stringify({ supported: true, updatedAt: now, users: { 'fixture-user': [{ ip: PEER, lastSeen: now }] } }));
+        if (onlineIPMode === 'error') res.statusCode = 503;
+        res.end(JSON.stringify({
+            supported: onlineIPMode === 'ready' || onlineIPMode === 'empty',
+            updatedAt: new Date().toISOString(),
+            users: onlineIPMode === 'ready' ? { 'fixture-user': [{ ip: PEER,
+                lastSeen: new Date(Date.now() - 300_000).toISOString() }] } : {},
+        }));
     });
     Module._load = function(request, parent, isMain) {
         const fromEntry = parent?.filename === path.join(ROOT, 'index.js');
@@ -131,12 +137,17 @@ if (process.argv[2] === '--fixture') {
                 await tasks.get('*/15 * * * * *').run();
                 process.send({ tick: true, count: node.onlineUsers, validWrites: mongoWrites.length > 0 && cacheWrites.length > 0,
                     leak: JSON.stringify({ logs, mongoWrites, cacheWrites }).includes(PEER) });
+            } else if (['empty', 'no-data', 'error'].includes(msg)) {
+                node.agentVersion = '1.6.1'; onlineIPMode = msg;
+                await tasks.get('*/15 * * * * *').run();
+                process.send(msg);
             } else if (msg === 'OLD') {
                 node.agentVersion = '1.5.1'; process.send('OLD');
             } else if (msg === 'UNKNOWN') {
                 node.agentVersion = '1.4.0'; node.status = 'unknown'; process.send('UNKNOWN');
             } else if (msg === 'HOLD') {
                 node.agentVersion = '1.6.0'; node.status = 'online';
+                onlineIPMode = 'ready';
                 served = new Promise(resolve => { release = resolve; });
                 await tasks.get('*/15 * * * * *').run();
             } else if (msg === 'RELEASE') release();
@@ -218,6 +229,11 @@ if (process.argv[2] === '--fixture') {
         assert.deepEqual(row, { username: 'Fixture Display', ip: PEER, country: null,
             asn: null, region: null, city: null, isp: null, lastSeen: new Date(row.lastSeen).toISOString() });
         assert.equal(await mcpList(), mcpBefore);
+        assert(Date.now() - Date.parse(row.lastSeen) >= 300_000);
+        for (const [mode, state] of [['no-data', 'no-data'], ['empty', 'ready'], ['error', 'unavailable']]) {
+            child.send(mode); await waitFor(msg => msg === mode);
+            assert.equal((await expect(url, admin, 200, state)).body, '[]');
+        }
         child.send('OLD'); await waitFor(msg => msg === 'OLD');
         assert.equal((await expect(url, admin, 200, 'old-agent')).body, '[]');
         child.send('UNKNOWN'); await waitFor(msg => msg === 'UNKNOWN');

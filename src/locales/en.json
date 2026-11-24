@@ -1816,6 +1816,7 @@
         "loading": "Loading connections…",
         "old-agent": "No connection data (agent 1.6.0 required)",
         "unavailable": "Connection data is unavailable",
+        "no-data": "No connections or connection tracking is disabled on this node",
         "empty": "No active connections",
         "username": "Username",
         "ip": "IP address",
@@ -1824,7 +1825,7 @@
         "city": "City",
         "asn": "ASN",
         "isp": "ISP",
-        "lastSeen": "Last seen"
+        "lastSeen": "Last connection"
       },
       "ofN": "of {n}",
       "ms": "{n} ms",

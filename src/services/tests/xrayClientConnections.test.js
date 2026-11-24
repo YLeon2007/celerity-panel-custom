@@ -3,7 +3,6 @@
 const assert = require('node:assert/strict');
 const { test, after } = require('node:test');
 const http = require('node:http');
-const { performance } = require('node:perf_hooks');
 
 process.env.PANEL_DOMAIN ||= 'fixture.invalid';
 process.env.ACME_EMAIL ||= 'fixture@fixture.invalid';
@@ -20,15 +19,23 @@ const iso = (offset = 0) => new Date(Date.now() + offset).toISOString();
 const snapshot = (users = {}, updatedAt = iso()) => ({ supported: true, users, updatedAt });
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-test('positive agent clock skew does not extend snapshot or sample retention', () => {
+test('positive agent clock skew does not extend snapshot retention', () => {
     const { decodeSnapshot } = require('../../utils/xrayClientConnections');
     const wall = Date.parse('2026-11-24T10:00:00Z');
     const packet = snapshot({ subscriber: [{ ip: CLIENT, lastSeen: new Date(wall - 1000).toISOString() }] },
         new Date(wall + 4000).toISOString());
     const entry = decodeSnapshot(packet, wall, 100);
     assert.equal(entry.expiresAt, 60_100);
-    assert.equal(entry.users.get('subscriber').get(CLIENT).expiresAt, 55_100);
     assert.equal(decodeSnapshot(packet, wall - 2000, 100), null);
+});
+
+test('fresh snapshot retains 300-second-old connections, but an expired snapshot does not', () => {
+    const { decodeSnapshot } = require('../../utils/xrayClientConnections');
+    const wall = Date.parse('2026-11-24T10:00:00Z');
+    const lastSeen = new Date(wall - 300_000).toISOString();
+    const packet = snapshot({ subscriber: [{ ip: CLIENT, lastSeen }] }, new Date(wall).toISOString());
+    assert.equal(decodeSnapshot(packet, wall, 1).users.get('subscriber')?.get(CLIENT)?.lastSeen, lastSeen);
+    assert.equal(decodeSnapshot(packet, wall + 60_000, 60_001), null);
 });
 
 after(() => require('../sshPoolService').closeAll());
@@ -161,22 +168,56 @@ test('version is learned from the stock health metadata path; bridges/relays/old
     assert.equal(f.paths.length, before);
 });
 
-test('expired snapshots and rows are rejected and purge does not require another poll', async t => {
+test('open connections and count share snapshot lifetime; createdAt still protects reused IDs', async t => {
     const f = await fixture(t);
-    const now = performance.now();
-    f.setWire(() => snapshot({ subscriber: [{ ip: CLIENT, lastSeen: iso(-59_700) }] }));
+    const lastSeen = iso(-300_000);
+    const active = { userId: 'subscriber', username: 'Display Name', enabled: true, _id: ID };
+    f.setUsers([{ ...active, createdAt: iso(-310_000) }]);
+    f.setWire(() => snapshot({ subscriber: [{ ip: CLIENT, lastSeen }, { ip: '2001:db8::1', lastSeen: iso(-1000) }] }));
+    await sync.collectXrayClientConnections();
+    let read = await sync.readXrayClientConnections(ID, async () => null);
+    assert.equal(read.state, 'ready');
+    assert.equal(read.rows.length, 2);
+    assert.equal(read.rows[0].lastSeen, lastSeen);
+    assert.equal(f.node.onlineUsers, new Set(read.rows.map(row => row.username)).size);
+    f.setUsers([{ ...active, createdAt: iso(-500) }]);
+    await sync.collectXrayClientConnections();
+    assert.equal(f.node.onlineUsers, 0);
+    assert.deepEqual(await sync.readXrayClientConnections(ID, async () => assert.fail()), { state: 'ready', rows: [] });
+    f.setUsers([active]);
+    sync.clearXrayClientConnections(); // Start a fresh cache; never accept an older update over a newer one.
+    // Near-expired upstream timestamp: a receive-side cache must not renew it.
+    const updatedAt = iso(-59_500);
+    f.setWire(() => snapshot({ subscriber: [{ ip: CLIENT, lastSeen }] }, updatedAt));
     await sync.collectXrayClientConnections();
     assert.equal(f.node.onlineUsers, 1);
-    await wait(350);
-    assert(performance.now() - now >= 350);
-    assert.deepEqual(await sync.readXrayClientConnections(ID, async () => assert.fail()), { state: 'ready', rows: [] });
-    // Near-expired upstream timestamp means a 60 s receive-side cache cannot renew it.
-    f.setWire(() => snapshot({ subscriber: [{ ip: CLIENT, lastSeen: iso(-59_700) }] }, iso(-59_700)));
-    await sync.collectXrayClientConnections();
-    await wait(350);
-    assert.equal((await sync.readXrayClientConnections(ID, async () => null)).state, 'unavailable');
+    await wait(550);
+    assert.deepEqual(await sync.readXrayClientConnections(ID, async () => assert.fail()), { state: 'unavailable', rows: [] });
     await sync.collectXrayAgentOnlineStates();
     assert.deepEqual(Object.keys(f.cached()), ['legacy']);
+});
+
+test('valid unsupported reply from 1.6.1+ is no-data, not a zero count or transport failure', async t => {
+    const f = await fixture(t);
+    await sync.collectXrayAgentOnlineStates();
+    f.setWire(() => ({ supported: false, users: {}, updatedAt: iso() }));
+    for (const [version, state] of [['1.6.0', 'unavailable'], ['1.6.1-rc.1', 'unavailable'],
+        ['v1.6.1+build', 'no-data'], ['1.6.10', 'no-data'], ['1.7.0', 'no-data'], ['2.0.0', 'no-data'],
+        ['1.6.1', 'no-data']]) {
+        f.node.agentVersion = version;
+        await sync.collectXrayClientConnections();
+        assert.deepEqual(await sync.readXrayClientConnections(ID, async () => assert.fail()), { state, rows: [] });
+        assert.equal(f.node.onlineUsers, 1);
+        assert.deepEqual(Object.keys(f.cached()), ['legacy']);
+    }
+    f.setWire(() => ({ supported: false, users: {}, updatedAt: iso() }), 503);
+    await sync.collectXrayClientConnections();
+    assert.deepEqual(await sync.readXrayClientConnections(ID, async () => assert.fail()), { state: 'unavailable', rows: [] });
+    for (const [users, updatedAt] of [[[], iso()], [{ subscriber: [] }, iso()], [{}, iso(-60_500)]]) {
+        f.setWire(() => ({ supported: false, users, updatedAt }));
+        await sync.collectXrayClientConnections();
+        assert.deepEqual(await sync.readXrayClientConnections(ID, async () => assert.fail()), { state: 'unavailable', rows: [] });
+    }
 });
 
 test('malformed wire values and unsupported core are never authoritative', async t => {
@@ -188,6 +229,7 @@ test('malformed wire values and unsupported core are never authoritative', async
         snapshot({ subscriber: [{ ip: `${CLIENT}:80`, lastSeen: iso() }] }),
         snapshot({ subscriber: [{ ip: 'fe80::1%eth0', lastSeen: iso() }] }),
         snapshot({ subscriber: [{ ip: CLIENT, lastSeen: 'yesterday' }] }),
+        snapshot({ subscriber: [{ ip: CLIENT, lastSeen: iso(10_000) }] }),
     ]) {
         f.setWire(() => payload);
         await sync.collectXrayClientConnections();

@@ -65,7 +65,7 @@ func (c *XrayClient) queryOnlineIPs(ctx context.Context) (onlineIPSnapshot, erro
 			continue
 		}
 		email, ok = strings.CutSuffix(email, ">>>online")
-		if !ok || strings.TrimSpace(email) == "" || isReverseObservationEmail(email) || seen[name] {
+		if !ok || strings.TrimSpace(email) == "" || seen[name] {
 			continue
 		}
 		seen[name] = true
@@ -85,6 +85,10 @@ func (c *XrayClient) queryOnlineIPs(ctx context.Context) (onlineIPSnapshot, erro
 			return empty, fmt.Errorf("unexpected Xray online-map name")
 		}
 		snapshot.Supported = true
+		// Internal Rebuild accounts prove support but are never client data.
+		if isReverseObservationEmail(email) {
+			continue
+		}
 		ips := make([]onlineIP, 0, len(list.GetIps()))
 		for ip, sec := range list.GetIps() {
 			addr, err := netip.ParseAddr(ip)

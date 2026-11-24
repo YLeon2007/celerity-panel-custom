@@ -215,6 +215,7 @@ test('client connections in shipped modern map (Firefox)', { timeout: 130000 }, 
             await textIs(chainCount, '7');
             await hover(browser, chainCount);
             await textIs(`${panel} th`, 'Пользователь');
+            await textIs(`${panel} th:last-child`, 'Последнее подключение');
             assert.deepEqual(await browser.evaluate(`Array.from(document.querySelectorAll(${q(`${panel} td`)}), e => e.textContent)`), Object.values(record).map(String));
             assert.equal(await browser.evaluate(`Boolean(${elem(`${panel} img`)}) || Boolean(window.fixtureInjected)`), false);
             await textIs(chainCount, '1');
@@ -231,10 +232,11 @@ test('client connections in shipped modern map (Firefox)', { timeout: 130000 }, 
             await browser.wait(hidden);
             requested('portal');
         });
-        await ctx.test('Old agent, unavailable and HTTP error leave count alone; ready empty is distinct', async () => {
+        await ctx.test('Old agent, no-data, unavailable and HTTP error leave count alone; ready empty is distinct', async () => {
             const priorCount = await browser.evaluate(`${elem(chainCount)}.textContent.trim()`);
             const expected = {
                 'old-agent': 'Нет данных о подключениях (нужен агент 1.6.0)',
+                'no-data': 'Нет подключений или учёт на ноде не включён',
                 empty: 'Нет активных подключений', unavailable: 'Данные о подключениях недоступны',
                 error: 'Данные о подключениях недоступны',
             };
@@ -249,10 +251,10 @@ test('client connections in shipped modern map (Firefox)', { timeout: 130000 }, 
             }
             app.use('forbidden');
             await hover(browser, chainCount);
-            await waitFor(() => app.clientReads.length === 6, 'HTTP 403 request not observed');
+            await waitFor(() => app.clientReads.length === Object.keys(expected).length + 2, 'HTTP 403 request not observed');
             await browser.wait(hidden);
             assert.equal(await browser.evaluate(`document.body.textContent.includes(${q(marker)})`), false);
-            requested('portal', 'portal', 'standalone', 'portal', 'portal', 'portal');
+            requested('portal', ...Object.keys(expected).map(mode => mode === 'empty' ? 'standalone' : 'portal'), 'portal');
         });
         await ctx.test('Pointer leave aborts the real outstanding GET; does not leave records or DOM', async () => {
             const prior = app.clientReads.length;
