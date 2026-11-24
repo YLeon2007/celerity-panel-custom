@@ -130,7 +130,7 @@ function mainProfile({ node, role }, users, options, hasClientInbound) {
     for (const rule of config.routing.rules) rule.inboundTag = tags.slice();
     // Keep references to the subscriber ACLs only, before API/tunnel rules are added.
     const subscriberDenies = [...config.routing.rules];
-    generator.applyXrayApi(config, apiPort);
+    generator.applyXrayApi(config, apiPort, { statsUserOnline: generator.hasXrayMainClientRole(node, role) });
     return { config, tags, subscriberDenies };
 }
 

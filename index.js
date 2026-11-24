@@ -156,6 +156,7 @@ const cascadeRoutes = require('./src/routes/cascade');
 const cascadeRouteGroupsRoutes = require('./src/routes/cascadeRouteGroups');
 const topologyTransferDraftsRoutes = rebuildEnabled ? rejectRebuildRoute : require('./src/routes/topologyTransferDrafts');
 const cascadeTopologyDeployRoutes = require('./src/routes/cascadeTopologyDeploy');
+const cascadeTopologyClients = require('./src/routes/cascadeTopologyClients');
 if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const groupsRoutes = require('./src/routes/groups');
 const subscriptionRoutes = require('./src/routes/subscription');
@@ -198,6 +199,7 @@ if (rebuildEnabled) {
     app.use(require('./src/routes/panel/rebuildL2tp').rebuildL2tpIngress);
 }
 
+app.all(cascadeTopologyClients.path, cascadeTopologyClients.noStore);
 app.use(cors({
     origin: config.BASE_URL,
     credentials: true,
@@ -248,6 +250,8 @@ app.use((req, res, next) => {
 });
 
 app.use(cookieParser());
+// Session-only; mount before API-key handling in both classic and Rebuild.
+cascadeTopologyClients.mountClientsRoute(app);
 app.use(i18nMiddleware);
 
 const { version: appVersion } = require('./package.json');
@@ -1169,6 +1173,15 @@ function setupCronJobs() {
         }
     });
 
+    clearClientConnectionsOnStop = () => syncService.clearXrayClientConnections?.();
+    scheduleCronJob('*/15 * * * * *', async () => {
+        try {
+            await syncService.collectXrayClientConnections();
+        } catch {
+            logger.error('[Cron] Xray client connections collection failed');
+        }
+    });
+
     // Save stats snapshot for charts every 5 minutes
     scheduleCronJob('*/5 * * * *', async () => {
         try {
@@ -1358,6 +1371,7 @@ let classicCronStopping = false;
 let classicCronStopPromise;
 let initialCheckTimer;
 let realityGuard;
+let clearClientConnectionsOnStop;
 function runCronJob(work) {
     if (classicCronStopping) return Promise.resolve();
     const run = Promise.resolve().then(work);
@@ -1380,6 +1394,7 @@ function stopCronJobs() {
         ...[...classicCronTasks].map(task => Promise.resolve().then(() => task.stop())),
         ...classicCronRuns,
     ]).then(results => {
+        clearClientConnectionsOnStop?.();
         const failed = results.find(result => result.status === 'rejected');
         if (failed) throw failed.reason;
     });

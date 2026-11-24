@@ -39,6 +39,12 @@ const {
     extractAgentOnlineUserIds,
     mergeNodeOnlineContributions,
 } = require('../utils/agentOnlineState');
+const {
+    MAX_BYTES: CLIENT_CONNECTIONS_MAX_BYTES, NODE_FIELDS: CLIENT_CONNECTIONS_NODE_FIELDS,
+    NODE_ROLE_FILTER: CLIENT_CONNECTIONS_ROLE_FILTER, nodeState: clientConnectionsNodeState,
+    nodeIdentity: clientConnectionsNodeIdentity, nodeFingerprint: clientConnectionsNodeFingerprint,
+    decodeSnapshot: decodeClientConnections, geoFields: clientConnectionGeoFields,
+} = require('../utils/xrayClientConnections');
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
@@ -236,6 +242,10 @@ async function checkPanelCertRotation(syncInstance) {
 }
 
 class SyncService {
+    #clientConnections = new Map();
+    #clientRequests = new Map();
+    #clientConnectionsRun;
+
     constructor() {
         this.isSyncing = false;
         this.lastSyncTime = null;
@@ -311,7 +321,7 @@ class SyncService {
             // receiving agent. This GET has a total deadline and never retries.
             Object.assign(options, {
                 proxy: false, maxRedirects: 0, timeout: directRead.timeout,
-                signal, maxContentLength: 1024,
+                signal, maxContentLength: directRead.maxContentLength ?? 1024,
                 responseType: 'text', transformResponse: [bytes => bytes],
             });
             options.headers.Accept = 'application/json';
@@ -349,6 +359,20 @@ class SyncService {
 
     readRebuildReverseObservation(node, path, timeout) {
         return this._sendAgentRequest(node, 'GET', path, null, { timeout });
+    }
+
+    async #readAgentClientConnections(node) {
+        try {
+            const response = await this._sendAgentRequest(node, 'GET', '/online-ips', null, {
+                timeout: 8000, maxContentLength: CLIENT_CONNECTIONS_MAX_BYTES,
+            });
+            if (response.status !== 200 || typeof response.data !== 'string') return null;
+            return decodeClientConnections(JSON.parse(response.data), Date.now(), performance.now());
+        } catch {
+            // Never escape with the response, Axios error/transport, or JSON
+            // parser exception (which can quote bytes from the private body).
+            return null;
+        }
     }
 
     // Read-only, safe to use from GET routes. Neither liveness nor legacy
@@ -440,6 +464,8 @@ class SyncService {
         if (previous && (status === 'offline' || status === 'unknown')) {
             const key = String(node._id);
             this.xrayTrafficLastActive.delete(key);
+            this.#clientRequests.delete(key);
+            this.#forgetClientConnections(key);
             // Reject in-flight online samples taken before confirmed demotion.
             this.xrayNodeOnlineUsers.set(key, { ids: [], observedAt: performance.now() });
         }
@@ -532,10 +558,18 @@ class SyncService {
     /**
      * Get all enabled users for a given node (by groups or explicit node list)
      */
-    async _getUsersForNode(node) {
-        const nodeId = node._id.toString();
+    async _getUsersForNode(node, userIds) {
+        const criteria = { enabled: true };
+        const read = filter => {
+            const query = HyUser.find({ ...criteria, ...filter });
+            return (userIds ? query.select('userId username expireAt createdAt') : query).lean();
+        };
+        if (userIds) {
+            if (!userIds.length) return [];
+            criteria.userId = { $in: userIds };
+        }
         // Users with explicit node assignment
-        const byNodes = await HyUser.find({ nodes: node._id, enabled: true }).lean();
+        const byNodes = await read({ nodes: node._id });
         // Users linked via groups
         const nodeGroupIds = (node.groups || []).map(g => g._id?.toString() || g.toString());
         const noExplicitNodes = {
@@ -546,10 +580,10 @@ class SyncService {
         };
         let byGroups = [];
         if (nodeGroupIds.length > 0) {
-            byGroups = await HyUser.find({ groups: { $in: node.groups }, enabled: true, ...noExplicitNodes }).lean();
+            byGroups = await read({ groups: { $in: node.groups }, ...noExplicitNodes });
         } else {
             // Node has no groups — all users without group assignment
-            byGroups = await HyUser.find({ enabled: true, groups: { $size: 0 }, ...noExplicitNodes }).lean();
+            byGroups = await read({ groups: { $size: 0 }, ...noExplicitNodes });
         }
         // Merge and deduplicate by userId
         const seen = new Set();
@@ -1454,6 +1488,135 @@ class SyncService {
         await this.#publishOnlineSamples(10);
     }
 
+    collectXrayClientConnections() {
+        if (this.#clientConnectionsRun) return this.#clientConnectionsRun;
+        this.#clientConnectionsRun = this.#pollClientConnections().finally(() => { this.#clientConnectionsRun = undefined; });
+        return this.#clientConnectionsRun;
+    }
+
+    async #pollClientConnections() {
+        const nodes = await HyNode.find({ type: 'xray', active: true, status: 'online',
+            'xray.agentToken': { $exists: true, $ne: '' }, ...CLIENT_CONNECTIONS_ROLE_FILTER })
+            .select(CLIENT_CONNECTIONS_NODE_FIELDS).lean();
+        const targets = nodes.filter(node => clientConnectionsNodeState(node) === 'eligible');
+        const keys = new Set(targets.map(node => String(node._id)));
+        for (const key of this.#clientConnections.keys()) {
+            if (!keys.has(key)) this.#forgetClientConnections(key);
+        }
+        for (let i = 0; i < targets.length; i += 8) {
+            await Promise.all(targets.slice(i, i + 8).map(async node => {
+                const key = String(node._id);
+                const request = {};
+                this.#clientRequests.set(key, request);
+                const fingerprint = clientConnectionsNodeFingerprint(node);
+                const sample = await this.#readAgentClientConnections(node);
+                const current = sample && await this.#findClientConnectionsNode(key).catch(() => null);
+                const invalidated = this.#clientRequests.get(key) !== request;
+                this.#clientRequests.delete(key);
+                const previous = this.#clientConnections.get(key);
+                if (invalidated || !sample || clientConnectionsNodeState(current) !== 'eligible'
+                    || fingerprint !== clientConnectionsNodeFingerprint(current)
+                    || (previous?.fingerprint === fingerprint && previous.updatedAt > sample.updatedAt)) {
+                    this.#forgetClientConnections(key);
+                    return;
+                }
+                this.#forgetClientConnections(key);
+                const entry = { ...sample, fingerprint };
+                this.#clientConnections.set(key, entry);
+                this.#pruneClientConnections(key, entry);
+            }));
+        }
+        await this.#publishOnlineSamples(10);
+    }
+
+    #findClientConnectionsNode(id) {
+        return HyNode.findById(id).select(CLIENT_CONNECTIONS_NODE_FIELDS).lean();
+    }
+
+    #forgetClientConnections(key) {
+        clearTimeout(this.#clientConnections.get(key)?.timer);
+        this.#clientConnections.delete(key);
+    }
+
+    clearXrayClientConnections() {
+        this.#clientRequests.clear();
+        for (const key of this.#clientConnections.keys()) this.#forgetClientConnections(key);
+    }
+
+    #pruneClientConnections(key, entry) {
+        if (this.#clientConnections.get(key) !== entry) return;
+        clearTimeout(entry.timer);
+        const now = performance.now();
+        if (entry.expiresAt <= now) return this.#forgetClientConnections(key);
+        let next = entry.expiresAt;
+        for (const [id, ips] of entry.users) {
+            for (const [ip, row] of ips) {
+                if (row.expiresAt <= now) ips.delete(ip);
+                else next = Math.min(next, row.expiresAt);
+            }
+            if (!ips.size) entry.users.delete(id);
+        }
+        entry.timer = setTimeout(() => this.#pruneClientConnections(key, entry), Math.ceil(next - now)).unref();
+    }
+
+    #currentClientConnections(node, expected) {
+        const key = String(node._id);
+        const entry = this.#clientConnections.get(key);
+        if (!entry || (expected && entry !== expected)) return null;
+        if (clientConnectionsNodeState(node) !== 'eligible' || entry.fingerprint !== clientConnectionsNodeFingerprint(node)
+            || entry.expiresAt <= performance.now()) {
+            this.#forgetClientConnections(key);
+            return null;
+        }
+        return entry;
+    }
+
+    async #clientConnectionUsers(node, entry) {
+        const users = await this._getUsersForNode(node, [...entry.users.keys()]);
+        return users.filter(user => user.expireAt == null || new Date(user.expireAt).getTime() > Date.now());
+    }
+
+    #clientRows(entry, user) {
+        const now = performance.now();
+        const createdAt = user.createdAt == null ? -Infinity : new Date(user.createdAt).getTime();
+        return [...(entry.users.get(user.userId)?.values() ?? [])]
+            .filter(row => row.expiresAt > now && row.seen >= createdAt);
+    }
+
+    async readXrayClientConnections(key, lookup) {
+        const node = await this.#findClientConnectionsNode(key);
+        if (!node) this.#forgetClientConnections(key);
+        const state = clientConnectionsNodeState(node);
+        const entry = node && this.#currentClientConnections(node);
+        const unavailable = { state: 'unavailable', rows: [] };
+        if (!entry) return state === 'old-agent' ? { state, rows: [] } : unavailable;
+        if (!entry.users.size) return { state: 'ready', rows: [] };
+
+        const initialUsers = await this.#clientConnectionUsers(node, entry);
+        if (!this.#currentClientConnections(node, entry)) return unavailable;
+        const ips = [...new Set(initialUsers.flatMap(user => this.#clientRows(entry, user).map(row => row.ip)))];
+        const geo = new Map();
+        for (let i = 0; i < ips.length; i += 32) {
+            if (!this.#currentClientConnections(node, entry)) return unavailable;
+            await Promise.all(ips.slice(i, i + 32).map(async ip => {
+                try { geo.set(ip, clientConnectionGeoFields(await lookup(ip))); }
+                catch { geo.set(ip, clientConnectionGeoFields(null)); }
+            }));
+        }
+        // Enrichment can yield to expiry, agent/role changes and user deletion.
+        // Do not return captured rows/identity from before those awaits.
+        const current = await this.#findClientConnectionsNode(key);
+        if (!current || !this.#currentClientConnections(current, entry)) return unavailable;
+        const users = await this.#clientConnectionUsers(current, entry);
+        const finalNode = await this.#findClientConnectionsNode(key);
+        if (!finalNode || !this.#currentClientConnections(finalNode, entry)
+            || String(finalNode.groups) !== String(current.groups)) return unavailable;
+        const rows = users.flatMap(user => this.#clientRows(entry, user).flatMap(row => geo.has(row.ip) ? [{
+            username: user.username || user.userId, ip: row.ip, ...geo.get(row.ip), lastSeen: row.lastSeen,
+        }] : []));
+        return { state: 'ready', rows };
+    }
+
     #publishOnlineSamples(ttl) {
         // The fast /online job and slower stats job can overlap. Serialize only
         // publication, so a slow count write cannot leave Redis with an older set.
@@ -1464,8 +1627,11 @@ class SyncService {
 
     async #writeOnlineSamples(ttl) {
         const filter = { type: 'xray', active: true, status: 'online', 'xray.agentToken': { $exists: true, $ne: '' } };
-        const nodes = await HyNode.find(filter).select('onlineUsers').lean();
+        const nodes = await HyNode.find(filter).select(CLIENT_CONNECTIONS_NODE_FIELDS).lean();
         const keys = new Set(nodes.map(node => String(node._id)));
+        for (const key of this.#clientConnections.keys()) {
+            if (!keys.has(key)) this.#forgetClientConnections(key);
+        }
         const now = performance.now();
         const { contributions } = mergeNodeOnlineContributions(this.xrayNodeOnlineUsers, keys, now);
         this.xrayNodeOnlineUsers = contributions;
@@ -1475,7 +1641,7 @@ class SyncService {
 
         const results = await Promise.allSettled(nodes.map(async node => {
             const key = String(node._id);
-            const ids = new Set(contributions.get(key)?.ids);
+            let ids = new Set(contributions.get(key)?.ids);
             const lastActive = this.xrayTrafficLastActive.get(key);
             if (lastActive) {
                 for (const [userId, stamp] of lastActive) {
@@ -1484,8 +1650,20 @@ class SyncService {
                 }
                 if (!lastActive.size) this.xrayTrafficLastActive.delete(key);
             }
+            const sample = this.#currentClientConnections(node);
+            let countFilter = { _id: node._id, ...filter };
+            if (sample) {
+                const users = await this.#clientConnectionUsers(node, sample);
+                if (this.#currentClientConnections(node, sample)) {
+                    const current = await this.#findClientConnectionsNode(key);
+                    if (!current || !this.#currentClientConnections(current, sample)
+                        || String(current.groups) !== String(node.groups)) return [];
+                    ids = new Set(users.filter(user => this.#clientRows(sample, user).length).map(user => user.userId));
+                    countFilter = { ...countFilter, ...clientConnectionsNodeIdentity(current), groups: current.groups ?? { $exists: false } };
+                }
+            }
             if (node.onlineUsers !== ids.size) {
-                const { matchedCount } = await HyNode.updateOne({ _id: node._id, ...filter }, { $set: { onlineUsers: ids.size } });
+                const { matchedCount } = await HyNode.updateOne(countFilter, { $set: { onlineUsers: ids.size } });
                 if (!matchedCount) return [];
             }
             return ids;

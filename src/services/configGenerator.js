@@ -918,6 +918,13 @@ function generateXrayConfig(node, users, options = {}) {
     return JSON.stringify(finalConfig, null, 2);
 }
 
+// A missing persisted role (e.g. a projected relay card) is not proof of a
+// standalone client node. A graph role cannot override inventory eligibility.
+function hasXrayMainClientRole(node, role = node.role ?? node.cascadeRole) {
+    return node.type === 'xray' && node.cascadeRole === role
+        && (role === 'portal' || role === 'standalone');
+}
+
 /**
  * Attach the panel management API surface (gRPC HandlerService/StatsService)
  * to a parsed Xray config. `generateXrayConfig` deliberately ships without it
@@ -927,9 +934,11 @@ function generateXrayConfig(node, users, options = {}) {
  *
  * @param {Object} config - Parsed Xray config object (mutated in place)
  * @param {number} apiPort - Loopback port for the gRPC API inbound
+ * @param {Object} [options]
+ * @param {boolean} [options.statsUserOnline] - Opt in on a client-facing MAIN only
  * @returns {Object} the same config object
  */
-function applyXrayApi(config, apiPort) {
+function applyXrayApi(config, apiPort, { statsUserOnline = false } = {}) {
     if (!Number.isSafeInteger(apiPort) || apiPort < 1 || apiPort > 65535) {
         throw new TypeError('applyXrayApi requires a valid loopback API port');
     }
@@ -943,6 +952,7 @@ function applyXrayApi(config, apiPort) {
             '0': {
                 statsUserUplink: true,
                 statsUserDownlink: true,
+                ...(statsUserOnline === true && { statsUserOnline: true }),
             },
         },
         system: {
@@ -983,7 +993,7 @@ function applyXrayApi(config, apiPort) {
  */
 function generateXrayConfigWithApi(node, users, options = {}) {
     const config = JSON.parse(generateXrayConfig(node, users, options));
-    applyXrayApi(config, (node.xray || {}).apiPort || 61000);
+    applyXrayApi(config, (node.xray || {}).apiPort || 61000, { statsUserOnline: hasXrayMainClientRole(node) });
     return JSON.stringify(config, null, 2);
 }
 
@@ -2165,6 +2175,7 @@ module.exports = {
     applyOutboundsAndAcl,
     generateXrayConfig,
     applyXrayApi,
+    hasXrayMainClientRole,
     generateXrayConfigWithApi,
     buildXrayLogSection,
     XRAY_ACCESS_LOG_PATH,

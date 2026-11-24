@@ -327,12 +327,14 @@ test('both actual telemetry cron callbacks remain admitted through their final c
         async collectXrayAgentOnlineStates() { h.calls.push('online-poll'); await online.promise; h.calls.push('online-cache-write'); },
         async collectAllStats() { h.calls.push('stats-poll'); await stats.promise; h.calls.push('stats-cache-write'); },
     } });
-    const runs = [jobs[0].work(), jobs[1].work()]; await flush();
+    const onlineJob = jobs.find(job => job.expression === '*/5 * * * * *');
+    const statsJob = jobs.find(job => job.expression === '*/30 * * * * *');
+    const runs = [onlineJob.work(), statsJob.work()]; await flush();
     h.process.emit('SIGTERM'); h.process.emit('SIGINT'); h.drain.resolve(); await flush();
     assert.equal(h.calls.filter(c => c === 'cron-stop').length, jobs.length);
     assert.equal(h.calls.includes('pool-close'), false);
     assert.equal(h.calls.includes('redis-quit'), false);
-    await jobs[0].work(); h.context.setupCronJobs(); await flush();
+    await onlineJob.work(); h.context.setupCronJobs(); await flush();
     assert.equal(h.calls.filter(c => c === 'online-poll').length, 1, 'queued tick must not pass the admission fence');
     online.resolve(); await flush();
     assert.equal(h.calls.includes('redis-quit'), false, 'second admitted callback still owns Redis');
@@ -345,8 +347,9 @@ test('both actual telemetry cron callbacks remain admitted through their final c
 test('a classic scheduler stop error still drains admitted work and stops sibling schedules before exit1', async () => {
     const h = harness(); const pending = deferred();
     const jobs = setupClassicJobs(h, { syncService: { collectXrayAgentOnlineStates: () => pending.promise } });
-    jobs[0].stop = () => { h.calls.push('cron-stop'); throw Error('scheduler stop failed'); };
-    const run = jobs[0].work(); await flush();
+    const onlineJob = jobs.find(job => job.expression === '*/5 * * * * *');
+    onlineJob.stop = () => { h.calls.push('cron-stop'); throw Error('scheduler stop failed'); };
+    const run = onlineJob.work(); await flush();
     h.process.emit('SIGTERM'); h.drain.resolve(); await flush();
     assert.equal(h.calls.filter(c => c === 'cron-stop').length, jobs.length);
     assert.equal(h.calls.some(c => c.startsWith('exit:')), false);
