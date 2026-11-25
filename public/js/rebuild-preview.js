@@ -9,6 +9,7 @@
     let previewDialogPending = false;
 
     const publicId = value => typeof value === 'string' && value.length === 24 && /^[a-f0-9]+$/i.test(value);
+    const channelRef = value => typeof value === 'string' && /^[a-f0-9]{8}(?![\s\S])/.test(value);
     const oneLine = value => typeof value === 'string' ? value.replace(/[\s\p{Cc}\p{Bidi_Control}]+/gu, ' ').trim().slice(0, 120) : '';
 
     function exitName(exit, lookupNode, labels) {
@@ -16,13 +17,14 @@
         if (!publicId(exit?.nodeId)) return labels.unknownPortalExit;
         const name = [exit.name, lookupNode(exit.nodeId)?.label].map(oneLine)
             .find(value => value && value.toLowerCase() !== exit.nodeId.toLowerCase()) || labels.unknownPortalExit;
-        if (!publicId(exit.linkId)) return name;
+        const suffix = publicId(exit.linkId) ? exit.linkId.slice(-8) : channelRef(exit.channelRef) ? exit.channelRef : null;
+        if (!suffix) return name;
         const label = oneLine(exit.linkName);
-        const shortId = '#' + exit.linkId.slice(-8);
+        const shortId = '#' + suffix;
         return `${name} (${label ? `${label} · ${shortId}` : shortId})`;
     }
 
-    function rebuildPreviewText(nodes, removing, lookupNode, labels) {
+    function rebuildPreviewText(nodes, removing, lookupNode, labels, transit) {
         const details = [], warnings = [];
         let protectedChanged = false;
         const listFormat = typeof Intl.ListFormat === 'function' ? new Intl.ListFormat(labels.lang) : null;
@@ -47,6 +49,31 @@
             const lines = [name + ' — ' + labels[role] + ': ' + summary,
                 settingsChanged ? labels.settingsChanged : labels.settingsUnchanged];
             if (node.profiles.some(profile => profile.tunnelMigration === 'legacy-to-vless-reverse')) lines.push(labels.migration);
+            if (transit) {
+                const changes = { create: labels.transitCreate, replace: labels.transitReplace, unchanged: labels.unchanged };
+                for (const { profile, change } of node.profiles) {
+                    if (profile === 'main' || profile === 'bridge') lines.push(`${profile.toUpperCase()}: ${changes[change]}`);
+                }
+            }
+            const path = node.portalExitPath;
+            const formatPath = hops => Array.isArray(hops) && hops.length
+                ? hops.map(hop => exitName(hop, lookupNode, labels)).join(' → ') : labels.unknownPortalExit;
+            if (role === 'portal' && labels.transitPath && path) {
+                lines.push(labels.transitPath.replace(/\{(before|after)\}/g, (_, key) => formatPath(path[key])));
+            }
+            const geoPaths = node.portalExitGeoPaths;
+            if (role === 'portal' && labels.transitGeoPaths && Array.isArray(geoPaths?.before) && Array.isArray(geoPaths.after)) {
+                const formatPaths = list => list.map(formatPath).join('; ') || '—';
+                lines.push(labels.transitGeoPaths.replace(/\{(before|after)\}/g, (_, key) => formatPaths(geoPaths[key])));
+            }
+            if (labels.transitListeners && Array.isArray(node.transitListeners)) {
+                const port = value => Number.isInteger(value) && value > 0 && value <= 65535 ? String(value) : '—';
+                for (const listener of node.transitListeners) {
+                    const suffix = publicId(listener?.channelId) ? listener.channelId.slice(-8)
+                        : channelRef(listener?.channelRef) ? listener.channelRef : null;
+                    if (suffix) lines.push(`${labels.transitListeners} #${suffix}: ${port(listener.before)} → ${port(listener.after)}`);
+                }
+            }
             const exitChange = node.portalExitChange;
             const hasChannels = publicId(exitChange?.before?.linkId) && publicId(exitChange?.after?.linkId);
             const defaultLabel = labels.portalExitChange || (hasChannels && labels.portalExitChannelChange);
@@ -149,8 +176,9 @@
             return stop(labels?.unavailable);
         }
         const { previewId } = report;
-        const text = rebuildPreviewText(report.nodes, removing, lookupNode, labels);
-        const allowed = report.allowed && !text.protectedChanged;
+        const text = rebuildPreviewText(report.nodes, removing, lookupNode, labels, report.transitBlocked === true);
+        if (report.transitBlocked === true) text.warning = [text.warning, labels.transitBlocked].filter(Boolean).join('\n\n');
+        const allowed = report.allowed && !text.protectedChanged && report.transitBlocked !== true;
         if (allowed && (typeof previewId !== 'string' || ![64, 128].includes(previewId.length) || /[^a-f0-9]/.test(previewId))) {
             return stop(labels.unavailable);
         }

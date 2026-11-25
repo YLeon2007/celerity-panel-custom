@@ -6,6 +6,7 @@ const {checkNeighborRefusal}=require('./rebuildNeighborRefusal');
 const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {compileRebuildGraph}=require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
+const {buildTransitChannels}=require('../modules/relay-l2tp/services/rebuildTransitChannels');
 const {createTransport,createBoundRelayTransport,profileBytes,profileSha256}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {assertRealityFingerprint,realityDialerId}=require('./rebuildRealityFingerprint');
@@ -328,7 +329,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     const graph=compileRebuildGraph({nodes,links,affectedNodeIds:ids});
                     // Keep the graph composer testable without enabling a new
                     // multi-host cutover on the legacy activation loop.
-                    if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
+                    if(!req.preview&&[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
                 }
                 states=await installedStates(ids);
                 const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
@@ -385,7 +386,14 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 }
                 await verifyTunnelTrust(prepared,panelTls,transports);
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
-                return {coreIdentities,kcpVersions,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
+                let transit;
+                if(req.preview&&prepared.some(link=>link.rebuildExit!=null)){
+                    const graph=compileRebuildGraph({nodes,links:prepared,affectedNodeIds:ids});
+                    if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1)){
+                        transit={multiHop:true,blocked:true,after:buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}))};
+                    }
+                }
+                return {coreIdentities,kcpVersions,transit,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
             },
             nodeRole:id=>roles.get(id),
             nodeName:id=>plainName(inventoryNames.get(id)),
@@ -401,14 +409,14 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             persistKeys:retire?undefined:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
             markDelete:async id=>{if(bindings.size)await verifyApply();const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
             checkKcpAdmission:()=>kcpAdmission(),
-            async checkActivation(ids,retirement){
+            async checkActivation(ids,retirement,{transitBlocked=false}={}){
                 if(retire)await checkLinks(retirement);
                 for(const id of ids)await preflight(id,()=>transports.get(id).verifyIdentity?.());
                 for(const id of ids){
                     // An mKCP refusal must not follow even a runtime metadata
                     // repair. Make the existing relay preflight read-only until admission passes.
                     try{await preflight(id,()=>transports.get(id).checkActivation?.({
-                        readOnly:!!req.preview||!!kcpAdmission,reattestRuntime:!kcpAdmission,
+                        readOnly:!!req.preview||!!kcpAdmission,reattestRuntime:!kcpAdmission&&!transitBlocked,
                     }));}
                     catch(error){
                         if(req.preview&&(!retire||id!==req.nodeId)&&inventoryNames.has(id)){

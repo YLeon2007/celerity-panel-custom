@@ -33,14 +33,14 @@ const backup = link(3, relay, alternative);
 const users = [{ userId: 'preview-fixture-subscriber', xrayUuid: '00000000-0000-4000-8000-000000000100' }];
 const compose = links => composeRebuildProfiles({ nodes, links, usersByNode: { [portal]: users } });
 
-function fixture(t, links, observed = compose(links)) {
+function fixture(t, links, observed = compose(links), inventory = nodes) {
     t.mock.method(generator, 'buildPanelInlineCertificate', () => null);
     const query = rows => ({ select() { return this; }, read() { return this; }, readConcern() { return this; },
         lean: async () => structuredClone(rows) });
     const noWrite = () => assert.fail('Preview must not write');
     const service = createRebuildService({
         env: { C3_REBUILD_ENABLED: 'true' }, locks: { run: fn => fn(async () => {}) },
-        Node: { find: filter => query(nodes.filter(n => filter._id.$in.includes(n._id))) },
+        Node: { find: filter => query(inventory.filter(n => filter._id.$in.includes(n._id))) },
         Link: { find: filter => query(filter._id ? links.filter(l => filter._id.$in.includes(l._id)) : links), updateOne: noWrite },
         State: { find: () => query([]) }, assertNoRelayAccountIntent: async () => {}, cache: {},
         sync: { _getUsersForNode: async node => node._id === portal ? users : [] },
@@ -58,6 +58,8 @@ function fixture(t, links, observed = compose(links)) {
         return JSON.parse(response.body);
     };
     preview.confirmRemove = (row, expectedPreview) => request(app, `/api/cascade/links/${row._id}`, { method: 'DELETE', session, headers,
+        body: { expectedPreview } });
+    preview.confirm = (row, expectedPreview) => request(app, `/api/cascade/links/${row._id}/deploy`, { session, headers,
         body: { expectedPreview } });
     return preview;
 }
@@ -217,6 +219,99 @@ function exitReport(links, before, after, remove = false) {
     return result;
 }
 
+test('mounted Preview shows the actual two-relay path, Geo and new TCP listener without arming Apply', async t => {
+    const relay2 = 'b'.repeat(24);
+    const inventory = [...previewNodes, { ...previewNodes[1], _id: relay2, name: 'Tail relay', ip: '192.0.2.6' }];
+    const mid = link(20, r, relay2, { mode: 'reverse' });
+    const tail = link(21, relay2, b);
+    const selected = link(22, relay2, a, { priority: 30 });
+    const tailGeo = { ...geoEdge, portalNode: relay2 };
+    const links = [inlet, mid, tail, selected, tailGeo];
+    const observed = composeRebuildProfiles({ nodes: inventory, links });
+    const edited = { ...inlet, rebuildExit: { nodeId: a, relayGeo: false } };
+    const preview = fixture(t, [edited, ...links.slice(1)], observed, inventory);
+    const result = await preview(edited, false);
+    assert.equal(result.allowed, false);
+    assert.equal(result.transitBlocked, true);
+    const portal = result.nodes.find(n => n.nodeId === p), relay = result.nodes.find(n => n.nodeId === r);
+    assert.deepEqual(portal.portalExitPath.before.map(hop => hop.nodeId), [r, relay2, b]);
+    assert.deepEqual(portal.portalExitPath.after.map(hop => hop.nodeId), [r, relay2, a]);
+    assert.deepEqual(portal.portalExitGeoChange, { before: [publicTarget(tailGeo, 'Other gateway')], after: [] });
+    assert.deepEqual(portal.portalExitGeoPaths.before[0].map(hop => hop.nodeId), [r, relay2, b]);
+    assert.deepEqual(portal.portalExitGeoPaths.after, []);
+    assert.equal(relay.transitListeners.length, 1);
+    const listener = relay.transitListeners[0];
+    assert.equal(listener.before, null);
+    assert.ok(listener.after >= 26000 && listener.after < 32000);
+    assert.equal(portal.portalExitPath.after[1].linkId, listener.channelId);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_MATCHER|tunnelUuid|00000000-0000-4000|fwd-hop|rebuild-rp-/);
+});
+
+for (const mode of ['reverse', 'forward']) {
+    test(`mounted Preview of ${mode} scoped retirement observes the old path and blocks legacy overwrite`, async t => {
+        const relay2 = 'b'.repeat(24);
+        const inventory = [...previewNodes, { ...previewNodes[1], _id: relay2, name: 'Tail relay', ip: '192.0.2.6' }];
+        const mid = link(20, r, relay2, { mode });
+        const tail = link(21, relay2, b);
+        const selected = link(22, relay2, a, { priority: 30 });
+        const links = [inlet, mid, tail, selected];
+        const applied = { ...inlet, rebuildExit: { nodeId: a, relayGeo: false } };
+        const observed = composeRebuildProfiles({ nodes: inventory, links: [applied, ...links.slice(1)] });
+        const preview = fixture(t, links, observed, inventory);
+        const result = await preview(inlet, false);
+        assert.equal(result.allowed, false);
+        assert.equal(result.transitBlocked, true);
+        const portal = result.nodes.find(n => n.nodeId === p);
+        assert.deepEqual(portal.portalExitPath.before.map(hop => hop.nodeId), [r, relay2, a]);
+        assert.deepEqual(portal.portalExitPath.after.map(hop => hop.nodeId), [r, relay2, b]);
+        const listener = result.nodes.find(n => n.nodeId === (mode === 'reverse' ? r : relay2)).transitListeners[0];
+        assert.match(listener.channelRef, /^[a-f0-9]{8}$/);
+        assert.equal(portal.portalExitPath.before[1].channelRef, listener.channelRef);
+        assert.ok(listener.before >= 26000 && listener.before < 32000);
+        assert.equal(listener.after, null);
+        const refused = await preview.confirm(inlet, result.previewId);
+        assert.equal(refused.status, 409);
+        assert.deepEqual(JSON.parse(refused.body), { error: { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' }, preview: result });
+    });
+}
+
+test('mounted Preview includes the multi-relay path on a Geo-only branch', async t => {
+    const relay2 = 'b'.repeat(24);
+    const inventory = [...previewNodes, { ...previewNodes[1], _id: relay2, name: 'Tail relay', ip: '192.0.2.6' }];
+    const geoInlet = { ...inlet, geoRouting: geoRule };
+    const direct = link(8, p, a);
+    const mid = link(20, r, relay2);
+    const tail = link(23, relay2, b);
+    const fallback = link(24, relay2, a);
+    const links = [geoInlet, direct, mid, tail, fallback];
+    const observed = composeRebuildProfiles({ nodes: inventory, links });
+    const edited = { ...geoInlet, rebuildExit: { nodeId: a, relayGeo: false } };
+    const result = await fixture(t, [edited, ...links.slice(1)], observed, inventory)(edited, false);
+    const portal = result.nodes.find(n => n.nodeId === p);
+    assert.equal(portal.portalExitPath, undefined);
+    assert.deepEqual(portal.portalExitGeoPaths.before.map(path => path.map(hop => hop.nodeId)), [[r, relay2, b]]);
+    assert.deepEqual(portal.portalExitGeoPaths.after.map(path => path.map(hop => hop.nodeId)), [[r, relay2, a]]);
+});
+
+test('mounted Preview does not report a tail Geo rule for an identical selector caught at the first relay', async t => {
+    const relay2 = 'b'.repeat(24);
+    const exit3 = 'c'.repeat(24);
+    const inventory = [...previewNodes, { ...previewNodes[1], _id: relay2, name: 'Tail relay', ip: '192.0.2.6' },
+        { ...previewNodes[2], _id: exit3, name: 'First Geo exit', ip: '192.0.2.7' }];
+    const firstGeo = link(19, r, exit3, { geoRouting: geoRule });
+    const mid = link(20, r, relay2);
+    const tail = link(21, relay2, b);
+    const selected = link(22, relay2, a, { priority: 30 });
+    const tailGeo = { ...geoEdge, portalNode: relay2 };
+    const links = [inlet, mid, tail, selected, firstGeo, tailGeo];
+    const observed = composeRebuildProfiles({ nodes: inventory, links });
+    const edited = { ...inlet, rebuildExit: { nodeId: a, relayGeo: false } };
+    const result = await fixture(t, [edited, ...links.slice(1)], observed, inventory)(edited, false);
+    const portal = result.nodes.find(n => n.nodeId === p);
+    assert.deepEqual(portal.portalExitGeoChange, { before: [publicTarget(firstGeo, 'First Geo exit')], after: [] });
+    assert.equal(portal.portalExitGeoPaths, undefined);
+});
+
 test('Remove reports the observed forward channel switching to a reverse channel on the same gateway', () => {
     const links = [inlet, first, second, sharedDefault];
     const [result] = exitReport([{ ...inlet, mode: 'reverse', rebuildExit: { nodeId: b } },
@@ -295,17 +390,17 @@ test('A scoped default terminates geo lookup before any later shared or foreign-
 });
 
 const project = path.join(__dirname, '../../..');
-async function previewDisplay(fields, modernMap, lang = 'en') {
-    const messages = require(`../../locales/${lang}.json`);
-    const t = key => key.split('.').reduce((obj, segment) => obj?.[segment], messages) ?? key;
+async function previewDisplay(fields, modernMap, lang = 'en', reportFields = {}) {
+    const t = key => require('../../middleware/i18n').t(key, lang);
     const html = await ejs.renderFile(path.join(project, 'views/partials/rebuild-preview.ejs'), { t, lang, modernMap });
     let text;
-    const window = { confirm: message => { text = message; return false; } };
+    const window = { confirm: message => { assert.notEqual(reportFields.transitBlocked, true); text = message; return false; },
+        alert: message => { assert.equal(reportFields.transitBlocked, true); text = message; } };
     const context = vm.createContext({ window, document: { getElementById: () => null } });
     vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], context);
     vm.runInContext(fs.readFileSync(path.join(project, 'public/js/rebuild-preview.js'), 'utf8'), context);
     await window.C3RebuildPreview.confirmReport({ removing: false,
-        lookupNode: () => ({ label: 'Portal', role: 'portal' }), report: { allowed: true, previewId: 'a'.repeat(64), nodes: [
+        lookupNode: () => ({ label: 'Portal', role: 'portal' }), report: { allowed: true, previewId: 'a'.repeat(64), ...reportFields, nodes: [
             { nodeId: p, profiles: [{ change: 'replace', protectedChanged: false, sections: ['routing'] }], ...fields },
         ] } });
     return text;
@@ -332,4 +427,24 @@ test('Preview text reports geo-only target and private matcher changes independe
     const ru = await previewDisplay({ portalExitGeoChange: matcherOnly }, false, 'ru');
     assert.match(ru, /(?:Геомаршруты|Geo \(маршруты\)): меняются маршруты/);
     assert.doesNotMatch(ru, /PRIVATE_MATCHER|network\.rebuildPreview/);
+});
+
+test('Blocked multi-relay details name profiles, paths and retired listeners on either map in every locale', async () => {
+    const old = { nodeId: r, name: 'Lab relay', channelRef: 'abcdef12' };
+    const next = publicTarget(first, 'Lab gateway');
+    for (const [lang, warning, geo, replace] of [
+        ['en', 'safe activation', 'Geo paths', 'replace profile'],
+        ['ru', 'безопасное переключение', 'Геомаршруты', 'заменить профиль'],
+        ['zh-CN', '安全切换', '地理分流路径', '替换配置'],
+    ]) for (const modern of [false, true]) {
+        const text = await previewDisplay({ profiles: [
+            { profile: 'main', change: 'replace', protectedChanged: false, sections: ['routing'] },
+            { profile: 'bridge', change: 'unchanged', protectedChanged: false, sections: [] },
+        ], portalExitPath: { before: [old, next], after: [next] }, portalExitGeoPaths: { before: [[old, next]], after: [] },
+        transitListeners: [{ channelRef: 'abcdef12', before: 27777, after: null }] }, modern, lang, { transitBlocked: true });
+        for (const snippet of [warning, geo, `MAIN: ${replace}`, 'BRIDGE:', 'Lab relay (#abcdef12) → Lab gateway', '#abcdef12: 27777 → —']) {
+            assert.ok(text.includes(snippet), `${lang}: ${snippet}`);
+        }
+        assert.doesNotMatch(text, /network\.rebuildPreview|undefined/);
+    }
 });

@@ -4,6 +4,7 @@ const previewKeys = [
     'portal', 'bridge', 'relay', 'standalone', 'changes', 'changesPlural', 'otherChanges', 'unchanged',
     'inbounds', 'outbounds', 'routing', 'reverse', 'log', 'api', 'stats', 'policy', 'dns', 'observatory',
     'migration', 'settingsUnchanged', 'settingsChanged', 'exitLost', 'defaultExitLost', 'exitBlocked',
+    'transitPath', 'transitGeoPaths', 'transitListeners', 'transitBlocked', 'transitCreate', 'transitReplace',
 ];
 const previewLabels = Object.fromEntries(previewKeys.map(key => [key, t('network.rebuildPreview.' + key)]));
 for (const key of ['noPortalExit', 'unknownPortalExit']) previewLabels[key] = t('network.rebuildPreview.' + key);
@@ -75,4 +76,4 @@ previewLabels.close = t('common.close');
 <script>
 window._networkRebuildPreviewI18n = <%- JSON.stringify(previewLabels).replace(/</g, '\\u003c') %>;
 </script>
-<script src="/js/rebuild-preview.js?v=6cb5cbe848490793"></script>
+<script src="/js/rebuild-preview.js?v=810114c463443169"></script>

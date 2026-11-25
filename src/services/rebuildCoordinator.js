@@ -2,7 +2,7 @@
 const { isDeepStrictEqual: equal } = require('node:util');
 const {createHmac,randomBytes}=require('node:crypto');
 const {linkSnapshotBytes}=require('./rebuildLinkSnapshot');
-const {addExitImpacts}=require('./rebuildPreviewExitImpact');
+const {addExitImpacts,hasObservedScopedTransit}=require('./rebuildPreviewExitImpact');
 const {hasReverseObservationEmail}=require('./rebuildReverseIdentity');
 const {refuseStaleKcpPreview}=require('./rebuildKcpAdmission');
 // The preview fingerprint is opaque and expires when the panel restarts.
@@ -158,7 +158,7 @@ async function runGraph(d, req, retire = false) {
             if(retire)checkRetirementLinks(links);
             const removedSet=new Set(removed);
             const desired=links.filter(row=>!removedSet.has(row)&&row.active!==false&&(!retire||row.rebuildDelete!==true));
-            const {candidates,coreIdentities,kcpVersions}=await d.build(nodes,desired,retirement);
+            const {candidates,coreIdentities,kcpVersions,transit}=await d.build(nodes,desired,retirement);
             if(candidates.length!==2*nodes.length) throw fail('REBUILD_INCOMPLETE_PROFILES');
             const pairs=new Map(), report=[], observedMain=d.nodeRole?new Map():null, fingerprint=createHmac('sha256',previewKey);
             const survivor=retire?createHmac('sha256',previewKey):null;
@@ -201,10 +201,12 @@ async function runGraph(d, req, retire = false) {
                 }
                 report.push({nodeId,profiles});
             }
-            const result={allowed:!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
+            const transitBlocked=!!transit?.blocked||!!observedMain&&hasObservedScopedTransit(observedMain);
+            const result={allowed:!transitBlocked&&!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
+            if(transitBlocked)result.transitBlocked=true;
             if(survivor)result.survivorPreview=linkVersion+survivor.digest('hex');
             const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;
-            if(observedMain&&(req.preview||!result.allowed||stale))addExitImpacts(report,links,observedMain,candidates,d.nodeRole,d.nodeName,!!req.remove);
+            if(observedMain&&(req.preview||!result.allowed||stale))addExitImpacts(report,links,observedMain,candidates,d.nodeRole,d.nodeName,!!req.remove,transit);
             async function checkKcpSnapshot(){
                 if(!kcpVersions?.length)return;
                 const fresh=await d.links();
@@ -216,11 +218,11 @@ async function runGraph(d, req, retire = false) {
             }
             if(req.preview){
                 await checkKcpSnapshot();
-                if(d.checkActivation){await verify(); await d.checkActivation(nodes,retirement);}
+                if(d.checkActivation){await verify(); await d.checkActivation(nodes,retirement,{transitBlocked});}
                 await checkKcpSnapshot();
                 return result;
             }
-            if(!result.allowed)throw previewRefusal('REBUILD_CLIENT_CHANGE',result);
+            if(!result.allowed)throw previewRefusal(transitBlocked?'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE':'REBUILD_CLIENT_CHANGE',result);
             if(stale&&kcpVersions?.length)refuseStaleKcpPreview();
             if(stale)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();

@@ -1717,6 +1717,12 @@
       "portalExitRelayGeoOn": "俄罗斯流量将经由中继的网关。",
       "portalExitRelayGeoOff": "俄罗斯流量将不再经由中继的网关。",
       "portalExitChange": "默认出口：{before} → {after}。",
+      "transitPath": "级联路径：{before}\n建议路径：{after}",
+      "transitGeoPaths": "地理分流路径：{before}\n建议地理分流路径：{after}",
+      "transitCreate": "创建配置",
+      "transitReplace": "替换配置",
+      "transitListeners": "TCP 隧道监听端口",
+      "transitBlocked": "路径有效，但尚不能安全切换多级中继出口。未更改配置。",
       "portalExitGeo": "地理路由",
       "noPortalExit": "无出口",
       "unknownPortalExit": "出口未知"
