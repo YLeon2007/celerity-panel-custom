@@ -271,18 +271,19 @@ class AptProgress:
 
 
 def bounded_status(argv, end, maximum, *, may_write=False, progress=None, stock_stage=False,
-                   stock_cwd=None, stock_config=None):
+                   stock_cwd=None, stock_config=None, stock_owner=None):
     """Join bounded pipe EOF and original reap, plus writer descendant settlement."""
     with package_child_scope() if may_write or stock_stage else contextlib.nullcontext():
         result = _bounded_child_status(argv, end, maximum, may_write, progress,
-                                       stock_stage=stock_stage, stock_cwd=stock_cwd, stock_config=stock_config)
+                                       stock_stage=stock_stage, stock_cwd=stock_cwd, stock_config=stock_config,
+                                       stock_owner=stock_owner)
     if time.monotonic() >= end:
         raise subprocess.TimeoutExpired((), 0)
     return result
 
 
 def _bounded_child_status(argv, end, maximum, may_write, progress=None, *, stock_stage=False,
-                          stock_cwd=None, stock_config=None):
+                          stock_cwd=None, stock_config=None, stock_owner=None):
     def left():
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -293,10 +294,15 @@ def _bounded_child_status(argv, end, maximum, may_write, progress=None, *, stock
     # With SIGCHLD ignored, Popen.wait() can turn ECHILD into a false zero.
     need(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, 'IN_FLIGHT')
     env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'DEBIAN_FRONTEND': 'noninteractive'}
+    options = {'start_new_session': True} if stock_stage else {}
     if stock_config is not None:
+        # Launch the downloader itself unprivileged. APT invoked as root
+        # can disable its own sandbox when a destination probe fails.
+        need(stock_stage and stock_cwd and stock_owner is not None and stock_owner[0] > 0, 'CONFFILE_UNKNOWN')
         env['APT_CONFIG'] = stock_config
+        options.update(user=stock_owner[0], group=stock_owner[1], extra_groups=[])
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             cwd=stock_cwd or '/', env=env, **({'start_new_session': True} if stock_stage else {}))
+                             cwd=stock_cwd or '/', env=env, **options)
     try:
         assert child.stdout is not None and child.stderr is not None
         with child.stdout as stdout, child.stderr as stderr, selectors.DefaultSelector() as pipes:

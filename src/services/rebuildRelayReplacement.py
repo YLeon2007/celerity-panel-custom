@@ -13,6 +13,7 @@ import pwd
 import re
 import shutil
 import stat
+import syslog
 import tarfile
 import time
 from dataclasses import dataclass, field
@@ -368,7 +369,7 @@ def stage_installed_stock(wanted, *, installed, cached_deb, download_deb, contro
 
 STOCK_LISTS = '/var/lib/apt/lists'
 STOCK_CACHE = '/var/cache/apt/archives'
-KEYRING = '/usr/share/keyrings/debian-archive-keyring.gpg'
+KEYRING = '/usr/share/keyrings/debian-archive-keyring.pgp'
 MAX_INDEX = 128 * 1024 * 1024
 
 
@@ -390,7 +391,7 @@ def _stamp(st):
 
 
 @contextlib.contextmanager
-def _stock_file(directory, path, maximum, *, owners=((0, 0),), optional=False, keyring=False):
+def _stock_file(directory, path, maximum, *, owners=((0, 0),), optional=False):
     parent, name = os.path.split(path)
     bad = 'REPLACEMENT_ARCHIVE_IO'
     directory_fd = None
@@ -398,11 +399,6 @@ def _stock_file(directory, path, maximum, *, owners=((0, 0),), optional=False, k
         try:
             directory_fd = stack.enter_context(directory(parent))
             observed = _stat(directory_fd, name)
-            if keyring and observed is not None and stat.S_ISLNK(observed.st_mode):
-                target = 'debian-archive-keyring.pgp'
-                need(observed.st_uid == observed.st_gid == 0 and os.readlink(name, dir_fd=directory_fd) == target, bad)
-                name = target
-                observed = _stat(directory_fd, name)
         except FileNotFoundError:
             observed = None
         if observed is None and optional:
@@ -505,12 +501,44 @@ def apt_stage_user():
     return user.pw_uid, user.pw_gid
 
 
+def stock_verifier(directory):
+    with directory('/usr/bin') as fd:
+        for name in ('sqv', 'gpgv'):
+            st = _stat(fd, name)
+            if st is not None:
+                need(stat.S_ISREG(st.st_mode) and st.st_uid == st.st_gid == 0
+                     and st.st_mode & 0o100 and not st.st_mode & 0o7022, 'REPLACEMENT_ARCHIVE_IO')
+                return '/usr/bin/' + name
+    syslog.syslog(syslog.LOG_WARNING, 'celerity-rebuild-l2tp: STOCK_SIGNATURE_VERIFIER_MISSING')
+    raise Refusal('STOCK_SIGNATURE_VERIFIER_MISSING')
+
+
+def verify_stock_release(run, verifier, work, keyring, release):
+    with _sealed_stock(release) as fd:
+        if verifier == '/usr/bin/gpgv':
+            return run((verifier, '--homedir', str(work), '--keyring', str(keyring), '--output', '-', fd),
+                       MAX_FILE, stderr_ok=True)
+        # sqv 1.3 prints signer fingerprints on stdout. `--output -` names
+        # a literal file, not stdout. Read only the authenticated cleartext.
+        output = work / 'Release'
+        run((verifier, '--keyring', str(keyring), '--cleartext', '--output', str(output), fd),
+            MAX_FILE, stderr_ok=True)
+        with output.open('rb') as stream:
+            verified = stream.read(MAX_FILE + 1)
+        output.unlink()
+        need(0 < len(verified) <= MAX_FILE, 'REPLACEMENT_ARCHIVE_RECORD')
+        return verified
+
+
 def stage_host_stock(wanted, *, installed, directory, workspace, run):
     """Consent-only adapter. Never refresh lists or invoke an installer."""
     identities = stock_identities(wanted, installed)
     need(identities and all(row[2] == 'amd64' for row in identities.values()), 'REPLACEMENT_INSTALLED_METADATA')
     bad = 'REPLACEMENT_ARCHIVE_RECORD'
-    key_data = _stock_read(directory, KEYRING, MAX_DEB, keyring=True)
+    verifier = stock_verifier(directory)
+    key_data = _stock_read(directory, KEYRING, MAX_DEB, optional=True)
+    if key_data is None:
+        key_data = _stock_read(directory, '/usr/share/keyrings/debian-archive-keyring.gpg', MAX_DEB)
     with workspace() as work:
         keyring = work / 'debian.gpg'
         keyring.write_bytes(key_data)
@@ -524,9 +552,7 @@ def stage_host_stock(wanted, *, installed, directory, workspace, run):
             release = _stock_read(directory, stem + 'InRelease', MAX_FILE, optional=True)
             if release is None:
                 continue
-            with _sealed_stock(release) as fd:
-                verified = run(('/usr/bin/gpgv', '--homedir', str(work), '--keyring', str(keyring), '--output', '-', fd),
-                               MAX_FILE, stderr_ok=True)
+            verified = verify_stock_release(run, verifier, work, keyring, release)
             sha, size = _stock_index_release(verified, suite)
             index = stem + 'main_binary-amd64_Packages'
             raw = _stock_read(directory, index, MAX_INDEX, optional=True)
@@ -550,8 +576,11 @@ def stage_host_stock(wanted, *, installed, directory, workspace, run):
                 copied += size
                 # APT must select from the signed bytes just verified, not a
                 # second lookup in volatile lists or another compression alias.
-                (lists / os.path.basename(stem + 'InRelease')).write_bytes(release)
-                (lists / os.path.basename(index)).write_bytes(raw)
+                for name, data in ((stem + 'InRelease', release), (index, raw)):
+                    target = lists / os.path.basename(name)
+                    target.write_bytes(data)
+                    target.chmod(0o644)
+        lists.chmod(0o755)
         def record(identity):
             exact = [_archive(identity, [r for r in rows if r.suite == suite]) for suite in REPOSITORIES
                      if any(r[:3] == identity and r.suite == suite for r in rows)]
@@ -583,9 +612,10 @@ def stage_host_stock(wanted, *, installed, directory, workspace, run):
             dest = work / 'download'
             dest.mkdir(mode=0o700)
             os.chown(dest, *owner)
-            work.chmod(0o711)  # permit the APT sandbox to traverse, not list/read other inputs
+            work.chmod(0o711)  # permit traversal and reads of public inputs, not workspace listing
             sources = work / 'sources.list'
             sources.write_text(f'deb [arch=amd64 signed-by={keyring}] {REPOSITORIES[row.suite]} {row.suite} main\n', encoding='ascii')
+            sources.chmod(0o644)
             config = work / 'apt.conf'
             config.write_text(f'''Dir::Etc::Parts "/dev/null";
 Dir::Etc::Main "/dev/null";
@@ -620,12 +650,16 @@ Acquire::https::Proxy "DIRECT";
 Acquire::https::Verify-Peer "true";
 Acquire::https::Verify-Host "true";
 ''', encoding='ascii')
+            config.chmod(0o644)
             try:
                 run(('/usr/bin/prlimit', f'--fsize={row.size}:{row.size}', '--', '/usr/bin/apt-get',
-                     'download', f'{package}:{arch}={version}'), 65536, stock_cwd=str(dest), stock_config=str(config))
+                     'download', f'{package}:{arch}={version}'), 65536, stock_cwd=str(dest), stock_config=str(config),
+                    stock_owner=owner)
                 with os.scandir(dest) as entries:
                     item = next(entries, None)
-                    need(item is not None and re.fullmatch(r'[A-Za-z0-9.+%~_\-]+\.deb', item.name)
+                    if item is None:
+                        raise Refusal(bad)
+                    need(re.fullmatch(r'[A-Za-z0-9.+%~_\-]+\.deb', item.name)
                          and next(entries, None) is None, bad)
                 # Keep the download directory held; it is intentionally _apt-owned.
                 @contextlib.contextmanager
@@ -638,8 +672,7 @@ Acquire::https::Verify-Host "true";
                         yield fd
                     finally:
                         os.close(fd)
-                return authenticate(row, _stock_read(download_dir, str(dest / item.name), row.size,
-                                                     owners=((0, 0), owner)))
+                return authenticate(row, _stock_read(download_dir, str(dest / item.name), row.size, owners=(owner,)))
             finally:
                 # Do not reuse the directory for the other package.
                 shutil.rmtree(dest)

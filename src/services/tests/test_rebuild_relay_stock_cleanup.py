@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import runpy
 import subprocess
+import syslog
 import tarfile
 import time
 import unittest
@@ -48,6 +49,7 @@ class StockCleanup(CLEANUP['Cleanup']):
         self.put('/usr/lib/os-release', b'ID=debian\nVERSION_ID="13"\nVERSION_CODENAME=trixie\n')
         self.put('/usr/share/keyrings/debian-archive-keyring.pgp', b'synthetic keyring (signature child modeled)')
         self.path('/usr/share/keyrings/debian-archive-keyring.gpg').symlink_to('debian-archive-keyring.pgp')
+        self.put('/usr/bin/gpgv', b'modeled verifier', 0o755)
         self.path('/var/cache/apt/archives').mkdir(parents=True)
         self.installed_arch = 'amd64'
         self.foreign = {}
@@ -106,7 +108,16 @@ class StockCleanup(CLEANUP['Cleanup']):
         self.assertLess(time.monotonic(), end)
         self.assertGreater(maximum, 0)
         self.assertTrue(kwargs['stock_stage'])
+        if argv[0] == '/usr/bin/sqv':
+            self.assertTrue(self.path(argv[0]).is_file())
+            self.assertEqual((argv[1], argv[3:5]), ('--keyring', ('--cleartext', '--output')))
+            self.assertEqual(Path(argv[2]).read_bytes(), b'synthetic keyring (signature child modeled)')
+            self.assertEqual(Path(argv[-1]).read_bytes(), b'modeled clearsigned release input')
+            # sqv writes the cleartext to a named file; stdout isn't the Release.
+            Path(argv[5]).write_bytes(self.release)
+            return (1 if self.child_failure == 'signature' else 0), b'public signer fingerprint\n', b''
         if argv[0] == '/usr/bin/gpgv':
+            self.assertTrue(self.path(argv[0]).is_file())
             if self.child_failure == 'signature':
                 return 1, self.release, b'private signature diagnostics'
             return 0, self.release, b'synthetic good signature'
@@ -140,11 +151,18 @@ class StockCleanup(CLEANUP['Cleanup']):
         index, = lists.glob('*_Packages')
         self.assertEqual(index.read_bytes(), self.index)
         self.assertEqual(Path(kwargs['stock_cwd']).parent.parent, self.scratch)
+        self.assertEqual(kwargs['stock_owner'], (0, 0))  # UID/GID modeled in this suite
+        self.assertEqual(Path(kwargs['stock_cwd']).stat().st_mode & 0o777, 0o700)
+        self.assertEqual(lists.parent.stat().st_mode & 0o777, 0o711)
+        self.assertEqual(lists.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(index.stat().st_mode & 0o777, 0o644)
         if self.child_failure == 'timeout':
             raise subprocess.TimeoutExpired(argv, 0)
         if self.child_failure == 'apt':
             return 100, b'', b'private apt diagnostics'
         (Path(kwargs['stock_cwd']) / 'fixture.deb').write_bytes(self.downloaded[package])
+        if self.child_failure == 'unsandboxed':
+            return 0, b'', b'W: Download is performed unsandboxed as root (private diagnostics)'
         return 0, b'', b''
 
     def challenge(self):
@@ -205,6 +223,45 @@ class StockCleanup(CLEANUP['Cleanup']):
         self.data_tar['xl2tpd'] = [('./etc/xl2tpd/xl2tpd.conf', b'# wrong default\n')]
         self.refused(auth)
         self.assertEqual(sum(a[:2] == ('/usr/bin/dpkg-deb', '--fsys-tarfile') for a in self.children), 2)
+
+    def test_sqv_only_pgp_only_empty_cache_downloads_both_packages(self):
+        self.put('/usr/bin/sqv', b'modeled verifier', 0o755)
+        self.path('/usr/bin/gpgv').unlink()
+        self.path('/usr/share/keyrings/debian-archive-keyring.gpg').unlink()
+        auth = self.challenge()
+        before = self.snapshot()
+        self.prepare(auth)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.children[0][0], '/usr/bin/sqv')
+        self.assertEqual([a[5] for a in self.children if a[0] == '/usr/bin/prlimit'],
+                         ['strongswan-starter:amd64=1:6.0.1-6+deb13u7', 'xl2tpd:amd64=1.3.18-1+b1'])
+
+    def test_preferred_sqv_refusal_does_not_try_gpgv_or_use_output(self):
+        self.put('/usr/bin/sqv', b'modeled verifier', 0o755)
+        self.child_failure = 'signature'
+        self.refused(self.challenge())
+        self.assertEqual([a[0] for a in self.children], ['/usr/bin/sqv'])
+
+    def test_legacy_regular_gpg_keyring_still_works(self):
+        keyring = self.path('/usr/share/keyrings/debian-archive-keyring.gpg')
+        keyring.unlink()
+        self.path('/usr/share/keyrings/debian-archive-keyring.pgp').rename(keyring)
+        self.prepare(self.challenge())
+        self.assertEqual(self.children[0][0], '/usr/bin/gpgv')
+
+    def test_missing_verifiers_log_fixed_reason_without_staging(self):
+        self.path('/usr/bin/gpgv').unlink()
+        with patch.object(syslog, 'syslog') as log:
+            auth = self.challenge()
+            log.assert_not_called()
+            self.refused(auth)
+            log.assert_called_once_with(syslog.LOG_WARNING, 'celerity-rebuild-l2tp: STOCK_SIGNATURE_VERIFIER_MISSING')
+        self.assertEqual(self.children, [])
+
+    def test_success_status_with_unsandboxed_warning_never_extracts(self):
+        self.child_failure = 'unsandboxed'
+        self.refused(self.challenge())
+        self.assertEqual([a[0] for a in self.children], ['/usr/bin/gpgv', '/usr/bin/prlimit'])
 
     def test_bad_cache_no_download_or_extraction(self):
         auth = self.challenge()
