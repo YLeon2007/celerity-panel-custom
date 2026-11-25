@@ -242,15 +242,17 @@ def tunnel_tag(link, incoming):
     return f"{prefix}-{link['id'][-8:]}"
 
 
-def probe(case, ports, origins, links):
+def probe(case, ports, origins, links, chain=False):
     host = GEO if case.kind == 'domain' else VIRTUAL_IP
     args = [] if case.kind != 'sniff' else ['--header', f'Host: {GEO}']
     attempts = []
-    access = Path('gateway-main.access.log')
-    offset = access.stat().st_size if access.exists() else 0
     ingress = next(link for link in links.values() if link['source'] == case.portal)
-    inbound = tunnel_tag(ingress, incoming=True)
     outbound = tunnel_tag(links[case.edge], incoming=False)
+    middle = links[7 if case.portal == 'p1' else 8] if chain and case.portal != 'p3' else None
+    hops = [(ingress, middle), (middle, links[case.edge])] if middle else [(ingress, links[case.edge])]
+    checks = [(Path(f"{first['target']}-main.access.log"), tunnel_tag(first, incoming=True), tunnel_tag(second, incoming=False))
+              for first, second in hops]
+    offsets = [path.stat().st_size if path.exists() else 0 for path, _, _ in checks]
     for _ in range(4):
         path = f'/proof-{case.portal}-{case.kind}-{secrets.token_hex(12)}'
         res = cmd(['curl', '-q', '--silent', '--show-error', '--fail', '--max-time', '2',
@@ -265,19 +267,21 @@ def probe(case, ports, origins, links):
             require(got is not None and sinks == [[got, host_header]], f'{case.name}: missing/invalid origin proof: {sinks}')
             # Distinguish two channels to the same backend using the live
             # relay access log, not just the backend's HTTP marker.
-            with access.open('rb') as log:
-                log.seek(offset)
-                routes = [row for row in log.read().decode().splitlines()
-                          if f'[{inbound} ' in row and any(f'accepted tcp:{addr}:{VIRTUAL_PORT} ' in row
-                                                          for addr in (VIRTUAL_IP, GEO))]
-            require(routes and all(row.endswith(f'[{inbound} -> {outbound}]') for row in routes),
-                    f'{case.name}: expected relay channel {outbound}, got {routes}')
-            return {'case': case.name, 'expected': case.want, 'actual': got, 'egress': outbound, 'attempts': attempts}
+            for (access, inbound, hop_outbound), offset in zip(checks, offsets, strict=True):
+                with access.open('rb') as log:
+                    log.seek(offset)
+                    routes = [row for row in log.read().decode().splitlines()
+                              if f'[{inbound} ' in row and any(f'accepted tcp:{addr}:{VIRTUAL_PORT} ' in row
+                                                              for addr in (VIRTUAL_IP, GEO))]
+                require(routes and all(row.endswith(f'[{inbound} -> {hop_outbound}]') for row in routes),
+                        f'{case.name}: {access} expected {inbound} -> {hop_outbound}, got {routes}')
+            return {'case': case.name, 'expected': case.want, 'actual': got, 'egress': outbound,
+                    'relay_hops': [[p.name, i, o] for p, i, o in checks], 'attempts': attempts}
         time.sleep(0.2)
     return {'case': case.name, 'expected': case.want, 'actual': None, 'attempts': attempts}
 
 
-def run(parent_net, mode, preferred, evidence):
+def run(parent_net, mode, preferred, evidence, chain=False):
     evidence['netns'] = namespace(parent_net)
     evidence['source_sha256'] = source_digests()
     evidence['actors_sha256'] = {bin: digest(bin) for bin in (XRAY, BRIDGE_XRAY, '/tools/cover')}
@@ -285,16 +289,17 @@ def run(parent_net, mode, preferred, evidence):
     print(f'CORE: {vx} | bridges: {vb}')
     evidence['versions'] = [vx, vb]
     clients = ['p1', 'p2', 'p3']
-    server_labels = clients + ['gateway'] + list(BRIDGES)
-    n_links = 7 if preferred else 6
-    ports = ports_for(['cover', *clients, 'gateway', *(f'api-{n}' for n in server_labels),
+    relays = ['gateway', 'tail'] if chain else ['gateway']
+    server_labels = clients + relays + list(BRIDGES)
+    n_links = 9 if chain else 7 if preferred else 6
+    ports = ports_for(['cover', *clients, *relays, *(f'api-{n}' for n in server_labels),
                        *(f'link-{i}' for i in range(n_links)), *(f'socks-{n}' for n in clients),
                        *(f'sink-{n}' for n in BRIDGES)])
     evidence['ports'] = ports
     cert, key = '/work/cover.crt', '/work/cover.key'
     checked(['openssl', 'req', '-config', '/dev/null', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', f'/CN={SNI}',
              '-addext', f'subjectAltName=DNS:{SNI}', '-out', cert, '-keyout', key])
-    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred,
+    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred, chain=chain,
                    reality=reality_keys(n_links, ports['cover']))
     raw = checked(['node', '/scripts/compose.cjs'], input=json.dumps(fixture))
     Path('composer-output.json').write_text(raw + '\n')
@@ -328,6 +333,8 @@ def run(parent_net, mode, preferred, evidence):
              Probe('p1', 'domain', 'A', 4), Probe('p2', 'domain', 'B', b),
              Probe('p1', 'sniff', 'A', 4), Probe('p2', 'sniff', 'B', b),
              Probe('p3', 'numeric', 'A', 2), Probe('p3', 'domain', 'A', 4)]
+    if chain:
+        cases = [Probe(case.portal, case.kind, 'A', 2) if case.portal == 'p2' else case for case in cases]
     links = {link['index']: link for link in generated['links']}
     origins = Origins()
     evidence['probes'] = []
@@ -338,7 +345,7 @@ def run(parent_net, mode, preferred, evidence):
         cover = start(stack, 'cover', ['/tools/cover', str(ports['cover']), cert, '/work/cover.key'], reaped)
         children = {'cover': cover}
         wait_until('cover listener', children, lambda: sockets(ports['cover'], cover), 4)
-        for label in ['gateway', *clients, *BRIDGES, 'subscriber']:
+        for label in [*relays, *clients, *BRIDGES, 'subscriber']:
             key = run_configs[label]
             children[label] = start(stack, key, [binary(key), 'run', '-c', f'{key}.json'], reaped)
         listens = [(ln['source'] if ln['mode'] == 'reverse' else ln['target'], ln['port']) for ln in generated['links']]
@@ -361,7 +368,7 @@ def run(parent_net, mode, preferred, evidence):
                                          'minimum_auth_records_per_listener_process': reverse_owners}
         print(f'REVERSE READY {len(reverse)}/{len(reverse)}')
         for case in cases:
-            result = probe(case, ports, origins, links)
+            result = probe(case, ports, origins, links, chain)
             evidence['probes'].append(result)
             print(f'{case.name}: HTTP {result["actual"] or "NO MARKER"} (want {case.want})')
         require(all(child.poll() is None for child in children.values()), 'child exited during HTTP probes')
@@ -388,11 +395,11 @@ def stop(signum, _frame):
 if __name__ == '__main__':
     os.umask(0o077)
     signal.signal(signal.SIGTERM, stop)
-    parent_net, mode, preferred, source = sys.argv[1:]
-    evidence = {'source_root': source, 'mode': mode, 'preferred': preferred == 'yes'}
+    parent_net, mode, preferred, source, chain = sys.argv[1:]
+    evidence = {'source_root': source, 'mode': mode, 'preferred': preferred == 'yes', 'chain_probe': chain == 'yes'}
     status = 2
     try:
-        status = run(parent_net, mode, preferred == 'yes', evidence)
+        status = run(parent_net, mode, preferred == 'yes', evidence, chain == 'yes')
     except (Exception, KeyboardInterrupt) as exc:
         evidence.update(result='INFRA_ERROR', error=str(exc))
         print(f'ERROR: {exc}', file=sys.stderr)

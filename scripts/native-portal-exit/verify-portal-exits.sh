@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 usage() {
-    printf 'Usage: %s --xray PATH --cover PATH [--root SOURCE] [--bridge-xray PATH] [--mode reverse|mixed] [--without-preferred]\n' "$0"
+    printf 'Usage: %s --xray PATH --cover PATH [--root SOURCE] [--bridge-xray PATH] [--mode reverse|mixed] [--without-preferred | --chain-probe]\n' "$0"
     printf 'Set TMPDIR to a scratch directory for private evidence. The cover binary accepts: port cert key (loopback TLS 1.3/H2).\n'
 }
 scripts=$(realpath -e -- "$(dirname -- "$0")")
@@ -12,6 +12,7 @@ bridge_xray=
 cover=
 mode=reverse
 preferred=yes
+chain=no
 while (($#)); do
     case "$1" in
         --root|--xray|--bridge-xray|--cover|--mode)
@@ -25,11 +26,13 @@ while (($#)); do
             esac
             shift 2;;
         --without-preferred) preferred=no; shift;;
+        --chain-probe) chain=yes; shift;;
         -h|--help) usage; exit;;
         *) usage >&2; exit 2;;
     esac
 done
 [[ -n $root && -n $xray && -n $cover && ($mode == reverse || $mode == mixed) ]] || { usage >&2; exit 2; }
+[[ $chain == no || $preferred == yes ]] || { usage >&2; exit 2; }
 root=$(realpath -e -- "$root")
 xray=$(realpath -e -- "$xray")
 bridge_xray=$(realpath -e -- "${bridge_xray:-$xray}")
@@ -56,5 +59,5 @@ exec /usr/bin/env -i PATH=/usr/bin:/usr/sbin /usr/bin/unshare -Urn --fork --kill
         --bind "$8/tmp" /tmp --chdir /work --clearenv --setenv PATH /tools:/usr/bin:/usr/sbin \
         --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LC_ALL C \
         --setenv XRAY_LOCATION_ASSET /work/assets --setenv GODEBUG netdns=go \
-        -- /usr/bin/python3 -I -B -u /scripts/probe.py "$9" "${10}" "${11}" "$1"
-' verify-portal-exits "$root" "$deps" "$node" "$xray" "$bridge_xray" "$cover" "$scripts" "$work" "$parent_net" "$mode" "$preferred"
+        -- /usr/bin/python3 -I -B -u /scripts/probe.py "$9" "${10}" "${11}" "$1" "${12}"
+' verify-portal-exits "$root" "$deps" "$node" "$xray" "$bridge_xray" "$cover" "$scripts" "$work" "$parent_net" "$mode" "$preferred" "$chain"
