@@ -80,7 +80,7 @@ class IkeAdmission(unittest.TestCase):
                                     fstat=lambda _: SimpleNamespace(st_dev=1, st_ino=17),
                                      stat=lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError()),
                                     path=SimpleNamespace(lexists=lambda _: False, split=os.path.split,
-                                                         basename=os.path.basename),
+                                                         basename=os.path.basename, dirname=os.path.dirname),
                                     scandir=lambda _: contextlib.nullcontext(iter(()))),
                  directory=lambda _: contextlib.nullcontext(17), fcntl=SimpleNamespace(flock=lambda *_: None,
                             LOCK_EX=1, LOCK_NB=2), directory_absent=lambda _: True, read=lambda p, *_, **__: files.get(p),

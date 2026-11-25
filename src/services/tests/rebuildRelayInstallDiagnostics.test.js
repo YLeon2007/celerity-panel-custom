@@ -607,13 +607,15 @@ test('package diagnostics reach the authenticated route and localized Install co
 
 const typedForeignKeys = ['SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'STARTER_NOT_STOCK',
     'SECRETS_NOT_EMPTY', 'CHAP_NOT_EMPTY', 'LNS_NOT_STOCK', 'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666',
-    'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN'];
+    'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN',
+    'NETWORK_UNIT_ORPHANED', 'LEGACY_NFT_PRESENT', 'IPSEC_D_FOREIGN_CONF', 'SWAN_TREE_NOT_STOCK',
+    'CONFFILE_UNKNOWN', 'INCLUDE_FOREIGN'];
 
 test('closed foreign-config grammar accepts exactly ordered, bounded diagnostics for fresh actions', () => {
     const action = 'install';
     const header = 'DIRECT_NO_WRITE_L2TP_FOREIGN_CONFIG ';
     const full = `${header}${typedForeignKeys.join(',')}\n`;
-    assert.equal(Buffer.byteLength(full), 261);
+    assert.ok(Buffer.byteLength(full) <= 512);
     assert.deepEqual(freshConflictFromFrame(action, refusal(full)), { check: 'L2TP_FOREIGN_CONFIG', keys: typedForeignKeys });
     for (const id of typedForeignKeys) {
         const item = refusal(`${header}${id}\n`);

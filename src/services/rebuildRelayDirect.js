@@ -168,7 +168,7 @@ function buildFiles(d, profiles, backupId) {
 }
 
 let directScript;
-// Seven base-120 digits carry six bytes. The SSH exec string (no PTY) and
+// The SSH exec string (no PTY) and
 // POSIX single quotes preserve this ASCII alphabet verbatim. Exclude NUL,
 // CR/LF, EOF/DEL and both layers' quote/escape characters.
 const directAlphabet = Array.from({ length: 127 }, (_, i) => i + 1)
@@ -205,12 +205,20 @@ function bundleDirectScript() {
     for (const [word] of text.matchAll(tokens)) counts.set(word, (counts.get(word) || 0) + 1);
     const dictionary = {}, codes = new Map();
     const available = Array.from({ length: 128 }, (_, i) => i + 128).filter(byte => !joined.includes(byte));
-    const savings = ([word, count]) => (word.length - 1) * (count - 1);
-    [...counts].filter(item => savings(item) > 0).sort((a, b) => savings(b) - savings(a))
-        .slice(0, available.length).forEach(([word], i) => {
-            dictionary[available[i]] = word;
-            codes.set(word, String.fromCharCode(available[i]));
-        });
+    // Reserve up to two unused prefixes for two-byte tokens. The decoder
+    // consumes the suffix together with its prefix, never as a separate token.
+    const prefixes = available.splice(0, Math.min(2, available.length));
+    const savings = (size, [word, count]) => (word.length - size) * (count - 1);
+    const ranked = (items, size) => items.filter(item => savings(size, item) > 0)
+        .sort((a, b) => savings(size, b) - savings(size, a));
+    function point(word, bytes) {
+        const key = String.fromCharCode(...bytes);
+        dictionary[Buffer.from(key, 'latin1').toString('hex')] = word;
+        codes.set(word, key);
+    }
+    ranked([...counts], 1).slice(0, available.length).forEach(([word], i) => point(word, [available[i]]));
+    ranked([...counts].filter(([word]) => !codes.has(word)), 2).slice(0, prefixes.length * 256)
+        .forEach(([word], i) => point(word, [prefixes[i >> 8], i & 255]));
     const packed = Buffer.from(`${JSON.stringify(dictionary)}\n${text.replace(tokens, word => codes.get(word) ?? word)}`, 'latin1');
     const compressed = deflateSync(packed, { level: 9, memLevel: 9 });
     const load = (key, index, name, filename) =>
@@ -223,8 +231,10 @@ function bundleDirectScript() {
         '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(25,"big")',
         `_c3_payload="${encodeDirectBytes(compressed)}"`,
         `_c3_dict,_,_c3_packed=zlib.decompress(b"".join(_c3_chunk(_c3_payload[i:i+29]) for i in range(0,len(_c3_payload),29))[:${compressed.length}]).partition(b"\\n")`,
-        '_c3_words={int(k):v.encode("ascii") for k,v in json.loads(_c3_dict).items()}',
-        '_c3_sources=re.sub(rb"[\\x80-\\xff]",lambda m:_c3_words.get(m[0][0],m[0]),_c3_packed)',
+        '_c3_words={bytes.fromhex(k):v.encode("ascii") for k,v in json.loads(_c3_dict).items()}',
+        '_c3_prefix=bytes(sorted({k[0] for k in _c3_words if len(k)==2}))',
+        '_c3_tokens=(b"["+_c3_prefix+b"][\\x00-\\xff]|" if _c3_prefix else b"")+rb"[\\x80-\\xff]"',
+        '_c3_sources=re.sub(_c3_tokens,lambda m:_c3_words.get(m[0],m[0]),_c3_packed)',
         `_c3_offsets=${JSON.stringify(offsets)}`,
         '_c3_compile=lambda n,filename:compile(_c3_sources[_c3_offsets[n]:_c3_offsets[n+1]],filename,"exec")',
         // Runtime's standalone path calculation needs an absolute __file__

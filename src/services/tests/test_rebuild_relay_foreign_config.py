@@ -49,6 +49,12 @@ class ForeignConfig(unittest.TestCase):
         self.enterContext(patch.object(os, 'stat', side_effect=project(os.stat)))
         self.enterContext(patch.object(subprocess, 'run', side_effect=AssertionError('unmodeled host command')))
         self.active = set()
+        self.net_state = 'static'
+        self.net_dropins = ''
+        self.tables = []
+        self.routes = []
+        self.malformed_tables = False
+        self.jobs = b''
         self.rules = []
         self.names = [b'systemd', b'ps']
         self.udp, self.udp6 = UDP, UDP
@@ -56,6 +62,7 @@ class ForeignConfig(unittest.TestCase):
         self.xfrm = b''
         self.stock, self.status, self.calls = {}, {}, []
         self.put(self.h['SYSTEM'] + '/.fixture', b'')
+        self.native_command = self.h['command']
         self.h.update(directory=self.directory, open=self.read_kernel, command=self.command,
                       ppp_device=lambda: True, ppp_registered=lambda: True,
                       missing_network_observers=lambda: [])
@@ -93,10 +100,22 @@ class ForeignConfig(unittest.TestCase):
             assert args[2] == r'-f=${Status}\n${Conffiles}', args
             return self.status.get(args[3], b'install ok installed\n') + self.stock.get(args[3], b'')
         if args[:4] == ('/usr/bin/systemctl', '--no-pager', 'show', '--all'):
+            if args[-1] == self.h['NET_UNIT']:
+                present = self.path(self.h['NET']).is_file()
+                active = 'active' if args[-1] in self.active else 'inactive'
+                return (f'LoadState={"loaded" if present else "not-found"}\nActiveState={active}\n'
+                        f'FragmentPath={self.h["NET"] if present else ""}\n'
+                        f'UnitFileState={self.net_state if present else ""}\n'
+                        f'DropInPaths={self.net_dropins}\nMainPID=0\n').encode()
             state = 'not-found' if args[-1] == 'strongswan.service' else 'loaded'
             return ('LoadState=' + state + '\nActiveState=' + ('active' if args[-1] in self.active else 'inactive') + '\n').encode()
         if args[0] == '/usr/bin/systemctl' and 'list-jobs' in args:
-            return b''
+            return self.jobs
+        if args == ('/usr/sbin/nft', '-j', 'list', 'tables'):
+            assert opts.get('quiet') is True
+            return json.dumps({'nftables': {} if self.malformed_tables else [{'table': row} for row in self.tables]}).encode()
+        if args == ('/usr/sbin/ip', '-j', '-N', '-4', 'route', 'show', 'table', 'all'):
+            return json.dumps(self.routes).encode()
         if args == ('/usr/bin/ps', '-ww', '-e', '-o', 'pid=', '-o', 'comm='):
             return b''.join(str(i).encode() + b' ' + name + b'\n' for i, name in enumerate(self.names, 1))
         if args == ('/usr/sbin/ip', '-j', '-details', 'link', 'show'):
@@ -138,6 +157,23 @@ class ForeignConfig(unittest.TestCase):
         self.assertEqual(self.run_host(), (70, '', 'DIRECT_L2TP_FOREIGN_CONFIG ' + ','.join(keys) + '\n'))
         self.assertEqual(self.snapshot(), before)
 
+    def test_absent_service_systemctl_status_one_is_a_valid_idle_observation(self):
+        original = self.command
+
+        def command(*args, **opts):
+            if args[:4] == ('/usr/bin/systemctl', '--no-pager', 'show', '--all'):
+                return self.native_command(*args, **opts)
+            return original(*args, **opts)
+
+        def systemctl_show(args, **_):
+            assert args[:4] == ('/usr/bin/systemctl', '--no-pager', 'show', '--all')
+            data = original(*args)
+            return subprocess.CompletedProcess(args, int(b'LoadState=not-found\n' in data), data, b'')
+
+        with patch.object(subprocess, 'run', side_effect=systemctl_show):
+            self.h['command'] = command
+            self.assertEqual(self.run_host()[0], 0)
+
     def test_each_exact_file_in_isolation(self):
         for key, path in PRESENCE:
             with self.subTest(path=path):
@@ -154,6 +190,38 @@ class ForeignConfig(unittest.TestCase):
         self.xfrm = b'synthetic SA without a daemon\n'
         self.assertEqual(self.run_host(), (70, '', 'DIRECT_L2TP_DAEMON_ACTIVE\n'))
         self.assertEqual(self.snapshot(), original)
+
+    def test_static_orphan_and_legacy_nft_keep_the_whole_list(self):
+        for _, path in PRESENCE[:3]:
+            self.put(path, b'')
+        self.put(self.h['NAMES']['chap'], b'fixture fixture fixture *\n')
+        self.put(self.h['NET'], b'[Service]\nType=oneshot\n')
+        expected = ('SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'CHAP_NOT_EMPTY')
+        self.assert_foreign(*expected, 'NETWORK_UNIT_ORPHANED')
+        self.put(self.h['LEGACY_NFT'], b'# synthetic legacy\n')
+        self.assert_foreign(*expected, 'NETWORK_UNIT_ORPHANED', 'LEGACY_NFT_PRESENT')
+        self.path(self.h['NET']).unlink()
+        self.assert_foreign(*expected, 'LEGACY_NFT_PRESENT')
+
+    def test_old_network_runtime_or_owned_state_prevents_replacement(self):
+        self.put(self.h['NET'], b'[Service]\nType=oneshot\n')
+        self.put(PRESENCE[0][1], b'')
+        for name, value in [('active', {self.h['NET_UNIT']}), ('net_state', 'enabled'),
+                            ('net_dropins', '/fixture/local.conf'), ('jobs', f'10 {self.h["NET_UNIT"]} start waiting\n'.encode()),
+                            ('rules', [{'priority': 80, 'table': 150, 'fwmark': '0x64'}]),
+                            ('rules', [{'priority': 10077, 'table': 100, 'fwmark': '0x4d'}]),
+                            ('routes', [{'type': 'local', 'dev': 'lo', 'dst': 'default', 'table': 100}]),
+                            ('malformed_tables', True),
+                            ('tables', [{'family': 'inet', 'name': self.h['TABLE']}])]:
+            with self.subTest(observer=name):
+                old = getattr(self, name)
+                setattr(self, name, value)
+                before = self.snapshot()
+                self.assertEqual(self.run_host(), (70, '', 'DIRECT_L2TP_DAEMON_ACTIVE\n'))
+                self.assertEqual(self.snapshot(), before)
+                setattr(self, name, old)
+        self.path(self.h['VAULT']).mkdir(parents=True)
+        self.assertEqual(self.run_host(), (70, '', 'DIRECT_L2TP_DAEMON_ACTIVE\n'))
 
     def test_each_custom_conffile_in_isolation(self):
         self.seed()
@@ -179,7 +247,8 @@ class ForeignConfig(unittest.TestCase):
                              (b'install ok installed\n', b' /etc/ipsec.conf bad\n')]:
             with self.subTest(status=status, size=len(rows)):
                 self.status[package], self.stock[package] = status, rows
-                self.assertEqual(self.run_host(), (70, '', 'DIRECT_PREREQUISITE\n'))
+                self.assert_foreign('OPTIONS_PRESENT', 'CONFFILE_UNKNOWN')
+                self.assertIsNone(self.h['foreign_config_observation']()[1])
 
     def test_dirs_and_nonexact_unit_modes_diagnose_without_fingerprint(self):
         for key, leaf in [('NFT_DIR_PRESENT', self.h['NFT_DIR']), ('DROPIN_PRESENT', self.h['DROP_DIR'])]:
@@ -205,9 +274,12 @@ class ForeignConfig(unittest.TestCase):
 
     def test_unknown_included_path_and_unsafe_owner_veto_exact_leftover(self):
         self.put(PRESENCE[2][1], b'')
-        for path in ['/etc/ipsec.d/custom.conf', '/etc/strongswan.d/custom.conf', '/etc/strongswan.conf']:
+        for path, key in [('/etc/ipsec.d/custom.conf', 'IPSEC_D_FOREIGN_CONF'),
+                          ('/etc/strongswan.d/custom.conf', 'SWAN_TREE_NOT_STOCK'),
+                          ('/etc/strongswan.conf', 'SWAN_TREE_NOT_STOCK')]:
             p = self.put(path, b'')
-            self.assertEqual(self.run_host(), (70, '', 'DIRECT_PREREQUISITE\n'))
+            self.assert_foreign('OPTIONS_PRESENT', key)
+            self.assertIsNone(self.h['foreign_config_observation']()[1])
             p.unlink()
         self.foreign_owner.add(self.path(PRESENCE[2][1]).stat().st_ino)
         self.assertEqual(self.run_host(), (70, '', 'DIRECT_PREREQUISITE\n'))
@@ -220,7 +292,8 @@ class ForeignConfig(unittest.TestCase):
         self.assertEqual(self.h['foreign_config_observation'](), ((), None))
         self.put(path, stock + b'\ninclude /etc/custom-vpn.conf\n')
         self.put(PRESENCE[2][1], b'')
-        self.assertEqual(self.run_host(), (70, '', 'DIRECT_PREREQUISITE\n'))
+        self.assert_foreign('OPTIONS_PRESENT', 'INCLUDE_FOREIGN')
+        self.assertIsNone(self.h['foreign_config_observation']()[1])
 
     def test_stock_then_foreign_exact_keys_private_fingerprint(self):
         self.seed()

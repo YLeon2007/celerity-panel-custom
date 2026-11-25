@@ -52,7 +52,9 @@ function packageWriteCheck(result) {
 // Canonical wire order; mirror FOREIGN_REASONS in rebuildRelayDirectHost.py.
 const foreignKeys = ['SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'STARTER_NOT_STOCK',
     'SECRETS_NOT_EMPTY', 'CHAP_NOT_EMPTY', 'LNS_NOT_STOCK', 'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666',
-    'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN'];
+    'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN',
+    'NETWORK_UNIT_ORPHANED', 'LEGACY_NFT_PRESENT', 'IPSEC_D_FOREIGN_CONF', 'SWAN_TREE_NOT_STOCK',
+    'CONFFILE_UNKNOWN', 'INCLUDE_FOREIGN'];
 const foreignCheck = 'L2TP_FOREIGN_CONFIG';
 const maxConflictFrame = `DIRECT_NO_WRITE_${foreignCheck} ${foreignKeys.join(',')}\n`.length;
 const freshConflicts = new Set([foreignCheck, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE']);

@@ -52,6 +52,9 @@ class FixtureOS:
     def fstat(self, fd):
         return FixtureStat(os.fstat(fd))
 
+    def stat(self, path, **kwargs):
+        return FixtureStat(os.stat(path if kwargs.get('dir_fd') is not None else physical(path), **kwargs))
+
     def lstat(self, path):
         return FixtureStat(os.lstat(physical(path)))
 
@@ -108,6 +111,12 @@ def model(scope):
         return machine
 
     def command(*args, **kwargs):
+        if args[:3] == ('/usr/bin/dpkg-query', '-W', r'-f=${Status}\n${Conffiles}'):
+            from hashlib import md5
+            stock = {'starter': b'config setup\n', 'secrets': b'# empty\n', 'lns': b'; factory\n'}
+            paths = {'strongswan-starter': ('starter', 'secrets'), 'xl2tpd': ('lns',)}[args[-1]]
+            return b'install ok installed\n' + b''.join(
+                f' {names[key]} {md5(stock[key], usedforsecurity=False).hexdigest()}\n'.encode() for key in paths)
         if scenario == 'rollback-policy-start' and args == ('/usr/sbin/nft', '-j', 'list', 'tables'):
             return scope['encode']({'nftables': nft_rows[:2] if state['nft'] else nft_rows[:1]})
         if scenario == 'rollback-policy-start' and args == ('/usr/sbin/nft', '-j', '-s', '-a', 'list', 'table', 'inet', scope['TABLE']):
@@ -218,6 +227,9 @@ def model(scope):
 
     def passive_open(path, mode='r'):
         reads.append(('file', path))
+        if path in ('/proc/net/udp', '/proc/net/udp6'):
+            assert mode == 'rb'
+            return io.BytesIO(b'  sl  local_address rem_address st tx_queue rx_queue\n')
         assert mode == 'r'
         if path == '/proc/modules':
             return io.StringIO(''.join(f'{name} 4096 0 - Live 0x0\n' for name in observers if name not in state['missing']))
@@ -290,8 +302,10 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
     units = {name: dict(LoadState='not-found' if name == NET else 'loaded', UnitFileState='disabled',
                         ActiveState='inactive', SubState='dead', MainPID='0', InvocationID='', DropInPaths='',
                         FragmentPath='' if name == NET else '/vendor/' + name) for name in (XL, IKE, X, B, NET)}
+    for name in h['FRESH_VPN_UNITS']:
+        units.setdefault(name, {**units[NET], 'UnitFileState': ''})
     units[X].update(ActiveState='active', SubState='running', MainPID='8', InvocationID='e' * 32)
-    original = copy.deepcopy(units)
+    original = {name: copy.deepcopy(units[name]) for name in h['UNITS']}
     state: dict[str, Any] = dict(boot='ab12cdef-1234-5678-aaaa-123456789abc', sockets=[], busy=False, vpn=False,
                  rule=False, route=False, nft=None, offline=False, unverified=False, missing=set(), stray_ike=False,
                  swan_drift=False)

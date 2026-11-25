@@ -96,24 +96,50 @@ function control(dataset = {}) {
         addEventListener(name, fn) { listeners[name] = fn; }, click() { listeners.click?.(); } };
 }
 
-async function launch() {
+async function launch({ reconciliation = false } = {}) {
     const html = await render();
     const attr = name => html.match(new RegExp(`data-${name}="([^"]*)"`))[1].replace(/&(amp|lt|gt|#34|#39);/g,
         (_, key) => ({ amp: '&', lt: '<', gt: '>', '#34': '"', '#39': "'" })[key]);
-    const status = control(), refresh = control(), calls = [];
+    const status = control(), refresh = control(), rowStatus = control(), rowTimer = control(), calls = [];
+    let now = 0;
+    const timers = [];
     let reply;
     const recovery = control({ installRecoveryUrl: attr('install-recovery-url'), nodeId: id });
     const install = control(); // Another relay's normal Install button.
     const page = { contains: () => true, dataset: { csrf: attr('csrf'), messages: attr('messages') },
-        querySelector: sel => ({ '[data-action-status]': status, '[data-refresh]': refresh })[sel],
+        querySelector: sel => ({ '[data-action-status]': status, '[data-refresh]': refresh, [`#relay-${id}`]: row })[sel],
         querySelectorAll: sel => ({ '[data-install-recovery-url]': [recovery], '[data-install-url]': [install] })[sel] ?? [] };
-    runInNewContext(script, { AbortController, performance, setTimeout() {}, clearTimeout() {}, document: { getElementById: () => page }, window: { addEventListener() {} },
+    const row = { querySelector: sel => ({ '[data-relay-action-status]': rowStatus, '[data-relay-action-timer]': rowTimer })[sel] };
+    runInNewContext(script, { AbortController, performance: { now: () => now },
+        setTimeout(fn) { if (reconciliation) timers.push(fn); }, clearTimeout() {},
+        document: { getElementById: () => page },
+        window: { addEventListener() {}, ...(reconciliation && { crypto: require('node:crypto').webcrypto }) },
         fetch: (...params) => { calls.push(params); return new Promise(resolve => { reply = resolve; }); } });
-    return { status, refresh, recovery, install, calls,
+    return { status, refresh, rowStatus, rowTimer, recovery, install, calls,
+        expire() { now = 300_000; for (const tick of timers.splice(0)) tick(); },
         resolve: value => reply(value), next: () => new Promise(resolve => setImmediate(resolve)) };
 }
 
 const receipt = { executionMode: 'rebuild', status: 'can_install_again', nodeId: id };
+
+test('an unconfirmed recovery replaces the checking countdown at its deadline', async () => {
+    const f = await launch({ reconciliation: true });
+    const { checkingResult, installRecoveryUnconfirmed } = require('../../../locales/ru.json').rebuildL2tp.messages;
+    f.recovery.click();
+    f.resolve({ ok: false, status: 503, json: async () => ({}) });
+    await f.next();
+    assert.equal(f.status.textContent, checkingResult);
+    assert.equal(f.rowStatus.textContent, checkingResult);
+    assert.equal(f.rowTimer.hidden, false);
+    f.expire();
+    await f.next();
+    assert.equal(f.status.textContent, installRecoveryUnconfirmed);
+    assert.equal(f.rowStatus.textContent, installRecoveryUnconfirmed);
+    assert.equal(f.rowTimer.hidden, true);
+    assert.equal(f.refresh.hidden, false);
+    assert.ok(f.install.disabled && f.recovery.disabled);
+    assert.deepEqual(f.calls.map(([, options]) => options.method), ['POST']);
+});
 
 test('one explicit click sends only empty JSON and waits for the bound success receipt; no reload or replay', async () => {
     const f = await launch();

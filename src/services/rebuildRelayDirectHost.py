@@ -106,6 +106,10 @@ STOCK_SWAN_ADDONS = (
 UNITS = (XL, IKE, X, B, NET_UNIT)
 TABLE = 'celerity_rebuild_l2tp'
 PRIORITY = 10077
+LEGACY_NFT = '/etc/nftables.d/celerity-l2tp.nft'
+LEGACY_MODULES = '/etc/modules-load.d/c3-l2tp.conf'
+# The classic default; also check the selected routing mark when one is known.
+LEGACY_FWMARK = 100
 NAMES = {
     'main': MAIN, 'lns': '/etc/xl2tpd/xl2tpd.conf', 'options': '/etc/ppp/options.xl2tpd',
     'chap': '/etc/ppp/chap-secrets', 'secrets': '/etc/ipsec.secrets', 'ike': '/etc/ipsec.d/celerity-rebuild-l2tp.conf',
@@ -121,7 +125,9 @@ FRESH_CONFLICTS = (FOREIGN_CONFIG, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP
 # Canonical wire order; mirror in rebuildRelayInstallDiagnostics.js.
 FOREIGN_REASONS = ('SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'STARTER_NOT_STOCK',
                    'SECRETS_NOT_EMPTY', 'CHAP_NOT_EMPTY', 'LNS_NOT_STOCK', 'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666',
-                   'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN')
+                   'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN',
+                   'NETWORK_UNIT_ORPHANED', 'LEGACY_NFT_PRESENT', 'IPSEC_D_FOREIGN_CONF',
+                   'SWAN_TREE_NOT_STOCK', 'CONFFILE_UNKNOWN', 'INCLUDE_FOREIGN')
 MAX_FILE = 16 * 1024 * 1024
 MAX_REQUEST = 25 * 1024 * 1024
 HOST_STARTED = time.monotonic()
@@ -656,7 +662,45 @@ def foreign_conffiles(package):
     return hashes
 
 
-def foreign_config_observation():
+def old_network_idle(has_unit, fwmark):
+    if recovery_stat(VAULT) is not None:
+        return False
+    try:
+        net = unit(NET_UNIT)
+        if net['ActiveState'] != 'inactive' or net.get('Job') or net.get('DropInPaths'):
+            return False
+        if has_unit:
+            if not (net['LoadState'] == 'loaded' and net.get('FragmentPath') == NET
+                    and net.get('UnitFileState') in ('static', 'disabled')
+                    and net.get('DropInPaths') == '' and net.get('MainPID') == '0'):
+                return False
+        elif not (net['LoadState'] == 'not-found' and not net.get('FragmentPath') and not net.get('UnitFileState')):
+            return False
+        no_jobs((NET_UNIT,))
+        marks = {LEGACY_FWMARK} if fwmark is None else {LEGACY_FWMARK, fwmark}
+        for rows in swan_rule_dumps():
+            for row in rows:
+                if number(row['priority']) == PRIORITY:
+                    return False
+                if 'fwmark' in row:
+                    mark, mask = number(row['fwmark']), number(row.get('fwmask', 0xffffffff))
+                    if row.get('not') or row.get('invert') or any(mark == value & mask for value in marks):
+                        return False
+        routes = json.loads(command('/usr/sbin/ip', '-j', '-N', '-4', 'route', 'show', 'table', 'all', quiet=True))
+        need(type(routes) is list and all(type(row) is dict for row in routes), 'NETWORK_CONFLICT')
+        routes = cast(list[dict[str, Any]], routes)
+        if any(row.get('type') == 'local' and row.get('dev') == 'lo'
+               and row.get('dst') in ('default', '0.0.0.0/0') for row in routes):
+            return False
+        # Do not autoload a provider or infer safety from failed observation.
+        if set(NFT_OBSERVERS).intersection(missing_network_observers()):
+            return False
+        return not any(row['name'] in (TABLE, 'celerity_l2tp') for row in nft_tables(strict=True))
+    except (OSError, Refusal, ValueError, KeyError, TypeError):
+        return False
+
+
+def foreign_config_observation(fwmark=None):
     """Return fixed reasons and a private sample fingerprint, never write authority."""
     found = {}
     metadata = {}
@@ -666,7 +710,7 @@ def foreign_config_observation():
         found[reason] = [path, leaf[1], digest(leaf[2]), stock.decode() if stock else None]
 
     for reason, path in (('SWAN_PROFILE_PRESENT', SWAN_PROFILE), ('IKE_PROFILE_PRESENT', NAMES['ike']),
-                         ('OPTIONS_PRESENT', NAMES['options']), ('MODULES_LOAD_FOREIGN', '/etc/modules-load.d/c3-l2tp.conf')):
+                         ('OPTIONS_PRESENT', NAMES['options']), ('MODULES_LOAD_FOREIGN', LEGACY_MODULES)):
         leaf = foreign_leaf(path)
         if leaf is not None:
             record(reason, path, leaf)
@@ -682,10 +726,16 @@ def foreign_config_observation():
 
     # A basename in a glob is not a cleanup candidate. Keep the existing
     # Debian strongSwan tree proof when there are other inputs in that tree.
-    need(all(name == os.path.basename(NAMES['ike']) or name.startswith('.') or not name.endswith('.conf')
-             for name in included('/etc/ipsec.d')), 'PREREQUISITE')
+    if any(name != os.path.basename(NAMES['ike']) and not name.startswith('.') and name.endswith('.conf')
+           for name in included(os.path.dirname(NAMES['ike']))):
+        diagnostic.add('IPSEC_D_FOREIGN_CONF')
     if set(included(SWAN_DIR)) - {os.path.basename(SWAN_PROFILE)} or recovery_stat(SWAN_CONF) is not None:
-        swan_inputs('SWAN_PROFILE_PRESENT' in found, 'PREREQUISITE')
+        try:
+            swan_inputs('SWAN_PROFILE_PRESENT' in found, 'SWAN_TREE_NOT_STOCK')
+        except Refusal as error:
+            if str(error) != 'SWAN_TREE_NOT_STOCK':
+                raise
+            diagnostic.add('SWAN_TREE_NOT_STOCK')
 
     for reason, name, package in (('STARTER_NOT_STOCK', 'starter', 'strongswan-starter'),
                                   ('SECRETS_NOT_EMPTY', 'secrets', 'strongswan-starter'),
@@ -695,16 +745,25 @@ def foreign_config_observation():
         if leaf is None:
             continue
         if package not in metadata:
-            metadata[package] = foreign_conffiles(package)
+            try:
+                metadata[package] = foreign_conffiles(package)
+            except Refusal as error:
+                if str(error) != 'PREREQUISITE':
+                    raise
+                metadata[package] = {}
         stock = metadata[package].get(path.encode())
-        need(stock is not None, 'PREREQUISITE')
         data = leaf[2]
         active = uncomment(data)
-        stock_bytes = hashlib.md5(data, usedforsecurity=False).hexdigest().encode() == stock
         if name != 'lns':
             # An include outside the reviewed starter glob is not a known leaf.
-            need(all(line.split(None, 1)[0] != b'include' or name == 'starter' and line == STOCK_IKE_INCLUDE
-                     for line in active), 'PREREQUISITE')
+            if any(line.split(None, 1)[0].lower() == b'include' and not (name == 'starter' and line == STOCK_IKE_INCLUDE)
+                   for line in active):
+                diagnostic.add('INCLUDE_FOREIGN')
+                continue
+        if stock is None:
+            diagnostic.add('CONFFILE_UNKNOWN')
+            continue
+        stock_bytes = hashlib.md5(data, usedforsecurity=False).hexdigest().encode() == stock
         if name == 'starter':
             # Also accept the exact wildcard append performed by install-runtime.sh.
             append = b'\n' + STOCK_IKE_INCLUDE + b'\n'
@@ -728,13 +787,22 @@ def foreign_config_observation():
     for reason, path in (('NFT_DIR_PRESENT', NFT_DIR), ('DROPIN_PRESENT', DROP_DIR)):
         if foreign_leaf(path, folder=True) is not None:
             diagnostic.add(reason)
-    # These existing legacy vetoes do not identify replaceable inputs.
-    need(all(recovery_stat(path) is None for path in (NET, '/etc/nftables.d/celerity-l2tp.nft')), 'PREREQUISITE')
+    net_exists = recovery_stat(NET) is not None
+    if net_exists or recovery_stat(LEGACY_NFT) is not None:
+        if not old_network_idle(net_exists, fwmark):
+            raise FreshInstallConflict('L2TP_DAEMON_ACTIVE')
+        net = foreign_leaf(NET)
+        legacy_nft = foreign_leaf(LEGACY_NFT)
+        need((net is not None) == net_exists and (net is not None or legacy_nft is not None), 'BASELINE_CHANGED')
+        if net is not None:
+            record('NETWORK_UNIT_ORPHANED', NET, net)
+        if legacy_nft is not None:
+            record('LEGACY_NFT_PRESENT', LEGACY_NFT, legacy_nft)
     keys = tuple(reason for reason in FOREIGN_REASONS if reason in found or reason in diagnostic)
     return keys, digest(encode(['foreign-config-v2', found])) if found and not diagnostic else None
 
 
-def fresh_install_conflicts(machine, lock_fd):
+def fresh_install_conflicts(machine, lock_fd, fwmark=None):
     def scope():
         need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
         current = (require_machine(machine), boot(), install_lock_identity(lock_fd))
@@ -753,7 +821,11 @@ def fresh_install_conflicts(machine, lock_fd):
     runtime = observe_runtime()
     keys = ()
     if runtime is None:
-        keys, _ = foreign_config_observation()
+        try:
+            keys, _ = foreign_config_observation(fwmark)
+        except FreshInstallConflict:
+            need(scope() == original, 'BASELINE_CHANGED')
+            raise
         if keys:
             # Runtime vetoes take precedence even if a daemon/session appeared
             # during the read. Do not export the fingerprint or any file bytes.
@@ -1331,8 +1403,15 @@ def routing(arg):
     return arg
 
 
-def nft_tables():
-    rows = json.loads(command('/usr/sbin/nft', '-j', 'list', 'tables'))['nftables']
+def nft_tables(*, strict=False):
+    output = command('/usr/sbin/nft', '-j', 'list', 'tables', **({'quiet': True} if strict else {}))
+    rows = json.loads(output)['nftables']
+    if strict:
+        need(type(rows) is list and all(type(row) is dict and (
+            set(row) == {'metainfo'} and type(row['metainfo']) is dict or
+            set(row) == {'table'} and type(row['table']) is dict and
+            all(type(row['table'].get(key)) is str and row['table'][key] for key in ('family', 'name'))
+        ) for row in rows), 'NETWORK_CONFLICT')
     return [row['table'] for row in rows if 'table' in row]
 
 
@@ -6642,7 +6721,8 @@ def reconcile_install(request):
 
 def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
     lock_id = install_lock_identity(lock_fd)
-    fresh_install_conflicts(machine, lock_fd)
+    # Called only on the Install path, never from verify/rollback/reconcile/remove.
+    fresh_install_conflicts(machine, lock_fd, network['fwmark'])
     modules = observe_ppp_preparation()
     deferred = tuple(name for name in modules['missing'] if name in OBSERVERS)
     before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner,

@@ -146,10 +146,9 @@ test('pending page does not POST until click; each outcome requires a fresh view
         }
         assert.equal(calls.filter(call => call.options.method === 'POST').length, recover ? 1 : 0, outcome);
         assert.equal(calls.filter(call => call.options.method === 'GET').length, messageKey === 'reconcileSettled' ? 1 : 0, outcome);
-        // This fixture does not advance poll timers; unresolved automatic
-        // observation is still running, not the manual-refresh fallback.
-        const polling = ['refused', 'unexpected', 'lost'].includes(outcome);
-        assert.equal(refresh.hidden, polling || !messageKey || messageKey === 'reconcileSettled', outcome);
+        // This fixture has no nonce: ambiguous results cannot be attributed
+        // by an automatic receipt read and require an explicit refresh.
+        assert.equal(refresh.hidden, !messageKey || messageKey === 'reconcileSettled', outcome);
         const message = messageKey ? words.messages[messageKey] ?? words.admission[messageKey] : words.accountsPendingLocked;
         assert.equal(status.textContent, count === undefined ? message : `${message} Подтверждено завершение сеансов этим запросом: ${count}.`, outcome);
         if (messageKey) {

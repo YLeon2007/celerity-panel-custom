@@ -664,7 +664,7 @@
         status.textContent = (words[message] ?? admissionWords[message]) + note;
         requireRefresh = true;
         if (message === 'reconcileSettled') await finishAcknowledged(csrf, status.textContent);
-        else if (unknown) {
+        else if (unknown && token) {
             const outcome = await reconcileUnknown(csrf, token, ['settled']);
             if (active) status.textContent = words[outcome ? 'reconcileSettled' : 'observationTimeout'];
         }
@@ -719,7 +719,7 @@
                     if (check !== undefined) note = ` ${installChecks[check]}`;
                     const keys = data.error.keys;
                     if (code === 'REBUILD_L2TP_FOREIGN_CONFIG' && outcome === 'refused' && check === 'L2TP_FOREIGN_CONFIG'
-                        && Array.isArray(keys) && keys.length > 0 && keys.length <= 16 && new Set(keys).size === keys.length
+                        && Array.isArray(keys) && keys.length > 0 && keys.length <= 24 && new Set(keys).size === keys.length
                         && keys.every(key => typeof key === 'string' && Object.hasOwn(installChecks, key))) {
                         note += ` ${keys.map(key => installChecks[key]).join(' ')}`;
                     }
@@ -737,15 +737,21 @@
         finally { endProgress?.(); }
         if (!active) return;
         let message = (words[result] ?? admissionWords[result]) + note;
-        if (action === 'install' && !accepted.includes(result) && !unknown && result !== 'uncertain' && result !== 'installCleanupFailed') {
+        if (action === 'install' && !accepted.includes(result) && !unknown
+            && !['uncertain', 'installCleanupFailed', 'identityChanged'].includes(result)) {
             message = words.installStopped.replace('{reason}', () => message);
         }
         setActionStatus(message, nodeId);
         if (accepted.includes(result) || result === 'installCleanupFailed' || result === 'installRolledBack') {
             await finishAcknowledged(csrf, message, !accepted.includes(result), nodeId);
         } else if (unknown || result === 'uncertain') {
-            const outcome = await reconcileUnknown(csrf, token, accepted, nodeId);
-            if (active) setActionStatus(words[outcome ?? 'observationTimeout'] + (outcome ? '' : note), nodeId);
+            if (token) {
+                const outcome = await reconcileUnknown(csrf, token, accepted, nodeId);
+                if (active) setActionStatus(words[outcome ?? 'observationTimeout'] + (outcome ? '' : note), nodeId);
+            } else {
+                // An unbound GET cannot settle this request; leave the explicit refresh fallback.
+                requireRefresh = true;
+            }
         }
         busy = false;
         updateMutations();
@@ -770,9 +776,9 @@
         setActionStatus(words[message], nodeId);
         requireRefresh = true;
         if (message === 'canInstallAgain') await finishAcknowledged(csrf, status.textContent, false, nodeId);
-        else if (message === 'installRecoveryUnconfirmed') {
+        else if (message === 'installRecoveryUnconfirmed' && token) {
             const outcome = await reconcileUnknown(csrf, token, ['can_install_again'], nodeId);
-            if (active) setActionStatus(words[outcome ? 'canInstallAgain' : 'observationTimeout'], nodeId);
+            if (active) setActionStatus(words[outcome ? 'canInstallAgain' : message], nodeId);
         }
         busy = false;
         updateMutations();

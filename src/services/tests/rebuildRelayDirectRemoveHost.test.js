@@ -85,7 +85,7 @@ def forbidden_signal(*args):
     mock_faults.append('unexpected pidfd signal')
     raise AssertionError('unexpected pidfd signal')
 h['signal'] = types.SimpleNamespace(pidfd_send_signal=forbidden_signal, SIGTERM=15)
-for k in ('MAIN', 'BRIDGE', 'XRAY', 'SYSTEM', 'NET', 'DROP_DIR', 'DROP', 'NFT_DIR', 'NFT_FILE', 'VAULT'):
+for k in ('MAIN', 'BRIDGE', 'XRAY', 'SYSTEM', 'NET', 'DROP_DIR', 'DROP', 'NFT_DIR', 'NFT_FILE', 'VAULT', 'SWAN_DIR', 'SWAN_CONF', 'SWAN_PROFILE', 'LEGACY_MODULES', 'LEGACY_NFT'):
     h[k] = str(root) + h[k]
 h['NAMES'] = {k: str(root) + v for k, v in h['NAMES'].items()}
 P, R, Refusal = h['NAMES'], h['read'], h['Refusal']
@@ -103,7 +103,7 @@ if scenario.startswith('chap-unterminated-'):
     Path(P['chap']).write_bytes(b'# original comment with opaque byte \xff')
 
 def stat(value):
-    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size','st_dev','st_ino','st_ctime_ns')})
+    return types.SimpleNamespace(st_uid=0, st_gid=0, **{k: getattr(value, k) for k in ('st_mode','st_nlink','st_size','st_dev','st_ino','st_mtime_ns','st_ctime_ns')})
 class FixtureOS:
     def __getattr__(self, name): return getattr(os, name)
     def lstat(self, path):
@@ -116,7 +116,8 @@ class FixtureOS:
             return types.SimpleNamespace(st_uid=987, st_gid=986)
         if path.startswith('/proc/'):
             return types.SimpleNamespace(st_uid=0, st_gid=0)
-        return os.stat(path, *args, **kw)
+        value = os.stat(path, *args, **kw)
+        return stat(value) if kw.get('dir_fd') is not None else value
     def fchown(self, fd, uid, gid):
         assert uid == gid == 0 and os.readlink('/proc/self/fd/' + str(fd)).startswith(tmp + '/')
     def geteuid(self): return 0
@@ -136,7 +137,11 @@ h['directory'] = directory
 machine_file = root / 'etc/machine-id'
 machine_file.write_text(f['machineId'] + '\n')
 h['read'] = lambda path, *args: R(str(machine_file) if path == '/etc/machine-id' else path, *args)
-h['open'] = lambda path, *args, **kw: open(machine_file if path == '/etc/machine-id' else path, *args, **kw)
+def open_fixture(path, *args, **kw):
+    if path in ('/proc/net/udp', '/proc/net/udp6'):
+        return io.BytesIO(b'  sl  local_address rem_address st tx_queue rx_queue\n')
+    return open(machine_file if path == '/etc/machine-id' else path, *args, **kw)
+h['open'] = open_fixture
 
 def preflight(machine, *, fresh=False):
     h['need'](machine == f['machineId'], 'IDENTITY')
@@ -165,6 +170,8 @@ for n in (X, B, XL, IKE, NET):
         Requires='sysinit.target system.slice' if n != NET else '', After='', ExecStartPre='', ExecStartPost='',
         RequiredBy='', BoundBy='', ConsistsOf='', PropagatesStopTo='', Conflicts='shutdown.target', ConflictedBy='',
         Wants='', BindsTo='', Upholds='', Type='simple', EnvironmentFiles='', ExecStopPost='')
+for n in h['FRESH_VPN_UNITS']:
+    units.setdefault(n, dict(units[NET]))
 units[XL]['ExecStart'] = '{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }'
 if scenario == 'chap-inspect-active' or joined_epoch:
     fragment = Path(h['SYSTEM'], XL)
@@ -212,6 +219,7 @@ if joined_epoch:
     h['os'].pidfd_open = pidfd_open
     starts = {}
     def proc_open(path, *args, **kw):
+        if path in ('/proc/net/udp', '/proc/net/udp6'): return open_fixture(path, *args, **kw)
         if path == '/proc/sys/kernel/random/boot_id': return io.StringIO(epoch + '\n')
         if path == '/proc/devices': return io.BytesIO(b'Character devices:\n108 ppp\n\nBlock devices:\n')
         if path == '/proc/net/dev': return io.StringIO('Inter-| Receive | Transmit\n face |bytes\n lo: 0\n')
@@ -245,8 +253,8 @@ if scenario.startswith('xtls-'):
     units[X].update(DropInPaths=str(xtls), ExecStart=f"{{ path={h['XRAY']} ; argv[]={start} ; ignore_errors=no ; "
                                                    'start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
     def proc_cmdline(path, mode):
-        if path == '/etc/machine-id':
-            return open(machine_file, mode)
+        if path in ('/etc/machine-id', '/proc/net/udp', '/proc/net/udp6'):
+            return open_fixture(path, mode)
         assert (path, mode) == ('/proc/' + units[X]['MainPID'] + '/cmdline', 'rb')
         return io.BytesIO(b'\0'.join(arg.encode() for arg in (h['XRAY'], 'run', '-config', h['MAIN'], '')))
     def realpath(path):
@@ -342,6 +350,15 @@ def command(*a, data=None):
             if scenario == 'invalid-candidate': raise Refusal('CANDIDATE_INVALID')
         return b''
     if a == ('/usr/sbin/nft', '-c', '-f', '-'): return b''
+    if a[:3] == ('/usr/bin/dpkg-query', '-W', r'-f=$' r'{Status}\n$' '{Conffiles}'):
+        paths = {'strongswan-starter': ('starter', 'secrets'), 'xl2tpd': ('lns',)}[a[-1]]
+        baseline = {'starter': b'# initial\n', 'secrets': b'# initial\n', 'lns': b'# stock\n'}
+        return b'install ok installed\n' + b''.join(
+            f' {P[k]} {h["hashlib"].md5(baseline[k], usedforsecurity=False).hexdigest()}\n'.encode() for k in paths)
+    if not testing and a == ('/usr/bin/ps', '-ww', '-e', '-o', 'pid=', '-o', 'comm='):
+        return b'  1 systemd\n 10 xray\n 40 ps\n'
+    if not testing and a == ('/usr/sbin/ip', '-j', '-details', 'link', 'show'):
+        return b'[{"ifindex":1,"ifname":"lo","link_type":"loopback"}]\n'
     if scenario == 'apply-quiescent-dependent':
         if a == ('/usr/bin/stat','-f','--format=%T','/sys/fs/cgroup/system.slice'):
             return b'cgroup2fs\n'
@@ -415,6 +432,8 @@ def command(*a, data=None):
         return b'fixture-only transform (no keys)\n'
     if a in (('/usr/sbin/ip','xfrm','policy','list'),('/usr/sbin/ip','xfrm','policy','list','nosock'),
              ('/usr/sbin/ip','xfrm','state','list','nokeys')): return b''
+    if a == ('/usr/sbin/ip','-j','-N','-6','rule','show'):
+        return h['encode']([row for row in stock_rules if row['priority'] != 32766])
     if a == ('/usr/sbin/ip','-j','-N','-4','rule','show'):
         # The epoch cases keep the stock RPDB required by reattestation.
         rules = stock_rules + ([foreign_rule] if testing and not joined_epoch else [])
