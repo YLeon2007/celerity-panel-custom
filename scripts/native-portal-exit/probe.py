@@ -133,9 +133,9 @@ def test_xray(label, owner, config, evidence):
     require(res.returncode == 0, f'{label}: xray run -test failed; see {label}.test.log')
 
 
-def start_xray(stack, label, owner, evidence):
+def start_xray(stack, label, owner, evidence, *, boot=None):
     spec = actor(owner, evidence)
-    child = start(stack, label, [spec['binary'], 'run', '-c', f'{label}.json'], evidence['reaped'])
+    child = start(stack, label, [spec['binary'], 'run', '-c', f'{boot or label}.json'], evidence['reaped'])
     # Popen returns after exec, so this verifies the actual mounted executable,
     # including when two mounts refer to the same host inode.
     exe = os.readlink(f'/proc/{child.pid}/exe')
@@ -242,26 +242,28 @@ def subscriber_config(users, ports):
     }
 
 
+def reap(label, child, reaped):
+    if label in reaped:
+        return
+    before = child.poll()
+    forced = False
+    if before is None:
+        child.terminate()
+        try:
+            child.wait(timeout=3)
+        except sp.TimeoutExpired:
+            forced = True
+            child.kill()
+            child.wait(timeout=3)
+    else:
+        child.wait(timeout=3)
+    reaped[label] = {'pid': child.pid, 'status': child.returncode, 'early_exit': before, 'forced_kill': forced}
+
+
 def start(stack, label, argv, reaped):
     with open(f'{label}.run.log', 'w') as log:
         child = sp.Popen(argv, stdin=sp.DEVNULL, stdout=log, stderr=sp.STDOUT)
-
-    def stop():
-        before = child.poll()
-        forced = False
-        if before is None:
-            child.terminate()
-            try:
-                child.wait(timeout=3)
-            except sp.TimeoutExpired:
-                forced = True
-                child.kill()
-                child.wait(timeout=3)
-        else:
-            child.wait(timeout=3)
-        reaped[label] = {'pid': child.pid, 'status': child.returncode, 'early_exit': before, 'forced_kill': forced}
-
-    stack.callback(stop)
+    stack.callback(reap, label, child, reaped)
     return child
 
 
@@ -581,11 +583,12 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     added = [(step['owner'], step['config']['port']) for step in plan['listeners']] if plan is not None else []
     delivery_owner = ''
     delivery_rule_tags = []
+    restarts = {}
     if plan is not None:
         transition = generated['transition']
         require([len(plan[key]) for key in ('listeners', 'dialers', 'transit', 'ingress')] == [2, 2, 1, 1],
                 'unexpected staged activation plan')
-        evidence['prequalified_sniffing'] = transition['prequalifiedSniffing']
+        evidence['main_restarts'] = []
         stock = {item['name']: fixture_config(item['config'], None, f'{item["name"]}-main') for item in transition['before']}
         require(set(stock) == {'gateway', 'tail'}, 'missing stock MAIN')
         for owner, original in stock.items():
@@ -615,6 +618,24 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         gateway['routing'] = {**switch['before'], 'rules': [*probes, *switch['before']['rules']]}
         for owner, original in stock.items():
             dump(f'{owner}-main.json', original)
+        for phase in ('preparation', 'portals'):
+            for op in plan[phase]:
+                owner = op['owner']
+                key = run_configs[owner]
+                require(owner not in restarts, 'duplicate restart owner')
+                old = stock.get(owner, fixture_config(op['before'], None, key))
+                new = deepcopy(old)
+                for tag in op['tags']:
+                    have, = [row for row in new['inbounds'] if row['tag'] == tag]
+                    was, = [row for row in op['before']['inbounds'] if row['tag'] == tag]
+                    want, = [row for row in op['after']['inbounds'] if row['tag'] == tag]
+                    require(have == was, 'restart input is not the stock inbound')
+                    have['sniffing']['routeOnly'] = want['sniffing']['routeOnly']
+                    require(have == want, 'restart changed more than its allowed sniffing flag')
+                restarts[owner] = {direction: f'{key}-boot-{direction}' for direction in ('before', 'after')}
+                test_xray(restarts[owner]['before'], owner, old, evidence)
+                test_xray(restarts[owner]['after'], owner, new, evidence)
+                dump(f'{key}.json', old)
         dump('staged-routes.json', {'routing': gateway['routing']})
         dump('desired-routes.json', {'routing': desired})
         dump('delivery-before.json', {'routing': delivery['before']})
@@ -623,7 +644,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         for phase, field in (('listeners', 'inbounds'), ('dialers', 'outbounds')):
             for step in plan[phase]:
                 dump(f'{phase}-{step["channelId"]}.json', {field: [step['config']]})
-    print(f'CONFIG OK {len(evidence["config_tests"])}/{len(configs)} (including bridge fixture redirects and subscriber)')
+    config_count = len(configs) + 2 * len(restarts)
+    print(f'CONFIG OK {len(evidence["config_tests"])}/{config_count} (including fixture boot candidates)')
 
     b = 6 if preferred else 3
     cases = [Probe('p1', 'numeric', 'B', b), Probe('p2', 'numeric', 'B', b),
@@ -644,8 +666,9 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     origins = Origins()
     evidence['probes'] = []
     expected_count = len(cases) + (5 if matrix else 0) + (13 if stage else 0)
-    evidence['expected_counts'] = {'config_tests': len(configs), 'http_probes': expected_count,
-                                   'live_xray': len(run_configs), 'children': len(run_configs) + 1}
+    xray_count = len(run_configs) + 3 * len(restarts)
+    evidence['expected_counts'] = {'config_tests': config_count, 'http_probes': expected_count,
+                                   'live_xray': xray_count, 'children': xray_count + 1}
     reaped = evidence['reaped']
     with ExitStack() as stack:
         for label in BRIDGES:
@@ -655,6 +678,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         wait_until('cover listener', children, lambda: sockets(ports['cover'], cover), 4)
         for label in [*relays, *PORTALS, *BRIDGES, 'subscriber']:
             children[label] = start_xray(stack, run_configs[label], label, evidence)
+        active_runs = dict(run_configs)
         initial_links = [ln for ln in generated['links'] if not stage or 'selectedBy' not in ln]
         scoped_links = [ln for ln in generated['links'] if stage and 'selectedBy' in ln]
         listens = [(ln['source'] if ln['mode'] == 'reverse' else ln['target'], ln['port']) for ln in initial_links]
@@ -671,7 +695,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
 
         def reverse_ready():
             return all(sockets(ln['port'], children[ln['source']], established=True) for ln in reverse) and all(
-                Path(f'{run_configs[owner]}.run.log').read_text().count(
+                Path(f'{active_runs[owner]}.run.log').read_text().count(
                     'proxy/vless/inbound: received request for tcp:v1.rvs.cool:0') >= count
                 for owner, count in reverse_owners.items())
 
@@ -682,7 +706,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         print(f'REVERSE READY {len(reverse)}/{len(reverse)}')
 
         def api_actor(owner, operation):
-            spec = evidence['live_actors'][run_configs[owner]]
+            spec = evidence['live_actors'][active_runs[owner]]
             port = ports[f'api-{owner}']
             require(sockets(port, children[owner]), f'{operation}: API socket not owned by {owner}')
             return {**spec, 'operation': operation, 'port': port}
@@ -717,6 +741,41 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                   + (f' via {result["egress"]}' if 'egress' in result else ''))
             require(result['actual'] == case.want, f'{case.name}: wrong origin')
 
+        def restart_mains(steps, direction, expected_listens):
+            ordered = reversed(steps) if direction == 'before' else steps
+            for operation in ordered:
+                owner = operation['owner']
+                previous = 'before' if direction == 'after' else 'after'
+                boot = Path(f'{run_configs[owner]}.json')
+                expected = Path(f'{restarts[owner][previous]}.json').read_bytes()
+                candidate = Path(f'{restarts[owner][direction]}.json').read_bytes()
+                require(boot.read_bytes() == expected and candidate != expected, 'MAIN boot preimage changed')
+                stage_file = boot.with_suffix('.next')
+                with stage_file.open('xb') as stream:
+                    stream.write(candidate)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(stage_file, boot)
+                directory = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+                require(boot.read_bytes() == candidate, 'published MAIN boot bytes differ')
+                retained = {node: proc for node, proc in children.items() if node != owner}
+                old = children[owner]
+                reap(active_runs[owner], old, reaped)
+                label = f'{run_configs[owner]}-start-{len(evidence["main_restarts"])}'
+                children[owner] = start_xray(stack, label, owner, evidence, boot=run_configs[owner])
+                active_runs[owner] = label
+                wait_until('restarted MAIN owns listeners', children, lambda: all(
+                    sockets(port, children[node]) for node, port in expected_listens), 6)
+                wait_until('original reverse paths reestablished', children, reverse_ready, 18)
+                require(children[owner].pid != old.pid and all(children[node] is proc and proc.poll() is None
+                        for node, proc in retained.items()) and boot.read_bytes() == candidate, 'MAIN restart generation mismatch')
+                evidence['main_restarts'].append({'owner': owner, 'previous_pid': old.pid,
+                    'current_pid': children[owner].pid, 'direction': direction, 'boot_sha256': digest(boot)})
+
         def stage_channels(steps, verify_baseline):
             require(all(not sockets(port, children[owner]) and not sockets(port, children[owner], established=True)
                         for owner, port in added), 'scoped listeners or old sessions already present')
@@ -742,16 +801,19 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         if plan is not None:
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+            restart_mains(plan['preparation'], 'after', listens)
             # Install listeners first into the original processes, then dialers
             # and the downstream policy. Subscriber selectors are still old.
             stage_channels(plan, True)
             api('gateway', 'adrules', 'desired-routes.json')
             verify_live_rules('gateway', 'desired-routes.json')
+            restart_mains(plan['portals'], 'after', [*listens, *added])
             wait_until('original staged process and all listeners retained', children,
                        lambda: all(sockets(port, children[owner]) for owner, port in [*listens, *added]), 4)
         for case in cases:
             verify_case(case)
         if plan is not None:
+            restart_mains(plan['portals'], 'before', [*listens, *added])
             api('gateway', 'adrules', 'staged-routes.json')
             verify_live_rules('gateway', 'staged-routes.json')
             api(delivery_owner, 'rmrules', *reversed(delivery_rule_tags))
@@ -767,11 +829,14 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                 require(f'"{step["tag"]}"' not in api(step['owner'], 'lso'), 'dialer remained after inverse plan')
             for owner, port in added:
                 drain_fixture_sessions(owner, port)
+            restart_mains(plan['preparation'], 'before', listens)
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
             # A separate explicit fixture operation after confirmed rollback.
+            restart_mains(plan['preparation'], 'after', listens)
             stage_channels(plan, False)
             api('gateway', 'adrules', 'desired-routes.json')
+            restart_mains(plan['portals'], 'after', [*listens, *added])
             verify_case(Probe('p1', 'numeric', 'B', 3))
             listens.extend(added)
         if matrix:
@@ -823,7 +888,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             require(json.loads(Path('switch.intent.json').read_text()) == intent, 'read-only reconciliation changed intent')
             evidence['lost_reply'] = {'intent': intent, 'writer_status': writer.returncode, 'observed': 'desired', 'acknowledged': False}
         require(all(child.poll() is None for child in children.values()), 'child exited during HTTP probes')
-    require(set(reaped) == set(run_configs.values()) | {'cover'} and all(
+    require(len(evidence['live_actors']) == xray_count and set(reaped) == set(evidence['live_actors']) | {'cover'} and all(
         r['early_exit'] is None and not r['forced_kill'] and r['status'] in (0, -signal.SIGTERM) for r in reaped.values()),
         f'unexpected child wait/cleanup: {reaped}')
     require(not checked(['ss', '-Hltun']).strip(), 'unexpected listeners left after fixture cleanup')

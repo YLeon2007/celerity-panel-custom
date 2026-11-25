@@ -43,8 +43,9 @@ function find(rows, match, reason) {
 
 // An additive plan, not an execution receipt. The executor must pin the exact
 // live and boot images and hold the writers' fence. Reject changes that would
-// need decommissioning, an existing listener replacement, or a MAIN restart.
-function planAdditiveScopedTransition({ before, after, composition }) {
+// need decommissioning or a listener replacement. A separately approved
+// cold step may change only sniffing.routeOnly of existing MAIN handlers.
+function planAdditiveScopedTransition({ before, after, composition, allowMainRestart = false }) {
     const { nodes, links, affectedNodeIds } = composition;
     const graph = compileRebuildGraph({ nodes, links, affectedNodeIds });
     const channels = buildTransitChannels(graph).artifacts;
@@ -55,7 +56,7 @@ function planAdditiveScopedTransition({ before, after, composition }) {
     const stage = new Map(graph.nodeIds.map(id => [id, structuredClone(live.get(key(id, 'main')))]));
     const downstreamFirst = [...graph.nodeIds].reverse();
     const rank = new Map(downstreamFirst.map((id, i) => [id, i]));
-    const listeners = [], dialers = [], transit = [], ingress = [];
+    const listeners = [], dialers = [], transit = [], ingress = [], preparation = [], portals = [];
     const orderedChannels = [...channels].sort((a, b) => rank.get(a.target) - rank.get(b.target)
         || rank.get(a.source) - rank.get(b.source) || a.id.localeCompare(b.id));
     const used = (config, tag) => config.inbounds.some(row => row.tag === tag || row.settings?.clients?.some(c => c.reverse?.tag === tag))
@@ -101,11 +102,11 @@ function planAdditiveScopedTransition({ before, after, composition }) {
     // Additions may be stored in a different order, but no original inbounds
     // or outbounds may move relative to one another; the first outbound is
     // the implicit default even in the absence of every routing rule.
-    const sameHandlers = (staged, desired, additions) => {
+    const sameHandlers = (staged, desired, additions, includeFirst = true) => {
         const tags = new Set(additions.map(item => item.tag));
         return new Set(desired.map(item => item.tag)).size === desired.length
             && equal(staged.filter(item => !tags.has(item.tag)), desired.filter(item => !tags.has(item.tag)))
-            && equal(staged[0], desired[0]);
+            && (!includeFirst || equal(staged[0], desired[0]));
     };
     for (const id of downstreamFirst) {
         const dst = stage.get(id), target = final.get(key(id, 'main'));
@@ -113,20 +114,42 @@ function planAdditiveScopedTransition({ before, after, composition }) {
         const { routing: policy, inbounds: nextInbounds, outbounds: nextOutbounds, ...nextFields } = target;
         requirePlan(equal(live.get(key(id, 'bridge')), final.get(key(id, 'bridge'))), 'bridge_changed');
         requirePlan(equal(oldFields, nextFields), 'main_settings_changed');
-        requirePlan(sameHandlers(inbounds, nextInbounds, listeners.filter(step => step.nodeId === id)), 'existing_inbounds_changed');
+        const newListeners = listeners.filter(step => step.nodeId === id);
+        if (!sameHandlers(inbounds, nextInbounds, newListeners, false) && allowMainRestart === true) {
+            const entry = graph.byNodeId.get(id), current = live.get(key(id, 'main'));
+            requirePlan((entry.role === 'relay' || entry.role === 'portal') && !nextFields.reverse, 'restart_layout');
+            const tags = [];
+            const adjusted = structuredClone(current);
+            for (const row of adjusted.inbounds) {
+                const next = nextInbounds.find(candidate => candidate.tag === row.tag);
+                if (!next || equal(row, next)) continue;
+                const from = row.sniffing?.routeOnly, to = next.sniffing?.routeOnly;
+                requirePlan(row.sniffing?.enabled === true && typeof from === 'boolean' && typeof to === 'boolean'
+                    && from !== to && equal({ ...row, sniffing: { ...row.sniffing, routeOnly: to } }, next), 'existing_inbounds_changed');
+                row.sniffing.routeOnly = to;
+                tags.push(row.tag);
+            }
+            requirePlan(tags.length > 0, 'existing_inbounds_changed');
+            if (entry.role === 'portal') {
+                requirePlan(!newListeners.length && !dialers.some(step => step.nodeId === id) && equal(adjusted, target), 'portal_restart_layout');
+            }
+            (entry.role === 'relay' ? preparation : portals).push({ nodeId: id, before: current, after: adjusted, tags });
+            inbounds.splice(0, current.inbounds.length, ...adjusted.inbounds);
+        }
+        requirePlan(sameHandlers(inbounds, nextInbounds, newListeners, false), 'existing_inbounds_changed');
         requirePlan(sameHandlers(outbounds, nextOutbounds, dialers.filter(step => step.nodeId === id)), 'existing_outbounds_changed');
         const { rules: oldRules, ...oldRouter } = original;
         const { rules: finalRules, ...newRouter } = policy;
         requirePlan(equal(oldRouter, newRouter), 'routing_strategy');
         const incoming = new Map(channels.filter(ch => ch.target === id).map(ch => [ingressTag(ch), hint(ch.id)]));
-        const portals = portalSelectors.get(id);
+        const selectors = portalSelectors.get(id);
         const transitRules = new Set(), portalRules = new Set(), ruleTags = new Set();
         for (const rule of finalRules) {
             const tag = rule.ruleTag;
             requirePlan(!tag || !ruleTags.has(tag), 'rule_collision');
             if (tag) ruleTags.add(tag);
             const transitSuffix = rule.inboundTag?.length === 1 && incoming.get(rule.inboundTag[0]);
-            const portalSuffix = rule.inboundTag?.length === 1 && portals?.get(rule.inboundTag[0]);
+            const portalSuffix = rule.inboundTag?.length === 1 && selectors?.get(rule.inboundTag[0]);
             if (typeof tag === 'string' && tag.startsWith('rebuild-policy-transit-')) {
                 requirePlan(transitSuffix && tag.startsWith(`rebuild-policy-transit-${transitSuffix}-`), 'transit_policy');
                 transitRules.add(rule);
@@ -137,7 +160,7 @@ function planAdditiveScopedTransition({ before, after, composition }) {
                 requirePlan(!rule.inboundTag?.some(v => incoming.has(v)), 'overlapping_transit');
             }
         }
-        for (const [kind, entries, rules] of [['transit', incoming, transitRules], ['portal', portals ?? [], portalRules]]) {
+        for (const [kind, entries, rules] of [['transit', incoming, transitRules], ['portal', selectors ?? [], portalRules]]) {
             for (const [tag, suffix] of entries) find([...rules], row => row.inboundTag[0] === tag
                 && row.ruleTag === `rebuild-policy-${kind}-${suffix}-default`, `${kind}_default`);
         }
@@ -162,7 +185,7 @@ function planAdditiveScopedTransition({ before, after, composition }) {
         if (portalRules.size) ingress.push({ nodeId: id, before: staged, after: policy });
     }
     requirePlan(equal(final, composed), 'desired_image_mismatch');
-    return structuredClone({ listeners, dialers, transit, ingress });
+    return structuredClone({ listeners, dialers, transit, ingress, preparation, portals });
 }
 
 module.exports = { planAdditiveScopedTransition };

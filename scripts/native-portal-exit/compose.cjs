@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
-const { isDeepStrictEqual: equal } = require('node:util');
+
 const { composeRebuildProfiles, ingressTag, egressTag } = require('/source/src/modules/relay-l2tp/services/rebuildTopologyComposer');
 
 const a = JSON.parse(fs.readFileSync(0, 'utf8'));
@@ -96,23 +96,8 @@ if (a.proof || a.matrix) {
     if (a.stage) {
         const { planAdditiveScopedTransition } = require('/source/src/services/rebuildTransitActivationPlan');
         const before = composeRebuildProfiles({ ...input, links: links.map(({ rebuildExit, ...row }) => row) });
-        // For this fixture only, start with the desired sniffing mode already
-        // provisioned. The additive plan still refuses a live handler change.
-        const prequalifiedSniffing = [];
-        for (const { nodeId, profile, config } of before) {
-            const next = profiles.find(p => p.nodeId === nodeId && p.profile === profile).config;
-            for (const row of config.inbounds) {
-                const desired = next.inbounds.find(i => i.tag === row.tag);
-                const from = row.sniffing?.routeOnly, to = desired?.sniffing?.routeOnly;
-                if (typeof from !== 'boolean' || typeof to !== 'boolean' || from === to) continue;
-                const changed = { ...row, sniffing: { ...row.sniffing, routeOnly: to } };
-                if (!equal(changed, desired)) throw new Error('fixture cannot prequalify the existing listener');
-                row.sniffing.routeOnly = to;
-                prequalifiedSniffing.push({ name: names[nodeId], profile, tag: row.tag });
-            }
-        }
-        const plan = planAdditiveScopedTransition({ before, after: profiles, composition: input });
-        transition = { prequalifiedSniffing, before: before.filter(p => p.profile === 'main' && ['gateway', 'tail'].includes(names[p.nodeId]))
+        const plan = planAdditiveScopedTransition({ before, after: profiles, composition: input, allowMainRestart: true });
+        transition = { before: before.filter(p => p.profile === 'main' && ['gateway', 'tail'].includes(names[p.nodeId]))
             .map(p => ({ ...p, name: names[p.nodeId] })),
         plan: Object.fromEntries(Object.entries(plan).map(([phase, steps]) => [phase,
             steps.map(step => ({ ...step, owner: names[step.nodeId] }))])) };

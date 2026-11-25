@@ -56,6 +56,21 @@ test('refuses nonadditive changes on every node, including existing portal liste
     assert.throws(() => planAdditiveScopedTransition(g), refused('bridge_changed'));
 });
 
+test('requires opt-in for a portal sniffing restart and leaves its old routes intact', () => {
+    const f = fixture();
+    const prev = config(f.before, 2), next = config(f.after, 2);
+    prev.inbounds.find(i => i.tag === 'vless-in').sniffing.routeOnly =
+        !next.inbounds.find(i => i.tag === 'vless-in').sniffing.routeOnly;
+    assert.throws(() => planAdditiveScopedTransition(f), refused('existing_inbounds_changed'));
+    const plan = planAdditiveScopedTransition({ ...f, allowMainRestart: true });
+    assert.deepEqual(plan.preparation, []);
+    assert.deepEqual(plan.portals, [{ nodeId: id(2), before: prev, after: next, tags: ['vless-in'] }]);
+    assert.deepEqual(plan.portals[0].before.routing, plan.portals[0].after.routing);
+
+    prev.inbounds.find(i => i.tag === 'vless-in').port++;
+    assert.throws(() => planAdditiveScopedTransition({ ...f, allowMainRestart: true }), refused('existing_inbounds_changed'));
+});
+
 test('refuses a preceding unscoped route, an altered old route, and an incomplete ingress policy', () => {
     const f = fixture();
     const broad = { type: 'field', network: 'tcp', outboundTag: 'block' };
