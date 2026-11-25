@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import file_digest
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -25,7 +26,7 @@ XRAY = '/tools/xray'
 BRIDGE_XRAY = '/tools/bridge-xray'
 BRIDGES = ('A', 'B')
 COMPOSER_INPUTS = ('services/rebuildTopologyComposer.js', 'domain/rebuildTopologyCompiler.js',
-                   'domain/rebuildPortalExit.js')
+                   'domain/rebuildPortalExit.js', 'services/rebuildTransitChannels.js')
 
 
 def require(condition, message):
@@ -281,9 +282,124 @@ def probe(case, ports, origins, links, chain=False):
     return {'case': case.name, 'expected': case.want, 'actual': None, 'attempts': attempts}
 
 
-def run(parent_net, mode, preferred, evidence, chain=False):
+def scoped_proofs(proofs, cert, cover_port, evidence):
+    require(len(proofs) == 2 and len({p['listenerPort'] for p in proofs}) == 2,
+            'expected two independently allocated channels on one physical link')
+    require(len({p['channel']['physicalId'] for p in proofs}) == 1, 'scoped proofs do not share a physical link')
+    answers = {}
+    receipt_lock = threading.Lock()
+    reaped = evidence['reaped'] = {}
+    results = evidence['scoped_proofs'] = []
+    with ExitStack() as stack:
+        def handler(channel, key):
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    path = self.path
+                    if not path.startswith('/proof-') or len(path) != 39:
+                        self.send_error(404)
+                        return
+                    with receipt_lock:
+                        answers.setdefault(path, []).append(channel)
+                    result = hmac.digest(key, (channel + path).encode('ascii'), 'sha256').hex().encode('ascii')
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(result)))
+                    self.end_headers()
+                    self.wfile.write(result)
+
+                def log_message(self, format, *args):
+                    pass
+            return Handler
+
+        cover = start(stack, 'cover', ['/tools/cover', str(cover_port), cert, '/work/cover.key'], reaped)
+        children = {'cover': cover}
+        wait_until('cover listener', children, lambda: sockets(cover_port, cover), 4)
+        keys = {}
+        for proof in proofs:
+            channel = proof['channel']['id']
+            keys[channel] = secrets.token_bytes(32)
+            server = ThreadingHTTPServer((LO, proof['responderPort']), handler(channel, keys[channel]))
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
+            thread.start()
+
+            def stop(responder=server, runner=thread):
+                responder.shutdown()
+                responder.server_close()
+                runner.join(timeout=2)
+                require(not runner.is_alive(), 'proof responder failed to stop')
+
+            stack.callback(stop)
+            for side in ('request', 'response'):
+                label = f'{channel}-{side}'
+                cfg = {**proof[side], 'log': {'access': f'/work/{label}.access.log', 'loglevel': 'info'}}
+                dump(f'{label}.json', cfg)
+                result = cmd([XRAY, 'run', '-test', '-c', f'{label}.json'])
+                Path(f'{label}.test.log').write_text(result.stdout + result.stderr)
+                require(result.returncode == 0, f'{label}: xray test failed; see private log')
+                children[label] = start(stack, label, [XRAY, 'run', '-c', f'{label}.json'], reaped)
+
+        for proof in proofs:
+            channel, mode = proof['channel']['id'], proof['channel']['mode']
+            request = children[f'{channel}-request']
+            listener = request if mode == 'reverse' else children[f'{channel}-response']
+            wait_until('PID-owned exact proof ports', children, lambda: sockets(proof['requestPort'], request)
+                       and sockets(proof['listenerPort'], listener), 6)
+            if mode == 'reverse':
+                wait_until('reverse control and authenticated TCP session', children,
+                           lambda: sockets(proof['listenerPort'], listener, established=True)
+                           and 'received request for tcp:v1.rvs.cool:0' in Path(f'{channel}-request.run.log').read_text(), 18)
+
+        def perform(proof, expected):
+            channel, mode = proof['channel']['id'], proof['channel']['mode']
+            request = children[f'{channel}-request']
+            require(request.poll() is None and sockets(proof['requestPort'], request), 'no live requester before proof')
+            path = '/proof-' + secrets.token_hex(16)
+            logs = [Path(f'{channel}-{side}.access.log') for side in ('request', 'response')]
+            offsets = [log.stat().st_size if log.exists() else 0 for log in logs]
+            response = cmd(['curl', '-q', '--noproxy', '*', '--silent', '--show-error', '--fail',
+                            '--max-time', '3', f'http://{LO}:{proof["requestPort"]}{path}'])
+            with receipt_lock:
+                got = answers.get(path)
+            if expected:
+                want = hmac.digest(keys[channel], (channel + path).encode('ascii'), 'sha256').hex()
+                require(response.returncode == 0 and hmac.compare_digest(response.stdout, want) and got == [channel],
+                        f'{mode}: end-to-end proof missing; see private logs')
+                suffix = channel[-8:]
+                inbound = ('rebuild-rp-ingress-' if mode == 'reverse' else 'fwd-hop-') + suffix
+                outbound = ('rebuild-rp-egress-' if mode == 'reverse' else 'fwd-') + suffix
+                tags = [('rebuild-proof-request', outbound), (inbound, 'rebuild-proof-response')]
+                for log, offset, ends in zip(logs, offsets, tags, strict=True):
+                    with log.open('rb') as stream:
+                        stream.seek(offset)
+                        access = stream.read().decode().splitlines()
+                    require(any(f'accepted tcp:{LO}:{proof["responderPort"]} ' in row
+                                and row.endswith(f'[{ends[0]} -> {ends[1]}]') for row in access),
+                            f'{mode}: expected proof tags not used in {log.name}')
+            else:
+                require(response.returncode in (28, 52, 56) and got is None, f'{mode}: expected failure through the live requester')
+            require(request.poll() is None and sockets(proof['requestPort'], request), 'requester failed during proof')
+            results.append({'mode': mode, 'id': channel, 'expected': 'marker' if expected else 'closed', 'verified': True})
+
+        for proof in proofs:
+            perform(proof, True)
+        # Cut only the response-side process, keeping both local requesters
+        # and both responders alive: the other policy must not carry its probe.
+        dead = children.pop(f'{proofs[0]["channel"]["id"]}-response')
+        dead.terminate()
+        require(dead.wait(timeout=3) in (0, -signal.SIGTERM), 'failed to terminate response process')
+        perform(proofs[0], False)
+        perform(proofs[1], True)
+    require(len(reaped) == 5 and all(not result['forced_kill'] and result['status'] in (0, -signal.SIGTERM)
+            and (label == f'{proofs[0]["channel"]["id"]}-response' or result['early_exit'] is None)
+            for label, result in reaped.items()), 'proof child cleanup incomplete')
+    require(not checked(['ss', '-Hltun']).strip(), 'proof left listeners behind')
+
+
+
+def run(parent_net, mode, preferred, evidence, chain=False, proof=False):
     evidence['netns'] = namespace(parent_net)
     evidence['source_sha256'] = source_digests()
+    if proof:
+        evidence['proof_source_sha256'] = digest('/scripts/transit-proof.cjs')
     evidence['actors_sha256'] = {bin: digest(bin) for bin in (XRAY, BRIDGE_XRAY, '/tools/cover')}
     vx, vb = version(XRAY), version(BRIDGE_XRAY)
     print(f'CORE: {vx} | bridges: {vb}')
@@ -294,17 +410,26 @@ def run(parent_net, mode, preferred, evidence, chain=False):
     n_links = 9 if chain else 7 if preferred else 6
     ports = ports_for(['cover', *clients, *relays, *(f'api-{n}' for n in server_labels),
                        *(f'link-{i}' for i in range(n_links)), *(f'socks-{n}' for n in clients),
-                       *(f'sink-{n}' for n in BRIDGES)])
+                       *(f'sink-{n}' for n in BRIDGES),
+                       *((f'proof-{side}-{i}' for side in ('request', 'origin') for i in range(2)) if proof else ())])
     evidence['ports'] = ports
     cert, key = '/work/cover.crt', '/work/cover.key'
     checked(['openssl', 'req', '-config', '/dev/null', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', f'/CN={SNI}',
              '-addext', f'subjectAltName=DNS:{SNI}', '-out', cert, '-keyout', key])
-    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred, chain=chain,
+    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred, chain=chain, proof=proof,
                    reality=reality_keys(n_links, ports['cover']))
     raw = checked(['node', '/scripts/compose.cjs'], input=json.dumps(fixture))
     Path('composer-output.json').write_text(raw + '\n')
     generated = json.loads(raw)
     evidence['links'] = generated['links']
+    if proof:
+        scoped_proofs(generated['proofs'], cert, ports['cover'], evidence)
+        require(evidence['source_sha256'] == source_digests()
+                and evidence['proof_source_sha256'] == digest('/scripts/transit-proof.cjs'),
+                'proof profile sources changed during the run')
+        print('PASS 4/4 scoped wire probe receipts (separate fixture processes, not MAIN activation)')
+        evidence['result'] = 'PASS'
+        return 0
     configs, run_configs = {}, {}
     for item in generated['profiles']:
         label, profile = item['name'], item['profile']
@@ -396,10 +521,11 @@ if __name__ == '__main__':
     os.umask(0o077)
     signal.signal(signal.SIGTERM, stop)
     parent_net, mode, preferred, source, chain = sys.argv[1:]
-    evidence = {'source_root': source, 'mode': mode, 'preferred': preferred == 'yes', 'chain_probe': chain == 'yes'}
+    evidence = {'source_root': source, 'mode': mode, 'preferred': preferred == 'yes', 'chain_probe': chain == 'yes',
+                'scoped_proof': chain == 'proof'}
     status = 2
     try:
-        status = run(parent_net, mode, preferred == 'yes', evidence, chain == 'yes')
+        status = run(parent_net, mode, preferred == 'yes', evidence, chain in ('yes', 'proof'), chain == 'proof')
     except (Exception, KeyboardInterrupt) as exc:
         evidence.update(result='INFRA_ERROR', error=str(exc))
         print(f'ERROR: {exc}', file=sys.stderr)

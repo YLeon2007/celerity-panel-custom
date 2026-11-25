@@ -2,6 +2,7 @@
 const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const { composeRebuildProfiles, ingressTag, egressTag } = require('/source/src/modules/relay-l2tp/services/rebuildTopologyComposer');
+
 const a = JSON.parse(fs.readFileSync(0, 'utf8'));
 
 const ids = Object.fromEntries(['p1', 'p2', 'p3', 'gateway', 'A', 'B', ...(a.chain ? ['tail'] : [])]
@@ -34,11 +35,11 @@ const links = [
     link(4, a.chain ? 'tail' : 'gateway', 'A', 50, 'reverse', { enabled: true, domains: ['full:fixture.invalid'] }),
     link(5, 'p3', a.chain ? 'tail' : 'gateway', 100),
     ...(a.preferred ? [link(6, a.chain ? 'tail' : 'gateway', 'B', 30, 'reverse', { enabled: true, domains: ['full:other.invalid'] })] : []),
-    ...(a.chain ? [link(7, 'gateway', 'tail', 100), link(8, 'gateway', 'tail', 200, other)] : []),
+    ...(a.chain ? [link(7, 'gateway', 'tail', 100, a.proof ? other : 'reverse'), link(8, 'gateway', 'tail', 200, other)] : []),
 ];
 // Both pick B, even when the preferred (geo) channel is removed. Only P1
 // keeps the relay's geo rules. P3 retains the original shared policy.
-if (!a.chain) {
+if (!a.chain || a.proof) {
     links[0].rebuildExit = { nodeId: ids.B, relayGeo: true };
     links[1].rebuildExit = { nodeId: ids.B, relayGeo: false };
 }
@@ -50,7 +51,7 @@ const profiles = composeRebuildProfiles({ nodes, links,
     usersByNode: Object.fromEntries(Object.entries(users).map(([name, user]) => [ids[name], [user]])),
     dialerVersions: new Map(nodes.map(n => [n._id, n.cascadeRole === 'bridge' ? a.bridgeVersion : a.version])),
 });
-if (a.chain) {
+if (a.chain && !a.proof) {
     // Transport experiment only: use real generated tunnel pairs but inject
     // policy selection by hand until the compiler can produce it itself.
     const cfg = name => profiles.find(p => p.nodeId === ids[name] && p.profile === 'main').config;
@@ -65,5 +66,17 @@ if (a.chain) {
     prepend('tail', [rule(7, 4, { domain: ['full:fixture.invalid'] }), rule(7, 6), rule(8, 2)]);
 }
 const names = Object.fromEntries(Object.entries(ids).map(([k, v]) => [v, k]));
+let proofs;
+if (a.proof) {
+    const { compileRebuildGraph } = require('/source/src/modules/relay-l2tp/domain/rebuildTopologyCompiler');
+    const { buildTransitChannels } = require('/source/src/modules/relay-l2tp/services/rebuildTransitChannels');
+    const { transitProofProfiles } = require('./transit-proof.cjs');
+    proofs = buildTransitChannels(compileRebuildGraph({ nodes, links })).artifacts.map((channel, i) => {
+        if (channel.mode !== other) throw new Error('unexpected scoped proof transport');
+        const requestPort = a.ports[`proof-request-${i}`], responderPort = a.ports[`proof-origin-${i}`];
+        return { channel: { id: channel.id, mode: channel.mode, physicalId: channel.physicalId }, requestPort, responderPort,
+            ...transitProofProfiles({ channel, profiles, requestPort, responderPort }) };
+    });
+}
 process.stdout.write(JSON.stringify({ profiles: profiles.map(p => ({ ...p, name: names[p.nodeId] })),
-    users, links: descriptions }));
+    users, links: descriptions, ...(a.proof && { proofs }) }));
