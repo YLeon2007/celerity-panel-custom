@@ -35,6 +35,7 @@ const {
     hasExecStdin,
     writeExecStdin,
 } = require('./sshExecStdin');
+const { heldOptions, openHeldExec } = require('./sshHeldExec');
 
 // Hard cap to keep CPU usage bounded on weak hardware (1 vCPU).
 // Each SSH handshake involves DH key-exchange which is CPU-heavy on Node.js.
@@ -70,6 +71,7 @@ class NodeSSH {
     #pendingDirect = null;
     #oneShotExec = null;
     #pendingStdin = new Set();
+    #pendingHeld = null;
 
     constructor(node, options) {
         this.#hostKeyOptions = sshPool.hostKeyOptions(node, options);
@@ -180,6 +182,25 @@ class NodeSSH {
                 }
             };
             const exec = (command, options, verify) => this.#exec(command, options, verify, assertConnection);
+            if (requirePin) {
+                let heldUsed = false;
+                Object.defineProperty(exec, 'openHeld', {
+                    value: async (command, options) => {
+                        const limits = heldOptions(command, options);
+                        assertConnection();
+                        if (!socket || heldUsed) throw new Error('SSH held exec requires an unused pinned socket');
+                        heldUsed = true;
+                        const controller = this.#pendingHeld = new AbortController();
+                        return openHeldExec(command, limits, {
+                            client, socket, assertConnection, signal: controller.signal,
+                            onTerminal: failure => {
+                                if (this.#pendingHeld === controller) this.#pendingHeld = null;
+                                if (failure) revoke();
+                            },
+                        });
+                    },
+                });
+            }
             client.on('end', revoke).on('close', revoke).on('error', revoke);
             return this.#oneShotExec = exec;
         } catch (error) {
@@ -371,6 +392,7 @@ class NodeSSH {
         this.#pendingDirect?.abort();
         this.#oneShotExec = null;
         this.#verifiedDirectClient = null;
+        this.#pendingHeld?.abort();
         for (const revoke of this.#pendingStdin) revoke();
         if (this.directClient) {
             this.directClient.end();

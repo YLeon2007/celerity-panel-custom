@@ -166,6 +166,23 @@ class Host(unittest.TestCase):
                                     clock=lambda: mgr.now, sleep=mgr.sleep)
                 self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', wnd.quiesce)
 
+    def test_stop_rejects_failed_and_inactive_non_dead_even_with_clean_receipt(self):
+        for props in ({'ActiveState': 'failed', 'SubState': 'failed'}, {'SubState': 'exited'}):
+            with self.subTest(props=props):
+                root = self.root / props['SubState']
+                root.mkdir()
+                mgr = System(root)
+
+                def run(argv, timeout):
+                    result = mgr(argv, timeout)
+                    if argv[1] == 'stop':
+                        mgr.agent_props = props
+                    return result
+
+                wnd = m.AgentWindow(run, main=self.main, cgroup_root=root)
+                self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', wnd.quiesce)
+                self.assertEqual(wnd.phase, 'exclusion-lost')
+
     def test_agent_start_timeout_is_not_success_or_retried(self):
         self.guard.quiesce()
         self.manager.start_error = True
