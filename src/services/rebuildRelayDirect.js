@@ -5,6 +5,7 @@ const { createHash, randomBytes } = require('node:crypto');
 const { join } = require('node:path');
 const { isIPv4 } = require('node:net');
 const { performance } = require('node:perf_hooks');
+const { deflateSync } = require('node:zlib');
 const { identityChanged, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 const { captureRelayBinding } = require('./rebuildRelayAuthorization');
 const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
@@ -42,6 +43,7 @@ const runtimeIdentityFrame = result => result?.code === 70 && result.stdout === 
 const directRefusals = new Set(['IDENTITY', 'PREREQUISITE', 'BASELINE_CHANGED', 'PROFILE_USERS', 'NETWORK_CONFLICT',
     'CANDIDATE_INVALID', 'ROLLBACK_DRIFT', 'RUNTIME_UNPROVED', 'COMMAND_FAILED']);
 const refusalFrame = /^DIRECT_(NO_WRITE_)?([A-Z][A-Z0-9_]*)\n(?![\s\S])/;
+const rollbackDiagnostic = /^DIRECT_UNCERTAIN_ROLLBACK_(DRIFT|TIMEOUT|UNPROVED) (guard|files|reload|xray|verify|foreign)\n(?![\s\S])/;
 const exactKeys = (value, keys) => value && Object.keys(value).length === keys.length
     && keys.every(key => Object.hasOwn(value, key));
 // Python's helper uses compact json.dumps(..., ensure_ascii=True) and LF.
@@ -170,8 +172,9 @@ let directScript;
 // The SSH exec string (no PTY) and
 // POSIX single quotes preserve this ASCII alphabet verbatim. Exclude NUL,
 // CR/LF, EOF/DEL and both layers' quote/escape characters.
+const directExcluded = [10, 13, 26, 34, 39, 92, 127];
 const directAlphabet = Array.from({ length: 127 }, (_, i) => i + 1)
-    .filter(i => ![10, 13, 26, 34, 39, 92, 127].includes(i)).map(i => String.fromCharCode(i)).join('');
+    .filter(i => !directExcluded.includes(i)).map(i => String.fromCharCode(i)).join('');
 function encodeDirectBytes(bytes) {
     let packed = '';
     // 120**139 covers all 120-byte words; larger blocks reduce radix padding
@@ -197,25 +200,25 @@ function bundleDirectScript() {
     const compressed = readFileSync(join(__dirname, 'rebuildRelayDirectPayload.xz'));
     requireThat(manifest.sources.length === names.length && sha(compressed) === manifest.sha256, 'DIRECT_BUNDLE_INVALID');
     const offsets = [0];
+    const joined = createHash('sha256');
     names.forEach((name, i) => {
         const source = readFileSync(join(__dirname, name));
         const saved = manifest.sources[i];
         requireThat(saved.path === name && source.length === saved.size && sha(source) === saved.sha256, 'DIRECT_BUNDLE_INVALID');
+        joined.update(source);
         offsets.push(offsets.at(-1) + source.length);
     });
     const load = (key, index, name, filename) =>
         `${key}=_c3_load(${index},"${name}","${filename}")`;
-    return [
+    const bootstrap = [
         'import lzma,functools,hashlib,re,sys,types',
-        `_c3_digits={c:i for i,c in enumerate("${directAlphabet}")}`,
+        `_c3_digits={chr(c):i for i,c in enumerate(c for c in range(1,128) if c not in ${JSON.stringify(directExcluded)})}`,
         '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(120,"big")',
-        `_c3_payload="${encodeDirectBytes(compressed)}"`,
         `_c3_sources=lzma.decompress(b"".join(_c3_chunk(_c3_payload[i:i+139]) for i in range(0,len(_c3_payload),139))[:${compressed.length}],memlimit=16777216)`,
         String.raw`_c3_sources=re.sub(rb"\t+",lambda m:b"\n"+b"    "*len(m[0]),_c3_sources)`,
         `_c3_offsets=${JSON.stringify(offsets)}`,
-        `_c3_hashes=${JSON.stringify(manifest.sources.map(row => row.sha256))}`,
+        `hashlib.sha256(_c3_sources).hexdigest()=="${joined.digest('hex')}" or sys.exit(75)`,
         '_c3_bytes=lambda n:_c3_sources[_c3_offsets[n]:_c3_offsets[n+1]]',
-        'all(hashlib.sha256(_c3_bytes(i)).hexdigest()==h for i,h in enumerate(_c3_hashes)) or sys.exit(75)',
         '_c3_compile=lambda n,filename:compile(_c3_bytes(n),filename,"exec")',
         'def _c3_load(n,name,path):',
         ' m=types.ModuleType(name);m.__file__=path;sys.modules[name]=m',
@@ -226,6 +229,9 @@ function bundleDirectScript() {
         load('C3_REPLACEMENT', 3, 'c3_foreign_replacement', '/__c3_direct__/services/rebuildRelayReplacement.py'),
         'exec(_c3_compile(4,"<DIRECT host>"))',
     ].join('\n');
+    // Keep the static loader inside the same Linux shell argv budget as the payload.
+    const loader = deflateSync(bootstrap, { level: 9 }).toString('base64');
+    return `_c3_payload="${encodeDirectBytes(compressed)}"\nexec(__import__("zlib").decompress(__import__("base64").b64decode("${loader}")))`;
 }
 
 function directCommand(limits) {
@@ -372,6 +378,16 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         // A verified diagnostic on rc75 is informational only. Missing or
         // tainted frames take the very same unknown/poison path without a hint.
         if (packageWrite && result?.code === 75) throw withInstallCheck(unknown(), packageWriteCheck(result));
+        if (!closed && ['install', 'reconcile-install'].includes(action) && result?.code === 75 && result.stdout === '') {
+            const proof = rollbackDiagnostic.exec(result.stderr);
+            if (proof) {
+                const [, reason, stage] = proof;
+                try { require('../utils/logger').warn(JSON.stringify({ event: 'rebuild.l2tp.rollback.unconfirmed', action, reason, stage })); }
+                catch { /* Diagnostics cannot change the result of a write. */ }
+                const error = unknown();
+                throw action === 'install' ? withInstallCheck(error, 'HOST_ROLLBACK_UNPROVED') : error;
+            }
+        }
         if (recovery && result?.code !== 0) throw unknown();
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {

@@ -10,6 +10,7 @@ import re
 import runpy
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,7 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.policy = [False, False, False]  # nft, route, RPDB
         self.nft_rows = NETWORK_FIXTURE['nft_rows'](NETWORK, TOKEN)
         self.cut = None
+        self.user_drift = False
         self.rules = [dict(priority=n, src='all', table=t) for n, t in ((0, 255), (32766, 254), (32767, 253))]
         self.swan = b'# synthetic stock strongSwan defaults\n'
         self.put(h['SWAN_CONF'], self.swan, 0o644)
@@ -97,9 +99,14 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
                     elif self.effects[-1:] == [['restart', self.X]]:
                         self.reached('xray-restarted')
                     return result
+                if incoming.get('foreignJournal', {}).get('rollbackTail') and not previous.get('foreignJournal', {}).get('rollbackTail'):
+                    result = base_write(path, before, after, **kwargs)
+                    self.reached('rollback-reloaded')
+                    return result
             return base_write(path, before, after, **kwargs)
 
         h.update(install_progress=progress, write=write)
+        self.prepare_xray_observers()
         # A failure to cut must not be confused with reaching verified Install.
         h['installed_runtime'] = lambda *_: self.fail('Install passed the selected cut')
 
@@ -122,7 +129,9 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         return rows
 
     def xray_users(self, profile, info, rows, *_):
-        self.h['need'](self.running_main == self.h['raw'](profile), 'RUNTIME_UNPROVED')
+        def users(data):
+            return [i for i in json.loads(data)['inbounds'] if i.get('protocol') == 'vless']
+        self.h['need'](not self.user_drift and users(self.running_main) == users(self.h['raw'](profile)), 'PROFILE_USERS')
         return self.h['owned_sockets'](rows, info['MainPID'])
 
     def model_unit(self, name):
@@ -171,10 +180,14 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
                     self.assertEqual(stat.S_IMODE(self.path(self.xray_fragment).stat().st_mode), 0o644)
                     self.loaded_drop, self.loaded_net = (self.path(h[k]).read_bytes() if self.path(h[k]).exists() else b''
                                                          for k in ('DROP', 'NET'))
+                    if self.manifest.exists() and json.loads(self.manifest.read_bytes())['phase'] == 'rolling-back':
+                        self.reached('rollback-reload-unacknowledged')
                 elif (op, names) == ('restart', [self.X]):
                     gen = self.effects.count(['restart', self.X])
                     self.births[self.X] = [str(20 + gen), f'{20 + gen:032x}']
                     self.running_main = self.path(h['MAIN']).read_bytes()
+                    if self.manifest.exists() and json.loads(self.manifest.read_bytes())['phase'] == 'rolling-back':
+                        self.reached('rollback-xray-unacknowledged')
                 elif (op, names) == ('start', [self.NET]):
                     self.policy[:] = [True, True, True]
                     self.births[self.NET] = ['0', '3' * 32]
@@ -257,7 +270,7 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
             err.seek(0)
             return code, out.getvalue(), err.read()
 
-    def process_cut(self, frame, phase, effects, *, files=True, started=False):
+    def process_cut(self, frame, phase, effects, *, files=True, started=False, rollback=False):
         # A real SIGKILL: no exception handler, finally block or original helper
         # process survives. The evidence file transfers only the modeled external world;
         # it is not a recovery receipt or a quiescence override.
@@ -266,6 +279,8 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
             if pid == 0:
                 try:
                     def cut(mark):
+                        if rollback and mark == 'xray-restarted':
+                            raise self.h['Refusal']('INJECTED_FAULT')
                         if mark == phase:
                             with self.directory(self.h['SYSTEM']) as fd:
                                 with self.assertRaises(BlockingIOError):
@@ -298,8 +313,8 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.assertEqual(len(journal['done']), len(journal['edits']))
         self.assertTrue(self.fence.is_file())
         self.assertNotEqual(self.path(self.h['NAMES']['chap']).read_bytes(), CHAP)
-        self.assertEqual(self.path(self.h['SWAN_PROFILE']).exists(), files)
-        self.assertEqual(self.path(self.h['MAIN']).read_bytes() != self.original_main, files)
+        self.assertEqual(self.path(self.h['SWAN_PROFILE']).exists(), files and not rollback)
+        self.assertEqual(self.path(self.h['MAIN']).read_bytes() != self.original_main, files and not rollback)
         self.assertEqual(backup.get('swanStart'), [self.births[n][1] for n in self.h['SWAN_START_UNITS']] if started else None)
 
     def assert_restored(self, original):
@@ -330,8 +345,10 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
 
     def assert_recover_blocked(self):
         effects, snapshot = self.effects.copy(), self.exact_snapshot()
-        self.assertEqual(self.run_wire('reconcile-install', network=NETWORK, backupId=TOKEN,
-                                       nodeId=NODE, challenge=CHALLENGE), (75, '', ''))
+        code, out, err = self.run_wire('reconcile-install', network=NETWORK, backupId=TOKEN,
+                                       nodeId=NODE, challenge=CHALLENGE)
+        self.assertEqual((code, out), (75, ''))
+        self.assertTrue(not err or re.fullmatch(r'DIRECT_UNCERTAIN_ROLLBACK_(DRIFT|UNPROVED) (guard|verify|xray)\n', err), err)
         self.assertTrue(self.fence.is_file())
         self.assertEqual((self.effects, self.exact_snapshot()), (effects, snapshot))
 
@@ -354,6 +371,66 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         frame, original = self.plan()
         self.process_cut(frame, 'xray-restarted', [['daemon-reload'], ['restart', self.X]])
         self.recover(original)
+
+    def prepare_xray_observers(self):
+        self.h['xray_argv'] = lambda info, _path=None: info['MainPID']
+        self.h['reattest_process'] = lambda pid, _info: int(pid)
+
+    def test_resume_rolling_back_after_settled_reload(self):
+        self.prepare_xray_observers()
+        frame, original = self.plan()
+        effects = [['daemon-reload'], ['restart', self.X], ['daemon-reload']]
+        self.process_cut(frame, 'rollback-reloaded', effects, rollback=True)
+        self.assertEqual(json.loads(self.manifest.read_bytes())['phase'], 'rolling-back')
+        self.assertNotEqual(self.running_main, self.original_main)
+        self.jobs = f'11 {self.X} restart running\n'.encode()
+        self.assert_recover_blocked()
+        self.jobs = b''
+        birth = self.births[self.X]
+        self.births[self.X] = ['99', 'f' * 32]
+        self.assert_recover_blocked()
+        self.births[self.X] = birth
+        self.user_drift = True
+        self.assert_recover_blocked()
+        self.user_drift = False
+        self.recover(original)
+        self.assertEqual(self.effects, [*effects, ['restart', self.X]])
+
+    def test_rolling_back_with_replaced_unit_does_not_restart(self):
+        frame, _ = self.plan()
+        self.process_cut(frame, 'rollback-reloaded', [['daemon-reload'], ['restart', self.X], ['daemon-reload']], rollback=True)
+        self.path(self.xray_fragment).write_bytes(b'[Service]\nExecStop=/bin/false\n')
+        self.assert_recover_blocked()
+
+    def test_unacknowledged_rollback_restart_stays_fenced(self):
+        self.prepare_xray_observers()
+        frame, _ = self.plan()
+        self.process_cut(frame, 'rollback-xray-unacknowledged',
+                         [['daemon-reload'], ['restart', self.X], ['daemon-reload'], ['restart', self.X]], rollback=True)
+        self.assertEqual(json.loads(self.manifest.read_bytes())['phase'], 'rolling-back')
+        self.assertEqual(self.running_main, self.original_main)
+        self.assert_recover_blocked()
+
+    def test_unacknowledged_rollback_reload_stays_fenced(self):
+        frame, _ = self.plan()
+        self.process_cut(frame, 'rollback-reload-unacknowledged',
+                         [['daemon-reload'], ['restart', self.X], ['daemon-reload']], rollback=True)
+        self.assertEqual(json.loads(self.manifest.read_bytes())['phase'], 'rolling-back')
+        self.assert_recover_blocked()
+
+    def test_inline_rollback_timeout_has_stage_but_does_not_ack_rollback(self):
+        self.prepare_xray_observers()
+        frame, _ = self.plan()
+        def cut(mark):
+            if mark == 'xray-restarted':
+                raise self.h['Refusal']('INJECTED_FAULT')
+            if mark == 'rollback-xray-unacknowledged':
+                raise subprocess.TimeoutExpired([], 0)
+        self.cut = cut
+        code, out, err = self.run_wire('install', **frame, progress=True)
+        self.assertEqual((code, out, err.splitlines()[-1]), (75, '', 'DIRECT_UNCERTAIN_ROLLBACK_TIMEOUT xray'))
+        self.assertEqual(json.loads(self.manifest.read_bytes())['phase'], 'rolling-back')
+        self.assertTrue(self.fence.exists())
 
     def test_recover_after_xl_start_and_durable_swan_start_record(self):
         frame, original = self.plan()
@@ -404,7 +481,7 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         assert unit is not None
         self.put(self.xray_fragment, unit[1], 0o666)
         # This fixture models the service's procfs evidence, not its filesystem edit.
-        self.h['xray_argv'] = lambda info, _path: info['MainPID']
+        self.h['xray_argv'] = lambda info, _path=None: info['MainPID']
         self.h['reattest_process'] = lambda pid, _info: int(pid)
         frame, original = self.plan(with_xray=True)
         self.process_cut(frame, 'xray-restarted', [['daemon-reload'], ['daemon-reload'], ['restart', self.X]])

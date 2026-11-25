@@ -93,7 +93,7 @@ const preflightModuleChecks = new Set(['PPP_MODULES_REQUIRED', 'PPP_MODULES_PERS
     'KERNEL_MODULE_BLACKLISTED', 'NETWORK_OBSERVATION_REQUIRED']);
 const checks = new Set([...freshConflicts].filter(check => check !== foreignChanged).concat([...packageChecks, ...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
     ...profileChecks.values(), 'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED', 'FOREIGN_CONFIG_RESTORED', 'CLEANUP_CONSENT_REQUIRED',
-    'CLEANUP_CONSENT_UNAVAILABLE', 'CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED']));
+    'CLEANUP_CONSENT_UNAVAILABLE', 'CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED', 'HOST_ROLLBACK_UNPROVED']));
 // The view uses the same localized map for the headline and list items.
 // List item IDs are not valid top-level checks.
 const installCheckIds = Object.freeze([...checks, ...foreignKeys]);

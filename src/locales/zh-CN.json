@@ -283,6 +283,7 @@
       "CLEANUP_CONSENT_UNAVAILABLE": "无法保存清理确认。未修改任何文件。",
       "CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED": "安装需要修正 Xray 单元的权限。未修改任何文件。",
       "FOREIGN_CONFIG_RESTORED": "已恢复原有的本地配置和文件权限。",
+      "HOST_ROLLBACK_UNPROVED": "中继未能确认回滚。请在面板日志中查看回滚阶段，然后点击检查并继续。",
       "L2TP_FOREIGN_CONFIG": "安装检测到本地 VPN 配置或已知 Xray 服务单元的权限不安全。请让中继管理员检查报告的项目。安装不会替换或清理这些项目。",
       "SWAN_PROFILE_PRESENT": "strongSwan 配置文件 /etc/strongswan.d/celerity-rebuild-l2tp.conf 已存在。",
       "IKE_PROFILE_PRESENT": "IKE 配置文件 /etc/ipsec.d/celerity-rebuild-l2tp.conf 已存在。",

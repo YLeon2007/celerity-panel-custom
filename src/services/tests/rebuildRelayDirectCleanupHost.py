@@ -171,7 +171,7 @@ class Cleanup(ForeignConfigFixture):
                 self.xfrm = b'unexpected association'
             return result
         self.h['write'] = fault
-        self.assertEqual(self.run_host('install', **frame), (75, '', ''))
+        self.assertEqual(self.run_host('install', **frame), (75, '', 'DIRECT_UNCERTAIN_ROLLBACK_UNPROVED foreign\n'))
         self.assertEqual(self.path(self.h['NAMES']['chap']).read_bytes(), CHAP)
         self.assertFalse(self.stock_entered)
         self.xfrm = b''
@@ -533,7 +533,7 @@ class Cleanup(ForeignConfigFixture):
             frame, result = self.file_failure()
         self.assertTrue(faulted)
         self.assertFalse(fence.exists())
-        self.assertEqual(result, (75, '', ''))
+        self.assertEqual(result, (75, '', 'DIRECT_UNCERTAIN_ROLLBACK_UNPROVED foreign\n'))
         args = {key: frame[key] for key in ('backupId', 'baseline', 'network')}
         self.assertEqual(self.run_host('rollback', **args), (0, '{"ok":true,"backupId":"' + TOKEN + '"}\n', ''))
         self.assertEqual(self.path(self.h['NAMES']['chap']).read_bytes(), CHAP)

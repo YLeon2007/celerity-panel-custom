@@ -348,6 +348,8 @@ test('closed diagnostics reach the authenticated API and the localized install c
                 if (scenario === 'install-prerequisite') return refusal('DIRECT_NO_WRITE_PREREQUISITE\n');
                 if (scenario === 'no-write' || scenario === 'lost-no-write-restore') return refusal('DIRECT_NO_WRITE_PPP_MODULES_LOAD_FAILED\n');
                 if (scenario === 'write' || scenario === 'lost-rollback') return refusal('DIRECT_XRAY_CONFIG_WRITABLE\n');
+                if (scenario === 'rollback-diagnostic' || scenario === 'rollback-tainted') return { code: 75, stdout: '',
+                    stderr: `DIRECT_UNCERTAIN_ROLLBACK_DRIFT verify\n${scenario === 'rollback-tainted' ? marker : ''}` };
                 if (scenario === 'unknown-frame') return refusal('DIRECT_NO_WRITE_REBUILD_FIXTURE_PRIVATE_VALUE\n');
                 if (scenario === 'bad-verify' || scenario === 'installed-cleanup') return ok({ ok: true, backupId });
                 return refusal('DIRECT_PPP_MODULES_LOAD_FAILED\n');
@@ -415,6 +417,8 @@ test('closed diagnostics reach the authenticated API and the localized install c
         ['write', 'REBUILD_L2TP_INSTALL_FAILED', 'rolled_back', 'XRAY_CONFIG_WRITABLE', 'installRolledBack', [...apply, 'rollback', 'restore']],
         ['lost-rollback', 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN', 'unknown', 'XRAY_CONFIG_WRITABLE', 'uncertain', [...apply, 'rollback']],
         ['unknown-frame', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'unknown', undefined, 'uncertain', apply],
+        ['rollback-diagnostic', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'unknown', 'HOST_ROLLBACK_UNPROVED', 'uncertain', apply],
+        ['rollback-tainted', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'unknown', undefined, 'uncertain', apply],
         ['bad-verify', 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', 'unknown', undefined, 'uncertain', [...apply, 'verify']],
         ['installed-cleanup', 'REBUILD_L2TP_INSTALLED_CLEANUP_FAILED', 'installed', undefined, 'installCleanupFailed', [...apply, 'verify', 'finish']],
         ['payload', 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', 'unknown', undefined, 'uncertain', apply.slice(0, 3)],

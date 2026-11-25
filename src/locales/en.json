@@ -2455,6 +2455,7 @@
       "CLEANUP_CONSENT_UNAVAILABLE": "Could not store cleanup confirmation. No files were changed.",
       "CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED": "This installation requires correcting the Xray unit permissions. No files were changed.",
       "FOREIGN_CONFIG_RESTORED": "The previous local configuration and file permissions were restored.",
+      "HOST_ROLLBACK_UNPROVED": "The relay could not confirm rollback. Check the panel log for the rollback stage and use Check and continue.",
       "L2TP_FOREIGN_CONFIG": "Install found local VPN configuration or unsafe permissions on a known Xray unit. Ask the relay administrator to review the reported items. Install will not replace or clean them up.",
       "SWAN_PROFILE_PRESENT": "A strongSwan profile already exists at /etc/strongswan.d/celerity-rebuild-l2tp.conf.",
       "IKE_PROFILE_PRESENT": "An IKE profile already exists at /etc/ipsec.d/celerity-rebuild-l2tp.conf.",

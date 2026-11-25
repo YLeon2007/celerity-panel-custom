@@ -46,7 +46,7 @@ def main():
     assert 120**139 >= 256**120
     encoded_size = (len(packed) + 119) // 120 * 139
     decoded = re.sub(rb'\t+', lambda m: b'\n' + b'    ' * len(m[0]), lzma.decompress(packed, memlimit=16777216))
-    if decoded != source or encoded_size + 1900 >= 131072:
+    if decoded != source or encoded_size + 1150 >= 131072:
         raise SystemExit('DIRECT source mismatch or shell argument too large')
     body = json.dumps(manifest, indent=2) + '\n'
     if args.check:

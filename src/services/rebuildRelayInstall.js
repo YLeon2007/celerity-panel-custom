@@ -201,7 +201,7 @@ async function runFreshRelayInstall(id, deps) {
                     if (error?.commandSettled === true) await rollback(conflict ? conflictCode(conflict) : 'REBUILD_L2TP_INSTALL_FAILED', {
                         noHostChanges: error.noHostChanges === true, check, conflict,
                     });
-                    throw fail(UNKNOWN);
+                    throw withInstallCheck(fail(UNKNOWN), check === 'HOST_ROLLBACK_UNPROVED' ? check : undefined);
                 }
                 if (installResult === false) await rollback('REBUILD_L2TP_INSTALL_FAILED');
                 let verified;

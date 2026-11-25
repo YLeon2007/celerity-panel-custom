@@ -2982,7 +2982,9 @@ def verify_retained_cleanup_edits(backup):
 
 
 def cleanup_rollback(request, path, record, backup, fd, *, file_undo=None, file_net=False):
-    global CLEANUP_ENTERED
+    global CLEANUP_ENTERED, ROLLBACK_STEP
+    if backup['phase'] != 'rolled-back':
+        ROLLBACK_STEP = 'guard'
     before = backup['before']
     need(install_lock_identity(fd) == before['installLock'] and backup['machineId'] == request['machineId']
          and backup['backupId'] == request['backupId'] and encode(backup['network']) == encode(request['network'])
@@ -3017,17 +3019,22 @@ def cleanup_rollback(request, path, record, backup, fd, *, file_undo=None, file_
         # publish a distinct phase before attempting to restore foreign bytes.
         settled = journal.get('installSettled')
         need(settled is True or 'installSettled' not in journal and backup.get('swanStart'), 'IN_FLIGHT')
-        if settled is True and backup['phase'] == 'applying':
-            for n in (X, B):
-                expected = journal.get('xrayBirths', {}).get(n, before['units'][n]['InvocationID'])
-                need(unit(n).get('InvocationID') == expected, 'IN_FLIGHT')
-        verify_retained_cleanup_edits(backup)
-        if journal['xray'] is not None:
-            need(cleanup_xray_identity() == journal.get('installXray', journal['xray']), 'IN_FLIGHT')
-        rollback(request, path, record, backup, cleanup=True)
-        record = entry(encode(backup))
+        if backup['phase'] == 'rolling-back':
+            record = resume_rollback_tail(request, path, record, backup)
+        else:
+            if settled is True and backup['phase'] == 'applying':
+                for n in (X, B):
+                    expected = journal.get('xrayBirths', {}).get(n, before['units'][n]['InvocationID'])
+                    need(unit(n).get('InvocationID') == expected, 'IN_FLIGHT')
+            verify_retained_cleanup_edits(backup)
+            if journal['xray'] is not None:
+                need(cleanup_xray_identity() == journal.get('installXray', journal['xray']), 'IN_FLIGHT')
+            rollback(request, path, record, backup, cleanup=True)
+            record = entry(encode(backup))
+    ROLLBACK_STEP = 'verify'
     if not pristine_phase and file_undo is None:
         verify_rollback(request['network'], request['backupId'], backup)
+    ROLLBACK_STEP = 'foreign'
     record = cleanup_transition(path, record, backup, fd, restore=True, preinstall=pristine_phase)
     # The foreign transition already restored the idle manager view before
     # returning any Xray fragment to 0666. No further reload is permitted.
@@ -3572,8 +3579,64 @@ def load_after(backup, require_all=False):
     return current
 
 
+def rollback_xray_pin(info):
+    pid = xray_argv(info)
+    fragment = read(info['FragmentPath'], 262144)
+    need(info['NeedDaemonReload'] == 'no' and fragment is not None, 'ROLLBACK_DRIFT')
+    return digest(encode([info, fragment, remove_generation(info['FragmentPath']), reattest_process(pid, info)]))
+
+
+def resume_rollback_tail(request, path, record, backup):
+    global ROLLBACK_STEP
+    journal = backup['foreignJournal']
+    tail = journal.get('rollbackTail')
+    before = backup['before']
+    need(journal.get('installSettled') is True and 'swanStart' not in backup and not before.get('ikeSockets')
+         and 'bridge' not in backup['after'] and read(path, 2 * MAX_FILE) == record
+         and 'modulePersistence' not in backup and type(tail) is dict
+         and set(tail) == {'pin', 'sockets'} and type(tail['pin']) is str, 'IN_FLIGHT')
+    sync_rollback_receipt(path, record)
+    module_boot_owner(backup, unwritten=True)
+    verify_retained_cleanup_edits(backup)
+    d, token = request['network'], request['backupId']
+    ROLLBACK_STEP = 'verify'
+    x = unit(X)
+    retained_xray_dropin(x, before['units'][X])
+    need(xray_accounts_match(x, before['units'][X]) and x['FragmentPath'] == before['units'][X]['FragmentPath']
+         and all(swan_unstarted(unit(n), before, n) for n in SWAN_START_UNITS), 'ROLLBACK_DRIFT')
+    restart = tail['sockets'] is not None
+    verify_rollback(d, token, backup, pending_main_pid=x['MainPID'] if restart else None)
+    need(rollback_xray_pin(x) == tail['pin'], 'ROLLBACK_DRIFT')
+    if restart:
+        ROLLBACK_STEP = 'xray'
+        sockets = xray_users(before['files']['main'], x, sock_rows(), before.get('transit'))
+        need(digest(encode(sockets)) == tail['sockets'] and rollback_xray_pin(unit(X)) == tail['pin'], 'ROLLBACK_DRIFT')
+        if DEADLINE - time.monotonic() < 22:
+            raise subprocess.TimeoutExpired([], 0)
+        # Never re-enter an unacknowledged restart, even if it appears to have landed.
+        del journal['rollbackTail']
+        pending = entry(encode(backup))
+        write(path, record, pending)
+        sc('restart', X, wait=22)
+        after = unit(X)
+        need(working(after) and after['InvocationID'] != x['InvocationID'], 'ROLLBACK_DRIFT')
+        journal['rollbackTail'] = dict(pin=rollback_xray_pin(after), sockets=None)
+        record = entry(encode(backup))
+        write(path, pending, record)
+    ROLLBACK_STEP = 'verify'
+    verify_rollback(d, token, backup)
+    need(rollback_xray_pin(unit(X)) == journal['rollbackTail']['pin'], 'ROLLBACK_DRIFT')
+    if journal['xray'] is not None:
+        journal['rollbackXray'] = cleanup_xray_identity()
+    del journal['rollbackTail']
+    backup['phase'] = 'projected-rollback'
+    projected = entry(encode(backup))
+    write(path, record, projected)
+    return projected
+
+
 def rollback(request, path, old_manifest, backup, *, cleanup=False):
-    global STAGE
+    global STAGE, ROLLBACK_STEP
     STAGE = 'COMMAND_FAILED'
     if cleanup:
         cleanup_no_remove(path)
@@ -3645,6 +3708,7 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
 
     # Do not stop an administrator replacement or unmask a unit. Failed
     # first start can leave a failed (but never active at baseline) stock unit.
+    tail = None
     for n in watched:
         info = unit(n)
         need(info['ActiveState'] in ('inactive', 'active', 'failed') and info['LoadState'] != 'masked', 'ROLLBACK_DRIFT')
@@ -3662,7 +3726,12 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
             retained_xray_dropin(info, before['units'][n])
             if working(info):
                 original_invocation = info['InvocationID'] == before['units'][n]['InvocationID']
-                xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows(), before.get('transit'))
+                sockets = xray_users(before['files']['main'] if original_invocation else current['main'], info, sock_rows(), before.get('transit'))
+                if (cleanup and unwritten and started is None and not sidecar and not before.get('ikeSockets')
+                        and not any(policy.values()) and 'modulePersistence' not in backup
+                        and swan_units is not None and all(swan_unstarted(swan_units[k], before, k) for k in SWAN_START_UNITS)):
+                    restart = current['main'] != before['files']['main'] and not original_invocation
+                    tail = dict(pin=rollback_xray_pin(info), sockets=digest(encode(sockets)) if restart else None)
         if n == B:
             need(xray_accounts_match(info, before['units'][n]), 'ROLLBACK_DRIFT')
             if working(info):
@@ -3670,6 +3739,8 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     if swan_units is not None and partial_start:
         no_jobs(UNITS)
         need(all(unit(n) == info for n, info in swan_units.items()), 'ROLLBACK_DRIFT')
+
+    ROLLBACK_STEP = 'files'
     backup['phase'] = 'rolling-back'
     rolling = entry(encode(backup))
     write(path, old_manifest, rolling)
@@ -3754,7 +3825,16 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     for p in (DROP_DIR, NFT_DIR):
         if not directory_absent(p):
             rmdir(p)
+    ROLLBACK_STEP = 'reload'
     sc('daemon-reload', wait=12)
+    if tail:
+        journal = backup['foreignJournal']
+        journal['rollbackTail'] = tail
+        reloaded = entry(encode(backup))
+        write(path, rolling, reloaded)
+        resume_rollback_tail(request, path, reloaded, backup)
+        return
+    ROLLBACK_STEP = 'xray'
     if sidecar:
         b = unit(B)
         if not working(b) or (current['bridge'] != originals['bridge'] and
@@ -3772,6 +3852,7 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     identity = None
     if cleanup and backup['foreignJournal']['xray'] is not None:
         identity = cleanup_xray_identity()
+    ROLLBACK_STEP = 'verify'
     verify_rollback(d, token, backup)
     if identity is not None:
         need(cleanup_xray_identity() == identity, 'IN_FLIGHT')
@@ -3782,7 +3863,7 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     write(path, rolling, entry(encode(backup)))
 
 
-def verify_rollback(d, token, backup, *, projection=None):
+def verify_rollback(d, token, backup, *, projection=None, pending_main_pid=None):
     projection = projection or {}
     before = runtime_before(backup)
     paths = operation_files(backup['after'])
@@ -3816,9 +3897,11 @@ def verify_rollback(d, token, backup, *, projection=None):
     reserved = (1701, d['tproxyPort']) if restored_ike else (500, 4500, 1701, d['tproxyPort'])
     x = unit(X)
     same_xray_dropin(x, before['units'][X])
-    need(xray_accounts_match(x, before['units'][X]) and
-         xray_users(before['files']['main'], x, rows, before.get('transit')) == before['sockets'] and
-         not any(port in reserved for p, a, port, owners in rows), 'RUNTIME_UNPROVED')
+    need(xray_accounts_match(x, before['units'][X]) and not any(port in reserved and
+         (port != d['tproxyPort'] or pending_main_pid is None or owners != [pending_main_pid])
+         for p, a, port, owners in rows) and
+         (x['MainPID'] == pending_main_pid if pending_main_pid is not None else
+          xray_users(before['files']['main'], x, rows, before.get('transit')) == before['sockets']), 'RUNTIME_UNPROVED')
     no_jobs(UNITS)
 
 
@@ -7583,7 +7666,7 @@ def recovery_manifest(request, scope):
                  and isinstance(item['data'], str) and re.fullmatch(r'[a-f0-9]{64}', item['data'])
                  for item in after.values()), 'IN_FLIGHT')
     need(phase in ('installed', 'applying', 'rolled-back')
-         or phase in ('cleaning-foreign', 'projected-rollback') and 'foreignJournal' in backup, 'IN_FLIGHT')
+         or phase in ('cleaning-foreign', 'projected-rollback', 'rolling-back') and 'foreignJournal' in backup, 'IN_FLIGHT')
     # The legacy applying manifest precedes all native effects. The flock
     # alone doesn't join an orphaned systemctl client. The stock swanStart
     # receipt is written *after* the last native writer returns.
@@ -7897,10 +7980,16 @@ def dispatch(request: dict[str, Any]):
 
 
 def main():
-    global DEADLINE
+    global DEADLINE, ROLLBACK_STEP
+    ROLLBACK_STEP = None
     os.umask(0o077)
     action = None
     original_deadline = DEADLINE
+
+    def unknown_rollback(reason):
+        if action in ('install', 'reconcile-install') and CLEANUP_ENTERED and ROLLBACK_STEP is not None:
+            print(f'DIRECT_UNCERTAIN_ROLLBACK_{reason} {ROLLBACK_STEP}', file=sys.stderr, flush=True)
+        return 75
     try:
         wire = sys.stdin.buffer.read(MAX_REQUEST + 1)
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
@@ -7923,12 +8012,14 @@ def main():
         result = dispatch(request)
         if action in ('prepare-packages', 'reconcile-install', 'reattest-runtime') or action == 'preflight' and 'packagePreparation' in result:
             need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
-    except (subprocess.TimeoutExpired, BlockingIOError):
-        return 75
+    except subprocess.TimeoutExpired:
+        return unknown_rollback('TIMEOUT')
+    except BlockingIOError:
+        return unknown_rollback('UNPROVED')
     except Refusal as error:
         if (action == 'reconcile-install' or REATTEST_ENTERED or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED
                 or NATIVE_PREPARING or CLEANUP_ENTERED or str(error) == 'IN_FLIGHT'):
-            return 75
+            return unknown_rollback('DRIFT' if str(error) == 'ROLLBACK_DRIFT' else 'UNPROVED')
         if (str(error) in (RUNTIME_REATTEST_REQUIRED, RUNTIME_FOREIGN_CHANGE) or
                 action == 'reattest-runtime' and str(error) == OBSERVATION_REQUIRED) and time.monotonic() >= DEADLINE:
             return 75
@@ -7978,7 +8069,7 @@ def main():
         # Trap parser failures without ever echoing file contents/child stderr.
         if (action == 'reconcile-install' or REATTEST_ENTERED or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED
                 or PPP_PREPARING or NATIVE_PREPARING or CLEANUP_ENTERED):
-            return 75
+            return unknown_rollback('UNPROVED')
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else
               SESSION_UNKNOWN if action in ('session-count', 'retirement-count') else STAGE), file=sys.stderr)
