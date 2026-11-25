@@ -54,9 +54,13 @@ def readback(executable, port):
 
 
 def publish(path, data):
+    publish_bytes(path, json.dumps(data).encode())
+
+
+def publish_bytes(path, data):
     tmp = path.with_name(path.name + '.fixture-new')
-    with tmp.open('x') as f:
-        json.dump(data, f)
+    with tmp.open('xb') as f:
+        f.write(data)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -168,6 +172,7 @@ class Native(System):
 
 def main():
     loopback_only()
+    os.umask(0o077)
     api, user_port, agent_port = ports()
     store = ROOT / 'store'
     store.mkdir()
@@ -230,7 +235,9 @@ def main():
         mgr.call('/users', 'POST', user)
         assert observed() == [(user['email'], user['id'], '')]
         wnd = m.AgentWindow(mgr, cgroup_root=cgroot)
-        if sys.argv[1:] == ['timeout']:
+        mode, = sys.argv[1:]
+        timeout = mode == 'timeout'
+        if timeout:
             mgr.stop_timeout = True
             assert mgr.agent is not None
             mgr.agent.send_signal(signal.SIGSTOP)
@@ -239,42 +246,109 @@ def main():
                 mgr.agent.returncode = os.waitstatus_to_exitcode(status)
                 raise AssertionError('fixture agent exited before Stop timeout test')
             assert pid == mgr.agent.pid
-            before = BOOT.read_bytes()
-            try:
+        assert mode in ('full', 'timeout')
+
+        def image(data):
+            return {'raw': data.hex(), 'topology': hashlib.sha256(m.topology_bytes(m.parse_json(data), managed)).hexdigest()}
+
+        def snapshot():
+            raw = BOOT.read_bytes()
+            st = BOOT.stat()
+            return {**image(raw), 'pid': core.pid, 'file': {'ino': str(st.st_ino), 'mode': st.st_mode,
+                    'uid': st.st_uid, 'gid': st.st_gid}, 'generation': mgr.xray_generation}
+
+        original = snapshot()
+        identities = []
+        trace = []
+
+        def handle(f):
+            nonlocal core, wnd, identities
+            action = f['action']
+            tag = 'a' if f.get('direction') == 'rollback' else 'b'
+            target = past if tag == 'a' else goal
+            trace.append((action, tag))
+            if action == 'manifest':
+                return {'before': original, 'desired': image(json.dumps(goal).encode())}
+            if action == 'capture':
+                return snapshot()
+            if action == 'agent-stop':
+                assert_profile(goal if tag == 'a' else past)
                 wnd.quiesce()
-            except m.WindowError as e:
-                assert e.code == 'REBUILD_AGENT_STOP_UNCONFIRMED' and wnd.phase == 'stop-unconfirmed'
+            elif action == 'drained-capture':
+                wnd.require_quiet()
+                fresh = snapshot()
+                expected = f['expected']
+                assert all(fresh[k] == expected[k] for k in ('pid', 'generation', 'topology'))
+                identities = observed()
+                assert len(identities) == (1 if tag == 'b' else 2)
+                actual = m.merge_clients(m.parse_json(bytes.fromhex(f['target']['raw'])), disk(), managed)
+                return {'before': fresh, 'desired': image(json.dumps(actual).encode())}
+            elif action == 'main-publication':
+                assert snapshot() == f['before']
+                wnd.require_quiet()
+                publish_bytes(BOOT, bytes.fromhex(f['desired']['raw']))
+                assert image(BOOT.read_bytes()) == f['desired']
+            elif action == 'xray-restart':
+                wnd.require_quiet()
+                stop_core(core)
+                prev, core = core, start_core()
+                mgr.xray_generation += 1
+                assert core.pid != prev.pid and observed() == identities and route() == tag
+                wnd.join_xray_restart()
+            elif action == 'agent-start':
+                wnd.resume()
+            elif action in ('agent-reconcile', 'verify', 'terminal'):
+                if action == 'agent-reconcile':
+                    wnd.wait_reconciled()
+                assert wnd.phase == 'reconciled'
+                assert_profile(target)
+                assert observed() == identities and route() == tag
+                assert mgr.call('/info')['users_count'] == len(identities)
+                verified = snapshot()
+                if action == 'terminal' and tag == 'b':
+                    mgr.call('/users', 'POST', new_user(2))
+                    wnd = m.AgentWindow(mgr, cgroup_root=cgroot)
+                return verified
+            elif action == 'observe':
+                assert timeout and wnd.phase == 'stop-unconfirmed' and snapshot() == original and route() == 'a'
+                return 'before'
             else:
-                raise AssertionError('undrained stop admitted')
-            assert BOOT.read_bytes() == before and core.poll() is None and route() == 'a'
-            print('PASS actual stopped daemon waits during TERM; no publication, Xray restart or agent start', flush=True)
-            return
-        assert not sys.argv[1:]
-        for expected, target, tag in [(past, goal, 'b'), (goal, past, 'a')]:
-            assert_profile(expected)
-            wnd.quiesce()
-            fresh = disk()
-            assert m.topology_bytes(fresh, managed) == m.topology_bytes(expected, managed)
-            identities = observed()
-            assert identities and len(identities) == (1 if tag == 'b' else 2)
-            actual = m.merge_clients(target, fresh, managed)
-            wnd.require_quiet()
-            publish(BOOT, actual)
-            wnd.require_quiet()
-            stop_core(core)
-            prev, core = core, start_core()
-            mgr.xray_generation += 1
-            assert core.pid != prev.pid and observed() == identities and route() == tag
-            wnd.join_xray_restart()
-            wnd.resume()
-            wnd.wait_reconciled()
-            assert_profile(target)
-            assert observed() == identities and route() == tag
-            assert mgr.call('/info')['users_count'] == len(identities)
-            print(f'PASS MAIN {tag}: after real drain, restart and startup reconcile; {len(identities)} users', flush=True)
-            if tag == 'b':
-                mgr.call('/users', 'POST', new_user(2))
-                wnd = m.AgentWindow(mgr, cgroup_root=cgroot)
+                raise AssertionError('unexpected fixture action')
+            return True
+
+        with subprocess.Popen(['/tools/node', '/scripts/main-window-journal.cjs', 'timeout' if timeout else 'rollback'],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as worker:
+            reader, writer = worker.stdout, worker.stdin
+            assert reader is not None and writer is not None
+            # One reply per request. Only the overall isolated runner may kill these children.
+            try:
+                for frame in iter(lambda: reader.readline(16384), b''):
+                    f = json.loads(frame)
+                    if f['action'] == 'done':
+                        assert f['status'] == ('unknown' if timeout else 'rolled-back')
+                        break
+                    try:
+                        reply = {'ok': True, 'value': handle(f)}
+                    except m.WindowError as e:
+                        if not (timeout and f['action'] == 'agent-stop' and e.code == 'REBUILD_AGENT_STOP_UNCONFIRMED'):
+                            raise
+                        reply = {'ok': False}
+                    writer.write(json.dumps(reply).encode() + b'\n')
+                    writer.flush()
+                else:
+                    raise AssertionError('MAIN journal worker ended without terminal witness')
+                writer.close()
+                assert worker.wait(timeout=3) == 0
+            finally:
+                if worker.poll() is None:
+                    worker.kill()
+                    worker.wait(timeout=3)
+        if timeout:
+            assert [action for action, _ in trace] == ['manifest', 'capture', 'agent-stop', 'observe']
+            print('PASS retained stop phase, no publication or restart and no replay', flush=True)
+        else:
+            assert [tag for action, tag in trace if action == 'agent-reconcile'] == ['b', 'a']
+            print('PASS journalled A→B→A with real agent drain, post-resume checks and new user retained', flush=True)
     finally:
         if mgr is not None:
             mgr.close()
