@@ -5,12 +5,14 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
-## v1.6.40 — Проверки L2TP / L2TP install checks
+## v1.6.40 — Установка и восстановление L2TP / L2TP install and recovery
 
-- Установка показывает конкретные несовместимые настройки хоста. Работающий VPN, занятые L2TP/IPsec-порты и активные PPP-сессии блокируют установку отдельно. Диагностика не удаляет файлы.
-- Install reports specific conflicting host settings. Active VPN, occupied L2TP/IPsec UDP ports and active PPP sessions block Install separately. Diagnosis never removes files.
-- На допущенном релее удаление известных настроек требует отдельного одноразового подтверждения. Неизвестные пути показаны для ручной проверки. [Заметки о выпуске](docs/release-v1.6.40.ru.md).
-- Known foreign settings on an admitted relay require separate, one-time consent before removal. Unrecognized paths are listed for manual review.
+- На странице L2TP допуск, установка, проверка результата и удаление обновляют состояние без ручной перезагрузки. При установке видны процент, этап и конкретная причина сбоя.
+- The L2TP page updates admission, installation, recovery and removal status without a manual reload. Install shows progress, the current stage and the specific failure reason.
+- На релее с допуском из базы известные чужие настройки удаляются только после отдельного одноразового подтверждения. Активный VPN, занятые порты, PPP-сессии и непроверенные настройки блокируют изменения.
+- On a relay with database-backed admission, known foreign settings are removed only after separate, one-time consent. Active VPN, occupied ports, PPP sessions and unverified settings block changes.
+- При подтверждённом откате панель сообщает причину и, если применимо, что исходные настройки восстановлены. При неизвестном исходе установка не повторяется автоматически. [Памятка оператора: выкладка и откат](docs/release-v1.6.40.ru.md).
+- Confirmed rollback reports the reason and, when applicable, restoration of the original settings. An unconfirmed outcome never triggers an automatic Install retry.
 
 ## v1.6.39 — Обновление L2TP / L2TP overview refresh
 

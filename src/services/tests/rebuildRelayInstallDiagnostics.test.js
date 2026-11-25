@@ -451,11 +451,11 @@ test('closed diagnostics reach the authenticated API and the localized install c
             const note = check ? ` ${translate(`rebuildL2tp.installChecks.${check}`, lang)}` : '';
             const stopped = text => translate('rebuildL2tp.messages.installStopped', lang).replace('{reason}', text);
             const summary = translate(`rebuildL2tp.messages.${message}`, lang) + note;
-            const failed = ['refused', 'rolled_back', 'busy'].includes(outcome);
+            const stoppedBeforeCompletion = ['refused', 'busy'].includes(outcome);
             assert.equal(initialText, outcome === 'unknown' ? translate('rebuildL2tp.messages.checkingResult', lang)
-                : failed ? stopped(summary) : summary, `${name}: ${lang}`);
+                : stoppedBeforeCompletion ? stopped(summary) : summary, `${name}: ${lang}`);
             assert.equal(finalText, outcome === 'unknown' ? translate('rebuildL2tp.messages.observationTimeout', lang) + note
-                : failed ? stopped(summary) : summary, `${name}: ${lang}`);
+                : stoppedBeforeCompletion ? stopped(summary) : summary, `${name}: ${lang}`);
             assert.deepEqual(log, actions, name);
             assert.equal(disabled, ['unknown', 'installed'].includes(outcome), name);
             assert.equal(refreshHidden, !disabled, name);

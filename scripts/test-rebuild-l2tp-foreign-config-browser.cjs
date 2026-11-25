@@ -41,7 +41,13 @@ const install = `#relay-${nodeId} [data-install-url]`;
 const recover = `#relay-${nodeId} [data-install-recovery-url]`;
 const sibling = `#relay-${siblingId} [data-install-url]`;
 const status = `#relay-${nodeId} [data-relay-action-status]`;
+const refreshReason = `#relay-${nodeId} [data-relay-refresh-reason]`;
 const progress = `#relay-${nodeId} [data-progress-text]`;
+const rollbackCopy = {
+    ru: 'Установка L2TP не удалась, выполнен откат.',
+    en: 'L2TP installation failed and was rolled back.',
+    'zh-CN': 'L2TP 安装失败，已回滚。',
+};
 const el = selector => `document.querySelector(${JSON.stringify(selector)})`;
 const visible = selector => `!!${el(selector)}?.getClientRects().length`;
 const text = selector => `${el(selector)}?.textContent`;
@@ -53,6 +59,7 @@ async function main() {
     const scratch = mkdtempSync(path.join(tmpdir(), 'rebuild-l2tp-foreign-firefox-'));
     const session = { authenticated: true, panelCsrfToken: csrf };
     let lang, replies, release, progressPercent, recovering = false, recoveryAttempts = 0;
+    let recoveryNoState = false;
     app.use(express.json(), (req, res, next) => {
         if (!req.path.startsWith('/js/')) requests.push({
             method: req.method, path: req.path, body: req.body, nonce: req.get(header),
@@ -75,7 +82,7 @@ async function main() {
         }, (error, html) => error ? next(error)
             : res.type('html').send(`<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,">${html}`));
     });
-    // Model only the not-yet-merged Install/progress producer; run real CSRF and the actual view/assets.
+    // Model Install/progress replies; run real CSRF and the actual view/assets.
     app.post(installUrl, requirePanelCsrf, async (_, res) => {
         const error = replies.shift();
         if (!error) return res.sendStatus(500);
@@ -86,6 +93,9 @@ async function main() {
         installProgress: { stage: 'foreignCleanup', percent: progressPercent, at: new Date().toISOString() },
     }));
     app.post(recoveryUrl, requirePanelCsrf, (_, res) => {
+        if (recoveryNoState) return res.status(409).json({
+            error: { code: 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE', retryAllowed: false },
+        });
         if (recoveryAttempts++ === 0) return res.status(503).json({ nodeId,
             error: { code: 'REBUILD_L2TP_INSTALL_RECOVERY_RECHECK', retryAllowed: false } });
         recovering = false;
@@ -215,13 +225,29 @@ async function main() {
         assert.equal(requests.filter(r => r.method === 'GET' && r.path === '/panel/l2tp').length, 1);
         console.log('drift: fresh explicit consent, distinct nonces, cleanup progress and rollback-restored status');
 
+        for (const locale of ['ru', 'en', 'zh-CN']) {
+            words = await start(locale, challenge([options], [options], [], first), {
+                outcome: 'rolled_back', code: 'REBUILD_L2TP_INSTALL_FAILED', check: 'FOREIGN_CONFIG_RESTORED',
+            });
+            await open();
+            await browser.click(confirm);
+            await finished();
+            const expected = `${rollbackCopy[locale]} ${words.installChecks.FOREIGN_CONFIG_RESTORED}`;
+            assert.equal(await browser.evaluate(text(status)), expected, locale);
+            assert.equal(await browser.evaluate(text('[data-action-status]')), expected, locale);
+            assert.equal(await browser.evaluate(`${visible('[data-refresh]')} || ${visible(refreshReason)}`), false);
+            assert.equal(await browser.evaluate('window.fixtureSameDocument'), true);
+            assert.equal(requests.filter(r => r.method === 'GET' && r.path === '/panel/l2tp').length, 1);
+            checkPostBodies([{}, { foreignCleanup: { token: first, fixXrayUnitMode: false } }]);
+            console.log(`${locale}: rollback and reason, automatic readback, no refresh prompt`);
+        }
+
         words = await start('en', challenge([xray], [xray], [], first), { outcome: 'rolled_back', code: 'REBUILD_L2TP_INSTALL_FAILED' });
         await open();
         await browser.click(confirm);
         await finished();
         checkPostBodies([{}, { foreignCleanup: { token: first, fixXrayUnitMode: true } }]);
-        assert.ok((await browser.evaluate(text(status))).includes(words.messages.installRolledBack));
-        assert.ok(!(await browser.evaluate(text(status))).includes(words.installChecks.FOREIGN_CONFIG_RESTORED));
+        assert.equal(await browser.evaluate(text(status)), rollbackCopy.en);
         console.log('Xray: checked choice sends true; generic rollback does not claim restoration');
 
         recovering = true;
@@ -238,6 +264,19 @@ async function main() {
         ]);
         assert.deepEqual(postRequests().map(r => r.body), [{}, {}]);
         console.log('Recover: another explicit click after 503, automatic readback, no Install replay or reload');
+
+        recovering = recoveryNoState = true;
+        words = await start('ru');
+        await browser.click(recover);
+        const siblingReason = `#relay-${siblingId} [data-relay-refresh-reason]`;
+        await browser.wait(visible('[data-refresh]'));
+        assert.equal(await browser.evaluate(text(status)), words.messages.installRecoveryNoState);
+        assert.equal(await browser.evaluate(visible(siblingReason)), true);
+        assert.equal(await browser.evaluate(text(siblingReason)), words.messages.refreshRequired);
+        assert.equal(await browser.evaluate(`${el(recover)}.disabled && ${el(sibling)}.disabled`), true);
+        assert.deepEqual(requests.map(r => [r.method, r.path]), [['POST', recoveryUrl]]);
+        recovering = recoveryNoState = false;
+        console.log('Recover NO_STATE: manual refresh fallback only while the view is locked');
 
         for (const error of [
             { code: initialCode, outcome: 'refused', check, keys: [options], message: taint },

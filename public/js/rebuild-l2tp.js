@@ -864,7 +864,7 @@
         if (!active) return;
         let message = (words[result] ?? admissionWords[result]) + note;
         if (action === 'install' && !accepted.includes(result) && !unknown
-            && !['uncertain', 'installCleanupFailed', 'identityChanged'].includes(result)) {
+            && !['uncertain', 'installCleanupFailed', 'installRolledBack', 'identityChanged'].includes(result)) {
             message = words.installStopped.replace('{reason}', () => message);
         }
         setActionStatus(message, nodeId);
