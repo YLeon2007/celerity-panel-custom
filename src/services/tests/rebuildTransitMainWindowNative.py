@@ -80,9 +80,10 @@ def profile(api, user_port, target):
 
 
 class Native(System):
-    def __init__(self, root, agent_port):
+    def __init__(self, root, agent_port, current_core):
         super().__init__(root)
         self.port = agent_port
+        self.current_core = current_core
         self.agent = None
         self.logs = {}
         self.stop_timeout = False
@@ -124,7 +125,13 @@ class Native(System):
     def __call__(self, argv, timeout):
         if argv[0] == '/usr/bin/journalctl':
             assert argv[-1].startswith('_SYSTEMD_INVOCATION_ID=')
-            return self.logs[argv[-1].split('=', 1)[1]].read_text()
+            lines = self.logs[argv[-1].split('=', 1)[1]].read_text().splitlines(keepends=True)
+            return ''.join(lines[-128:])
+        if argv[-1] == m.XRAY:
+            core = self.current_core()
+            assert core.poll() is None
+            return super().__call__(argv, timeout).replace(f'MainPID={self.xray_generation + 500}\n',
+                                                           f'MainPID={core.pid}\n')
         assert self.agent is not None
         if argv[1] == 'show':
             row = super().__call__(argv, timeout)
@@ -216,7 +223,7 @@ def main():
         assert observed() == [] and route() == 'a'
         cgroot = ROOT / 'fake-system.slice'
         cgroot.mkdir()
-        mgr = Native(cgroot, agent_port)
+        mgr = Native(cgroot, agent_port, lambda: core)
         # Stock first boot lacks users.json and only admits a full panel sync.
         assert mgr.call('/sync', 'POST', {'users': []})['errors'] == 0
         user = new_user(1)
@@ -256,7 +263,9 @@ def main():
             wnd.require_quiet()
             stop_core(core)
             prev, core = core, start_core()
+            mgr.xray_generation += 1
             assert core.pid != prev.pid and observed() == identities and route() == tag
+            wnd.join_xray_restart()
             wnd.resume()
             wnd.wait_reconciled()
             assert_profile(target)

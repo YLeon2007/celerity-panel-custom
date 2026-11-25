@@ -40,6 +40,9 @@ class System:
         self.keep_process = False
         self.temp: pathlib.Path | None = None
         self.generation = 1
+        self.xray_generation = 1
+        self.xray_job = ''
+        self.agent_props = {}
         self.result = 'success'
         self.log_tail = ''
 
@@ -54,9 +57,18 @@ class System:
             if self.now >= self.terminal_time:
                 return '[main] Startup stats discarded (cold-start reset)\n' + self.log_tail
             return ''
-        assert argv[0] == '/usr/bin/systemctl' and argv[-1] == 'cc-agent.service'
+        assert argv[0] == '/usr/bin/systemctl'
+        if argv[-1] == 'xray.service':
+            assert cmd == 'show'
+            row = dict(Id=argv[-1], LoadState='loaded', NeedDaemonReload='no', ActiveState='active',
+                       SubState='running', Job=self.xray_job, MainPID=str(self.xray_generation + 500),
+                       InvocationID=f'{self.xray_generation + 300:032x}',
+                       ExecStart='{ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config '
+                                 '/usr/local/etc/xray/config.json ; ignore_errors=no ; }')
+            return ''.join(f'{k}={row[k]}\n' for k in m.XRAY_PROPS)
+        assert argv[-1] == 'cc-agent.service'
         if cmd == 'show':
-            row = dict(Id=argv[-1], LoadState='loaded', NeedDaemonReload='no',
+            row = dict.fromkeys(m.AGENT_EMPTY, '') | dict(Id=argv[-1], LoadState='loaded', NeedDaemonReload='no',
                        Type='simple', KillMode='control-group', TriggeredBy='',
                        ExecStart='{ path=/usr/local/bin/cc-agent ; argv[]=/usr/local/bin/cc-agent ; ignore_errors=no ; }',
                        ActiveState='active' if self.active else 'inactive',
@@ -64,7 +76,10 @@ class System:
                        ControlGroup='/system.slice/cc-agent.service' if self.active else '',
                        MainPID=str(100 + self.generation) if self.active else '0',
                        InvocationID=self.inv if self.active else '', Result=self.result,
-                       ExecMainCode='0' if self.active else '1', ExecMainStatus='0')
+                       ExecMainCode='0' if self.active else '1', ExecMainStatus='0',
+                       InactiveEnterTimestampMonotonic=str(self.generation * 1000),
+                       Conflicts='shutdown.target', ConflictedBy='', Requires='system.slice sysinit.target',
+                       FragmentPath='/etc/systemd/system/cc-agent.service') | self.agent_props
             keys = [a.removeprefix('--property=') for a in argv if a.startswith('--property=')]
             return ''.join(f'{key}={row[key]}\n' for key in keys)
         if cmd == 'stop':
@@ -111,6 +126,8 @@ class Host(unittest.TestCase):
         self.guard.require_quiet()
         self.main.write_text(json.dumps(profile('b')))
         self.guard.require_quiet()
+        self.manager.xray_generation += 1
+        self.guard.join_xray_restart()
         self.guard.resume()
         self.guard.wait_reconciled()
         self.assertGreaterEqual(self.manager.now, 19)
@@ -162,6 +179,44 @@ class Host(unittest.TestCase):
         self.manager.log_tail = '[main] Startup config reflush: synthetic error\n'
         self.assertCode('REBUILD_AGENT_RECONCILE_UNPROVED', self.guard.wait_reconciled)
         self.assertEqual(self.guard.phase, 'reconcile-unconfirmed')
+
+    def test_queued_xray_heal_vetoes_stop_before_or_publish_after_drain(self):
+        self.manager.xray_job = '8'
+        self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', self.guard.quiesce)
+        self.assertNotIn('stop', [a[1] for a in self.manager.trace])
+        self.manager.xray_job = ''
+        self.guard.quiesce()
+        self.manager.xray_job = '8'
+        self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', self.guard.require_quiet)
+        self.assertEqual(self.guard.phase, 'exclusion-lost')
+
+    def test_stop_hooks_dependency_activation_and_later_quiet_generation_refuse(self):
+        for key in ('ExecStopPost', 'PropagatesStopTo', 'UpheldBy', 'DropInPaths'):
+            self.manager.agent_props = {key: 'unexpected'}
+            self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', self.guard.quiesce)
+        self.assertNotIn('stop', [a[1] for a in self.manager.trace])
+        self.manager.agent_props = {}
+        self.guard.quiesce()
+        self.manager.generation += 1  # invisible stop/start/stop would otherwise look inactive
+        self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', self.guard.require_quiet)
+
+    def test_reconcile_refuses_truncated_invocation_conflict_or_restarted_xray(self):
+        for name in ('truncated', 'conflict', 'xray-restart'):
+            with self.subTest(name=name):
+                root = self.root / name
+                root.mkdir()
+                mgr = System(root)
+                wnd = m.AgentWindow(mgr, main=root / 'config.json', cgroup_root=root,
+                                    clock=lambda: mgr.now, sleep=mgr.sleep)
+                wnd.quiesce()
+                wnd.resume()
+                if name == 'truncated':
+                    mgr.log_tail = 'unverified\n' * 128
+                if name == 'conflict':
+                    mgr.log_tail = '[store] Preserving users and Xray config until full /sync: fixture\n'
+                if name == 'xray-restart':
+                    mgr.xray_generation += 1
+                self.assertCode('REBUILD_AGENT_RECONCILE_UNPROVED', wnd.wait_reconciled)
 
 
 class Images(unittest.TestCase):

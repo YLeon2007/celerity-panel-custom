@@ -14,14 +14,21 @@ import subprocess
 import time
 
 UNIT = 'cc-agent.service'
+XRAY = 'xray.service'
 GROUP = '/system.slice/' + UNIT
 MAIN = pathlib.Path('/usr/local/etc/xray/config.json')
 CGROUP_ROOT = pathlib.Path('/sys/fs/cgroup/system.slice')
-PROPERTIES = tuple('Id LoadState NeedDaemonReload Type KillMode TriggeredBy ExecStart '
+AGENT_EMPTY = tuple('DropInPaths SourcePath ExecCondition ExecStartPre ExecStartPost ExecStop ExecStopPost '
+                    'TriggeredBy Triggers BindsTo BoundBy PartOf ConsistsOf PropagatesStopTo StopPropagatedFrom '
+                    'Upholds UpheldBy Wants'.split())
+PROPERTIES = tuple('Id LoadState NeedDaemonReload Type KillMode ExecStart FragmentPath Requires Conflicts ConflictedBy '
                    'ActiveState SubState Job ControlGroup MainPID InvocationID Result '
-                   'ExecMainCode ExecMainStatus'.split())
+                   'ExecMainCode ExecMainStatus InactiveEnterTimestampMonotonic'.split()) + AGENT_EMPTY
+XRAY_PROPS = tuple('Id LoadState NeedDaemonReload ActiveState SubState Job MainPID InvocationID ExecStart'.split())
 EXPECTED_EXEC = re.compile(r'\{ path=/usr/local/bin/cc-agent ; argv\[\]=/usr/local/bin/cc-agent ; '
                            r'ignore_errors=no ; [^{}]*\}')
+XRAY_EXEC = re.compile(r'\{ path=/usr/local/bin/xray ; argv\[\]=/usr/local/bin/xray run (?:-config|-c) '
+                       r'/usr/local/etc/xray/config\.json ; ignore_errors=no ; [^{}]*\}')
 INVOCATION = re.compile(r'[a-f0-9]{32}')
 PID = re.compile(r'[1-9][0-9]{0,9}')
 TAG = re.compile(r'[A-Za-z0-9_.:-]{1,128}')
@@ -118,24 +125,26 @@ def merge_clients(target, current, managed):
     return result
 
 
-def _state_fields(text):
+def _state_fields(text, props, service):
     require(isinstance(text, str) and len(text) <= 16384)
     data = {}
     for line in text.splitlines():
         k, separator, v = line.partition('=')
-        require(separator and k in PROPERTIES and k not in data)
+        require(separator and k in props and k not in data)
         data[k] = v
-    require(data.keys() == set(PROPERTIES) and data['Id'] == UNIT and data['LoadState'] == 'loaded'
-            and data['NeedDaemonReload'] == 'no' and data['Type'] == 'simple'
-            and data['KillMode'] == 'control-group' and data['TriggeredBy'] == ''
-            and EXPECTED_EXEC.fullmatch(data['ExecStart']) and data['Job'] in ('', '0'))
+    require(data.keys() == set(props) and data['Id'] == service and data['LoadState'] == 'loaded'
+            and data['NeedDaemonReload'] == 'no' and data['Job'] in ('', '0'))
     return data
 
 
-def _running(row):
+def _generation(row):
     return (row['ActiveState'] == 'active' and row['SubState'] == 'running'
-            and row['ControlGroup'] == GROUP and PID.fullmatch(row['MainPID'])
-            and INVOCATION.fullmatch(row['InvocationID']) and row['InvocationID'] != '0' * 32
+            and PID.fullmatch(row['MainPID'])
+            and INVOCATION.fullmatch(row['InvocationID']) and row['InvocationID'] != '0' * 32)
+
+
+def _running(row):
+    return (_generation(row) and row['ControlGroup'] == GROUP
             and row['Result'] == 'success')
 
 
@@ -157,16 +166,36 @@ class AgentWindow:
         self._sleep = sleep
         self._old = None
         self._new = None
+        self._quiet = None
+        self._xray = None
+        self._xray_joined = False
         self._slice_id = None
         self.phase = 'initial'
 
-    def _unit(self, timeout=4):
+    def _show(self, name, props, timeout):
         return _state_fields(self._run(['/usr/bin/systemctl', 'show', '--all',
-                                       *('--property=' + k for k in PROPERTIES), '--', UNIT], timeout))
+                                       *('--property=' + k for k in props), '--', name], timeout), props, name)
+
+    def _unit(self, timeout=4):
+        row = self._show(UNIT, PROPERTIES, timeout)
+        require(row['FragmentPath'] == '/etc/systemd/system/' + UNIT
+                and row['Type'] == 'simple' and row['KillMode'] == 'control-group'
+                and not any(row[k] for k in AGENT_EMPTY)
+                and set(row['Requires'].split()) <= {'system.slice', 'sysinit.target'}
+                and all(set(row[k].split()) <= {'shutdown.target'} for k in ('Conflicts', 'ConflictedBy'))
+                and EXPECTED_EXEC.fullmatch(row['ExecStart']))
+        return row
+
+    def _main_unit(self, timeout=4):
+        row = self._show(XRAY, XRAY_PROPS, timeout)
+        require(_generation(row) and XRAY_EXEC.fullmatch(row['ExecStart']))
+        return row
 
     def _journal(self, invocation, timeout=4):
-        return self._run(['/usr/bin/journalctl', '--quiet', '--no-pager', '--output=cat', '--lines=128',
-                          '_SYSTEMD_UNIT=' + UNIT, '_SYSTEMD_INVOCATION_ID=' + invocation], timeout).splitlines()
+        text = self._run(['/usr/bin/journalctl', '--quiet', '--no-pager', '--output=cat', '--lines=128',
+                          '_SYSTEMD_UNIT=' + UNIT, '_SYSTEMD_INVOCATION_ID=' + invocation], timeout)
+        require(isinstance(text, str) and len(text) <= 65536 and (not text or text.endswith('\n')))
+        return text.splitlines()
 
     def _cgroup_populated(self):
         # A missing service cgroup is admissible only beneath a readable
@@ -199,7 +228,8 @@ class AgentWindow:
     def _stopped(self):
         row = self._unit()
         require(row['ActiveState'] in ('inactive', 'failed') and row['MainPID'] == '0'
-                and row['ControlGroup'] in ('', GROUP))
+                and row['ControlGroup'] in ('', GROUP)
+                and re.fullmatch(r'[1-9][0-9]{0,19}', row['InactiveEnterTimestampMonotonic']))
         require(not self._cgroup_populated())
         parent = os.open(self._main.parent, DIR)
         try:
@@ -217,12 +247,13 @@ class AgentWindow:
         try:
             row = self._unit()
             require(_running(row) and self._cgroup_populated() and self._unit() == row)
+            self._xray = self._main_unit()
         except (OSError, UnicodeError, subprocess.SubprocessError, WindowError):
             raise WindowError('REBUILD_AGENT_EXCLUSION_UNPROVED') from None
         self._old = row
         self.phase = 'stop-unconfirmed'  # latch before the synchronous manager handoff
         try:
-            self._run(['/usr/bin/systemctl', 'stop', '--', UNIT], 25)
+            self._run(['/usr/bin/systemctl', 'stop', '--job-mode=fail', '--', UNIT], 25)
         except (OSError, subprocess.SubprocessError):
             raise WindowError('REBUILD_AGENT_STOP_UNCONFIRMED') from None
         try:
@@ -232,27 +263,46 @@ class AgentWindow:
             journal = self._journal(row['InvocationID'])
             require(any(msg.endswith('[main] Shutdown complete') for msg in journal)
                     and not any('[config] Final flush:' in msg or '[store] Final save:' in msg for msg in journal))
+            require(self._stopped() == stopped and self._main_unit() == self._xray)
         except (OSError, UnicodeError, subprocess.SubprocessError, WindowError):
             self.phase = 'exclusion-lost'
             raise WindowError('REBUILD_AGENT_EXCLUSION_UNPROVED') from None
+        self._quiet = stopped
         self.phase = 'quiet'
 
-    def require_quiet(self):
+    def _check_quiet(self, xray):
         require(self.phase == 'quiet', 'REBUILD_AGENT_WINDOW_STATE')
         try:
-            self._stopped()
+            require(self._stopped() == self._quiet)
+            current = self._main_unit()
+            if xray == 'same':
+                require(current == self._xray)
+            else:
+                require(not self._xray_joined and self._xray is not None
+                        and all(current[k] != self._xray[k] for k in ('MainPID', 'InvocationID')))
+            require(self._unit() == self._quiet)
+            return current
         except (OSError, UnicodeError, subprocess.SubprocessError, WindowError):
             self.phase = 'exclusion-lost'
             raise WindowError('REBUILD_AGENT_EXCLUSION_UNPROVED') from None
+
+    def require_quiet(self):
+        self._check_quiet('same')
+
+    def join_xray_restart(self):
+        """Accept the new generation only after the caller joins its restart."""
+        self._xray = self._check_quiet('new')
+        self._xray_joined = True
 
     def resume(self):
         self.require_quiet()
         self.phase = 'start-unconfirmed'
         try:
-            self._run(['/usr/bin/systemctl', 'start', '--', UNIT], 15)
+            self._run(['/usr/bin/systemctl', 'start', '--job-mode=fail', '--', UNIT], 15)
             row = self._unit()
             require(_running(row) and self._old is not None
-                    and row['InvocationID'] != self._old['InvocationID'] and self._cgroup_populated())
+                    and row['InvocationID'] != self._old['InvocationID'] and self._cgroup_populated()
+                    and self._main_unit() == self._xray)
         except (OSError, UnicodeError, subprocess.SubprocessError, WindowError):
             raise WindowError('REBUILD_AGENT_START_UNCONFIRMED') from None
         self._new = row
@@ -264,6 +314,7 @@ class AgentWindow:
         terminal = '[main] Startup stats discarded (cold-start reset)'
         denied = ('[main] Preserving Xray config and runtime', '[main] Startup config flush:',
                   '[main] Startup config reflush:', '[main] Stale Xray config on startup, restarting',
+                  '[store] Preserving users and Xray config until full /sync',
                   '[main] Startup stats discard failed:')
         # The known agent waits 3 s + 15 s before the reflush, with up to 60 s
         # for the final RPC. An active unit or a 5–10 s sleep is not settlement.
@@ -275,11 +326,13 @@ class AgentWindow:
                     require(remaining > 0)
                     return min(4, remaining)
 
-                require(self._unit(timeout()) == self._new)
+                require(self._unit(timeout()) == self._new and self._main_unit(timeout()) == self._xray)
                 lines = self._journal(self._new['InvocationID'], timeout())
-                require(not any(msg in line for line in lines for msg in denied))
-                if any(line.endswith(terminal) for line in lines):
-                    require(self._unit(timeout()) == self._new and self._clock() < deadline)
+                require(len(lines) < 128 and not any(msg in line for line in lines for msg in denied))
+                receipts = sum(line.endswith(terminal) for line in lines)
+                if receipts:
+                    require(receipts == 1 and self._main_unit(timeout()) == self._xray
+                            and self._unit(timeout()) == self._new and self._clock() < deadline)
                     self.phase = 'reconciled'
                     return
                 self._sleep(max(0, min(0.25, deadline - self._clock())))
