@@ -1,6 +1,7 @@
 'use strict';
 const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
+const { isDeepStrictEqual: equal } = require('node:util');
 const { composeRebuildProfiles, ingressTag, egressTag } = require('/source/src/modules/relay-l2tp/services/rebuildTopologyComposer');
 
 const a = JSON.parse(fs.readFileSync(0, 'utf8'));
@@ -52,13 +53,14 @@ for (const [i, link] of links.entries()) {
 // Either endpoint can dial (source in forward, target in reverse), including
 // the endpoints of composer-derived channels. Key by node, not by link.
 const dialerVersions = new Map(labels.map(name => [ids[name], a.versionsByNode[name]]));
-const profiles = composeRebuildProfiles({ nodes, links,
+const input = { nodes, links,
     usersByNode: Object.fromEntries(Object.entries(users).map(([name, user]) => [ids[name], [user]])),
     dialerVersions,
     ...(a.matrix && { controlPlaneAddresses: ['panel.fixture.invalid', ...nodes.map(n => n.ip)],
         followRelayStates: ['gateway', 'island'].map(name => ({ node: ids[name], desiredState: 'installed', status: 'installed',
             tproxyPort: a.ports[`ppp-${name}`], secretRevision: 1, routingMode: 'follow-relay', routingVersion: 1 })) }),
-});
+};
+const profiles = composeRebuildProfiles(input);
 if (a.chain && !a.proof && !a.matrix) {
     // Transport experiment only: use real generated tunnel pairs but inject
     // policy selection by hand until the compiler can produce it itself.
@@ -74,7 +76,7 @@ if (a.chain && !a.proof && !a.matrix) {
     prepend('tail', [rule(7, 4, { domain: ['full:fixture.invalid'] }), rule(7, 6), rule(8, 2)]);
 }
 const names = Object.fromEntries(Object.entries(ids).map(([k, v]) => [v, k]));
-let proofs;
+let proofs, transition;
 if (a.proof || a.matrix) {
     const { compileRebuildGraph } = require('/source/src/modules/relay-l2tp/domain/rebuildTopologyCompiler');
     const { buildTransitChannels } = require('/source/src/modules/relay-l2tp/services/rebuildTransitChannels');
@@ -91,6 +93,30 @@ if (a.proof || a.matrix) {
         if (new Set(descriptions.slice(-2).map(row => row.id)).size !== 2) throw new Error('shared distinct policies');
     }
 
+    if (a.stage) {
+        const { planAdditiveScopedTransition } = require('/source/src/services/rebuildTransitActivationPlan');
+        const before = composeRebuildProfiles({ ...input, links: links.map(({ rebuildExit, ...row }) => row) });
+        // For this fixture only, start with the desired sniffing mode already
+        // provisioned. The additive plan still refuses a live handler change.
+        const prequalifiedSniffing = [];
+        for (const { nodeId, profile, config } of before) {
+            const next = profiles.find(p => p.nodeId === nodeId && p.profile === profile).config;
+            for (const row of config.inbounds) {
+                const desired = next.inbounds.find(i => i.tag === row.tag);
+                const from = row.sniffing?.routeOnly, to = desired?.sniffing?.routeOnly;
+                if (typeof from !== 'boolean' || typeof to !== 'boolean' || from === to) continue;
+                const changed = { ...row, sniffing: { ...row.sniffing, routeOnly: to } };
+                if (!equal(changed, desired)) throw new Error('fixture cannot prequalify the existing listener');
+                row.sniffing.routeOnly = to;
+                prequalifiedSniffing.push({ name: names[nodeId], profile, tag: row.tag });
+            }
+        }
+        const plan = planAdditiveScopedTransition({ before, after: profiles, composition: input });
+        transition = { prequalifiedSniffing, before: before.filter(p => p.profile === 'main' && ['gateway', 'tail'].includes(names[p.nodeId]))
+            .map(p => ({ ...p, name: names[p.nodeId] })),
+        plan: Object.fromEntries(Object.entries(plan).map(([phase, steps]) => [phase,
+            steps.map(step => ({ ...step, owner: names[step.nodeId] }))])) };
+    }
     if (a.proof) {
         const { transitProofProfiles } = require('./transit-proof.cjs');
         proofs = channels.artifacts.map((channel, i) => {
@@ -103,6 +129,6 @@ if (a.proof || a.matrix) {
     }
 }
 process.stdout.write(JSON.stringify({ profiles: profiles.map(p => ({ ...p, name: names[p.nodeId] })),
-    users, links: descriptions, ...(a.proof && { proofs }), ...(a.matrix && { pppTags: {
+    users, links: descriptions, ...(a.proof && { proofs }), ...(a.stage && { transition }), ...(a.matrix && { pppTags: {
         gateway: `relay-l2tp-${ids.gateway}`, island: `relay-l2tp-${ids.island}`,
     } }) }));

@@ -491,6 +491,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         evidence['proof_source_sha256'] = digest('/scripts/transit-proof.cjs')
     if stage:
         evidence['switch_source_sha256'] = digest('/scripts/stage-switch.py')
+        evidence['planner_source_sha256'] = digest('/source/src/services/rebuildTransitActivationPlan.js')
     if matrix:
         evidence['geoip_fixture'] = geoip_fixture()
     binaries = (XRAY, RELAY_XRAY, BRIDGE_XRAY)
@@ -517,7 +518,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     versions_by_node = evidence['dialer_versions_by_node'] = {
         name: actor(name, evidence)['version'].split()[1] for name in server_labels}
     fixture = dict(ports=ports, versionsByNode=versions_by_node, mode=mode, preferred=preferred,
-                   chain=chain, proof=proof, matrix=matrix,
+                   chain=chain, proof=proof, matrix=matrix, stage=stage,
                    reality=reality_keys(n_links, ports['cover']))
     raw = checked(['node', '/scripts/compose.cjs'], input=json.dumps(fixture))
     Path('composer-output.json').write_text(raw + '\n')
@@ -566,13 +567,31 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             ppp.update(tag=tag, listen=LO, port=port, protocol='socks', settings={'auth': 'noauth'})
             dump(f'{node}-main.json', config)
     scoped_rule_tags = []
-    if stage:
-        gateway = configs['gateway-main']
-        desired = deepcopy(gateway['routing'])
+    plan = generated['transition']['plan'] if stage else None
+    added = [(step['owner'], step['config']['port']) for step in plan['listeners']] if plan is not None else []
+    delivery_owner = ''
+    if plan is not None:
+        transition = generated['transition']
+        require([len(plan[key]) for key in ('listeners', 'dialers', 'transit', 'ingress')] == [2, 2, 1, 1],
+                'unexpected staged activation plan')
+        evidence['prequalified_sniffing'] = transition['prequalifiedSniffing']
+        stock = {item['name']: fixture_config(item['config'], None, f'{item["name"]}-main') for item in transition['before']}
+        require(set(stock) == {'gateway', 'tail'}, 'missing stock MAIN')
+        for owner, original in stock.items():
+            original['api']['services'].append('RoutingService')
+            for i, row in enumerate(original['inbounds']):
+                if row['tag'] == generated['pppTags'].get(owner):
+                    original['inbounds'][i] = next(copy for copy in configs[f'{owner}-main']['inbounds'] if copy['tag'] == row['tag'])
+        gateway = stock['gateway']
+        switch, = plan['ingress']
+        delivery, = plan['transit']
+        delivery_owner = delivery['owner']
+        require(switch['owner'] == 'gateway' and delivery['owner'] == 'tail'
+                and gateway['routing'] == switch['before'] and stock['tail']['routing'] == delivery['before'],
+                'wrong selector preimages')
+        desired = switch['after']
         scoped_rule_tags = [rule['ruleTag'] for rule in desired['rules'] if rule.get('ruleTag', '').startswith('rebuild-policy-portal-')]
         require(len(set(scoped_rule_tags)) == len(scoped_rule_tags) == 2, 'fixture needs exactly two scoped ingress selectors')
-        keep = [rule for rule in desired['rules'] if rule.get('ruleTag') not in scoped_rule_tags]
-        gateway['api']['services'].append('RoutingService')
         probes = []
         for ln in generated['links']:
             if 'selectedBy' not in ln:
@@ -581,10 +600,16 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             gateway['inbounds'].append({'tag': tag, 'listen': LO, 'port': ports[tag], 'protocol': 'socks'})
             probes.append({'type': 'field', 'ruleTag': tag, 'inboundTag': [tag], 'outboundTag': tunnel_tag(ln, False)})
         require(len(probes) == 2, 'missing staged probe inputs')
-        gateway['routing'] = {**desired, 'rules': [*probes, *keep]}
-        dump('gateway-main.json', gateway)
+        gateway['routing'] = {**switch['before'], 'rules': [*probes, *switch['before']['rules']]}
+        for owner, original in stock.items():
+            dump(f'{owner}-main.json', original)
         dump('staged-routes.json', {'routing': gateway['routing']})
         dump('desired-routes.json', {'routing': desired})
+        dump('delivery-before.json', {'routing': delivery['before']})
+        dump('delivery-after.json', {'routing': delivery['after']})
+        for phase, field in (('listeners', 'inbounds'), ('dialers', 'outbounds')):
+            for step in plan[phase]:
+                dump(f'{phase}-{step["channelId"]}.json', {field: [step['config']]})
     print(f'CONFIG OK {len(evidence["config_tests"])}/{len(configs)} (including bridge fixture redirects and subscriber)')
 
     b = 6 if preferred else 3
@@ -605,7 +630,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     links = {link['index']: link for link in generated['links']}
     origins = Origins()
     evidence['probes'] = []
-    expected_count = len(cases) + (5 if matrix else 0) + (9 if stage else 0)
+    expected_count = len(cases) + (5 if matrix else 0) + (13 if stage else 0)
     evidence['expected_counts'] = {'config_tests': len(configs), 'http_probes': expected_count,
                                    'live_xray': len(run_configs), 'children': len(run_configs) + 1}
     reaped = evidence['reaped']
@@ -617,7 +642,9 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         wait_until('cover listener', children, lambda: sockets(ports['cover'], cover), 4)
         for label in [*relays, *PORTALS, *BRIDGES, 'subscriber']:
             children[label] = start_xray(stack, run_configs[label], label, evidence)
-        listens = [(ln['source'] if ln['mode'] == 'reverse' else ln['target'], ln['port']) for ln in generated['links']]
+        initial_links = [ln for ln in generated['links'] if not stage or 'selectedBy' not in ln]
+        scoped_links = [ln for ln in generated['links'] if stage and 'selectedBy' in ln]
+        listens = [(ln['source'] if ln['mode'] == 'reverse' else ln['target'], ln['port']) for ln in initial_links]
         listens += [(n, ports[n]) for n in PORTALS] + [('subscriber', ports[f'socks-{n}']) for n in PORTALS]
         if matrix:
             listens += [(node, ports[f'ppp-{node}']) for node in generated['pppTags']]
@@ -625,7 +652,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             listens += [('gateway', ports[tag]) for tag in ('stage-p1', 'stage-p2')]
         wait_until('PID-owned tunnel/portal/SOCKS listeners', children,
                    lambda: all(sockets(port, children[owner]) for owner, port in listens), 6)
-        reverse = [ln for ln in generated['links'] if ln['mode'] == 'reverse']
+        reverse = [ln for ln in initial_links if ln['mode'] == 'reverse']
         reverse_owners = {owner: sum(ln['source'] == owner for ln in reverse)
                           for owner in {ln['source'] for ln in reverse}}
 
@@ -654,6 +681,22 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             result.check_returncode()
             return result.stdout
 
+        def verify_live_rules(owner, filename):
+            expected = json.loads(Path(filename).read_text())['routing']['rules']
+            live = json.loads(api(owner, 'lsrules'))['rules']
+            # The API reports ordered tags and actions, not the predicates.
+            require([(r.get('ruleTag', ''), r.get('tag', '')) for r in live]
+                    == [(r.get('ruleTag', ''), r.get('outboundTag', '')) for r in expected],
+                    f'{owner}: live rule order or outbound differs from {filename}')
+
+        def drain_fixture_sessions(owner, port):
+            # Only in this private fixture namespace, on the scoped port.
+            if sockets(port, children[owner], established=True):
+                result = cmd(['ss', '-Ktn', 'state', 'established', f'( sport = :{port} )'])
+                require(result.returncode == 0 and not result.stderr, 'fixture could not close the exact TCP sessions')
+            wait_until('scoped sessions drained', children,
+                       lambda: not sockets(port, children[owner], established=True), 6)
+
         def verify_case(case, staged=False):
             result = probe(case, ports, origins, links, chain, matrix, staged=staged)
             evidence['probes'].append(result)
@@ -661,24 +704,63 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                   + (f' via {result["egress"]}' if 'egress' in result else ''))
             require(result['actual'] == case.want, f'{case.name}: wrong origin')
 
-        if stage:
-            # Prove both old subscriber routes and the new scoped channels
-            # through the same live processes before changing the selectors.
-            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
-            verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+        def stage_channels(steps, verify_baseline):
+            require(all(not sockets(port, children[owner]) and not sockets(port, children[owner], established=True)
+                        for owner, port in added), 'scoped listeners or old sessions already present')
+            for step in steps['listeners']:
+                api(step['owner'], 'adi', f'listeners-{step["channelId"]}.json')
+            wait_until('new listeners before any dialer is installed', children,
+                       lambda: all(sockets(port, children[owner]) for owner, port in added), 6)
+            require(all(not sockets(port, children[owner], established=True) for owner, port in added),
+                    'new channel has a session before its dialer is installed')
+            for step in steps['dialers']:
+                api(step['owner'], 'ado', f'dialers-{step["channelId"]}.json')
+            api(delivery_owner, 'adrules', 'delivery-after.json')
+            verify_live_rules(delivery_owner, 'delivery-after.json')
+            wait_until('staged reverse control sockets', children, lambda: all(
+                sockets(ln['port'], children[ln['source']], established=True)
+                for ln in scoped_links if ln['mode'] == 'reverse'), 18)
+            if verify_baseline:
+                verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+                verify_case(Probe('p2', 'other', 'B', 6), staged=True)
             verify_case(Probe('stage-p1', 'numeric', 'B', 3), staged=True)
             verify_case(Probe('stage-p2', 'other', 'A', 2), staged=True)
-            api('gateway', 'adrules', 'desired-routes.json')
-            wait_until('original staged process and all listeners retained', children,
-                       lambda: all(sockets(port, children[owner]) for owner, port in listens), 4)
-        for case in cases:
-            verify_case(case)
-        if stage:
-            api('gateway', 'adrules', 'staged-routes.json')
+
+        if plan is not None:
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+            # Install listeners first into the original processes, then dialers
+            # and the downstream policy. Subscriber selectors are still old.
+            stage_channels(plan, True)
+            api('gateway', 'adrules', 'desired-routes.json')
+            verify_live_rules('gateway', 'desired-routes.json')
+            wait_until('original staged process and all listeners retained', children,
+                       lambda: all(sockets(port, children[owner]) for owner, port in [*listens, *added]), 4)
+        for case in cases:
+            verify_case(case)
+        if plan is not None:
+            api('gateway', 'adrules', 'staged-routes.json')
+            verify_live_rules('gateway', 'staged-routes.json')
+            api(delivery_owner, 'adrules', 'delivery-before.json')
+            verify_live_rules(delivery_owner, 'delivery-before.json')
+            for step in reversed(plan['dialers']):
+                api(step['owner'], 'rmo', step['tag'])
+            for step in reversed(plan['listeners']):
+                api(step['owner'], 'rmi', step['tag'])
+            wait_until('new listeners absent after inverse plan', children,
+                       lambda: all(not sockets(port, children[owner]) for owner, port in added)
+                       and all(sockets(port, children[owner]) for owner, port in listens), 6)
+            for step in plan['dialers']:
+                require(f'"{step["tag"]}"' not in api(step['owner'], 'lso'), 'dialer remained after inverse plan')
+            for owner, port in added:
+                drain_fixture_sessions(owner, port)
+            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+            verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+            # A separate explicit fixture operation after confirmed rollback.
+            stage_channels(plan, False)
             api('gateway', 'adrules', 'desired-routes.json')
             verify_case(Probe('p1', 'numeric', 'B', 3))
+            listens.extend(added)
         if matrix:
             # Remove one incoming listener in the actual, still-running MAIN.
             # Do not remove its route or damage the neighboring/shared policy.
@@ -695,10 +777,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             if cut['mode'] == 'reverse':
                 # Unbinding a reverse connector alone does not close its
                 # established workers. Cut only this tuple in our private netns.
-                result = cmd(['ss', '-Ktn', 'state', 'established', f'( sport = :{cut["port"]} )'])
-                require(result.returncode == 0 and not result.stderr, 'fixture could not close the exact reverse sockets')
-                wait_until('cut reverse sessions drained', children,
-                           lambda: not sockets(cut['port'], children[owner], established=True), 6)
+                drain_fixture_sessions(owner, cut['port'])
             evidence['cut'] = {'id': cut['id'], 'owner': owner, 'mode': cut['mode'], 'tag': tag, 'api': reply.strip()}
             verify_case(Probe('p1', 'cut', None, 0))
             verify_case(Probe('p2', 'numeric', 'A', 2))
@@ -739,6 +818,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     require(evidence['source_sha256'] == source_digests(), 'composer inputs changed during the run')
     if stage:
         require(evidence['switch_source_sha256'] == digest('/scripts/stage-switch.py'), 'stage writer changed during the run')
+        require(evidence['planner_source_sha256'] == digest('/source/src/services/rebuildTransitActivationPlan.js'), 'planner changed during the run')
     rows = evidence['probes']
     if len(rows) == expected_count and all(row['actual'] == row['expected'] for row in rows):
         print(f'PASS {len(rows)}/{len(rows)} HTTP marker/block checks and exact relay channels')
