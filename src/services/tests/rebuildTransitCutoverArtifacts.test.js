@@ -81,3 +81,20 @@ test('no artifact receipt on write sync failure; callers cannot smuggle object i
     assert.throws(() => f.store.seal(f.ctx, 'before', { bytes: 'not exact bytes' }), refused);
     assert.deepEqual(f.store.read(f.ctx, 'desired', f.store.seal(f.ctx, 'desired', Buffer.alloc(0))), Buffer.alloc(0));
 });
+
+test('post-drain artifacts bind marked step, direction and side without changing legacy AAD', t => {
+    const f = fixture(t);
+    const step = { ...f.ctx.step, phase: 'selector', window: 'main-agent' };
+    const ctx = { plan: { ...f.ctx.plan, steps: [step] }, step };
+    const bytes = Buffer.from('MAIN after final flush\n');
+    const original = f.store.seal(f.ctx, 'before', bytes);
+    const pin = f.store.seal(ctx, 'publication-forward-before', bytes);
+    const fresh = createCutoverArtifactStore({ directory: f.directory, key: f.key });
+    assert.deepEqual(fresh.read(ctx, 'before', original), bytes);
+    assert.deepEqual(fresh.read(ctx, 'publication-forward-before', pin), bytes);
+    for (const side of ['before', 'publication-forward-desired', 'publication-rollback-before']) {
+        assert.throws(() => fresh.read(ctx, side, pin), refused);
+    }
+    assert.throws(() => fresh.read(f.ctx, 'publication-forward-before', pin), refused);
+    assert.throws(() => fresh.seal({ ...ctx, plan: { ...ctx.plan, steps: [] } }, 'publication-forward-before', bytes), refused);
+});

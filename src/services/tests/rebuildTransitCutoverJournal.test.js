@@ -50,6 +50,7 @@ function fixture(root, journal, actions = {}) {
         return Buffer.concat([decipher.update(bytes.subarray(12, -16)), decipher.final()]);
     }
     return {
+        seal: save, open: load,
         async verifyFence({ plan: p }) { return fence() === p.fenceId; },
         async capture(ctx) {
             if (actions.beforeCapture) await actions.beforeCapture(ctx);
@@ -109,8 +110,8 @@ function fixture(root, journal, actions = {}) {
             if (!state.pending) return 'unavailable';
             const ctx = { plan: state.plan, ...state.pending };
             const current = fs.readFileSync(runtime(root, ctx.step.id));
-            const before = load(ctx, ctx.direction === 'forward' ? ctx.artifacts.before : ctx.artifacts.confirmed);
-            const after = load(ctx, ctx.direction === 'forward' ? ctx.artifacts.desired : ctx.artifacts.before);
+            const before = load(ctx, ctx.publication?.before ?? (ctx.direction === 'forward' ? ctx.artifacts.before : ctx.artifacts.confirmed));
+            const after = load(ctx, ctx.publication?.desired ?? (ctx.direction === 'forward' ? ctx.artifacts.desired : ctx.artifacts.before));
             return current.equals(before) ? 'before' : current.equals(after) ? 'after' : 'mixed';
         }
     };
@@ -161,6 +162,9 @@ if (process.argv[2] === '--cutover-child') {
             beforeCapture: async ctx => { if (mode === 'after-durable-ack' && ctx.step.id === 'relay-selector') await pause(); },
             beforeTerminalFinish: async ctx => { if (mode === 'after-terminal-proof' && ctx.direction === 'forward') await pause(); }
         });
+        if (mode === 'reopen' && p.steps.some(step => step.window)) {
+            binding.adapter.captureMainPublication = () => assert.fail('fresh reader attempted publication capture');
+        }
         const service = createScopedCutoverExecutor(binding);
         try {
             const result = mode === 'reopen'
@@ -172,11 +176,11 @@ if (process.argv[2] === '--cutover-child') {
         }
     });
 } else {
-    async function child(t, root, mode) {
+    async function child(t, root, mode, input = plan) {
         const worker = fork(__filename, ['--cutover-child', root, mode], { execArgv: [], stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
         const exited = once(worker, 'exit');
         t.after(async () => { if (worker.exitCode === null && worker.signalCode === null) worker.kill('SIGKILL'); await exited; });
-        worker.send(plan);
+        worker.send(input);
         const result = await Promise.race([once(worker, 'message').then(([msg]) => msg), exited.then(([code, signal]) => {
             throw new Error(`fixture exited before boundary: ${code}/${signal}`);
         })]);
@@ -348,6 +352,333 @@ if (process.argv[2] === '--cutover-child') {
         const lines = fs.readFileSync(journalFile(root), 'utf8').trimEnd().split('\n');
         return JSON.parse(lines.at(-1)).event;
     }
+
+    const mainPhases = ['agent-stop', 'main-publication', 'xray-restart', 'agent-start', 'agent-reconcile'];
+    const mainPlan = { ...plan, steps: [{ ...plan.steps[0], window: 'main-agent' }] };
+
+    function mainFixture(root, actions = {}) {
+        const binding = executor(root), { journal, adapter } = binding;
+        const trace = [], publications = [];
+        const clients = { forward: Buffer.from('drained clients A'), rollback: Buffer.from('drained clients B') };
+        const withClients = (image, direction) => actions.drain ? Buffer.concat([image, clients[direction]]) : image;
+        adapter.captureMainPublication = async ctx => {
+            assert.equal(journal.read(plan.scope).pending.checkpoint, 'agent-stop');
+            assert.equal(trace.at(-1), `${ctx.direction}:agent-stop`);
+            const before = fs.readFileSync(runtime(root, ctx.step.id));
+            const desired = adapter.open(ctx, ctx.direction === 'forward' ? ctx.artifacts.desired : ctx.artifacts.before);
+            const pins = { before: adapter.seal(ctx, before), desired: adapter.seal(ctx, withClients(desired, ctx.direction)) };
+            publications.push(pins);
+            return actions.capture ? actions.capture(ctx, pins) : pins;
+        };
+        const { dispatch, verify } = adapter;
+        adapter.dispatch = (ctx, submit) => ctx.step.window !== 'main-agent' ? dispatch(ctx, submit) : submit(async checkpoint => {
+            let previous = null;
+            for (const phase of mainPhases) {
+                const action = async phaseCtx => {
+                    const { pending } = journal.read(plan.scope);
+                    assert.equal(pending.checkpoint, phase);
+                    assert.deepEqual(pending.artifacts, ctx.artifacts);
+                    assert.equal(lastEvent(root).type, 'checkpoint');
+                    assert.deepEqual(phaseCtx.publication, pending.publication);
+                    if (phase === 'agent-stop' && actions.drain) {
+                        const file = runtime(root, ctx.step.id);
+                        const liveTopology = adapter.open(ctx, ctx.direction === 'forward' ? ctx.artifacts.before : ctx.artifacts.desired);
+                        fs.writeFileSync(file, withClients(liveTopology, ctx.direction));
+                    }
+                    if (phase === 'main-publication') {
+                        assert.deepEqual(pending.publication, publications.at(-1));
+                        assert(Object.isFrozen(phaseCtx.publication.before));
+                        const file = runtime(root, ctx.step.id);
+                        assert.deepEqual(fs.readFileSync(file), adapter.open(ctx, phaseCtx.publication.before));
+                        fs.writeFileSync(file, adapter.open(ctx, phaseCtx.publication.desired));
+                    }
+                    trace.push(`${ctx.direction}:${phase}`);
+                    if (actions.afterAction) await actions.afterAction(ctx, phase);
+                    return { privateDiagnostic: beforeImage };
+                };
+                previous = actions.atCheckpoint
+                    ? await actions.atCheckpoint(checkpoint, phase, previous, action)
+                    : await checkpoint(phase, previous, action);
+            }
+            return previous;
+        });
+        adapter.verify = (ctx, reply) => {
+            if (ctx.step.window !== 'main-agent') return verify(ctx, reply);
+            assert.deepEqual(reply.privateDiagnostic, beforeImage);
+            assert.equal(ctx.checkpoint, mainPhases.at(-1));
+            assert.deepEqual(ctx.publication, publications.at(-1));
+            const current = fs.readFileSync(runtime(root, ctx.step.id));
+            assert.deepEqual(current, adapter.open(ctx, ctx.publication.desired));
+            return adapter.seal(ctx, current);
+        };
+        adapter.verifyTerminal = ctx => {
+            assert.deepEqual(ctx.confirmed[0].publication, publications[0]);
+            const rollback = ctx.direction === 'rollback';
+            if (rollback) assert.deepEqual(ctx.restored[0].publication, publications[1]);
+            const step = ctx.plan.steps[0];
+            const expected = rollback ? beforeImage : Buffer.concat([beforeImage, Buffer.from(step.id)]);
+            assert.deepEqual(fs.readFileSync(runtime(root, step.id)), withClients(expected, ctx.direction));
+            return actions.inverse && !rollback ? false : adapter.seal(ctx, Buffer.from(ctx.direction));
+        };
+        return { ...binding, trace, publications };
+    }
+
+    for (const inverse of [false, true]) {
+        test(`v3 durable MAIN window with terminal proof (${inverse ? 'inverse' : 'forward'})`, async t => {
+            const root = scratch(t), binding = mainFixture(root, { inverse, drain: true });
+            const service = createScopedCutoverExecutor(binding);
+            assert.deepEqual(await service.execute(mainPlan), { status: inverse ? 'rolled-back' : 'applied', retryAllowed: false });
+            const state = fileJournal(root).read(plan.scope);
+            assert.equal(state.version, 3);
+            assert.deepEqual(state.plan, mainPlan);
+            assert.equal(state.pending, null);
+            assert.match(state.terminalProof.sha256, /^[a-f0-9]{64}$/);
+            assert.deepEqual(binding.trace, [
+                ...mainPhases.map(phase => `forward:${phase}`),
+                ...(inverse ? mainPhases.map(phase => `rollback:${phase}`) : [])
+            ]);
+            const [forward, rollback] = binding.publications;
+            const ctx = { plan, step: mainPlan.steps[0] };
+            assert.deepEqual(binding.adapter.open(ctx, forward.before), Buffer.concat([beforeImage, Buffer.from('drained clients A')]));
+            assert.notDeepEqual(forward.before, state.confirmed[0].artifacts.before);
+            if (inverse) {
+                assert.notDeepEqual(rollback.before, forward.desired);
+                assert.deepEqual(binding.adapter.open(ctx, rollback.before), Buffer.concat([
+                    beforeImage, Buffer.from(`${ctx.step.id}drained clients B`)
+                ]));
+                assert.deepEqual(fs.readFileSync(runtime(root, ctx.step.id)), Buffer.concat([beforeImage, Buffer.from('drained clients B')]));
+            }
+        });
+    }
+
+    for (const direction of ['forward', 'rollback']) {
+        test(`v3 lost ${direction} publication reply preserves pending pins and never starts or replays`, async t => {
+            const inverse = direction === 'rollback';
+            const root = scratch(t), binding = mainFixture(root, { inverse, afterAction(ctx, phase) {
+                if (ctx.direction === direction && phase === 'main-publication') {
+                    throw Object.assign(Error('fixture lost reply'), { notDispatched: true });
+                }
+            } });
+            const service = createScopedCutoverExecutor(binding);
+            assert.deepEqual(await service.execute(mainPlan), { status: 'unknown', retryAllowed: false });
+            const before = fs.readFileSync(journalFile(root));
+            const fresh = await child(t, root, 'reopen', mainPlan);
+            const { journal, observation, retryAllowed } = fresh.result.observation;
+            assert.equal(journal.pending.direction, direction);
+            assert.equal(journal.pending.checkpoint, 'main-publication');
+            assert.deepEqual(journal.pending.publication, binding.publications.at(-1));
+            assert.equal(journal.confirmed.length, Number(inverse));
+            assert.equal(journal.restored.length, 0);
+            assert.equal(journal.terminalProof, null);
+            assert.equal(observation, 'after');
+            assert.equal(retryAllowed, false);
+            assert.deepEqual(binding.trace, [
+                ...(inverse ? mainPhases.map(phase => `forward:${phase}`) : []),
+                `${direction}:agent-stop`, `${direction}:main-publication`
+            ]);
+            assert.equal(fresh.result.replay.status, 'already-recorded');
+            assert.deepEqual(await fresh.exited, [0, null]);
+            assert.deepEqual(fs.readFileSync(journalFile(root)), before);
+        });
+    }
+
+    const invalid = { code: 'REBUILD_CUTOVER_INVALID' };
+    for (const fault of ['order', 'altered receipt', 'surplus pins', 'duplicate']) {
+        test(`v3 ${fault} is sticky even when the adapter catches the refusal`, async t => {
+            const root = scratch(t);
+            const binding = mainFixture(root, { async atCheckpoint(checkpoint, phase, previous, action) {
+                if (phase !== 'main-publication') return checkpoint(phase, previous, action);
+                const forbidden = () => assert.fail('invalid checkpoint dispatched');
+                const invalidArgs = {
+                    order: ['xray-restart', previous, forbidden],
+                    'altered receipt': [phase, { ...previous }, forbidden],
+                    'surplus pins': [phase, previous, forbidden, { desired: {} }],
+                    duplicate: ['agent-stop', null, forbidden]
+                };
+                await assert.rejects(checkpoint(...invalidArgs[fault]), invalid);
+                return checkpoint(phase, previous, action);
+            } });
+            const service = createScopedCutoverExecutor(binding);
+            assert.equal((await service.execute(mainPlan)).status, 'unknown');
+            assert.equal(binding.journal.read(plan.scope).pending.checkpoint, 'agent-stop');
+            assert.equal(binding.publications.length, 0);
+            assert.deepEqual(binding.trace, ['forward:agent-stop']);
+        });
+    }
+
+    test('v3 rejects stale intent pins in place of newly authenticated post-drain pins', async t => {
+        const root = scratch(t), binding = mainFixture(root, { capture: ctx => ctx.artifacts });
+        const service = createScopedCutoverExecutor(binding);
+        assert.equal((await service.execute(mainPlan)).status, 'unknown');
+        const { pending } = binding.journal.read(plan.scope);
+        assert.equal(pending.checkpoint, 'agent-stop');
+        assert.equal(pending.publication, undefined);
+        assert.deepEqual(binding.trace, ['forward:agent-stop']);
+    });
+
+    test('v3 revokes a detached checkpoint waiting for a live fence and refuses late reuse', async t => {
+        const root = scratch(t), binding = mainFixture(root), { adapter } = binding;
+        const { promise, resolve } = Promise.withResolvers();
+        let detached, saved, waiting = false, effects = 0;
+        const verifyFence = adapter.verifyFence;
+        adapter.verifyFence = ctx => waiting ? promise : verifyFence(ctx);
+        adapter.dispatch = (ctx, submit) => submit(checkpoint => {
+            saved = checkpoint;
+            waiting = true;
+            detached = checkpoint('agent-stop', null, () => { effects++; });
+            return {}; // not the joined final receipt
+        });
+        const service = createScopedCutoverExecutor(binding);
+        assert.equal((await service.execute(mainPlan)).status, 'unknown');
+        resolve(true);
+        await assert.rejects(detached, invalid);
+        await assert.rejects(saved('agent-stop', null, () => { effects++; }), invalid);
+        assert.equal(effects, 0);
+        assert.equal(binding.journal.read(plan.scope).pending.checkpoint, null);
+    });
+
+    test('v3 ignores a completed native tail without the original final checkpoint receipt', async t => {
+        const root = scratch(t), binding = mainFixture(root);
+        const { dispatch } = binding.adapter;
+        binding.adapter.dispatch = (ctx, submit) => dispatch(ctx, effect => submit(async checkpoint => {
+            await effect(checkpoint);
+            return Object.freeze({});
+        }));
+        const service = createScopedCutoverExecutor(binding);
+        assert.equal((await service.execute(mainPlan)).status, 'unknown');
+        assert.deepEqual(binding.trace, mainPhases.map(phase => `forward:${phase}`));
+        assert.equal(binding.journal.read(plan.scope).pending.checkpoint, 'agent-reconcile');
+        assert.equal(binding.journal.read(plan.scope).confirmed.length, 0);
+    });
+
+    for (const fault of ['fence lost during capture', 'journal replaced during capture', 'lost checkpoint sync reply']) {
+        test(`v3 ${fault} prevents publication and leaves the previous intent intact`, async t => {
+            const root = scratch(t);
+            const binding = mainFixture(root, { capture(ctx, pins) {
+                if (fault === 'fence lost during capture') {
+                    fs.writeFileSync(path.join(root, 'fixture-fence'), randomUUID());
+                } else if (fault === 'journal replaced during capture') {
+                    const file = journalFile(root), replacement = path.join(root, 'replacement');
+                    fs.writeFileSync(replacement, fs.readFileSync(file), { mode: 0o600 });
+                    fs.renameSync(replacement, file);
+                }
+                return pins;
+            } });
+            let syncLost = false;
+            if (fault === 'lost checkpoint sync reply') {
+                const sync = fs.fsyncSync;
+                t.mock.method(fs, 'fsyncSync', fd => {
+                    sync(fd);
+                    if (binding.publications.length && lastEvent(root).phase === 'main-publication') {
+                        syncLost = true;
+                        throw Error('fixture lost fsync reply');
+                    }
+                });
+            }
+            const service = createScopedCutoverExecutor(binding);
+            assert.equal((await service.execute(mainPlan)).status, 'unknown');
+            assert.equal(syncLost, fault === 'lost checkpoint sync reply');
+            const { pending } = fileJournal(root).read(plan.scope);
+            assert.equal(pending.checkpoint, syncLost ? 'main-publication' : 'agent-stop');
+            assert.deepEqual(binding.trace, ['forward:agent-stop']);
+            assert.deepEqual(fs.readFileSync(runtime(root, mainPlan.steps[0].id)), beforeImage);
+            assert.equal((await service.execute(mainPlan)).status, 'already-recorded');
+        });
+    }
+
+    test('v3 complete checkpoints and ACK still require independent terminal proof', async t => {
+        const root = scratch(t), binding = mainFixture(root);
+        binding.adapter.verifyTerminal = () => { throw Error('fixture terminal proof unavailable'); };
+        const service = createScopedCutoverExecutor(binding);
+        assert.deepEqual(await service.execute(mainPlan), { status: 'blocked', retryAllowed: false });
+        const state = binding.journal.read(plan.scope);
+        assert.equal(state.confirmed.length, 1);
+        assert.equal(state.pending, null);
+        assert.equal(state.terminalProof, null);
+        assert.deepEqual(state.terminalFailure, { direction: 'forward', reason: 'proof' });
+    });
+
+    test('v3 marker is explicit and needs a publication capture hook before reservation', async t => {
+        const root = scratch(t), binding = executor(root), service = createScopedCutoverExecutor(binding);
+        await assert.rejects(service.execute(mainPlan), invalid);
+        await assert.rejects(service.execute({ ...mainPlan, steps: [{ ...mainPlan.steps[0], window: 'other' }] }), invalid);
+        assert.equal(binding.journal.read(plan.scope), null);
+        assert.equal((await service.execute(plan)).status, 'applied');
+        assert.equal(binding.journal.read(plan.scope).version, 2);
+    });
+
+    test('v3 mixed plan gives an unmarked step the original submit contract', async t => {
+        const root = scratch(t), binding = mainFixture(root), { adapter } = binding;
+        const input = { ...mainPlan, steps: [mainPlan.steps[0], plan.steps[1]] };
+        const { dispatch, verifyTerminal } = adapter;
+        adapter.dispatch = (ctx, submit) => dispatch(ctx, ctx.step.window ? submit : effect => submit((...args) => {
+            assert.equal(args.length, 0);
+            assert.equal(ctx.checkpoint, undefined);
+            return effect();
+        }));
+        adapter.verifyTerminal = ctx => {
+            assert.deepEqual(effects(root), [`forward:${input.steps[1].id}`]);
+            assert.equal(ctx.confirmed[1].publication, undefined);
+            return verifyTerminal(ctx);
+        };
+        const service = createScopedCutoverExecutor(binding);
+        assert.equal((await service.execute(input)).status, 'applied');
+        assert.equal(binding.journal.read(plan.scope).version, 3);
+        assert.deepEqual(binding.trace, mainPhases.map(phase => `forward:${phase}`));
+    });
+
+    function writeFrames(root, events) {
+        let prev = '0'.repeat(64);
+        const bytes = Buffer.from(events.map(event => {
+            const sha256 = digest(JSON.stringify({ prev, event }));
+            const line = JSON.stringify({ prev, event, sha256 }) + '\n';
+            prev = sha256;
+            return line;
+        }).join(''));
+        const file = path.join(root, 'journal', `cutover-${digest(plan.scope)}.jsonl`);
+        fs.writeFileSync(file, bytes, { mode: 0o600 });
+        return { file, bytes };
+    }
+
+    test('historical v1 accepts proof-less finish, v2 does not downgrade terminal proof', async t => {
+        const root = scratch(t), binding = executor(root), service = createScopedCutoverExecutor(binding);
+        const step = plan.steps[0], input = { ...plan, steps: [step] };
+        const receipt = { id: randomUUID(), sha256: digest('historical artifact') };
+        const events = [{ type: 'start', version: 1, plan: input },
+            { type: 'intent', direction: 'forward', stepId: step.id, artifacts: { before: receipt, desired: receipt } },
+            { type: 'ack', confirmed: receipt }, { type: 'proved' }, { type: 'finish', status: 'applied' }];
+        const { file, bytes } = writeFrames(root, events);
+        assert.equal((await service.reconcile(plan.scope)).journal.status, 'applied');
+        assert.equal((await service.execute(input)).status, 'already-recorded');
+        assert.deepEqual(fs.readFileSync(file), bytes);
+        writeFrames(root, [{ ...events[0], version: 2 }, ...events.slice(1)]);
+        assert.throws(() => binding.journal.read(plan.scope), uncertain);
+        for (const version of [1, 2]) {
+            writeFrames(root, [{ type: 'start', version, plan: mainPlan }]);
+            assert.throws(() => binding.journal.read(plan.scope), uncertain);
+        }
+    });
+
+    test('v3 rejects rehashed checkpoints and ACKs that cannot follow the durable intent', async t => {
+        const root = scratch(t), journal = fileJournal(root);
+        const step = mainPlan.steps[0];
+        const artifacts = Object.fromEntries(['before', 'desired'].map(side => [side, { id: randomUUID(), sha256: digest(side) }]));
+        const intent = { type: 'intent', direction: 'forward', stepId: step.id, artifacts };
+        const marker = { type: 'checkpoint', phase: 'agent-stop' };
+        const start = { type: 'start', version: 3, plan: mainPlan };
+        const publication = { type: 'checkpoint', phase: 'main-publication', artifacts };
+        const phases = mainPhases.map(phase => phase === 'main-publication'
+            ? { ...publication, artifacts: { before: { ...artifacts.before, id: randomUUID() }, desired: { ...artifacts.desired, id: randomUUID() } } }
+            : { type: 'checkpoint', phase });
+        for (const frames of [[start, intent, publication], [start, intent, marker, marker],
+            [start, intent, marker, publication], [start, intent, marker, { type: 'ack', confirmed: artifacts.desired }],
+            [start, intent, marker, { type: 'not-dispatched', reason: 'handoff' }],
+            [{ ...start, plan: { ...mainPlan, steps: [plan.steps[0], { ...plan.steps[1], window: step.window }] } }, intent, marker],
+            [start, intent, ...phases, { type: 'ack', confirmed: artifacts.desired }, { type: 'proved' }, { type: 'finish', status: 'applied' }]]) {
+            writeFrames(root, frames);
+            assert.throws(() => journal.read(plan.scope), uncertain);
+        }
+    });
 
     for (const fault of ['file-fsync', 'directory-fsync', 'readback']) {
         test(`intent ${fault} failure cannot reach first handoff`, async t => {

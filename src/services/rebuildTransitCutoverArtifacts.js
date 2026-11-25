@@ -22,10 +22,17 @@ const need = condition => { if (!condition) throw refused(); };
 
 function associatedData({ plan, step }, side, id) {
     need(valid(LABEL, plan.scope) && valid(UUID, plan.operationId) && valid(UUID, plan.fenceId)
-        && valid(SHA, plan.planDigest) && valid(LABEL, step.id) && valid(UUID, id)
-        && ['before', 'desired', 'confirmed'].includes(side));
-    return Buffer.from(JSON.stringify(['rebuild-cutover-artifact-v1', plan.scope, plan.operationId,
-        plan.fenceId, plan.planDigest, step.id, side, id]));
+        && valid(SHA, plan.planDigest) && valid(LABEL, step.id) && valid(UUID, id));
+    if (['before', 'desired', 'confirmed'].includes(side)) {
+        return Buffer.from(JSON.stringify(['rebuild-cutover-artifact-v1', plan.scope, plan.operationId,
+            plan.fenceId, plan.planDigest, step.id, side, id]));
+    }
+    // Opened by capture, handoff, and crash observation. A rollback publication
+    // must not adopt the logically adjacent forward publication or its receipt.
+    need(step.window === 'main-agent' && plan.steps?.some(entry => entry.id === step.id && entry.window === step.window)
+        && valid(/^publication-(forward|rollback)-(before|desired)(?![\s\S])/, side));
+    return Buffer.from(JSON.stringify(['rebuild-cutover-publication-v1', plan.scope, plan.operationId,
+        plan.fenceId, plan.planDigest, step.id, step.window, side, id]));
 }
 
 // A private, already provisioned durable directory and a trusted 256-bit key

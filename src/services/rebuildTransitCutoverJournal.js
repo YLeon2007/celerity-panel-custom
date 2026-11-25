@@ -7,6 +7,8 @@ const { createHash } = require('node:crypto');
 const MAX_STEPS = 128;
 const MAX_BYTES = 512 * 1024;
 const PHASES = ['prepare', 'selector', 'portal'];
+const MAIN_PHASES = ['agent-stop', 'main-publication', 'xray-restart', 'agent-start', 'agent-reconcile'];
+const mainWindow = step => step.window === 'main-agent';
 const ZERO = '0'.repeat(64);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -24,7 +26,7 @@ const exact = (record, keys) => record && Object.getPrototypeOf(record) === Obje
 
 // All labels and pins are non-secret. A plan digest identifies a separately
 // approved immutable manifest; neither the manifest nor its raw config is logged.
-function checkedPlan(value) {
+function checkedPlan(value, version = 3) {
     need(exact(value, ['scope', 'operationId', 'fenceId', 'planDigest', 'steps']));
     const { scope, operationId, fenceId, planDigest, steps } = value;
     need(matches(LABEL, scope) && matches(UUID, operationId) && matches(UUID, fenceId) && matches(SHA256, planDigest));
@@ -34,12 +36,13 @@ function checkedPlan(value) {
     const checked = [];
     for (let index = 0; index < steps.length; index++) {
         const step = Object.getOwnPropertyDescriptor(steps, index)?.value;
-        need(exact(step, ['id', 'phase']) && matches(LABEL, step.id) && !ids.has(step.id));
+        const window = version === 3 && exact(step, ['id', 'phase', 'window']) && mainWindow(step);
+        need((window || exact(step, ['id', 'phase'])) && matches(LABEL, step.id) && !ids.has(step.id));
         const next = PHASES.indexOf(step.phase);
         need(next >= phase);
         phase = next;
         ids.add(step.id);
-        checked.push({ id: step.id, phase: step.phase });
+        checked.push({ id: step.id, phase: step.phase, ...(window && { window: 'main-agent' }) });
     }
     return { scope, operationId, fenceId, planDigest, steps: checked };
 }
@@ -57,13 +60,22 @@ const nextInverse = state => state.confirmed[state.confirmed.length - state.rest
 const forwardComplete = state => !state.refusal && state.proved && !nextForward(state);
 const inverseComplete = state => state.refusal && state.confirmed.length && !nextInverse(state);
 
+function mainPublication(state, value) {
+    const pins = captured(value);
+    const { direction, artifacts } = state.pending;
+    const original = direction === 'rollback' ? nextInverse(state).publication : undefined;
+    const ids = [...Object.values(artifacts), ...Object.values(original ?? {})].map(artifact => artifact.id);
+    need(pins.before.id !== pins.desired.id && !ids.includes(pins.before.id) && !ids.includes(pins.desired.id));
+    return pins;
+}
+
 // One state machine is used for both the writer and fresh readers. A pending
 // intent, even with a current before-image, can never be turned into an ACK by it.
 function advance(state, event, scope) {
     if (!state) {
-        need(exact(event, ['type', 'version', 'plan']) && event.type === 'start' && [1, 2].includes(event.version));
-        const plan = checkedPlan(event.plan);
-        need(plan.scope === scope);
+        need(exact(event, ['type', 'version', 'plan']) && event.type === 'start' && [1, 2, 3].includes(event.version));
+        const plan = checkedPlan(event.plan, event.version);
+        need(plan.scope === scope && (event.version !== 3 || plan.steps.some(mainWindow)));
         return { plan, version: event.version, status: 'interrupted', proved: false, pending: null,
             terminalProof: null, terminalFailure: null,
             confirmed: [], restored: [], refusal: null, rollbackRefusal: null };
@@ -77,7 +89,7 @@ function advance(state, event, scope) {
     case 'stop':
         need(exact(event, ['type', 'reason']) && !state.pending && !state.refusal);
         need(['capture', 'fence', 'proof'].includes(event.reason)
-            || (state.version === 2 && event.reason === 'terminal-proof' && forwardComplete(state)));
+            || (state.version >= 2 && event.reason === 'terminal-proof' && forwardComplete(state)));
         state.refusal = { step: nextForward(state) ?? null, reason: event.reason };
         if (event.reason === 'fence' && state.confirmed.length) state.status = 'blocked';
         break;
@@ -95,21 +107,35 @@ function advance(state, event, scope) {
             need(original?.step.id === event.stepId);
             state.pending = { direction: 'rollback', step: original.step, artifacts: original.artifacts };
         }
+        if (mainWindow(state.pending.step)) state.pending.checkpoint = null;
         state.status = 'unknown';
+        break;
+    }
+    case 'checkpoint': {
+        const pending = state.pending;
+        need(state.version === 3 && pending && mainWindow(pending.step));
+        const phase = MAIN_PHASES[MAIN_PHASES.indexOf(pending.checkpoint) + 1];
+        const publication = phase === 'main-publication';
+        need(phase && exact(event, publication ? ['type', 'phase', 'artifacts'] : ['type', 'phase']) && event.phase === phase);
+        if (publication) pending.publication = mainPublication(state, event.artifacts);
+        pending.checkpoint = phase;
         break;
     }
     case 'ack': {
         need(exact(event, ['type', 'confirmed']) && state.pending);
-        const { direction, step, artifacts } = state.pending;
+        const { direction, step, artifacts, checkpoint, publication } = state.pending;
+        need(!mainWindow(step) || checkpoint === MAIN_PHASES.at(-1));
+        const window = publication ? { publication } : {};
         const confirmed = pin(event.confirmed);
-        if (direction === 'forward') state.confirmed.push({ step, artifacts: { ...artifacts, confirmed } });
-        else state.restored.push({ step, confirmed });
+        if (direction === 'forward') state.confirmed.push({ step, artifacts: { ...artifacts, confirmed }, ...window });
+        else state.restored.push({ step, confirmed, ...window });
         state.pending = null;
         state.status = 'interrupted';
         break;
     }
     case 'not-dispatched': {
-        need(exact(event, ['type', 'reason']) && state.pending && ['fence', 'handoff'].includes(event.reason));
+        need(exact(event, ['type', 'reason']) && state.pending && !state.pending.checkpoint
+            && ['fence', 'handoff'].includes(event.reason));
         const refusal = { step: state.pending.step, reason: event.reason };
         if (state.pending.direction === 'forward') state.refusal = refusal;
         else state.rollbackRefusal = refusal;
@@ -118,14 +144,14 @@ function advance(state, event, scope) {
         break;
     }
     case 'terminal-blocked':
-        need(state.version === 2 && !state.pending && exact(event, ['type', 'direction', 'reason'])
+        need(state.version >= 2 && !state.pending && exact(event, ['type', 'direction', 'reason'])
             && ['fence', 'proof'].includes(event.reason)
             && (event.direction === 'forward' ? forwardComplete(state) : event.direction === 'rollback' && inverseComplete(state)));
         state.terminalFailure = { direction: event.direction, reason: event.reason };
         state.status = 'blocked';
         break;
     case 'finish': {
-        const requiresProof = state.version === 2 && event.status !== 'not-dispatched';
+        const requiresProof = state.version >= 2 && event.status !== 'not-dispatched';
         need(!state.pending && exact(event, requiresProof ? ['type', 'status', 'proof'] : ['type', 'status']));
         if (event.status === 'applied') need(forwardComplete(state));
         else if (event.status === 'rolled-back') need(inverseComplete(state));
@@ -149,12 +175,14 @@ function decode(scope, bytes) {
     need(text.endsWith('\n') && Buffer.from(text).equals(bytes));
     let head = ZERO, state = null;
     const lines = text.slice(0, -1).split('\n');
-    need(lines.length <= 4 * MAX_STEPS + 4);
+    const legacyLimit = 4 * MAX_STEPS + 4;
+    need(lines.length <= legacyLimit + 2 * MAIN_PHASES.length * MAX_STEPS);
     for (const line of lines) {
         const { event } = JSON.parse(line);
         const record = encode(head, event);
         need(record.bytes.toString('utf8') === line + '\n');
         state = advance(state, event, scope);
+        need(state.version === 3 || lines.length <= legacyLimit);
         head = record.head;
     }
     return { ...state, head };
@@ -248,7 +276,7 @@ function createFileCutoverJournal({ directory } = {}) {
                     state = { ...candidate, head };
                     return structuredClone(state);
                 }
-                record({ type: 'start', version: 2, plan });
+                record({ type: 'start', version: plan.steps.some(mainWindow) ? 3 : 2, plan });
                 return await run({ record, assertCurrent, state: () => structuredClone(state) });
             } finally { fs.closeSync(fd); }
         } finally { fs.closeSync(dir); }
@@ -287,9 +315,26 @@ function frozen(value) {
  *   fresh generation. `history` contains just the durable forward/inverse ACKs,
  *   in each direction's execution order; `artifacts.confirmed` is the original
  *   forward effect's pin, not necessarily the current generation.
+ * - A step with `window: 'main-agent'` opts the journal into v3. For that step
+ *   only, `submit(async checkpoint => ...)` replaces the undivided handoff.
+ *   Await `checkpoint(phase, previous, action)` for each MAIN_PHASES entry;
+ *   pass null first, then the preceding opaque receipt, and return the final
+ *   receipt from the effect. Each action receives the frozen current context.
+ *   It must join and verify its native phase before returning; throw on missing
+ *   or uncertain results. Never dispatch outside these action callbacks.
+ * - captureMainPublication(ctx) is required for marked steps. After the stop
+ *   has settled it must independently prove the drain and seal/reopen exact
+ *   live before and authorized desired images as fresh {before, desired} pins,
+ *   preserving post-drain managed clients. Bind the artifacts to this step,
+ *   operation, direction and live generation, and derive the inverse from the
+ *   original intent and latest ACK, not from a changed plan. Do not mutate MAIN
+ *   here. The journal passes those immutable pins in `ctx.publication`; the
+ *   publication action must use them for the actual native byte/generation CAS.
  * - verify(ctx, nativeReply): independently authenticate the settled effect and
  *   exact readback (not just the reply); return a durable encrypted artifact pin
- *   including the observed generations, or refuse. No target mutations here.
+ *   including the observed generations, or refuse. For a marked step, ctx has
+ *   the final checkpoint and publication pins; nativeReply is the final
+ *   action's reply. No target mutations here.
  * - prove({plan, confirmed}): true only after the read-only preparation proof
  *   (including old and new path checks). Called once before selectors or portals.
  * - verifyTerminal({plan, direction, confirmed, restored, step}): read-only on
@@ -320,8 +365,49 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
             : { type: 'intent', direction, stepId: step.id };
         const state = tx.record(record);
         const ctx = frozen({ plan, ...state.pending, history: history(state) });
+        const window = mainWindow(step);
+        let phaseCtx = ctx;
         let open = true, called = false, checkingHandoff = false, entered = false, duplicate = false;
         let fenceLost = false, journalLost = false, receipt, nativeReply, returned;
+        let phaseOpen = false, phaseFailed = false, index = 0, previous = null;
+        const usable = () => open && phaseOpen && !phaseFailed && !duplicate;
+        function assertPhaseCurrent() {
+            if (!usable()) throw invalid();
+            tx.assertCurrent();
+        }
+        function checkpoint(phase, predecessor, action) {
+            const exactArity = arguments.length === 3;
+            const attempt = (async () => {
+                try {
+                    if (!usable() || previous === undefined || index === MAIN_PHASES.length || phase !== MAIN_PHASES[index]
+                        || predecessor !== previous || !exactArity || typeof action !== 'function') throw invalid();
+                    previous = undefined; // consume before waiting or calling untrusted I/O
+                    assertPhaseCurrent();
+                    if (!await checkFence(phaseCtx)) throw invalid();
+                    assertPhaseCurrent();
+                    let artifacts;
+                    if (phase === 'main-publication') {
+                        artifacts = captured(await adapter.captureMainPublication(phaseCtx));
+                        assertPhaseCurrent();
+                        if (!await checkFence(frozen({ ...phaseCtx, publication: artifacts }))) throw invalid();
+                        assertPhaseCurrent();
+                    }
+                    const { pending } = tx.record({ type: 'checkpoint', phase, ...(artifacts && { artifacts }) });
+                    phaseCtx = frozen({ ...ctx, ...pending });
+                    if (!await checkFence(phaseCtx)) throw invalid();
+                    assertPhaseCurrent();
+                    nativeReply = await action(phaseCtx);
+                    assertPhaseCurrent();
+                    index++;
+                    return previous = Object.freeze({});
+                } catch (err) {
+                    phaseFailed = true; // a swallowed refusal cannot reuse or advance this window
+                    throw err;
+                }
+            })();
+            attempt.catch(() => {});
+            return attempt;
+        }
         function submit(effect) {
             const attempt = (async () => {
                 if (!open) throw invalid();
@@ -334,7 +420,13 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
                 if (!open) throw invalid();
                 try { tx.assertCurrent(); } catch { journalLost = true; throw uncertain(); }
                 entered = true; // latch before a single potentially effectful handoff
-                nativeReply = await effect();
+                if (window) {
+                    phaseOpen = true;
+                    try {
+                        const completed = await effect(checkpoint);
+                        if (!usable() || index !== MAIN_PHASES.length || completed !== previous) throw invalid();
+                    } finally { phaseOpen = false; }
+                } else nativeReply = await effect();
                 receipt = Object.freeze({});
                 return receipt;
             })();
@@ -347,7 +439,7 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
             catch { /* Never trust a thrown or returned no-send claim after handoff. */ }
             finally { open = false; }
         } else { open = false; fenceLost = true; }
-        if (journalLost) return 'unknown';
+        if (journalLost || (window && (phaseFailed || duplicate || checkingHandoff))) return 'unknown';
         if (!entered) {
             // An adapter that detached a still-running authority check has not
             // joined it. Revocation proves zero handoff, not continuous fencing.
@@ -355,10 +447,11 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
             tx.record({ type: 'not-dispatched', reason });
             return reason;
         }
-        if (duplicate || !receipt || returned !== receipt || !await checkFence(ctx)) return 'unknown';
+        if (duplicate || !receipt || returned !== receipt || !await checkFence(phaseCtx)
+            || (window && (phaseFailed || duplicate))) return 'unknown';
         let confirmed;
-        try { confirmed = pin(await adapter.verify(ctx, nativeReply)); } catch { return 'unknown'; }
-        if (!await checkFence(ctx)) return 'unknown';
+        try { confirmed = pin(await adapter.verify(phaseCtx, nativeReply)); } catch { return 'unknown'; }
+        if (!await checkFence(phaseCtx) || (window && (phaseFailed || duplicate))) return 'unknown';
         tx.record({ type: 'ack', confirmed });
         return 'ack';
     }
@@ -424,6 +517,7 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
         async execute(input) {
             let plan;
             try { plan = frozen(checkedPlan(input)); } catch { throw invalid(); }
+            if (plan.steps.some(mainWindow) && typeof adapter.captureMainPublication !== 'function') throw invalid();
             try { return await reserve(plan, tx => run(tx, plan)); }
             catch { return outcome('unknown'); }
         },
