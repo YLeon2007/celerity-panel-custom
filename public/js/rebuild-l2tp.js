@@ -400,13 +400,13 @@
         updateMutations();
     }
 
-    function installProgress(nodeId, csrf) {
+    function installProgress(nodeId, csrf, consented) {
         const initial = hex(nodeId, 24) && page.querySelector(`[data-install-progress][data-progress-node="${nodeId}"]`);
         if (initial) initial.hidden = false;
         const progress = new AbortController();
         window.addEventListener('pagehide', () => progress.abort(), { once: true, signal: progress.signal });
         try {
-            const stop = window.rebuildL2tpInstallProgress?.start(page, nodeId);
+            const stop = window.rebuildL2tpInstallProgress?.start(page, nodeId, consented);
             if (stop) progress.signal.addEventListener('abort', stop, { once: true });
         } catch { /* Progress is observational only. */ }
         // Item 2 can observe the outstanding synchronous POST without access
@@ -672,22 +672,143 @@
         updateMutations();
     }
 
-    async function mutate(action, url, body, match, nodeId) {
+    // Install conflict keys are identifiers, not paths. Never render paths,
+    // names or descriptions supplied by the Install response.
+    const foreignPaths = new Map([
+        ['SWAN_PROFILE_PRESENT', ['/etc/strongswan.d/celerity-rebuild-l2tp.conf']],
+        ['IKE_PROFILE_PRESENT', ['/etc/ipsec.d/celerity-rebuild-l2tp.conf']],
+        ['OPTIONS_PRESENT', ['/etc/ppp/options.xl2tpd']],
+        ['STARTER_NOT_STOCK', ['/etc/ipsec.conf']],
+        ['SECRETS_NOT_EMPTY', ['/etc/ipsec.secrets']],
+        ['CHAP_NOT_EMPTY', ['/etc/ppp/chap-secrets']],
+        ['LNS_NOT_STOCK', ['/etc/xl2tpd/xl2tpd.conf']],
+        ['XRAY_UNIT_0666', ['/etc/systemd/system/xray.service']],
+        ['XRAY_BRIDGE_UNIT_0666', ['/etc/systemd/system/xray-bridge.service']],
+        ['UNIT_WRITABLE', ['/etc/systemd/system/xray.service', '/etc/systemd/system/xray-bridge.service']],
+        ['NFT_DIR_PRESENT', ['/etc/celerity-rebuild-l2tp/']],
+        ['DROPIN_PRESENT', ['/etc/systemd/system/xl2tpd.service.d/']],
+        ['MODULES_LOAD_FOREIGN', ['/etc/modules-load.d/c3-l2tp.conf']],
+        ['NETWORK_UNIT_ORPHANED', ['/etc/systemd/system/celerity-rebuild-l2tp-network.service']],
+        ['LEGACY_NFT_PRESENT', ['/etc/nftables.d/celerity-l2tp.nft']],
+        ['IPSEC_D_FOREIGN_CONF', ['/etc/ipsec.d/']],
+        ['SWAN_TREE_NOT_STOCK', ['/etc/strongswan.d/', '/etc/strongswan.conf']],
+        ['CONFFILE_UNKNOWN', ['/etc/ipsec.conf', '/etc/ipsec.secrets', '/etc/xl2tpd/xl2tpd.conf']],
+        ['INCLUDE_FOREIGN', ['/etc/ipsec.conf', '/etc/ipsec.secrets']],
+    ]);
+    const xrayModeKeys = new Set(['XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666']);
+    const foreignCode = 'REBUILD_L2TP_FOREIGN_CONFIG';
+    const changedForeignCode = 'REBUILD_L2TP_FOREIGN_CONFIG_CHANGED';
+    function cleanupChallenge(error) {
+        if (!error || ![foreignCode, changedForeignCode].includes(error.code)
+            || error.outcome !== 'refused' || error.check !== 'L2TP_FOREIGN_CONFIG') return;
+        const { keys, cleanable, manual, cleanupToken } = error;
+        if (![keys, cleanable, manual].every(list => Array.isArray(list) && list.length <= foreignPaths.size)
+            || !keys.length || keys.length !== cleanable.length + manual.length) return;
+        const partition = new Set([...cleanable, ...manual]);
+        if (partition.size !== keys.length || new Set(keys).size !== keys.length
+            || !keys.every(key => foreignPaths.has(key) && partition.has(key))) return;
+        if (!manual.length && !hex(cleanupToken, 64)) return;
+        return { cleanable, manual, token: cleanupToken, changed: error.code === changedForeignCode };
+    }
+
+    function askForeignCleanup(modal, relayName, { cleanable, manual, changed }) {
+        const field = name => modal.querySelector(`[data-foreign-cleanup-${name}]`);
+        const canConfirm = !manual.length;
+        const confirm = field('confirm'), cancel = field('cancel');
+        const xray = field('xray').querySelector('input');
+        const modes = cleanable.filter(key => xrayModeKeys.has(key));
+        function list(name, keys) {
+            const container = field(name);
+            const items = [...new Set(keys.flatMap(key => foreignPaths.get(key)))].map(path => {
+                const item = document.createElement('li'), label = document.createElement('code');
+                label.textContent = path;
+                item.append(label);
+                return item;
+            });
+            container.querySelector('ul').replaceChildren(...items);
+            container.hidden = !items.length;
+        }
+        field('title').textContent = modal.dataset.title.replace('{name}', () => relayName);
+        field('changed').hidden = !changed;
+        field('instructions').hidden = !canConfirm;
+        list('files', cleanable.filter(key => !xrayModeKeys.has(key)));
+        list('manual', manual);
+        list('xray', modes);
+        xray.checked = !!modes.length;
+        xray.disabled = !modes.length || !canConfirm;
+        confirm.hidden = confirm.disabled = !canConfirm;
+
+        return new Promise((resolve, reject) => {
+            const listeners = new AbortController();
+            const options = { signal: listeners.signal };
+            let choice, pressedOutside = false;
+            const outside = event => {
+                if (event.target !== modal) return false;
+                const { left, right, top, bottom } = modal.getBoundingClientRect();
+                return event.clientX < left || event.clientX >= right || event.clientY < top || event.clientY >= bottom;
+            };
+            modal.addEventListener('pointerdown', event => { pressedOutside = outside(event); }, options);
+            modal.addEventListener('click', event => { if (pressedOutside && outside(event)) modal.close(); }, options);
+            cancel.addEventListener('click', () => modal.close(), options);
+            confirm.addEventListener('click', () => {
+                if (!modal.open || !canConfirm || !active) return;
+                choice = { fixXrayUnitMode: !!modes.length && xray.checked };
+                modal.close();
+            }, options);
+            modal.addEventListener('close', () => { listeners.abort(); resolve(choice); }, options);
+            window.addEventListener('pagehide', () => {
+                listeners.abort();
+                if (modal.open) modal.close();
+                resolve();
+            }, options);
+            try { modal.showModal(); }
+            catch (error) { listeners.abort(); reject(error); }
+        });
+    }
+
+    async function mutate(action, url, body, match, nodeId, installButton) {
         if (!active || busy || flow || requireRefresh) return;
         lockForAction();
         setActionStatus(words.working, nodeId);
-        const csrf = page.dataset.csrf, token = nonce();
+        const csrf = page.dataset.csrf;
+        let token = nonce();
         let result = 'uncertain', note = '';
         const revocation = action === 'disable' || action === 'delete';
         const accepted = action === 'install' ? [expected[action]] : [expected[action], 'canceled'];
-        let unknown = true, endProgress;
+        let unknown = true;
         try {
-            if (action === 'install') endProgress = installProgress(nodeId, csrf);
-            const { response, data } = await post(url, body, undefined, token, csrf);
-            if (!active) return;
+            let response, data;
+            for (;;) {
+                unknown = true;
+                const endProgress = action === 'install' ? installProgress(nodeId, csrf, !!body.foreignCleanup) : null;
+                try { ({ response, data } = await post(url, body, undefined, token, csrf)); }
+                finally { endProgress?.(); }
+                if (!active) return;
+                unknown = ambiguous(response, data);
+                const challenge = action === 'install' && response.status === 409 && !noRetry(data)
+                    && cleanupChallenge(data?.error);
+                const modal = challenge && page.querySelector('[data-foreign-cleanup-dialog]');
+                if (!modal || !isCurrent(installButton)) break;
+
+                setActionStatus(words.installRefused, nodeId);
+                const choice = await askForeignCleanup(modal, installButton.dataset.nodeName, challenge);
+                if (!active) return;
+                const confirmed = choice && isCurrent(installButton);
+                const next = confirmed && nonce();
+                if (!next || next === token) {
+                    setActionStatus(words[confirmed ? 'cryptoUnavailable' : 'installCanceled'], nodeId);
+                    busy = false;
+                    updateMutations();
+                    if (isCurrent(installButton)) installButton.focus();
+                    return;
+                }
+                token = next;
+                body = { foreignCleanup: { token: challenge.token, fixXrayUnitMode: choice.fixXrayUnitMode } };
+                setActionStatus(words.working, nodeId);
+                // A drift reply loops back to the dialog, not directly to another POST.
+            }
             const { code, outcome, check } = data?.error ?? {};
             const blocked = noRetry(data);
-            unknown = ambiguous(response, data);
             if (response.ok && !blocked && !unknown) {
                 const canceled = action !== 'install' && data?.status === 'canceled' && data.recovered === true
                     && (!revocation || (data.sessionsTerminated === 0 && data.sessionsTerminatedScope === 'request'));
@@ -714,13 +835,14 @@
                 // Only show local copy; raw codes, exceptions and detail fields are never rendered.
                 if ((!blocked || outcome === 'unknown' || (outcome === 'installed' && !unknownOutcome(data)))
                     && installOutcomes.has(outcome)
+                    && (check !== 'FOREIGN_CONFIG_RESTORED' || outcome === 'rolled_back')
                     && (check === undefined || (typeof check === 'string' && Object.hasOwn(installChecks, check)))) {
                     result = installOutcomes.get(outcome);
                     if (check !== undefined) note = ` ${installChecks[check]}`;
                     const keys = data.error.keys;
-                    if (code === 'REBUILD_L2TP_FOREIGN_CONFIG' && outcome === 'refused' && check === 'L2TP_FOREIGN_CONFIG'
+                    if ([foreignCode, changedForeignCode].includes(code) && outcome === 'refused' && check === 'L2TP_FOREIGN_CONFIG'
                         && Array.isArray(keys) && keys.length > 0 && keys.length <= 24 && new Set(keys).size === keys.length
-                        && keys.every(key => typeof key === 'string' && Object.hasOwn(installChecks, key))) {
+                        && keys.every(key => foreignPaths.has(key) && Object.hasOwn(installChecks, key))) {
                         note += ` ${keys.map(key => installChecks[key]).join(' ')}`;
                     }
                     if (outcome === 'installed' || outcome === 'rolled_back') {
@@ -734,7 +856,6 @@
                 note = closureNote(data.error, data.error.confirmedSessionsTerminated);
             }
         } catch { /* A lost response is not proof that the mutation failed. */ }
-        finally { endProgress?.(); }
         if (!active) return;
         let message = (words[result] ?? admissionWords[result]) + note;
         if (action === 'install' && !accepted.includes(result) && !unknown
@@ -832,7 +953,7 @@
         for (const button of installs) button.addEventListener('click', () => {
             if (!isCurrent(button)) return;
             const { installUrl, nodeId } = button.dataset;
-            void mutate('install', installUrl, {}, data => data.nodeId === nodeId, nodeId);
+            void mutate('install', installUrl, {}, data => data.nodeId === nodeId, nodeId, button);
         });
         for (const button of installRecoveries) button.addEventListener('click', () => {
             if (isCurrent(button)) void recoverInstall(button.dataset);

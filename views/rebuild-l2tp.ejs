@@ -33,7 +33,7 @@ const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLog
     'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired', 'runtimeForeignChange', 'runtimeNetworkNotReady',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
     'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed', 'canInstallAgain', 'installRecoveryUnconfirmed', 'installRecoveryNoState',
-    'installStopped', 'checkingResult'];
+    'installStopped', 'installCanceled', 'checkingResult'];
 function secretControl(kind, url, index, login) {
     const valueId = `rebuild-l2tp-${kind}-${index}`;
 %>
@@ -61,17 +61,18 @@ function secretControl(kind, url, index, login) {
     #rebuild-l2tp [data-relay-control]:has(> :is(:disabled, [aria-disabled="true"])) { cursor: not-allowed; }
     #rebuild-l2tp [data-relay-control] > :is(:disabled, [aria-disabled="true"]) { pointer-events: none; }
     #rebuild-l2tp [data-relay-refresh-reason]:not([hidden]) { display: block; margin-top: .35rem; }
-    #rebuild-l2tp [data-admission-dialog] { position: fixed; color: inherit; overflow: auto; width: min(37rem, calc(100% - 2rem)); }
-    #rebuild-l2tp [data-admission-dialog] code { overflow-wrap: anywhere; }
+    #rebuild-l2tp dialog.card { position: fixed; color: inherit; overflow: auto; width: min(37rem, calc(100% - 2rem)); }
+    #rebuild-l2tp dialog.card code, #rebuild-l2tp [data-foreign-cleanup-title] { overflow-wrap: anywhere; }
     #rebuild-l2tp [data-admission-console] pre { white-space: pre-wrap; }
     /* The shared .btn display otherwise overrides the browser's hidden style. */
-    #rebuild-l2tp [data-admission-dialog]:not([open]),
-    #rebuild-l2tp [data-admission-dialog][hidden],
-    #rebuild-l2tp [data-admission-dialog] [hidden],
+    #rebuild-l2tp dialog.card:not([open]),
+    #rebuild-l2tp dialog.card[hidden],
+    #rebuild-l2tp dialog.card [hidden],
     #rebuild-l2tp [data-review][hidden] { display: none; }
 </style>
 <div id="rebuild-l2tp" data-csrf="<%= csrfToken %>" data-account-url="<%= accountPath %>"
-     data-install-checks="<%= JSON.stringify(typeof installChecks === 'undefined' ? {} : installChecks) %>"
+     data-install-checks="<%= JSON.stringify({ ...(typeof installChecks === 'undefined' ? {} : installChecks),
+         FOREIGN_CONFIG_RESTORED: l('installChecks.FOREIGN_CONFIG_RESTORED') }) %>"
      data-admission-messages="<%= JSON.stringify({ ...Object.fromEntries(admissionMessages.map(key => [key, l(`admission.${key}`)])),
          conflictFields: Object.fromEntries(conflictFields.map(key => [key, l(`admission.conflictFields.${key}`)])) }) %>"
      data-messages="<%= JSON.stringify(Object.fromEntries(messages.map(key => [key, l(`messages.${key}`)]))) %>">
@@ -160,7 +161,8 @@ function secretControl(kind, url, index, login) {
                                         </p>
                                         <% if (source === 'db') { %><p class="text-muted" id="install-packages-<%= relay.id %>"><%= l('installPackageHint') %></p><% } %>
                                         <span data-relay-control aria-label="<%= l('install') %>" aria-describedby="relay-refresh-<%= relay.id %>"><button type="button" class="btn btn-sm btn-primary" disabled data-install-url="<%= relayPath(relay.id) %>/install"
-                                                data-node-id="<%= relay.id %>" aria-describedby="install-profile-<%= relay.id %><%= source === 'db' ? ` install-packages-${relay.id}` : '' %>"><%= l('install') %></button></span>
+                                                data-node-id="<%= relay.id %>" data-node-name="<%= relay.name %>" aria-haspopup="dialog"
+                                                aria-describedby="install-profile-<%= relay.id %><%= source === 'db' ? ` install-packages-${relay.id}` : '' %>"><%= l('install') %></button></span>
                                     <% } %>
                                     <% if (actionable && !changed && relay.canRemove === true) { %>
                                         <span data-relay-control aria-label="<%= l('remove') %>" aria-describedby="relay-refresh-<%= relay.id %>"><a class="btn btn-sm btn-danger" data-remove-link href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a></span>
@@ -274,6 +276,27 @@ function secretControl(kind, url, index, login) {
             <button type="button" class="btn btn-secondary" data-admission-cancel><%= l('admission.cancel') %></button>
         </div>
     </dialog>
+    <dialog class="card" data-foreign-cleanup-dialog data-title="<%= l('foreignCleanup.title') %>" aria-labelledby="rebuild-l2tp-foreign-cleanup-title">
+        <div class="card-header"><h2 id="rebuild-l2tp-foreign-cleanup-title" data-foreign-cleanup-title></h2></div>
+        <div class="card-body">
+            <p data-foreign-cleanup-changed hidden><%= l('foreignCleanup.changed') %></p>
+            <p data-foreign-cleanup-instructions hidden><%= l('foreignCleanup.instructions') %></p>
+            <div data-foreign-cleanup-files hidden>
+                <p><%= l('foreignCleanup.files') %></p>
+                <ul></ul>
+            </div>
+            <div data-foreign-cleanup-xray hidden>
+                <label><input type="checkbox" disabled> <%= l('foreignCleanup.xray') %></label>
+                <ul></ul>
+            </div>
+            <div data-foreign-cleanup-manual hidden>
+                <p><%= l('foreignCleanup.manual') %></p>
+                <ul></ul>
+            </div>
+            <button type="button" class="btn btn-secondary" data-foreign-cleanup-cancel autofocus><%= t('common.cancel') %></button>
+            <button type="button" class="btn btn-primary" data-foreign-cleanup-confirm hidden disabled><%= l('foreignCleanup.confirm') %></button>
+        </div>
+    </dialog>
 </div>
-<script src="/js/rebuild-l2tp-install-progress.js?v=1" defer></script>
+<script src="/js/rebuild-l2tp-install-progress.js?v=2" defer></script>
 <script src="/js/rebuild-l2tp.js?v=<%= rebuildL2tpScriptVersion %>" defer></script>

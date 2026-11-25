@@ -254,6 +254,7 @@
       "label": "安装进度",
       "preflight": "正在检查链路和已应用的配置",
       "reserve": "正在预留安装",
+      "foreignCleanup": "正在清理冲突配置",
       "preparePackages": "正在准备软件包",
       "prepare": "正在准备配置",
       "install": "正在安装",
@@ -267,7 +268,17 @@
     "recoverInstall": "检查并继续",
     "installRecoveryHint": "此操作会检查已中断的安装，并可能完成清理。它不会启动新的安装。",
     "refresh": "刷新状态",
+    "foreignCleanup": {
+      "title": "中继「{name}」存在 L2TP 配置冲突",
+      "changed": "冲突已发生变化。请查看更新后的列表，再次确认是否清理。",
+      "instructions": "继续后，面板将备份并清理下方列出的配置；如已勾选，也将修复 Xray 服务单元权限。随后继续安装 L2TP。",
+      "files": "可自动清理的配置：",
+      "xray": "修复不安全的 Xray 服务单元权限（0666）",
+      "manual": "以下路径需要人工检查。面板无法继续安装。请让中继管理员解决冲突后再试。",
+      "confirm": "清理并继续"
+    },
     "installChecks": {
+      "FOREIGN_CONFIG_RESTORED": "已恢复原有的本地配置和文件权限。",
       "L2TP_FOREIGN_CONFIG": "安装检测到本地 VPN 配置或已知 Xray 服务单元的权限不安全。请让中继管理员检查报告的项目。安装不会替换或清理这些项目。",
       "SWAN_PROFILE_PRESENT": "strongSwan 配置文件 /etc/strongswan.d/celerity-rebuild-l2tp.conf 已存在。",
       "IKE_PROFILE_PRESENT": "IKE 配置文件 /etc/ipsec.d/celerity-rebuild-l2tp.conf 已存在。",
@@ -340,6 +351,7 @@
       "observationTimeout": "五分钟内未能确认结果。操作仍处于锁定状态，请勿重试。",
       "refreshFailed": "无法加载当前状态。操作仍处于锁定状态。",
       "refreshRequired": "请刷新页面后继续。",
+      "installCanceled": "L2TP 安装已取消。",
       "installStopped": "安装已停止：{reason}",
       "checkingResult": "正在确认操作结果…",
       "canceled": "请求的账户更改已取消，未应用。",

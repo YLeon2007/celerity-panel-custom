@@ -2294,6 +2294,7 @@
       "label": "Installation progress",
       "preflight": "Checking the link and applied profile",
       "reserve": "Reserving the installation",
+      "foreignCleanup": "Cleaning up conflicting configuration",
       "preparePackages": "Preparing packages",
       "prepare": "Preparing configuration",
       "install": "Installing",
@@ -2434,10 +2435,21 @@
       "observationTimeout": "The outcome could not be verified within five minutes. Controls remain locked; do not retry the operation.",
       "refreshFailed": "The current view could not be loaded. Controls remain locked.",
       "refreshRequired": "Refresh the page to continue.",
+      "installCanceled": "L2TP installation canceled.",
       "installStopped": "Installation stopped: {reason}",
       "checkingResult": "Checking the result…"
     },
+    "foreignCleanup": {
+      "title": "L2TP configuration conflict on {name}",
+      "changed": "The conflict changed. Review the updated list before confirming again.",
+      "instructions": "If you continue, the panel will back up and clean up only the configuration listed below and apply the selected Xray permission fix, then continue installing L2TP.",
+      "files": "Eligible for automatic cleanup:",
+      "xray": "Fix unsafe Xray service unit permissions (0666)",
+      "manual": "Manual review is required for the following paths. The panel cannot continue. Ask the relay administrator to resolve the conflicts before trying again.",
+      "confirm": "Clean up and continue"
+    },
     "installChecks": {
+      "FOREIGN_CONFIG_RESTORED": "The previous local configuration and file permissions were restored.",
       "L2TP_FOREIGN_CONFIG": "Install found local VPN configuration or unsafe permissions on a known Xray unit. Ask the relay administrator to review the reported items. Install will not replace or clean them up.",
       "SWAN_PROFILE_PRESENT": "A strongSwan profile already exists at /etc/strongswan.d/celerity-rebuild-l2tp.conf.",
       "IKE_PROFILE_PRESENT": "An IKE profile already exists at /etc/ipsec.d/celerity-rebuild-l2tp.conf.",

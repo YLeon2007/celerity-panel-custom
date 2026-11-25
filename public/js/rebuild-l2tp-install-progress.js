@@ -1,8 +1,8 @@
 (() => {
     'use strict';
-    const ranges = new Map(Object.entries({ preflight: [0, 0], reserve: [10, 10], preparePackages: [20, 49],
+    const ranges = new Map(Object.entries({ preflight: [0, 0], reserve: [10, 10], foreignCleanup: [0, 64], preparePackages: [20, 49],
         prepare: [50, 50], install: [65, 65], restart: [80, 80], verify: [92, 92], unknown: [10, 92] }));
-    function start(page, nodeId) {
+    function start(page, nodeId, consented) {
         if (typeof nodeId !== 'string' || !/^[a-f0-9]{24}(?![\s\S])/.test(nodeId)) return;
         const root = page.querySelector(`[data-install-progress][data-progress-node="${nodeId}"]`);
         if (!root) return;
@@ -16,7 +16,7 @@
             label.textContent = words[stage];
             bar.value = percent;
         }
-        show('preflight', 0);
+        show(consented === true ? 'foreignCleanup' : 'preflight', 0);
         root.hidden = false;
         const timer = setInterval(async () => {
             if (!active || pending) return;
@@ -28,7 +28,8 @@
                 const body = await response.json();
                 if (!active || !root.isConnected || body?.nodeId !== nodeId) return;
                 const p = body.installProgress, range = ranges.get(p?.stage);
-                if (!range || p.stage === 'preflight' || Object.keys(p).length !== 3 || !Object.hasOwn(words, p.stage)
+                if (!range || p.stage === 'preflight' || (p.stage === 'foreignCleanup' && consented !== true)
+                    || Object.keys(p).length !== 3 || !Object.hasOwn(words, p.stage)
                     || !Number.isInteger(p.percent) || p.percent < Math.max(last, range[0]) || p.percent > range[1]
                     || typeof p.at !== 'string' || !Number.isFinite(Date.parse(p.at))) return;
                 last = p.percent;
