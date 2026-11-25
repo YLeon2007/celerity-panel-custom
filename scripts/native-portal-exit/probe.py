@@ -502,7 +502,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     if proof:
         evidence['proof_source_sha256'] = digest('/scripts/transit-proof.cjs')
     if stage:
-        evidence['switch_source_sha256'] = digest('/scripts/stage-switch.py')
+        evidence['switch_source_sha256'] = digest('/scripts/stage-switch.cjs')
+        evidence['journal_source_sha256'] = digest('/source/src/services/rebuildTransitCutoverJournal.js')
         evidence['planner_source_sha256'] = digest('/source/src/services/rebuildTransitActivationPlan.js')
     if matrix:
         evidence['geoip_fixture'] = geoip_fixture()
@@ -874,19 +875,27 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             before = api('gateway', 'lsrules')
             spec = api_actor('gateway', 'adrules (lost reply)')
-            writer = cmd([sys.executable, '-I', '-B', '/scripts/stage-switch.py',
-                          str(spec['port']), str(spec['pid']), parent_net, spec['binary']])
+            writer_argv = ['node', '/scripts/stage-switch.cjs']
+            pinned = [str(spec['port']), str(spec['pid']), parent_net, spec['binary']]
+            writer = cmd([*writer_argv, 'lost', *pinned])
             evidence['api_calls'].append({**spec, 'writer_status': writer.returncode})
-            require(writer.returncode == 77 and not writer.stdout and not writer.stderr, 'expected lost reply after real switch')
-            intent = json.loads(Path('switch.intent.json').read_text())
-            require(intent == {'version': 1, 'step': 'switch_ingress', 'netns': evidence['netns'],
-                    'pid': children['gateway'].pid, 'started': Path(f'/proc/{children["gateway"].pid}/stat').read_text().rsplit(') ', 1)[1].split()[19],
-                    'from': digest('staged-routes.json'), 'to': digest('desired-routes.json')}, 'switch intent is not pinned')
+            require(writer.returncode == -signal.SIGKILL and not writer.stdout and not writer.stderr,
+                    'expected lost reply after real switch')
+            record, = Path('selector-journal').glob('cutover-*.jsonl')
+            original = record.read_bytes()
+            events = [json.loads(row)['event'] for row in original.splitlines()]
+            require([row['type'] for row in events] == ['start', 'proved', 'intent'], 'unexpected durable events')
+            observer = cmd([*writer_argv, 'observe', *pinned])
+            require(observer.returncode == 0 and not observer.stderr, 'fresh journal observer refused')
+            outcome = json.loads(observer.stdout)
+            require(outcome == {'observation': 'after', 'retryAllowed': False, 'pending': 'switch_ingress',
+                                'acknowledged': False, 'head': json.loads(original.splitlines()[-1])['sha256']},
+                    'unknown cutover was not observed as desired without replay')
             after = api('gateway', 'lsrules')
             require(before != after and all(tag not in before and tag in after for tag in scoped_rule_tags), 'live rule readback did not change')
             verify_case(Probe('p1', 'numeric', 'B', 3))
-            require(json.loads(Path('switch.intent.json').read_text()) == intent, 'read-only reconciliation changed intent')
-            evidence['lost_reply'] = {'intent': intent, 'writer_status': writer.returncode, 'observed': 'desired', 'acknowledged': False}
+            require(record.read_bytes() == original, 'read-only reconciliation changed journal bytes')
+            evidence['lost_reply'] = {**outcome, 'writer_status': writer.returncode}
         require(all(child.poll() is None for child in children.values()), 'child exited during HTTP probes')
     require(len(evidence['live_actors']) == xray_count and set(reaped) == set(evidence['live_actors']) | {'cover'} and all(
         r['early_exit'] is None and not r['forced_kill'] and r['status'] in (0, -signal.SIGTERM) for r in reaped.values()),
@@ -895,7 +904,9 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     print(f'REAPED {len(reaped)} children; no TCP/UDP listeners remain')
     require(evidence['source_sha256'] == source_digests(), 'composer inputs changed during the run')
     if stage:
-        require(evidence['switch_source_sha256'] == digest('/scripts/stage-switch.py'), 'stage writer changed during the run')
+        require(evidence['switch_source_sha256'] == digest('/scripts/stage-switch.cjs'), 'stage writer changed during the run')
+        require(evidence['journal_source_sha256'] == digest('/source/src/services/rebuildTransitCutoverJournal.js'),
+                'cutover journal changed during the run')
         require(evidence['planner_source_sha256'] == digest('/source/src/services/rebuildTransitActivationPlan.js'), 'planner changed during the run')
     rows = evidence['probes']
     if len(rows) == expected_count and all(row['actual'] == row['expected'] for row in rows):
