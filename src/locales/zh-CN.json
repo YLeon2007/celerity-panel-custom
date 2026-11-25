@@ -269,6 +269,7 @@
     "installRecoveryHint": "此操作会检查已中断的安装，并可能完成清理。它不会启动新的安装。",
     "refresh": "刷新状态",
     "foreignCleanup": {
+      "cancel": "取消安装",
       "title": "中继「{name}」存在 L2TP 配置冲突",
       "changed": "冲突已发生变化。请查看更新后的列表，再次确认是否清理。",
       "instructions": "继续后，面板将备份并清理下方列出的配置；如已勾选，也将修复 Xray 服务单元权限。随后继续安装 L2TP。",
@@ -278,6 +279,9 @@
       "confirm": "清理并继续"
     },
     "installChecks": {
+      "CLEANUP_CONSENT_REQUIRED": "确认已过期或已使用。请重新启动安装以检查设置。",
+      "CLEANUP_CONSENT_UNAVAILABLE": "无法保存清理确认。未修改任何文件。",
+      "CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED": "安装需要修正 Xray 单元的权限。未修改任何文件。",
       "FOREIGN_CONFIG_RESTORED": "已恢复原有的本地配置和文件权限。",
       "L2TP_FOREIGN_CONFIG": "安装检测到本地 VPN 配置或已知 Xray 服务单元的权限不安全。请让中继管理员检查报告的项目。安装不会替换或清理这些项目。",
       "SWAN_PROFILE_PRESENT": "strongSwan 配置文件 /etc/strongswan.d/celerity-rebuild-l2tp.conf 已存在。",
@@ -351,6 +355,7 @@
       "observationTimeout": "五分钟内未能确认结果。操作仍处于锁定状态，请勿重试。",
       "refreshFailed": "无法加载当前状态。操作仍处于锁定状态。",
       "refreshRequired": "请刷新页面后继续。",
+      "installAwaitingCleanup": "等待您的决定：发现非面板管理的 L2TP 设置",
       "installCanceled": "L2TP 安装已取消。",
       "installStopped": "安装已停止：{reason}",
       "checkingResult": "正在确认操作结果…",

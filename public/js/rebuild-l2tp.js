@@ -716,13 +716,18 @@
         const canConfirm = !manual.length;
         const confirm = field('confirm'), cancel = field('cancel');
         const xray = field('xray').querySelector('input');
-        const modes = cleanable.filter(key => xrayModeKeys.has(key));
+        const modes = [...cleanable, ...manual].filter(key => xrayModeKeys.has(key));
         function list(name, keys) {
             const container = field(name);
-            const items = [...new Set(keys.flatMap(key => foreignPaths.get(key)))].map(path => {
-                const item = document.createElement('li'), label = document.createElement('code');
-                label.textContent = path;
-                item.append(label);
+            const items = keys.map(key => {
+                const item = document.createElement('li'), reason = document.createElement('span');
+                reason.textContent = installChecks[key];
+                item.append(reason);
+                for (const path of foreignPaths.get(key)) {
+                    const label = document.createElement('code');
+                    label.textContent = path;
+                    item.append(' ', label);
+                }
                 return item;
             });
             container.querySelector('ul').replaceChildren(...items);
@@ -790,7 +795,7 @@
                 const modal = challenge && page.querySelector('[data-foreign-cleanup-dialog]');
                 if (!modal || !isCurrent(installButton)) break;
 
-                setActionStatus(words.installRefused, nodeId);
+                setActionStatus(words.installAwaitingCleanup, nodeId);
                 const choice = await askForeignCleanup(modal, installButton.dataset.nodeName, challenge);
                 if (!active) return;
                 const confirmed = choice && isCurrent(installButton);

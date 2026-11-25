@@ -117,6 +117,12 @@ async function main() {
             const words = await start(locale, challenge([options, xray, bridge], [options, xray, bridge], [], first));
             await open();
             await checkHeading(words);
+            assert.equal(await browser.evaluate(text(status)), words.messages.installAwaitingCleanup);
+            if (locale === 'ru') {
+                assert.equal(words.foreignCleanup.title, 'На релее «{name}» обнаружены чужие настройки протокола L2TP');
+                assert.equal(await browser.evaluate(text(confirm)), 'Удалить настройки и продолжить установку');
+                assert.equal(await browser.evaluate(text(cancel)), 'Отменить установку');
+            }
             assert.equal(await browser.evaluate(`${el(install)}.disabled && ${el(sibling)}.disabled`), true);
             assert.equal(await browser.evaluate(`document.activeElement === ${el(cancel)}`), true);
             assert.equal(await browser.evaluate(`${el(xrayOption)}.checked && ${visible(xrayOption)}`), true);

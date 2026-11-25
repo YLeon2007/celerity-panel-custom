@@ -33,7 +33,7 @@ const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLog
     'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired', 'runtimeForeignChange', 'runtimeNetworkNotReady',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
     'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed', 'canInstallAgain', 'installRecoveryUnconfirmed', 'installRecoveryNoState',
-    'installStopped', 'installCanceled', 'checkingResult'];
+    'installStopped', 'installCanceled', 'installAwaitingCleanup', 'checkingResult'];
 function secretControl(kind, url, index, login) {
     const valueId = `rebuild-l2tp-${kind}-${index}`;
 %>
@@ -293,7 +293,7 @@ function secretControl(kind, url, index, login) {
                 <p><%= l('foreignCleanup.manual') %></p>
                 <ul></ul>
             </div>
-            <button type="button" class="btn btn-secondary" data-foreign-cleanup-cancel autofocus><%= t('common.cancel') %></button>
+            <button type="button" class="btn btn-secondary" data-foreign-cleanup-cancel autofocus><%= l('foreignCleanup.cancel') %></button>
             <button type="button" class="btn btn-primary" data-foreign-cleanup-confirm hidden disabled><%= l('foreignCleanup.confirm') %></button>
         </div>
     </dialog>
