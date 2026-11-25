@@ -3,7 +3,7 @@
 const { randomBytes } = require('node:crypto');
 const { AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError } = require('./rebuildRelayInstallTransaction');
 const { classifyInstallFailure, installFailure, hasPackagePreparation, requireInstallHostReady,
-    checkedInstallId, freshConflict } = require('./rebuildRelayInstallDiagnostics');
+    checkedInstallId, freshConflict, conflictCode, setCleanupChallenge, withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
 const { IDENTITY_CHANGED, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -31,7 +31,7 @@ async function runFreshRelayInstall(id, deps) {
                 if (deps.verifyBinding && await verifyLock() === false) throw fail('REBUILD_LOCK_LOST');
                 await checkAuthorization();
             };
-            let remote, reservation, unsettled = false, progressTail = Promise.resolve(), percent = 10, lastStage = 'reserve';
+            let remote, reservation, consumedCleanup, cleanup, unsettled = false, progressTail = Promise.resolve(), percent = 10, lastStage = 'reserve';
             const verifyTopology = async () => {
                 if (deps.verifyTopology) await deps.verifyTopology(inventory);
             };
@@ -59,6 +59,7 @@ async function runFreshRelayInstall(id, deps) {
             };
             try {
                 await checkAuthority();
+                if (deps.foreignCleanup && !deps.cleanupConsent) throw withInstallCheck(fail('REBUILD_L2TP_CLEANUP_CONSENT_REQUIRED'), 'CLEANUP_CONSENT_REQUIRED');
                 inventory = await deps.inventory(id);
                 if (inventory.eligible !== true || inventory.pristine !== true) throw fail('REBUILD_L2TP_NOT_FRESH_RELAY');
                 if (deps.verifyBinding) await checkAuthority();
@@ -67,7 +68,37 @@ async function runFreshRelayInstall(id, deps) {
                 remote = await deps.connect(inventory);
                 await checkAuthorization();
                 await proveMain();
-                const host = await remote.preflight();
+                let host;
+                if (!deps.foreignCleanup) host = await remote.preflight();
+                else {
+                    let observed, refusal;
+                    try { await remote.preflight(); } catch (error) {
+                        observed = freshConflict(error);
+                        if (!observed) throw error;
+                        if (observed.check !== 'L2TP_FOREIGN_CONFIG') {
+                            await checkAuthority();
+                            // Burn only this actor/session/admission's ticket on a positive runtime veto.
+                            try { await deps.cleanupConsent.consume(deps.foreignCleanup, undefined); }
+                            catch { /* Keep the authoritative runtime refusal. */ }
+                            throw error;
+                        }
+                        refusal = error;
+                    }
+                    await checkAuthority();
+                    try { consumedCleanup = await deps.cleanupConsent.consume(deps.foreignCleanup, observed); }
+                    catch (error) {
+                        if (error.code === 'REBUILD_L2TP_CLEANUP_CONSENT_CHANGED' && refusal) {
+                            throw installFailure('REBUILD_L2TP_FOREIGN_CONFIG_CHANGED', 'refused', observed.check, { conflict: observed });
+                        }
+                        if (error.code === 'REBUILD_L2TP_CLEANUP_CONSENT_CHANGED') {
+                            throw installFailure('REBUILD_L2TP_FOREIGN_CONFIG_CHANGED', 'refused', 'L2TP_FOREIGN_CONFIG');
+                        }
+                        throw withInstallCheck(error, error.code?.slice('REBUILD_L2TP_'.length));
+                    }
+                    cleanup = Object.freeze({ digest: observed.digest, fixXrayUnitMode: consumedCleanup.fixXrayUnitMode,
+                        at: new Date().toISOString() });
+                    host = await remote.preflight(cleanup);
+                }
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
                     throw fail(deps.unifiedIdentity ? IDENTITY_CHANGED : 'REBUILD_L2TP_INSTALL_IDENTITY_MISMATCH');
                 }
@@ -79,12 +110,17 @@ async function runFreshRelayInstall(id, deps) {
                 // before reserving. The package path must reserve before its
                 // first host write, using an ID generated only on this server.
                 let plan;
-                if (!preparePackages) plan = await deps.prepare(inventory, remote);
+                if (cleanup && preparePackages) throw fail('REBUILD_L2TP_HOST_NOT_READY');
+                if (!preparePackages) plan = await deps.prepare(inventory, remote, ...(cleanup ? [cleanup] : []));
                 const backupId = preparePackages ? randomBytes(16).toString('hex') : plan?.backupId;
                 if (typeof backupId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(backupId)) {
                     throw fail('REBUILD_L2TP_INSTALL_PLAN_INVALID');
                 }
                 await proveMain();
+                if (cleanup) {
+                    try { await deps.cleanupConsent.bind(deps.foreignCleanup, backupId); }
+                    catch { throw withInstallCheck(fail('REBUILD_L2TP_CLEANUP_CONSENT_UNAVAILABLE'), 'CLEANUP_CONSENT_UNAVAILABLE'); }
+                }
                 try { reservation = await deps.reserve(inventory, backupId, deps.verifyTopology ? topologyGuard : checkAuthority, preparePackages ? host.packagePreparation : undefined); }
                 catch (error) {
                     unsettled = error instanceof ReservationOutcomeUnknownError || error instanceof AcknowledgedCommitCleanupError;
@@ -134,7 +170,8 @@ async function runFreshRelayInstall(id, deps) {
                         throw installFailure(error instanceof AcknowledgedCommitCleanupError
                             ? 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED' : ROLLBACK_UNKNOWN, 'unknown', check);
                     }
-                    throw installFailure(code, noHostChanges ? 'refused' : 'rolled_back', check, { conflict });
+                    throw installFailure(code, noHostChanges ? 'refused' : 'rolled_back',
+                        cleanup && !noHostChanges ? 'FOREIGN_CONFIG_RESTORED' : check, { conflict });
                 };
 
                 let installResult;
@@ -142,6 +179,7 @@ async function runFreshRelayInstall(id, deps) {
                     await guard();
                     await progress('install', 65);
                     installResult = await remote.install(plan, guard, mark => {
+                        if (mark === 'foreignCleanup' && cleanup) void progress('foreignCleanup', 70);
                         if (mark === 'restart') void progress('restart', 80);
                     });
                 } catch (error) {
@@ -155,7 +193,7 @@ async function runFreshRelayInstall(id, deps) {
                     // explicit proof that all dispatched mutations have settled.
                     // Do not infer settlement from errno, timeout or SSH close.
                     const conflict = freshConflict(error);
-                    if (error?.commandSettled === true) await rollback(conflict ? `REBUILD_${conflict.check}` : 'REBUILD_L2TP_INSTALL_FAILED', {
+                    if (error?.commandSettled === true) await rollback(conflict ? conflictCode(conflict) : 'REBUILD_L2TP_INSTALL_FAILED', {
                         noHostChanges: error.noHostChanges === true, check, conflict,
                     });
                     throw fail(UNKNOWN);
@@ -195,8 +233,23 @@ async function runFreshRelayInstall(id, deps) {
                 } else if (deps.unifiedIdentity && primary.outcome === 'installed') {
                     primary = installFailure(primary.code, 'installed', undefined, { retryAllowed: false });
                 }
+                const proof = freshConflict(primary);
+                if (!unsettled && primary.outcome === 'refused' && proof?.digest && deps.cleanupConsent) {
+                    try {
+                        await checkAuthority();
+                        const { cleanable, manual } = proof;
+                        const issued = !manual.length ? await deps.cleanupConsent.issue(proof) : undefined;
+                        setCleanupChallenge(primary, { cleanable, manual, ...(issued && { cleanupToken: issued.token }) });
+                    } catch { /* No valid ticket means no destructive control. */ }
+                }
                 throw primary;
             } finally {
+                if (consumedCleanup) {
+                    const result = installed ? 'installed' : unsettled ? 'unknown' : primary?.outcome === 'rolled_back'
+                        ? 'rolled_back' : primary?.outcome === 'installed' ? 'installed' : 'refused';
+                    // Audit is advisory to settlement: never replay a possible write to repair audit.
+                    try { await deps.cleanupConsent.finish(deps.foreignCleanup, result); } catch { /* Retain the original consent audit. */ }
+                }
                 if (remote) {
                     try { await remote.close(); deps.handBackRecovery?.(); }
                     catch {

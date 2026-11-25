@@ -116,8 +116,8 @@ async function precheckSource({ node, fence, installation, currentUsers }, creat
 }
 
 function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, relayGrantStore, actor: defaultActor,
-    createRelayDirect = defaultDriver }) {
-    return async function installRelay(id, { actor = defaultActor } = {}) {
+    createRelayDirect = defaultDriver, getCleanupConsent }) {
+    return async function installRelay(id, { actor = defaultActor, cleanupSessionId, foreignCleanup } = {}) {
         let enabled;
         try { enabled = validateRebuildMode(env); } catch { /* Conflicting mode. */ }
         if (enabled !== true || env.C3_REBUILD_L2TP_INSTALL_ENABLED !== 'true' || typeof id !== 'string'
@@ -129,10 +129,29 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
         const { machineId } = fence.binding;
         const getNode = (nodeId = id) => read(Node.findById(nodeId).select('ip domain active type cascadeRole useCustomConfig ssh'));
         let store, owner;
+        const scope = fence.source === 'db' && fence.generation && validActor(actor) && cleanupSessionId
+            ? { nodeId: id, generation: fence.generation, actor, sessionId: cleanupSessionId } : undefined;
+        let cleanupStore;
+        async function consentStore() {
+            cleanupStore ??= getCleanupConsent();
+            const store = await cleanupStore;
+            return store;
+        }
+        function proofForStore(proof) {
+            if (proof?.digest && proof.manual?.length === 0 && proof.cleanable?.length === proof.keys?.length) {
+                return { check: proof.check, keys: proof.keys, digest: proof.digest, cleanable: true, manual: false };
+            }
+        }
+        const cleanupConsent = scope && getCleanupConsent && {
+            issue: async proof => (await consentStore()).issue(scope, proofForStore(proof)),
+            consume: async (confirmation, proof) => (await consentStore()).consume(scope, confirmation, proofForStore(proof)),
+            bind: async (confirmation, backupId) => (await consentStore()).bind(scope, confirmation, backupId),
+            finish: async (confirmation, result) => (await consentStore()).finish(scope, confirmation, result),
+        };
         return runFreshRelayInstall(id, {
             authorize: relayGrantStore ? async () => { await fence.check(); return true; }
                 : () => { try { fence.check(); return true; } catch { return false; } },
-            machineId,
+            machineId, foreignCleanup, cleanupConsent,
             ...(relayGrantStore && { unifiedIdentity: true }),
             allowPackagePreparation: fence.listMode === true && fence.source === 'db',
             lock: fn => locks.run((verifyLock, retainLock) => withNode(id, async () => {
@@ -185,8 +204,9 @@ function createRebuildRelayBackend({ Node, Link, State, L2tpUser, locks, env, re
             async proveMain({ appliedMain }, remote, guard) {
                 if (await remote.proveAppliedMain?.(appliedMain, guard) !== true) throw fail('REBUILD_L2TP_TOPOLOGY_NOT_APPLIED');
             },
-            prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit, appliedMain }, remote) =>
-                remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, appliedMain, ...(transit && { transit }) }),
+            prepare: ({ nodeId, desired, controlPlaneAddresses, carryDomain, transit, appliedMain }, remote, cleanup) =>
+                remote.prepare({ nodeId, desired, controlPlaneAddresses, carryDomain, appliedMain, ...(transit && { transit }),
+                    ...(cleanup && { foreignCleanup: cleanup }) }),
             reserve: (inventory, backupId, verifyLock, packagePreparation) => store.reserve({ ...inventory, backupId, machineId, packagePreparation,
                 ...(owner && { recovery: { owner, actor, authority: grantIdentity(inventory.bound), key: inventory.key } }),
             }, verifyLock),

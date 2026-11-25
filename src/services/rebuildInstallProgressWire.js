@@ -1,7 +1,7 @@
 'use strict';
 
 const prefix = 'DIRECT_PROGRESS ';
-const names = { 'prepare-packages': ['unpacking', 'settingUp'], install: ['restart'] };
+const names = { 'prepare-packages': ['unpacking', 'settingUp'], install: ['foreignCleanup', 'restart'] };
 function progressWire(action, notify) {
     const allowed = names[action];
     if (!allowed || typeof notify !== 'function') return undefined;

@@ -9,6 +9,8 @@
 
 - Установка показывает конкретные несовместимые настройки хоста. Работающий VPN, занятые L2TP/IPsec-порты и активные PPP-сессии блокируют установку отдельно. Диагностика не удаляет файлы.
 - Install reports specific conflicting host settings. Active VPN, occupied L2TP/IPsec UDP ports and active PPP sessions block Install separately. Diagnosis never removes files.
+- На допущенном релее удаление известных настроек требует отдельного одноразового подтверждения. Неизвестные пути показаны для ручной проверки. [Заметки о выпуске](docs/release-v1.6.40.ru.md).
+- Known foreign settings on an admitted relay require separate, one-time consent before removal. Unrecognized paths are listed for manual review.
 
 ## v1.6.39 — Обновление L2TP / L2TP overview refresh
 

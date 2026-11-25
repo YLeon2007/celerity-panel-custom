@@ -21,6 +21,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -30,6 +31,7 @@ from typing import Any, cast
 C3_STOCK_RUNTIME: dict[str, Any]
 C3_STOCK_ENSURE: dict[str, Any]
 C3_PACKAGE_GUARD: dict[str, Any]
+C3_REPLACEMENT: dict[str, Any]
 
 MAIN = '/usr/local/etc/xray/config.json'
 XRAY_CONFIG_WRITABLE = 'XRAY_CONFIG_WRITABLE'
@@ -121,7 +123,10 @@ FRESH_VPN_UNITS = (XL, IKE, 'ipsec.service', 'strongswan.service', 'strongswan-s
                    'charon.service', 'charon-systemd.service', 'charon-nm.service')
 FRESH_VPN_COMM = {name[:-8].encode() for name in FRESH_VPN_UNITS} | {b'starter', b'pluto'}
 FOREIGN_CONFIG = 'L2TP_FOREIGN_CONFIG'
-FRESH_CONFLICTS = (FOREIGN_CONFIG, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE')
+FOREIGN_CHANGED = FOREIGN_CONFIG + '_CHANGED'
+FOREIGN_PENDING = 'foreign-cleanup.pending'
+FRESH_ACTIONS = ('preflight', 'prepare', 'check', 'install')
+FRESH_CONFLICTS = (FOREIGN_CONFIG, FOREIGN_CHANGED, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE')
 # Canonical wire order; mirror in rebuildRelayInstallDiagnostics.js.
 FOREIGN_REASONS = ('SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'STARTER_NOT_STOCK',
                    'SECRETS_NOT_EMPTY', 'CHAP_NOT_EMPTY', 'LNS_NOT_STOCK', 'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666',
@@ -142,6 +147,7 @@ NETWORK_UPGRADE_ENTERED = False
 NO_INSTALL_WRITES = False
 PPP_PREPARING = False
 NATIVE_PREPARING = False
+CLEANUP_ENTERED = False
 PPP_MODULES = ('ppp_generic', 'l2tp_ppp')
 SOCKET_OBSERVERS = ('inet_diag', 'tcp_diag', 'udp_diag')
 NFT_OBSERVERS = ('nfnetlink', 'nf_tables')
@@ -163,9 +169,9 @@ class Refusal(Exception):
 
 
 class FreshInstallConflict(Refusal):
-    def __init__(self, check, keys=()):
+    def __init__(self, check, keys=(), fingerprint=None, cleanable=()):
         super().__init__(check)
-        self.keys = keys
+        self.keys, self.fingerprint, self.cleanable = keys, fingerprint, cleanable
 
 
 class PackageDiagnostic(Refusal):
@@ -264,16 +270,19 @@ class AptProgress:
         self.overflow = False
 
 
-def bounded_status(argv, end, maximum, *, may_write=False, progress=None):
+def bounded_status(argv, end, maximum, *, may_write=False, progress=None, stock_stage=False,
+                   stock_cwd=None, stock_config=None):
     """Join bounded pipe EOF and original reap, plus writer descendant settlement."""
-    with package_child_scope() if may_write else contextlib.nullcontext():
-        result = _bounded_child_status(argv, end, maximum, may_write, progress)
+    with package_child_scope() if may_write or stock_stage else contextlib.nullcontext():
+        result = _bounded_child_status(argv, end, maximum, may_write, progress,
+                                       stock_stage=stock_stage, stock_cwd=stock_cwd, stock_config=stock_config)
     if time.monotonic() >= end:
         raise subprocess.TimeoutExpired((), 0)
     return result
 
 
-def _bounded_child_status(argv, end, maximum, may_write, progress=None):
+def _bounded_child_status(argv, end, maximum, may_write, progress=None, *, stock_stage=False,
+                          stock_cwd=None, stock_config=None):
     def left():
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -283,9 +292,11 @@ def _bounded_child_status(argv, end, maximum, may_write, progress=None):
     left()
     # With SIGCHLD ignored, Popen.wait() can turn ECHILD into a false zero.
     need(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, 'IN_FLIGHT')
+    env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'DEBIAN_FRONTEND': 'noninteractive'}
+    if stock_config is not None:
+        env['APT_CONFIG'] = stock_config
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             cwd='/', env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C',
-                                           'DEBIAN_FRONTEND': 'noninteractive'})
+                             cwd=stock_cwd or '/', env=env, **({'start_new_session': True} if stock_stage else {}))
     try:
         assert child.stdout is not None and child.stderr is not None
         with child.stdout as stdout, child.stderr as stderr, selectors.DefaultSelector() as pipes:
@@ -317,7 +328,10 @@ def _bounded_child_status(argv, end, maximum, may_write, progress=None):
         # durable pending fence survives us even if descendants remain live.
         if not may_write:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                child.kill()
+                if stock_stage:
+                    os.killpg(child.pid, signal.SIGKILL)
+                else:
+                    child.kill()
                 child.wait(timeout=0.25)
         raise
 
@@ -415,8 +429,9 @@ def rmdir(path):
         os.fsync(fd)
 
 
-def write(path, before, after, *, generation=None, witness=False):
-    need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
+def write(path, before, after, *, generation=None, witness=False, reader=None, mtime_ns=None):
+    get = reader if reader is not None else lambda path: read(path, 2 * MAX_FILE)
+    need(get(path) == before, 'ROLLBACK_DRIFT')
     parent, name = os.path.split(path)
 
     def check_generation(fd):
@@ -428,7 +443,7 @@ def write(path, before, after, *, generation=None, witness=False):
     with directory(parent) as fd:
         if after is None:
             if generation is not None:
-                need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
+                need(get(path) == before, 'ROLLBACK_DRIFT')
                 check_generation(fd)
             os.unlink(name, dir_fd=fd)
         else:
@@ -442,11 +457,13 @@ def write(path, before, after, *, generation=None, witness=False):
                     need(uid == 0 or (path in (MAIN, BRIDGE) and uid == pwd.getpwnam('nobody').pw_uid), 'ROLLBACK_DRIFT')
                     os.fchown(output.fileno(), uid, after['gid'])
                     os.fchmod(output.fileno(), after['mode'])
+                    if mtime_ns is not None:
+                        os.utime(output.fileno(), ns=(mtime_ns, mtime_ns))
                     os.fsync(output.fileno())
                     if path == PPP_PATH or witness:
                         st = os.fstat(output.fileno())
                         published = [st.st_dev, st.st_ino]
-                need(read(path, 2 * MAX_FILE) == before, 'ROLLBACK_DRIFT')
+                need(get(path) == before, 'ROLLBACK_DRIFT')
                 check_generation(fd)
                 if before is None:
                     os.link(scratch, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
@@ -461,7 +478,7 @@ def write(path, before, after, *, generation=None, witness=False):
             st = os.stat(name, dir_fd=fd, follow_symlinks=False)
             need([st.st_dev, st.st_ino] == published, 'ROLLBACK_DRIFT')
             installed = [*published, st.st_ctime_ns]
-    need(read(path, 2 * MAX_FILE) == after, 'RUNTIME_UNPROVED')
+    need(get(path) == after, 'RUNTIME_UNPROVED')
     if installed is not None:
         need(remove_generation(path) == installed, 'ROLLBACK_DRIFT')
     return installed
@@ -612,7 +629,7 @@ def fresh_runtime_conflict():
     return None
 
 
-def foreign_leaf(path, *, folder=False, unit_mode=False):
+def foreign_leaf(path, *, folder=False, unit_mode=False, read_unit=False):
     def stamp(st):
         return [st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_nlink,
                 st.st_size, st.st_mtime_ns, st.st_ctime_ns]
@@ -638,7 +655,7 @@ def foreign_leaf(path, *, folder=False, unit_mode=False):
             data = None
             # A directory and an unsafe non-0666 unit are diagnosis only.
             # For an ordinary unit there is no reason to read its contents.
-            if not folder and (not unit_mode or mode == 0o666):
+            if not folder and (not unit_mode or mode == 0o666 or read_unit):
                 with os.fdopen(leaf, 'rb', closefd=False) as stream:
                     data = stream.read(1024 * 1024 + 1)
                 need(len(data) == st.st_size and len(data) <= 1024 * 1024, 'PREREQUISITE')
@@ -662,8 +679,8 @@ def foreign_conffiles(package):
     return hashes
 
 
-def old_network_idle(has_unit, fwmark):
-    if recovery_stat(VAULT) is not None:
+def old_network_idle(has_unit, fwmark, *, vacant=True):
+    if vacant and recovery_stat(VAULT) is not None:
         return False
     try:
         net = unit(NET_UNIT)
@@ -674,7 +691,8 @@ def old_network_idle(has_unit, fwmark):
                     and net.get('UnitFileState') in ('static', 'disabled')
                     and net.get('DropInPaths') == '' and net.get('MainPID') == '0'):
                 return False
-        elif not (net['LoadState'] == 'not-found' and not net.get('FragmentPath') and not net.get('UnitFileState')):
+        elif not (net['LoadState'] == 'not-found' and not net.get('FragmentPath') and not net.get('UnitFileState')
+                  and (vacant or net.get('MainPID') == '0')):
             return False
         no_jobs((NET_UNIT,))
         marks = {LEGACY_FWMARK} if fwmark is None else {LEGACY_FWMARK, fwmark}
@@ -689,7 +707,7 @@ def old_network_idle(has_unit, fwmark):
         routes = json.loads(command('/usr/sbin/ip', '-j', '-N', '-4', 'route', 'show', 'table', 'all', quiet=True))
         need(type(routes) is list and all(type(row) is dict for row in routes), 'NETWORK_CONFLICT')
         routes = cast(list[dict[str, Any]], routes)
-        if any(row.get('type') == 'local' and row.get('dev') == 'lo'
+        if any(row.get('type') in ('local', '2', 2) and row.get('dev') == 'lo'
                and row.get('dst') in ('default', '0.0.0.0/0') for row in routes):
             return False
         # Do not autoload a provider or infer safety from failed observation.
@@ -700,14 +718,16 @@ def old_network_idle(has_unit, fwmark):
         return False
 
 
-def foreign_config_observation(fwmark=None):
+def foreign_config_observation(fwmark=None, *, detailed=False, vacant=True):
     """Return fixed reasons and a private sample fingerprint, never write authority."""
     found = {}
+    contents = {}
     metadata = {}
     diagnostic = set()
 
     def record(reason, path, leaf, stock=None):
         found[reason] = [path, leaf[1], digest(leaf[2]), stock.decode() if stock else None]
+        contents[reason] = leaf[2]
 
     for reason, path in (('SWAN_PROFILE_PRESENT', SWAN_PROFILE), ('IKE_PROFILE_PRESENT', NAMES['ike']),
                          ('OPTIONS_PRESENT', NAMES['options']), ('MODULES_LOAD_FOREIGN', LEGACY_MODULES)):
@@ -785,11 +805,31 @@ def foreign_config_observation(fwmark=None):
             else:
                 diagnostic.add('UNIT_WRITABLE')
     for reason, path in (('NFT_DIR_PRESENT', NFT_DIR), ('DROPIN_PRESENT', DROP_DIR)):
-        if foreign_leaf(path, folder=True) is not None:
+        folder = foreign_leaf(path, folder=True)
+        if folder is not None:
             diagnostic.add(reason)
+            if detailed:
+                leaf_path = NFT_FILE if path == NFT_DIR else DROP
+                with directory(path) as fd, os.scandir(fd) as names:
+                    inventory = []
+                    for i, member in enumerate(names):
+                        need(i < 128, 'PREREQUISITE')
+                        st = member.stat(follow_symlinks=False)
+                        inventory.append([member.name, st.st_ino, st.st_mode, st.st_size, st.st_ctime_ns])
+                sample = [path, folder[1], sorted(inventory)]
+                if len(inventory) == 1 and inventory[0][0] == os.path.basename(leaf_path):
+                    try:
+                        leaf = foreign_leaf(leaf_path)
+                    except (OSError, Refusal):
+                        leaf = None
+                    if leaf is not None:
+                        sample.append([leaf[1], digest(leaf[2])])
+                        contents[reason] = leaf[2]
+                need(foreign_leaf(path, folder=True) == folder, 'BASELINE_CHANGED')
+                found[reason] = sample
     net_exists = recovery_stat(NET) is not None
     if net_exists or recovery_stat(LEGACY_NFT) is not None:
-        if not old_network_idle(net_exists, fwmark):
+        if not old_network_idle(net_exists, fwmark, **({} if vacant else {'vacant': False})):
             raise FreshInstallConflict('L2TP_DAEMON_ACTIVE')
         net = foreign_leaf(NET)
         legacy_nft = foreign_leaf(LEGACY_NFT)
@@ -799,10 +839,60 @@ def foreign_config_observation(fwmark=None):
         if legacy_nft is not None:
             record('LEGACY_NFT_PRESENT', LEGACY_NFT, legacy_nft)
     keys = tuple(reason for reason in FOREIGN_REASONS if reason in found or reason in diagnostic)
+    if detailed:
+        for reason in diagnostic:
+            found.setdefault(reason, None)
+        return keys, digest(encode(['foreign-config-v2', found])) if keys else None, found, contents
     return keys, digest(encode(['foreign-config-v2', found])) if found and not diagnostic else None
 
 
-def fresh_install_conflicts(machine, lock_fd, fwmark=None):
+@contextlib.contextmanager
+def stock_workspace():
+    # This is not the cleanup VAULT. Nothing from here is ever published.
+    with directory('/run'), tempfile.TemporaryDirectory(prefix='c3-conffile-', dir='/run') as path:
+        yield Path(path)
+
+
+def cleanup_stock_inputs(keys, found, contents):
+    planner = C3_REPLACEMENT
+    bad = 'CONFFILE_UNKNOWN'
+    release = read('/usr/lib/os-release', 8192)
+    need(release is not None and os.uname().machine == 'x86_64', bad)
+    lines = raw(release).split(b'\n')
+    for k, v in ((b'ID', b'debian'), (b'VERSION_ID', b'13'), (b'VERSION_CODENAME', b'trixie')):
+        need([line.split(b'=', 1)[1] for line in lines if line.startswith(k + b'=')] in ([v], [b'"' + v + b'"']), bad)
+    need(all(native_vpn(unit(name), name) for name in (XL, IKE)), bad)
+    sample = {key: found[key] for key in keys}
+    wanted = planner['stock_requirements'](keys, digest(encode(['foreign-config-v2', sample])),
+                                           sample, {key: contents[key] for key in keys})
+    packages = sorted({planner['STOCK'][key][1] for key in keys})
+    installed = {p: command('/usr/bin/dpkg-query', '-W',
+                            r'-f=${binary:Package}\t${Status}\t${Architecture}\t${Version}\n${Conffiles}',
+                            p, quiet=True, refusal=bad) for p in packages}
+    need(all(row[2] == 'amd64' for row in planner['stock_identities'](wanted, installed).values()), bad)
+    return wanted, installed
+
+
+def cleanup_stage_stock(wanted, installed):
+    bad = 'CONFFILE_UNKNOWN'
+    end = min(DEADLINE, time.monotonic() + 28)
+    def run(argv, maximum, *, stderr_ok=False, **options):
+        rc, out, err = bounded_status(argv, end, maximum, stock_stage=True, **options)
+        need(rc == 0 and (stderr_ok or not err) and time.monotonic() < end, bad)
+        return out
+    staged = C3_REPLACEMENT['stage_host_stock'](wanted, installed=installed, directory=directory,
+                                               workspace=stock_workspace, run=run)
+    need(staged.keys() == wanted.keys() and time.monotonic() < end, bad)
+    if 'STARTER_NOT_STOCK' in staged:
+        data = staged['STARTER_NOT_STOCK'].data
+        need(uncomment(data) in ([STOCK_IKE_INCLUDE], [b'config setup', STOCK_IKE_INCLUDE]) or
+             digest(data) == STOCK_IKE_STARTER_SHA, bad)
+    if 'SECRETS_NOT_EMPTY' in staged:
+        need(not uncomment(staged['SECRETS_NOT_EMPTY'].data), bad)
+    return staged
+
+
+def fresh_install_conflicts(machine, lock_fd, fwmark=None, *, cleanup=None, detailed=False):
     def scope():
         need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
         current = (require_machine(machine), boot(), install_lock_identity(lock_fd))
@@ -822,13 +912,16 @@ def fresh_install_conflicts(machine, lock_fd, fwmark=None):
     keys = ()
     if runtime is None:
         try:
-            keys, _ = foreign_config_observation(fwmark)
+            if detailed:
+                keys, fingerprint, found, contents = foreign_config_observation(fwmark, detailed=True)
+            else:
+                keys, _ = foreign_config_observation(fwmark)
         except FreshInstallConflict:
             need(scope() == original, 'BASELINE_CHANGED')
             raise
         if keys:
-            # Runtime vetoes take precedence even if a daemon/session appeared
-            # during the read. Do not export the fingerprint or any file bytes.
+            # Runtime vetoes take precedence. The digest is private protocol
+            # data; never return file content or the sample itself.
             runtime = observe_runtime()
             if runtime is None and 'xfrm_user' not in missing_network_observers():
                 if (command('/usr/sbin/ip', 'xfrm', 'policy', 'list', 'nosock', quiet=True).strip()
@@ -837,8 +930,206 @@ def fresh_install_conflicts(machine, lock_fd, fwmark=None):
     need(scope() == original, 'BASELINE_CHANGED')
     if runtime is not None:
         raise FreshInstallConflict(runtime)
-    if keys:
+    if not detailed:
+        if keys:
+            raise FreshInstallConflict(FOREIGN_CONFIG, keys)
+        return
+    if not keys:
+        if cleanup is not None:
+            raise FreshInstallConflict(FOREIGN_CHANGED)
+        return
+    if cleanup is None and 'C3_REPLACEMENT' not in globals():
         raise FreshInstallConflict(FOREIGN_CONFIG, keys)
+    try:
+        edits = cleanup_edits(found, contents, fwmark, cleanup_at=cleanup['at'] if cleanup else None)
+    except FreshInstallConflict:
+        need(scope() == original, 'BASELINE_CHANGED')
+        raise
+    need(scope() == original, 'BASELINE_CHANGED')
+    cleanable = tuple(key for key in keys if key in edits)
+    if cleanup is not None and cleanup['digest'] != fingerprint:
+        raise FreshInstallConflict(FOREIGN_CHANGED, keys, fingerprint, cleanable)
+    planner = globals().get('C3_REPLACEMENT')
+    stock_keys = tuple(key for key in cleanable if key in planner['STOCK']) if planner else ()
+    if stock_keys:
+        # First request proves intrinsic eligibility only. Do not touch cache,
+        # APT indexes or staging until the authenticated consent is joined.
+        try:
+            wanted, installed = cleanup_stock_inputs(stock_keys, found, contents)
+        except (planner['Refusal'], Refusal, OSError, ValueError, subprocess.TimeoutExpired):
+            need(scope() == original, 'BASELINE_CHANGED')
+            raise FreshInstallConflict(FOREIGN_CONFIG, ('CONFFILE_UNKNOWN',)) from None
+        need(scope() == original, 'BASELINE_CHANGED')
+    mode_keys = {'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666'}
+    if cleanup is None or cleanable != keys or (mode_keys.intersection(keys) and not cleanup['fixXrayUnitMode']):
+        raise FreshInstallConflict(FOREIGN_CONFIG, keys, fingerprint, cleanable)
+    if stock_keys:
+        try:
+            staged = cleanup_stage_stock(wanted, installed)
+            need(cleanup_stock_inputs(stock_keys, found, contents) == (wanted, installed), 'CONFFILE_UNKNOWN')
+        except (planner['Refusal'], Refusal, OSError, ValueError, KeyError, OverflowError, subprocess.TimeoutExpired):
+            need(scope() == original, 'BASELINE_CHANGED')
+            raise FreshInstallConflict(FOREIGN_CONFIG, ('CONFFILE_UNKNOWN',)) from None
+        need(foreign_config_observation(fwmark, detailed=True) == (keys, fingerprint, found, contents), 'BASELINE_CHANGED')
+        edits = cleanup_edits(found, contents, fwmark, cleanup_at=cleanup['at'], staged=staged)
+        need(scope() == original, 'BASELINE_CHANGED')
+        need(edits.keys() == set(keys) and all(edits.values()), 'BASELINE_CHANGED')
+    return [edit for key in keys for edit in edits[key]]
+
+
+
+# These are projections of observed fixed paths, not a writable overlay.
+def cleanup_paths():
+    return {'SWAN_PROFILE_PRESENT': SWAN_PROFILE, 'IKE_PROFILE_PRESENT': NAMES['ike'],
+            'OPTIONS_PRESENT': NAMES['options'], 'MODULES_LOAD_FOREIGN': LEGACY_MODULES,
+            'STARTER_NOT_STOCK': NAMES['starter'], 'SECRETS_NOT_EMPTY': NAMES['secrets'], 'LNS_NOT_STOCK': NAMES['lns'],
+            'CHAP_NOT_EMPTY': NAMES['chap'], 'XRAY_UNIT_0666': SYSTEM + '/' + X,
+            'XRAY_BRIDGE_UNIT_0666': SYSTEM + '/' + B, 'NFT_DIR_PRESENT': NFT_DIR,
+            'NFT_MEMBER': NFT_FILE, 'DROPIN_PRESENT': DROP_DIR, 'DROP_MEMBER': DROP,
+            'LEGACY_NFT_PRESENT': LEGACY_NFT}
+
+
+CLEANUP_FOLDERS = ('NFT_DIR_PRESENT', 'DROPIN_PRESENT')
+CLEANUP_XRAY_SHA = {
+    'XRAY_UNIT_0666': '535cc050a1b1a0dfd209cdec45a43938d578a06ef5d05cec44a7a15e62253d9b',
+    'XRAY_BRIDGE_UNIT_0666': '8419e3b8dc8345ed8f7c1ce585a1e8bd6300134d040fef2de70535aee773696a',
+}
+
+
+def cleanup_xray_identity():
+    no_jobs((X, B))
+    result = {}
+    for name in (X, B):
+        info = unit(name)
+        if info['LoadState'] == 'not-found' and info['ActiveState'] == 'inactive' and info.get('MainPID') == '0' and name == B:
+            result[name] = {k: info.get(k) for k in INSTALL_UNIT_FIELDS}
+        else:
+            path = MAIN if name == X else BRIDGE
+            need(info.get('NeedDaemonReload') == 'no', 'BASELINE_CHANGED')
+            pid = xray_argv(info, path)
+            result[name] = [info['InvocationID'], pid, reattest_process(pid, info)]
+    return result
+
+
+def cleanup_runtime(fwmark, *, has_unit=False):
+    require_network_observers()
+    conflict = fresh_runtime_conflict()
+    if conflict is not None:
+        raise FreshInstallConflict(conflict)
+    if (command('/usr/sbin/ip', 'xfrm', 'policy', 'list', quiet=True).strip()
+            or command('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys', quiet=True).strip()):
+        raise FreshInstallConflict('L2TP_DAEMON_ACTIVE')
+    need(old_network_idle(has_unit, fwmark, vacant=False), OBSERVATION_REQUIRED)
+
+
+def cleanup_nft(data, *, classic):
+    # Demand byte equality with the known renderer; a table name/comment alone
+    # is insufficient. Do not run even nft --check during a read-only action.
+    try:
+        if classic:
+            cidr, port, mark = re.search(rb'ip saddr ([0-9./]+) meta l4proto tcp tproxy ip to :([0-9]+) meta mark set ([0-9]+) accept', data).groups()
+            cidr, port, mark = cidr.decode(), int(port), int(mark)
+            need(str(ipaddress.IPv4Network(cidr)) == cidr and 1 <= port <= 65535 and 1 <= mark <= 0xffffffff, 'PREREQUISITE')
+            lines = ''.join(f'        iifname "ppp*" ip saddr {cidr} meta l4proto {proto} tproxy ip to :{port} meta mark set {mark} accept\n'
+                            for proto in ('tcp', 'udp'))
+            return data == ('table inet celerity_l2tp {\n    chain prerouting {\n'
+                            '        type filter hook prerouting priority mangle; policy accept;\n' + lines +
+                            '    }\n\n    chain forward {\n        type filter hook forward priority filter; policy accept;\n'
+                            f'        iifname "ppp*" ip saddr {cidr} drop comment "block non-TPROXY PPP egress"\n'
+                            '    }\n}\n').encode()
+        token, cidr, port, mark = re.search(
+            rb'\Acreate table inet celerity_rebuild_l2tp \{\n    comment "([a-f0-9]{32})"\n.*?ip saddr ([0-9./]+) meta l4proto \{ tcp, udp \} tproxy ip to :([0-9]+) meta mark set ([0-9]+)',
+            data, re.S).groups()
+        cidr, port, mark = cidr.decode(), int(port), int(mark)
+        need(str(ipaddress.IPv4Network(cidr)) == cidr and 1 <= port <= 65535 and 1 <= mark <= 0xffffffff, 'PREREQUISITE')
+        return data == managed_nft_bytes(dict(clientCidr=cidr, tproxyPort=port, fwmark=mark), token.decode())
+    except (AttributeError, Refusal, ValueError):
+        return False
+
+
+def cleanup_record(data, pin):
+    return entry(data, stat.S_IMODE(pin[2]), pin[4], pin[3])
+
+
+def cleanup_edits(found, contents, fwmark, *, cleanup_at=None, staged=None):
+    planner = globals().get('C3_REPLACEMENT')
+    if planner is None:
+        return {}
+    try:
+        cleanup_runtime(fwmark, has_unit='NETWORK_UNIT_ORPHANED' in found)
+    except FreshInstallConflict:
+        # A late positive runtime conflict takes precedence over file diagnostics.
+        raise
+    except Refusal as error:
+        if str(error) != OBSERVATION_REQUIRED:
+            raise
+        return {}
+    result = {}
+    paths = cleanup_paths()
+    for key, item in found.items():
+        data = contents.get(key)
+        if key not in paths or data is None:
+            continue
+        if key in CLEANUP_FOLDERS:
+            member, = item[3:]
+            if stat.S_IMODE(item[1][2]) != 0o755 or stat.S_IMODE(member[0][2]) != 0o644:
+                continue
+            if key == 'NFT_DIR_PRESENT':
+                # A known body is not proof that a persistent include may be removed.
+                qualified = read('/etc/nftables.conf', 65536) is None and cleanup_nft(data, classic=False)
+                leaf = 'NFT_MEMBER'
+            else:
+                info = unit(XL)
+                qualified = (info.get('DropInPaths') == '' and info.get('NeedDaemonReload') == 'no'
+                             and data == f'[Unit]\nRequires={NET_UNIT} {IKE}\nAfter={NET_UNIT} {IKE}\n'.encode())
+                leaf = 'DROP_MEMBER'
+            if qualified:
+                result[key] = [[leaf, cleanup_record(data, member[0]), None, member[0]], [key, 0o755, None, item[1]]]
+            continue
+        if key == 'LEGACY_NFT_PRESENT':
+            base_nft = read('/etc/nftables.conf', 65536)
+            # No validator for a foreign persistent include graph.
+            if base_nft is None and (
+                    item[0] == paths[key] and stat.S_IMODE(item[1][2]) == 0o644 and cleanup_nft(data, classic=True)):
+                result[key] = [[key, cleanup_record(data, item[1]), None, item[1]]]
+            continue
+        if key in CLEANUP_XRAY_SHA:
+            name = X if key == 'XRAY_UNIT_0666' else B
+            info = unit(name)
+            if digest(data) != CLEANUP_XRAY_SHA[key] or info.get('FragmentPath') != paths[key]:
+                continue
+            try:
+                cleanup_xray_identity()
+            except (OSError, Refusal):
+                continue
+        try:
+            sample = {key: item}
+            args = ((key,), digest(encode(['foreign-config-v2', sample])), sample, {key: data})
+            if key in planner['STOCK'] and staged is None:
+                planner['stock_requirements'](*args)
+                result[key] = ()  # intrinsic eligibility, not a materialized edit
+                continue
+            plan = planner['plan_replacement'](*args, staged={key: staged[key]} if key in planner['STOCK'] else None,
+                                                allow_xray_mode=True, cleanup_at=cleanup_at)
+        except planner['Refusal']:
+            continue
+        if plan.set_aside or len(plan.edits) != 1:
+            continue
+        edit, = plan.edits
+        need(edit.key == key and edit.path == paths[key] and edit.before == data and list(edit.pin) == item[1], 'PREREQUISITE')
+        before = cleanup_record(data, item[1])
+        after = None if edit.after is None else {**before, 'data': b64(edit.after), 'mode': before['mode'] if edit.mode is None else edit.mode}
+        result[key] = [[key, before, after, item[1]]]
+    return result
+
+
+def cleanup_view(edits):
+    paths = cleanup_paths()
+    return {paths[key]: after for key, _, after, _ in edits}
+
+
+def foreign_no_pending():
+    need(recovery_stat(VAULT + '/' + FOREIGN_PENDING) is None, 'IN_FLIGHT')
 
 
 def stock_runtime_root():
@@ -895,7 +1186,7 @@ def module_name(name):
     return name.replace('-', '_')
 
 
-def ppp_boot_file(dependencies, installed=None):
+def ppp_boot_file(dependencies, installed=None, *, drop_legacy=False):
     # A same-name override may intentionally suppress a vendor module request.
     # Do not circumvent it by publishing our own file with a different name.
     def modules(path):
@@ -923,6 +1214,8 @@ def ppp_boot_file(dependencies, installed=None):
                 continue
             for name in names:
                 path = parent + '/' + name
+                if drop_legacy and path == LEGACY_MODULES:
+                    continue
                 if name == PPP_CONF:
                     need(path == PPP_PATH and own is not None, PPP_CONFLICT)
                 elif name in {PPP_CONF[:-5] + '-' + observer + '.conf' for observer in OBSERVERS}:
@@ -1056,7 +1349,7 @@ def ppp_host_scope():
     need(caps is not None and int(caps[1], 16) & (1 << 16), PPP_REQUIRED)  # CAP_SYS_MODULE
 
 
-def observe_ppp_preparation(required_observers=(), *, installed=None, fresh=True):
+def observe_ppp_preparation(required_observers=(), *, installed=None, fresh=True, drop_legacy=False):
     """Observe boot policy separately from the modules needing a live load."""
     try:
         absent = missing_network_observers()
@@ -1069,7 +1362,7 @@ def observe_ppp_preparation(required_observers=(), *, installed=None, fresh=True
         deps, builtin, policy, observer_policy = ppp_policy(observers)
         loaded, device = ppp_loaded(builtin), ppp_device()
         need(device is not False and (not loaded['ppp_generic'] or device is True), PPP_REQUIRED)
-        before = ppp_boot_file(deps, installed)
+        before = ppp_boot_file(deps, installed, **({'drop_legacy': True} if drop_legacy else {}))
         persist = installed is None and (canonical or before['record'] is None or bool(absent))
         missing = [name for name in PPP_MODULES if not loaded[name]] + absent
         if missing or persist:
@@ -1577,15 +1870,16 @@ def enroll_boot(target, expected=None):
         os.fsync(fd)
 
 
-def ike_include_matches(starter, expected, *, check_tree=False):
+def ike_include_matches(starter, expected, *, check_tree=False, removed=False):
     if check_tree or STOCK_IKE_INCLUDE in uncomment(raw(starter)):
         # A wildcard must never enroll or reload an unmanaged connection.
         with directory('/etc/ipsec.d') as fd:
-            return sorted(name for name in os.listdir(fd) if not name.startswith('.') and name.endswith('.conf')) == expected
+            return sorted(name for name in os.listdir(fd) if not name.startswith('.') and name.endswith('.conf')
+                          and not (removed and name == os.path.basename(NAMES['ike']))) == expected
     return True
 
 
-def swan_inputs(present, bad):
+def swan_inputs(present, bad, *, removed=False):
     # The reviewed bytes close both stock globs. Do not validate just individual
     # setting names: alternate includes, section references and other settings
     # could still bypass the managed routing configuration.
@@ -1594,6 +1888,8 @@ def swan_inputs(present, bad):
     try:
         with directory(SWAN_DIR) as fd:
             top = set(os.listdir(fd))
+        if removed:
+            top.discard(profile)
         need('charon' in top and (profile in top) == present, bad)
         top -= {'charon', profile}
         plugins = SWAN_DIR + '/charon'
@@ -1709,9 +2005,10 @@ def xray_accounts_match(info, original):
     return all(k not in original or (k in info and info[k] == original[k]) for k in XRAY_ACCOUNT_FIELDS)
 
 
-def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=()) -> dict[str, Any]:
+def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=(), projection=None) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
+    projection = projection or {}
     ready = preflight(machine)
     need(not ready['masked'], 'PREREQUISITE')
     no_jobs(UNITS)
@@ -1738,11 +2035,11 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
     need(units[NET_UNIT]['LoadState'] == 'not-found'
          and units[B]['ActiveState'] in ('active', 'inactive'), 'PREREQUISITE')
     for path in (NFT_DIR, DROP_DIR):
-        need(directory_absent(path), 'PREREQUISITE')
-    need(not any(os.path.lexists(p) for p in ('/etc/nftables.d/celerity-l2tp.nft', '/etc/ipsec.d/celerity-l2tp.conf')),
+        need(path in projection or directory_absent(path), 'PREREQUISITE')
+    need(not any(p not in projection and os.path.lexists(p) for p in (LEGACY_NFT, '/etc/ipsec.d/celerity-l2tp.conf')),
          'PREREQUISITE')
     files = {key: read(path, diagnose_main_mode=True, diagnose_profile_owner=diagnose_profile_owner)
-             if key == 'main' else read(path)
+             if key == 'main' else projection[path] if path in projection else read(path)
              for key, path in NAMES.items()}
     need(all(files[k] is None for k in ('ike', 'options', 'nft', 'net', 'drop'))
          and all(files[k] is not None for k in ('main', 'starter', 'chap', 'secrets')), 'PREREQUISITE')
@@ -1758,8 +2055,8 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
         raise Refusal('PREREQUISITE')
     need(is_stock_lns(files['lns']), 'PREREQUISITE')
     stock_starter = digest(raw(files['starter'])) == STOCK_IKE_STARTER_SHA
-    need(ike_include_matches(files['starter'], [], check_tree=True) if stock_starter
-         else ike_include_matches(files['starter'], []), 'PREREQUISITE')
+    need(ike_include_matches(files['starter'], [], **({'check_tree': True} if stock_starter else {}),
+                             **({'removed': True} if NAMES['ike'] in projection else {})), 'PREREQUISITE')
     bridge_generation = remove_generation(BRIDGE)
     bridge = read(BRIDGE, diagnose_profile_owner=diagnose_profile_owner)
     need(bridge is not None or units[B]['ActiveState'] == 'inactive', 'PREREQUISITE')
@@ -1801,9 +2098,9 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
              and not units[n].get('ExecCondition') for n in vpn), 'PREREQUISITE')
     removal_dependencies({n: units[n] for n in vpn}, installed=False)
     swan_default_environment('PREREQUISITE')
-    files['swan'] = read(SWAN_PROFILE, 8192)
+    files['swan'] = None if SWAN_PROFILE in projection else read(SWAN_PROFILE, 8192)
     need(files['swan'] is None, 'PREREQUISITE')
-    swan = swan_inputs(False, 'PREREQUISITE')
+    swan = swan_inputs(False, 'PREREQUISITE', **({'removed': True} if SWAN_PROFILE in projection else {}))
     STAGE = 'PROFILE_USERS'
     sockets = xray_users(files['main'], units[X], rows, transit) if rows is not None else None
     need(rows is None or sockets, 'RUNTIME_UNPROVED')
@@ -2306,14 +2603,14 @@ def installed_runtime(d, token, before, after):
             'files': file_generations(after), 'bootEnrollment': boot_link() if before.get('installBoot') else None}
 
 
-def write_swan_profile(path, old_manifest, backup, after):
+def write_swan_profile(path, old_manifest, backup, after, *, pin=False):
     before = backup['before']
     need(before['files']['swan'] is None and not before['ikeSockets']
          and after['swan'] == entry(SWAN_SETTINGS, 0o644)
          and swan_inputs(False, 'ROLLBACK_DRIFT') == before['swanInputs'], 'ROLLBACK_DRIFT')
     no_swan_rule()
-    write(SWAN_PROFILE, None, after['swan'])
-    backup['swanGeneration'] = remove_generation(SWAN_PROFILE)
+    generation = write(SWAN_PROFILE, None, after['swan'], witness=pin)
+    backup['swanGeneration'] = generation if pin else remove_generation(SWAN_PROFILE)
     check_swan_profile(backup, read(SWAN_PROFILE))
     updated = entry(encode(backup))
     write(path, old_manifest, updated)
@@ -2354,22 +2651,413 @@ def prepare_native_install(request, before, after, lock_fd):
     return dict(unit=live['units'][XL], generation=created)
 
 
-def install(request, before, after, lock_fd=None):
-    global STAGE, PPP_PREPARING, NATIVE_PREPARING
+
+
+def cleanup_current(key):
+    path = cleanup_paths()[key]
+    folder = key in CLEANUP_FOLDERS
+    leaf = foreign_leaf(path, folder=folder, unit_mode=key in CLEANUP_XRAY_SHA, read_unit=True)
+    if leaf is None:
+        return None, None
+    mode, pin, data = leaf
+    return (mode if folder else cleanup_record(data, pin)), pin
+
+
+def cleanup_fence(backup):
+    return entry(encode({k: backup[k] for k in ('backupId', 'machineId', 'network')} | {
+        'boot': backup['before']['boot'], 'installLock': backup['before']['installLock'],
+        'digest': backup['before']['foreignCleanup']['digest']}))
+
+
+def cleanup_guard(backup, fd, identity, *, file_net=False):
+    scope = package_scope(backup['machineId'], fd)
+    before = backup['before']
+    need(scope['boot'] == before['boot'] and scope['installLock'] == before['installLock']
+         and read(VAULT + '/' + FOREIGN_PENDING, 2048) == cleanup_fence(backup), 'IN_FLIGHT')
+    package_no_pending()
+    cleanup_runtime(backup['network']['fwmark'], has_unit=file_net and unit(NET_UNIT)['LoadState'] == 'loaded')
+    need(identity is None or cleanup_xray_identity() == identity, 'IN_FLIGHT')
+    need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+
+
+def cleanup_reload(edits):
+    return any(e[0] in (*CLEANUP_XRAY_SHA, 'DROPIN_PRESENT', 'NETWORK_UNIT_ORPHANED') for e in edits)
+
+
+def cleanup_no_remove(path):
+    need(removal_intent_matches(os.path.dirname(path) + '/remove-attempt.json', None), 'IN_FLIGHT')
+
+
+def restore_unit_mode(path, key, current, pin, original, identity):
+    # The forward replacement rotates away pre-existing writable FDs. On
+    # undo never publish a world-writable temporary unit before its final name.
+    parent, name = os.path.split(path)
+    with directory(parent) as held:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=held)
+        try:
+            name_unit = X if key == 'XRAY_UNIT_0666' else B
+            need(cleanup_xray_identity() == identity and unit(name_unit)['FragmentPath'] == path, 'IN_FLIGHT')
+            live = os.fstat(fd)
+            need(pin is not None and [live.st_dev, live.st_ino, live.st_ctime_ns] == [pin[0], pin[1], pin[8]]
+                 and cleanup_current(key) == (current, pin) and current is not None
+                 and current['mode'] == 0o644 and original == {**current, 'mode': 0o666}, 'IN_FLIGHT')
+            os.fchmod(fd, original['mode'])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(held)
+
+
+def cleanup_transition(path, record, backup, fd, *, restore=False, preinstall=False):
+    journal = backup['foreignJournal']
+    edits, done = journal['edits'], journal['done']
+    need(journal.get('editsSha256') == digest(encode(edits)), 'IN_FLIGHT')
+    paths = cleanup_paths()
+    need(edits and len(edits) <= len(paths) and len({e[0] for e in edits}) == len(edits)
+         and len(done) <= len(edits) and all(e[0] in paths for e in edits), 'IN_FLIGHT')
+    identity = journal.get('rollbackXray', journal['xray']) if restore else journal['xray']
+    need((identity is not None) == any(e[0] in CLEANUP_XRAY_SHA for e in edits), 'IN_FLIGHT')
+    cleanup_guard(backup, fd, identity)
+    validated = {}
+    for i, (key, before, after, pin) in enumerate(edits):
+        live, live_pin = cleanup_current(key)
+        if i < len(done):
+            need(live == after and ((not preinstall and restore and key not in CLEANUP_XRAY_SHA)
+                                    or live_pin == done[i]), 'IN_FLIGHT')
+            validated[key] = live_pin
+        else:
+            # A tracked member deletion changes its parent timestamps. Never
+            # infer a replacement directory from a pathname or from emptiness.
+            need(live == before and live_pin is not None and (live_pin[:6] == pin[:6]
+                 if key in CLEANUP_FOLDERS and i and i == len(done) else live_pin == pin), 'IN_FLIGHT')
+    if restore and backup['phase'] != 'restoring-foreign':
+        backup['phase'] = 'restoring-foreign'
+        nxt = entry(encode(backup))
+        write(path, record, nxt)
+        record = nxt
+    order = reversed(edits[:len(done)]) if restore else iter(edits)
+    for key, before, after, pin in order:
+        cleanup_guard(backup, fd, identity)
+        leaf = paths[key]
+        publication = None
+        current, live_pin = cleanup_current(key)
+        need(current == (after if restore else before), 'IN_FLIGHT')
+        if restore:
+            need(live_pin == validated[key], 'IN_FLIGHT')
+        if key in CLEANUP_FOLDERS:
+            if restore:
+                mkdir(leaf, before)
+                with directory(leaf) as held:
+                    os.fchmod(held, before)
+                    os.fsync(held)
+            else:
+                need(live_pin is not None and live_pin[:6] == pin[:6], 'IN_FLIGHT')
+                rmdir(leaf)  # never recurse or erase an unobserved member
+        elif restore and key in CLEANUP_XRAY_SHA:
+            restore_unit_mode(leaf, key, current, live_pin, before, identity)
+        else:
+            if not restore:
+                need(live_pin == pin, 'IN_FLIGHT')
+            generation = [live_pin[0], live_pin[1], live_pin[8]] if live_pin is not None else None
+            publication = write(leaf, current, before if restore else after, generation=generation,
+                                reader=lambda _: cleanup_current(key)[0], witness=key in CLEANUP_XRAY_SHA,
+                                mtime_ns=pin[7] if key in CLEANUP_XRAY_SHA else None)
+        observed, observed_pin = cleanup_current(key)
+        need(observed == (before if restore else after), 'IN_FLIGHT')
+        if key in CLEANUP_XRAY_SHA:
+            need(observed_pin is not None, 'IN_FLIGHT')
+            if restore:
+                need(observed_pin[:2] == live_pin[:2], 'IN_FLIGHT')
+                journal.setdefault('restoredXray', {})[key] = observed_pin
+            else:
+                need([observed_pin[0], observed_pin[1], observed_pin[8]] == publication, 'IN_FLIGHT')
+        if not restore:
+            done.append(observed_pin)
+            nxt = entry(encode(backup))
+            write(path, record, nxt)
+            record = nxt
+    cleanup_guard(backup, fd, identity)
+    expected = {key: before if restore else after for key, before, after, _ in edits}
+    need(all(cleanup_current(key)[0] == value for key, value in expected.items()), 'IN_FLIGHT')
+    return record
+
+
+def clear_cleanup_fence(backup):
+    pending = VAULT + '/' + FOREIGN_PENDING
+    fence = cleanup_fence(backup)
+    st = recovery_stat(pending)
+    if st is not None:
+        write(pending, fence, None, generation=[st.st_dev, st.st_ino, st.st_ctime_ns])
+    # A previous unlink can be visible even though its parent fsync failed.
+    with directory(VAULT, private=True) as held:
+        foreign_no_pending()
+        os.fsync(held)
+        foreign_no_pending()
+
+
+def complete_cleanup_rollback(path, record, backup):
+    cleanup_no_remove(path)
+    need(record == entry(encode(backup)) and backup['phase'] == 'rolled-back', 'IN_FLIGHT')
+    token_dir, name = os.path.split(path)
+    with directory(token_dir, private=True) as held:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=held)
+        with os.fdopen(fd, 'rb') as handle:
+            st = os.fstat(fd)
+            need(stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600
+                 and (st.st_uid, st.st_gid, st.st_nlink) == (0, 0, 1) and not os.listxattr(fd)
+                 and handle.read(2 * MAX_FILE + 1) == raw(record), 'IN_FLIGHT')
+            os.fsync(fd)
+            os.fsync(held)
+            live = os.stat(name, dir_fd=held, follow_symlinks=False)
+            need((live.st_dev, live.st_ino, live.st_ctime_ns) == (st.st_dev, st.st_ino, st.st_ctime_ns)
+                 and read(path, 2 * MAX_FILE) == record, 'IN_FLIGHT')
+    for parent in (VAULT, os.path.dirname(VAULT)):
+        with directory(parent, private=parent == VAULT) as held:
+            os.fsync(held)
+    clear_cleanup_fence(backup)
+    need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+
+
+def verify_retained_cleanup_edits(backup):
+    journal = backup['foreignJournal']
+    managed = set(operation_files(backup['after']).values()) | {NFT_DIR, DROP_DIR}
+    need(len(journal['edits']) == len(journal['done']) and all(
+        cleanup_paths()[key] in managed or cleanup_current(key) == (after, pin)
+        for (key, _, after, _), pin in zip(journal['edits'], journal['done'])), 'IN_FLIGHT')
+
+
+def cleanup_rollback(request, path, record, backup, fd, *, file_undo=None, file_net=False):
+    global CLEANUP_ENTERED
+    before = backup['before']
+    need(install_lock_identity(fd) == before['installLock'] and backup['machineId'] == request['machineId']
+         and backup['backupId'] == request['backupId'] and encode(backup['network']) == encode(request['network'])
+         and boot() == before['boot'], 'IN_FLIGHT')
+    CLEANUP_ENTERED = True
+    cleanup_no_remove(path)
+    package_no_pending()
+    journal = backup['foreignJournal']
+    need(not journal.get('reloadPending'), 'IN_FLIGHT')
+    if backup['phase'] == 'rolled-back':
+        verify_cleanup_rollback(request, backup)
+        complete_cleanup_rollback(path, record, backup)
+        return
+    if not package_entry_exists(FOREIGN_PENDING):
+        need(installed_phase(backup['phase']), 'IN_FLIGHT')
+        write(VAULT + '/' + FOREIGN_PENDING, None, cleanup_fence(backup))
+    need(read(VAULT + '/' + FOREIGN_PENDING, 2048) == cleanup_fence(backup), 'IN_FLIGHT')
+    pristine_phase = backup['phase'] == 'cleaning-foreign'
+    if file_undo is not None:
+        need(backup['phase'] == 'applying' and not backup.get('swanStart'), 'IN_FLIGHT')
+        cleanup_guard(backup, fd, journal['xray'], file_net=file_net)
+        verify_retained_cleanup_edits(backup)
+        need(read(path, 2 * MAX_FILE) == record, 'IN_FLIGHT')
+        backup['phase'] = 'restoring-foreign'
+        restoring = entry(encode(backup))
+        write(path, record, restoring)
+        record = restoring
+        file_undo()
+        verify_cleanup_original_runtime(request, backup, projection={})
+    elif not pristine_phase and backup['phase'] != 'projected-rollback':
+        # Join stock rollback as before. It proves the projected baseline;
+        # publish a distinct phase before attempting to restore foreign bytes.
+        need(backup.get('swanStart'), 'IN_FLIGHT')
+        verify_retained_cleanup_edits(backup)
+        if journal['xray'] is not None:
+            need(cleanup_xray_identity() == journal.get('installXray'), 'IN_FLIGHT')
+        rollback(request, path, record, backup, cleanup=True)
+        record = entry(encode(backup))
+    if not pristine_phase and file_undo is None:
+        verify_rollback(request['network'], request['backupId'], backup)
+    record = cleanup_transition(path, record, backup, fd, restore=True, preinstall=pristine_phase)
+    # Do not load restored, previously ignored drop-ins or reload again after
+    # restoring an Xray fragment to 0666. Read back the original manager state.
+    journal['preinstallRollback'] = pristine_phase or file_undo is not None
+    verify_cleanup_rollback(request, backup)
+    backup['phase'] = 'rolled-back'
+    terminal = entry(encode(backup))
+    write(path, record, terminal)
+    complete_cleanup_rollback(path, terminal, backup)
+
+
+def verify_cleanup_original_runtime(request, backup, *, projection):
+    before = backup['before']
+    live = observe(request['machineId'], request['network'], before.get('transit'), projection=projection)
+    need(encode(live) == encode({k: v for k, v in before.items() if k not in
+                                 ('pppModules', 'installLock', 'foreignCleanup')}), 'IN_FLIGHT')
+
+
+def verify_cleanup_rollback(request, backup):
+    journal = backup['foreignJournal']
+    edits = journal['edits']
+    need(journal.get('editsSha256') == digest(encode(edits)), 'IN_FLIGHT')
+    need(all(cleanup_current(key)[0] == original for key, original, _, _ in edits), 'IN_FLIGHT')
+    for i, (key, _, _, pin) in enumerate(edits):
+        if key in CLEANUP_XRAY_SHA:
+            expected = journal.get('restoredXray', {}).get(key) if i < len(journal['done']) else pin
+            need(expected is not None and cleanup_current(key)[1] == expected, 'IN_FLIGHT')
+    for key, member in (('NFT_DIR_PRESENT', NFT_FILE), ('DROPIN_PRESENT', DROP)):
+        if any(edit[0] == key for edit in edits):
+            with directory(cleanup_paths()[key]) as held, os.scandir(held) as rows:
+                need(next(rows).name == os.path.basename(member) and next(rows, None) is None, 'IN_FLIGHT')
+    cleanup_runtime(request['network']['fwmark'])
+    identity = journal.get('rollbackXray', journal['xray'])
+    need(identity is None or cleanup_xray_identity() == identity, 'IN_FLIGHT')
+    if journal['preinstallRollback']:
+        verify_cleanup_original_runtime(request, backup, projection=cleanup_view(edits))
+        plan = backup['before'].get('pppModules', {}).get('bootFile')
+        if 'modulePersistence' in backup:
+            need(plan is not None and read(PPP_PATH, 4096) == plan['before']['record'], 'IN_FLIGHT')
+    else:
+        verify_rollback(request['network'], request['backupId'], backup, projection=cleanup_view(edits))
+
+
+def cleanup_install_files(request, path, record, backup, fd, after, *, can_undo_modules):
+    """Join only this helper's synchronous, acknowledged file prefix."""
+    global CLEANUP_ENTERED
+    before = backup['before']
+    paths, originals = operation_files(after), original_files(before, after)
+    expected = {k: (originals[k], remove_generation(p)) for k, p in paths.items()}
+    dirs = {}
+    identity = backup['foreignJournal']['xray']
+
+    def verify_prefix():
+        for key, leaf in paths.items():
+            image, pin = expected[key]
+            need((image is None) == (pin is None) and read(leaf) == image
+                 and remove_generation(leaf) == pin, 'IN_FLIGHT')
+        for leaf in (NFT_DIR, DROP_DIR):
+            if leaf not in dirs:
+                need(directory_absent(leaf), 'IN_FLIGHT')
+                continue
+            live, own = recovery_stat(leaf), os.fstat(dirs[leaf])
+            need(live is not None and stat.S_ISDIR(live.st_mode)
+                 and (live.st_dev, live.st_ino, live.st_mode, live.st_uid, live.st_gid)
+                 == (own.st_dev, own.st_ino, own.st_mode, 0, 0), 'IN_FLIGHT')
+            with os.scandir(dirs[leaf]) as rows:
+                members = {os.path.basename(p) for k, p in paths.items()
+                           if os.path.dirname(p) == leaf and expected[k][0] is not None}
+                for row in rows:
+                    need(row.name in members, 'IN_FLIGHT')
+                    members.remove(row.name)
+                need(not members, 'IN_FLIGHT')
+
+    verify_prefix()
+    touched_parent = os.path.dirname(SWAN_PROFILE)
+    with contextlib.ExitStack() as held:
+        try:
+            if 'swan' in after:
+                record = write_swan_profile(path, record, backup, after, pin=True)
+                expected['swan'] = after['swan'], backup['swanGeneration']
+            for folder in (NFT_DIR, DROP_DIR):
+                touched_parent = os.path.dirname(folder)
+                mkdir(folder, 0o755)
+                dirs[folder] = held.enter_context(directory(folder))
+            for key in operation_order(after):
+                if key == 'swan' or originals[key] == after[key]:
+                    continue
+                leaf = paths[key]
+                touched_parent = os.path.dirname(leaf)
+                pin = write(leaf, originals[key], after[key], generation=expected[key][1], witness=True)
+                expected[key] = after[key], pin
+        except OSError as error:
+            # No boot enrollment or service command was admitted in this
+            # region. An unacknowledged publication (even byte-identical), a
+            # left-over stage or a changed neighbor invalidates the whole join.
+            need(not isinstance(error, BlockingIOError) and can_undo_modules, 'IN_FLIGHT')
+            need(read(path, 2 * MAX_FILE) == record, 'IN_FLIGHT')
+            with directory(touched_parent) as parent:
+                recovery_scan(touched_parent, lambda name: name.startswith('.direct-'))
+                os.fsync(parent)
+            verify_prefix()
+            owner = module_boot_owner(backup)
+            check_module_boot_owner(owner)
+            if 'swan' in after:
+                check_swan_profile(backup, expected['swan'][0])
+            file_net = expected['net'][0] != originals['net']
+
+            def undo():
+                for key in reversed(operation_order(after)):
+                    image, pin = expected[key]
+                    if image != originals[key]:
+                        cleanup_guard(backup, fd, identity, file_net=file_net)
+                        if key == 'swan':
+                            check_swan_profile(backup, read(SWAN_PROFILE))
+                        write(paths[key], image, originals[key], generation=pin)
+                for folder in reversed(dirs):
+                    h = os.fstat(dirs[folder])
+                    live = recovery_stat(folder)
+                    need(live is not None and (live.st_dev, live.st_ino) == (h.st_dev, h.st_ino), 'IN_FLIGHT')
+                    rmdir(folder)
+                release_module_boot(owner)
+                if file_net or expected['drop'][0] != originals['drop']:
+                    # The manager may have loaded a fragment on observation,
+                    # even though our forward daemon-reload never ran.
+                    sc('daemon-reload', wait=12)
+                    cleanup_guard(backup, fd, identity)
+
+            cleanup_rollback(request, path, record, backup, fd, file_undo=undo, file_net=file_net)
+        else:
+            return record
+    # The existing typed rollback/reconcile reply still has to be read back
+    # by the caller. This refusal is settled, but is never a no-write frame.
+    need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+    CLEANUP_ENTERED = False
+    raise Refusal('COMMAND_FAILED')
+
+
+def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
+    global STAGE, PPP_PREPARING, NATIVE_PREPARING, NO_INSTALL_WRITES, CLEANUP_ENTERED
     STAGE = 'COMMAND_FAILED'
     token, d = request['backupId'], request['network']
     pending = 'nativePreparation' in before
     backup: dict[str, Any] = dict(machineId=request['machineId'], backupId=token, before=before, network=d,
                   after={k: {**r, 'data': digest(raw(r))} for k, r in after.items()},
                   phase='preparing-native' if pending else 'applying')
+    if cleanup_edits:
+        backup['phase'] = 'cleaning-foreign'
+        xray = cleanup_xray_identity() if any(e[0] in CLEANUP_XRAY_SHA for e in cleanup_edits) else None
+        backup['foreignJournal'] = dict(edits=cleanup_edits, editsSha256=digest(encode(cleanup_edits)), done=[], xray=xray)
+        need(not pending and lock_fd is not None, 'PREREQUISITE')
+        cleanup_runtime(d['fwmark'])
     payload = encode(backup)
     need(len(payload) <= 2 * MAX_FILE, 'CANDIDATE_INVALID')
+    if cleanup_edits:
+        # Include VAULT creation in the uncertain boundary. The manifest and
+        # global pending marker are independently durable before host edits.
+        NO_INSTALL_WRITES = False
+        CLEANUP_ENTERED = True
     mkdir(VAULT, 0o700, exist_ok=True)
     mkdir(VAULT + '/' + token, 0o700)
     path = manifest_path(token)
     old_manifest = entry(payload)
     NATIVE_PREPARING = pending
     write(path, None, old_manifest)
+    if cleanup_edits:
+        with directory(os.path.dirname(VAULT)) as parent:
+            os.fsync(parent)
+        write(VAULT + '/' + FOREIGN_PENDING, None, cleanup_fence(backup))
+        _, live_digest, _, _ = foreign_config_observation(d['fwmark'], detailed=True, vacant=False)
+        need(live_digest == request['foreignCleanup']['digest'], 'IN_FLIGHT')
+        if request.get('progress') is True:
+            install_progress('foreignCleanup')
+        old_manifest = cleanup_transition(path, old_manifest, backup, lock_fd)
+        if cleanup_reload(cleanup_edits):
+            journal = backup['foreignJournal']
+            journal['reloadPending'] = True
+            intent = entry(encode(backup))
+            write(path, old_manifest, intent)
+            sc('daemon-reload', wait=12)
+            cleanup_guard(backup, lock_fd, journal['xray'])
+            del journal['reloadPending']
+            old_manifest = entry(encode(backup))
+            write(path, intent, old_manifest)
+        live = observe_install(request['machineId'], d, before.get('transit'), lock_fd)
+        need({**live, 'foreignCleanup': request['foreignCleanup']} == before
+             and candidate(request, live) == after, 'BASELINE_CHANGED')
+        backup['phase'] = 'applying'
+        start = entry(encode(backup))
+        write(path, old_manifest, start)
+        old_manifest = start
     if pending:
         need(lock_fd is not None and observe_install(request['machineId'], routing(d), before.get('transit'), lock_fd) == before,
              'BASELINE_CHANGED')
@@ -2381,12 +3069,16 @@ def install(request, before, after, lock_fd=None):
         before = runtime_before(backup, preparing_modules=True)
         NATIVE_PREPARING = False
     modules = before.get('pppModules')
+    can_undo_modules = not modules or not modules['missing']
     if modules is not None:
         # The live kernel loads are shared and irreversible. Only the exact
         # boot-file generation published here can be released later.
         PPP_PREPARING = True
         need(lock_fd is not None and install_lock_identity(lock_fd) == before['installLock']
              and boot() == before['boot'] and preflight(request['machineId'])['masked'] is False, 'BASELINE_CHANGED')
+        if cleanup_edits and 'bootFile' in modules:
+            # Rollback owns the receipted boot file, not a newly created parent.
+            can_undo_modules = can_undo_modules and recovery_stat(PPP_DIRS[0]) is not None
         generation = apply_ppp_preparation(modules)
         if 'bootFile' in modules:
             backup['modulePersistence'] = generation
@@ -2419,14 +3111,18 @@ def install(request, before, after, lock_fd=None):
         # after the durable host intent and under the reserved host lock.
         command('/usr/sbin/nft', '-c', '-f', '-', data=raw(after['nft']))
         PPP_PREPARING = False
-    if 'swan' in after:
-        old_manifest = write_swan_profile(path, old_manifest, backup, after)
-    mkdir(NFT_DIR, 0o755)
-    mkdir(DROP_DIR, 0o755)
-    paths, originals = operation_files(after), original_files(before, after)
-    for key in (*ORDER, 'bridge') if 'bridge' in after else ORDER:
-        if originals[key] != after[key]:
-            write(paths[key], originals[key], after[key])
+    if cleanup_edits:
+        old_manifest = cleanup_install_files(request, path, old_manifest, backup, lock_fd, after,
+                                             can_undo_modules=can_undo_modules)
+    else:
+        if 'swan' in after:
+            old_manifest = write_swan_profile(path, old_manifest, backup, after)
+        mkdir(NFT_DIR, 0o755)
+        mkdir(DROP_DIR, 0o755)
+        paths, originals = operation_files(after), original_files(before, after)
+        for key in (*ORDER, 'bridge') if 'bridge' in after else ORDER:
+            if originals[key] != after[key]:
+                write(paths[key], originals[key], after[key])
     if before.get('installBoot'):
         target = before['units'][XL]['FragmentPath']
         enroll_boot(target)
@@ -2449,6 +3145,8 @@ def install(request, before, after, lock_fd=None):
     if before.get('ikeSockets'):
         sc('restart', IKE, wait=22)
     no_jobs(UNITS)
+    if cleanup_edits and backup['foreignJournal']['xray'] is not None:
+        backup['foreignJournal']['installXray'] = cleanup_xray_identity()
     if 'swan' in after:
         check_swan_profile(backup, read(SWAN_PROFILE))
         units = {n: unit(n) for n in SWAN_START_UNITS}
@@ -2488,8 +3186,13 @@ def install(request, before, after, lock_fd=None):
     if 'swan' in after:
         need(runtime['files']['swan'] == backup['swanGeneration']
              and runtime['invocations'][1:4] == backup['swanStart'], 'ROLLBACK_DRIFT')
+    if cleanup_edits:
+        verify_retained_cleanup_edits(backup)
     backup.update(phase='installed', runtime=runtime)
     write(path, old_manifest, entry(encode(backup)))
+    if cleanup_edits:
+        clear_cleanup_fence(backup)
+        need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
 
 
 def after_match(record, expected):
@@ -2678,9 +3381,11 @@ def load_after(backup, require_all=False):
     return current
 
 
-def rollback(request, path, old_manifest, backup):
+def rollback(request, path, old_manifest, backup, *, cleanup=False):
     global STAGE
     STAGE = 'COMMAND_FAILED'
+    if cleanup:
+        cleanup_no_remove(path)
     was_installed = installed_phase(backup['phase'])
     need(backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
     # Reattestation does not transfer the original Install rollback authority,
@@ -2868,14 +3573,21 @@ def rollback(request, path, old_manifest, backup):
         sc('restart', X, wait=22)
     if before.get('ikeSockets'):
         sc('start', IKE, wait=22)
+    identity = None
+    if cleanup and backup['foreignJournal']['xray'] is not None:
+        identity = cleanup_xray_identity()
     verify_rollback(d, token, backup)
+    if identity is not None:
+        need(cleanup_xray_identity() == identity, 'IN_FLIGHT')
+        backup['foreignJournal']['rollbackXray'] = identity
     need(read(path, 2 * MAX_FILE) == rolling, 'ROLLBACK_DRIFT')
     release_module_boot(module_owner)
-    backup['phase'] = 'rolled-back'
+    backup['phase'] = 'projected-rollback' if cleanup else 'rolled-back'
     write(path, rolling, entry(encode(backup)))
 
 
-def verify_rollback(d, token, backup):
+def verify_rollback(d, token, backup, *, projection=None):
+    projection = projection or {}
     before = runtime_before(backup)
     paths = operation_files(backup['after'])
     originals = original_files(before, paths)
@@ -2883,13 +3595,13 @@ def verify_rollback(d, token, backup):
     no_jobs(UNITS)
     neighbors(before, sidecar)
     if 'swan' in paths:
-        need(swan_inputs(False, STAGE) == before['swanInputs'], STAGE)
+        need(swan_inputs(False, STAGE, **({'removed': True} if SWAN_PROFILE in projection else {})) == before['swanInputs'], STAGE)
     if sidecar:
         bpid = xray_argv(unit(B), BRIDGE)
         handoff = next(i['port'] for i in json.loads(raw(originals['bridge']))['inbounds'] if i['tag'] == 'rebuild-relay-ingress')
         verify_socks_handoff(sock_rows(), handoff, bpid)
-    need(all(directory_absent(p) for p in (DROP_DIR, NFT_DIR)) and
-         {key: read(p) for key, p in paths.items()} == originals and
+    need(all(p in projection or directory_absent(p) for p in (DROP_DIR, NFT_DIR)) and
+         {key: projection[p] if p in projection else read(p) for key, p in paths.items()} == originals and
          (not before.get('installBoot') or boot_link() is None) and
          network_projection(d, token, pinned=pinned_network_manifest(d, token, backup))
          == {'nft': None, 'rule': False, 'route': False}
@@ -4511,6 +5223,22 @@ def removal_ike_ready(state):
             time.sleep(0.2)
 
 
+def discard_removed_cleanup_backup(state, intent_record):
+    if 'foreignCleanup' not in state['before']:
+        return
+    path, record = state['path'], state['manifest']
+    backup = json.loads(raw(record))
+    journal = backup.get('foreignJournal')
+    need(installed_phase(backup['phase']) and type(journal) is dict
+         and journal.get('editsSha256') == digest(encode(journal['edits']))
+         and removal_intent_matches(state['intent'], intent_record), 'ROLLBACK_DRIFT')
+    # Retire all private preimages, not the no-replay generation. Older
+    # receive helpers still collide with its exact existing token directory.
+    tombstone = entry(encode({'phase': 'removed', 'backupId': backup['backupId']}))
+    write(path, record, tombstone)
+    need(read(path, 2 * MAX_FILE) == tombstone, 'ROLLBACK_DRIFT')
+
+
 def remove_installation(request, state, *, drain=None):
     global REMOVE_ENTERED, STAGE
     token, d = request['backupId'], request['network']
@@ -4690,6 +5418,7 @@ def remove_installation(request, state, *, drain=None):
     removal_files_after(state)
     removal_neighbors(state)
     release_module_boot(state.get('module_owner'))
+    discard_removed_cleanup_backup(state, intent_record)
 
 
 SESSION_UNKNOWN = 'SESSION_COUNT_UNPROVED'
@@ -6369,7 +7098,8 @@ def package_preflight(machine):
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         package_no_pending()
-        fresh_install_conflicts(machine, fd)
+        foreign_no_pending()
+        fresh_install_conflicts(machine, fd, detailed=True)
         check_package_observer_policy()
         _, _, commit = package_observation(guard, machine, fd, PackageRunner())
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
@@ -6422,6 +7152,7 @@ def prepare_packages(request):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             require_machine(machine)
             package_no_pending()
+            foreign_no_pending()
             need(not package_entry_exists(receipt_name) and not package_entry_exists(token), 'BASELINE_CHANGED')
             try:
                 require_runtime_packages(PACKAGE_AUTOSTART_UNSAFE)
@@ -6621,10 +7352,11 @@ def recovery_manifest(request, scope):
     unit_keys = set(INSTALL_UNIT_FIELDS)
     account_keys = set(XRAY_ACCOUNT_FIELDS)
     need(keys <= set(backup) <= keys | {'runtime', 'nativePrepared', 'bootEnrollment', 'swanStart', 'swanGeneration',
-                                      'preparedSockets', 'modulePersistence'}
+                                      'preparedSockets', 'modulePersistence', 'foreignJournal'}
+         and ('foreignJournal' in backup) == ('foreignCleanup' in before)
          and record == entry(encode(backup)) and backup['backupId'] == request['backupId']
          and backup['machineId'] == scope['machineId'] and encode(backup['network']) == encode(request['network'])
-         and baseline_keys <= set(before) <= baseline_keys | {'transit', 'nativePreparation', 'emptyBridgeGeneration'}
+         and baseline_keys <= set(before) <= baseline_keys | {'transit', 'nativePreparation', 'emptyBridgeGeneration', 'foreignCleanup'}
          and before['boot'] == scope['boot'] and before['installLock'] == scope['installLock']
          and type(before['installBoot']) is bool and type(before['ikeSockets']) is list
          and ((type(before['sockets']) is list and 'preparedSockets' not in backup)
@@ -6641,11 +7373,12 @@ def recovery_manifest(request, scope):
          and all(type(item) is dict and set(item) in ({'data', 'mode', 'gid'}, {'data', 'mode', 'gid', 'uid'})
                  and isinstance(item['data'], str) and re.fullmatch(r'[a-f0-9]{64}', item['data'])
                  for item in after.values()), 'IN_FLIGHT')
-    need(phase in ('installed', 'applying', 'rolled-back'), 'IN_FLIGHT')
+    need(phase in ('installed', 'applying', 'rolled-back')
+         or phase in ('cleaning-foreign', 'projected-rollback') and 'foreignJournal' in backup, 'IN_FLIGHT')
     # The legacy applying manifest precedes all native effects. The flock
     # alone doesn't join an orphaned systemctl client. The stock swanStart
     # receipt is written *after* the last native writer returns.
-    if phase != 'rolled-back':
+    if phase not in ('rolled-back', 'cleaning-foreign', 'projected-rollback'):
         started = backup['swanStart']
         need(type(started) is list and len(started) == len(SWAN_START_UNITS)
              and all(isinstance(birth, str) and re.fullmatch(r'[a-f0-9]{32}', birth) and int(birth, 16) for birth in started)
@@ -6679,6 +7412,7 @@ def reconcile_install(request):
         recovery_scan(VAULT, lambda name: name.startswith('.direct-'), private=True)
         token_exists = package_entry_exists(token)
         if not token_exists or recovery_stat(manifest_path(token)) is None:
+            foreign_no_pending()
             need(package is not None, 'IN_FLIGHT')
             marker_path = token_dir + '/' + INSTALL_ABSENT
             fence = entry(encode({**scope, 'backupId': token, 'nodeId': node, 'network': d, 'package': package}))
@@ -6706,11 +7440,15 @@ def reconcile_install(request):
             need(package is None or package['phase'] == 'ready', 'IN_FLIGHT')
             recovery_scan(token_dir, lambda name: name != 'manifest.json', private=True)
             path, record, backup = recovery_manifest(request, scope)
-            if backup['phase'] == 'rolled-back':
+            if 'foreignJournal' in backup:
+                cleanup_rollback(request, path, record, backup, fd)
+            elif backup['phase'] == 'rolled-back':
+                foreign_no_pending()
                 verify_rollback(d, token, backup)
                 owner = module_boot_owner(backup)
                 need(owner is None or read(PPP_PATH, 4096) == owner[0], 'IN_FLIGHT')
             else:
+                foreign_no_pending()
                 rollback(request, path, record, backup)
             need(backup['phase'] == 'rolled-back' and read(path, 2 * MAX_FILE) == entry(encode(backup)), 'IN_FLIGHT')
             result = 'rolled_back'
@@ -6719,22 +7457,46 @@ def reconcile_install(request):
     return {'nodeId': node, 'backupId': token, 'machineId': machine, 'challenge': request['challenge'], 'result': result}
 
 
-def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
+def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False, edits=None):
     lock_id = install_lock_identity(lock_fd)
-    # Called only on the Install path, never from verify/rollback/reconcile/remove.
-    fresh_install_conflicts(machine, lock_fd, network['fwmark'])
-    modules = observe_ppp_preparation()
+    projection = cleanup_view(edits) if edits else {}
+    if edits is None:
+        fresh_install_conflicts(machine, lock_fd, network['fwmark'], detailed=True)
+    modules = observe_ppp_preparation(**({'drop_legacy': True} if LEGACY_MODULES in projection else {}))
     deferred = tuple(name for name in modules['missing'] if name in OBSERVERS)
     before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner,
-                     **({'deferred': deferred} if deferred else {}))
+                     **({'deferred': deferred} if deferred else {}), **({'projection': projection} if projection else {}))
     need(install_lock_identity(lock_fd) == lock_id, 'BASELINE_CHANGED')
     return {**before, 'pppModules': modules, 'installLock': lock_id}
 
 
+def cleanup_observe(request, d, transit, fd, *, diagnose_profile_owner=False):
+    machine = request['machineId']
+    cleanup = request.get('foreignCleanup')
+    edits = (fresh_install_conflicts(machine, fd, d['fwmark'], cleanup=cleanup, detailed=True)
+             if cleanup is not None else None)
+    before = observe_install(machine, d, transit, fd, **({'diagnose_profile_owner': True} if diagnose_profile_owner else {}),
+                             **({'edits': edits} if edits else {}))
+    if edits:
+        # Do not project a pending native service activation or absent observer.
+        need('nativePreparation' not in before and not set(before['pppModules']['missing']).intersection(OBSERVERS)
+             and before['sockets'] is not None, 'PREREQUISITE')
+        before['foreignCleanup'] = cleanup
+    return before, edits
+
+
 def dispatch(request: dict[str, Any]):
-    global STAGE, NO_INSTALL_WRITES
+    global STAGE, NO_INSTALL_WRITES, CLEANUP_ENTERED
     need(os.geteuid() == 0 and type(request) is dict, 'PREREQUISITE')
     action = request['action']
+    NO_INSTALL_WRITES = action == 'install'
+    CLEANUP_ENTERED = False
+    cleanup = request.get('foreignCleanup')
+    if 'foreignCleanup' in request:
+        need(action in FRESH_ACTIONS and type(cleanup) is dict and set(cleanup) == {'digest', 'fixXrayUnitMode', 'at'}
+             and type(cleanup['digest']) is str and re.fullmatch(r'[a-f0-9]{64}', cleanup['digest'])
+             and type(cleanup['fixXrayUnitMode']) is bool and type(cleanup['at']) is str
+             and re.fullmatch(r'[0-9]{4}(?:-[0-9]{2}){2}T[0-9]{2}(?::[0-9]{2}){2}\.[0-9]{3}Z', cleanup['at']), 'CANDIDATE_INVALID')
     if action == 'reconcile-install':
         return reconcile_install(request)
     if action == 'prove-applied-main':
@@ -6757,6 +7519,7 @@ def dispatch(request: dict[str, Any]):
         with directory(SYSTEM) as fd:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             require_machine(request['machineId'])
+            foreign_no_pending()
             return reattest_runtime(request, fd)
     machine = request['machineId']
     if action in ('session-count', 'retirement-count'):
@@ -6765,25 +7528,26 @@ def dispatch(request: dict[str, Any]):
          ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove')
          + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
     if action == 'preflight':
-        need(set(request) == {'action', 'machineId'}, 'CANDIDATE_INVALID')
-    NO_INSTALL_WRITES = action == 'install'
-    fresh = action in ('preflight', 'prepare', 'check', 'install')
+        need(set(request) <= {'action', 'machineId', 'foreignCleanup'}, 'CANDIDATE_INVALID')
+    fresh = action in FRESH_ACTIONS
     try:
         ready = preflight(machine, fresh=True) if fresh else preflight(machine)
     except Refusal as error:
-        if action == 'preflight' and str(error) == PACKAGE_AUTOSTART_UNSAFE:
+        if action == 'preflight' and cleanup is None and str(error) == PACKAGE_AUTOSTART_UNSAFE:
             return package_preflight(machine)
         raise
     if action == 'preflight':
+        need(cleanup is None or not ready['masked'], 'PREREQUISITE')
         if not ready['masked']:
             with directory(SYSTEM) as fd:
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 package_no_pending()
-                fresh_install_conflicts(machine, fd)
+                foreign_no_pending()
+                fresh_install_conflicts(machine, fd, cleanup=cleanup, detailed=True)
         xl = unit(XL)
         pending = pending_xl(xl)
         if pending:
-            need(not ready['masked'], NATIVE_UNIT_REQUIRED)
+            need(cleanup is None and not ready['masked'], NATIVE_UNIT_REQUIRED)
             pending_native(xl, unit(IKE), pending)
             package_no_pending()
             return {**ready, 'unitsLoaded': False, 'pppPreparation': True, 'nativePreparation': True}
@@ -6798,6 +7562,8 @@ def dispatch(request: dict[str, Any]):
         require_machine(machine)
         if fresh:
             package_no_pending()
+        if action != 'rollback':
+            foreign_no_pending()
         if action in APPLY_NETWORK_ACTIONS:
             keys = {'action', 'machineId', 'backupId', 'network'}
             if action in ('verify-apply-network', 'restart-apply-network', 'publish-apply-profiles', 'finalize-apply-profiles'):
@@ -6866,7 +7632,7 @@ def dispatch(request: dict[str, Any]):
         need('transit' not in request or type(transit) is list, 'CANDIDATE_INVALID')
         need('progress' not in request or (action == 'install' and request['progress'] is True), 'CANDIDATE_INVALID')
         if action == 'prepare':
-            before = observe_install(machine, d, transit, fd, diagnose_profile_owner=True)
+            before, _ = cleanup_observe(request, d, transit, fd, diagnose_profile_owner=True)
             if 'nativePreparation' in before:
                 ready = {**ready, 'unitsLoaded': False}
             main = raw(before['files']['main'])
@@ -6876,14 +7642,17 @@ def dispatch(request: dict[str, Any]):
         token = request['backupId']
         need(re.fullmatch(r'[a-f0-9]{32}', token) and re.fullmatch(r'[a-f0-9]{64}', request['baseline']), 'CANDIDATE_INVALID')
         if action in ('check', 'install'):
-            before = observe_install(machine, d, transit, fd)
+            before, edits = cleanup_observe(request, d, transit, fd)
             need(digest(encode(before)) == request['baseline'], 'BASELINE_CHANGED')
             after = candidate(request, before)
             validate_profiles(after)
             if action == 'install':
-                need(observe_install(machine, d, transit, fd) == before, 'BASELINE_CHANGED')
-                NO_INSTALL_WRITES = False
-                install(request, before, after, fd)
+                need(cleanup_observe(request, d, transit, fd) == (before, edits), 'BASELINE_CHANGED')
+                if edits:
+                    install(request, before, after, fd, cleanup_edits=edits)
+                else:
+                    NO_INSTALL_WRITES = False
+                    install(request, before, after, fd)
         else:
             require_network_observers()
             path, record, backup = bound_manifest(request)
@@ -6899,7 +7668,11 @@ def dispatch(request: dict[str, Any]):
                 need(installed_runtime(d, token, runtime_before(backup), files) == backup['runtime'], 'RUNTIME_UNPROVED')
             else:
                 need(backup['phase'] != 'preparing-native', 'IN_FLIGHT')
-                rollback(request, path, record, backup)
+                if 'foreignJournal' in backup:
+                    cleanup_rollback(request, path, record, backup, fd)
+                else:
+                    foreign_no_pending()
+                    rollback(request, path, record, backup)
         return {'ok': True, 'backupId': token}
 
 
@@ -6913,8 +7686,10 @@ def main():
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
         request = json.loads(wire)
         action = request.get('action') if type(request) is dict else None
-        if action in ('preflight', 'prove-applied-main', 'prepare-packages', 'reconcile-install', 'reattest-runtime'):
-            need(len(wire) <= 1024, 'CANDIDATE_INVALID')
+        if action in ('preflight', 'prove-applied-main', 'prepare-packages', 'reconcile-install', 'reattest-runtime') \
+                or type(request) is dict and 'foreignCleanup' in request:
+            if action not in ('prepare', 'check', 'install'):
+                need(len(wire) <= 1024, 'CANDIDATE_INVALID')
 
             def unique_fields(pairs):
                 value = dict(pairs)
@@ -6932,7 +7707,7 @@ def main():
         return 75
     except Refusal as error:
         if (action == 'reconcile-install' or REATTEST_ENTERED or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED
-                or NATIVE_PREPARING or str(error) == 'IN_FLIGHT'):
+                or NATIVE_PREPARING or CLEANUP_ENTERED or str(error) == 'IN_FLIGHT'):
             return 75
         if (str(error) in (RUNTIME_REATTEST_REQUIRED, RUNTIME_FOREIGN_CHANGE) or
                 action == 'reattest-runtime' and str(error) == OBSERVATION_REQUIRED) and time.monotonic() >= DEADLINE:
@@ -6942,13 +7717,20 @@ def main():
         if isinstance(error, FreshInstallConflict):
             if time.monotonic() >= DEADLINE:
                 return 75
-            if (action not in ('preflight', 'prepare', 'check', 'install') or str(error) not in FRESH_CONFLICTS
-                    or bool(error.keys) != (str(error) == FOREIGN_CONFIG)
-                    or tuple(k for k in FOREIGN_REASONS if k in error.keys) != error.keys):
+            if (action not in FRESH_ACTIONS or str(error) not in FRESH_CONFLICTS
+                    or (str(error) == FOREIGN_CONFIG and not error.keys)
+                    or (error.keys and str(error) not in (FOREIGN_CONFIG, FOREIGN_CHANGED))
+                    or tuple(k for k in FOREIGN_REASONS if k in error.keys) != error.keys
+                    or tuple(k for k in error.keys if k in error.cleanable) != error.cleanable
+                    or (error.fingerprint is not None and (not error.keys
+                        or not re.fullmatch(r'[a-f0-9]{64}', error.fingerprint)))):
                 print('DIRECT_PREREQUISITE', file=sys.stderr)
                 return 70
             prefix = 'DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_'
-            print(prefix + str(error) + (' ' + ','.join(error.keys) if error.keys else ''), file=sys.stderr)
+            detail = ' ' + ','.join(error.keys) if error.keys else ''
+            if error.fingerprint is not None:
+                detail += ' ' + error.fingerprint + ' ' + (','.join(error.cleanable) or '-')
+            print(prefix + str(error) + detail, file=sys.stderr)
             return 70
         if isinstance(error, PackageDiagnostic):
             if time.monotonic() >= DEADLINE:
@@ -6975,7 +7757,7 @@ def main():
     except Exception:
         # Trap parser failures without ever echoing file contents/child stderr.
         if (action == 'reconcile-install' or REATTEST_ENTERED or REMOVE_ENTERED or CHAP_ENTERED or NETWORK_UPGRADE_ENTERED
-                or PPP_PREPARING or NATIVE_PREPARING):
+                or PPP_PREPARING or NATIVE_PREPARING or CLEANUP_ENTERED):
             return 75
         print(('DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_') + ('REMOVE_REFUSED' if action == 'remove' else
               'CHAP_REFUSED' if action in CHAP_ACTIONS else

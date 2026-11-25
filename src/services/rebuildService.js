@@ -26,6 +26,17 @@ const {transactOnce,AcknowledgedCommitCleanupError}=require('./rebuildRelayInsta
 const {createPrivateKey,createPublicKey,randomBytes}=require('node:crypto');
 const {PRIVATE_KEY_SELECT}=require('../utils/vlessEncryption');
 const fail=code=>Object.assign(new Error(code),{code});
+const cleanupStores=new WeakMap();
+async function cleanupConsentFor(db){
+    if(!db) throw fail('REBUILD_L2TP_CLEANUP_CONSENT_UNAVAILABLE');
+    if(!cleanupStores.has(db)) {
+        const store=require('./rebuildRelayCleanupConsentMongo').createRelayCleanupConsentStore({db});
+        const pending=store.ensureIndexes().then(()=>store);
+        cleanupStores.set(db,pending);
+        void pending.catch(()=>{ if(cleanupStores.get(db)===pending) cleanupStores.delete(db); });
+    }
+    return cleanupStores.get(db);
+}
 const networkErrors=new Set(['ECONNREFUSED','ECONNRESET','ETIMEDOUT','EHOSTUNREACH','ENETUNREACH','ENOTFOUND','EAI_AGAIN']);
 // A no-install retirement must not adopt or overwrite unexplained PPP or
 // handoff ownership, including an orphan reference in either profile.
@@ -459,7 +470,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         if(retire&&req.preview&&req.mode==='online')targetBridges.set(result,baseline.get(req.nodeId).bridge??emptyBridge);
         return result;
     }
-    const installDeps={Link,Node,State,L2tpUser,locks:guardedLocks,env,relayGrantStore,createRelayDirect};
+    const installDeps={Link,Node,State,L2tpUser,locks:guardedLocks,env,relayGrantStore,createRelayDirect,
+        getCleanupConsent: grantDb && (()=>cleanupConsentFor(grantDb.db))};
     const installRelay=createRebuildRelayBackend(installDeps);
     const recoverRelayInstall=async (id,{actor}={})=>{
         if(!relayInstallEnabled(env))throw fail('REBUILD_L2TP_INSTALL_DISABLED');

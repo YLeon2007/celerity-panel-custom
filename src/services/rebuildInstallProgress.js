@@ -1,7 +1,7 @@
 'use strict';
 
 const ranges = Object.freeze({ preflight: [0, 0], reserve: [10, 10], preparePackages: [20, 49],
-    prepare: [50, 50], install: [65, 65], restart: [80, 80], verify: [92, 92], unknown: [10, 92],
+    prepare: [50, 50], install: [65, 65], foreignCleanup: [70, 70], restart: [80, 80], verify: [92, 92], unknown: [10, 92],
     installed: [100, 100] });
 const validPercent = (stage, percent) => typeof stage === 'string' && Object.hasOwn(ranges, stage) && Number.isInteger(percent)
     && percent >= ranges[stage][0] && percent <= ranges[stage][1];

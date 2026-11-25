@@ -96,7 +96,7 @@ async function main() {
         const start = async (locale, ...errors) => {
             lang = locale;
             replies = errors;
-            progressPercent = 15;
+            progressPercent = 70;
             await browser.navigate(`${origin}/panel/l2tp?lang=${locale}`);
             requests.length = 0;
             await browser.evaluate('window.fixtureSameDocument = true');
@@ -194,7 +194,7 @@ async function main() {
         checkPostBodies([{}, { foreignCleanup: { token: first, fixXrayUnitMode: false } }]);
         await browser.click(confirm);
         await browser.wait(`${text(progress)} === ${JSON.stringify(words.installProgress.foreignCleanup)}`);
-        await browser.wait(`${el(`#relay-${nodeId} progress`)}.value === 15`);
+        await browser.wait(`${el(`#relay-${nodeId} progress`)}.value === ${progressPercent}`);
         checkPostBodies([{}, { foreignCleanup: { token: first, fixXrayUnitMode: false } },
             { foreignCleanup: { token: fresh, fixXrayUnitMode: false } }]);
         release();

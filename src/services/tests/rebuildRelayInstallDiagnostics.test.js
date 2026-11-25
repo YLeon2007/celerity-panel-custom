@@ -246,7 +246,7 @@ async function localizedFrontend(html, expected, { app, headers, csrf }) {
     return { initialText, finalText: status.textContent, disabled: view.install.disabled, refreshHidden: refresh.hidden };
 }
 
-async function diagnosticPanel(t, installRelay) {
+async function diagnosticPanel(t, installRelay, actor) {
     const previous = process.env.C3_REBUILD_ENABLED;
     process.env.C3_REBUILD_ENABLED = 'true';
     t.after(() => { if (previous === undefined) delete process.env.C3_REBUILD_ENABLED; else process.env.C3_REBUILD_ENABLED = previous; });
@@ -272,6 +272,7 @@ async function diagnosticPanel(t, installRelay) {
     app.use(session({ secret: 'fixture-only-signing-key', saveUninitialized: false, resave: false }));
     app.get('/fixture/session', (req, res) => {
         req.session.authenticated = true;
+        if (actor) req.session.adminUsername = actor;
         res.json({ csrf: issuePanelCsrfToken(req) });
     });
     t.mock.method(require('../rebuildService'), 'createRebuildService', () => ({ installRelay }));
@@ -735,6 +736,8 @@ test('late L2TP conflict preserves Install cleanup authority and never calls rol
         [late(), false, { code: `REBUILD_${foreign}`, outcome: 'refused', check: foreign, keys: ['CHAP_NOT_EMPTY'] }, ['restore']],
         [late(), true, { code: 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN', outcome: 'unknown', check: foreign, retryAllowed: false }, ['restore', 'retain']],
         [late(''), false, { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false }, ['retain']],
+        [refusal('DIRECT_PROGRESS restart\nDIRECT_NO_WRITE_BASELINE_CHANGED\n'), false,
+            { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false }, ['retain']],
         [refusal('DIRECT_PROGRESS restart\n' + late().stderr), false,
             { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false }, ['retain']],
     ]) {
@@ -744,4 +747,68 @@ test('late L2TP conflict preserves Install cleanup authority and never calls rol
         assert.deepEqual(JSON.parse(response.body), { error: expected });
         assert.deepEqual(actions, ['preflight', 'preflight', 'prepare', 'check', 'reserve', 'install', ...tail]);
     }
+});
+
+
+test('authenticated Install returns scoped consent, then consumes it only against a fresh observation', async t => {
+    const foreign = 'L2TP_FOREIGN_CONFIG';
+    const cleanable = ['CHAP_NOT_EMPTY'];
+    let keys = cleanable, digest = 'e'.repeat(64), expected, tokenNumber = 0, sessionId;
+    const actions = [];
+    const token = () => String(++tokenNumber).repeat(64);
+    class SSH {
+        connect() {}
+        disconnect() {}
+        async exec(_command, { stdin }, verify) {
+            await verify();
+            const frame = JSON.parse(stdin);
+            actions.push(frame.action);
+            assert.equal(frame.foreignCleanup, undefined, 'stale consent must not reach the confirmed host path');
+            return refusal(`DIRECT_${foreign} ${keys.join(',')} ${digest} ${cleanable.join(',')}\n`);
+        }
+    }
+    const { app, auth, csrf } = await diagnosticPanel(t, (id, options) => {
+        assert.equal(options.actor, 'fixture-admin');
+        assert.equal(typeof options.cleanupSessionId, 'string');
+        sessionId ??= options.cleanupSessionId;
+        assert.equal(options.cleanupSessionId, sessionId);
+        return runFreshRelayInstall(id, {
+            authorize: () => true, machineId, inventory: async () => ({ eligible: true, pristine: true }),
+            lock: fn => fn(() => true), connect: async () => createRelayDirect({ node, env, SSH: attested(SSH, machineId) }),
+            foreignCleanup: options.foreignCleanup,
+            cleanupConsent: {
+                issue: async proof => {
+                    assert.deepEqual(proof.manual, []);
+                    expected = { token: token(), digest: proof.digest };
+                    return { token: expected.token };
+                },
+                consume: async (input, observed) => {
+                    const current = expected;
+                    if (current?.token !== input.token) throw Object.assign(Error(), { code: 'REBUILD_L2TP_CLEANUP_CONSENT_REQUIRED' });
+                    expected = undefined;
+                    assert.notEqual(observed.digest, current.digest);
+                    throw Object.assign(Error(), { code: 'REBUILD_L2TP_CLEANUP_CONSENT_CHANGED' });
+                },
+            },
+            reserve: async () => assert.fail('observation and drift must not reserve'),
+        });
+    }, 'fixture-admin');
+    const post = async body => {
+        const reply = await request(app, installUrl, { headers: { ...auth, 'x-csrf-token': csrf }, body });
+        assert.equal(reply.status, 409);
+        assert.equal(reply.headers['cache-control'], 'no-store');
+        assert(!reply.body.includes(digest));
+        return JSON.parse(reply.body).error;
+    };
+    assert.deepEqual(await post({}), { code: `REBUILD_${foreign}`, outcome: 'refused', check: foreign,
+        keys, cleanable, manual: [], cleanupToken: '1'.repeat(64) });
+    digest = 'f'.repeat(64);
+    const changed = await post({ foreignCleanup: { token: '1'.repeat(64), fixXrayUnitMode: false } });
+    assert.deepEqual(changed, { code: `REBUILD_${foreign}_CHANGED`, outcome: 'refused', check: foreign,
+        keys, cleanable, manual: [], cleanupToken: '2'.repeat(64) });
+    assert.equal((await post({ foreignCleanup: { token: '1'.repeat(64), fixXrayUnitMode: false } })).check, 'CLEANUP_CONSENT_REQUIRED');
+    keys = [...cleanable, 'IPSEC_D_FOREIGN_CONF'];
+    assert.deepEqual(await post({}), { code: `REBUILD_${foreign}`, outcome: 'refused', check: foreign,
+        keys, cleanable, manual: ['IPSEC_D_FOREIGN_CONF'] });
+    assert.deepEqual(actions, ['preflight', 'preflight', 'preflight', 'preflight']);
 });

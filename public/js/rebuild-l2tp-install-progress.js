@@ -1,7 +1,7 @@
 (() => {
     'use strict';
-    const ranges = new Map(Object.entries({ preflight: [0, 0], reserve: [10, 10], foreignCleanup: [0, 64], preparePackages: [20, 49],
-        prepare: [50, 50], install: [65, 65], restart: [80, 80], verify: [92, 92], unknown: [10, 92] }));
+    const ranges = new Map(Object.entries({ preflight: [0, 0], reserve: [10, 10], preparePackages: [20, 49],
+        prepare: [50, 50], install: [65, 65], foreignCleanup: [70, 70], restart: [80, 80], verify: [92, 92], unknown: [10, 92] }));
     function start(page, nodeId, consented) {
         if (typeof nodeId !== 'string' || !/^[a-f0-9]{24}(?![\s\S])/.test(nodeId)) return;
         const root = page.querySelector(`[data-install-progress][data-progress-node="${nodeId}"]`);

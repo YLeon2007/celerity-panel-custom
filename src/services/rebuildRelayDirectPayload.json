@@ -1,0 +1,30 @@
+{
+  "sources": [
+    {
+      "path": "../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py",
+      "size": 907,
+      "sha256": "f38900db3b3b159976d876a3ac6c76e28861bc2a94f1ae00f067b73d0bdd35e1"
+    },
+    {
+      "path": "rebuildRelayStockRuntime.py",
+      "size": 20589,
+      "sha256": "ac80e5b435ad76c308d62695bce5be4a956ac7100453ceacf65a82b3ae86763a"
+    },
+    {
+      "path": "rebuildRelayPackageGuard.py",
+      "size": 61766,
+      "sha256": "db4efe8a60f4935aea76f6ce909fc081dbb89649155aeaf9fbda434388eb1dde"
+    },
+    {
+      "path": "rebuildRelayReplacement.py",
+      "size": 30073,
+      "sha256": "c9b3c892e431da219ba3989dc0d43a1d260293830d634609573a18e76e303616"
+    },
+    {
+      "path": "rebuildRelayDirectHost.py",
+      "size": 403898,
+      "sha256": "8f18dc95d40ea9b6d81520e9757fe7d755434fdfb0e6912f41852512aece45e8"
+    }
+  ],
+  "sha256": "8cdd375998b933fe4e1bdd86c3c7c6ec79f39fb29911d27557afde8ce9d6adbf"
+}

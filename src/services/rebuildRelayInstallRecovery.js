@@ -17,7 +17,7 @@ const defaultDriver = options => require('./rebuildRelayDirect').createRelayDire
 
 // The authenticated actor is composition input, never a recovery request field.
 function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, actor, relayGrantStore,
-    createRelayDirect = defaultDriver,
+    createRelayDirect = defaultDriver, getCleanupConsent,
     assertNoRelayAccountIntent = session => assertNoPendingRelayAccounts(L2tpUser.db, session) }) {
     return async id => {
         const db = State.db;
@@ -115,6 +115,8 @@ function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, 
                     await checkAuthority(session);
                     await held.settle(session);
                 });
+                try { await (await getCleanupConsent?.())?.finishRecovery({ nodeId: id, actor, backupId }, result); }
+                catch { /* Do not replay an acknowledged recovery to repair audit. */ }
                 return { status: 'can_install_again' };
             });
         } catch (error) {

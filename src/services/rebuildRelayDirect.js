@@ -1,9 +1,8 @@
 'use strict';
 
 const { readFileSync } = require('node:fs');
-const { deflateSync } = require('node:zlib');
+const { createHash, randomBytes } = require('node:crypto');
 const { join } = require('node:path');
-const { randomBytes } = require('node:crypto');
 const { isIPv4 } = require('node:net');
 const { performance } = require('node:perf_hooks');
 const { identityChanged, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
@@ -12,7 +11,7 @@ const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { validCensus, validRetirementCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
 const { isInstallStage, specificHostRefusal, packageWriteCheck, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
-    withInstallCheck, freshConflictFromFrame, withFreshConflict } = require('./rebuildRelayInstallDiagnostics');
+    withInstallCheck, freshConflictFromFrame, withFreshConflict, conflictCode } = require('./rebuildRelayInstallDiagnostics');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
 const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
@@ -191,61 +190,38 @@ function encodeDirectBytes(bytes) {
 }
 
 function bundleDirectScript() {
-    // Compress a single stream to share the zlib window across sources, but
-    // compile the original bytes separately in their original namespaces.
-    const sources = ['../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'rebuildRelayStockRuntime.py',
-        'rebuildRelayPackageGuard.py', 'rebuildRelayDirectHost.py'].map(path => readFileSync(join(__dirname, path)));
-    const offsets = sources.reduce((indexes, source) => [...indexes, indexes.at(-1) + source.length], [0]);
-    const joined = Buffer.concat(sources);
-    // Give frequent identifiers and whitespace runs (including newline + indent) a one-byte representation
-    // before deflate. Only use byte values absent from the original sources:
-    // UTF-8 and all other original bytes must survive without normalization.
-    const text = joined.toString('latin1'), tokens = /\n *| +|[A-Za-z_][A-Za-z0-9_]+/g;
-    const counts = new Map();
-    for (const [word] of text.matchAll(tokens)) counts.set(word, (counts.get(word) || 0) + 1);
-    const dictionary = {}, codes = new Map();
-    const available = Array.from({ length: 128 }, (_, i) => i + 128).filter(byte => !joined.includes(byte));
-    // Reserve up to two unused prefixes for two-byte tokens. The decoder
-    // consumes the suffix together with its prefix, never as a separate token.
-    const prefixes = available.splice(0, Math.min(2, available.length));
-    const savings = (size, [word, count]) => (word.length - size) * (count - 1);
-    const ranked = (items, size) => items.filter(item => savings(size, item) > 0)
-        .sort((a, b) => savings(size, b) - savings(size, a));
-    function point(word, bytes) {
-        const key = String.fromCharCode(...bytes);
-        dictionary[Buffer.from(key, 'latin1').toString('hex')] = word;
-        codes.set(word, key);
-    }
-    ranked([...counts], 1).slice(0, available.length).forEach(([word], i) => point(word, [available[i]]));
-    ranked([...counts].filter(([word]) => !codes.has(word)), 2).slice(0, prefixes.length * 256)
-        .forEach(([word], i) => point(word, [prefixes[i >> 8], i & 255]));
-    const packed = Buffer.from(`${JSON.stringify(dictionary)}\n${text.replace(tokens, word => codes.get(word) ?? word)}`, 'latin1');
-    const compressed = deflateSync(packed, { level: 9, memLevel: 9 });
+    const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+    const names = ['../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'rebuildRelayStockRuntime.py',
+        'rebuildRelayPackageGuard.py', 'rebuildRelayReplacement.py', 'rebuildRelayDirectHost.py'];
+    const manifest = require('./rebuildRelayDirectPayload.json');
+    const compressed = readFileSync(join(__dirname, 'rebuildRelayDirectPayload.xz'));
+    requireThat(manifest.sources.length === names.length && sha(compressed) === manifest.sha256, 'DIRECT_BUNDLE_INVALID');
+    const offsets = [0];
+    names.forEach((name, i) => {
+        const source = readFileSync(join(__dirname, name));
+        const saved = manifest.sources[i];
+        requireThat(saved.path === name && source.length === saved.size && sha(source) === saved.sha256, 'DIRECT_BUNDLE_INVALID');
+        offsets.push(offsets.at(-1) + source.length);
+    });
     const load = (key, index, name, filename) =>
-        `${key}={"__name__":"${name}","__file__":"${filename}"};exec(_c3_compile(${index},"${filename}"),${key})`;
-    // These are fixed repository sources, not imports from the remote working
-    // directory. Non-main namespaces keep their standalone entrypoints inert.
+        `${key}=types.ModuleType("${name}");${key}.__file__="${filename}";sys.modules["${name}"]=${key};${key}=${key}.__dict__;exec(_c3_compile(${index},"${filename}"),${key})`;
     return [
-        'import zlib,functools,json,re',
+        'import lzma,functools,hashlib,re,sys,types',
         `_c3_digits={c:i for i,c in enumerate("${directAlphabet}")}`,
         '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(25,"big")',
         `_c3_payload="${encodeDirectBytes(compressed)}"`,
-        `_c3_dict,_,_c3_packed=zlib.decompress(b"".join(_c3_chunk(_c3_payload[i:i+29]) for i in range(0,len(_c3_payload),29))[:${compressed.length}]).partition(b"\\n")`,
-        '_c3_words={bytes.fromhex(k):v.encode("ascii") for k,v in json.loads(_c3_dict).items()}',
-        '_c3_prefix=bytes(sorted({k[0] for k in _c3_words if len(k)==2}))',
-        '_c3_tokens=(b"["+_c3_prefix+b"][\\x00-\\xff]|" if _c3_prefix else b"")+rb"[\\x80-\\xff]"',
-        '_c3_sources=re.sub(_c3_tokens,lambda m:_c3_words.get(m[0],m[0]),_c3_packed)',
+        `_c3_sources=lzma.decompress(b"".join(_c3_chunk(_c3_payload[i:i+29]) for i in range(0,len(_c3_payload),29))[:${compressed.length}],memlimit=16777216)`,
+        String.raw`_c3_sources=re.sub(rb"(?m)^\t+",lambda m:b"    "*len(m[0]),_c3_sources)`,
         `_c3_offsets=${JSON.stringify(offsets)}`,
-        '_c3_compile=lambda n,filename:compile(_c3_sources[_c3_offsets[n]:_c3_offsets[n+1]],filename,"exec")',
-        // Runtime's standalone path calculation needs an absolute __file__
-        // with parents; the direct host gets the ensure code as a separate dict.
-        load('C3_STOCK_RUNTIME', 1, 'c3_stock_runtime',
-            '/__c3_direct__/services/rebuildRelayStockRuntime.py'),
-        load('C3_STOCK_ENSURE', 0, 'c3_stock_ensure',
-            '/__c3_direct__/modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'),
-        load('C3_PACKAGE_GUARD', 2, 'c3_package_guard',
-            '/__c3_direct__/services/rebuildRelayPackageGuard.py'),
-        'exec(_c3_compile(3,"<DIRECT host>"))',
+        `_c3_hashes=${JSON.stringify(manifest.sources.map(row => row.sha256))}`,
+        '_c3_bytes=lambda n:_c3_sources[_c3_offsets[n]:_c3_offsets[n+1]]',
+        'all(hashlib.sha256(_c3_bytes(i)).hexdigest()==h for i,h in enumerate(_c3_hashes)) or sys.exit(75)',
+        '_c3_compile=lambda n,filename:compile(_c3_bytes(n),filename,"exec")',
+        load('C3_STOCK_RUNTIME', 1, 'c3_stock_runtime', '/__c3_direct__/services/rebuildRelayStockRuntime.py'),
+        load('C3_STOCK_ENSURE', 0, 'c3_stock_ensure', '/__c3_direct__/modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'),
+        load('C3_PACKAGE_GUARD', 2, 'c3_package_guard', '/__c3_direct__/services/rebuildRelayPackageGuard.py'),
+        load('C3_REPLACEMENT', 3, 'c3_foreign_replacement', '/__c3_direct__/services/rebuildRelayReplacement.py'),
+        'exec(_c3_compile(4,"<DIRECT host>"))',
     ].join(';');
 }
 
@@ -396,6 +372,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
         if (recovery && result?.code !== 0) throw unknown();
         if (!integer(result?.code, 0, 255) || [75, 124, 125, 126, 127].includes(result.code) || result.code >= 128) throw unknown();
         if (result.code !== 0) {
+            if (action === 'install' && result.stderr?.startsWith('DIRECT_NO_WRITE_') && conflictFrame.stderr !== result.stderr) throw unknown();
             if (result.code === 70 && result.stdout === ''
                 && (result.stderr === 'DIRECT_IDENTITY\n' || action === 'install' && result.stderr === 'DIRECT_NO_WRITE_IDENTITY\n')) {
                 poison();
@@ -417,7 +394,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             // Restart progress follows host effects and contradicts a fresh no-write claim.
             const conflict = !closed && !poisoned && freshConflictFromFrame(action, conflictFrame);
             if (conflict) {
-                const error = withFreshConflict(fail(conflict.check.slice('L2TP_'.length)), conflict);
+                const error = withFreshConflict(Object.assign(new Error(conflictCode(conflict)), { code: conflictCode(conflict) }), conflict);
                 if (action === 'install') Object.assign(error, { commandSettled: true, noHostChanges: true });
                 throw error;
             }
@@ -469,8 +446,8 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
     const preparationKeys = [...readinessKeys, 'pppPreparation'];
     const validReadiness = value => tokenMatches(TOKEN, value.machineId) && value.machineId.length === 32
         && ['ppp', 'masked', 'unitsLoaded'].every(key => typeof value[key] === 'boolean');
-    async function preflight() {
-        const proof = await exec('preflight', {}, false, value => hasPackagePreparation(value) || ((exactKeys(value, readinessKeys)
+    async function preflight(cleanup) {
+        const proof = await exec('preflight', cleanup ? { foreignCleanup: cleanup } : {}, false, value => hasPackagePreparation(value) || ((exactKeys(value, readinessKeys)
             || (exactKeys(value, preparationKeys) && value.pppPreparation === true)
             || hasNativePreparation(value)) && validReadiness(value)));
         if (proof.machineId !== machineId) { poison(); throw merged ? identityChanged() : fail('INSTALL_IDENTITY_MISMATCH'); }
@@ -572,9 +549,9 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
     });
 
     return Object.freeze({
-        preflight: () => serial(async () => {
+        preflight: cleanup => serial(async () => {
             packagePreparation = undefined;
-            const proof = await preflight();
+            const proof = await preflight(cleanup);
             if (!packageAttempt && hasPackagePreparation(proof)) packagePreparation = proof.packagePreparation;
             return proof;
         }),
@@ -610,10 +587,12 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
                 && Array.isArray(input.controlPlaneAddresses), 'INSTALL_INPUT_INVALID');
             const d = makeDesired(input.desired);
             const controlPlaneAddresses = [...input.controlPlaneAddresses], carryDomain = input.carryDomain;
-            const host = await preflight();
+            const cleanup = input.foreignCleanup;
+            const host = await preflight(cleanup);
             requireInstallHostReady(host);
             const network = { clientCidr: d.clientCidr, tproxyPort: d.tproxyPort, fwmark: d.fwmark, routeTable: d.routeTable };
-            const topology = input.transit === undefined ? {} : { transit: structuredClone(input.transit) };
+            const topology = { ...(input.transit !== undefined && { transit: structuredClone(input.transit) }),
+                ...(cleanup && { foreignCleanup: cleanup }) };
             const snapshot = await exec('prepare', { network, ...topology }, false, v => exactKeys(v,
                 [...readinessKeys, 'baseline', 'main', 'mainSha256', 'bridge', 'bridgeSha256'])
                 && validReadiness(v) && tokenMatches(PIN, v.baseline) && v.baseline.length === 64);

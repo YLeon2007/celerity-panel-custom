@@ -90,9 +90,9 @@ test('the exact SSH command shell and Python stdin reject invalid framing locall
     await remote.close();
 });
 
-test('DIRECT bootstrap compiles the four exact repo sources without loading them from the host', async () => {
+test('DIRECT bootstrap compiles the five exact repo sources without loading them from the host', async () => {
     const fingerprints = [
-        '../rebuildRelayDirectHost.py', '../rebuildRelayStockRuntime.py', '../rebuildRelayPackageGuard.py',
+        '../rebuildRelayDirectHost.py', '../rebuildRelayStockRuntime.py', '../rebuildRelayPackageGuard.py', '../rebuildRelayReplacement.py',
         '../../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py',
     ].map(file => sha(readFileSync(join(__dirname, file))));
     const probe = String.raw`
@@ -112,7 +112,7 @@ def audit(event, args):
             or event == 'open' and args[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT)
             or event == 'open' and isinstance(args[0], str) and args[0].endswith(
                 ('rebuildRelayDirectHost.py', 'rebuildRelayStockRuntime.py', 'ensure-xl2tpd-unit.py',
-                 'rebuildRelayPackageGuard.py'))):
+                 'rebuildRelayPackageGuard.py', 'rebuildRelayReplacement.py'))):
         faults.append(event)
         raise AssertionError('unexpected external source or dispatch')
 sys.addaudithook(audit)
@@ -123,7 +123,7 @@ assert sorted(digest for digest in sources if digest in expected) == sorted(expe
 for name, function in [('C3_STOCK_RUNTIME', 'verify_package'), ('C3_STOCK_ENSURE', 'ensure')]:
     scope = host[name]
     assert scope[function].__globals__ is scope
-scopes = [host[key] for key in ['C3_STOCK_RUNTIME', 'C3_STOCK_ENSURE', 'C3_PACKAGE_GUARD']]
+scopes = [host[key] for key in ['C3_STOCK_RUNTIME', 'C3_STOCK_ENSURE', 'C3_PACKAGE_GUARD', 'C3_REPLACEMENT']]
 assert all(type(scope) is dict and scope['__name__'] not in ('__main__', host['__name__']) for scope in scopes)
 assert len({scope['__name__'] for scope in scopes}) == len(scopes)
 `;

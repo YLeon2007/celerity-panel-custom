@@ -56,30 +56,42 @@ const foreignKeys = ['SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRE
     'NETWORK_UNIT_ORPHANED', 'LEGACY_NFT_PRESENT', 'IPSEC_D_FOREIGN_CONF', 'SWAN_TREE_NOT_STOCK',
     'CONFFILE_UNKNOWN', 'INCLUDE_FOREIGN'];
 const foreignCheck = 'L2TP_FOREIGN_CONFIG';
-const maxConflictFrame = `DIRECT_NO_WRITE_${foreignCheck} ${foreignKeys.join(',')}\n`.length;
-const freshConflicts = new Set([foreignCheck, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE']);
+const foreignChanged = 'L2TP_FOREIGN_CONFIG_CHANGED';
+const maxConflictFrame = `DIRECT_NO_WRITE_${foreignChanged} ${foreignKeys.join(',')} ${'0'.repeat(64)} ${foreignKeys.join(',')}\n`.length;
+const freshConflicts = new Set([foreignCheck, foreignChanged, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE']);
 const conflictCodes = new Set([...freshConflicts].map(check => `REBUILD_${check}`));
+const conflictCode = proof => `REBUILD_${proof.kind ?? proof.check}`;
+const cleanupChallenges = new WeakMap();
+const cleanupChallenge = error => cleanupChallenges.get(error);
+const setCleanupChallenge = (error, challenge) => { cleanupChallenges.set(error, Object.freeze(challenge)); return error; };
 const conflicts = new WeakMap();
 function freshConflictFromFrame(action, result) {
     if (!isInstallStage(action) || result?.code !== 70 || result.stdout !== '' || typeof result.stderr !== 'string'
         || result.stderr.length > maxConflictFrame) return undefined;
     const prefix = action === 'install' ? 'DIRECT_NO_WRITE_' : 'DIRECT_';
     if (!result.stderr.startsWith(prefix) || !result.stderr.endsWith('\n')) return undefined;
-    const [check, items, ...extra] = result.stderr.slice(prefix.length, -1).split(' ');
-    if (!freshConflicts.has(check) || extra.length) return undefined;
-    if (check !== foreignCheck) return items === undefined ? { check } : undefined;
-    if (!items) return undefined;
+    const [kind, items, digest, permitted, ...extra] = result.stderr.slice(prefix.length, -1).split(' ');
+    if (!freshConflicts.has(kind) || extra.length) return undefined;
+    if (kind !== foreignCheck && kind !== foreignChanged) return items === undefined ? { check: kind } : undefined;
+    if (items === undefined) return kind === foreignChanged ? { check: foreignCheck, kind } : undefined;
     const keys = items.split(',');
-    if (foreignKeys.filter(key => keys.includes(key)).join(',') !== items) return undefined;
-    return { check, keys: Object.freeze(keys) };
+    if (!items || foreignKeys.filter(key => keys.includes(key)).join(',') !== items) return undefined;
+    if (digest === undefined) return kind === foreignCheck ? { check: foreignCheck, keys: Object.freeze(keys) } : undefined;
+    if (!permitted || !/^[a-f0-9]{64}(?![\s\S])/.test(digest)) return undefined;
+    const cleanable = permitted === '-' ? [] : permitted.split(',');
+    if (permitted !== '-' && keys.filter(key => cleanable.includes(key)).join(',') !== permitted) return undefined;
+    const manual = keys.filter(key => !cleanable.includes(key));
+    return Object.freeze({ kind, check: foreignCheck, keys: Object.freeze(keys), digest,
+        cleanable: Object.freeze(cleanable), manual: Object.freeze(manual) });
 }
 function withFreshConflict(error, proof) {
     conflicts.set(error, proof);
     return withInstallCheck(error, proof.check);
 }
 const freshConflict = error => conflicts.get(error);
-const checks = new Set([...freshConflicts, ...packageChecks, ...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
-    ...profileChecks.values(), 'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED']);
+const checks = new Set([...freshConflicts].filter(check => check !== foreignChanged).concat([...packageChecks, ...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
+    ...profileChecks.values(), 'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED', 'FOREIGN_CONFIG_RESTORED', 'CLEANUP_CONSENT_REQUIRED',
+    'CLEANUP_CONSENT_UNAVAILABLE', 'CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED']));
 // The view uses the same localized map for the headline and list items.
 // List item IDs are not valid top-level checks.
 const installCheckIds = Object.freeze([...checks, ...foreignKeys]);
@@ -148,6 +160,7 @@ const codeOutcomes = new Map([
         'PROFILE_PRECONDITION', 'XRAY_BASELINE_UNSUPPORTED', 'STOCK_INSTALL_OUT_OF_SCOPE', 'STOCK_ARTIFACT_MISMATCH',
         'DIRECT_IDENTITY', 'DIRECT_PREREQUISITE', 'DIRECT_BASELINE_CHANGED', 'DIRECT_NETWORK_CONFLICT',
         'DIRECT_PROFILE_USERS', 'DIRECT_RUNTIME_UNPROVED', 'DIRECT_CANDIDATE_INVALID', 'DIRECT_COMMAND_FAILED',
+        'CLEANUP_CONSENT_REQUIRED', 'CLEANUP_CONSENT_INVALID', 'CLEANUP_CONSENT_UNAVAILABLE', 'CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED',
     ].map(code => [`REBUILD_L2TP_${code}`, 'refused']),
     ...['ACCOUNT_SOURCE_BUSY', 'ACCOUNTS_BLOCKED'].map(code => [`REBUILD_L2TP_${code}`, 'busy']),
     ...['DIRECT_OUTCOME_UNKNOWN', 'DIRECT_ROLLBACK_DRIFT', 'RESERVATION_FAILED', 'RESERVATION_CLEANUP_FAILED',
@@ -197,10 +210,11 @@ function publicInstallFailure(error) {
     const classified = classifyInstallFailure(error);
     const { code, outcome, check, retryAllowed } = classified;
     const keys = freshConflict(classified)?.keys;
-    return { code, outcome, ...(check !== undefined && { check }), ...(keys && { keys }),
+    const challenge = outcome === 'refused' && cleanupChallenge(classified);
+    return { code, outcome, ...(check !== undefined && { check }), ...(keys && { keys }), ...(challenge || {}),
         ...(retryAllowed === false && { retryAllowed }) };
 }
 
 module.exports = { installCheckIds, isInstallStage, specificHostRefusal, packageWriteCheck, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
     withInstallCheck, checkedInstallId, freshConflictFromFrame, freshConflict, withFreshConflict,
-    installFailure, classifyInstallFailure, publicInstallFailure };
+    installFailure, classifyInstallFailure, publicInstallFailure, conflictCode, setCleanupChallenge };
