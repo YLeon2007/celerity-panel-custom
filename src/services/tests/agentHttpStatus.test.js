@@ -74,6 +74,45 @@ test('agent 200 remains successful', async t => {
     });
 });
 
+test('Rebuild node lock holds panel user mutations until the agent is back', { timeout: 5000 }, async t => {
+    const old = process.env.C3_REBUILD_ENABLED;
+    process.env.C3_REBUILD_ENABLED = 'true';
+    t.after(() => {
+        if (old === undefined) delete process.env.C3_REBUILD_ENABLED;
+        else process.env.C3_REBUILD_ENABLED = old;
+    });
+    const { withNodes } = require('../rebuildLocks');
+    let agentBack = false;
+    const requests = [];
+    await withAgent(t, req => {
+        requests.push([req.method, req.url, agentBack]);
+        return agentBack ? 200 : 503;
+    }, async node => {
+        const entered = Promise.withResolvers();
+        const release = Promise.withResolvers();
+        const apply = withNodes([node._id], async () => {
+            entered.resolve();
+            await release.promise;
+        });
+        await entered.promise;
+        const user = { userId: 'cutover-fixture', xrayUuid: 'fixture-uuid' };
+        const effects = [syncService.addXrayUser(node, user), syncService.removeXrayUser(node, user)];
+        try {
+            // A real HTTP round-trip while the lock is held: reads are not
+            // serialized, whereas no POST/DELETE should leave this panel.
+            await assert.rejects(syncService._agentRequest(node, 'GET', '/info'), { httpStatus: 503 });
+            assert.deepEqual(requests, [['GET', '/info', false]]);
+            agentBack = true;
+        } finally {
+            release.resolve();
+            await apply;
+            await Promise.allSettled(effects);
+        }
+        assert.deepEqual(await Promise.all(effects), [true, true]);
+        assert.deepEqual(requests.slice(1), [['POST', '/users', true], ['DELETE', '/users/cutover-fixture', true]]);
+    });
+});
+
 test('agent 401 retains its unauthorized exception', async t => {
     await withAgent(t, 401, async node => {
         await assert.rejects(syncService._agentRequest(node, 'GET', '/info'), error => {

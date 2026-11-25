@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,14 +77,17 @@ func TestNativeCutoverPersisterBoundary(t *testing.T) {
 	}
 
 	t.Run("client-only-flush-from-current-image", func(t *testing.T) {
-		cutoverPersisterCase(t, core, false)
+		cutoverPersisterCase(t, core, "clients")
 	})
 	t.Run("old-image-flush-lands-after-positive-verification", func(t *testing.T) {
-		cutoverPersisterCase(t, core, true)
+		cutoverPersisterCase(t, core, "unfenced")
+	})
+	t.Run("joined-stop-drains-the-same-pending-publish", func(t *testing.T) {
+		cutoverPersisterCase(t, core, "stopped")
 	})
 }
 
-func cutoverPersisterCase(t *testing.T, core string, late bool) {
+func cutoverPersisterCase(t *testing.T, core, mode string) {
 	root := t.TempDir()
 	boot := filepath.Join(root, "config.json")
 	reserve := func() net.Listener {
@@ -224,7 +228,7 @@ func cutoverPersisterCase(t *testing.T, core string, late bool) {
 	}
 	expected := map[string]recoveryIdentity{email: {id: id}}
 	old, candidate := image("exit-a", nil), image("exit-b", []*User{{ID: userID, Email: email}})
-	if !late {
+	if mode == "clients" {
 		publish(image("exit-b", nil))
 		proc, _ := start()
 		verifyLive(proc, "exit-b", map[string]recoveryIdentity{})
@@ -275,6 +279,52 @@ func cutoverPersisterCase(t *testing.T, core string, late bool) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("persister did not reach its native write boundary")
 	}
+	if mode == "stopped" {
+		// Reproduce the old writer at exactly the same boundary. The real Stop
+		// must wait for it, unlike an unrelated flock or a boot readback.
+		p.debounce = time.Hour
+		go p.run()
+		began, joined := make(chan struct{}), make(chan error, 1)
+		go func() {
+			close(began)
+			joined <- p.Stop()
+		}()
+		<-began
+		runtime.Gosched()
+		select {
+		case <-joined:
+			t.Fatal("Stop acknowledged while an old write was still parked")
+		default:
+		}
+		join()
+		select {
+		case err := <-joined:
+			if err != nil || flushErr != nil {
+				t.Fatal("agent flush did not drain")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("Stop did not finish after the original writer drained")
+		}
+		if bytes.Equal(readBoot(), old) || !bytes.Equal(project(readBoot()), project(old)) {
+			t.Fatal("final flush did not retain the fresh user on A")
+		}
+		if _, err := p.Flush(); err != errPersisterStopped {
+			t.Fatal("old persister accepted another flush after Stop")
+		}
+		publish(candidate)
+		stopFirst()
+		second, stopSecond := start()
+		verifyLive(second, "exit-b", expected)
+		replacement := NewConfigPersister(boot, cfg.Inbounds, store)
+		if changed, err := replacement.Flush(); changed || err != nil || !bytes.Equal(project(readBoot()), project(candidate)) {
+			t.Fatal("new persister changed the verified topology")
+		}
+		stopSecond()
+		third, _ := start()
+		verifyLive(third, "exit-b", expected)
+		return
+	}
+
 	publish(candidate)
 	stopFirst()
 	second, stopSecond := start()
