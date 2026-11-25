@@ -431,9 +431,15 @@ def mkdir(path, mode, exist_ok=False):
         pass
 
 
-def rmdir(path):
+def directory_pin(st):
+    return [st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid]
+
+
+def rmdir(path, *, pin=None):
     parent, name = os.path.split(path)
     with directory(parent) as fd:
+        if pin is not None:
+            need(directory_pin(os.stat(name, dir_fd=fd, follow_symlinks=False)) == pin, 'ROLLBACK_DRIFT')
         os.rmdir(name, dir_fd=fd)
         os.fsync(fd)
 
@@ -493,17 +499,22 @@ def write(path, before, after, *, generation=None, witness=False, reader=None, m
     return installed
 
 
-def unit(name):
+UNIT_DEPENDENCIES = ('Requires', 'After', 'RequiredBy', 'BoundBy', 'ConsistsOf', 'PropagatesStopTo',
+                     'Conflicts', 'ConflictedBy', 'Wants', 'BindsTo', 'PartOf', 'Upholds',
+                     'Before', 'WantedBy', 'Triggers', 'TriggeredBy')
+
+
+def unit(name, *, raw_dependencies=False):
     keys = ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'MainPID', 'InvocationID',
             'NeedDaemonReload', 'FragmentPath', 'DropInPaths', 'ExecStart', 'User', 'Group', 'Job',
             'Environment', 'EnvironmentFiles', 'RootDirectory', 'RootImage', 'PrivateNetwork',
             'KillMode', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'WorkingDirectory',
-            'Restart', 'Type', 'Requires', 'After', 'ControlGroup', 'RequiredBy', 'BoundBy', 'ConsistsOf',
-            'PropagatesStopTo', 'Conflicts', 'ConflictedBy', 'Wants', 'BindsTo', 'PartOf', 'Upholds',
+            'Restart', 'Type', 'ControlGroup',
             'SourcePath', 'ExecCondition', 'ExecReload', 'PassEnvironment', 'UnsetEnvironment')
     # `systemctl show` returns nonzero for some not-found units. LoadState is
     # inspected explicitly; do not treat arbitrary command failures as absence.
-    text = command('/usr/bin/systemctl', '--no-pager', 'show', '--all', '--property=' + ','.join(keys), name,
+    deps = UNIT_DEPENDENCIES[:-4] if raw_dependencies else UNIT_DEPENDENCIES
+    text = command('/usr/bin/systemctl', '--no-pager', 'show', '--all', '--property=' + ','.join((*keys, *deps)), name,
                    unit_show=True).decode('utf-8')
     pairs = [line.split('=', 1) for line in text.splitlines() if '=' in line]
     if name == NET_UNIT:
@@ -523,6 +534,9 @@ def unit(name):
                       any(key == 'DropInPaths' and value for key, value in pairs) else 'PREREQUISITE')
     need(info.get('LoadState') in ('loaded', 'masked', 'not-found') and
          info.get('ActiveState') in ('active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading'), 'PREREQUISITE')
+    if not raw_dependencies:
+        for key in info.keys() & set(deps):
+            info[key] = ' '.join(sorted(set(info[key].split())))
     return info
 
 
@@ -3019,10 +3033,13 @@ def cleanup_rollback(request, path, record, backup, fd, *, file_undo=None, file_
         # publish a distinct phase before attempting to restore foreign bytes.
         settled = journal.get('installSettled')
         need(settled is True or 'installSettled' not in journal and backup.get('swanStart'), 'IN_FLIGHT')
-        if backup['phase'] == 'rolling-back':
+        tail = journal.get('rollbackTail')
+        rolling = backup['phase'] == 'rolling-back'
+        files = rolling and (tail is None or type(tail) is dict and tail.get('step') == 'files')
+        if rolling and not files:
             record = resume_rollback_tail(request, path, record, backup)
         else:
-            if settled is True and backup['phase'] == 'applying':
+            if settled is True and (backup['phase'] == 'applying' or files):
                 for n in (X, B):
                     expected = journal.get('xrayBirths', {}).get(n, before['units'][n]['InvocationID'])
                     need(unit(n).get('InvocationID') == expected, 'IN_FLIGHT')
@@ -3569,9 +3586,13 @@ def check_swan_profile(backup, record, bad='ROLLBACK_DRIFT'):
     no_swan_rule()
 
 
-def load_after(backup, require_all=False):
+def load_after(backup, require_all=False, restored_swan=False):
     current = {key: read(path) for key, path in operation_files(backup['after']).items()}
-    check_swan_profile(backup, current.get('swan'))
+    if restored_swan and current['swan'] is None:
+        need(swan_inputs(False, 'ROLLBACK_DRIFT') == backup['before']['swanInputs'], 'ROLLBACK_DRIFT')
+        no_swan_rule()
+    else:
+        check_swan_profile(backup, current.get('swan'))
     original = original_files(backup['before'], current)
     for key, value in current.items():
         need(after_match(value, backup['after'][key]) or (not require_all and value == original[key]),
@@ -3579,11 +3600,35 @@ def load_after(backup, require_all=False):
     return current
 
 
-def rollback_xray_pin(info):
+def rollback_xray_pin(info, *, legacy=False):
     pid = xray_argv(info)
     fragment = read(info['FragmentPath'], 262144)
     need(info['NeedDaemonReload'] == 'no' and fragment is not None, 'ROLLBACK_DRIFT')
+    if not legacy:
+        # Our NET unit contributes these reverse edges until the rollback reload.
+        info = {**info, **{k: ' '.join(n for n in info[k].split() if n != NET_UNIT)
+                           for k in ('Before', 'WantedBy') if k in info}}
     return digest(encode([info, fragment, remove_generation(info['FragmentPath']), reattest_process(pid, info)]))
+
+
+def rollback_checkpoint(path, record, backup, tail, step):
+    backup['foreignJournal']['rollbackTail'] = {**tail, 'step': step}
+    updated = entry(encode(backup))
+    write(path, record, updated)
+    return updated
+
+
+def rollback_dirs(current):
+    pins = {}
+    for path, leaf, key in ((DROP_DIR, DROP, 'drop'), (NFT_DIR, NFT_FILE, 'nft')):
+        if not directory_absent(path):
+            with directory(path) as fd:
+                expected = [os.path.basename(leaf)] if current[key] is not None else []
+                pin = directory_pin(os.fstat(fd))
+                need(stat.S_IMODE(pin[2]) in (0o700, 0o755) and pin[3:] == [0, 0]
+                     and os.listdir(fd) == expected, 'ROLLBACK_DRIFT')
+                pins[path] = pin
+    return pins
 
 
 def resume_rollback_tail(request, path, record, backup):
@@ -3594,7 +3639,8 @@ def resume_rollback_tail(request, path, record, backup):
     need(journal.get('installSettled') is True and 'swanStart' not in backup and not before.get('ikeSockets')
          and 'bridge' not in backup['after'] and read(path, 2 * MAX_FILE) == record
          and 'modulePersistence' not in backup and type(tail) is dict
-         and set(tail) == {'pin', 'sockets'} and type(tail['pin']) is str, 'IN_FLIGHT')
+         and (set(tail) == {'pin', 'sockets'} or set(tail) == {'pin', 'sockets', 'step'}
+              and tail['step'] in ('reloaded', 'restarted')) and type(tail['pin']) is str, 'IN_FLIGHT')
     sync_rollback_receipt(path, record)
     module_boot_owner(backup, unwritten=True)
     verify_retained_cleanup_edits(backup)
@@ -3606,6 +3652,12 @@ def resume_rollback_tail(request, path, record, backup):
          and all(swan_unstarted(unit(n), before, n) for n in SWAN_START_UNITS), 'ROLLBACK_DRIFT')
     restart = tail['sockets'] is not None
     verify_rollback(d, token, backup, pending_main_pid=x['MainPID'] if restart else None)
+    if 'step' not in tail:
+        raw_unit = unit(X, raw_dependencies=True)
+        need(all(x.get(k) == (' '.join(sorted(set(v.split()))) if k in UNIT_DEPENDENCIES else v)
+                 for k, v in raw_unit.items())
+             and rollback_xray_pin(raw_unit, legacy=True) == tail['pin'], 'ROLLBACK_DRIFT')
+        tail = {**tail, 'pin': rollback_xray_pin(x), 'step': 'reloaded'}
     need(rollback_xray_pin(x) == tail['pin'], 'ROLLBACK_DRIFT')
     if restart:
         ROLLBACK_STEP = 'xray'
@@ -3614,18 +3666,15 @@ def resume_rollback_tail(request, path, record, backup):
         if DEADLINE - time.monotonic() < 22:
             raise subprocess.TimeoutExpired([], 0)
         # Never re-enter an unacknowledged restart, even if it appears to have landed.
-        del journal['rollbackTail']
-        pending = entry(encode(backup))
-        write(path, record, pending)
+        pending = rollback_checkpoint(path, record, backup, tail, 'restart-pending')
         sc('restart', X, wait=22)
         after = unit(X)
         need(working(after) and after['InvocationID'] != x['InvocationID'], 'ROLLBACK_DRIFT')
-        journal['rollbackTail'] = dict(pin=rollback_xray_pin(after), sockets=None)
-        record = entry(encode(backup))
-        write(path, pending, record)
+        tail = dict(pin=rollback_xray_pin(after), sockets=None)
+        record = rollback_checkpoint(path, pending, backup, tail, 'restarted')
     ROLLBACK_STEP = 'verify'
     verify_rollback(d, token, backup)
-    need(rollback_xray_pin(unit(X)) == journal['rollbackTail']['pin'], 'ROLLBACK_DRIFT')
+    need(rollback_xray_pin(unit(X)) == tail['pin'], 'ROLLBACK_DRIFT')
     if journal['xray'] is not None:
         journal['rollbackXray'] = cleanup_xray_identity()
     del journal['rollbackTail']
@@ -3640,8 +3689,18 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     STAGE = 'COMMAND_FAILED'
     if cleanup:
         cleanup_no_remove(path)
+    rolling = cleanup and backup['phase'] == 'rolling-back'
+    journal = backup['foreignJournal'] if cleanup else {}
+    saved = journal.get('rollbackTail') if rolling else None
+    legacy = rolling and 'rollbackTail' not in journal
+    if rolling:
+        need('swanStart' not in backup and 'modulePersistence' not in backup
+             and 'bridge' not in backup['after'] and journal.get('installSettled') is True
+             and (legacy and 'swanGeneration' in backup and 'xrayBirths' not in journal
+                  or type(saved) is dict and saved.get('step') == 'files'), 'IN_FLIGHT')
+        sync_rollback_receipt(path, old_manifest)
     was_installed = installed_phase(backup['phase'])
-    need(backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
+    need(rolling or backup['phase'] == 'applying' or was_installed, 'ROLLBACK_DRIFT')
     # Reattestation does not transfer the original Install rollback authority,
     # even if only a service (not the machine boot) changed generation.
     need(not was_installed or 'boot' not in backup['runtime'], 'ROLLBACK_DRIFT')
@@ -3652,11 +3711,13 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     no_jobs(UNITS)
     sidecar = 'bridge' in backup['after']
     neighbors(before, sidecar)
-    current = load_after(backup, require_all=was_installed)
+    current = load_after(backup, require_all=was_installed or legacy, restored_swan=rolling and not legacy)
     need(ike_include_matches(current['starter'], [os.path.basename(NAMES['ike'])] if current['ike'] is not None else []),
          'ROLLBACK_DRIFT')
     boot_enrollment = boot_link() if before.get('installBoot') else None
-    need(boot_enrollment == backup.get('bootEnrollment'), 'ROLLBACK_DRIFT')
+    boot_removed = rolling and not legacy and 'bootEnrollment' in backup and boot_enrollment is None and all(
+        current[k] == v for k, v in original_files(before, current).items())
+    need(boot_enrollment == backup.get('bootEnrollment') or boot_removed, 'ROLLBACK_DRIFT')
     need(vpn_empty(allow_socket_policies=True), 'ROLLBACK_DRIFT')
     pinned = pinned_network_manifest(d, token, backup)
     policy = network_projection(d, token, pinned=pinned)
@@ -3715,7 +3776,7 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
         if n in (XL, IKE):
             need(native_vpn(info, n) or (info['NeedDaemonReload'] == 'yes' and info['ActiveState'] == 'inactive' and
                  info.get('FragmentPath') == before['units'][n]['FragmentPath']), 'ROLLBACK_DRIFT')
-            allowed = ('enabled', 'disabled') if n == XL and boot_enrollment else (before['units'][n]['UnitFileState'],)
+            allowed = ('enabled', 'disabled') if n == XL and (boot_enrollment or boot_removed) else (before['units'][n]['UnitFileState'],)
             need(info['UnitFileState'] in allowed and
                  info.get('DropInPaths') in (('', DROP) if n == XL else ('',)), 'ROLLBACK_DRIFT')
         if n == NET_UNIT:
@@ -3730,7 +3791,8 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
                 if (cleanup and unwritten and started is None and not sidecar and not before.get('ikeSockets')
                         and not any(policy.values()) and 'modulePersistence' not in backup
                         and swan_units is not None and all(swan_unstarted(swan_units[k], before, k) for k in SWAN_START_UNITS)):
-                    restart = current['main'] != before['files']['main'] and not original_invocation
+                    restart = not original_invocation and (current['main'] != before['files']['main']
+                                                           or saved is not None and saved.get('sockets') is not None)
                     tail = dict(pin=rollback_xray_pin(info), sockets=digest(encode(sockets)) if restart else None)
         if n == B:
             need(xray_accounts_match(info, before['units'][n]), 'ROLLBACK_DRIFT')
@@ -3740,10 +3802,35 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
         no_jobs(UNITS)
         need(all(unit(n) == info for n, info in swan_units.items()), 'ROLLBACK_DRIFT')
 
+    paths, originals = operation_files(current), original_files(before, current)
+    order = tuple(reversed(operation_order(current)))
+    undo = {k: remove_generation(paths[k]) for k in order if current[k] != originals[k]} if tail else {}
+    dirs = rollback_dirs(current) if tail else {}
+    need(all(v is not None for v in undo.values()), 'ROLLBACK_DRIFT')
+    if rolling:
+        # A legacy install postimage still includes the pinned SWAN file, the
+        # last rollback unlink before reload. No forward Xray receipt means
+        # Install did not reach either VPN start. Do not adopt a lost native ACK.
+        need(tail is not None and (not legacy or current['swan'] is not None and not restart), 'IN_FLIGHT')
+        if not legacy:
+            need(set(saved) == {'pin', 'sockets', 'step', 'undo', 'dirs'}
+                 and type(saved['undo']) is dict and type(saved['dirs']) is dict
+                 and set(saved['undo']) <= paths.keys() and set(saved['dirs']) <= {DROP_DIR, NFT_DIR}
+                 and list(undo) == [k for k in order if k in saved['undo']][len(saved['undo']) - len(undo):]
+                 and all(v == saved['undo'].get(k) for k, v in undo.items())
+                 and all(pin == saved['dirs'].get(p) for p, pin in dirs.items())
+                 and all(tail[k] == saved[k] for k in tail), 'ROLLBACK_DRIFT')
+            tail.update(undo=saved['undo'], dirs=saved['dirs'])
     ROLLBACK_STEP = 'files'
     backup['phase'] = 'rolling-back'
-    rolling = entry(encode(backup))
-    write(path, old_manifest, rolling)
+    if cleanup:
+        if tail:
+            tail.setdefault('undo', undo)
+            tail.setdefault('dirs', dirs)
+        rolling = rollback_checkpoint(path, old_manifest, backup, tail or {}, 'files' if tail else 'blocked')
+    else:
+        rolling = entry(encode(backup))
+        write(path, old_manifest, rolling)
     for n in SWAN_START_UNITS:
         info = unit(n)
         if swan_units is not None:
@@ -3793,6 +3880,7 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
             no_jobs(UNITS)
             need(all(unit(name) == u for name, u in dependents.items()) and unit(n) == info, 'ROLLBACK_DRIFT')
         if info['LoadState'] == 'loaded' and info['ActiveState'] != 'inactive':
+            need(tail is None, 'ROLLBACK_DRIFT')
             sc('stop', n, wait=14)
             no_jobs(UNITS)
             if unit(n)['ActiveState'] == 'failed':
@@ -3814,24 +3902,39 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
         else:
             need(nft_projection(token) == policy['nft'], 'ROLLBACK_DRIFT')
         command('/usr/sbin/nft', 'delete', 'table', 'inet', TABLE)
-    paths, originals = operation_files(current), original_files(before, current)
-    for k in reversed(operation_order(current)):
+    for k in order:
         if current[k] != originals[k]:
             if k == 'swan':
                 check_swan_profile(backup, read(SWAN_PROFILE))
-            write(paths[k], current[k], originals[k])
+            write(paths[k], current[k], originals[k], generation=undo.get(k))
     if boot_enrollment:
         enroll_boot(before['units'][XL]['FragmentPath'], boot_enrollment)
     for p in (DROP_DIR, NFT_DIR):
         if not directory_absent(p):
-            rmdir(p)
+            if tail:
+                need(p in dirs, 'ROLLBACK_DRIFT')
+                rmdir(p, pin=dirs[p])
+            else:
+                rmdir(p)
     ROLLBACK_STEP = 'reload'
+    if tail:
+        if saved is not None:
+            # A visible rename/unlink may precede its original parent fsync.
+            parents = {os.path.dirname(paths[k]) for k in saved['undo']} - {DROP_DIR, NFT_DIR}
+            parents.update(os.path.dirname(p) for p in saved['dirs'])
+            if boot_removed:
+                parents.add(os.path.dirname(XL_BOOT))
+            for parent in sorted(parents):
+                with directory(parent) as fd:
+                    os.fsync(fd)
+        tail.pop('undo')
+        tail.pop('dirs')
+        if DEADLINE - time.monotonic() < 12:
+            raise subprocess.TimeoutExpired([], 0)
+        rolling = rollback_checkpoint(path, rolling, backup, tail, 'reload-pending')
     sc('daemon-reload', wait=12)
     if tail:
-        journal = backup['foreignJournal']
-        journal['rollbackTail'] = tail
-        reloaded = entry(encode(backup))
-        write(path, rolling, reloaded)
+        reloaded = rollback_checkpoint(path, rolling, backup, tail, 'reloaded')
         resume_rollback_tail(request, path, reloaded, backup)
         return
     ROLLBACK_STEP = 'xray'
@@ -3860,6 +3963,8 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     need(read(path, 2 * MAX_FILE) == rolling, 'ROLLBACK_DRIFT')
     release_module_boot(module_owner)
     backup['phase'] = 'projected-rollback' if cleanup else 'rolled-back'
+    if cleanup:
+        del journal['rollbackTail']
     write(path, rolling, entry(encode(backup)))
 
 

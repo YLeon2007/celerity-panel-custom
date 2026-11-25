@@ -57,7 +57,7 @@ const expected = compose(...laterArgs, false);
 // Actual helper, file IO, flock, manifest, parser, and mutation sequence.
 // No subprocess can run a real systemctl, ip, nft, Xray, ss or IPsec command.
 const fixture = String.raw`
-import contextlib, copy, ctypes, errno, io, json, os, pathlib, runpy, shlex, subprocess, sys, types
+import contextlib, copy, ctypes, errno, io, json, os, pathlib, random, runpy, shlex, subprocess, sys, types
 from pathlib import Path
 source, tmp, scenario = sys.argv[1:]
 joined_epoch = scenario.startswith('epoch-remove-')
@@ -333,12 +333,19 @@ def sc(*args):
     else:
         raise AssertionError(args)
     return b''
+shuffle_deps = random.Random(25713)
 def command(*a, data=None):
     global l2tp_reads, ipsec_live, ipsec_appears_at_recount
     if len(a) == 6 and a[:4] == ('/usr/bin/systemctl','--no-pager','show','--all'):
         flag, name = a[4:]
         assert flag.startswith('--property=') and name in units
-        return ''.join(f'{key}={units[name].get(key, "")}\n' for key in flag.removeprefix('--property=').split(',')).encode()
+        info = dict(units[name])
+        if scenario in ('normal', 'census-idle') and info['LoadState'] == 'loaded':
+            for key in ('After', 'Wants'):
+                words = sorted(set(info.get(key, '').split()) | {'basic.target', 'sysinit.target', 'network.target'})
+                shuffle_deps.shuffle(words)
+                info[key] = ' '.join(words)
+        return ''.join(f'{key}={info.get(key, "")}\n' for key in flag.removeprefix('--property=').split(',')).encode()
     if a[:2] == ('/usr/bin/systemctl','--no-pager'): return sc(*a[2:])
     if a[0] == '/usr/bin/setpriv':
         uid, gid = (987, 986) if xray_account else (0, 0)
@@ -481,7 +488,7 @@ stray_pppd = foreign_l2tp_listener = False
 before = dict(boot=h['boot'](), files={k: R(p) for k,p in P.items()}, units=stock_units, bridge=None,
               globalFiles={}, installBoot=False, ikeSockets=[],
               sockets=h['owned_sockets'](h['sock_rows'](), units[X]['MainPID']))
-if xray_account:
+if xray_account or scenario in ('normal', 'census-idle'):
     before['units'] = h['install_unit_pins'](stock_units)
 if scenario == 'apply-quiescent-dependent': before['transit'] = []
 h['observe'] = lambda m,d,transit,**kw: before

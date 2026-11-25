@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import random
 import re
 import runpy
 import signal
@@ -22,6 +23,8 @@ MACHINE, NETWORK, TOKEN, CHAP = (CLEANUP[k] for k in ('MACHINE', 'NETWORK', 'TOK
 NETWORK_FIXTURE = runpy.run_path(str(HERE / 'helpers/rebuildRelayNetworkFixture.py'))
 NODE = 'd' * 24
 CHALLENGE = 'e' * 32
+DEPENDENCIES = ('After Before Wants WantedBy Requires RequiredBy BindsTo BoundBy PartOf ConsistsOf '
+                'Conflicts ConflictedBy PropagatesStopTo Upholds Triggers TriggeredBy').split()
 
 
 class CleanupInstallFaults(CLEANUP['Cleanup']):
@@ -45,6 +48,10 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.policy = [False, False, False]  # nft, route, RPDB
         self.nft_rows = NETWORK_FIXTURE['nft_rows'](NETWORK, TOKEN)
         self.cut = None
+        self.shuffle = random.Random(25713)
+        self.orders = {}
+        self.dependency_drift = False
+        self.native_boot_link = False
         self.user_drift = False
         self.rules = [dict(priority=n, src='all', table=t) for n, t in ((0, 255), (32766, 254), (32767, 253))]
         self.swan = b'# synthetic stock strongSwan defaults\n'
@@ -99,14 +106,28 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
                     elif self.effects[-1:] == [['restart', self.X]]:
                         self.reached('xray-restarted')
                     return result
-                if incoming.get('foreignJournal', {}).get('rollbackTail') and not previous.get('foreignJournal', {}).get('rollbackTail'):
+                tail = incoming.get('foreignJournal', {}).get('rollbackTail', {})
+                old_tail = previous.get('foreignJournal', {}).get('rollbackTail', {})
+                if tail.get('step') != old_tail.get('step'):
                     result = base_write(path, before, after, **kwargs)
-                    self.reached('rollback-reloaded')
+                    self.reached('rollback-' + tail.get('step', 'projected'))
                     return result
-            return base_write(path, before, after, **kwargs)
+            result = base_write(path, before, after, **kwargs)
+            if path in (h['MAIN'], h['SWAN_PROFILE']) and self.manifest.exists() and (
+                    json.loads(self.manifest.read_bytes())['phase'] == 'rolling-back'):
+                self.reached('rollback-main' if path == h['MAIN'] else 'rollback-swan')
+            return result
 
         h.update(install_progress=progress, write=write)
         self.prepare_xray_observers()
+        boot_enroll = h['enroll_boot']
+
+        def enroll(target, expected=None):
+            boot_enroll(target, expected)
+            if expected is not None:
+                self.reached('rollback-boot-unlinked')
+
+        h['enroll_boot'] = enroll
         # A failure to cut must not be confused with reaching verified Install.
         h['installed_runtime'] = lambda *_: self.fail('Install passed the selected cut')
 
@@ -145,6 +166,9 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         if name == self.XL:
             leaf = self.path(h['DROP'])
             props['NeedDaemonReload'] = 'yes' if (leaf.read_bytes() if leaf.exists() else b'') != self.loaded_drop else 'no'
+            if self.native_boot_link:
+                props['UnitFileState'] = ('enabled' if self.loaded_drop or self.path(h['XL_BOOT']).is_symlink()
+                                          else 'disabled')
         if name == self.NET:
             if not self.loaded_net:
                 props['InvocationID'] = ''
@@ -164,12 +188,25 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         elif name == self.X:
             props.update(ActiveState='active', SubState='running', MainPID='7', InvocationID='1' * 32,
                          ControlGroup='/system.slice/' + name)
+        if name == self.X:
+            props.update(Before=self.NET if self.loaded_net else '', WantedBy=self.NET if self.loaded_net else '')
         return props
 
     def model_command(self, *args, **opts):
         h = self.h
         if args[:4] == ('/usr/bin/systemctl', '--no-pager', 'show', '--all'):
-            return ''.join(f'{k}={v}\n' for k, v in self.model_unit(args[-1]).items()).encode()
+            name = args[-1]
+            props = self.model_unit(name)
+            if name in (self.X, self.XL, self.IKE, self.NET) and props['LoadState'] == 'loaded':
+                for key in ('After', 'Wants'):
+                    words = sorted(set(props.get(key, '').split()) | {'basic.target', 'sysinit.target', 'network.target'})
+                    if key == 'After' and self.dependency_drift:
+                        words.append('foreign.service')
+                    self.shuffle.shuffle(words)
+                    props[key] = ' '.join(words)
+                    self.orders.setdefault((name, key), set()).add(props[key])
+            keys = args[-2].removeprefix('--property=').split(',')
+            return ''.join(f'{k}={props[k]}\n' for k in keys if k in props).encode()
         if args[:2] == ('/usr/bin/systemctl', '--no-pager'):
             op, *names = args[2:]
             if op == 'show-environment':
@@ -270,7 +307,7 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
             err.seek(0)
             return code, out.getvalue(), err.read()
 
-    def process_cut(self, frame, phase, effects, *, files=True, started=False, rollback=False):
+    def process_cut(self, frame, phase, effects, *, files=True, started=False, rollback=False, before_install_reload=False):
         # A real SIGKILL: no exception handler, finally block or original helper
         # process survives. The evidence file transfers only the modeled external world;
         # it is not a recovery receipt or a quiescence override.
@@ -279,7 +316,7 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
             if pid == 0:
                 try:
                     def cut(mark):
-                        if rollback and mark == 'xray-restarted':
+                        if rollback and mark == ('restart-progress' if before_install_reload else 'xray-restarted'):
                             raise self.h['Refusal']('INJECTED_FAULT')
                         if mark == phase:
                             with self.directory(self.h['SYSTEM']) as fd:
@@ -313,8 +350,8 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.assertEqual(len(journal['done']), len(journal['edits']))
         self.assertTrue(self.fence.is_file())
         self.assertNotEqual(self.path(self.h['NAMES']['chap']).read_bytes(), CHAP)
-        self.assertEqual(self.path(self.h['SWAN_PROFILE']).exists(), files and not rollback)
-        self.assertEqual(self.path(self.h['MAIN']).read_bytes() != self.original_main, files and not rollback)
+        self.assertEqual(self.path(self.h['SWAN_PROFILE']).exists(), files and (not rollback or phase in ('rollback-files', 'rollback-main')))
+        self.assertEqual(self.path(self.h['MAIN']).read_bytes() != self.original_main, files and (not rollback or phase == 'rollback-files'))
         self.assertEqual(backup.get('swanStart'), [self.births[n][1] for n in self.h['SWAN_START_UNITS']] if started else None)
 
     def assert_restored(self, original):
@@ -376,6 +413,17 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.h['xray_argv'] = lambda info, _path=None: info['MainPID']
         self.h['reattest_process'] = lambda pid, _info: int(pid)
 
+    def test_unit_canonicalizes_only_dependency_sets(self):
+        h = self.h
+        ordering = 'sysinit.target basic.target sysinit.target'
+        ordered = '/first /second { keep ; verbatim }'
+        props = {**dict.fromkeys(DEPENDENCIES, ordering), 'ExecStart': ordered, 'DropInPaths': '/b /a'}
+        props.update(LoadState='loaded', ActiveState='inactive')
+        h['command'] = lambda *_, **__: ''.join(f'{k}={v}\n' for k, v in props.items()).encode()
+        got = h['unit'](self.X)
+        self.assertEqual({k: got[k] for k in DEPENDENCIES}, dict.fromkeys(DEPENDENCIES, 'basic.target sysinit.target'))
+        self.assertEqual((got['ExecStart'], got['DropInPaths']), (ordered, '/b /a'))
+
     def test_resume_rolling_back_after_settled_reload(self):
         self.prepare_xray_observers()
         frame, original = self.plan()
@@ -393,6 +441,9 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.user_drift = True
         self.assert_recover_blocked()
         self.user_drift = False
+        self.dependency_drift = True
+        self.assert_recover_blocked()
+        self.dependency_drift = False
         self.recover(original)
         self.assertEqual(self.effects, [*effects, ['restart', self.X]])
 
@@ -400,6 +451,58 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         frame, _ = self.plan()
         self.process_cut(frame, 'rollback-reloaded', [['daemon-reload'], ['restart', self.X], ['daemon-reload']], rollback=True)
         self.path(self.xray_fragment).write_bytes(b'[Service]\nExecStop=/bin/false\n')
+        self.assert_recover_blocked()
+
+    def test_recover_after_first_rollback_write(self):
+        self.resume_cut('rollback-files', [])
+
+    def test_recover_after_first_rollback_file(self):
+        self.resume_cut('rollback-main', [])
+
+    def test_recover_after_last_rollback_file(self):
+        self.resume_cut('rollback-swan', [])
+
+    def test_recover_after_rollback_unlinks_owned_boot_enrollment(self):
+        h = self.h
+        self.native_boot_link = True
+        unit = b'[Service]\nExecStart=/usr/sbin/xl2tpd -D\n[Install]\nWantedBy=multi-user.target\n'
+        h['NATIVE_XL_SHA'] = h['digest'](unit)
+        self.put(h['SYSTEM'] + '/' + self.XL, unit, 0o644)
+        self.resume_cut('rollback-boot-unlinked', [])
+
+    def test_recover_after_acknowledged_rollback_restart(self):
+        self.resume_cut('rollback-restarted', [['daemon-reload'], ['restart', self.X]], step='restarted')
+
+    def resume_cut(self, cut, extra, *, step='files'):
+        frame, original = self.plan()
+        effects = [['daemon-reload'], ['restart', self.X], *extra]
+        self.process_cut(frame, cut, effects, rollback=True)
+        tail = json.loads(self.manifest.read_bytes())['foreignJournal']['rollbackTail']
+        self.assertEqual(tail['step'], step)
+        self.recover(original)
+        self.assertEqual(self.effects, [['daemon-reload'], ['restart', self.X], ['daemon-reload'], ['restart', self.X]])
+
+    def omit_rollback_tail(self):
+        h = self.h
+        backup = json.loads(self.manifest.read_bytes())
+        record = h['entry'](h['encode'](backup))
+        del backup['foreignJournal']['rollbackTail']
+        h['write'](h['manifest_path'](TOKEN), record, h['entry'](h['encode'](backup)))
+
+    def test_recover_legacy_early_without_tail(self):
+        frame, original = self.plan()
+        self.process_cut(frame, 'rollback-files', [], rollback=True, before_install_reload=True)
+        self.omit_rollback_tail()
+        self.recover(original)
+        self.assertEqual(self.effects, [['daemon-reload']])
+
+    def test_resume_files_refuses_republished_swan_postimage(self):
+        frame, _ = self.plan()
+        self.process_cut(frame, 'rollback-files', [['daemon-reload'], ['restart', self.X]], rollback=True)
+        leaf = self.path(self.h['SWAN_PROFILE'])
+        data = leaf.read_bytes()
+        leaf.unlink()
+        leaf.write_bytes(data)
         self.assert_recover_blocked()
 
     def test_unacknowledged_rollback_restart_stays_fenced(self):
@@ -416,6 +519,8 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.process_cut(frame, 'rollback-reload-unacknowledged',
                          [['daemon-reload'], ['restart', self.X], ['daemon-reload']], rollback=True)
         self.assertEqual(json.loads(self.manifest.read_bytes())['phase'], 'rolling-back')
+        self.assert_recover_blocked()
+        self.omit_rollback_tail()
         self.assert_recover_blocked()
 
     def test_inline_rollback_timeout_has_stage_but_does_not_ack_rollback(self):
@@ -452,6 +557,7 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
 
     def test_sync_refusal_after_restart_progress(self):
         self.sync_rollback('restart-progress')
+        self.assertGreater(len(self.orders[self.IKE, 'After']), 1)
 
     def test_legacy_applying_and_missing_boot_are_not_rebound(self):
         frame, _ = self.plan()
