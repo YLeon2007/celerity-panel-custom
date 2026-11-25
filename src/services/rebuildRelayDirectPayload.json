@@ -22,9 +22,9 @@
     },
     {
       "path": "rebuildRelayDirectHost.py",
-      "size": 403898,
-      "sha256": "8f18dc95d40ea9b6d81520e9757fe7d755434fdfb0e6912f41852512aece45e8"
+      "size": 410072,
+      "sha256": "9e627566cc9c05f591df1db9e8cd13d5d34220189799aa678825055d40d8c880"
     }
   ],
-  "sha256": "8cdd375998b933fe4e1bdd86c3c7c6ec79f39fb29911d27557afde8ce9d6adbf"
+  "sha256": "be74625d81d18a59c71b483f83eb0e4ba580ec6f0b4ad4608cc1ea9563c1e75e"
 }

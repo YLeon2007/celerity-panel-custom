@@ -1,5 +1,6 @@
 """Offline DIRECT fresh cleanup dispatch: real flock, VAULT and file effects."""
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,8 @@ MACHINE = PARENT['MACHINE']
 NETWORK = dict(clientCidr='10.14.0.0/24', tproxyPort=18080, fwmark=100, routeTable=101)
 TOKEN = 'c' * 32
 CHAP = b'# prior comment\nexample fixture synthetic *\n'
+NFT_BASE = b'#!/usr/sbin/nft -f\n\nflush ruleset\n'
+LEGACY_NETWORK = dict(NETWORK, tproxyPort=12345, routeTable=100)
 
 
 # Reuse the kernel/FS model, not the parent's independent legacy test cases.
@@ -45,6 +48,7 @@ class Cleanup(ForeignConfigFixture):
         self.h['command'] = self.command_cleanup
         self.h['remove_generation'] = self.generation
         self.h['observe_ppp_preparation'] = lambda **_: {'missing': []}
+        self.real_observe = self.h['observe']
         self.h['observe'] = self.observe
         self.h['candidate'] = lambda *_: {key: self.h['entry'](b'{"candidate":true}')
                                            for key in (*self.h['NAMES'], 'swan')}
@@ -63,7 +67,12 @@ class Cleanup(ForeignConfigFixture):
     def command_cleanup(self, *args, **opts):
         if args == ('/usr/bin/systemctl', '--no-pager', 'daemon-reload'):
             self.calls.append(args)
-            self.net_loaded = False
+            xray = self.path(self.h['SYSTEM'] + '/' + self.h['X'])
+            if xray.exists():
+                self.assertEqual(stat.S_IMODE(xray.stat().st_mode), 0o644)
+            self.net_loaded = self.path(self.h['NET']).exists()
+            if hasattr(self, 'drop_loaded'):
+                self.drop_loaded = self.h['DROP'] if self.path(self.h['DROP']).exists() else ''
             return b''
         if args == ('/usr/sbin/ip', 'xfrm', 'policy', 'list'):
             return b''
@@ -71,23 +80,23 @@ class Cleanup(ForeignConfigFixture):
             return b''
         if args == ('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys'):
             return self.xfrm
-        if args == ('/usr/sbin/ip', '-j', '-N', '-4', 'route', 'show', 'table', 'all'):
-            return b'[]'
-        if args == ('/usr/sbin/nft', '-j', 'list', 'tables'):
-            return b'{"nftables":[]}'
+
         if args[:4] == ('/usr/bin/systemctl', '--no-pager', 'show', '--all'):
+            if getattr(self, 'native_observe_model', False) and args[-1] in self.h['UNITS']:
+                return ''.join(f'{k}={v}\n' for k, v in self.legacy_unit(args[-1]).items()).encode()
             if args[-1] == self.h['NET_UNIT']:
                 if getattr(self, 'model_net_load', False):
                     self.net_loaded = getattr(self, 'net_loaded', False) or self.path(self.h['NET']).exists()
                     if self.net_loaded:
                         return (f'LoadState=loaded\nActiveState=inactive\nMainPID=0\nFragmentPath={self.h["NET"]}\n'
-                                'DropInPaths=\nUnitFileState=static\n').encode()
+                                f'DropInPaths=\nUnitFileState={self.net_state}\n').encode()
                 return b'LoadState=not-found\nActiveState=inactive\nMainPID=0\n'
             if args[-1] == self.h['X'] and self.path(self.h['SYSTEM'] + '/' + self.h['X']).exists():
                 fragment = self.h['SYSTEM'] + '/' + self.h['X']
                 return f'LoadState=loaded\nActiveState=active\nFragmentPath={fragment}\n'.encode()
             if args[-1] == self.h['XL']:
-                return b'LoadState=loaded\nActiveState=inactive\nMainPID=0\nDropInPaths=\nNeedDaemonReload=no\n'
+                return (f'LoadState=loaded\nActiveState=inactive\nMainPID=0\n'
+                        f'DropInPaths={getattr(self, "drop_loaded", "")}\nNeedDaemonReload=no\n').encode()
         return self.command(*args, **opts)
 
     def observe(self, machine, routing, transit, *, projection=None, **_):
@@ -196,20 +205,151 @@ class Cleanup(ForeignConfigFixture):
         self.assertEqual(self.run_host(foreignCleanup={'digest': fingerprint, 'fixXrayUnitMode': False, 'at': '2026-11-25T08:25:00.000Z'})[2], err)
         self.assertFalse(self.path(self.h['VAULT']).exists())
 
-    def test_known_nft_and_drop_are_journalled_as_exact_closed_trees(self):
+    def seed_legacy_network(self):
         nft, drop = self.h['NFT_FILE'], self.h['DROP']
-        self.put(nft, self.h['managed_nft_bytes'](NETWORK, TOKEN), 0o644)
+        self.put(nft, self.h['managed_nft_bytes'](LEGACY_NETWORK, MACHINE).removeprefix(b'create '), 0o644)
         self.put(drop, f'[Unit]\nRequires={self.h["NET_UNIT"]} {self.h["IKE"]}\nAfter={self.h["NET_UNIT"]} {self.h["IKE"]}\n'.encode(), 0o644)
         for leaf in (nft, drop):
-            self.path(leaf).parent.chmod(0o755)
+            self.path(leaf).parent.chmod(0o700)
+        self.put('/etc/nftables.conf', NFT_BASE, 0o755)
+        self.stock['nftables'] = b' /etc/nftables.conf ' + hashlib.md5(NFT_BASE, usedforsecurity=False).hexdigest().encode() + b'\n'
+        self.put(self.h['NET'], self.h['network_unit'](LEGACY_NETWORK, False, legacy=True), 0o644)
+        self.model_net_load = True
+        self.drop_loaded = drop
+
+    def legacy_unit(self, name):
+        xl, ike, net = (self.h[k] for k in ('XL', 'IKE', 'NET_UNIT'))
+        props = dict.fromkeys(self.h['INSTALL_UNIT_FIELDS'] + self.h['XRAY_ACCOUNT_FIELDS'], '')
+        props.update(ActiveState='inactive', SubState='dead', MainPID='0', NeedDaemonReload='no',
+                     PrivateNetwork='no', KillMode='control-group')
+        props.update(dict.fromkeys(('Requires', 'After', 'RequiredBy', 'BoundBy', 'ConsistsOf', 'PropagatesStopTo',
+                                    'Conflicts', 'ConflictedBy', 'Wants', 'BindsTo', 'Upholds'), ''))
+        if name == net:
+            present = self.path(self.h['NET']).exists()
+            if self.net_loaded:
+                props.update(LoadState='loaded', FragmentPath=self.h['NET'], UnitFileState=self.net_state if present else '',
+                             RequiredBy=xl if self.drop_loaded else '')
+            else:
+                props.update(LoadState='not-found', InvocationID='0' * 32)
+        elif name == self.h['B']:
+            props['LoadState'] = 'not-found'
+        else:
+            props.update(LoadState='loaded', UnitFileState='enabled', FragmentPath='/usr/lib/systemd/system/' + name)
+            if name == xl:
+                deps = f'{net} {ike}' if self.drop_loaded else ''
+                props.update(DropInPaths=self.drop_loaded, Requires='sysinit.target ' + deps, After=deps,
+                             ExecStart='{ path=/usr/sbin/xl2tpd ; argv[]=/usr/sbin/xl2tpd -D ; }')
+            if name == ike:
+                props.update(RequiredBy=xl if self.drop_loaded else '',
+                             ExecStart='{ path=/usr/sbin/ipsec ; argv[]=/usr/sbin/ipsec start --nofork ; }')
+            if self.path(self.h['SYSTEM'] + '/' + name).exists():
+                props['FragmentPath'] = self.h['SYSTEM'] + '/' + name
+        return props
+
+    def use_native_observe(self):
+        self.native_observe_model = self.net_loaded = True
+        self.enterContext(patch('os.path.lexists', side_effect=lambda p: self.path(p).exists()))
+        self.h.update(observe=self.real_observe, is_stock_lns=lambda _: True, ike_include_matches=lambda *_a, **_kw: True,
+                      sock_rows=lambda: [], vpn_empty=lambda: True, ip=lambda *_: [],
+                      network_projection=lambda *_a, **_kw: {'nft': None, 'rule': False, 'route': False},
+                      nft_tables=lambda **_: [], swan_default_environment=lambda _: None,
+                      swan_inputs=lambda *_: 'model', xray_users=lambda *_: [('tcp', '127.0.0.1', 9999)])
+        path = self.h['NAMES']['starter']
+        starter = self.h['STOCK_IKE_INCLUDE'] + b'\n'
+        self.put(path, starter)
+        self.stock['strongswan-starter'] = re.sub(rb'(?m)^ /etc/ipsec\.conf [a-f0-9]{32}$',
+            b' ' + path.encode() + b' ' + hashlib.md5(starter, usedforsecurity=False).hexdigest().encode(),
+            self.stock['strongswan-starter'])
+
+    def legacy_consent(self, xray=False):
+        original = self.snapshot()
         kind, keys, fingerprint, cleanable = self.run_host()[2].strip().split(' ')
-        self.assertEqual((kind, keys, cleanable), ('DIRECT_L2TP_FOREIGN_CONFIG',
-                         'CHAP_NOT_EMPTY,NFT_DIR_PRESENT,DROPIN_PRESENT', 'CHAP_NOT_EMPTY,NFT_DIR_PRESENT,DROPIN_PRESENT'))
-        frame = self.prepare({'digest': fingerprint, 'fixXrayUnitMode': False, 'at': '2026-11-25T08:25:00.000Z'})
+        expected = 'CHAP_NOT_EMPTY' + (',XRAY_UNIT_0666' if xray else '') + ',NFT_DIR_PRESENT,DROPIN_PRESENT,NETWORK_UNIT_ORPHANED'
+        self.assertEqual((kind, keys, cleanable), ('DIRECT_L2TP_FOREIGN_CONFIG', expected, expected))
+        self.assertEqual(self.snapshot(), original)
+        return {'digest': fingerprint, 'fixXrayUnitMode': xray, 'at': '2026-11-25T08:25:00.000Z'}
+
+    def test_known_nft_drop_and_net_are_journalled_as_exact_closed_trees(self):
+        self.seed_legacy_network()
+        self.use_native_observe()
+        frame = self.prepare(self.legacy_consent())
+        self.assertEqual(self.run_host('check', **frame)[0], 0)
         self.assertEqual(self.run_host('install', **frame), (75, '', ''))
         self.assertTrue(self.stock_entered)
-        for leaf in (nft, drop):
-            self.assertFalse(self.path(leaf).parent.exists())
+        for leaf in (self.h['NFT_DIR'], self.h['DROP_DIR'], self.h['NET']):
+            self.assertFalse(self.path(leaf).exists())
+        self.assertEqual(self.path('/etc/nftables.conf').read_bytes(), NFT_BASE)
+        self.assertEqual([args for args in self.calls if 'daemon-reload' in args],
+                         [('/usr/bin/systemctl', '--no-pager', 'daemon-reload')])
+
+    def test_legacy_rollback_restores_loaded_units_before_xray_mode(self):
+        self.seed_legacy_network()
+        self.use_native_observe()
+        generator = (ROOT.parent / 'configGenerator.js').read_bytes()
+        xray = self.h['SYSTEM'] + '/' + self.h['X']
+        self.put(xray, re.search(rb'function generateXraySystemdService\(\) \{\n    return `([^`]+)`;', generator)[1], 0o666)
+        self.h['cleanup_xray_identity'] = lambda: {self.h['X']: ['invocation', 'pid', 'start']}
+        before = {k: v for k, v in self.snapshot().items() if k.startswith('etc/')}
+        frame = self.prepare(self.legacy_consent(xray=True))
+        observe_install = self.h['observe_install']
+        fence = self.path(self.h['VAULT'] + '/foreign-cleanup.pending')
+        def cut(*args, **kwargs):
+            if fence.exists():
+                raise self.h['Refusal']('IN_FLIGHT')
+            return observe_install(*args, **kwargs)
+        self.h['observe_install'] = cut
+        self.assertEqual(self.run_host('install', **frame), (75, '', ''))
+        self.assertFalse(self.net_loaded)
+        self.assertEqual(self.drop_loaded, '')
+        args = {key: frame[key] for key in ('backupId', 'baseline', 'network')}
+        self.assertEqual(self.run_host('rollback', **args)[0], 0)
+        self.assertFalse(fence.exists())
+        self.assertTrue(self.net_loaded)
+        self.assertEqual(self.drop_loaded, self.h['DROP'])
+        self.assertEqual({k: v for k, v in self.snapshot().items() if k.startswith('etc/')}, before)
+        self.assertEqual(sum(a[-1] == 'daemon-reload' for a in self.calls), 2)
+
+    def test_legacy_nft_and_drop_refuse_unproved_persistence(self):
+        self.seed_legacy_network()
+        for updated, stock_hash in ((NFT_BASE + b'# local edit\n', False),
+                                    (NFT_BASE + b'include "/etc/celerity-rebuild-l2tp/*.nft"\n', True)):
+            with self.subTest(stock_hash=stock_hash):
+                self.put('/etc/nftables.conf', updated, 0o755)
+                if stock_hash:
+                    self.stock['nftables'] = (b' /etc/nftables.conf ' +
+                                             hashlib.md5(updated, usedforsecurity=False).hexdigest().encode() + b'\n')
+                self.drop_loaded += ' /etc/systemd/system/xl2tpd.service.d/extra.conf'
+                original = self.snapshot()
+                cleanable = self.run_host()[2].split()[-1].split(',')
+                self.assertNotIn('NFT_DIR_PRESENT', cleanable)
+                self.assertNotIn('DROPIN_PRESENT', cleanable)
+                self.assertEqual(self.snapshot(), original)
+
+    def test_nftables_base_change_invalidates_legacy_consent_before_vault(self):
+        self.seed_legacy_network()
+        frame = self.prepare(self.legacy_consent())
+        self.put('/etc/nftables.conf', NFT_BASE + b'# edit after approval\n', 0o755)
+        original = self.snapshot()
+        code, out, err = self.run_host('install', **frame)
+        self.assertEqual((code, out), (70, ''))
+        self.assertRegex(err, r'^DIRECT_NO_WRITE_L2TP_FOREIGN_CONFIG_CHANGED [A-Z_,]+ [a-f0-9]{64} [A-Z_,]+\n$')
+        self.assertNotIn('NFT_DIR_PRESENT', err.split()[-1].split(','))
+        self.assertEqual(self.snapshot(), original)
+        self.assertFalse(self.path(self.h['VAULT']).exists())
+
+    def test_orphan_net_has_live_runtime_veto(self):
+        self.seed_legacy_network()
+        for attr, value in (('net_state', 'enabled'), ('tables', [dict(family='inet', name=self.h['TABLE'])]),
+                            ('rules', [dict(priority=101, fwmark=100)])):
+            with self.subTest(attr=attr):
+                previous = getattr(self, attr)
+                setattr(self, attr, value)
+                try:
+                    before = self.snapshot()
+                    self.assertEqual(self.run_host(), (70, '', 'DIRECT_L2TP_DAEMON_ACTIVE\n'))
+                    self.assertEqual(self.snapshot(), before)
+                finally:
+                    setattr(self, attr, previous)
 
     def test_unacknowledged_edit_does_not_autorollback(self):
         frame = self.prepare(self.consent())

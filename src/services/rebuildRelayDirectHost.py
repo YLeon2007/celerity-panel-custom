@@ -679,7 +679,7 @@ def foreign_conffiles(package):
     return hashes
 
 
-def old_network_idle(has_unit, fwmark, *, vacant=True):
+def old_network_idle(has_unit, fwmark, *, vacant=True, unlinked=False):
     if vacant and recovery_stat(VAULT) is not None:
         return False
     try:
@@ -688,7 +688,8 @@ def old_network_idle(has_unit, fwmark, *, vacant=True):
             return False
         if has_unit:
             if not (net['LoadState'] == 'loaded' and net.get('FragmentPath') == NET
-                    and net.get('UnitFileState') in ('static', 'disabled')
+                    and (net.get('UnitFileState') in ('static', 'disabled')
+                         or unlinked and net.get('UnitFileState') in ('', None))
                     and net.get('DropInPaths') == '' and net.get('MainPID') == '0'):
                 return False
         elif not (net['LoadState'] == 'not-found' and not net.get('FragmentPath') and not net.get('UnitFileState')
@@ -826,6 +827,8 @@ def foreign_config_observation(fwmark=None, *, detailed=False, vacant=True):
                         sample.append([leaf[1], digest(leaf[2])])
                         contents[reason] = leaf[2]
                 need(foreign_leaf(path, folder=True) == folder, 'BASELINE_CHANGED')
+                if reason == 'NFT_DIR_PRESENT':
+                    sample.append(cleanup_nft_base())
                 found[reason] = sample
     net_exists = recovery_stat(NET) is not None
     if net_exists or recovery_stat(LEGACY_NFT) is not None:
@@ -941,7 +944,7 @@ def fresh_install_conflicts(machine, lock_fd, fwmark=None, *, cleanup=None, deta
     if cleanup is None and 'C3_REPLACEMENT' not in globals():
         raise FreshInstallConflict(FOREIGN_CONFIG, keys)
     try:
-        edits = cleanup_edits(found, contents, fwmark, cleanup_at=cleanup['at'] if cleanup else None)
+        edits = cleanup_edits(found, contents, fwmark, machine=machine, cleanup_at=cleanup['at'] if cleanup else None)
     except FreshInstallConflict:
         need(scope() == original, 'BASELINE_CHANGED')
         raise
@@ -971,7 +974,7 @@ def fresh_install_conflicts(machine, lock_fd, fwmark=None, *, cleanup=None, deta
             need(scope() == original, 'BASELINE_CHANGED')
             raise FreshInstallConflict(FOREIGN_CONFIG, ('CONFFILE_UNKNOWN',)) from None
         need(foreign_config_observation(fwmark, detailed=True) == (keys, fingerprint, found, contents), 'BASELINE_CHANGED')
-        edits = cleanup_edits(found, contents, fwmark, cleanup_at=cleanup['at'], staged=staged)
+        edits = cleanup_edits(found, contents, fwmark, machine=machine, cleanup_at=cleanup['at'], staged=staged)
         need(scope() == original, 'BASELINE_CHANGED')
         need(edits.keys() == set(keys) and all(edits.values()), 'BASELINE_CHANGED')
     return [edit for key in keys for edit in edits[key]]
@@ -986,10 +989,11 @@ def cleanup_paths():
             'CHAP_NOT_EMPTY': NAMES['chap'], 'XRAY_UNIT_0666': SYSTEM + '/' + X,
             'XRAY_BRIDGE_UNIT_0666': SYSTEM + '/' + B, 'NFT_DIR_PRESENT': NFT_DIR,
             'NFT_MEMBER': NFT_FILE, 'DROPIN_PRESENT': DROP_DIR, 'DROP_MEMBER': DROP,
-            'LEGACY_NFT_PRESENT': LEGACY_NFT}
+            'NETWORK_UNIT_ORPHANED': NET, 'LEGACY_NFT_PRESENT': LEGACY_NFT}
 
 
 CLEANUP_FOLDERS = ('NFT_DIR_PRESENT', 'DROPIN_PRESENT')
+CLEANUP_MANAGER = ('DROPIN_PRESENT', 'NETWORK_UNIT_ORPHANED')
 CLEANUP_XRAY_SHA = {
     'XRAY_UNIT_0666': '535cc050a1b1a0dfd209cdec45a43938d578a06ef5d05cec44a7a15e62253d9b',
     'XRAY_BRIDGE_UNIT_0666': '8419e3b8dc8345ed8f7c1ce585a1e8bd6300134d040fef2de70535aee773696a',
@@ -1011,7 +1015,7 @@ def cleanup_xray_identity():
     return result
 
 
-def cleanup_runtime(fwmark, *, has_unit=False):
+def cleanup_runtime(fwmark, *, has_unit=False, unlinked=False):
     require_network_observers()
     conflict = fresh_runtime_conflict()
     if conflict is not None:
@@ -1019,10 +1023,27 @@ def cleanup_runtime(fwmark, *, has_unit=False):
     if (command('/usr/sbin/ip', 'xfrm', 'policy', 'list', quiet=True).strip()
             or command('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys', quiet=True).strip()):
         raise FreshInstallConflict('L2TP_DAEMON_ACTIVE')
-    need(old_network_idle(has_unit, fwmark, vacant=False), OBSERVATION_REQUIRED)
+    need(old_network_idle(has_unit, fwmark, vacant=False, unlinked=unlinked), OBSERVATION_REQUIRED)
 
 
-def cleanup_nft(data, *, classic):
+def cleanup_nft_base():
+    """Absent, proven stock without includes, or unqualified (False)."""
+    path = '/etc/nftables.conf'
+    try:
+        leaf = foreign_leaf(path)
+        if leaf is None:
+            return None
+        _, pin, data = leaf
+        if (data is not None and len(data) <= 65536 and not any(re.search(rb'\binclude\b', line, re.I)
+                                           for line in data.splitlines() if not line.lstrip().startswith(b'#'))
+                and foreign_conffiles('nftables').get(path.encode()) == hashlib.md5(data, usedforsecurity=False).hexdigest().encode()):
+            return [pin, digest(data)]
+    except (OSError, Refusal, subprocess.TimeoutExpired):
+        pass
+    return False
+
+
+def cleanup_nft(data, *, classic, machine=None):
     # Demand byte equality with the known renderer; a table name/comment alone
     # is insufficient. Do not run even nft --check during a read-only action.
     try:
@@ -1038,11 +1059,13 @@ def cleanup_nft(data, *, classic):
                             f'        iifname "ppp*" ip saddr {cidr} drop comment "block non-TPROXY PPP egress"\n'
                             '    }\n}\n').encode()
         token, cidr, port, mark = re.search(
-            rb'\Acreate table inet celerity_rebuild_l2tp \{\n    comment "([a-f0-9]{32})"\n.*?ip saddr ([0-9./]+) meta l4proto \{ tcp, udp \} tproxy ip to :([0-9]+) meta mark set ([0-9]+)',
+            rb'\A(?:create )?table inet celerity_rebuild_l2tp \{\n    comment "([a-f0-9]{32})"\n.*?ip saddr ([0-9./]+) meta l4proto \{ tcp, udp \} tproxy ip to :([0-9]+) meta mark set ([0-9]+)',
             data, re.S).groups()
         cidr, port, mark = cidr.decode(), int(port), int(mark)
         need(str(ipaddress.IPv4Network(cidr)) == cidr and 1 <= port <= 65535 and 1 <= mark <= 0xffffffff, 'PREREQUISITE')
-        return data == managed_nft_bytes(dict(clientCidr=cidr, tproxyPort=port, fwmark=mark), token.decode())
+        rendered = managed_nft_bytes(dict(clientCidr=cidr, tproxyPort=port, fwmark=mark), token.decode())
+        return data == rendered or (token.decode() == machine and mark == LEGACY_FWMARK
+                                    and data == rendered.removeprefix(b'create '))
     except (AttributeError, Refusal, ValueError):
         return False
 
@@ -1051,7 +1074,22 @@ def cleanup_record(data, pin):
     return entry(data, stat.S_IMODE(pin[2]), pin[4], pin[3])
 
 
-def cleanup_edits(found, contents, fwmark, *, cleanup_at=None, staged=None):
+def cleanup_net_bytes(data):
+    try:
+        table, cidr, mark = re.search(rb'route add local 0\.0\.0\.0/0 dev lo table ([0-9]+)\n'
+                                     rb'[^\n]+ from ([0-9./]+) fwmark ([0-9]+) table ', data).groups()
+        table, cidr, mark = int(table), cidr.decode(), int(mark)
+        if (str(ipaddress.IPv4Network(cidr)) == cidr and 1 <= table <= 0xffffffff
+                and mark == LEGACY_FWMARK):
+            d = dict(clientCidr=cidr, routeTable=table, fwmark=mark)
+            return any(data == network_unit(d, sidecar, legacy=legacy)
+                       for sidecar in (False, True) for legacy in (False, True))
+    except (AttributeError, ValueError):
+        pass
+    return False
+
+
+def cleanup_edits(found, contents, fwmark, *, machine=None, cleanup_at=None, staged=None):
     planner = globals().get('C3_REPLACEMENT')
     if planner is None:
         return {}
@@ -1071,20 +1109,24 @@ def cleanup_edits(found, contents, fwmark, *, cleanup_at=None, staged=None):
         if key not in paths or data is None:
             continue
         if key in CLEANUP_FOLDERS:
-            member, = item[3:]
-            if stat.S_IMODE(item[1][2]) != 0o755 or stat.S_IMODE(member[0][2]) != 0o644:
+            member = item[3]
+            mode = stat.S_IMODE(item[1][2])
+            if mode not in (0o700, 0o755) or stat.S_IMODE(member[0][2]) != 0o644:
                 continue
             if key == 'NFT_DIR_PRESENT':
                 # A known body is not proof that a persistent include may be removed.
-                qualified = read('/etc/nftables.conf', 65536) is None and cleanup_nft(data, classic=False)
+                qualified = item[4] is not False and cleanup_nft(data, classic=False, machine=machine)
                 leaf = 'NFT_MEMBER'
             else:
                 info = unit(XL)
-                qualified = (info.get('DropInPaths') == '' and info.get('NeedDaemonReload') == 'no'
+                qualified = (info.get('DropInPaths') == DROP and info.get('NeedDaemonReload') == 'no'
+                             and info['ActiveState'] == 'inactive' and info.get('MainPID') == '0'
                              and data == f'[Unit]\nRequires={NET_UNIT} {IKE}\nAfter={NET_UNIT} {IKE}\n'.encode())
                 leaf = 'DROP_MEMBER'
             if qualified:
-                result[key] = [[leaf, cleanup_record(data, member[0]), None, member[0]], [key, 0o755, None, item[1]]]
+                result[key] = [[leaf, cleanup_record(data, member[0]), None, member[0]], [key, mode, None, item[1]]]
+            continue
+        if key == 'NETWORK_UNIT_ORPHANED' and (stat.S_IMODE(item[1][2]) != 0o644 or not cleanup_net_bytes(data)):
             continue
         if key == 'LEGACY_NFT_PRESENT':
             base_nft = read('/etc/nftables.conf', 65536)
@@ -2005,6 +2047,30 @@ def xray_accounts_match(info, original):
     return all(k not in original or (k in info and info[k] == original[k]) for k in XRAY_ACCOUNT_FIELDS)
 
 
+def cleanup_project_units(units, projection):
+    # Project only the known manager edges of the authenticated local files.
+    # The plain observation after daemon-reload must match this prediction.
+    units = {name: dict(info) for name, info in units.items()}
+    if DROP in projection:
+        xl = units[XL]
+        need(xl.get('DropInPaths') == DROP and xl.get('NeedDaemonReload') == 'no', 'PREREQUISITE')
+        xl['DropInPaths'] = ''
+        for field in ('Requires', 'After'):
+            xl[field] = ' '.join(n for n in xl[field].split() if n not in (IKE, NET_UNIT))
+        ike = units[IKE]
+        ike['RequiredBy'] = ' '.join(n for n in ike['RequiredBy'].split() if n != XL)
+    if NET in projection:
+        old = units[NET_UNIT]
+        need(old['LoadState'] == 'loaded' and old['ActiveState'] == 'inactive'
+             and old.get('MainPID') == '0' and old.get('FragmentPath') == NET
+             and old.get('UnitFileState') in ('static', 'disabled') and old.get('DropInPaths') == ''
+             and set(old.get('RequiredBy', '').split()) <= ({XL} if DROP in projection else set())
+             and not any(old.get(k) for k in ('BoundBy', 'ConsistsOf', 'PropagatesStopTo')), 'PREREQUISITE')
+        units[NET_UNIT] = dict.fromkeys(INSTALL_UNIT_FIELDS, '') | dict(
+            LoadState='not-found', ActiveState='inactive', SubState='dead', MainPID='0')
+    return units
+
+
 def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=(), projection=None) -> dict[str, Any]:
     global STAGE
     STAGE = 'PREREQUISITE'
@@ -2013,6 +2079,8 @@ def observe(machine, d, transit=None, *, diagnose_profile_owner=False, deferred=
     need(not ready['masked'], 'PREREQUISITE')
     no_jobs(UNITS)
     units = {name: unit(name) for name in UNITS}
+    if NET in projection or DROP in projection:
+        units = cleanup_project_units(units, projection)
     inspect_sockets = not any(name in deferred for name in SOCKET_OBSERVERS)
     inspect_nft = not any(name in deferred for name in NFT_OBSERVERS)
     inspect_xfrm = 'xfrm_user' not in deferred
@@ -2669,19 +2737,30 @@ def cleanup_fence(backup):
         'digest': backup['before']['foreignCleanup']['digest']}))
 
 
-def cleanup_guard(backup, fd, identity, *, file_net=False):
+def cleanup_guard(backup, fd, identity, *, file_net=False, legacy_net=False):
     scope = package_scope(backup['machineId'], fd)
     before = backup['before']
     need(scope['boot'] == before['boot'] and scope['installLock'] == before['installLock']
          and read(VAULT + '/' + FOREIGN_PENDING, 2048) == cleanup_fence(backup), 'IN_FLIGHT')
     package_no_pending()
-    cleanup_runtime(backup['network']['fwmark'], has_unit=file_net and unit(NET_UNIT)['LoadState'] == 'loaded')
+    has_unit = (file_net or legacy_net) and unit(NET_UNIT)['LoadState'] == 'loaded'
+    cleanup_runtime(backup['network']['fwmark'], has_unit=has_unit, unlinked=legacy_net and recovery_stat(NET) is None)
     need(identity is None or cleanup_xray_identity() == identity, 'IN_FLIGHT')
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
 
 
 def cleanup_reload(edits):
-    return any(e[0] in (*CLEANUP_XRAY_SHA, 'DROPIN_PRESENT', 'NETWORK_UNIT_ORPHANED') for e in edits)
+    return any(e[0] in (*CLEANUP_XRAY_SHA, *CLEANUP_MANAGER) for e in edits)
+
+
+def cleanup_manager_ready(edits):
+    keys = {e[0] for e in edits}
+    if 'DROPIN_PRESENT' in keys:
+        xl = unit(XL)
+        need(xl.get('DropInPaths') in ('', DROP) and xl.get('MainPID') == '0', 'IN_FLIGHT')
+        if xl['DropInPaths'] != DROP or xl.get('NeedDaemonReload') != 'no':
+            return False
+    return 'NETWORK_UNIT_ORPHANED' not in keys or unit(NET_UNIT)['LoadState'] == 'loaded'
 
 
 def cleanup_no_remove(path):
@@ -2717,7 +2796,8 @@ def cleanup_transition(path, record, backup, fd, *, restore=False, preinstall=Fa
          and len(done) <= len(edits) and all(e[0] in paths for e in edits), 'IN_FLIGHT')
     identity = journal.get('rollbackXray', journal['xray']) if restore else journal['xray']
     need((identity is not None) == any(e[0] in CLEANUP_XRAY_SHA for e in edits), 'IN_FLIGHT')
-    cleanup_guard(backup, fd, identity)
+    legacy_net = any(e[0] == 'NETWORK_UNIT_ORPHANED' for e in edits)
+    cleanup_guard(backup, fd, identity, legacy_net=legacy_net)
     validated = {}
     for i, (key, before, after, pin) in enumerate(edits):
         live, live_pin = cleanup_current(key)
@@ -2735,9 +2815,36 @@ def cleanup_transition(path, record, backup, fd, *, restore=False, preinstall=Fa
         nxt = entry(encode(backup))
         write(path, record, nxt)
         record = nxt
-    order = reversed(edits[:len(done)]) if restore else iter(edits)
+    order = list(reversed(edits[:len(done)])) if restore else edits
+    if restore:
+        # Restore the manager before any Xray fragment returns to mode 0666.
+        order.sort(key=lambda e: e[0] in CLEANUP_XRAY_SHA)
+
+    def restore_manager():
+        nonlocal record
+        if not restore or cleanup_manager_ready(edits):
+            return
+        for key in CLEANUP_XRAY_SHA:
+            current, _ = cleanup_current(key)
+            need(current is None or not current['mode'] & 0o022, 'IN_FLIGHT')
+        journal['reloadPending'] = True
+        intent = entry(encode(backup))
+        write(path, record, intent)
+        sc('daemon-reload', wait=12)
+        cleanup_guard(backup, fd, identity, legacy_net=legacy_net)
+        need(cleanup_manager_ready(edits), 'IN_FLIGHT')
+        del journal['reloadPending']
+        record = entry(encode(backup))
+        write(path, intent, record)
+
     for key, before, after, pin in order:
-        cleanup_guard(backup, fd, identity)
+        if restore and key in CLEANUP_XRAY_SHA:
+            restore_manager()
+        cleanup_guard(backup, fd, identity, legacy_net=legacy_net)
+        if not restore and key == 'NFT_MEMBER':
+            need(cleanup_nft_base() is not False, 'IN_FLIGHT')
+        if not restore and key == 'DROP_MEMBER':
+            need(cleanup_manager_ready([['DROPIN_PRESENT']]), 'IN_FLIGHT')
         leaf = paths[key]
         publication = None
         current, live_pin = cleanup_current(key)
@@ -2776,7 +2883,8 @@ def cleanup_transition(path, record, backup, fd, *, restore=False, preinstall=Fa
             nxt = entry(encode(backup))
             write(path, record, nxt)
             record = nxt
-    cleanup_guard(backup, fd, identity)
+    restore_manager()
+    cleanup_guard(backup, fd, identity, legacy_net=legacy_net)
     expected = {key: before if restore else after for key, before, after, _ in edits}
     need(all(cleanup_current(key)[0] == value for key, value in expected.items()), 'IN_FLIGHT')
     return record
@@ -2869,8 +2977,8 @@ def cleanup_rollback(request, path, record, backup, fd, *, file_undo=None, file_
     if not pristine_phase and file_undo is None:
         verify_rollback(request['network'], request['backupId'], backup)
     record = cleanup_transition(path, record, backup, fd, restore=True, preinstall=pristine_phase)
-    # Do not load restored, previously ignored drop-ins or reload again after
-    # restoring an Xray fragment to 0666. Read back the original manager state.
+    # The foreign transition already restored the idle manager view before
+    # returning any Xray fragment to 0666. No further reload is permitted.
     journal['preinstallRollback'] = pristine_phase or file_undo is not None
     verify_cleanup_rollback(request, backup)
     backup['phase'] = 'rolled-back'
@@ -2899,7 +3007,8 @@ def verify_cleanup_rollback(request, backup):
         if any(edit[0] == key for edit in edits):
             with directory(cleanup_paths()[key]) as held, os.scandir(held) as rows:
                 need(next(rows).name == os.path.basename(member) and next(rows, None) is None, 'IN_FLIGHT')
-    cleanup_runtime(request['network']['fwmark'])
+    need(cleanup_manager_ready(edits), 'IN_FLIGHT')
+    cleanup_runtime(request['network']['fwmark'], has_unit=any(e[0] == 'NETWORK_UNIT_ORPHANED' for e in edits))
     identity = journal.get('rollbackXray', journal['xray'])
     need(identity is None or cleanup_xray_identity() == identity, 'IN_FLIGHT')
     if journal['preinstallRollback']:
@@ -3018,7 +3127,7 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
         xray = cleanup_xray_identity() if any(e[0] in CLEANUP_XRAY_SHA for e in cleanup_edits) else None
         backup['foreignJournal'] = dict(edits=cleanup_edits, editsSha256=digest(encode(cleanup_edits)), done=[], xray=xray)
         need(not pending and lock_fd is not None, 'PREREQUISITE')
-        cleanup_runtime(d['fwmark'])
+        cleanup_runtime(d['fwmark'], has_unit=any(e[0] == 'NETWORK_UNIT_ORPHANED' for e in cleanup_edits))
     payload = encode(backup)
     need(len(payload) <= 2 * MAX_FILE, 'CANDIDATE_INVALID')
     if cleanup_edits:
@@ -3052,6 +3161,11 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
             old_manifest = entry(encode(backup))
             write(path, intent, old_manifest)
         live = observe_install(request['machineId'], d, before.get('transit'), lock_fd)
+        if any(e[0] == 'NETWORK_UNIT_ORPHANED' for e in cleanup_edits):
+            # A never-started not-found unit may report a null invocation ID.
+            net = live['units'][NET_UNIT]
+            if net['InvocationID'] == '0' * 32:
+                net['InvocationID'] = ''
         need({**live, 'foreignCleanup': request['foreignCleanup']} == before
              and candidate(request, live) == after, 'BASELINE_CHANGED')
         backup['phase'] = 'applying'
@@ -3606,8 +3720,10 @@ def verify_rollback(d, token, backup, *, projection=None):
          network_projection(d, token, pinned=pinned_network_manifest(d, token, backup))
          == {'nft': None, 'rule': False, 'route': False}
          and vpn_empty(allow_socket_policies=bool(before.get('ikeSockets'))), 'RUNTIME_UNPROVED')
-    for n in (XL, IKE, NET_UNIT):
-        info = unit(n)
+    vpn_units = {n: unit(n) for n in (XL, IKE, NET_UNIT)}
+    if NET in projection or DROP in projection:
+        vpn_units = cleanup_project_units(vpn_units, projection)
+    for n, info in vpn_units.items():
         fields = ('LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'DropInPaths', 'FragmentPath')
         need(all(info.get(k) == before['units'][n][k] for k in fields), 'RUNTIME_UNPROVED')
         need((n == IKE and before.get('ikeSockets')) or info.get('MainPID') == before['units'][n]['MainPID'], 'RUNTIME_UNPROVED')
