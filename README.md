@@ -192,6 +192,8 @@ state or different config is refused; Apply does not backfill Install history.
 
 The supported production path for this custom repository is the source-based installer above (`scripts/install.sh`) and `docker-compose.yml` with Caddy. It keeps the local git checkout in `/opt/hysteria-panel`; **Settings → Maintenance → Panel update** uses an isolated HMAC-authenticated updater sidecar to back up, move to an immutable release tag, rebuild the backend, and retain rollback artifacts. The backend itself has no Docker socket access.
 
+Before a panel update, save any local changes to `Caddyfile` in `Caddyfile.local` in the project directory. Keep the copy out of Git and set `CADDYFILE=./Caddyfile.local` in `.env`. The updater replaces tracked files and uses only `docker-compose.yml`, so put backend feature flags in `.env`, not `docker-compose.override.yml`. The updater does not recreate Caddy: after 1.6.41 or later is checked out, recreate only `caddy` once to apply the new mount. See the [1.6.41 release notes (RU)](docs/release-v1.6.41.ru.md).
+
 `docker-compose.dokploy.yml` is kept only for operators who intentionally deploy through Dokploy/Traefik and understand the trade-offs:
 
 - Dokploy must build from **this repository/branch** (`build: .`).

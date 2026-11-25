@@ -192,6 +192,8 @@ Apply не дописывает историю Install.
 
 Основной supported production-путь для этого custom-репозитория — source-based installer выше (`scripts/install.sh`) и `docker-compose.yml` с Caddy. Он сохраняет git checkout в `/opt/hysteria-panel`; раздел **Настройки → Обслуживание → Обновление панели** использует отдельный HMAC-аутентифицированный updater-sidecar для backup, перехода на immutable release tag, пересборки backend и сохранения rollback-артефактов. Сам backend не имеет доступа к Docker socket.
 
+До обновления из панели сохраните локальные правки `Caddyfile` в `Caddyfile.local` в каталоге проекта. Не добавляйте копию в Git и задайте `CADDYFILE=./Caddyfile.local` в `.env`. Updater заменяет отслеживаемые файлы и читает только `docker-compose.yml`, поэтому флаги backend храните в `.env`, а не в `docker-compose.override.yml`. Updater не пересоздаёт Caddy: после перехода на 1.6.41 или новее один раз пересоздайте только `caddy`, чтобы применить новое подключение файла. См. [заметки к 1.6.41](docs/release-v1.6.41.ru.md).
+
 `docker-compose.dokploy.yml` оставлен только для операторов, которые осознанно деплоят через Dokploy/Traefik и понимают ограничения:
 
 - Dokploy должен собирать backend именно из **этого репозитория/ветки** (`build: .`).

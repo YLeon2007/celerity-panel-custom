@@ -5,6 +5,11 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.6.41 — Локальный Caddyfile / Local Caddyfile
+
+- Source-updater: локальные настройки Caddy можно вынести из Git в `Caddyfile.local` и указать его через `CADDYFILE` в `.env`. Без переменной используется штатный файл. [Памятка оператора](docs/release-v1.6.41.ru.md).
+- Source updater: keep custom Caddy settings in an untracked `Caddyfile.local` and select it with `CADDYFILE` in `.env`. The stock file remains the default.
+
 ## v1.6.40 — Установка и восстановление L2TP / L2TP install and recovery
 
 - На странице L2TP допуск, установка, проверка результата и удаление обновляют состояние без ручной перезагрузки. При установке видны процент, этап и конкретная причина сбоя.

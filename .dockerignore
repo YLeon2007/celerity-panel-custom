@@ -5,6 +5,8 @@ npm-debug.log
 .env
 .env.*
 !.env.docker
+Caddyfile.local
+Caddyfile.*.local
 mongo-keyfile
 .mongo-keyfile.*
 logs/*

@@ -47,6 +47,17 @@ assert.strictEqual(updateService.isUpdaterConfigured(), false);
     assert.ok(updaterBlock.includes('/var/run/docker.sock'), 'updater sidecar must mount docker.sock');
 }
 
+// A local Caddyfile must survive source-mode checkout and stay out of the image.
+{
+    const root = path.join(__dirname, '..');
+    const compose = fs.readFileSync(path.join(root, 'docker-compose.yml'), 'utf8');
+    const caddy = compose.match(/^  caddy:\n(?:^[ \t]+[^\n]*\n)*/m)?.[0] ?? '';
+    const mounts = caddy.split('\n').filter(line => line.includes(':/etc/caddy/Caddyfile:'));
+    assert.deepStrictEqual(mounts, ['      - ${CADDYFILE:-./Caddyfile}:/etc/caddy/Caddyfile:ro']);
+    const dockerignore = fs.readFileSync(path.join(root, '.dockerignore'), 'utf8').split(/\r?\n/);
+    for (const pattern of ['Caddyfile.local', 'Caddyfile.*.local']) assert.ok(dockerignore.includes(pattern), pattern);
+}
+
 // ─── updater: HMAC signing / verification ────────────────────────────────────
 
 const SECRET = 'a'.repeat(48);
