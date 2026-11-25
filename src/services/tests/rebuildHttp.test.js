@@ -66,7 +66,7 @@ test('public rebuild actions use the DB component; read-only preview, user guard
         assert.deepEqual(Object.keys(refusal.body).sort(),['error','fingerprintIssue']);
         assert.deepEqual(refusal.body.error,{code:'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED'});
         const {allowed,...issue}=refusal.body.fingerprintIssue;
-        assert.deepEqual(issue,{dialerId:id(relay),version:'26.11.9',fingerprint:'random'});
+        assert.deepEqual(issue,{endpointId:id(relay),endpointRole:'dialer',version:'26.11.9',fingerprint:'random'});
         assert.ok(allowed.includes('chrome'));assert.ok(!allowed.includes('random'));
         assert.equal(f.commands.slice(start).some(c=>['insert','update','delete','commitTransaction'].includes(c.name)&&c.collection!=='c3_rebuild_locks'),false);
         assert.equal(stages.length,0);assert.equal(writes.length,0);assert.equal(await applied(pr.linkId),null);
@@ -76,7 +76,7 @@ test('public rebuild actions use the DB component; read-only preview, user guard
     await Link.collection.updateOne({_id:new mongoose.Types.ObjectId(pr.linkId)},{$set:{lastHealthCheck:new Date(),latencyMs:12,lastError:'old'}});
     await seedEvidence(pr.linkId); // Within the same Preview confirmation window.
     const result=await ok('POST',deploy,{linkId:pr.linkId,expectedPreview:pr.preview.previewId});assert.deepEqual([...new Set(writes)].sort(),[portal,relay,exit,geo].map(id).sort());
-    assert.equal(result.previewId,pr.preview.previewId,'Apply used the same REALITY dialer candidate as Preview');
+    assert.equal(result.previewId,pr.preview.previewId,'Apply used the same REALITY endpoint identities and candidates as Preview');
     const dialer=files.get(id(relay)).main.outbounds.find(o=>o.tag===`rebuild-rp-dial-${pr.linkId.slice(-8)}`);
     assert.equal(dialer.streamSettings.security,'reality');
     assert.equal(dialer.streamSettings.realitySettings.fingerprint,'random');

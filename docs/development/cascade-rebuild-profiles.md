@@ -1,7 +1,8 @@
 # Pure rebuild profile contract
 
 `src/modules/relay-l2tp/services/rebuildTopologyComposer.js` exports the synchronous
-`composeRebuildProfiles({ nodes, links, usersByNode, affectedNodeIds, panelTls })`.
+`composeRebuildProfiles({ nodes, links, usersByNode, affectedNodeIds, panelTls, dialerVersions })`.
+The historical `dialerVersions` option is a `Map` of numeric Xray triplets keyed by node ID. REALITY composition requires entries for both endpoints; production callers probe them directly and offline fixtures supply both explicitly.
 It uses the normal Xray client generator and the topology hop primitives, not the
 strict frozen-deployment planner. It performs no environment, certificate-file,
 database, service or network I/O; it does not grant authority to apply a profile.

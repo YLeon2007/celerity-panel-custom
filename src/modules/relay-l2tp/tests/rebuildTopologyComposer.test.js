@@ -323,7 +323,8 @@ for (const mode of ['reverse', 'forward']) {
             realityShortIds: ['aabbccddeeff1122'] };
         const link = edge('pair', 'p', 'b', 1, { ...reality, mode, tunnelSecurity: 'reality', _rebuildVless: undefined });
         const dialerId = reverse ? 'b' : 'p';
-        const output = composeRebuildProfiles({ nodes, links: [link], dialerVersions: new Map([[dialerId, '26.11.9']]) });
+        const dialerVersions = new Map([[dialerId, '26.3.27'], [listenerNode._id, '26.11.9']]);
+        const output = composeRebuildProfiles({ nodes, links: [link], dialerVersions });
         const listener = byNode(output, listenerNode._id, reverse ? 'main' : 'bridge').inbounds.find(i => i.port === link.tunnelPort);
         const dialer = byNode(output, reverse ? 'b' : 'p', reverse ? 'bridge' : 'main').outbounds
             .find(o => o.tag === (reverse ? 'rebuild-rp-dial-pair' : 'fwd-pair'));
@@ -351,9 +352,12 @@ for (const mode of ['reverse', 'forward']) {
         assert.equal(listener.settings.decryption, 'none');
         assert.throws(() => composeRebuildProfiles({ nodes, links: [link], dialerVersions: new Map([[listenerNode._id, '26.3.27']]) }),
             { code: 'REBUILD_XRAY_VERSION_UNKNOWN' });
+        assert.throws(() => composeRebuildProfiles({ nodes, links: [link], dialerVersions: new Map([[dialerId, '26.3.27']]) }),
+            { code: 'REBUILD_XRAY_VERSION_UNKNOWN' });
         assert.throws(() => composeRebuildProfiles({ nodes, links: [{ ...link, realityFingerprint: 'random' }],
-            dialerVersions: new Map([[dialerId, '26.11.9']]) }), { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED',
-            fingerprintIssue: { dialerId, version: '26.11.9', fingerprint: 'random', allowed: ['chrome', 'firefox', 'safari'] } });
+            dialerVersions }), { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED',
+            fingerprintIssue: { endpointId: listenerNode._id, endpointRole: 'listener', version: '26.11.9',
+                fingerprint: 'random', allowed: ['chrome', 'firefox', 'safari'] } });
     });
 }
 

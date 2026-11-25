@@ -20,6 +20,7 @@ const encrypted = key => typeof key === 'string' && key.length > 0 && key !== 'n
 function projectLinks(graph, channels, options, dialerVersions) {
     const shortIds = new Set();
     const result = new Map();
+    const roles = new Map([...graph.byNodeId].map(([id, entry]) => [id, entry.role]));
     for (const entry of [...graph.byLinkId.values(), ...channels.artifacts]) {
         const { link, protocol } = entry;
         const reverse = entry.mode === 'reverse';
@@ -37,9 +38,8 @@ function projectLinks(graph, channels, options, dialerVersions) {
             && CASCADE_TRANSPORTS.includes(transport)
             && (!isKcpTransport(transport) || isKcpSecurity(security)), 'REBUILD_INVALID_TUNNEL');
         if (security === 'reality') {
-            const dialerVersion = dialerVersions?.get(reverse ? entry.target : entry.source);
             const fingerprint = assertRealityFingerprint({ mode: entry.mode, portalNode: entry.source,
-                bridgeNode: entry.target, realityFingerprint: link.realityFingerprint }, dialerVersion);
+                bridgeNode: entry.target, realityFingerprint: link.realityFingerprint }, dialerVersions, roles);
             wire = { ...link, realityFingerprint: fingerprint };
             requireRebuild(typeof link.realityPrivateKey === 'string' && link.realityPrivateKey.length > 0
                 && typeof link.realityPublicKey === 'string' && link.realityPublicKey.length > 0, 'REBUILD_INVALID_TUNNEL');

@@ -18,7 +18,7 @@ if (typeof modernMap !== 'undefined' && modernMap) {
     }
 }
 previewLabels.fingerprint = Object.fromEntries([
-    'known', 'limited', 'unknown', 'mismatch', 'serverMismatch', 'refused', 'savedNotApplied', 'unknownVersion', 'unset',
+    'dialer', 'listener', 'known', 'limited', 'unknown', 'mismatch', 'serverMismatch', 'refused', 'savedNotApplied', 'unknownVersion', 'unset',
 ].map(key => [key, t('network.rebuildFingerprint.' + key)]));
 previewLabels.neighbor = Object.fromEntries(['neighborRefused', 'neighborUnknown', 'neighborRuntimeForeignChange', 'neighborNetworkNotReady']
     .map(key => [key, t('nodes.retireRelay.' + key)]));

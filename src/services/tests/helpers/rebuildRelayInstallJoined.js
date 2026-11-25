@@ -115,7 +115,7 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 realityPrivateKey: 'fixture-private', realityPublicKey: 'fixture-public' });
         }
         const usersByNode = { [id]: subscribers };
-        const dialerVersions = new Map([[String(exit._id), '26.3.27']]); // Matches the apply-wire fixture.
+        const dialerVersions = new Map(f.nodes.map(node => [String(node._id), '26.3.27'])); // Matches the apply-wire fixture.
         const generated = composeRebuildProfiles({ nodes: f.nodes, links: f.links, usersByNode, dialerVersions });
         // Use the same unmodified pretty JSON as regular Setup for the negative.
         const setupMain = scenario === 'legacy-setup-profile' ? generateXrayConfigWithApi(relay, subscribers) : null;

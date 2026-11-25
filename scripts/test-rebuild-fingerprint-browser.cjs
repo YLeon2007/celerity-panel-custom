@@ -59,10 +59,11 @@ async function main() {
         writes.push({ method: req.method, path: req.path, body: req.body });
         next();
     }, requirePanelCsrf);
-    // Contract fixture: the matching backend implementation is not in this worktree.
+    // The real route serialization is exercised by the HTTP tests; here the
+    // server's measured version deliberately differs from the inventory hint.
     app.post('/api/cascade/rebuild/preview', (_, res) => res.status(409).json({
         error: { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED' },
-        fingerprintIssue: { dialerId: bridge, version: '26.11.10', fingerprint: 'random', allowed: ['chrome', 'firefox', 'safari'] },
+        fingerprintIssue: { endpointId: bridge, endpointRole: 'listener', version: '27.0.1', fingerprint: 'random', allowed: ['chrome', 'firefox', 'safari'] },
     }));
     app.use('/api', (_, res) => res.sendStatus(404));
     const scratch = mkdtempSync(path.join(process.env.TMPDIR, 'rebuild-fp-firefox-'));
@@ -95,7 +96,8 @@ async function main() {
                 };
             };
         }` });
-        for (const lang of ['en', 'ru']) {
+        for (const [lang, dialer, listener, allowed] of [['en', 'Dialer: ', 'Listener: ', 'Allowed: '],
+            ['ru', 'Инициирующий узел: ', 'Слушающий узел: ', 'Допустимо: '], ['zh-CN', '拨号端：', '监听端：', '可选：']]) {
             writes.length = 0;
             await browser.navigate(origin + '/panel/nodes?map=classic&lang=' + lang);
             const assetExpression = `Array.from(document.scripts, s => s.src).find(src => src.includes('/js/network.js?'))`;
@@ -130,7 +132,7 @@ async function main() {
                     hint: document.getElementById('linkFingerprintHint').textContent,
                 }; })()`)) + JSON.stringify(browser.events.filter(event => event.method === 'log.entryAdded' && event.params.type === 'javascript')));
             assert.match(await browser.evaluate('document.getElementById("linkFingerprintHint").textContent'),
-                lang === 'ru' ? /Исходящее соединение: Bridge .*26\.11\.9.*Допустимо: chrome, firefox, safari/ : /Dialer: Bridge .*26\.11\.9.*Allowed: chrome, firefox, safari/);
+                new RegExp(`${dialer}Bridge .*26\\.11\\.9.*${allowed}chrome, firefox, safari`));
             assert.equal(await browser.evaluate('document.querySelector("[data-fingerprint-fixture]") === null'), true);
             await browser.click('#modalClose');
             // This checkout ships the quick form, but has no normal entry
@@ -144,7 +146,7 @@ async function main() {
             await browser.wait(`${quickHint}.includes('26.11.9')`);
             assert.match(await browser.evaluate(quickHint), /Bridge .*26\.11\.9.*chrome.*chrome, firefox, safari/);
             await browser.click('#quickSwapBtn');
-            assert.match(await browser.evaluate(quickHint), /Portal.*26\.3\.27.*chrome/);
+            assert.match(await browser.evaluate(quickHint), new RegExp(`${listener}Bridge .*26\\.11\\.9.*chrome`));
             await browser.click('#quickModalClose');
             await browser.evaluate('fixtureTapEdge()');
             await browser.click('#btnEdit');
@@ -162,8 +164,7 @@ async function main() {
             }; })()`);
             assert.equal(dialog.applyHidden, true);
             assert.equal(dialog.injected, false);
-            assert.match(dialog.warning, lang === 'ru' ? /Исходящее соединение: Bridge .*26\.11\.10.*random.*Допустимо: chrome, firefox, safari/
-                : /Dialer: Bridge .*26\.11\.10.*random.*Allowed: chrome, firefox, safari/);
+            assert.match(dialog.warning, new RegExp(`${listener}Bridge .*27\\.0\\.1.*random.*chrome, firefox, safari`));
             assert.ok(dialog.warning.includes(unsafeName));
             assert.equal(dialog.close, require('../src/locales/' + lang + '.json').common.close);
             await browser.click('#rebuildPreviewCancel');

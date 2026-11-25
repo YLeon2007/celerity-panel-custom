@@ -376,6 +376,35 @@ const chainFixture = (mode = 'reverse') => {
         { ...c, ...pick(10, true) }, tailIngress, middle, west, east, ru], middle, west, east, ru, tailIngress };
 };
 
+test('interrelay REALITY admits only chrome/firefox at 26.11+ and preserves them on direct and scoped channels', () => {
+    for (const mode of ['reverse', 'forward']) {
+        const fixture = chainFixture(mode);
+        const listener = id(mode === 'forward' ? 9 : 4), dialer = id(mode === 'forward' ? 4 : 9);
+        const compose = (fp, version, scoped = true) => composeRebuildProfiles({ ...fixture,
+            dialerVersions: new Map([[dialer, '26.3.27'], [listener, version]]),
+            links: fixture.links.map(link => {
+                if (link === fixture.middle) return { ...link, tunnelSecurity: 'reality', realityFingerprint: fp,
+                    realityPrivateKey: 'fixture-private', realityPublicKey: 'fixture-public', realitySni: ['cover.invalid'],
+                    realityShortIds: ['aabbccdd'] };
+                const { rebuildExit, ...direct } = link;
+                return scoped ? link : direct;
+            }),
+        });
+        for (const scoped of [false, true]) {
+            for (const fp of ['safari', 'random', 'ios', 'edge']) {
+                assert.throws(() => compose(fp, '27.0.1', scoped), { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED',
+                    fingerprintIssue: { endpointId: listener, endpointRole: 'listener', version: '27.0.1', fingerprint: fp,
+                        allowed: ['chrome', 'firefox'] } });
+            }
+            for (const [fp, version] of [['chrome', '26.11.9'], ['firefox', '27.0.1'], ['safari', '26.3.27']]) {
+                const fingerprints = compose(fp, version, scoped).filter(p => p.nodeId === dialer)
+                    .flatMap(p => p.config.outbounds.map(o => o.streamSettings?.realitySettings?.fingerprint).filter(Boolean));
+                assert.deepEqual(fingerprints, Array(scoped ? 3 : 1).fill(fp));
+            }
+        }
+    }
+});
+
 test('scoped TCP channels share only identical suffixes; PPP keeps the base channel', () => {
     for (const mode of ['reverse', 'forward']) {
         const fixture = chainFixture(mode);

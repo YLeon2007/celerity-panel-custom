@@ -166,8 +166,8 @@ async function runGraph(d, req, retire = false) {
             if(retire)binding.push('retire',req.nodeId,req.mode);
             fingerprint.update(JSON.stringify(binding));
             survivor?.update(JSON.stringify(['retire-survivors',binding]));
-            // Even if the newly composed profiles are byte-identical, a
-            // desired REALITY dialer must still be the same checked build.
+            // Even if the profiles are byte-identical, both REALITY endpoints
+            // must still be the builds checked by the confirmed Preview.
             if(coreIdentities?.size){
                 const identities=nodes.filter(id=>coreIdentities.has(id)).map(id=>[id,...coreIdentities.get(id)]);
                 fingerprint.update(JSON.stringify(identities));

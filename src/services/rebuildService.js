@@ -9,7 +9,7 @@ const {compileRebuildGraph}=require('../modules/relay-l2tp/domain/rebuildTopolog
 const {buildTransitChannels}=require('../modules/relay-l2tp/services/rebuildTransitChannels');
 const {createTransport,createBoundRelayTransport,profileBytes,profileSha256}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
-const {assertRealityFingerprint,realityDialerId}=require('./rebuildRealityFingerprint');
+const {assertRealityFingerprint,realityEndpoints}=require('./rebuildRealityFingerprint');
 const {readKcpAdmission,kcpListenerId,hasDirectLifecycle,assertKcpVersionsUnchanged}=require('./rebuildKcpAdmission');
 const {prepareLinks}=require('./rebuildLinkKeys');
 const {fullLinkRead}=require('./rebuildLinkSnapshot');
@@ -199,17 +199,18 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     async function verifyDraftRealityFingerprint(link,alreadyHeld){
         gate();
         if(!['forward','reverse'].includes(link.mode))throw fail('REBUILD_INVALID_REQUEST');
-        const id=String(link.mode==='reverse'?link.bridgeNode:link.portalNode);
-        return underApply(alreadyHeld,verify=>withNodes([id],async()=>{
+        const ids=Object.values(realityEndpoints(link));
+        return underApply(alreadyHeld,verify=>withNodes(ids,async()=>{
             const transports=new Map(),bindings=new Map();
             return usingTransports(transports,async()=>{
-                const node=await Node.findOne({_id:id,active:true,type:'xray'}).lean();
-                if(!node||node.useCustomConfig)throw fail('REBUILD_NODE_UNSUPPORTED');
-                const verifyBinding=await openTransports([node],await installedStates([id]),transports,bindings,verify);
-                const version=await transports.get(id).requireSupportedCore();
+                const nodes=await Node.find({_id:{$in:ids},active:true,type:'xray'}).lean();
+                if(nodes.length!==2||nodes.some(n=>n.useCustomConfig))throw fail('REBUILD_NODE_UNSUPPORTED');
+                const verifyBinding=await openTransports(nodes,await installedStates(ids),transports,bindings,verify);
+                const versions=new Map(),roles=new Map(nodes.map(n=>[String(n._id),n.role??n.cascadeRole]));
+                for(const id of ids)versions.set(id,await transports.get(id).requireSupportedCore());
                 await verify();
-                if(bindings.has(id))await verifyBinding(id,bindings.get(id));
-                return require('./rebuildRealityFingerprint').assertRealityFingerprint(link,version);
+                for(const [id,binding] of bindings)await verifyBinding(id,binding);
+                return assertRealityFingerprint(link,versions,roles);
             });
         }));
     }
@@ -352,17 +353,17 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 // `links` is the complete desired component, excluding both
                 // the requested removal and any retained deletion tombstones.
                 const realityLinks=links.filter(link=>link.tunnelSecurity==='reality');
-                const dialerIds=new Set(realityLinks.map(realityDialerId));
-                const coreIdentities=new Map(), dialerVersions=new Map();
+                const realityIds=new Set(realityLinks.flatMap(link=>Object.values(realityEndpoints(link))));
+                const coreIdentities=new Map(), endpointVersions=new Map();
                 for(const id of ids){
                     const transport=transports.get(id);
-                    if(!dialerIds.has(id)){await preflight(id,()=>transport.requireSupportedCore());continue;}
+                    if(!realityIds.has(id)){await preflight(id,()=>transport.requireSupportedCore());continue;}
                     const identity=await preflight(id,()=>transport.requireSupportedCoreIdentity?.());
                     if(typeof identity?.buildDigest!=='string'||!/^[a-f0-9]{64}(?![\s\S])/.test(identity.buildDigest))throw fail('REBUILD_XRAY_VERSION_UNKNOWN');
                     coreIdentities.set(id,[identity.version,identity.buildDigest]);
-                    dialerVersions.set(id,identity.version);
+                    endpointVersions.set(id,identity.version);
                 }
-                for(const link of realityLinks)assertRealityFingerprint(link,dialerVersions.get(realityDialerId(link)));
+                for(const link of realityLinks)assertRealityFingerprint(link,endpointVersions,roles);
                 const followRelayStates=[...states.values()].map(row=>({...row,routingMode:'follow-relay',routingVersion:1}));
                 const panelTls=panelTLS();
                 const usersByNode=new Map();for(const node of nodes){
@@ -379,7 +380,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     const main=retire?baseline.get(id).main:await transports.get(id).read('main');
                     if(hasProtectedClientInbound(main,node.xray?.inboundTag||'vless-in'))bridgesWithClientInbound.add(id);
                 }
-                const candidates=compose({nodes,links:prepared,dialerVersions,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses});
+                const candidates=compose({nodes,links:prepared,dialerVersions:endpointVersions,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses});
                 if(retire&&candidates.some(p=>p.profile==='bridge'
                     &&profilePreview(baseline.get(p.nodeId).bridge??emptyBridge,p.config,'main').protectedChanged)){
                     throw fail('REBUILD_CLIENT_CHANGE');

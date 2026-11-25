@@ -72,7 +72,7 @@ test('REALITY link settings persisted by the public rebuild HTTP routes', async 
     const post = (node, port, fields) => save('POST', '', edge(node, port, fields));
     const settings = id => Link.findById(id).select('realitySni realityDest -_id').lean();
     const fingerprint = async id => (await Link.collection.findOne({ _id: new mongoose.Types.ObjectId(id) })).realityFingerprint;
-    const noBusinessWrites = async (fn, dialer) => {
+    const noBusinessWrites = async (fn, dialer, listener) => {
         const start = f.commands.length, firstProbe = probes.length, firstOpen = open.length;
         const before = await Link.collection.find({}).sort({ _id: 1 }).toArray();
         const result = await fn();
@@ -80,21 +80,17 @@ test('REALITY link settings persisted by the public rebuild HTTP routes', async 
             && c.collection !== 'c3_rebuild_locks'), [], 'no draft, key or other business persistence');
         assert.deepEqual(await Link.collection.find({}).sort({ _id: 1 }).toArray(), before);
         assert.equal(await f.connection.db.collection('c3_rebuild_locks').countDocuments(), 0);
-        const selected = dialer ? [idOf(dialer)] : [];
-        assert.deepEqual(open.slice(firstOpen), selected);
+        const selected = [dialer, listener].filter(Boolean).map(idOf);
+        assert.deepEqual(open.slice(firstOpen).sort(), selected.slice().sort());
         assert.deepEqual(probes.slice(firstProbe), selected);
         assert.deepEqual(stages, []); assert.deepEqual(writes, []);
         return result;
     };
-    function checkIssue({ status, body }, code, dialer, version, choice) {
+    function checkIssue({ status, body }, endpoint, endpointRole, version, choice, allowed = ['chrome', 'firefox', 'safari']) {
         assert.equal(status, 409);
         assert.deepEqual(Object.keys(body).sort(), ['error', 'fingerprintIssue']);
-        assert.deepEqual(body.error, { code });
-        assert.deepEqual(Object.keys(body.fingerprintIssue).sort(), ['allowed', 'dialerId', 'fingerprint', 'version']);
-        const { allowed, ...issue } = body.fingerprintIssue;
-        assert.deepEqual(issue, { dialerId: idOf(dialer), version, fingerprint: choice });
-        assert.ok(Array.isArray(allowed));
-        if (version) { assert.ok(allowed.includes('chrome')); assert.ok(!allowed.includes('random')); }
+        assert.deepEqual(body.error, { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED' });
+        assert.deepEqual(body.fingerprintIssue, { endpointId: idOf(endpoint), endpointRole, version, fingerprint: choice, allowed });
     }
     const blank = { realitySni: [], realityDest: '' };
     await t.test('POST: forward inherits both fields from the listening bridge', async () => {
@@ -147,52 +143,51 @@ test('REALITY link settings persisted by the public rebuild HTTP routes', async 
     await t.test('POST/PUT refuse against the current forward dialer before saving, including interactive autoDeploy', async () => {
         const id = await post(target, 30113, { realityFingerprint: 'random' });
         versions.set(idOf(source), '26.11.9');
-        const code = 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED';
         for (const autoDeploy of [false, true]) {
             const input = { autoDeploy, interactivePreview: true, xrayVersion: '26.3.27', dialerVersion: '26.3.27' };
-            checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(target, 30114, { ...input, realityFingerprint: 'random' })), source), code, source, '26.11.9', 'random');
-            checkIssue(await noBusinessWrites(() => request('PUT', `/links/${id}`, { ...input, name: 'refused' }), source), code, source, '26.11.9', 'random');
+            checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(target, 30114, { ...input, realityFingerprint: 'random' })), source, target), source, 'dialer', '26.11.9', 'random');
+            checkIssue(await noBusinessWrites(() => request('PUT', `/links/${id}`, { ...input, name: 'refused' }), source, target), source, 'dialer', '26.11.9', 'random');
         }
         const opaqueChoice = { realityFingerprint: 'synthetic-private-text/should-not-be-echoed' };
-        checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(target, 30114, opaqueChoice)), source), code, source, '26.11.9', 'unknown');
+        checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(target, 30114, opaqueChoice)), source, target), source, 'dialer', '26.11.9', 'unknown');
         await save('PUT', `/${id}`, { name: 'fixed', realityFingerprint: 'chrome' });
         assert.equal(await fingerprint(id), 'chrome');
     });
-    await t.test('reverse probes only the bridge, and a bound relay requires its authorized transport', async () => {
+    await t.test('reverse probes both ends; whether dialing or listening, a bound relay uses its authorized transport', async () => {
         versions.set(idOf(target), '26.11.9');
-        const code = 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED';
         const reverse = { mode: 'reverse', autoDeploy: true, interactivePreview: true, realityFingerprint: 'random' };
-        checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(target, 30115, reverse)), target), code, target, '26.11.9', 'random');
+        checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(target, 30115, reverse)), target, source), target, 'dialer', '26.11.9', 'random');
         const reverseId = await post(target, 30115, { mode: 'reverse', realityFingerprint: 'chrome' });
-        checkIssue(await noBusinessWrites(() => request('PUT', `/links/${reverseId}`, reverse), target), code, target, '26.11.9', 'random');
+        checkIssue(await noBusinessWrites(() => request('PUT', `/links/${reverseId}`, reverse), target, source), target, 'dialer', '26.11.9', 'random');
+        versions.set(idOf(target), '26.3.27');
+        checkIssue(await noBusinessWrites(() => request('PUT', `/links/${reverseId}`, reverse), target, source), source, 'listener', '26.11.9', 'random');
 
-        versions.set(idOf(relay), '26.11.9');
+        versions.set(idOf(source), '26.3.27');
+        versions.set(idOf(relay), '27.0.1');
         await State.collection.insertOne({ node: relay._id, status: 'installed', desiredState: 'installed' });
-        checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(relay, 30116, reverse)), relay), code, relay, '26.11.9', 'random');
+        checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(relay, 30116, reverse)), relay, source), relay, 'dialer', '27.0.1', 'random');
+        const ios = { realityFingerprint: 'ios', xrayVersion: '26.3.27' };
+        checkIssue(await noBusinessWrites(() => request('POST', '/links', edge(relay, 30116, ios)), source, relay), relay, 'listener', '27.0.1', 'ios');
         env.C3_REBUILD_L2TP_RELAYS_JSON = JSON.stringify([{ ...enrollment, host: '192.0.2.99' }]);
         assert.deepEqual(await noBusinessWrites(() => request('POST', '/links', edge(relay, 30116, reverse))),
             { status: 409, body: { error: { code: 'REBUILD_L2TP_BINDING_MISMATCH' } } });
-        // That same bound relay is only the listener in forward mode. Its broken
-        // grant must neither open a transport nor gate the portal-dialed draft.
-        const first = open.length;
-        const id = await post(relay, 30116, { realityFingerprint: 'chrome' });
-        assert.deepEqual(open.slice(first), [idOf(source)]);
-        assert.deepEqual(await settings(id), card);
+        assert.deepEqual(await noBusinessWrites(() => request('POST', '/links', edge(relay, 30116, { realityFingerprint: 'chrome' }))),
+            { status: 409, body: { error: { code: 'REBUILD_L2TP_BINDING_MISMATCH' } } });
     });
     await t.test('unavailable authoritative version cannot fall back to the card cache', async () => {
-        versions.delete(idOf(source));
-        assert.deepEqual(await noBusinessWrites(() => request('POST', '/links', edge(target, 30117, { xrayVersion: '26.3.27' })), source),
+        versions.delete(idOf(target));
+        assert.deepEqual(await noBusinessWrites(() => request('POST', '/links', edge(target, 30117, { xrayVersion: '26.3.27' })), source, target),
             { status: 409, body: { error: { code: 'REBUILD_XRAY_VERSION_UNKNOWN' } } });
     });
     await t.test('HTTP only projects allowlisted diagnostic fields on compatibility refusal', async t => {
         const text = 'synthetic-private-diagnostic';
-        const issue = { dialerId: idOf(source), version: `26.11.9 ${text}`, fingerprint: text,
-            allowed: ['chrome', text, 'chrome', { private: text }], raw: text };
+        const issue = { endpointId: idOf(source), endpointRole: 'listener', version: `26.11.9 ${text}`, fingerprint: text,
+            allowed: ['chrome', text, 'chrome', 'random', { private: text }], raw: text };
         let code = 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED';
         t.mock.method(service, 'execute', async () => { throw Object.assign(new Error(text), { code, fingerprintIssue: issue }); });
         const preview = () => request('POST', '/rebuild/preview', { linkId: idOf(source) });
         assert.deepEqual(await preview(), { status: 409, body: { error: { code }, fingerprintIssue: {
-            dialerId: idOf(source), version: null, fingerprint: 'unknown', allowed: ['chrome'],
+            endpointId: idOf(source), endpointRole: 'listener', version: null, fingerprint: 'unknown', allowed: ['chrome'],
         } } });
         code = 'REBUILD_XRAY_VERSION_UNKNOWN';
         assert.deepEqual(await preview(), { status: 409, body: { error: { code } } });

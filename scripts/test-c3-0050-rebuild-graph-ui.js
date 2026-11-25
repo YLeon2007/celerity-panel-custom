@@ -289,20 +289,22 @@ const inventory = [{ ...portal, name: 'Portal <node>', xrayVersion: '26.3.27' },
     { ...bridge, xrayVersion: 'Xray 26.11.9 (Xray, Penetrates Everything.) abc1234 (go1.25.3 linux/amd64)' }];
 const fingerprintConflict = { status: 409, body: { error: { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED' },
     fingerprintIssue: { dialerId: bridge._id, version: '26.11.9', fingerprint: 'random', allowed: ['chrome', 'firefox', 'safari'] } } };
+const listenerConflict = { status: 409, body: { error: { code: 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED' },
+    fingerprintIssue: { endpointId: bridge._id, endpointRole: 'listener', version: '27.0.1', fingerprint: 'random', allowed: ['chrome', 'firefox'] } } };
 
-test('rebuild create blocks incompatible saves and preserves explicit random on the 26.3.27 dialer', async t => {
+test('rebuild create blocks incompatible saves in both directions and preserves choice', async t => {
     const ui = await graphUI(t, { inventory });
     const { form, auto, mode } = await openCreate(ui, 'main');
     const picker = form.realityFingerprint;
     const random = picker.options.find(opt => opt.value === 'random');
     const hint = ui.get('linkFingerprintHint');
     assert.equal(picker.value, 'chrome');
-    assert.match(hint.textContent, /Portal <node>.*26\.3\.27/);
+    assert.match(hint.textContent, /Listener: Bridge.*26\.11\.9/);
     picker.value = 'random';
     await mode('reverse');
     assert.equal(picker.value, 'random');
     assert.equal(random.disabled, true);
-    assert.match(hint.textContent, /Bridge.*26\.11\.9.*random.*chrome, firefox, safari/);
+    assert.match(hint.textContent, /Dialer: Bridge.*26\.11\.9.*random.*chrome, firefox, safari/);
     assert.equal(ui.get('linkModalSubmit').disabled, true);
     auto.checked = false;
     await form.dispatch('submit');
@@ -314,10 +316,24 @@ test('rebuild create blocks incompatible saves and preserves explicit random on 
     assert.doesNotMatch(hint.textContent, /26\.11\.9/);
     form.bridgeNodeId.value = bridge._id;
     await mode('forward');
-    assert.equal(random.disabled, false);
+    assert.equal(random.disabled, true);
+    assert.match(hint.textContent, /Listener: Bridge.*26\.11\.9.*random/);
     auto.checked = false;
     await form.dispatch('submit');
-    assert.equal(ui.writes()[0].body.realityFingerprint, 'random');
+    assert.deepEqual(ui.writes(), []);
+    assert.equal(picker.value, 'random');
+});
+
+test('rebuild interrelay form disables Safari on a 27.0 listener, but still submits explicit Firefox', async t => {
+    const ui = await graphUI(t, { inventory: [{ ...inventory[0], cascadeRole: 'relay' },
+        { ...inventory[1], cascadeRole: 'relay', xrayVersion: '27.0.1' }] });
+    const { form, auto } = await openCreate(ui, 'main');
+    const picker = form.realityFingerprint;
+    assert.equal(picker.options.find(opt => opt.value === 'safari').disabled, true);
+    picker.value = 'firefox';
+    auto.checked = false;
+    await form.dispatch('submit');
+    assert.equal(ui.writes()[0].body.realityFingerprint, 'firefox');
 });
 
 test('rebuild edit retains the visibly incompatible saved choice until the operator replaces it', async t => {
@@ -351,15 +367,15 @@ test('rebuild legacy empty fingerprint stays unset instead of taking the create 
     assert.ok(!Object.hasOwn(ui.writes()[0].body, 'realityFingerprint'));
 });
 
-test('rebuild quick form audits Chrome against the dialer after mode changes and swaps', async t => {
+test('rebuild quick form keeps auditing the restricted endpoint after mode changes and swaps', async t => {
     const ui = await graphUI(t, { inventory });
     const { form, auto, mode } = await openCreate(ui, 'quick');
     const hint = ui.get('quickFingerprintHint');
-    assert.match(hint.textContent, /Portal <node>.*26\.3\.27.*chrome/);
+    assert.match(hint.textContent, /Listener: Bridge.*26\.11\.9.*chrome/);
     await ui.get('quickSwapBtn').dispatch('click');
     assert.match(hint.textContent, /Bridge.*26\.11\.9.*chrome, firefox, safari/);
     await mode('reverse');
-    assert.match(hint.textContent, /Portal <node>.*26\.3\.27/);
+    assert.match(hint.textContent, /Listener: Bridge.*26\.11\.9/);
     const security = ui.get('quickTunnelSecurity');
     security.value = 'none';
     await security.dispatch('change');
@@ -400,12 +416,12 @@ test('a draft response that confirms a save but refuses Preview cannot trigger a
     assert.equal(ui.toasts.at(-1)[1], 'error');
 });
 
-test('Preview refusal explains the authoritative error and sends no Apply', async t => {
-    const ui = await graphUI(t, { responses: { ['POST ' + previewUrl]: fingerprintConflict } });
+test('Preview refusal identifies the authoritative listener and sends no Apply', async t => {
+    const ui = await graphUI(t, { inventory, responses: { ['POST ' + previewUrl]: listenerConflict } });
     ui.tapEdge();
     await ui.clickAction('btnDeploy');
     assert.deepEqual(ui.writes().map(write => write.url), [previewUrl]);
-    assert.match(ui.refusals[0], /Bridge.*26\.11\.9.*random.*chrome, firefox, safari/);
+    assert.match(ui.refusals[0], /Listener: Bridge.*27\.0\.1.*random.*Allowed: chrome, firefox\./);
     assert.ok(ui.refusals[0].endsWith(en.network.rebuildPreview.refused));
 });
 

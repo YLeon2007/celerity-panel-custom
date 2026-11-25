@@ -21,18 +21,21 @@ function fingerprintIssueForError(error,code){
     const ownValue=(obj,key)=>Object.getOwnPropertyDescriptor(obj,key)?.value;
     try{
         const issue=ownValue(error,'fingerprintIssue');
+        const endpointId=ownValue(issue,'endpointId'),endpointRole=ownValue(issue,'endpointRole');
         const dialerId=ownValue(issue,'dialerId');
-        if(!objectId(dialerId))return;
+        const endpoint=objectId(endpointId)&&['dialer','listener'].includes(endpointRole)
+            ? {endpointId,endpointRole} : endpointId===undefined&&endpointRole===undefined&&objectId(dialerId)?{dialerId}:null;
+        if(!endpoint)return;
         const version=ownValue(issue,'version'),fingerprint=ownValue(issue,'fingerprint'),choices=ownValue(issue,'allowed');
         const allowed=[];
         const count=Array.isArray(choices)?ownValue(choices,'length'):0;
         if(Number.isSafeInteger(count)&&count<=publicFingerprints.size){
             for(let i=0;i<count;i++){
                 const value=ownValue(choices,i);
-                if(publicFingerprints.has(value)&&!allowed.includes(value))allowed.push(value);
+                if(['chrome','firefox','safari'].includes(value)&&!allowed.includes(value))allowed.push(value);
             }
         }
-        return {dialerId,version:typeof version==='string'&&/^\d{1,4}\.\d{1,4}\.\d{1,4}(?![\s\S])/.test(version)?version:null,
+        return {...endpoint,version:typeof version==='string'&&/^\d{1,4}\.\d{1,4}\.\d{1,4}(?![\s\S])/.test(version)?version:null,
             fingerprint:publicFingerprints.has(fingerprint)?fingerprint:'unknown',allowed};
     }catch{return undefined;}
 }

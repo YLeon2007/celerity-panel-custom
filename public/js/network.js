@@ -11,7 +11,10 @@
     // Newly created rebuild links default to Chrome. Edits retain even an empty
     // legacy value unless the operator explicitly selects a fingerprint.
     const CREATE_DEFAULT_FINGERPRINT = 'chrome';
-    const REALITY_FINGERPRINTS_26_11 = ['chrome', 'firefox', 'safari'];
+    const INTERRELAY_REALITY_FINGERPRINTS = ['chrome', 'firefox'];
+    const RESTRICTED_REALITY_FINGERPRINTS = [...INTERRELAY_REALITY_FINGERPRINTS, 'safari'];
+    const PUBLIC_REALITY_FINGERPRINTS = new Set([...RESTRICTED_REALITY_FINGERPRINTS,
+        'ios', 'android', 'edge', '360', 'qq', 'random', 'randomized', 'unknown']);
 
     function expireReverseStatus(row, now = Date.now()) {
         if (row.isInternetEdge || row.mode === 'forward' || row.status !== 'online') return row;
@@ -249,7 +252,13 @@
     function readFingerprintInventory(nodes) {
         return new Map(nodes.filter(n => typeof n?._id === 'string').map(n => [n._id, {
             name: typeof n.name === 'string' ? n.name : '', version: xrayVersionHint(n.xrayVersion),
+            role: n.role ?? n.cascadeRole,
         }]));
+    }
+
+    function restrictedRealityVersion(version) {
+        const [major, minor] = (version || '').split('.').map(Number);
+        return major > 26 || (major === 26 && minor >= 11);
     }
 
     function fingerprintCopy(key, values) {
@@ -260,15 +269,18 @@
         if (!rebuild || status !== 409 || payload?.error?.code !== 'REBUILD_REALITY_FINGERPRINT_UNSUPPORTED') return '';
         const issue = payload.fingerprintIssue;
         if (!fingerprintLabels) return payload.error.code;
-        if (!issue || typeof issue.dialerId !== 'string') return fingerprintLabels.refused;
-        const id = issue.dialerId;
+        const legacy = issue?.endpointRole === undefined && issue?.endpointId === undefined;
+        const role = legacy ? 'dialer' : issue?.endpointRole;
+        const id = legacy ? issue?.dialerId : issue?.endpointId;
+        if (!['dialer', 'listener'].includes(role) || typeof id !== 'string' || !/^[a-f\d]{24}(?![\s\S])/i.test(id)) return fingerprintLabels.refused;
         const name = fingerprintInventory.main.get(id)?.name || fingerprintInventory.quick.get(id)?.name
             || _allNodes.get(id)?.label || id;
-        const allowed = Array.isArray(issue.allowed) && issue.allowed.length > 0
-            && issue.allowed.every(fp => typeof fp === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(fp))
-            ? issue.allowed : REALITY_FINGERPRINTS_26_11;
-        return fingerprintCopy('serverMismatch', { name, version: xrayVersionHint(issue.version) || fingerprintLabels.unknownVersion,
-            fingerprint: typeof issue.fingerprint === 'string' && issue.fingerprint || fingerprintLabels.unset,
+        const allowed = Array.isArray(issue.allowed) ? [...new Set(issue.allowed.filter(fp => RESTRICTED_REALITY_FINGERPRINTS.includes(fp)))] : [];
+        if (!allowed.length) return fingerprintLabels.refused;
+        const version = typeof issue.version === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,4}(?![\s\S])/.test(issue.version)
+            ? issue.version : fingerprintLabels.unknownVersion;
+        return fingerprintCopy('serverMismatch', { role: fingerprintLabels[role], name, version,
+            fingerprint: PUBLIC_REALITY_FINGERPRINTS.has(issue.fingerprint) ? issue.fingerprint : fingerprintLabels.unset,
             allowed: allowed.join(', ') });
     }
 
@@ -2378,25 +2390,34 @@
         const mode = quick ? get('quickLinkMode')?.value : form?.mode?.value;
         const source = quick ? get('quickPortalId') : form?.portalNodeId;
         const target = quick ? get('quickBridgeId') : form?.bridgeNodeId;
-        // Unlike port checks, the fingerprint belongs to the outbound dialer.
-        const dialerId = (mode === 'forward' ? source : target)?.value;
-        const node = fingerprintInventory[kind].get(dialerId);
-        const version = node?.version;
+        const readEndpoint = (id, endpointRole) => {
+            const node = fingerprintInventory[kind].get(id);
+            return { id, endpointRole, name: node?.name, version: node?.version,
+                nodeRole: node?.role ?? _allNodes.get(id)?.role };
+        };
+        const [dialerId, listenerId] = mode === 'forward' ? [source?.value, target?.value] : [target?.value, source?.value];
+        const dialer = readEndpoint(dialerId, 'dialer'), listener = readEndpoint(listenerId, 'listener');
+        const endpoints = [dialer, listener].filter(endpoint => endpoint.id);
+        const restricted = endpoints.find(endpoint => restrictedRealityVersion(endpoint.version));
+        const endpoint = restricted || endpoints.find(node => !node.version) || endpoints[0];
+        const allowed = dialer.nodeRole === 'relay' && listener.nodeRole === 'relay'
+            ? INTERRELAY_REALITY_FINGERPRINTS : RESTRICTED_REALITY_FINGERPRINTS;
         const pick = !quick && form?.realityFingerprint;
         const selected = resolveRealityFingerprint(pick?.value, quick ? 'create' : linkModalMode);
-        const show = active && security === 'reality' && !!dialerId;
-        const limited = security === 'reality' && /^26\.11\./.test(version);
+        const show = active && security === 'reality' && !!endpoint;
+        const limited = show && !!restricted;
         // A disabled, already-selected option remains visible until changed.
         // The submit handler rechecks so synthetic/keyboard paths cannot send it.
-        const blocked = limited && !!selected && !REALITY_FINGERPRINTS_26_11.includes(selected);
+        const blocked = limited && !!selected && !allowed.includes(selected);
         if (pick) for (const option of pick.options) {
-            option.disabled = show && limited && !!option.value && !REALITY_FINGERPRINTS_26_11.includes(option.value);
+            option.disabled = limited && !!option.value && !allowed.includes(option.value);
         }
         const hint = get(quick ? 'quickFingerprintHint' : 'linkFingerprintHint');
         if (hint && fingerprintLabels) {
-            const values = { name: node?.name || _allNodes.get(dialerId)?.label || dialerId, version,
-                fingerprint: selected || fingerprintLabels.unset, allowed: REALITY_FINGERPRINTS_26_11.join(', ') };
-            hint.textContent = show ? fingerprintCopy(!version ? 'unknown' : blocked ? 'mismatch' : limited ? 'limited' : 'known', values) : '';
+            hint.textContent = !show ? '' : fingerprintCopy(!endpoint.version ? 'unknown' : blocked ? 'mismatch' : limited ? 'limited' : 'known', {
+                role: fingerprintLabels[endpoint.endpointRole], name: endpoint.name || _allNodes.get(endpoint.id)?.label || endpoint.id,
+                version: endpoint.version, fingerprint: selected || fingerprintLabels.unset, allowed: allowed.join(', '),
+            });
             hint.hidden = !show;
         }
         const submit = get(quick ? 'quickLinkSubmit' : 'linkModalSubmit');
