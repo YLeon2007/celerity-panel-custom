@@ -667,7 +667,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     links = {link['index']: link for link in generated['links']}
     origins = Origins()
     evidence['probes'] = []
-    expected_count = len(cases) + (5 if matrix else 0) + (13 if stage else 0)
+    expected_count = len(cases) + (5 if matrix else 0) + (15 if stage else 0)
     xray_count = len(run_configs) + 3 * len(restarts)
     evidence['expected_counts'] = {'config_tests': config_count, 'http_probes': expected_count,
                                    'live_xray': xray_count, 'children': xray_count + 1}
@@ -888,6 +888,27 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             verify_case(Probe('p1', 'domain', 'A', 4))
             verify_case(Probe('p1', 'numeric', 'B', 3))
         if stage:
+            # Negative control: a different live predicate must not masquerade
+            # as the desired routing image. Keep tags/actions, PID and boot bytes.
+            wanted = json.loads(Path('desired-routes.json').read_text())
+            p1 = next(ln for ln in links.values() if ln['source'] == 'p1')
+            selected, = [row for row in wanted['routing']['rules']
+                         if row.get('ruleTag') in scoped_rule_tags and row.get('inboundTag') == [tunnel_tag(p1, True)]]
+            selected['inboundTag'] = ['fixture-unused-selector']
+            dump('different-predicate.json', wanted)
+            desired_view = api('gateway', 'lsrules')
+            boot = digest('gateway-main.json')
+            process = children['gateway']
+            api('gateway', 'adrules', 'different-predicate.json')
+            require(api('gateway', 'lsrules') == desired_view and digest('gateway-main.json') == boot
+                    and children['gateway'] is process and process.poll() is None,
+                    'negative control changed the router projection or serving generation')
+            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+            api('gateway', 'adrules', 'desired-routes.json')
+            verify_case(Probe('p1', 'numeric', 'B', 3))
+            evidence['rule_projection_control'] = {'projection_unchanged': True, 'boot_unchanged': True,
+                                                   'same_pid': process.pid, 'origin_with_changed_predicate': 'A',
+                                                   'origin_with_restored_predicate': 'B'}
             # A fresh writer dies after a real routing update. The observer
             # must read the live result and leave the unacknowledged intent;
             # it has no permission to send that write a second time.
