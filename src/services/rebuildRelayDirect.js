@@ -204,7 +204,7 @@ function bundleDirectScript() {
         offsets.push(offsets.at(-1) + source.length);
     });
     const load = (key, index, name, filename) =>
-        `${key}=types.ModuleType("${name}");${key}.__file__="${filename}";sys.modules["${name}"]=${key};${key}=${key}.__dict__;exec(_c3_compile(${index},"${filename}"),${key})`;
+        `${key}=_c3_load(${index},"${name}","${filename}")`;
     return [
         'import lzma,functools,hashlib,re,sys,types',
         `_c3_digits={c:i for i,c in enumerate("${directAlphabet}")}`,
@@ -217,12 +217,15 @@ function bundleDirectScript() {
         '_c3_bytes=lambda n:_c3_sources[_c3_offsets[n]:_c3_offsets[n+1]]',
         'all(hashlib.sha256(_c3_bytes(i)).hexdigest()==h for i,h in enumerate(_c3_hashes)) or sys.exit(75)',
         '_c3_compile=lambda n,filename:compile(_c3_bytes(n),filename,"exec")',
+        'def _c3_load(n,name,path):',
+        ' m=types.ModuleType(name);m.__file__=path;sys.modules[name]=m',
+        ' exec(_c3_compile(n,path),m.__dict__);return m.__dict__',
         load('C3_STOCK_RUNTIME', 1, 'c3_stock_runtime', '/__c3_direct__/services/rebuildRelayStockRuntime.py'),
         load('C3_STOCK_ENSURE', 0, 'c3_stock_ensure', '/__c3_direct__/modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py'),
         load('C3_PACKAGE_GUARD', 2, 'c3_package_guard', '/__c3_direct__/services/rebuildRelayPackageGuard.py'),
         load('C3_REPLACEMENT', 3, 'c3_foreign_replacement', '/__c3_direct__/services/rebuildRelayReplacement.py'),
         'exec(_c3_compile(4,"<DIRECT host>"))',
-    ].join(';');
+    ].join('\n');
 }
 
 function directCommand(limits) {

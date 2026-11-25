@@ -577,7 +577,8 @@ def preflight(machine, *, fresh=False):
     units = [xl['LoadState'], ike['LoadState']]
     if not fresh and units == ['loaded'] * 2:
         require_runtime_packages('PREREQUISITE')
-    return dict(machineId=machine_id, ppp=ppp, masked='masked' in units, unitsLoaded=units == ['loaded'] * 2)
+    masked = 'masked' in units or (fresh and any(u.get('UnitFileState') in ('masked', 'masked-runtime') for u in (xl, ike)))
+    return dict(machineId=machine_id, ppp=ppp, masked=masked, unitsLoaded=units == ['loaded'] * 2)
 
 
 def fresh_udp_bound():
@@ -1397,6 +1398,10 @@ def check_package_observer_policy():
     # Package preparation can precede the normal Install baseline. Reject a
     # known observer blacklist before publishing even the package intent.
     # PPP itself may not be ready until the runtime packages are installed.
+    try:
+        ppp_host_scope()
+    except (OSError, ValueError):
+        raise Refusal(PPP_REQUIRED) from None
     missing = missing_network_observers()
     if missing:
         ppp_policy(missing, include_ppp=False)
@@ -1414,11 +1419,15 @@ def ppp_host_scope():
     with open('/proc/self/status') as stream:
         caps = re.search(r'^CapEff:\s*([0-9a-f]+)$', stream.read(65536), re.M)
     need(caps is not None and int(caps[1], 16) & (1 << 16), PPP_REQUIRED)  # CAP_SYS_MODULE
+    with open('/proc/sys/kernel/modules_disabled') as stream:
+        need(stream.read(8).strip() == '0', PPP_REQUIRED)
 
 
-def observe_ppp_preparation(required_observers=(), *, installed=None, fresh=True, drop_legacy=False):
+def observe_ppp_preparation(required_observers=(), *, installed=None, fresh=True, drop_legacy=False, precheck=False):
     """Observe boot policy separately from the modules needing a live load."""
     try:
+        if precheck:
+            ppp_host_scope()  # Fresh Install always persists boot policy.
         absent = missing_network_observers()
         # Fresh Install requests every provider at next boot, including the
         # modules already loaded or built in on this boot. Check their policy
@@ -1429,13 +1438,16 @@ def observe_ppp_preparation(required_observers=(), *, installed=None, fresh=True
         deps, builtin, policy, observer_policy = ppp_policy(observers)
         loaded, device = ppp_loaded(builtin), ppp_device()
         need(device is not False and (not loaded['ppp_generic'] or device is True), PPP_REQUIRED)
+        if precheck:
+            # Only the known legacy leaf can be removed. Prepare rechecks the
+            # boot-file policy against the exact confirmed projection.
+            ppp_boot_file(deps, drop_legacy=True)
+            return
         before = ppp_boot_file(deps, installed, **({'drop_legacy': True} if drop_legacy else {}))
         persist = installed is None and (canonical or before['record'] is None or bool(absent))
         missing = [name for name in PPP_MODULES if not loaded[name]] + absent
         if missing or persist:
             ppp_host_scope()
-            with open('/proc/sys/kernel/modules_disabled') as stream:
-                need(stream.read(8).strip() == '0', PPP_REQUIRED)
         plan: dict[str, Any] = dict(missing=missing, persist=persist, builtin=builtin, policy=policy)
         if observers:
             plan['observers'] = observer_policy
@@ -7238,9 +7250,17 @@ def package_preflight(machine):
     need(guard is not None, PACKAGE_AUTOSTART_UNSAFE)
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        require_machine(machine)
         package_no_pending()
         foreign_no_pending()
-        fresh_install_conflicts(machine, fd, detailed=True)
+        try:
+            fresh_install_conflicts(machine, fd)
+        except FreshInstallConflict as error:
+            if str(error) == FOREIGN_CONFIG:
+                # Package preparation may autostart VPN units and cannot be
+                # combined with cleanup. Keep runtime vetoes unchanged.
+                raise Refusal(PACKAGE_AUTOSTART_UNSAFE) from None
+            raise
         check_package_observer_policy()
         _, _, commit = package_observation(guard, machine, fd, PackageRunner())
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
@@ -7670,30 +7690,28 @@ def dispatch(request: dict[str, Any]):
          + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
     if action == 'preflight':
         need(set(request) <= {'action', 'machineId', 'foreignCleanup'}, 'CANDIDATE_INVALID')
-    fresh = action in FRESH_ACTIONS
-    try:
-        ready = preflight(machine, fresh=True) if fresh else preflight(machine)
-    except Refusal as error:
-        if action == 'preflight' and cleanup is None and str(error) == PACKAGE_AUTOSTART_UNSAFE:
-            return package_preflight(machine)
-        raise
-    if action == 'preflight':
-        need(cleanup is None or not ready['masked'], 'PREREQUISITE')
-        if not ready['masked']:
+        try:
             with directory(SYSTEM) as fd:
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                package_no_pending()
+                ready = preflight(machine, fresh=True)
                 foreign_no_pending()
-                fresh_install_conflicts(machine, fd, cleanup=cleanup, detailed=True)
-        xl = unit(XL)
-        pending = pending_xl(xl)
-        if pending:
-            need(cleanup is None and not ready['masked'], NATIVE_UNIT_REQUIRED)
-            pending_native(xl, unit(IKE), pending)
-            package_no_pending()
-            return {**ready, 'unitsLoaded': False, 'pppPreparation': True, 'nativePreparation': True}
-        package_no_pending()
-        return {**ready, 'pppPreparation': True}
+                if not ready['masked']:
+                    observe_ppp_preparation(precheck=True)
+                    xl = unit(XL)
+                    pending = pending_xl(xl)
+                    fresh_install_conflicts(machine, fd, cleanup=cleanup, detailed=True)
+                    if pending:
+                        need(cleanup is None, NATIVE_UNIT_REQUIRED)
+                        pending_native(xl, unit(IKE), pending)
+                        ready = {**ready, 'unitsLoaded': False, 'nativePreparation': True}
+                package_no_pending()
+                return {**ready, 'pppPreparation': True}
+        except Refusal as error:
+            if cleanup is None and str(error) == PACKAGE_AUTOSTART_UNSAFE:
+                return package_preflight(machine)
+            raise
+    fresh = action in FRESH_ACTIONS
+    ready = preflight(machine, fresh=True) if fresh else preflight(machine)
     d = routing(request['network'])
     # Lock a stable system directory without creating a lock file in prepare.
     # This only serializes DIRECT invocations; the caller must exclude other

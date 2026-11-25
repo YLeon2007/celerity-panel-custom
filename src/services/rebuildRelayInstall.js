@@ -32,6 +32,7 @@ async function runFreshRelayInstall(id, deps) {
                 await checkAuthorization();
             };
             let remote, reservation, consumedCleanup, cleanup, unsettled = false, progressTail = Promise.resolve(), percent = 10, lastStage = 'reserve';
+            let firstPreflight = false;
             const verifyTopology = async () => {
                 if (deps.verifyTopology) await deps.verifyTopology(inventory);
             };
@@ -69,8 +70,11 @@ async function runFreshRelayInstall(id, deps) {
                 await checkAuthorization();
                 await proveMain();
                 let host;
-                if (!deps.foreignCleanup) host = await remote.preflight();
-                else {
+                if (!deps.foreignCleanup) {
+                    firstPreflight = true;
+                    host = await remote.preflight();
+                    firstPreflight = false;
+                } else {
                     let observed, refusal;
                     try { await remote.preflight(); } catch (error) {
                         observed = freshConflict(error);
@@ -234,7 +238,7 @@ async function runFreshRelayInstall(id, deps) {
                     primary = installFailure(primary.code, 'installed', undefined, { retryAllowed: false });
                 }
                 const proof = freshConflict(primary);
-                if (!unsettled && primary.outcome === 'refused' && proof?.digest && deps.cleanupConsent) {
+                if (firstPreflight && !unsettled && primary.outcome === 'refused' && proof?.digest && deps.cleanupConsent) {
                     try {
                         await checkAuthority();
                         const { cleanable, manual } = proof;

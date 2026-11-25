@@ -41,11 +41,11 @@ def main():
         'sources': [{'path': path, 'size': len(data), 'sha256': sha(data)} for path, data in zip(SOURCES, files)],
         'sha256': sha(packed),
     }
-    # The current bootstrap and longest shell wrapper add 2554 bytes with NUL.
-    # Keep a rounded allowance here; directCommand checks the exact argv.
+    # Reserve space for the bootstrap and shell wrapper with NUL.
+    # directCommand also checks the exact argv.
     encoded_size = (len(packed) + 24) // 25 * 29
     decoded = re.sub(rb'\t+', lambda m: b'\n' + b'    ' * len(m[0]), lzma.decompress(packed, memlimit=16777216))
-    if decoded != source or encoded_size + 2600 >= 131072:
+    if decoded != source or encoded_size + 2200 >= 131072:
         raise SystemExit('DIRECT source mismatch or shell argument too large')
     body = json.dumps(manifest, indent=2) + '\n'
     if args.check:

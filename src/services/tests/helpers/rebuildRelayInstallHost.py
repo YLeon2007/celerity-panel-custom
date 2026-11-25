@@ -367,7 +367,9 @@ def run(argv, **kwargs):
         return reply(v[1] + '\n')
     if prog == '/usr/bin/systemd-detect-virt':
         if v == ['--container']:
-            return reply('lxc\n', 0) if scenario in ('ppp-container', 'ppp-container-ready') else reply('none\n', 1)
+            if scenario == 'ppp-container-ready':
+                return reply('systemd-nspawn\n', 0)
+            return reply('lxc\n', 0) if scenario == 'ppp-container' else reply('none\n', 1)
         assert v == ['--chroot']
         return reply(code=1)
     if prog == '/usr/sbin/modprobe':

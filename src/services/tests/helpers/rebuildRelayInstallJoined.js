@@ -593,6 +593,82 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         }
     });
 
+    test('joined authenticated Install: independent prerequisites precede foreign cleanup consent', async t => {
+        for (const [scenario, check] of [
+            ['ppp-container-ready', 'PPP_MODULES_REQUIRED'],
+            ['ppp-disabled', 'PPP_MODULES_REQUIRED'],
+            ['ppp-blacklist', 'PPP_MODULES_REQUIRED'],
+            ['ppp-conflict', 'PPP_MODULES_PERSISTENCE_CONFLICT'],
+            ['ppp-resident-observer-blacklist', 'KERNEL_MODULE_BLACKLISTED'],
+            ['ppp-missing-packages', 'RUNTIME_PACKAGE_AUTOSTART_UNSAFE'],
+            ['ppp-vpn-masked', 'VPN_UNITS_MASKED'],
+            ['ppp-vpn-masked-runtime', 'VPN_UNITS_MASKED'],
+            ['ppp-late-foreign', 'L2TP_FOREIGN_CONFIG'],
+            ['ppp-ready', 'L2TP_FOREIGN_CONFIG'],
+        ]) await t.test(scenario, async tt => {
+            const f = host(tt, scenario, { cohort: true });
+            const file = join(f.root, '/etc/ppp/chap-secrets');
+            const foreign = 'fixture synthetic fixture *\n';
+            let original;
+            function seedForeign() {
+                fs.writeFileSync(file, foreign);
+                original = fs.statSync(file, { bigint: true });
+            }
+            if (scenario === 'ppp-late-foreign') f.beforeDirectAction(action => { if (action === 'prepare') seedForeign(); });
+            else seedForeign();
+            const records = f.records();
+            if (scenario === 'ppp-missing-packages') records.missingPackages = ['xl2tpd'];
+            if (scenario === 'ppp-vpn-masked') Object.assign(records.units[f.xl], { LoadState: 'masked', UnitFileState: 'masked' });
+            if (scenario === 'ppp-vpn-masked-runtime') records.units[f.ike].UnitFileState = 'masked-runtime';
+            f.writeRecords(records);
+            const row = { nodeId: id, host: f.relay.ip, port: 22, username: 'root', sshHostKeySha256: f.pin, machineId,
+                generation: 'a1f2edc4-676c-4a6e-b111-a1239fbbcd1e', createdBy: 'fixture', confirmedBy: 'fixture',
+                createdAt: new Date(0), confirmedAt: new Date(0) };
+            const consentJournal = [];
+            const consentDb = { collection(name) {
+                if (name === 'c3_rebuild_l2tp_retired_relays') return { find: () => ({ toArray: async () => [] }) };
+                assert.equal(name, 'rebuild_l2tp_cleanup_consents_v1');
+                return { async createIndex() {}, async updateMany(filter, update, options) {
+                    assert.equal(options.upsert, true);
+                    consentJournal.push(update[0].$set.state);
+                    return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedCount: 1, upsertedId: filter._id };
+                } };
+            } };
+            const grantDb = { readyState: 1, db: consentDb, collection(name) {
+                assert.equal(name, 'c3_rebuild_l2tp_relay_grants');
+                return { find: () => ({ toArray: async () => [{ ...row }] }) };
+            } };
+            delete f.env.C3_REBUILD_L2TP_RELAY_ID;
+            delete f.env.C3_REBUILD_L2TP_RELAY_MACHINE_ID;
+            delete f.env.C3_REBUILD_L2TP_SSH_SHA256;
+            let status, result;
+            await installHandler(() => f.create({ grantDb }))({ params: { id }, body: {},
+                session: { authenticated: true, adminUsername: 'fixture' }, sessionID: 'fixture-session',
+            }, { status(value) { status = value; return this; }, json(value) { result = value; } });
+            assert.equal(status, 409, JSON.stringify({ code: result?.error?.code, actions: f.actions, refusals: f.refusals }));
+            if (scenario === 'ppp-ready') {
+                assert.equal(result.error.check, check);
+                assert.deepEqual(result.error.cleanable, ['CHAP_NOT_EMPTY']);
+                assert.match(result.error.cleanupToken, /^[a-f0-9]{64}$/);
+                assert.deepEqual(consentJournal, ['issued']);
+            } else if (scenario === 'ppp-late-foreign') {
+                assert.deepEqual(result, { error: { code: 'REBUILD_L2TP_FOREIGN_CONFIG', outcome: 'refused',
+                    check, keys: ['CHAP_NOT_EMPTY'] } });
+                assert.deepEqual(consentJournal, []);
+            } else {
+                assert.deepEqual(consentJournal, [], 'no consent record');
+                assert.deepEqual(result, { error: { outcome: 'refused', check, code: check === 'VPN_UNITS_MASKED'
+                    ? 'REBUILD_L2TP_HOST_NOT_READY' : 'REBUILD_L2TP_DIRECT_PREREQUISITE' } });
+            }
+            assert.deepEqual(f.actions, scenario === 'ppp-late-foreign' ? ['preflight', 'preflight', 'prepare'] : ['preflight']);
+            assert.deepEqual([f.states, f.users, f.records().effects], [[], [], []]);
+            assert.ok(!present(join(f.root, '/var/lib/celerity-rebuild-l2tp-direct')));
+            const after = fs.statSync(file, { bigint: true });
+            assert.deepEqual([after.ino, after.mode, after.ctimeNs], [original.ino, original.mode, original.ctimeNs]);
+            assert.equal(fs.readFileSync(file, 'utf8'), foreign);
+        });
+    });
+
     for (const [scenario, expected, loads, retained] of [
         ['ppp-both', 'installed', ['ppp_generic', 'l2tp_ppp']],
         ['ppp-l2tp', 'installed', ['l2tp_ppp']],

@@ -65,7 +65,7 @@ class ForeignConfig(unittest.TestCase):
         self.native_command = self.h['command']
         self.h.update(directory=self.directory, open=self.read_kernel, command=self.command,
                       ppp_device=lambda: True, ppp_registered=lambda: True,
-                      missing_network_observers=lambda: [])
+                      missing_network_observers=lambda: [], observe_ppp_preparation=lambda **_: None)
 
     def path(self, path):
         return self.temp / path.lstrip('/')

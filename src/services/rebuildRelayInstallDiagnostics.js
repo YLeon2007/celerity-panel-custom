@@ -89,6 +89,8 @@ function withFreshConflict(error, proof) {
     return withInstallCheck(error, proof.check);
 }
 const freshConflict = error => conflicts.get(error);
+const preflightModuleChecks = new Set(['PPP_MODULES_REQUIRED', 'PPP_MODULES_PERSISTENCE_CONFLICT',
+    'KERNEL_MODULE_BLACKLISTED', 'NETWORK_OBSERVATION_REQUIRED']);
 const checks = new Set([...freshConflicts].filter(check => check !== foreignChanged).concat([...packageChecks, ...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
     ...profileChecks.values(), 'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED', 'FOREIGN_CONFIG_RESTORED', 'CLEANUP_CONSENT_REQUIRED',
     'CLEANUP_CONSENT_UNAVAILABLE', 'CLEANUP_CONSENT_XRAY_OPT_IN_REQUIRED']));
@@ -98,7 +100,7 @@ const installCheckIds = Object.freeze([...checks, ...foreignKeys]);
 const isInstallCheck = check => checks.has(check);
 const isInstallStage = action => stages.has(action);
 function specificHostRefusal(action, suffix, noWrite) {
-    if (action === 'preflight' && !noWrite && (packageChecks.has(suffix) || suffix === 'KERNEL_MODULE_BLACKLISTED')) {
+    if (action === 'preflight' && !noWrite && (packageChecks.has(suffix) || preflightModuleChecks.has(suffix))) {
         return { check: suffix, prerequisitePartial: false };
     }
     const match = hostChecks.get(suffix);
