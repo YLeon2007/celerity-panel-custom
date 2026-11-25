@@ -15,13 +15,18 @@ const validGeneration = value => typeof value === 'string' && value.length === 3
 const retryableClaim = value => value && Object.getPrototypeOf(value) === Object.prototype
     && Object.keys(value).length === 2 && validGeneration(value.id) && value.phase === 'retryable';
 const queues = new Map(), held = new AsyncLocalStorage();
+function nodeLockVerifier(nodeId) {
+    const key = String(nodeId), lease = held.getStore()?.get(key);
+    return () => lease?.active === true && held.getStore()?.get(key) === lease;
+}
 async function withNode(nodeId, fn) {
-    const key=String(nodeId); if (held.getStore()?.has(key)) return fn();
+    const key=String(nodeId); if (nodeLockVerifier(key)()) return fn();
     const prev=queues.get(key)||Promise.resolve(); let release;
     const done=new Promise(resolve=>{release=resolve}); queues.set(key,done);
     await prev;
-    try { return await held.run(new Set([...(held.getStore()||[]),key]),fn); }
-    finally { release(); if(queues.get(key)===done) queues.delete(key); }
+    const lease = { active: true };
+    try { return await held.run(new Map([...(held.getStore()||[]),[key,lease]]),fn); }
+    finally { lease.active = false; release(); if(queues.get(key)===done) queues.delete(key); }
 }
 function withNodes(ids, fn) {
     const keys=[...new Set(ids.map(String))].sort();
@@ -150,4 +155,4 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
     }
     return {run,status,unlock,readInstallRecovery};
 }
-module.exports={withNode,withNodes,makeLocks,installOwner};
+module.exports={withNode,withNodes,nodeLockVerifier,makeLocks,installOwner};

@@ -52,6 +52,25 @@ const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
 // Mark node offline after this many consecutive health check failures (1 check/min)
 const HEALTH_FAILURE_THRESHOLD = 3;
 const XRAY_TRAFFIC_ONLINE_WINDOW_MS = 90_000;
+// The stock /sync handler gives Xray up to 60s to reconcile the snapshot.
+const REBUILD_USER_SYNC_TIMEOUT_MS = 65_000;
+const rebuildUserSyncError = code => Object.assign(new Error(code), { code, retryAllowed: false });
+const primaryMajority = query => query.read('primary').readConcern('majority').maxTimeMS(5000).lean();
+
+function inheritedNodeUsersFilter(node) {
+    const nodeGroupIds = (node.groups || []).map(g => g._id?.toString() || g.toString());
+    return {
+        // Implicit assignment applies only when the user has no explicit nodes.
+        groups: nodeGroupIds.length ? { $in: node.groups } : { $size: 0 },
+        $or: [{ nodes: { $size: 0 } }, { nodes: { $exists: false } }],
+    };
+}
+
+function xrayUserSyncPayload(users, security, transport, configuredFlow) {
+    const flow = ((security === 'reality' || security === 'tls') && transport === 'tcp')
+        ? (configuredFlow || 'xtls-rprx-vision') : '';
+    return users.map(u => ({ id: u.xrayUuid, email: u.userId, flow })).filter(u => u.id);
+}
 
 // Fields whose change requires regenerating the runtime config on the node.
 // Anything not listed here (name, groups, flag, rankingCoefficient, ssh.*, ...)
@@ -275,7 +294,7 @@ class SyncService {
         return this._sendAgentRequest(node, method, path, body);
     }
 
-    async _sendAgentRequest(node, method, path, body, directRead) {
+    async _sendAgentRequest(node, method, path, body, direct) {
         const xray = node.xray || {};
         const useTls = xray.agentTls !== false;
         const port = xray.agentPort || 62080;
@@ -287,7 +306,7 @@ class SyncService {
 
         const protocol = useTls ? 'https' : 'http';
         let host = node.ip;
-        if (directRead) {
+        if (direct) {
             const ipVersion = require('node:net').isIP(host);
             if (ipVersion === 6) host = `[${host}]`;
             else if (typeof host !== 'string' || !/^[a-z0-9.-]+$/i.test(host)) throw new Error('Invalid agent host');
@@ -315,13 +334,13 @@ class SyncService {
             options.httpsAgent = selfSignedAgent;
         }
 
-        const signal = directRead && AbortSignal.timeout(directRead.timeout);
-        if (directRead) {
-            // The observation challenge and bearer must stay at the configured
-            // receiving agent. This GET has a total deadline and never retries.
+        const signal = direct && AbortSignal.timeout(direct.timeout);
+        if (direct) {
+            // Keep the bearer (and any request payload) at the configured
+            // receiving agent. Direct requests have a total deadline and never retry.
             Object.assign(options, {
-                proxy: false, maxRedirects: 0, timeout: directRead.timeout,
-                signal, maxContentLength: directRead.maxContentLength ?? 1024,
+                proxy: false, maxRedirects: 0, timeout: direct.timeout,
+                signal, maxContentLength: direct.maxContentLength ?? 1024,
                 responseType: 'text', transformResponse: [bytes => bytes],
             });
             options.headers.Accept = 'application/json';
@@ -333,7 +352,7 @@ class SyncService {
         catch (error) {
             // Axios reports our absolute deadline as cancellation, not as its
             // socket timeout. Require an attempted request and no HTTP reply.
-            if (signal?.aborted && error?.code === 'ERR_CANCELED' && axios.isCancel(error)
+            if (method === 'GET' && signal?.aborted && error?.code === 'ERR_CANCELED' && axios.isCancel(error)
                 && error.request && !error.request.res && !error.response) {
                 throw Object.assign(new Error('Agent observation timed out'), { code: 'AGENT_OBSERVATION_TIMEOUT' });
             }
@@ -571,20 +590,7 @@ class SyncService {
         // Users with explicit node assignment
         const byNodes = await read({ nodes: node._id });
         // Users linked via groups
-        const nodeGroupIds = (node.groups || []).map(g => g._id?.toString() || g.toString());
-        const noExplicitNodes = {
-            $or: [
-                { nodes: { $size: 0 } },
-                { nodes: { $exists: false } },
-            ],
-        };
-        let byGroups = [];
-        if (nodeGroupIds.length > 0) {
-            byGroups = await read({ groups: { $in: node.groups }, ...noExplicitNodes });
-        } else {
-            // Node has no groups — all users without group assignment
-            byGroups = await read({ groups: { $size: 0 }, ...noExplicitNodes });
-        }
+        const byGroups = await read(inheritedNodeUsersFilter(node));
         // Merge and deduplicate by userId
         const seen = new Set();
         return [...byNodes, ...byGroups].filter(u => {
@@ -592,6 +598,74 @@ class SyncService {
             seen.add(u.userId);
             return true;
         });
+    }
+
+    /**
+     * One full user-only sync after a separately verified agent resume/reconcile.
+     * Call and await inside the original withNode/withNodes callback. The caller
+     * owns that lock and supplies its live operation verifier, bound to the exact
+     * node/agent endpoint and resumed generation. Only true authorizes progress;
+     * the verifier must not reacquire locks or accept a historical receipt alone.
+     * This method neither acquires nor releases a lock. Its ACK is a stock HTTP
+     * acknowledgement, not a durable receipt or permission to replay a POST.
+     */
+    async syncRebuildNodeUsersAfterResume(nodeId, { verifyFence } = {}) {
+        const rebuildEnabled = require('./rebuildMode').isRebuildEnabled;
+        const fenceError = () => rebuildUserSyncError('REBUILD_NODE_USER_SYNC_FENCE_UNPROVED');
+        const prepareError = () => rebuildUserSyncError('REBUILD_NODE_USER_SYNC_PREPARE_FAILED');
+        if (!rebuildEnabled() || typeof verifyFence !== 'function') throw fenceError();
+        if (typeof nodeId !== 'string' || nodeId.length !== 24 || !/^[a-f0-9]+$/.test(nodeId)) throw prepareError();
+        const ownsNode = require('./rebuildLocks').nodeLockVerifier(nodeId);
+        if (!ownsNode()) throw fenceError();
+
+        let node, target;
+        try {
+            node = await primaryMajority(HyNode.findById(nodeId).select(
+                'type ip groups xray.agentPort xray.agentTls xray.agentToken xray.security xray.transport xray.flow'));
+            if (node?.type !== 'xray' || String(node._id) !== nodeId || typeof node.ip !== 'string' || !node.ip
+                || typeof node.xray?.agentToken !== 'string' || !node.xray.agentToken) throw prepareError();
+            const agentPort = node.xray.agentPort ?? 62080;
+            if (!Number.isInteger(agentPort) || agentPort < 1 || agentPort > 65535) throw prepareError();
+            target = Object.freeze({ nodeId, ip: node.ip, agentTls: node.xray.agentTls !== false, agentPort });
+        } catch { throw prepareError(); }
+
+        const verify = async () => {
+            try {
+                if (ownsNode() && rebuildEnabled() && await verifyFence(target) === true && ownsNode() && rebuildEnabled()) return;
+            } catch { /* Do not expose the caller's private diagnostics. */ }
+            throw fenceError();
+        };
+        await verify();
+
+        let users;
+        try {
+            // One authoritative query for the complete union. Separate reads can
+            // miss someone moving between explicit and inherited assignment.
+            const rows = await primaryMajority(HyUser.find({ enabled: true,
+                $or: [{ nodes: node._id }, inheritedNodeUsersFilter(node)],
+            }).select('userId xrayUuid'));
+            // Match the HyNode defaults used by the hydrated legacy path,
+            // without applying HyUser defaults (in particular, minting a UUID).
+            const { security = 'reality', transport = 'tcp', flow } = node.xray;
+            users = xrayUserSyncPayload(rows, security, transport, flow);
+        } catch { throw prepareError(); }
+        await verify();
+
+        try {
+            // _agentRequest may acquire the per-node lock. This caller already
+            // owns it, so dispatch once through the underlying stock transport.
+            const response = await this._sendAgentRequest(node, 'POST', '/sync', { users },
+                { timeout: REBUILD_USER_SYNC_TIMEOUT_MS });
+            const ack = response.status === 200 && typeof response.data === 'string' && JSON.parse(response.data);
+            if (ack && Object.keys(ack).length === 4
+                && ['added', 'removed', 'errors', 'total'].every(key =>
+                    Object.hasOwn(ack, key) && Number.isSafeInteger(ack[key]) && ack[key] >= 0)
+                && ack.errors === 0 && ack.total === users.length && ack.added <= ack.total) {
+                await verify();
+                return Object.freeze(ack);
+            }
+        } catch { /* No raw Axios error, response, or verification detail crosses this boundary. */ }
+        throw rebuildUserSyncError('REBUILD_NODE_USER_SYNC_UNCONFIRMED');
     }
 
     /**
@@ -975,12 +1049,8 @@ class SyncService {
         // Step 3: Sync users via Agent (builds the runtime user list in Xray without restart)
         if (hasAgent) {
             try {
-                const xray = node.xray || {};
-                const userPayload = users.map(u => {
-                    const flow = ((xray.security === 'reality' || xray.security === 'tls') && xray.transport === 'tcp')
-                        ? (xray.flow || 'xtls-rprx-vision') : '';
-                    return { id: u.xrayUuid, email: u.userId, flow };
-                }).filter(u => u.id);
+                const { security, transport, flow } = node.xray || {};
+                const userPayload = xrayUserSyncPayload(users, security, transport, flow);
 
                 await this._agentRequest(node, 'POST', '/sync', { users: userPayload });
                 logger.info(`[Xray Sync] Node ${node.name}: synced ${userPayload.length} users via agent`);
