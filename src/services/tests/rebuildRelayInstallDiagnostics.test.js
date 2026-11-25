@@ -41,7 +41,7 @@ const root = join(__dirname, '../../..');
 // no manager/kernel/network command is allowed to run. The exception includes a
 // private filename so the producer's exception path is exercised, not fabricated.
 const hostPreflight = String.raw`
-import io, json, re, shlex, stat, sys, types
+import contextlib, io, json, re, shlex, stat, sys, types
 command, request = json.load(sys.stdin)
 argv = shlex.split(command)
 assert argv[:-1] == ['/usr/bin/timeout', '-k', '4s', '125s', '/usr/bin/python3', '-I', '-B', '-c']
@@ -61,11 +61,16 @@ host['open'] = lambda path, mode: io.BytesIO({ '/etc/machine-id': json.loads(req
     '/proc/devices': b'Character devices:\n108 ppp\nBlock devices:\n' }[path])
 host['unit'] = lambda name: {'LoadState': 'loaded'}
 vault_checks = []
+lock_checks = []
 def absent_fixture_vault(path, private=False):
+    if path == host['SYSTEM']:
+        assert not private
+        return contextlib.nullcontext(17)
     assert path == host['VAULT'] and private is True
     vault_checks.append(path)
     raise FileNotFoundError(path)
 host['directory'] = absent_fixture_vault
+host['fcntl'] = types.SimpleNamespace(LOCK_SH=1, LOCK_NB=2, flock=lambda fd, flags: lock_checks.append((fd, flags)))
 package_calls = []
 def read_package(*args, **kwargs):
     assert args[0] == '/usr/bin/dpkg-query'
@@ -75,6 +80,7 @@ host['command'] = read_package
 sys.stdin = io.TextIOWrapper(io.BytesIO(request.encode()))
 status = host['main']()
 assert not faults, faults
+assert lock_checks == [(17, 3)]
 assert vault_checks == [host['VAULT']]
 assert package_calls == ['/usr/bin/dpkg-query']
 sys.exit(status)

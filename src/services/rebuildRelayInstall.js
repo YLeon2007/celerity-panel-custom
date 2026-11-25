@@ -70,8 +70,8 @@ async function runFreshRelayInstall(id, deps) {
                 await checkAuthorization();
                 await proveMain();
                 let host;
+                firstPreflight = true;
                 if (!deps.foreignCleanup) {
-                    firstPreflight = true;
                     host = await remote.preflight();
                     firstPreflight = false;
                 } else {
@@ -101,6 +101,7 @@ async function runFreshRelayInstall(id, deps) {
                     }
                     cleanup = Object.freeze({ digest: observed.digest, fixXrayUnitMode: consumedCleanup.fixXrayUnitMode,
                         at: new Date().toISOString() });
+                    firstPreflight = false;
                     host = await remote.preflight(cleanup);
                 }
                 if (deps.machineId !== undefined && host?.machineId !== deps.machineId) {
