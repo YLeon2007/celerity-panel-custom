@@ -10,6 +10,7 @@ from ipaddress import ip_network
 import json
 import os
 from pathlib import Path
+from select import select
 import secrets
 import signal
 import socket
@@ -720,8 +721,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     links = {link['index']: link for link in generated['links']}
     origins = Origins()
     evidence['probes'] = []
-    expected_count = len(cases) + (5 if matrix and not serial else 0) + (15 if stage else 0) + (8 if serial else 0)
-    xray_count = len(run_configs) + 3 * len(restarts) + 2 * len(serial_steps)
+    expected_count = len(cases) + (5 if matrix and not serial else 0) + (15 if stage else 0) + (14 if serial else 0)
+    xray_count = len(run_configs) + 3 * len(restarts) + 3 * len(serial_steps)
     evidence['expected_counts'] = {'config_tests': config_count, 'http_probes': expected_count,
                                    'live_xray': xray_count, 'children': xray_count + 1}
     reaped = evidence['reaped']
@@ -795,6 +796,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             print(f'{case.name}: HTTP {result["actual"] or "NO MARKER"} (want {case.want})'
                   + (f' via {result["egress"]}' if 'egress' in result else ''))
             require(result['actual'] == case.want, f'{case.name}: wrong origin')
+            return result
 
         def restart_main(owner, direction, source, target, expected_listens, **step):
             boot = Path(f'{run_configs[owner]}.json')
@@ -834,29 +836,6 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                 previous = 'before' if direction == 'after' else 'after'
                 restart_main(owner, direction, restarts[owner][previous], restarts[owner][direction], expected_listens)
 
-        def serial_round(direction, states):
-            inverse = direction == 'before'
-            for step in reversed(serial_steps) if inverse else serial_steps:
-                owner = step['owner']
-                name = f'{owner}-serial-{step["id"]}'
-                previous = 'after' if inverse else 'before'
-                states[owner] = json.loads(Path(f'{name}-{direction}.json').read_bytes())
-                bound = [(node, port) for node, port in added if any(
-                    row['port'] == port for row in states[node]['inbounds'])]
-                if not inverse and step['kind'] == 'dialers':
-                    require(bound == added and all(sockets(port, children[node]) for node, port in added),
-                            'serial dialer dispatched before all listeners were serving')
-                if not inverse and step['kind'] == 'selector':
-                    wait_until('prepared scoped reverse sockets', children, serial_reverse_ready, 18)
-                    verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
-                    verify_case(Probe('p2', 'other', 'B', 6), staged=True)
-                    verify_case(Probe('stage-p1', 'numeric', 'B', 3), staged=True)
-                    verify_case(Probe('stage-p2', 'other', 'A', 2), staged=True)
-                restart_main(owner, direction, f'{name}-{previous}', f'{name}-{direction}',
-                             [*listens, *bound], stepId=step['id'], phase=step['phase'])
-                require(all(not sockets(port, children[node]) and not sockets(port, children[node], established=True)
-                            for node, port in added if (node, port) not in bound), 'unexpected live scoped listener or worker')
-
         def serial_reverse_ready():
             return all(sockets(ln['port'], children[ln['source']], established=True)
                        for ln in scoped_links if ln['mode'] == 'reverse')
@@ -866,6 +845,101 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                 expected = (json.dumps(config, indent=2) + '\n').encode('utf-8')
                 require(Path(f'{run_configs[owner]}.json').read_bytes() == expected,
                         'serial terminal boot image mismatch')
+
+        def serial_snapshot(owner):
+            proc, label = children[owner], run_configs[owner]
+            path = Path(f'{label}.json')
+            binary = os.readlink(f'/proc/{proc.pid}/exe')
+            require(proc.poll() is None and binary == actor(owner, evidence)['binary']
+                    and Path(f'/proc/{proc.pid}/cmdline').read_bytes().split(b'\0')
+                    == [binary.encode(), b'run', b'-c', os.fsencode(path), b''], 'serial serving generation changed')
+            proc_start = Path(f'/proc/{proc.pid}/stat').read_text().rsplit(') ', 1)[1].split()[19]
+            info = path.stat()
+            boot = digest(path)
+            require(info == path.stat() and proc.poll() is None, 'serial boot observation changed')
+            return {'pid': proc.pid, 'start': proc_start, 'binary': binary, 'boot': boot,
+                    'dev': str(info.st_dev), 'ino': str(info.st_ino), 'mode': info.st_mode,
+                    'uid': info.st_uid, 'gid': info.st_gid, 'ctime': str(info.st_ctime_ns)}
+
+        def serial_run(operation):
+            states = serial_initial.copy()
+            by_id = {step['id']: step for step in serial_steps}
+            manifest = {'initial': {owner: serial_snapshot(owner) for owner in run_configs}, 'steps': []}
+            for step in serial_steps:
+                name = f'{step["owner"]}-serial-{step["id"]}'
+                manifest['steps'].append({k: step[k] for k in ('id', 'owner', 'phase')} |
+                                         {side: digest(f'{name}-{side}.json') for side in ('before', 'after')})
+
+            def handle(frame):
+                action = frame['action']
+                if action == 'manifest':
+                    return manifest
+                if action == 'fence':
+                    # Only this parent can mutate serving state in the fixture;
+                    # this is not a claim about a product/remote writer fence.
+                    return all(p.poll() is None for p in children.values())
+                if action == 'snapshot':
+                    return serial_snapshot(frame['owner'])
+                if action == 'prepared':
+                    wait_until('prepared scoped reverse sockets', children, serial_reverse_ready, 18)
+                    for case in (Probe('p1', 'numeric', 'A', 2), Probe('p2', 'other', 'B', 6),
+                                 Probe('stage-p1', 'numeric', 'B', 3), Probe('stage-p2', 'other', 'A', 2)):
+                        verify_case(case, staged=True)
+                    return True
+                inverse = frame['direction'] == 'rollback'
+                require(inverse or frame['direction'] == 'forward', 'unknown serial direction')
+                if action == 'terminal':
+                    serial_terminal(serial_initial if inverse else serial_final)
+                    if not inverse:
+                        wait_until('full chain from boot images', children, serial_reverse_ready, 18)
+                    terminal = ([Probe('p1', 'numeric', 'A', 2), Probe('p2', 'other', 'B', 6)] if inverse else
+                                [Probe('p1', 'numeric', 'B', 3), Probe('p2', 'other', 'A', 2)] if operation == 'rollback' else cases)
+                    records = [verify_case(case, staged=inverse) for case in terminal]
+                    return [{k: row[k] for k in ('case', 'expected', 'actual')} |
+                            {'receipts': [a['path'] for a in row['attempts']], 'hops': row.get('relay_hops', [])}
+                            for row in records]
+                require(action == 'restart', 'unknown serial action')
+                step = by_id[frame['id']]
+                owner = step['owner']
+                name = f'{owner}-serial-{step["id"]}'
+                previous, direction = ('after', 'before') if inverse else ('before', 'after')
+                states[owner] = json.loads(Path(f'{name}-{direction}.json').read_bytes())
+                bound = [(node, port) for node, port in added if any(
+                    row['port'] == port for row in states[node]['inbounds'])]
+                if not inverse and step['kind'] == 'dialers':
+                    require(bound == added and all(sockets(port, children[node]) for node, port in added),
+                            'serial dialer dispatched before all listeners were serving')
+                require(digest(f'{name}-{direction}.json') == frame['target']
+                        and serial_snapshot(owner) == frame['before'], 'serial handoff precondition changed')
+                restart_main(owner, direction, f'{name}-{previous}', f'{name}-{direction}',
+                             [*listens, *bound], stepId=step['id'], phase=step['phase'], operation=operation)
+                require(all(not sockets(port, children[node]) and not sockets(port, children[node], established=True)
+                            for node, port in added if (node, port) not in bound), 'unexpected live scoped listener or worker')
+                return True
+
+            worker = sp.Popen(['node', '/scripts/serial-journal.cjs', operation, parent_net],
+                              stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE)
+            tx, rx, err = worker.stdin, worker.stdout, worker.stderr
+            assert tx is not None and rx is not None and err is not None
+            try:
+                while True:
+                    require(select([rx], [], [], 10)[0], 'serial journal worker did not respond')
+                    row = rx.readline(4097)
+                    require(row.endswith(b'\n') and len(row) <= 4096, 'serial journal worker refused or invalid response')
+                    frame = json.loads(row)
+                    if frame['action'] == 'done':
+                        tx.close()
+                        require(worker.wait(timeout=3) == 0 and not rx.read() and not err.read(),
+                                'serial journal worker did not exit successfully')
+                        return frame
+                    tx.write((json.dumps(handle(frame)) + '\n').encode())
+                    tx.flush()
+            finally:
+                if worker.poll() is None:
+                    worker.kill()
+                    worker.wait(timeout=3)
+                for stream in (tx, rx, err):
+                    stream.close()
 
         def stage_channels(steps, verify_baseline):
             require(all(not sockets(port, children[owner]) and not sockets(port, children[owner], established=True)
@@ -889,13 +963,11 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             verify_case(Probe('stage-p1', 'numeric', 'B', 3), staged=True)
             verify_case(Probe('stage-p2', 'other', 'A', 2), staged=True)
 
-        serial_state = serial_initial.copy()
         if serial:
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
-            serial_round('after', serial_state)
-            serial_terminal(serial_final)
-            wait_until('full chain from boot images', children, serial_reverse_ready, 18)
+            evidence['serial_terminals'] = [serial_run('rollback'), serial_run('apply')]
+            require(not evidence['api_calls'], 'serial fixture must use only boot image changes')
         if plan is not None:
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
@@ -927,14 +999,9 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             restart_mains(plan['portals'], 'after', [*listens, *added])
             wait_until('original staged process and all listeners retained', children,
                        lambda: all(sockets(port, children[owner]) for owner, port in [*listens, *added]), 4)
-        for case in cases:
-            verify_case(case)
-        if serial:
-            serial_round('before', serial_state)
-            serial_terminal(serial_initial)
-            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
-            verify_case(Probe('p2', 'other', 'B', 6), staged=True)
-            require(not evidence['api_calls'], 'serial fixture must use only boot image changes')
+        if not serial:
+            for case in cases:
+                verify_case(case)
         if plan is not None:
             restart_mains(plan['portals'], 'before', [*listens, *added])
             api('gateway', 'adrules', 'staged-routes.json')

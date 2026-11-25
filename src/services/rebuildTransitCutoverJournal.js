@@ -281,8 +281,12 @@ function frozen(value) {
  * - dispatch(ctx, submit): transport setup may happen outside submit, but *every*
  *   possible target mutation must be inside the one submit(() => nativeHandoff())
  *   invocation. Return that exact awaited opaque receipt after required cleanup.
- *   At handoff enforce native CAS, identities, scope, pins and deadlines; rollback
- *   uses the original before pin and requires the ACKed generation (confirmed).
+ *   At handoff enforce native CAS, identities, scope, pins and deadlines. An
+ *   inverse uses the original before pin, but its CAS uses the latest ACK for
+ *   that target. A later step's inverse may have restored the bytes under a
+ *   fresh generation. `history` contains just the durable forward/inverse ACKs,
+ *   in each direction's execution order; `artifacts.confirmed` is the original
+ *   forward effect's pin, not necessarily the current generation.
  * - verify(ctx, nativeReply): independently authenticate the settled effect and
  *   exact readback (not just the reply); return a durable encrypted artifact pin
  *   including the observed generations, or refuse. No target mutations here.
@@ -309,11 +313,13 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
         try { return await adapter.verifyFence(ctx) === true; } catch { return false; }
     }
 
+    const history = ({ confirmed, restored }) => ({ confirmed, restored });
     async function perform(tx, plan, direction, step, artifacts) {
         const record = direction === 'forward'
             ? { type: 'intent', direction, stepId: step.id, artifacts }
             : { type: 'intent', direction, stepId: step.id };
-        const ctx = frozen({ plan, ...tx.record(record).pending });
+        const state = tx.record(record);
+        const ctx = frozen({ plan, ...state.pending, history: history(state) });
         let open = true, called = false, checkingHandoff = false, entered = false, duplicate = false;
         let fenceLost = false, journalLost = false, receipt, nativeReply, returned;
         function submit(effect) {
@@ -382,7 +388,7 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
         }
         for (;;) {
             const state = tx.state(), step = nextForward(state);
-            const ctx = frozen({ plan, step: step ?? null, direction: 'forward' });
+            const ctx = frozen({ plan, step: step ?? null, direction: 'forward', history: history(state) });
             if (!await checkFence(ctx)) { stop('fence'); break; }
             if (!state.proved && step?.phase !== 'prepare') {
                 let proved = false;
