@@ -1,0 +1,9 @@
+# Rebuild portal exits: local Xray checks
+
+Run `verify-portal-exits.sh --xray PATH --cover PATH --mode reverse|mixed` in a disposable local workspace. The runner creates a private network namespace with only `lo`; it does not mount the host resolver, credentials or service sockets. `--bridge-xray PATH` may pin a different core for bridge fixtures. Logs and synthetic profiles remain in the private evidence directory printed by the script.
+
+- `--chain-probe`: the original two-relay transport experiment, with hand-authored policy rules.
+- `--scoped-proof`: authenticated TCP round trips in separate miniature Xray processes using the generated scoped listener/dialer. This checks protocol viability, not the readiness of any deployed MAIN.
+- `--scoped-matrix`: the unmodified composer selects paths and routing rules for three portals, two chained relays, two bridge exits, and a disconnected relay. Separate origin markers and fresh access-log entries at each hop distinguish the shared and scoped channels. The runner removes and restores one synthetic listener via the real loopback Xray API, checking that the affected portal blocks and the other portal and shared PPP policy still route. For reverse, listener removal alone does not close established workers; the fixture drops their exact local TCP tuple inside its own network namespace before checking the cut.
+
+The matrix checks Xray syntax of the generated TPROXY configuration. For traffic, it substitutes a loopback SOCKS ingress with the exact TPROXY tag and port; the actual generated ACL, local SOCKS handoff and shared Xray routing still run. It does **not** test kernel PPP/IPsec/TPROXY, live Apply/recovery, public geodata, or deployment. Bridge egress is limited to the two local fixture origins. `--scoped-matrix` and `--scoped-proof` do not contact TEST B or PROD.

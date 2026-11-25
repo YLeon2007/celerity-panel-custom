@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 usage() {
-    printf 'Usage: %s --xray PATH --cover PATH [--root SOURCE] [--bridge-xray PATH] [--mode reverse|mixed] [--without-preferred | --chain-probe | --scoped-proof]\n' "$0"
+    printf 'Usage: %s --xray PATH --cover PATH [--root SOURCE] [--bridge-xray PATH] [--mode reverse|mixed] [--without-preferred | --chain-probe | --scoped-proof | --scoped-matrix]\n' "$0"
     printf 'Set TMPDIR to a scratch directory for private evidence. The cover binary accepts: port cert key (loopback TLS 1.3/H2).\n'
 }
 scripts=$(realpath -e -- "$(dirname -- "$0")")
@@ -28,6 +28,7 @@ while (($#)); do
         --without-preferred) preferred=no; shift;;
         --chain-probe) [[ $chain == no ]] || exit 2; chain=yes; shift;;
         --scoped-proof) [[ $chain == no ]] || exit 2; chain=proof; shift;;
+        --scoped-matrix) [[ $chain == no ]] || exit 2; chain=matrix; shift;;
         -h|--help) usage; exit;;
         *) usage >&2; exit 2;;
     esac

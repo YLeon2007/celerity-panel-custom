@@ -21,12 +21,15 @@ LO = '127.0.0.1'
 VIRTUAL_IP = '127.0.0.42'  # No listener here; only a synthetic destination before egress.
 VIRTUAL_PORT = 18080
 GEO = 'fixture.invalid'
+OTHER_GEO = 'other.invalid'
+PPP_IP = '198.51.100.42'  # Documentation-only, never bound or sent outside the fixture.
 SNI = 'cover.fixture.invalid'
 XRAY = '/tools/xray'
 BRIDGE_XRAY = '/tools/bridge-xray'
 BRIDGES = ('A', 'B')
 COMPOSER_INPUTS = ('services/rebuildTopologyComposer.js', 'domain/rebuildTopologyCompiler.js',
-                   'domain/rebuildPortalExit.js', 'services/rebuildTransitChannels.js')
+                   'domain/rebuildPortalExit.js', 'domain/routePolicy.js', 'services/rebuildTransitChannels.js',
+                   'services/l2tpFollowRelay.js')
 
 
 def require(condition, message):
@@ -112,7 +115,7 @@ class Origins:
             def do_GET(self):
                 host = self.headers.get('Host')
                 if not self.path.startswith('/proof-') or host not in (GEO, f'{GEO}:{VIRTUAL_PORT}',
-                                                                          f'{VIRTUAL_IP}:{VIRTUAL_PORT}'):
+                        f'{OTHER_GEO}:{VIRTUAL_PORT}', f'{VIRTUAL_IP}:{VIRTUAL_PORT}', f'{PPP_IP}:{VIRTUAL_PORT}'):
                     self.send_error(404)
                     return
                 with origins.lock:
@@ -157,7 +160,7 @@ def fixture_config(profile, sink_port, label):
     require(freedom['protocol'] == 'freedom', f'unexpected exit protocol: {label}')
     config['routing'] = {'domainStrategy': 'AsIs', 'rules': [
         {**permits[0], 'port': str(VIRTUAL_PORT), **selector}
-        for selector in ({'domain': [f'full:{GEO}']}, {'ip': [f'{VIRTUAL_IP}/32']})
+        for selector in ({'domain': [f'full:{GEO}', f'full:{OTHER_GEO}']}, {'ip': [f'{VIRTUAL_IP}/32', f'{PPP_IP}/32']})
     ]}
     freedom['settings'] = {'redirect': f'{LO}:{sink_port}', 'domainStrategy': 'AsIs',
                            'finalRules': [{'action': 'allow', 'ip': [f'{LO}/32']}, {'action': 'block'}]}
@@ -227,7 +230,7 @@ def sockets(port, proc, *, established=False):
 class Probe:
     portal: str
     kind: str
-    want: str
+    want: str | None
     edge: int
 
     @property
@@ -243,25 +246,42 @@ def tunnel_tag(link, incoming):
     return f"{prefix}-{link['id'][-8:]}"
 
 
-def probe(case, ports, origins, links, chain=False):
-    host = GEO if case.kind == 'domain' else VIRTUAL_IP
+def probe(case, ports, origins, links, chain=False, matrix=False):
+    hosts = {'domain': GEO, 'other': OTHER_GEO, 'control': 'panel.fixture.invalid'}
+    ppp = case.portal in ('ppp', 'ppp-island')
+    host = hosts.get(case.kind, PPP_IP if ppp else VIRTUAL_IP)
     args = [] if case.kind != 'sniff' else ['--header', f'Host: {GEO}']
     attempts = []
-    ingress = next(link for link in links.values() if link['source'] == case.portal)
-    outbound = tunnel_tag(links[case.edge], incoming=False)
-    middle = links[7 if case.portal == 'p1' else 8] if chain and case.portal != 'p3' else None
-    hops = [(ingress, middle), (middle, links[case.edge])] if middle else [(ingress, links[case.edge])]
-    checks = [(Path(f"{first['target']}-main.access.log"), tunnel_tag(first, incoming=True), tunnel_tag(second, incoming=False))
-              for first, second in hops]
+    checks = []
+    if matrix and ppp:
+        sock = ports['ppp-island' if case.portal == 'ppp-island' else 'ppp-gateway']
+        if case.want is not None:
+            middle = links[7]
+            checks = [(Path('gateway-main.access.log'), 'rebuild-relay-ingress', tunnel_tag(middle, False)),
+                      (Path('tail-main.access.log'), tunnel_tag(middle, True), tunnel_tag(links[case.edge], False))]
+    else:
+        sock = ports[f'socks-{case.portal}']
+        ingress = next(link for link in links.values() if link['source'] == case.portal)
+        if matrix:
+            middle = next((link for link in links.values() if link.get('selectedBy') == case.portal), None)
+        else:
+            middle = links[7 if case.portal == 'p1' else 8] if chain and case.portal != 'p3' else None
+        if case.want is not None:
+            hops = [(ingress, middle), (middle, links[case.edge])] if middle else [(ingress, links[case.edge])]
+            checks = [(Path(f"{first['target']}-main.access.log"), tunnel_tag(first, True), tunnel_tag(second, False))
+                      for first, second in hops]
     offsets = [path.stat().st_size if path.exists() else 0 for path, _, _ in checks]
     for _ in range(4):
         path = f'/proof-{case.portal}-{case.kind}-{secrets.token_hex(12)}'
         res = cmd(['curl', '-q', '--silent', '--show-error', '--fail', '--max-time', '2',
-                   '--noproxy', '', '--socks5-hostname', f'{LO}:{ports[f"socks-{case.portal}"]}', *args,
+                   '--noproxy', '', '--socks5-hostname', f'{LO}:{sock}', *args,
                    f'http://{host}:{VIRTUAL_PORT}{path}'])
         with origins.lock:
             sinks = [list(row) for row in origins.receipts.get(path, [])]
         attempts.append({'path': path, 'curl_status': res.returncode, 'curl_error': res.stderr, 'sinks': sinks})
+        if case.want is None:
+            require(res.returncode in (28, 52, 56) and not sinks, f'{case.name}: expected block, got exit {res.returncode} and {sinks}')
+            return {'case': case.name, 'expected': None, 'actual': None, 'attempts': attempts}
         if res.returncode == 0:
             got = next((name for name, marker in origins.marker.items() if marker == res.stdout), None)
             host_header = GEO if case.kind == 'sniff' else f'{host}:{VIRTUAL_PORT}'
@@ -273,10 +293,10 @@ def probe(case, ports, origins, links, chain=False):
                     log.seek(offset)
                     routes = [row for row in log.read().decode().splitlines()
                               if f'[{inbound} ' in row and any(f'accepted tcp:{addr}:{VIRTUAL_PORT} ' in row
-                                                              for addr in (VIRTUAL_IP, GEO))]
+                                                              for addr in (VIRTUAL_IP, PPP_IP, GEO, OTHER_GEO))]
                 require(routes and all(row.endswith(f'[{inbound} -> {hop_outbound}]') for row in routes),
                         f'{case.name}: {access} expected {inbound} -> {hop_outbound}, got {routes}')
-            return {'case': case.name, 'expected': case.want, 'actual': got, 'egress': outbound,
+            return {'case': case.name, 'expected': case.want, 'actual': got, 'egress': tunnel_tag(links[case.edge], False),
                     'relay_hops': [[p.name, i, o] for p, i, o in checks], 'attempts': attempts}
         time.sleep(0.2)
     return {'case': case.name, 'expected': case.want, 'actual': None, 'attempts': attempts}
@@ -395,28 +415,31 @@ def scoped_proofs(proofs, cert, cover_port, evidence):
 
 
 
-def run(parent_net, mode, preferred, evidence, chain=False, proof=False):
+def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=False):
     evidence['netns'] = namespace(parent_net)
     evidence['source_sha256'] = source_digests()
     if proof:
         evidence['proof_source_sha256'] = digest('/scripts/transit-proof.cjs')
+    if matrix:
+        # Minimal synthetic protobuf GeoIPList with PRIVATE -> 127/8 only.
+        Path('/work/assets/geoip.dat').write_bytes(b'\x0a\x13\x0a\x07PRIVATE\x12\x08\x0a\x04\x7f\0\0\0\x10\x08')
     evidence['actors_sha256'] = {bin: digest(bin) for bin in (XRAY, BRIDGE_XRAY, '/tools/cover')}
     vx, vb = version(XRAY), version(BRIDGE_XRAY)
     print(f'CORE: {vx} | bridges: {vb}')
     evidence['versions'] = [vx, vb]
     clients = ['p1', 'p2', 'p3']
-    relays = ['gateway', 'tail'] if chain else ['gateway']
-    server_labels = clients + relays + list(BRIDGES)
+    relays = ('gateway', 'tail', 'island') if matrix else ('gateway', 'tail') if chain else ('gateway',)
+    server_labels = [*clients, *relays, *BRIDGES]
     n_links = 9 if chain else 7 if preferred else 6
     ports = ports_for(['cover', *clients, *relays, *(f'api-{n}' for n in server_labels),
                        *(f'link-{i}' for i in range(n_links)), *(f'socks-{n}' for n in clients),
-                       *(f'sink-{n}' for n in BRIDGES),
+                       *(f'sink-{n}' for n in BRIDGES), *(['ppp-gateway', 'ppp-island'] if matrix else []),
                        *((f'proof-{side}-{i}' for side in ('request', 'origin') for i in range(2)) if proof else ())])
     evidence['ports'] = ports
     cert, key = '/work/cover.crt', '/work/cover.key'
     checked(['openssl', 'req', '-config', '/dev/null', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', f'/CN={SNI}',
              '-addext', f'subjectAltName=DNS:{SNI}', '-out', cert, '-keyout', key])
-    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred, chain=chain, proof=proof,
+    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred, chain=chain, proof=proof, matrix=matrix,
                    reality=reality_keys(n_links, ports['cover']))
     raw = checked(['node', '/scripts/compose.cjs'], input=json.dumps(fixture))
     Path('composer-output.json').write_text(raw + '\n')
@@ -451,6 +474,19 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False):
         Path(f'{key}.test.log').write_text(res.stdout + res.stderr)
         evidence['config_tests'][key] = res.returncode
         require(res.returncode == 0, f'{key}: xray run -test failed; see {key}.test.log')
+    if matrix:
+        # The emitted TPROXY config above is parsed unchanged. At runtime use a
+        # loopback SOCKS adapter at its exact tag/port instead of kernel PPP.
+        # No routing decisions or local handoff rules are replaced.
+        for node, tag in generated['pppTags'].items():
+            config = configs[f'{node}-main']
+            ppp, = [row for row in config['inbounds'] if row['tag'] == tag]
+            port = ports[f'ppp-{node}']
+            require(ppp['protocol'] == 'dokodemo-door' and ppp['port'] == port
+                    and ppp['settings']['followRedirect'], 'fixture lost the generated TPROXY identity')
+            ppp.clear()
+            ppp.update(tag=tag, listen=LO, port=port, protocol='socks', settings={'auth': 'noauth'})
+            dump(f'{node}-main.json', config)
     print(f'CONFIG OK {len(configs)}/{len(configs)} (all emitted profiles + synthetic subscriber)')
 
     b = 6 if preferred else 3
@@ -458,7 +494,13 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False):
              Probe('p1', 'domain', 'A', 4), Probe('p2', 'domain', 'B', b),
              Probe('p1', 'sniff', 'A', 4), Probe('p2', 'sniff', 'B', b),
              Probe('p3', 'numeric', 'A', 2), Probe('p3', 'domain', 'A', 4)]
-    if chain:
+    if matrix:
+        cases = [Probe('p1', 'numeric', 'B', 3), Probe('p1', 'domain', 'A', 4), Probe('p1', 'sniff', 'A', 4),
+                 Probe('p2', 'numeric', 'A', 2), Probe('p2', 'other', 'A', 2), Probe('p2', 'sniff', 'A', 2),
+                 Probe('p3', 'numeric', 'A', 2), Probe('p3', 'other', 'B', 6),
+                 Probe('ppp', 'numeric', 'A', 2), Probe('ppp', 'other', 'B', 6), Probe('ppp', 'control', None, 0),
+                 Probe('ppp-island', 'numeric', None, 0)]
+    elif chain:
         cases = [Probe(case.portal, case.kind, 'A', 2) if case.portal == 'p2' else case for case in cases]
     links = {link['index']: link for link in generated['links']}
     origins = Origins()
@@ -475,6 +517,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False):
             children[label] = start(stack, key, [binary(key), 'run', '-c', f'{key}.json'], reaped)
         listens = [(ln['source'] if ln['mode'] == 'reverse' else ln['target'], ln['port']) for ln in generated['links']]
         listens += [(n, ports[n]) for n in clients] + [('subscriber', ports[f'socks-{n}']) for n in clients]
+        if matrix:
+            listens += [(node, ports[f'ppp-{node}']) for node in generated['pppTags']]
         wait_until('PID-owned tunnel/portal/SOCKS listeners', children,
                    lambda: all(sockets(port, children[owner]) for owner, port in listens), 6)
         reverse = [ln for ln in generated['links'] if ln['mode'] == 'reverse']
@@ -492,10 +536,45 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False):
         evidence['reverse_readiness'] = {'socket_paths': [f"{ln['source']}->{ln['target']}" for ln in reverse],
                                          'minimum_auth_records_per_listener_process': reverse_owners}
         print(f'REVERSE READY {len(reverse)}/{len(reverse)}')
-        for case in cases:
-            result = probe(case, ports, origins, links, chain)
+        def verify_case(case):
+            result = probe(case, ports, origins, links, chain, matrix)
             evidence['probes'].append(result)
             print(f'{case.name}: HTTP {result["actual"] or "NO MARKER"} (want {case.want})')
+            require(result['actual'] == case.want, f'{case.name}: wrong origin')
+
+        for case in cases:
+            verify_case(case)
+        if matrix:
+            # Remove one incoming listener in the actual, still-running MAIN.
+            # Do not remove its route or damage the neighboring/shared policy.
+            cut, = [ln for ln in links.values() if ln.get('selectedBy') == 'p1']
+            owner = cut['source'] if cut['mode'] == 'reverse' else cut['target']
+            tag = ('rebuild-rp-conn-' if cut['mode'] == 'reverse' else 'fwd-hop-') + cut['id'][-8:]
+            previous, = [row for row in configs[run_configs[owner]]['inbounds'] if row['tag'] == tag]
+            require(previous['port'] == cut['port'], 'wrong original channel listener')
+            dump('cut-preimage.json', {'inbounds': [previous]})
+            server = f'--server={LO}:{ports[f"api-{owner}"]}'
+            reply = checked([XRAY, 'api', 'rmi', server, tag])
+            wait_until('cut listener absent, peer listeners retained', children,
+                       lambda: not sockets(cut['port'], children[owner]) and all(
+                           sockets(port, children[node]) for node, port in listens if port != cut['port']), 4)
+            if cut['mode'] == 'reverse':
+                # Unbinding a reverse connector alone does not close its
+                # established workers. Cut only this tuple in our private netns.
+                result = cmd(['ss', '-Ktn', 'state', 'established', f'( sport = :{cut["port"]} )'])
+                require(result.returncode == 0 and not result.stderr, 'fixture could not close the exact reverse sockets')
+                wait_until('cut reverse sessions drained', children,
+                           lambda: not sockets(cut['port'], children[owner], established=True), 6)
+            evidence['cut'] = {'id': cut['id'], 'owner': owner, 'mode': cut['mode'], 'tag': tag, 'api': reply.strip()}
+            verify_case(Probe('p1', 'cut', None, 0))
+            verify_case(Probe('p2', 'numeric', 'A', 2))
+            verify_case(Probe('ppp', 'other', 'B', 6))
+            checked([XRAY, 'api', 'adi', server, 'cut-preimage.json'])
+            wait_until('restored listener in the original process', children,
+                       lambda: sockets(cut['port'], children[owner]) and (
+                           cut['mode'] != 'reverse' or sockets(cut['port'], children[owner], established=True)), 18)
+            verify_case(Probe('p1', 'domain', 'A', 4))
+            verify_case(Probe('p1', 'numeric', 'B', 3))
         require(all(child.poll() is None for child in children.values()), 'child exited during HTTP probes')
     require(set(reaped) == set(run_configs.values()) | {'cover'} and all(
         r['early_exit'] is None and not r['forced_kill'] and r['status'] in (0, -signal.SIGTERM) for r in reaped.values()),
@@ -504,8 +583,9 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False):
     print(f'REAPED {len(reaped)} children; no TCP/UDP listeners remain')
     require(evidence['source_sha256'] == source_digests(), 'composer inputs changed during the run')
     rows = evidence['probes']
-    if all(row['actual'] == row['expected'] for row in rows):
-        print(f'PASS {len(rows)}/{len(cases)} HTTP markers and exact relay channels')
+    expected_count = len(cases) + (5 if matrix else 0)
+    if len(rows) == expected_count and all(row['actual'] == row['expected'] for row in rows):
+        print(f'PASS {len(rows)}/{len(rows)} HTTP marker/block checks and exact relay channels')
         evidence['result'] = 'PASS'
         return 0
     evidence['result'] = 'ASSERTION_FAILED'
@@ -522,10 +602,10 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, stop)
     parent_net, mode, preferred, source, chain = sys.argv[1:]
     evidence = {'source_root': source, 'mode': mode, 'preferred': preferred == 'yes', 'chain_probe': chain == 'yes',
-                'scoped_proof': chain == 'proof'}
+                'scoped_proof': chain == 'proof', 'scoped_matrix': chain == 'matrix'}
     status = 2
     try:
-        status = run(parent_net, mode, preferred == 'yes', evidence, chain in ('yes', 'proof'), chain == 'proof')
+        status = run(parent_net, mode, preferred == 'yes', evidence, chain in ('yes', 'proof', 'matrix'), chain == 'proof', chain == 'matrix')
     except (Exception, KeyboardInterrupt) as exc:
         evidence.update(result='INFRA_ERROR', error=str(exc))
         print(f'ERROR: {exc}', file=sys.stderr)
