@@ -10,8 +10,11 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import time
+from typing import NamedTuple
+from uuid import uuid4
 
 UNIT = 'cc-agent.service'
 XRAY = 'xray.service'
@@ -34,6 +37,14 @@ PID = re.compile(r'[1-9][0-9]{0,9}')
 TAG = re.compile(r'[A-Za-z0-9_.:-]{1,128}')
 DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 SMALL_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+MAX_MAIN = 8 * 1024 * 1024
+MAIN_DRIFT = 'REBUILD_MAIN_CAS_UNPROVED'
+
+
+class MainImage(NamedTuple):
+    data: bytes
+    metadata: tuple[int, int, int]  # mode, uid, gid
+    generation: tuple[int, int, int]  # dev, inode, ctime_ns
 
 
 class WindowError(RuntimeError):
@@ -148,6 +159,29 @@ def _running(row):
             and row['Result'] == 'success')
 
 
+def _file_generation(info):
+    return info.st_dev, info.st_ino, info.st_ctime_ns
+
+
+def _file_metadata(info):
+    return stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid
+
+
+def _read_main(parent, name):
+    fd = os.open(name, SMALL_FILE, dir_fd=parent)
+    with os.fdopen(fd, 'rb') as source:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and 0 < before.st_size <= MAX_MAIN
+                and not before.st_mode & 0o7000 and not os.listxattr(fd), MAIN_DRIFT)
+        data = source.read(before.st_size + 1)
+        after = os.fstat(fd)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        require(len(data) == before.st_size and before.st_size == after.st_size == named.st_size
+                and _file_generation(before) == _file_generation(after) == _file_generation(named)
+                and _file_metadata(before) == _file_metadata(after) == _file_metadata(named), MAIN_DRIFT)
+    return MainImage(data, _file_metadata(before), _file_generation(before))
+
+
 class AgentWindow:
     """Single-use process-local capability; never resumed from old receipts.
 
@@ -169,6 +203,7 @@ class AgentWindow:
         self._quiet = None
         self._xray = None
         self._xray_joined = False
+        self._publication_entered = False
         self._slice_id = None
         self.phase = 'initial'
 
@@ -288,6 +323,81 @@ class AgentWindow:
 
     def require_quiet(self):
         self._check_quiet('same')
+
+    def _check_main_dir(self, parent):
+        held, named = os.fstat(parent), self._main.parent.lstat()
+        require(stat.S_ISDIR(named.st_mode) and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino), MAIN_DRIFT)
+
+    def read_main(self):
+        """Bounded descriptor-based read addressed to the fixed MAIN."""
+        try:
+            parent = os.open(self._main.parent, DIR)
+            try:
+                result = _read_main(parent, self._main.name)
+                self._check_main_dir(parent)
+                return result
+            finally:
+                os.close(parent)
+        except OSError:
+            raise WindowError(MAIN_DRIFT) from None
+
+    def publish_main(self, before, desired):
+        """One exact-generation CAS using reopened, journal-bound image bytes.
+
+        Caller must authenticate both artifacts and still own host authority.
+        A post-rename failure can never authorize a second publication.
+        """
+        require(self.phase == 'quiet' and not self._publication_entered and not self._xray_joined,
+                'REBUILD_AGENT_WINDOW_STATE')
+        self._publication_entered = True
+        require(type(before) is MainImage and type(desired) is bytes and 0 < len(desired) <= MAX_MAIN, MAIN_DRIFT)
+        self.require_quiet()
+        renamed = False
+        try:
+            parent = os.open(self._main.parent, DIR)
+            try:
+                name, scratch = self._main.name, '.c3-main-' + uuid4().hex
+                require(_read_main(parent, name) == before, MAIN_DRIFT)
+                stage = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                0o600, dir_fd=parent)
+                stage_id = None
+                try:
+                    with os.fdopen(stage, 'wb') as output:
+                        stage_id = _file_generation(os.fstat(stage))[:2]
+                        output.write(desired)
+                        output.flush()
+                        mode, uid, gid = before.metadata
+                        if _file_metadata(os.fstat(stage))[1:] != (uid, gid):
+                            os.fchown(stage, uid, gid)
+                        os.fchmod(stage, mode)
+                        os.fsync(stage)
+                        staged = MainImage(desired, before.metadata, _file_generation(os.fstat(stage)))
+                    self.require_quiet()
+                    self._check_main_dir(parent)
+                    require(_read_main(parent, scratch) == staged and _read_main(parent, name) == before, MAIN_DRIFT)
+                    renamed = True
+                    os.replace(scratch, name, src_dir_fd=parent, dst_dir_fd=parent)
+                    os.fsync(parent)
+                    result = _read_main(parent, name)
+                    self._check_main_dir(parent)
+                    require(result.generation[:2] == stage_id and result.metadata == before.metadata
+                            and result.data == desired, MAIN_DRIFT)
+                    return result
+                finally:
+                    if not renamed and stage_id is not None:
+                        info = os.stat(scratch, dir_fd=parent, follow_symlinks=False)
+                        require(_file_generation(info)[:2] == stage_id, MAIN_DRIFT)
+                        os.unlink(scratch, dir_fd=parent)
+                        os.fsync(parent)
+            finally:
+                os.close(parent)
+        except (OSError, WindowError) as error:
+            if renamed:
+                self.phase = 'publication-unconfirmed'
+                raise WindowError('REBUILD_MAIN_PUBLICATION_UNCONFIRMED') from None
+            if isinstance(error, WindowError):
+                raise
+            raise WindowError(MAIN_DRIFT) from None
 
     def join_xray_restart(self):
         """Accept the new generation only after the caller joins its restart."""

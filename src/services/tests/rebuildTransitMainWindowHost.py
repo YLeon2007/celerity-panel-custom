@@ -180,6 +180,47 @@ class Host(unittest.TestCase):
         self.assertCode('REBUILD_AGENT_RECONCILE_UNPROVED', self.guard.wait_reconciled)
         self.assertEqual(self.guard.phase, 'reconcile-unconfirmed')
 
+    def test_publish_cas_preserves_file_metadata_and_witnesses_own_inode(self):
+        self.main.chmod(0o640)
+        self.guard.quiesce()
+        before = self.guard.read_main()
+        desired = json.dumps(profile('b')).encode()
+        after = self.guard.publish_main(before, desired)
+        self.assertEqual(self.guard.read_main(), after)
+        self.assertEqual(after.data, desired)
+        self.assertEqual(after.metadata, before.metadata)
+        self.assertNotEqual(after.generation, before.generation)
+        self.assertCode('REBUILD_AGENT_WINDOW_STATE', lambda: self.guard.publish_main(after, before.data))
+
+    def test_identical_bytes_replacement_and_final_exclusion_loss_refuse(self):
+        for reason in ('inode', 'agent'):
+            with self.subTest(reason=reason):
+                root = self.root / reason
+                root.mkdir()
+                mgr = System(root)
+                path = root / 'config.json'
+                path.write_text(json.dumps(profile()))
+                wnd = m.AgentWindow(mgr, main=path, cgroup_root=root)
+                wnd.quiesce()
+                before = wnd.read_main()
+                if reason == 'inode':
+                    twin = root / 'replacement'
+                    twin.write_bytes(before.data)
+                    twin.replace(path)
+                else:
+                    quiet = wnd.require_quiet
+
+                    def fault_at_rename():
+                        if list(root.glob('.c3-main-*')):
+                            mgr.active = True
+                        quiet()
+
+                    wnd.require_quiet = fault_at_rename
+                with self.assertRaises(m.WindowError):
+                    wnd.publish_main(before, json.dumps(profile('b')).encode())
+                self.assertEqual(path.read_bytes(), before.data)
+                self.assertFalse(list(root.glob('.c3-main-*')))
+
     def test_queued_xray_heal_vetoes_stop_before_or_publish_after_drain(self):
         self.manager.xray_job = '8'
         self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', self.guard.quiesce)

@@ -252,10 +252,11 @@ def main():
             return {'raw': data.hex(), 'topology': hashlib.sha256(m.topology_bytes(m.parse_json(data), managed)).hexdigest()}
 
         def snapshot():
-            raw = BOOT.read_bytes()
-            st = BOOT.stat()
-            return {**image(raw), 'pid': core.pid, 'file': {'ino': str(st.st_ino), 'mode': st.st_mode,
-                    'uid': st.st_uid, 'gid': st.st_gid}, 'generation': mgr.xray_generation}
+            main = wnd.read_main()
+            mode_bits, uid, gid = main.metadata
+            dev, ino, ctime = main.generation
+            return {**image(main.data), 'pid': core.pid, 'file': {'dev': str(dev), 'ino': str(ino),
+                    'ctime': str(ctime), 'mode': mode_bits, 'uid': uid, 'gid': gid}, 'generation': mgr.xray_generation}
 
         original = snapshot()
         identities = []
@@ -285,9 +286,11 @@ def main():
                 return {'before': fresh, 'desired': image(json.dumps(actual).encode())}
             elif action == 'main-publication':
                 assert snapshot() == f['before']
-                wnd.require_quiet()
-                publish_bytes(BOOT, bytes.fromhex(f['desired']['raw']))
-                assert image(BOOT.read_bytes()) == f['desired']
+                raw, meta = bytes.fromhex(f['before']['raw']), f['before']['file']
+                before = m.MainImage(raw, (meta['mode'], meta['uid'], meta['gid']),
+                                     (int(meta['dev']), int(meta['ino']), int(meta['ctime'])))
+                written = wnd.publish_main(before, bytes.fromhex(f['desired']['raw']))
+                assert written.metadata == before.metadata and image(written.data) == f['desired']
             elif action == 'xray-restart':
                 wnd.require_quiet()
                 stop_core(core)
