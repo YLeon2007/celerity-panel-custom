@@ -173,8 +173,8 @@ test('portal exit choices, draft/Apply/readback and reactive routes (Firefox)', 
     await browser.fill('select[name="bridgeNodeId"]', relay);
     await browser.wait(`${el(exit)} && !${el(exit)}.disabled`, 2500);
     assert.deepEqual(await browser.evaluate(`Object.fromEntries(Array.from(${el(exit)}.options).slice(1).map(o => [o.value, o.textContent]))`),
-        { [shared]: names[shared], [selected]: names[selected], [geo]: names[geo] });
-    assert.equal(await browser.evaluate(`${el(exit)}.options.length`), 4, 'one option per target, including the geo target');
+        { [shared]: names[shared], [selected]: names[selected], [geo]: names[geo], [otherBridge]: names[otherBridge], [extra]: names[extra] });
+    assert.equal(await browser.evaluate(`${el(exit)}.options.length`), 6, 'one option per terminal bridge, including geo targets');
     assert.match(await browser.evaluate(text(`${create} label:has(${exit})`)), /Выход этого портала/);
     assert.equal(await browser.evaluate(`${el(exit)}.options[0].textContent`), 'Общий выход релея (по умолчанию)');
     assert.equal(await browser.evaluate(`${el(geoCheck)}.disabled`), true);
@@ -313,6 +313,7 @@ test('localized portal exit refusals block Preview/Apply and keep the editor (Fi
     await browser.start(process.env.TMPDIR || os.tmpdir());
     const cases = [
         { lang: 'ru', error: { code: 'REBUILD_PORTAL_EXIT_INVALID' }, key: 'badExit' },
+        { lang: 'ru', error: { code: 'REBUILD_PORTAL_EXIT_AMBIGUOUS' }, key: 'ambiguous' },
         { lang: 'en', error: { code: 'REBUILD_PORTAL_EXIT_UNSUPPORTED' }, key: 'unsupported' },
         { lang: 'zh-CN', error: { code: 'REBUILD_EXIT_IN_USE', portalNames: ['Portal P', 'Peer Q', 'Bad\nName', 'b'.repeat(24)] },
             key: 'inUseNamed', names: 'Portal P, Peer Q' },

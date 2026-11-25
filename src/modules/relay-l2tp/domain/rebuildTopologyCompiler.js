@@ -8,6 +8,7 @@ const DEFAULT_PRIORITY = 100; // CascadeLink.priority, including old lean docume
 const ID = /^[A-Za-z0-9_-]+$/;
 const ROLES = new Set(['portal', 'relay', 'bridge', 'standalone']);
 const PORTAL_EXIT_UNSUPPORTED = 'REBUILD_PORTAL_EXIT_UNSUPPORTED';
+const PORTAL_EXIT_AMBIGUOUS = 'REBUILD_PORTAL_EXIT_AMBIGUOUS';
 const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 
 function requireRebuild(condition, code) {
@@ -75,25 +76,55 @@ function selectDefaultLink(links) {
     return links.find(link => link.id === selection.pathKey) ?? null;
 }
 
-function resolvePortalExits(portal, picks, byNodeId) {
+// Compute reachability once per selected bridge, in reverse topological order.
+// A geo-only transit leg is not an unrestricted path. An ambiguous preferred
+// suffix must not silently select a less preferred path.
+function exitResolver(byNodeId, nodeIds) {
+    const byExit = new Map();
+    return (relayId, nodeId) => {
+        if (byNodeId.get(nodeId)?.role !== 'bridge') return null;
+        if (!byExit.has(nodeId)) {
+            const reachable = new Map([[nodeId, {}]]);
+            for (let i = nodeIds.length - 1; i >= 0; i--) {
+                const entry = byNodeId.get(nodeIds[i]);
+                if (entry.role !== 'relay' || entry.node.useCustomConfig || (entry.node.type && entry.node.type !== 'xray')) continue;
+                const usable = entry.outgoing.filter(link => link.target === nodeId
+                    || (!link.domains && reachable.has(link.target)));
+                if (!usable.length) continue;
+                // Preserve a legacy direct pick even if the same bridge is
+                // reachable via a longer path. Order alternatives by priority.
+                const direct = usable.filter(link => link.target === nodeId);
+                const edge = selectDefaultLink(direct.length ? direct : usable);
+                reachable.set(entry.id, { edge, ambiguous: !edge || reachable.get(edge.target).ambiguous });
+            }
+            byExit.set(nodeId, reachable);
+        }
+        const reachable = byExit.get(nodeId);
+        const first = reachable.get(relayId);
+        if (!first) return null;
+        requireRebuild(!first.ambiguous, PORTAL_EXIT_AMBIGUOUS);
+        const path = [];
+        for (let step = first; step.edge; step = reachable.get(step.edge.target)) path.push(step.edge);
+        return path.length ? path : null;
+    };
+}
+
+function resolvePortalExits(portal, picks, byNodeId, resolvePath) {
     const geo = unshadowedGeoLinks(portal);
     for (const [incoming, { nodeId, relayGeo }] of picks) {
-        const relay = byNodeId.get(incoming.target);
-        const target = byNodeId.get(nodeId);
-        // Only this relay's live compiled edges qualify, including geo edges.
-        // A missing exit or any tied priority fails closed instead of using the shared default.
-        const selected = target?.hasExit && selectDefaultLink(relay.outgoing.filter(edge => edge.target === nodeId));
-        requireRebuild(selected, PORTAL_EXIT_INVALID);
+        const path = resolvePath(incoming.target, nodeId);
+        requireRebuild(path, PORTAL_EXIT_INVALID);
         requireRebuild(incoming === portal.defaultLink || geo.has(incoming), PORTAL_EXIT_UNSUPPORTED);
-        const geoLinks = relayGeo ? relay.geoLinks : [];
+        const selected = path.at(-1);
+        const geoLinks = relayGeo ? byNodeId.get(selected.source).geoLinks : [];
         const endsInRelay = edge => {
             const target = byNodeId.get(edge.target);
             return target.hasExit && target.role === 'relay';
         };
         // A closed geo branch still blocks its matches. A live branch into
         // another relay would turn this into a policy for more than one relay.
-        requireRebuild(!endsInRelay(selected) && !geoLinks.some(endsInRelay), PORTAL_EXIT_UNSUPPORTED);
-        incoming.portalExit = { geoLinks, defaultLink: selected };
+        requireRebuild(!geoLinks.some(endsInRelay), PORTAL_EXIT_UNSUPPORTED);
+        incoming.portalExit = { geoLinks, defaultLink: selected, path };
     }
 }
 
@@ -167,6 +198,7 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
     }
     requireRebuild(nodeIds.length === byNodeId.size, 'REBUILD_CYCLE');
 
+    const resolvePath = exitResolver(byNodeId, nodeIds);
     for (let i = nodeIds.length - 1; i >= 0; i--) {
         const entry = byNodeId.get(nodeIds[i]);
         entry.isExit = entry.role === 'bridge' && entry.incoming.length > 0;
@@ -177,7 +209,7 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
         entry.hasExit = entry.isExit || !!entry.defaultLink || routedLinks.length > 0;
         if (entry.role === 'portal' && portalPicks.size) {
             const picks = entry.outgoing.filter(link => portalPicks.has(link)).map(link => [link, portalPicks.get(link)]);
-            if (picks.length) resolvePortalExits(entry, picks, byNodeId);
+            if (picks.length) resolvePortalExits(entry, picks, byNodeId, resolvePath);
         }
         // Native reverse does not carry route-only sniff metadata. Work out
         // whether a client (or forward-hop) sniff must replace the destination
@@ -191,11 +223,12 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
         entry.hasDomainPolicy = (entry.hasExit && entry.geoLinks.some(link => link.domains.length > 0))
             || routedLinks.some(hasDomainPolicy);
         entry.carryDomain = routedLinks.some(link => (!link.portalExit && byNodeId.get(link.target).carryDomain)
-            || (link.mode === 'reverse' && hasDomainPolicy(link)));
+            || ((link.mode === 'reverse' || link.portalExit?.path.slice(0, -1).some(edge => edge.mode === 'reverse'))
+                && hasDomainPolicy(link)));
     }
     const orderedNodes = new Map(nodeIds.map(id => [id, byNodeId.get(id)]));
     const orderedLinks = new Map([...byLinkId].sort(([a], [b]) => compare(a, b)));
     return { nodeIds, byNodeId: orderedNodes, byLinkId: orderedLinks };
 }
 
-module.exports = { compileRebuildGraph, rebuildId, requireRebuild, normalizeRebuildExit };
+module.exports = { compileRebuildGraph, rebuildId, requireRebuild, normalizeRebuildExit, PORTAL_EXIT_AMBIGUOUS };

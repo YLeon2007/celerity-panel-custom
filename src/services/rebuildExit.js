@@ -1,7 +1,7 @@
 'use strict';
 
 const { Types: { ObjectId } } = require('mongoose');
-const { compileRebuildGraph } = require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
+const { compileRebuildGraph, PORTAL_EXIT_AMBIGUOUS } = require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
 const { normalizeRebuildExit, PORTAL_EXIT_INVALID } = require('../modules/relay-l2tp/domain/rebuildPortalExit');
 const PORTAL_EXIT_UNSUPPORTED = 'REBUILD_PORTAL_EXIT_UNSUPPORTED';
 const fail = code => Object.assign(new Error(code), { code });
@@ -77,12 +77,12 @@ async function validateExit({ Link, Node, selector, from, to, ingress, component
     const nodes = [from, to, ...await Node.find({ _id: { $in: peers } })
         .select('role cascadeRole type active useCustomConfig').lean()];
     const target = nodes.find(node => id(node._id) === targetId);
-    if (!['bridge', 'relay'].includes(role(target)) || target.type !== 'xray'
+    if (role(target) !== 'bridge' || target.type !== 'xray'
         || target.active !== true || target.useCustomConfig) throw invalid();
     try {
         compileRebuildGraph({ nodes, links: links.filter(row => scope.has(id(row.portalNode)) && scope.has(id(row.bridgeNode))) });
     } catch (error) {
-        throw error?.code === PORTAL_EXIT_UNSUPPORTED ? fail(PORTAL_EXIT_UNSUPPORTED) : invalid();
+        throw [PORTAL_EXIT_UNSUPPORTED, PORTAL_EXIT_AMBIGUOUS].includes(error?.code) ? fail(error.code) : invalid();
     }
 }
 
@@ -90,7 +90,7 @@ const inUseRefusals = new WeakMap();
 const exitRefusalForError = error => inUseRefusals.get(error);
 const primary = query => query.read('primary').readConcern('majority');
 const liveEdge = row => row.active === true && row.rebuildDelete !== true && row.lifecycle?.state !== 'deleting';
-const edgeKey = (relay, target) => `${relay}/${target}`;
+
 const pinRows = (Link, filter) => primary(Link.find(filter)
     .select('_id portalNode bridgeNode active lifecycle rebuildDelete rebuildExit rebuildApplied rebuildAppliedExit')).lean();
 
@@ -107,27 +107,45 @@ function pinsMatch(row, matches) {
 async function assertExitsUnused({ Link, Node, removedIds, retiredNodeId }) {
     const removing = new Set(removedIds.map(id).filter(Boolean));
     if (!removing.size) return;
-    const edgeRead = filter => primary(Link.find(filter).select('_id portalNode bridgeNode active rebuildDelete lifecycle')).lean();
-    const removed = await edgeRead({ _id: { $in: [...removing] }, active: true });
-    const relays = new Set(), targets = new Set(), lost = new Set();
-    for (const row of removed) {
-        const relay = id(row.portalNode), target = id(row.bridgeNode);
-        if (!relay || !target) continue;
-        relays.add(relay); targets.add(target); lost.add(edgeKey(relay, target));
-    }
-    if (!lost.size) return;
-    const relaysIn = { $in: [...relays] }, targetsIn = { $in: [...targets] };
-    const edges = await edgeRead({ portalNode: relaysIn, bridgeNode: targetsIn, active: true });
-    for (const row of edges) if (!removing.has(id(row._id)) && liveEdge(row)) {
-        lost.delete(edgeKey(id(row.portalNode), id(row.bridgeNode)));
-    }
-    if (!lost.size) return;
-    const rows = await pinRows(Link, { bridgeNode: relaysIn, $or: [
-        { 'rebuildExit.nodeId': targetsIn }, { 'rebuildAppliedExit.nodeId': targetsIn },
-    ] });
+    const rows = await primary(Link.find({ $or: [{ active: true }, { rebuildApplied: { $ne: null } }] })
+        .select('_id portalNode bridgeNode active lifecycle rebuildDelete geoRouting rebuildExit rebuildApplied rebuildAppliedExit')).lean();
+    if (!rows.some(row => removing.has(id(row._id)))) return;
     const retired = id(retiredNodeId);
-    await refusePinnedPortals(Node, rows.filter(row => !(retired && id(row.portalNode) === retired)
-        && pinsMatch(row, target => lost.has(edgeKey(id(row.bridgeNode), target)))));
+    const outgoing = new Map();
+    for (const row of rows) {
+        const from = id(row.portalNode);
+        if (!outgoing.has(from)) outgoing.set(from, []);
+        outgoing.get(from).push(row);
+    }
+    // Applied rows are independent of the next desired selector. Legacy
+    // active rows without an explicit "unapplied" receipt may still serve.
+    // A draft-only row is not proof of an alternative applied path.
+    const available = (row, applied, after) => {
+        if (after && (removing.has(id(row._id)) || !liveEdge(row))) return false;
+        if (applied && row.rebuildApplied != null) return true;
+        return row.active === true && (!applied || row.rebuildApplied !== null)
+            && (liveEdge(row) || removing.has(id(row._id)));
+    };
+    const used = (start, target, applied, after) => {
+        const seen = new Set([start]);
+        for (const from of seen) {
+            for (const row of outgoing.get(from) ?? []) {
+                if (!available(row, applied, after)) continue;
+                const next = id(row.bridgeNode);
+                if (next === target) return true;
+                if (next && row.geoRouting?.enabled !== true) seen.add(next);
+            }
+        }
+        return false;
+    };
+    await refusePinnedPortals(Node, rows.filter(row => {
+        if (retired && id(row.portalNode) === retired) return false;
+        const start = id(row.bridgeNode);
+        const desired = liveEdge(row) && id(row.rebuildExit?.nodeId);
+        const applied = row.rebuildApplied != null && id(row.rebuildAppliedExit?.nodeId);
+        return [[desired, false], [applied, true]].some(([target, observed]) => target
+            && used(start, target, observed, false) && !used(start, target, observed, true));
+    }));
 }
 
 // An edit to the portal itself can invalidate its ingress regardless of how

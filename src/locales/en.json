@@ -2081,6 +2081,7 @@
         "actual": "Current route: {route}",
         "draft": "Draft (not applied): {route}",
         "badExit": "The selected node is not an eligible exit for this portal and relay. Choose an available exit node.",
+        "ambiguous": "The selected bridge has an ambiguous route: eligible links share a priority. Assign distinct priorities.",
         "unsupported": "A separate portal exit is not supported by this routing policy.",
         "inUse": "This change would leave one or more portals without their selected exit node. Change those portals’ exits first.",
         "inUseNamed": "This change would leave these portals without their selected exit node: {names}. Change those portals’ exits first."

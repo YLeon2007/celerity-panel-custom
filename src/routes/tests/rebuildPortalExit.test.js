@@ -313,7 +313,34 @@ test('registered MCP creates and updates Rebuild drafts without Apply or host op
     assert.deepEqual(effects, []);
 });
 
-test('mounted REST/MCP refuse selected relay and geo relay chains and a non-routed portal ingress', async t => {
+test('mounted REST/MCP resolve a terminal bridge and guard its applied path on removal', async t => {
+    const { send, tool, nodes, rows, insert, effects } = fixture(t);
+    const tail = new ObjectId('00000000000000000000000a');
+    const transit = new ObjectId('00000000000000000000000b');
+    nodes.push({ _id: tail, name: 'Tail relay', cascadeRole: 'relay', type: 'xray', active: true });
+    const via = { ...rows[0], _id: transit, bridgeNode: tail, priority: 1 };
+    rows[0].portalNode = tail;
+    rows.push(via, { ...via, _id: new ObjectId('00000000000000000000000c') });
+    const spec = { ...create, rebuildExit: choose(ids.bridge, false) };
+    const code = 'REBUILD_PORTAL_EXIT_AMBIGUOUS';
+    assert.deepEqual(await send('POST', '/links', spec), { status: 409, json: { error: { code } } });
+    assert.deepEqual(await tool('manage_cascade', { action: 'create', data: spec }), { status: 409, code, error: code });
+    assert.equal(insert.mock.callCount(), 0);
+    rows.pop();
+    const saved = await send('POST', '/links', spec);
+    assert.equal(saved.status, 200, JSON.stringify(saved.json));
+    const ingress = rows.find(row => String(row._id) === saved.json.linkId);
+    ingress.rebuildAppliedExit = ingress.rebuildExit;
+    ingress.rebuildExit = choose(new ObjectId(ids.otherBridge), false);
+    ingress.rebuildApplied = { listener: ingress.portalNode, mode: 'reverse', protocol: 'vless', port: 42009, uuid: 'fixture' };
+    for (const linkId of [String(transit), ids.exit]) {
+        const result = await send('POST', '/rebuild/preview', { linkId, remove: true });
+        assert.deepEqual(result, { status: 409, json: { error: { code: 'REBUILD_EXIT_IN_USE', portalNames: ['portal'] } } });
+    }
+    assert.deepEqual(effects, []);
+});
+
+test('mounted REST/MCP refuse a relay exit, live geo transit and a non-routed portal ingress', async t => {
     const { send, tool, nodes, rows, insert, update, effects } = fixture(t);
     const extraRelay = new ObjectId('00000000000000000000000a');
     const chain = new ObjectId('00000000000000000000000b');
@@ -329,7 +356,8 @@ test('mounted REST/MCP refuse selected relay and geo relay chains and a non-rout
         const mcp = await tool('manage_cascade', { action: id ? 'update' : 'create', ...(id && { id }), data });
         assert.deepEqual(mcp, { status: 409, code, error: code });
     }
-    await unsupported({ ...create, rebuildExit: choose(String(extraRelay), false) });
+    assert.deepEqual(await send('POST', '/links', { ...create, rebuildExit: choose(String(extraRelay), false) }),
+        { status: 400, json: { error: { code: 'REBUILD_PORTAL_EXIT_INVALID' } } });
     rows[2].geoRouting = { enabled: true, domains: ['geo.fixture.invalid'] };
     await unsupported({ ...create, rebuildExit: choose(ids.bridge) });
     assert.equal(insert.mock.callCount() + update.mock.callCount(), 0);

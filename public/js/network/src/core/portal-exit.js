@@ -44,13 +44,17 @@ function relayEdges(index, relay) {
 
 const directExit = (index, link) => index.nodes.get(link.target)?.cascadeRole === 'bridge';
 function exitChoiceNodes(index, relay) {
-    const groups = new Map();
-    for (const link of relayEdges(index, relay)) {
-        if (!directExit(index, link) || !hexId(link.target)) continue;
-        if (!groups.has(link.target)) groups.set(link.target, []);
-        groups.get(link.target).push(link);
+    const relays = new Set([relay]), bridges = new Set();
+    for (const current of relays) {
+        for (const link of relayEdges(index, current)) {
+            if (!hexId(link.target)) continue;
+            if (directExit(index, link)) bridges.add(link.target);
+            else if (link.geoRouting?.enabled === false) relays.add(link.target);
+        }
     }
-    return [...groups.values()].map(lowestUniquePriority).filter(Boolean).map(link => index.nodes.get(link.target));
+    // The server is authoritative for priorities and can return an explicit
+    // ambiguity diagnostic. Do not disguise ambiguity as a missing bridge.
+    return [...bridges].map(nodeId => index.nodes.get(nodeId));
 }
 const isGeo = link => link.geoRouting?.enabled === true;
 const isPending = link => link.hasUnappliedChanges === true || link.status === 'pending' || link.status === 'staged'

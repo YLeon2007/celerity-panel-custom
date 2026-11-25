@@ -56,6 +56,7 @@ function refusalInfo(err, editing = false) {
         if (code === 'REBUILD_PORTAL_EXIT_INVALID' || code === 'REBUILD_INVALID_EXIT') {
             return { message: t('map.portalExit.badExit'), notSaved: true };
         }
+        if (code === 'REBUILD_PORTAL_EXIT_AMBIGUOUS') return { message: t('map.portalExit.ambiguous'), notSaved: true };
         if (code === 'REBUILD_PORTAL_EXIT_UNSUPPORTED') return { message: t('map.portalExit.unsupported'), notSaved: true };
         if (code === 'REBUILD_EXIT_IN_USE') {
             const names = portalNames(error, err.body.details);

@@ -229,8 +229,13 @@ function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}
                 }
             }
             for (const incoming of entry.incoming) {
-                if (incoming.portalExit) addPolicy(main, [ingressTag(incoming)], incoming.portalExit, graph,
-                    `${REBUILD_POLICY_RULE_PREFIX}portal-${short(incoming)}-`);
+                if (incoming.portalExit) {
+                    // Refuse until scoped transport is prepared. Never emit a
+                    // last-hop outbound tag on the wrong relay.
+                    requireRebuild(incoming.portalExit.path.length === 1, 'REBUILD_PORTAL_EXIT_UNSUPPORTED');
+                    addPolicy(main, [ingressTag(incoming)], incoming.portalExit, graph,
+                        `${REBUILD_POLICY_RULE_PREFIX}portal-${short(incoming)}-`);
+                }
             }
             // Keep the shared rules (including their transit tags) unchanged.
             // In an entirely closed component omit geo DNS; otherwise a dead

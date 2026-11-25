@@ -31,6 +31,7 @@ const clientSniff = (profiles, n) => config(profiles, n).inbounds.find(i => i.ta
 const bytes = value => JSON.stringify(value);
 const digest = text => createHash('sha256').update(text).digest('hex');
 const INVALID = { code: 'REBUILD_PORTAL_EXIT_INVALID' };
+const AMBIGUOUS = { code: 'REBUILD_PORTAL_EXIT_AMBIGUOUS' };
 const UNSUPPORTED = { code: 'REBUILD_PORTAL_EXIT_UNSUPPORTED' };
 
 const nodes = [node(1, 'portal'), node(2, 'portal'), node(3, 'portal'), node(4, 'relay', {
@@ -193,7 +194,7 @@ test('any live duplicate priority within the selected node blocks; other nodes a
         const faster = edge(42, 4, 6, { priority: 1 });
         for (const base of [enabled, [...enabled, faster]]) {
             for (const ordered of [[...base, tied], [tied, ...base.slice().reverse()]]) {
-                assert.throws(() => compileRebuildGraph({ nodes, links: ordered }), INVALID);
+                assert.throws(() => compileRebuildGraph({ nodes, links: ordered }), AMBIGUOUS);
             }
         }
         for (const peer of [{ ...tied, active: false }, { ...tied, rebuildDelete: true },
@@ -223,14 +224,41 @@ test('requires a routed portal edge: ranked defaults and live geo are valid, sha
     }
 });
 
-test('rejects selected or copied live relay chains, but not unused chain routes', () => {
+test('resolves an explicitly selected terminal bridge through successive relays', () => {
+    const next = edge(31, 4, 9, { mode: 'forward', priority: 5 });
+    const last = edge(32, 9, 10, { priority: 3 });
+    const exit = edge(33, 10, 11);
+    const ru = edge(34, 10, 6, geo(['full:ru.invalid'], ['ru'], 1));
+    const peers = [...nodes, node(9, 'relay'), node(10, 'relay'), node(11, 'bridge')];
+    const rest = links.filter(l => l !== a);
+    const compile = (useGeo, added = [next, last, exit, ru]) => compileRebuildGraph({
+        nodes: peers, links: [...rest, ...added, { ...a, ...pick(11, useGeo) }],
+    });
+    for (const useGeo of [true, false]) {
+        const graph = compile(useGeo);
+        const policy = graph.byLinkId.get(a._id).portalExit;
+        assert.deepEqual(policy.path.map(link => link.id), [next, last, exit].map(link => link._id));
+        assert.equal(policy.defaultLink.id, exit._id);
+        assert.deepEqual(policy.geoLinks.map(link => link.id), useGeo ? [ru._id] : []);
+        assert.equal(graph.byNodeId.get(a.portalNode).carryDomain, useGeo);
+        assert.equal(graph.byNodeId.get(next.bridgeNode).carryDomain, true, 'the shared policy still needs the domain');
+    }
+    const unordered = compile(true, [ru, exit, last, next]);
+    assert.deepEqual(unordered.byLinkId.get(a._id).portalExit.path.map(link => link.id), [next, last, exit].map(link => link._id));
+    assert.throws(() => compile(true, [last, exit, ru]), INVALID);
+    const conflictingNext = edge(36, 4, 9, { priority: 5 });
+    assert.throws(() => compile(true, [next, last, exit, ru, conflictingNext]), AMBIGUOUS);
+    assert.throws(() => compile(true, [next, last, exit, ru, edge(37, 10, 4)]), { code: 'REBUILD_CYCLE' });
+});
+
+test('rejects selecting a relay or copying live geo relay branches; unused chains remain valid', () => {
     const secondRelay = node(9, 'relay');
     const tail = edge(30, 9, 7);
     const chain = edge(31, 4, 9, { priority: 5 });
     const other = links.filter(l => l !== a);
     const compile = (choice, intermediate = chain) => compileRebuildGraph({ nodes: [...nodes, secondRelay],
         links: [...other, intermediate, tail, { ...a, ...choice }] });
-    assert.throws(() => compile(pick(9, false)), UNSUPPORTED);
+    assert.throws(() => compile(pick(9, false)), INVALID);
     assert.doesNotThrow(() => compile(pick(7)), 'a shared default is not part of the portal policy');
     const geoChain = { ...chain, ...geo(['full:multi-hop.invalid']) };
     assert.throws(() => compile(pick(7), geoChain), UNSUPPORTED);
