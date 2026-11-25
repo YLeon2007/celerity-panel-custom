@@ -85,6 +85,7 @@ if (a.proof || a.matrix) {
         }
         if (new Set(descriptions.slice(-2).map(row => row.id)).size !== 2) throw new Error('shared distinct policies');
     }
+
     if (a.proof) {
         const { transitProofProfiles } = require('./transit-proof.cjs');
         proofs = channels.artifacts.map((channel, i) => {

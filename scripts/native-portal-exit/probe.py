@@ -246,7 +246,7 @@ def tunnel_tag(link, incoming):
     return f"{prefix}-{link['id'][-8:]}"
 
 
-def probe(case, ports, origins, links, chain=False, matrix=False):
+def probe(case, ports, origins, links, chain=False, matrix=False, staged=False):
     hosts = {'domain': GEO, 'other': OTHER_GEO, 'control': 'panel.fixture.invalid'}
     ppp = case.portal in ('ppp', 'ppp-island')
     host = hosts.get(case.kind, PPP_IP if ppp else VIRTUAL_IP)
@@ -259,11 +259,18 @@ def probe(case, ports, origins, links, chain=False, matrix=False):
             middle = links[7]
             checks = [(Path('gateway-main.access.log'), 'rebuild-relay-ingress', tunnel_tag(middle, False)),
                       (Path('tail-main.access.log'), tunnel_tag(middle, True), tunnel_tag(links[case.edge], False))]
+    elif matrix and case.portal in ('stage-p1', 'stage-p2'):
+        sock = ports[case.portal]
+        middle = next(link for link in links.values() if link.get('selectedBy') == case.portal.removeprefix('stage-'))
+        checks = [(Path('gateway-main.access.log'), case.portal, tunnel_tag(middle, False)),
+                  (Path('tail-main.access.log'), tunnel_tag(middle, True), tunnel_tag(links[case.edge], False))]
     else:
         sock = ports[f'socks-{case.portal}']
         ingress = next(link for link in links.values() if link['source'] == case.portal)
         if matrix:
             middle = next((link for link in links.values() if link.get('selectedBy') == case.portal), None)
+            if middle and staged:
+                middle = links[7]
         else:
             middle = links[7 if case.portal == 'p1' else 8] if chain and case.portal != 'p3' else None
         if case.want is not None:
@@ -415,11 +422,13 @@ def scoped_proofs(proofs, cert, cover_port, evidence):
 
 
 
-def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=False):
+def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=False, stage=False):
     evidence['netns'] = namespace(parent_net)
     evidence['source_sha256'] = source_digests()
     if proof:
         evidence['proof_source_sha256'] = digest('/scripts/transit-proof.cjs')
+    if stage:
+        evidence['switch_source_sha256'] = digest('/scripts/stage-switch.py')
     if matrix:
         # Minimal synthetic protobuf GeoIPList with PRIVATE -> 127/8 only.
         Path('/work/assets/geoip.dat').write_bytes(b'\x0a\x13\x0a\x07PRIVATE\x12\x08\x0a\x04\x7f\0\0\0\x10\x08')
@@ -434,12 +443,14 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     ports = ports_for(['cover', *clients, *relays, *(f'api-{n}' for n in server_labels),
                        *(f'link-{i}' for i in range(n_links)), *(f'socks-{n}' for n in clients),
                        *(f'sink-{n}' for n in BRIDGES), *(['ppp-gateway', 'ppp-island'] if matrix else []),
+                       *(['stage-p1', 'stage-p2'] if stage else []),
                        *((f'proof-{side}-{i}' for side in ('request', 'origin') for i in range(2)) if proof else ())])
     evidence['ports'] = ports
     cert, key = '/work/cover.crt', '/work/cover.key'
     checked(['openssl', 'req', '-config', '/dev/null', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', f'/CN={SNI}',
              '-addext', f'subjectAltName=DNS:{SNI}', '-out', cert, '-keyout', key])
-    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred, chain=chain, proof=proof, matrix=matrix,
+    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred,
+                   chain=chain, proof=proof, matrix=matrix,
                    reality=reality_keys(n_links, ports['cover']))
     raw = checked(['node', '/scripts/compose.cjs'], input=json.dumps(fixture))
     Path('composer-output.json').write_text(raw + '\n')
@@ -487,6 +498,26 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             ppp.clear()
             ppp.update(tag=tag, listen=LO, port=port, protocol='socks', settings={'auth': 'noauth'})
             dump(f'{node}-main.json', config)
+    scoped_rule_tags = []
+    if stage:
+        gateway = configs['gateway-main']
+        desired = deepcopy(gateway['routing'])
+        scoped_rule_tags = [rule['ruleTag'] for rule in desired['rules'] if rule.get('ruleTag', '').startswith('rebuild-policy-portal-')]
+        require(len(set(scoped_rule_tags)) == len(scoped_rule_tags) == 2, 'fixture needs exactly two scoped ingress selectors')
+        keep = [rule for rule in desired['rules'] if rule.get('ruleTag') not in scoped_rule_tags]
+        gateway['api']['services'].append('RoutingService')
+        probes = []
+        for ln in generated['links']:
+            if 'selectedBy' not in ln:
+                continue
+            tag = f'stage-{ln["selectedBy"]}'
+            gateway['inbounds'].append({'tag': tag, 'listen': LO, 'port': ports[tag], 'protocol': 'socks'})
+            probes.append({'type': 'field', 'ruleTag': tag, 'inboundTag': [tag], 'outboundTag': tunnel_tag(ln, False)})
+        require(len(probes) == 2, 'missing staged probe inputs')
+        gateway['routing'] = {**desired, 'rules': [*probes, *keep]}
+        dump('gateway-main.json', gateway)
+        dump('staged-routes.json', {'routing': gateway['routing']})
+        dump('desired-routes.json', {'routing': desired})
     print(f'CONFIG OK {len(configs)}/{len(configs)} (all emitted profiles + synthetic subscriber)')
 
     b = 6 if preferred else 3
@@ -519,6 +550,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         listens += [(n, ports[n]) for n in clients] + [('subscriber', ports[f'socks-{n}']) for n in clients]
         if matrix:
             listens += [(node, ports[f'ppp-{node}']) for node in generated['pppTags']]
+        if stage:
+            listens += [('gateway', ports[tag]) for tag in ('stage-p1', 'stage-p2')]
         wait_until('PID-owned tunnel/portal/SOCKS listeners', children,
                    lambda: all(sockets(port, children[owner]) for owner, port in listens), 6)
         reverse = [ln for ln in generated['links'] if ln['mode'] == 'reverse']
@@ -536,14 +569,32 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         evidence['reverse_readiness'] = {'socket_paths': [f"{ln['source']}->{ln['target']}" for ln in reverse],
                                          'minimum_auth_records_per_listener_process': reverse_owners}
         print(f'REVERSE READY {len(reverse)}/{len(reverse)}')
-        def verify_case(case):
-            result = probe(case, ports, origins, links, chain, matrix)
+        def verify_case(case, staged=False):
+            result = probe(case, ports, origins, links, chain, matrix, staged=staged)
             evidence['probes'].append(result)
             print(f'{case.name}: HTTP {result["actual"] or "NO MARKER"} (want {case.want})')
             require(result['actual'] == case.want, f'{case.name}: wrong origin')
 
+        if stage:
+            # Prove both old subscriber routes and the new scoped channels
+            # through the same live processes before changing the selectors.
+            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+            verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+            verify_case(Probe('stage-p1', 'numeric', 'B', 3), staged=True)
+            verify_case(Probe('stage-p2', 'other', 'A', 2), staged=True)
+            server = f'--server={LO}:{ports["api-gateway"]}'
+            checked([XRAY, 'api', 'adrules', server, 'desired-routes.json'])
+            wait_until('original staged process and all listeners retained', children,
+                       lambda: all(sockets(port, children[owner]) for owner, port in listens), 4)
         for case in cases:
             verify_case(case)
+        if stage:
+            server = f'--server={LO}:{ports["api-gateway"]}'
+            checked([XRAY, 'api', 'adrules', server, 'staged-routes.json'])
+            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+            verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+            checked([XRAY, 'api', 'adrules', server, 'desired-routes.json'])
+            verify_case(Probe('p1', 'numeric', 'B', 3))
         if matrix:
             # Remove one incoming listener in the actual, still-running MAIN.
             # Do not remove its route or damage the neighboring/shared policy.
@@ -575,6 +626,26 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                            cut['mode'] != 'reverse' or sockets(cut['port'], children[owner], established=True)), 18)
             verify_case(Probe('p1', 'domain', 'A', 4))
             verify_case(Probe('p1', 'numeric', 'B', 3))
+        if stage:
+            # A fresh writer dies after a real routing update. The observer
+            # must read the live result and leave the unacknowledged intent;
+            # it has no permission to send that write a second time.
+            server = f'--server={LO}:{ports["api-gateway"]}'
+            checked([XRAY, 'api', 'adrules', server, 'staged-routes.json'])
+            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+            before = checked([XRAY, 'api', 'lsrules', server])
+            writer = cmd([sys.executable, '-I', '-B', '/scripts/stage-switch.py',
+                          str(ports['api-gateway']), str(children['gateway'].pid), parent_net])
+            require(writer.returncode == 77 and not writer.stdout and not writer.stderr, 'expected lost reply after real switch')
+            intent = json.loads(Path('switch.intent.json').read_text())
+            require(intent == {'version': 1, 'step': 'switch_ingress', 'netns': evidence['netns'],
+                    'pid': children['gateway'].pid, 'started': Path(f'/proc/{children["gateway"].pid}/stat').read_text().rsplit(') ', 1)[1].split()[19],
+                    'from': digest('staged-routes.json'), 'to': digest('desired-routes.json')}, 'switch intent is not pinned')
+            after = checked([XRAY, 'api', 'lsrules', server])
+            require(before != after and all(tag not in before and tag in after for tag in scoped_rule_tags), 'live rule readback did not change')
+            verify_case(Probe('p1', 'numeric', 'B', 3))
+            require(json.loads(Path('switch.intent.json').read_text()) == intent, 'read-only reconciliation changed intent')
+            evidence['lost_reply'] = {'intent': intent, 'writer_status': writer.returncode, 'observed': 'desired', 'acknowledged': False}
         require(all(child.poll() is None for child in children.values()), 'child exited during HTTP probes')
     require(set(reaped) == set(run_configs.values()) | {'cover'} and all(
         r['early_exit'] is None and not r['forced_kill'] and r['status'] in (0, -signal.SIGTERM) for r in reaped.values()),
@@ -582,8 +653,10 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     require(not checked(['ss', '-Hltun']).strip(), 'unexpected listeners left after fixture cleanup')
     print(f'REAPED {len(reaped)} children; no TCP/UDP listeners remain')
     require(evidence['source_sha256'] == source_digests(), 'composer inputs changed during the run')
+    if stage:
+        require(evidence['switch_source_sha256'] == digest('/scripts/stage-switch.py'), 'stage writer changed during the run')
     rows = evidence['probes']
-    expected_count = len(cases) + (5 if matrix else 0)
+    expected_count = len(cases) + (5 if matrix else 0) + (9 if stage else 0)
     if len(rows) == expected_count and all(row['actual'] == row['expected'] for row in rows):
         print(f'PASS {len(rows)}/{len(rows)} HTTP marker/block checks and exact relay channels')
         evidence['result'] = 'PASS'
@@ -602,10 +675,11 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, stop)
     parent_net, mode, preferred, source, chain = sys.argv[1:]
     evidence = {'source_root': source, 'mode': mode, 'preferred': preferred == 'yes', 'chain_probe': chain == 'yes',
-                'scoped_proof': chain == 'proof', 'scoped_matrix': chain == 'matrix'}
+                'scoped_proof': chain == 'proof', 'scoped_matrix': chain == 'matrix', 'staged_matrix': chain == 'stage'}
     status = 2
     try:
-        status = run(parent_net, mode, preferred == 'yes', evidence, chain in ('yes', 'proof', 'matrix'), chain == 'proof', chain == 'matrix')
+        status = run(parent_net, mode, preferred == 'yes', evidence, chain != 'no',
+                     chain == 'proof', chain in ('matrix', 'stage'), chain == 'stage')
     except (Exception, KeyboardInterrupt) as exc:
         evidence.update(result='INFRA_ERROR', error=str(exc))
         print(f'ERROR: {exc}', file=sys.stderr)
