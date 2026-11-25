@@ -7,6 +7,7 @@ const {withNodes,makeLocks}=require('./rebuildLocks');
 const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTopologyComposer');
 const {compileRebuildGraph}=require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
 const {buildTransitChannels}=require('../modules/relay-l2tp/services/rebuildTransitChannels');
+const {planSerialScopedTransition}=require('./rebuildTransitActivationPlan');
 const {createTransport,createBoundRelayTransport,profileBytes,profileSha256}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {assertRealityFingerprint,realityEndpoints}=require('./rebuildRealityFingerprint');
@@ -380,7 +381,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     const main=retire?baseline.get(id).main:await transports.get(id).read('main');
                     if(hasProtectedClientInbound(main,node.xray?.inboundTag||'vless-in'))bridgesWithClientInbound.add(id);
                 }
-                const candidates=compose({nodes,links:prepared,dialerVersions:endpointVersions,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses});
+                const composition={nodes,links:prepared,dialerVersions:endpointVersions,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses};
+                const candidates=compose(composition);
                 if(retire&&candidates.some(p=>p.profile==='bridge'
                     &&profilePreview(baseline.get(p.nodeId).bridge??emptyBridge,p.config,'main').protectedChanged)){
                     throw fail('REBUILD_CLIENT_CHANGE');
@@ -392,6 +394,16 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     const graph=compileRebuildGraph({nodes,links:prepared,affectedNodeIds:ids});
                     if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1)){
                         transit={multiHop:true,blocked:true,after:buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}))};
+                        if(!retire&&!req.remove)transit.planRestarts=before=>{
+                            try {
+                                return planSerialScopedTransition({before,after:candidates,composition,allowMainRestart:true});
+                            } catch(error) {
+                                // This describes a plan, not live/boot attestation. Unsupported
+                                // transitions must not invent a schedule or weaken the refusal.
+                                if(error.code==='REBUILD_SCOPE_STAGE_UNPROVED')return [];
+                                throw error;
+                            }
+                        };
                     }
                 }
                 return {coreIdentities,kcpVersions,transit,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};

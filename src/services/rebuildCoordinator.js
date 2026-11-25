@@ -179,12 +179,14 @@ async function runGraph(d, req, retire = false) {
                 fingerprint.update(JSON.stringify(['mkcp-health-versions',kcpVersions]));
                 survivor?.update(JSON.stringify(['mkcp-health-versions',kcpVersions]));
             }
+            const transitPreimages=transit?.planRestarts && [];
             for(const nodeId of nodes){
                 const pair=candidates.filter(p=>p.nodeId===nodeId); pairs.set(nodeId,pair);
                 if(pair.length!==2||new Set(pair.map(p=>p.profile)).size!==2||!pair.every(p=>['main','bridge'].includes(p.profile)))throw fail('REBUILD_INCOMPLETE_PROFILES');
                 const profiles=[];
                 for(const p of pair){
                     const before=await d.read(nodeId,p.profile,true);
+                    transitPreimages?.push({nodeId,profile:p.profile,config:before});
                     if(observedMain&&p.profile==='main')observedMain.set(nodeId,before);
                     // Unlike ordinary Apply, retirement replaces every peer
                     // pair even if its links split off or all disappear.
@@ -202,7 +204,13 @@ async function runGraph(d, req, retire = false) {
                 report.push({nodeId,profiles});
             }
             const transitBlocked=!!transit?.blocked||!!observedMain&&hasObservedScopedTransit(observedMain);
-            const result={allowed:!transitBlocked&&!report.some(n=>n.profiles.some(p=>p.protectedChanged)),nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
+            const protectedChanged=report.some(n=>n.profiles.some(p=>p.protectedChanged));
+            if(transitPreimages&&!protectedChanged){
+                const counts=new Map();
+                for(const {nodeId} of transit.planRestarts(transitPreimages))counts.set(nodeId,(counts.get(nodeId)||0)+1);
+                for(const entry of report)if(counts.has(entry.nodeId))entry.mainRestartCount=counts.get(entry.nodeId);
+            }
+            const result={allowed:!transitBlocked&&!protectedChanged,nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
             if(transitBlocked)result.transitBlocked=true;
             if(survivor)result.survivorPreview=linkVersion+survivor.digest('hex');
             const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;

@@ -234,6 +234,8 @@ test('mounted Preview shows the actual two-relay path, Geo and new TCP listener 
     assert.equal(result.allowed, false);
     assert.equal(result.transitBlocked, true);
     const portal = result.nodes.find(n => n.nodeId === p), relay = result.nodes.find(n => n.nodeId === r);
+    assert.deepEqual(result.nodes.filter(node => node.mainRestartCount).map(node => [node.nodeId, node.mainRestartCount]).sort(),
+        [[p, 1], [r, 2], [relay2, 2]].sort());
     assert.deepEqual(portal.portalExitPath.before.map(hop => hop.nodeId), [r, relay2, b]);
     assert.deepEqual(portal.portalExitPath.after.map(hop => hop.nodeId), [r, relay2, a]);
     assert.deepEqual(portal.portalExitGeoChange, { before: [publicTarget(tailGeo, 'Other gateway')], after: [] });
@@ -261,6 +263,7 @@ for (const mode of ['reverse', 'forward']) {
         const result = await preview(inlet, false);
         assert.equal(result.allowed, false);
         assert.equal(result.transitBlocked, true);
+        assert.ok(result.nodes.every(node => !Object.hasOwn(node, 'mainRestartCount')));
         const portal = result.nodes.find(n => n.nodeId === p);
         assert.deepEqual(portal.portalExitPath.before.map(hop => hop.nodeId), [r, relay2, a]);
         assert.deepEqual(portal.portalExitPath.after.map(hop => hop.nodeId), [r, relay2, b]);
@@ -446,5 +449,19 @@ test('Blocked multi-relay details name profiles, paths and retired listeners on 
             assert.ok(text.includes(snippet), `${lang}: ${snippet}`);
         }
         assert.doesNotMatch(text, /network\.rebuildPreview|undefined/);
+    }
+});
+
+test('Preview warns about interrupted connections only on MAINs in the derived serial plan', async () => {
+    for (const [lang, warning, count] of [
+        ['en', 'Active connections will be interrupted', 'MAIN restarts in plan: 2'],
+        ['ru', 'Активные соединения прервутся', 'Перезапусков MAIN по плану: 2'],
+        ['zh-CN', '现有连接会中断', '计划重启 MAIN 次数：2'],
+    ]) for (const modern of [false, true]) {
+        const blocked = { transitBlocked: true };
+        const text = await previewDisplay({ mainRestartCount: 2 }, modern, lang, blocked);
+        assert.ok(text.includes(warning) && text.includes(count));
+        assert.ok(!(await previewDisplay({}, modern, lang, blocked)).includes(warning));
+        assert.ok(!(await previewDisplay({ mainRestartCount: 'foreign' }, modern, lang, blocked)).includes(warning));
     }
 });

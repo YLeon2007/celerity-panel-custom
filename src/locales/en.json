@@ -1576,6 +1576,8 @@
       "transitReplace": "replace profile",
       "transitListeners": "TCP tunnel listener",
       "transitBlocked": "The path is valid, but safe activation of multi-relay exits is not available. No profiles were changed.",
+      "mainRestartCount": "MAIN restarts in plan: {count}",
+      "mainRestartWarning": "Active connections will be interrupted on the listed nodes if the plan is applied or rolled back. MAIN services restart one at a time; affected portals are switched last on Apply.",
       "portalExitGeo": "Geo routes",
       "noPortalExit": "no exit",
       "unknownPortalExit": "unknown exit",

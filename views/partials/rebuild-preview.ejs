@@ -5,6 +5,7 @@ const previewKeys = [
     'inbounds', 'outbounds', 'routing', 'reverse', 'log', 'api', 'stats', 'policy', 'dns', 'observatory',
     'migration', 'settingsUnchanged', 'settingsChanged', 'exitLost', 'defaultExitLost', 'exitBlocked',
     'transitPath', 'transitGeoPaths', 'transitListeners', 'transitBlocked', 'transitCreate', 'transitReplace',
+    'mainRestartCount', 'mainRestartWarning',
 ];
 const previewLabels = Object.fromEntries(previewKeys.map(key => [key, t('network.rebuildPreview.' + key)]));
 for (const key of ['noPortalExit', 'unknownPortalExit']) previewLabels[key] = t('network.rebuildPreview.' + key);

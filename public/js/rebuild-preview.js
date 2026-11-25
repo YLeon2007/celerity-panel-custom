@@ -27,6 +27,7 @@
     function rebuildPreviewText(nodes, removing, lookupNode, labels, transit) {
         const details = [], warnings = [];
         let protectedChanged = false;
+        let mainRestart = false;
         const listFormat = typeof Intl.ListFormat === 'function' ? new Intl.ListFormat(labels.lang) : null;
         nodes.forEach((node, index) => {
             const inventory = lookupNode(node.nodeId);
@@ -48,6 +49,10 @@
             protectedChanged ||= settingsChanged;
             const lines = [name + ' — ' + labels[role] + ': ' + summary,
                 settingsChanged ? labels.settingsChanged : labels.settingsUnchanged];
+            if (labels.mainRestartCount && Number.isSafeInteger(node.mainRestartCount) && node.mainRestartCount > 0) {
+                mainRestart = true;
+                lines.push(labels.mainRestartCount.replace('{count}', node.mainRestartCount));
+            }
             if (node.profiles.some(profile => profile.tunnelMigration === 'legacy-to-vless-reverse')) lines.push(labels.migration);
             if (transit) {
                 const changes = { create: labels.transitCreate, replace: labels.transitReplace, unchanged: labels.unchanged };
@@ -104,6 +109,7 @@
             const warningKey = removing && exitWarningKeys.get(node.exitImpact);
             if (warningKey) warnings.push(labels[warningKey].replace('{name}', () => name));
         });
+        if (mainRestart && labels.mainRestartWarning) warnings.unshift(labels.mainRestartWarning);
         return { details: details.join('\n\n'), warning: warnings.join('\n\n'), protectedChanged };
     }
 
