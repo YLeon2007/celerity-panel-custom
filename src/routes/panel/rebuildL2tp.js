@@ -310,9 +310,13 @@ function mountInstallRecovery(router, limiter) {
             acknowledge('can_install_again');
             return res.json({ executionMode: 'rebuild', status: 'can_install_again', nodeId });
         } catch (error) {
-            if (error?.code === 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE' && error.retryAllowed === false
-                && error.outcome === undefined && !error.remoteOutcomeUncertain) {
-                return res.status(409).json({ error: { code: error.code, retryAllowed: false } });
+            if (error?.retryAllowed === false && error.outcome === undefined && !error.remoteOutcomeUncertain) {
+                if (error.code === 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE') {
+                    return res.status(409).json({ error: { code: error.code, retryAllowed: false } });
+                }
+                if (error.code === 'REBUILD_L2TP_INSTALL_RECOVERY_RECHECK') {
+                    return res.status(503).json({ error: { code: error.code, retryAllowed: false }, nodeId });
+                }
             }
             const status = error?.code === 'REBUILD_L2TP_INSTALL_DISABLED' ? 409 : grantEffectStatus(error?.code);
             return unconfirmedRecovery(res, status);

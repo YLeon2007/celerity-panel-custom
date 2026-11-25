@@ -467,18 +467,23 @@ test('mounted default Install and Recovery preserve the reservation on zero disp
 
         const pending = await begin();
         mode = 'lost first write';
-        checked(await send(), 503);
+        assert.deepEqual(JSON.parse(checked(await send(), 503).body), { error: {
+            code: 'REBUILD_L2TP_INSTALL_RECOVERY_RECHECK', retryAllowed: false,
+        }, nodeId: id });
         assert.equal(writes, 2);
         const after = await snapshot();
         const { installRecoveryClaim, ...held } = after[0];
-        assert.ok(installRecoveryClaim);
+        assert.equal(installRecoveryClaim.phase, 'retryable');
         assertSame([held, after[1], after[2]], pending, 'a lost write changed more than the temporary claim');
         const count = opens;
         mode = 'available';
-        checked(await send(), 503);
+        checked(await send(url, { session: wrongActor }), 503);
         assert.equal(opens, count);
-        assert.equal(writes, 2);
-        assertSame(await snapshot(), after, 'the subsequent POST changed an unresolved claim');
+        assertSame(await snapshot(), after, 'another operator must not rotate the claim');
+        assert.deepEqual(JSON.parse(checked(await send(), 200).body), { executionMode: 'rebuild', status: 'can_install_again', nodeId: id });
+        assert.equal(opens, count + 1);
+        assert.equal(writes, 3);
+        assert.deepEqual(await snapshot(), [null, null, []]);
     });
 
 test.after(() => require('../../../services/sshPoolService').closeAll());

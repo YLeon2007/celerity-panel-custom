@@ -11,6 +11,7 @@ const { BLOCKED, changed, createRecoveryStore, grantIdentity, plain, validActor 
 const { transactOnce, AcknowledgedCommitCleanupError } = require('./rebuildRelayInstallTransaction');
 
 const UNCONFIRMED = 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED';
+const RECHECK = 'REBUILD_L2TP_INSTALL_RECOVERY_RECHECK';
 const NO_STATE = 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE';
 const fail = code => Object.assign(new Error(code), { code, retryAllowed: false });
 const defaultDriver = options => require('./rebuildRelayDirect').createRelayDirect(options);
@@ -28,7 +29,7 @@ function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, 
         }
         const store = createRecoveryStore(State, L2tpUser);
         const getNode = session => read(Node.findById(id).select('ip domain active type cascadeRole useCustomConfig ssh').maxTimeMS(5000), session);
-        let held, stagedClaim, remote, noState, mayHaveDispatched = false, closing = false, settling = false;
+        let held, stagedClaim, remote, noState, mayHaveDispatched = false, closing = false, drained = false, commitAttempted = false;
         // Claim the global fence before entering the process-local node queue.
         // An active Install or another claimant is refused, not queued behind.
         try {
@@ -107,14 +108,14 @@ function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, 
                 if (!verified || revoked || (result !== 'absent' && result !== 'rolled_back')) throw changed();
                 closing = true;
                 await remote.close();
+                drained = true;
                 await check();
-                settling = true;
                 await transactOnce(State, L2tpUser, async session => {
                     const image = await check(session);
                     await store.restore(image, session);
                     await checkAuthority(session);
                     await held.settle(session);
-                });
+                }, () => { commitAttempted = true; });
                 try { await (await getCleanupConsent?.())?.finishRecovery({ nodeId: id, actor, backupId }, result); }
                 catch { /* Do not replay an acknowledged recovery to repair audit. */ }
                 return { status: 'can_install_again' };
@@ -122,16 +123,19 @@ function createRebuildRelayInstallRecovery({ Node, State, L2tpUser, locks, env, 
         } catch (error) {
             if (noState && error === noState) throw error;
             if (remote && !closing && typeof remote.close === 'function') {
-                try { await remote.close(); } catch { /* The claim remains if dispatch was possible. */ }
+                try { await remote.close(); drained = true; } catch { /* Keep the active claim on unproved closure. */ }
             }
-            // Only a definite pre-dispatch refusal can undo our claim. In
-            // particular, an unsafe/unacknowledged host operation or an
-            // unknown settlement COMMIT is never retried or read back as
-            // success. If COMMIT landed, all three effects landed together.
+            // A drained attempt may offer another explicit *reconciliation*,
+            // not Install or an assertion that the remote helper has exited.
+            // The next DIRECT command must take its flock and prove the same
+            // host receipt afresh. Do not reclassify an unknown DB settlement.
             if (held && !mayHaveDispatched) {
                 try { await held.releaseClaim(); } catch { throw fail(UNCONFIRMED); }
+            } else if (held && drained && !commitAttempted) {
+                try { await held.allowRecheck(); } catch { throw fail(UNCONFIRMED); }
+                throw fail(RECHECK);
             }
-            if (settling && error instanceof AcknowledgedCommitCleanupError) {
+            if (commitAttempted && error instanceof AcknowledgedCommitCleanupError) {
                 throw fail('REBUILD_L2TP_INSTALL_RECOVERY_CLEANUP_FAILED');
             }
             throw fail(mayHaveDispatched || (stagedClaim && !held) ? UNCONFIRMED : BLOCKED);

@@ -11,7 +11,7 @@ class AcknowledgedCommitCleanupError extends Error {
 // No withTransaction (body replay) or ClientSession.commitTransaction
 // (implicit commit retry). A lost commit response stays unknown. Keep this
 // one-shot driver boundary aligned with topologyV2Settlement in this repo.
-async function transactOnce(State, User, work) {
+async function transactOnce(State, User, work, beforeCommit) {
     const db = State.db;
     if (!db || db !== User.db) throw new Error('Install requires a shared transaction-capable database');
     const session = await db.startSession();
@@ -20,6 +20,7 @@ async function transactOnce(State, User, work) {
         if (typeof session.transaction?.transition !== 'function') throw new Error('Unsupported transaction session');
         session.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
         const result = await work(session);
+        beforeCommit?.();
         attempted = true;
         const reply = await db.getClient().db('admin').command({ commitTransaction: 1,
             ...(session.transaction.recoveryToken ? { recoveryToken: session.transaction.recoveryToken } : {}),

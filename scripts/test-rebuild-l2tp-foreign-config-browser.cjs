@@ -17,6 +17,7 @@ const { rebuildL2tpScriptVersion } = require('../src/routes/panel/rebuildL2tpObs
 
 const nodeId = 'a'.repeat(24), siblingId = 'b'.repeat(24);
 const installUrl = `/panel/rebuild/relays/${nodeId}/l2tp/install`;
+const recoveryUrl = `${installUrl}/recover`;
 const header = 'x-rebuild-l2tp-observation';
 const csrf = 'fixture-csrf';
 const name = 'Relay <i data-foreign-fixture>literal $&</i>';
@@ -37,6 +38,7 @@ const confirm = '[data-foreign-cleanup-confirm]';
 const cancel = '[data-foreign-cleanup-cancel]';
 const xrayOption = '[data-foreign-cleanup-xray] input';
 const install = `#relay-${nodeId} [data-install-url]`;
+const recover = `#relay-${nodeId} [data-install-recovery-url]`;
 const sibling = `#relay-${siblingId} [data-install-url]`;
 const status = `#relay-${nodeId} [data-relay-action-status]`;
 const progress = `#relay-${nodeId} [data-progress-text]`;
@@ -50,7 +52,7 @@ async function main() {
     const app = express(), browser = new Firefox(), requests = [];
     const scratch = mkdtempSync(path.join(tmpdir(), 'rebuild-l2tp-foreign-firefox-'));
     const session = { authenticated: true, panelCsrfToken: csrf };
-    let lang, replies, release, progressPercent;
+    let lang, replies, release, progressPercent, recovering = false, recoveryAttempts = 0;
     app.use(express.json(), (req, res, next) => {
         if (!req.path.startsWith('/js/')) requests.push({
             method: req.method, path: req.path, body: req.body, nonce: req.get(header),
@@ -67,7 +69,9 @@ async function main() {
         ejs.renderFile(path.join(root, 'views/rebuild-l2tp.ejs'), {
             t: translate, csrfToken: csrf, rebuildL2tpScriptVersion: rebuildL2tpScriptVersion(),
             installChecks: Object.fromEntries(installCheckIds.map(id => [id, translate(`rebuildL2tp.installChecks.${id}`)])),
-            relays: [relay(nodeId, name), relay(siblingId, 'Sibling relay')], accounts: [], canManageAccounts: false,
+            relays: [{ ...relay(nodeId, name), ...(recovering && { status: 'installing', canInstall: false,
+                grantSource: 'db', canRecoverInstall: true }) }, relay(siblingId, 'Sibling relay')],
+            accounts: [], canManageAccounts: false, canRequestInstallRecovery: true,
         }, (error, html) => error ? next(error)
             : res.type('html').send(`<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,">${html}`));
     });
@@ -81,6 +85,12 @@ async function main() {
     app.get(`${installUrl}/progress`, (_, res) => res.json({ nodeId,
         installProgress: { stage: 'foreignCleanup', percent: progressPercent, at: new Date().toISOString() },
     }));
+    app.post(recoveryUrl, requirePanelCsrf, (_, res) => {
+        if (recoveryAttempts++ === 0) return res.status(503).json({ nodeId,
+            error: { code: 'REBUILD_L2TP_INSTALL_RECOVERY_RECHECK', retryAllowed: false } });
+        recovering = false;
+        return res.json({ executionMode: 'rebuild', status: 'can_install_again', nodeId });
+    });
     const server = app.listen(0, '127.0.0.1');
     try {
         await once(server, 'listening');
@@ -213,6 +223,21 @@ async function main() {
         assert.ok((await browser.evaluate(text(status))).includes(words.messages.installRolledBack));
         assert.ok(!(await browser.evaluate(text(status))).includes(words.installChecks.FOREIGN_CONFIG_RESTORED));
         console.log('Xray: checked choice sends true; generic rollback does not claim restoration');
+
+        recovering = true;
+        words = await start('ru');
+        await browser.click(recover);
+        await browser.wait(`${el(recover)}?.disabled === false && ${text(status)} === ${JSON.stringify(words.messages.installRecoveryUnconfirmed)}`, 3500);
+        assert.equal(await browser.evaluate(`${el(install)} === null && !${visible('[data-refresh]')}`), true);
+        assert.deepEqual(requests.map(r => [r.method, r.path]), [['POST', recoveryUrl], ['GET', '/panel/l2tp']]);
+        await browser.click(recover);
+        await browser.wait(`${el(install)}?.disabled === false && ${text(status)} === ${JSON.stringify(words.messages.canInstallAgain)}`, 3500);
+        assert.equal(await browser.evaluate('window.fixtureSameDocument'), true);
+        assert.deepEqual(requests.map(r => [r.method, r.path]), [
+            ['POST', recoveryUrl], ['GET', '/panel/l2tp'], ['POST', recoveryUrl], ['GET', '/panel/l2tp'],
+        ]);
+        assert.deepEqual(postRequests().map(r => r.body), [{}, {}]);
+        console.log('Recover: another explicit click after 503, automatic readback, no Install replay or reload');
 
         for (const error of [
             { code: initialCode, outcome: 'refused', check, keys: [options], message: taint },

@@ -2774,15 +2774,16 @@ def cleanup_current(key):
 
 
 def cleanup_fence(backup):
+    before = backup['before']
+    need('boot' in before, 'IN_FLIGHT')
     return entry(encode({k: backup[k] for k in ('backupId', 'machineId', 'network')} | {
-        'boot': backup['before']['boot'], 'installLock': backup['before']['installLock'],
-        'digest': backup['before']['foreignCleanup']['digest']}))
+        'boot': before['boot'], 'installLock': before['installLock'], 'digest': before['foreignCleanup']['digest']}))
 
 
 def cleanup_guard(backup, fd, identity, *, file_net=False, legacy_net=False):
     scope = package_scope(backup['machineId'], fd)
     before = backup['before']
-    need(scope['boot'] == before['boot'] and scope['installLock'] == before['installLock']
+    need(scope['boot'] == before.get('boot') and scope['installLock'] == before['installLock']
          and read(VAULT + '/' + FOREIGN_PENDING, 2048) == cleanup_fence(backup), 'IN_FLIGHT')
     package_no_pending()
     has_unit = (file_net or legacy_net) and unit(NET_UNIT)['LoadState'] == 'loaded'
@@ -2945,9 +2946,7 @@ def clear_cleanup_fence(backup):
         foreign_no_pending()
 
 
-def complete_cleanup_rollback(path, record, backup):
-    cleanup_no_remove(path)
-    need(record == entry(encode(backup)) and backup['phase'] == 'rolled-back', 'IN_FLIGHT')
+def sync_rollback_receipt(path, record):
     token_dir, name = os.path.split(path)
     with directory(token_dir, private=True) as held:
         fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=held)
@@ -2964,6 +2963,12 @@ def complete_cleanup_rollback(path, record, backup):
     for parent in (VAULT, os.path.dirname(VAULT)):
         with directory(parent, private=parent == VAULT) as held:
             os.fsync(held)
+
+
+def complete_cleanup_rollback(path, record, backup):
+    cleanup_no_remove(path)
+    need(record == entry(encode(backup)) and backup['phase'] == 'rolled-back', 'IN_FLIGHT')
+    sync_rollback_receipt(path, record)
     clear_cleanup_fence(backup)
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
 
@@ -7546,19 +7551,22 @@ def recovery_empty(request):
 
 def recovery_manifest(request, scope):
     path, record, backup = read_manifest(request['backupId'])
-    phase, before, after = (backup[k] for k in ('phase', 'before', 'after'))
     keys = {'phase', 'backupId', 'machineId', 'network', 'before', 'after'}
+    need(type(backup) is dict and keys <= backup.keys(), 'IN_FLIGHT')
+    phase, before, after = (backup[k] for k in ('phase', 'before', 'after'))
+    # A legacy preimage missing the original boot cannot be rebound to this one.
+    need(type(before) is dict and before.get('boot') == scope['boot'] and type(after) is dict, 'IN_FLIGHT')
     baseline_keys = {'boot', 'installLock', 'pppModules', 'files', 'units', 'bridge', 'sockets',
                      'globalFiles', 'installBoot', 'ikeSockets', 'swanInputs'}
     unit_keys = set(INSTALL_UNIT_FIELDS)
     account_keys = set(XRAY_ACCOUNT_FIELDS)
-    need(keys <= set(backup) <= keys | {'runtime', 'nativePrepared', 'bootEnrollment', 'swanStart', 'swanGeneration',
+    need(set(backup) <= keys | {'runtime', 'nativePrepared', 'bootEnrollment', 'swanStart', 'swanGeneration',
                                       'preparedSockets', 'modulePersistence', 'foreignJournal'}
          and ('foreignJournal' in backup) == ('foreignCleanup' in before)
          and record == entry(encode(backup)) and backup['backupId'] == request['backupId']
          and backup['machineId'] == scope['machineId'] and encode(backup['network']) == encode(request['network'])
          and baseline_keys <= set(before) <= baseline_keys | {'transit', 'nativePreparation', 'emptyBridgeGeneration', 'foreignCleanup'}
-         and before['boot'] == scope['boot'] and before['installLock'] == scope['installLock']
+         and before['installLock'] == scope['installLock']
          and type(before['installBoot']) is bool and type(before['ikeSockets']) is list
          and ((type(before['sockets']) is list and 'preparedSockets' not in backup)
               or (before['sockets'] is None and type(backup.get('preparedSockets')) is list
@@ -7652,7 +7660,10 @@ def reconcile_install(request):
             else:
                 foreign_no_pending()
                 rollback(request, path, record, backup)
-            need(backup['phase'] == 'rolled-back' and read(path, 2 * MAX_FILE) == entry(encode(backup)), 'IN_FLIGHT')
+            terminal = entry(encode(backup))
+            need(backup['phase'] == 'rolled-back' and read(path, 2 * MAX_FILE) == terminal, 'IN_FLIGHT')
+            if 'foreignJournal' not in backup:
+                sync_rollback_receipt(path, terminal)
             result = 'rolled_back'
         need(package_scope(machine, fd) == scope and recovery_package_receipt(request, scope) == package, 'IN_FLIGHT')
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')

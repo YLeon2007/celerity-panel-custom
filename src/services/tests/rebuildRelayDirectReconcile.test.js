@@ -87,9 +87,9 @@ test('errors, pending, inexact receipts and lock loss never confirm settlement',
 
 const scenarios = {
     absent: ['ready', 'refused', 'ready-retained-bridge', 'ready-cold-retained-bridge', 'refused-cold'],
-    rolled_back: ['rollback', 'rollback-applying', 'already-rolled-back'],
+    rolled_back: ['rollback', 'rollback-applying', 'already-rolled-back', 'rollback-receipt-fsync'],
     unknown: ['missing', 'mismatch-token', 'mismatch-machine', 'mismatch-boot', 'mismatch-lock', 'mismatch-plan',
-        'pending', 'preparing', 'empty-token-dir', 'symlink-receipt', 'trace-policy', 'trace-config', 'trace-ppp',
+        'pending', 'preparing', 'empty-token-dir', 'symlink-receipt', 'trace-policy', 'trace-config', 'detached-vault-foreign-chap', 'trace-ppp',
         'trace-network', 'trace-listener', 'jobs', 'unavailable', 'concurrent', 'rollback-partial', 'rollback-policy-start',
         'rollback-postcondition', 'drift-rolled-back', 'manifest-lock', 'manifest-node', 'manifest-network', 'rollback-cold',
         'cold-nft-unavailable', 'cold-socket-unavailable', 'cold-partial-token', 'cold-bridge-drift', 'cold-network-drift',

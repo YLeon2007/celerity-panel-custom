@@ -293,7 +293,7 @@ function sessionFixture(t, f, { graph = false } = {}) {
         session.commitDirectory?.();
         return { ok: 1 };
     }
-    t.mock.method(State.db, 'startSession', async () => new Session());
+    t.mock.method(State.db, 'startSession', async () => { hooks.start?.(); return new Session(); });
     t.mock.method(State.db, 'getClient', () => ({ db(name) {
         assert.equal(name, 'admin');
         return { async command(command, { session }) {
@@ -347,6 +347,7 @@ function recoveryFixture(t, { prior = false, source = false, pkg = false } = {})
 }
 
 const notConfirmed = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_UNCONFIRMED', retryAllowed: false };
+const canRecheck = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_RECHECK', retryAllowed: false };
 const recoveryBlocked = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_BLOCKED', retryAllowed: false };
 const recoveryNoState = { code: 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE', retryAllowed: false };
 
@@ -406,13 +407,20 @@ test('Install recovery: absent and rolled-back receipts restore only this relay,
             return result;
         };
         if (result === 'unsafe') {
-            await assert.rejects(r.create()(id), notConfirmed);
+            await assert.rejects(r.create()(id), canRecheck);
             assert.deepEqual(f.states, original.states);
             assert.deepEqual(f.users, original.users);
             const { installRecoveryClaim, ...stillHeld } = f.locks[0];
-            assert.ok(installRecoveryClaim);
+            assert.equal(installRecoveryClaim.phase, 'retryable');
             assert.deepEqual(stillHeld, original.locks[0]);
-            await assert.rejects(r.create()(id), recoveryBlocked);
+            await assert.rejects(r.create({ actor: 'other-admin' })(id), recoveryBlocked);
+            r.hooks.reconcile = async (_input, guard) => {
+                assert.notEqual(f.locks[0].installRecoveryClaim.id, installRecoveryClaim.id);
+                await guard();
+                return 'rolled_back';
+            };
+            assert.deepEqual(await r.create()(id), { status: 'can_install_again' });
+            assert.equal(f.lockHeld, false);
         } else {
             assert.deepEqual(await r.create()(id), { status: 'can_install_again' });
             assert.equal(f.lockHeld, false);
@@ -421,9 +429,20 @@ test('Install recovery: absent and rolled-back receipts restore only this relay,
             assert.deepEqual(f.states.find(row => String(row.node) === sourceId), r.neighbor.state);
         }
         assert.deepEqual(await f.directory.findOne({ _id: 'directory' }, { readConcern: { level: 'majority' } }), directory);
-        assert.equal(r.recovered, 1);
-        assert.equal(r.closed, 1);
+        assert.equal(r.recovered, result === 'unsafe' ? 2 : 1);
+        assert.equal(r.closed, r.recovered);
     });
+});
+
+test('Install recovery: a legacy string claim cannot rule out a lost settlement COMMIT and never dispatches', async t => {
+    const { randomUUID } = require('node:crypto');
+    const r = recoveryFixture(t);
+    await assert.rejects(r.install(id), { retryAllowed: false });
+    r.f.locks[0].installRecoveryClaim = randomUUID();
+    const before = copy({ states: r.f.states, users: r.f.users, locks: r.f.locks });
+    await assert.rejects(r.create()(id), recoveryBlocked);
+    assert.deepEqual({ states: r.f.states, users: r.f.users, locks: r.f.locks }, before);
+    assert.equal(r.recovered, 0);
 });
 
 test('Install recovery: wrong generations, actor, credentials, scope or a legacy singleton never reach DIRECT', async t => {
@@ -489,13 +508,21 @@ test('Install recovery: unclassified transport failures, even before a reported 
             return 'rolled_back';
         };
         if (cut === 'close') r.hooks.close = () => { throw new Error('private close fault'); };
-        await assert.rejects(r.create()(id), notConfirmed);
+        await assert.rejects(r.create()(id), cut === 'close' ? notConfirmed : canRecheck);
         assert.deepEqual({ states: r.f.states, users: r.f.users }, original);
         assert.equal(r.f.locks[0].token, originalToken);
         assert.equal(r.closed, 1);
         assert.deepEqual(r.tx.events, ['commit', 'commit']);
-        await assert.rejects(r.create()(id), recoveryBlocked);
-        assert.equal(r.recovered, 1);
+        if (cut === 'close') {
+            assert.equal(r.f.locks[0].installRecoveryClaim.phase, 'active');
+            await assert.rejects(r.create()(id), recoveryBlocked);
+            assert.equal(r.recovered, 1);
+        } else {
+            assert.equal(r.f.locks[0].installRecoveryClaim.phase, 'retryable');
+            r.hooks.reconcile = async (_input, guard) => { await guard(); return 'rolled_back'; };
+            assert.deepEqual(await r.create()(id), { status: 'can_install_again' });
+            assert.equal(r.recovered, 2);
+        }
     });
 });
 
@@ -549,12 +576,31 @@ test('Install recovery: a final lock CAS miss aborts earlier copy and state CAS 
     const original = copy({ states: r.f.states, users: r.f.users });
     const originalToken = r.f.locks[0].token;
     r.f.lockHooks.refuseRelease = true;
-    await assert.rejects(r.create()(id), notConfirmed);
+    await assert.rejects(r.create()(id), canRecheck);
     assert.deepEqual(r.f.events.slice(-3), ['L2tpUser:delete', 'L2tpUser:delete', 'RelayL2tpState:update']);
     assert.deepEqual(r.tx.events, ['commit', 'commit', 'abort']);
     assert.deepEqual({ states: r.f.states, users: r.f.users }, original);
     assert.equal(r.f.locks[0].token, originalToken);
-    assert.ok(r.f.locks[0].installRecoveryClaim);
+    assert.equal(r.f.locks[0].installRecoveryClaim.phase, 'retryable');
+});
+
+test('Install recovery: a DB failure before the settlement transaction can be rechecked', async t => {
+    const r = recoveryFixture(t);
+    await assert.rejects(r.install(id), { retryAllowed: false });
+    const original = copy({ states: r.f.states, users: r.f.users });
+    r.hooks.reconcile = async (_input, guard) => {
+        await guard();
+        r.tx.hooks.start = () => { throw Error('no settlement session'); };
+        return 'rolled_back';
+    };
+    await assert.rejects(r.create()(id), canRecheck);
+    assert.deepEqual(r.tx.events, ['commit', 'commit']);
+    assert.deepEqual({ states: r.f.states, users: r.f.users }, original);
+    assert.equal(r.f.locks[0].installRecoveryClaim.phase, 'retryable');
+    delete r.tx.hooks.start;
+    r.hooks.reconcile = async (_input, guard) => { await guard(); return 'rolled_back'; };
+    assert.deepEqual(await r.create()(id), { status: 'can_install_again' });
+    assert.equal(r.recovered, 2);
 });
 
 test('Install recovery: lost settlement response is not replayed regardless of whether commit landed', async t => {

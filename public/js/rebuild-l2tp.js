@@ -888,11 +888,14 @@
         lockForAction();
         setActionStatus(words.working, nodeId);
         const csrf = page.dataset.csrf, token = nonce();
-        let message = 'installRecoveryUnconfirmed';
+        let message = 'installRecoveryUnconfirmed', recheck = false;
         try {
             const { response, data } = await post(installRecoveryUrl, {}, undefined, token, csrf);
             if (response.ok && !ambiguous(response, data) && !noRetry(data) && data?.executionMode === 'rebuild'
                 && data.status === 'can_install_again' && data.nodeId === nodeId) message = 'canInstallAgain';
+            else if (response.status === 503 && data?.error?.code === 'REBUILD_L2TP_INSTALL_RECOVERY_RECHECK'
+                && data.nodeId === nodeId && data.error.retryAllowed === false
+                && data.error.outcome === undefined && data.outcome === undefined) recheck = true;
             else if (response.status === 409 && data?.error?.code === 'REBUILD_L2TP_INSTALL_RECOVERY_NO_STATE'
                 && data.error.retryAllowed === false && data.error.outcome === undefined && data.outcome === undefined) {
                 message = 'installRecoveryNoState';
@@ -901,7 +904,7 @@
         if (!active) return;
         setActionStatus(words[message], nodeId);
         requireRefresh = true;
-        if (message === 'canInstallAgain') await finishAcknowledged(csrf, status.textContent, false, nodeId);
+        if (message === 'canInstallAgain' || recheck) await finishAcknowledged(csrf, status.textContent, false, nodeId);
         else if (message === 'installRecoveryUnconfirmed' && token) {
             const outcome = await reconcileUnknown(csrf, token, ['can_install_again'], nodeId);
             if (active) setActionStatus(words[outcome ? 'canInstallAgain' : message], nodeId);

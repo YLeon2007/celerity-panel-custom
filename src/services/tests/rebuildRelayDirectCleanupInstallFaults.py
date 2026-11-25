@@ -387,6 +387,15 @@ class CleanupInstallFaults(CLEANUP['Cleanup']):
         self.assert_recover_blocked()
         manifest['before'].pop('boot')
         self.h['write'](self.h['manifest_path'](TOKEN), legacy, self.h['entry'](self.h['encode'](manifest)))
+        with self.directory(self.h['SYSTEM']) as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            scope = self.h['package_scope'](MACHINE, fd)
+            with self.assertRaisesRegex(self.h['Refusal'], '^IN_FLIGHT$'):
+                self.h['recovery_manifest'](dict(backupId=TOKEN, network=NETWORK), scope)
+            with self.assertRaisesRegex(self.h['Refusal'], '^IN_FLIGHT$'):
+                self.h['cleanup_guard'](manifest, fd, None)
+            with self.assertRaisesRegex(self.h['Refusal'], '^IN_FLIGHT$'):
+                self.h['cleanup_fence'](manifest)
         self.assert_recover_blocked()
 
     def test_recover_after_xray_restart_restores_unit_mode(self):

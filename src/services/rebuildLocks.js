@@ -11,6 +11,9 @@ const exactLock = row => ({ _id: rowId, token: row.token, $expr: { $eq: ['$$ROOT
 const one = (reply, field) => reply?.acknowledged === true && reply[field] === 1;
 const ownerDigest = token => createHash('sha256').update(token).digest('hex');
 const generation = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const validGeneration = value => typeof value === 'string' && value.length === 36 && generation.test(value);
+const retryableClaim = value => value && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).length === 2 && validGeneration(value.id) && value.phase === 'retryable';
 const queues = new Map(), held = new AsyncLocalStorage();
 async function withNode(nodeId, fn) {
     const key=String(nodeId); if (held.getStore()?.has(key)) return fn();
@@ -107,17 +110,22 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
         const row = await store.findOne({ _id: rowId }, lockRead);
         if (row === null) return null;
         const receipt = row?.installRecovery;
+        const prior = row?.installRecoveryClaim;
         // 8a56425 and pre-handoff crashes have no durable proof the original
         // writer has exited. Neither age nor an empty local active set suffices.
-        if (row?._id !== rowId || row.allowStaleUnlock !== false || typeof row.token !== 'string'
-            || row.token.length !== 36 || !generation.test(row.token)
-            || active.has(row.token) || Object.hasOwn(row, 'installRecoveryClaim') || ![1, 2].includes(receipt?.version)
+        if (row?._id !== rowId || row.allowStaleUnlock !== false || !validGeneration(row.token)
+            || active.has(row.token) || ![1, 2].includes(receipt?.version)
             || receipt.phase !== 'ready' || receipt.nodeId !== nodeId || receipt.actor !== actor
             || receipt.ownerDigest !== ownerDigest(row.token)) throw blocked();
+        // A legacy UUID cannot distinguish a host refusal from an unknown
+        // settlement COMMIT. Only the positively published retryable state
+        // permits rotation, even after a panel restart.
+        const hadClaim = Object.hasOwn(row, 'installRecoveryClaim');
+        if (hadClaim && !retryableClaim(prior)) throw blocked();
         const filter = exactLock(row);
         return { receipt, async claim(session) {
             if (!session?.inTransaction() || active.has(row.token)) throw blocked();
-            const value = randomUUID();
+            const value = { id: randomUUID(), phase: 'active' };
             if (!one(await store.updateMany(filter, { $set: { installRecoveryClaim: value } }, { session }), 'matchedCount')) throw blocked();
             const actual = await store.findOne({ _id: rowId, token: row.token, installRecoveryClaim: value }, { session });
             if (!actual) throw blocked();
@@ -127,7 +135,12 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
                     if (!await store.findOne(claimed, session ? { session } : lockRead)) throw blocked();
                 },
                 async releaseClaim() {
-                    if (!one(await store.updateMany(claimed, { $unset: { installRecoveryClaim: '' } }, majority), 'matchedCount')) throw blocked();
+                    const update = hadClaim ? { $set: { installRecoveryClaim: prior } } : { $unset: { installRecoveryClaim: '' } };
+                    if (!one(await store.updateMany(claimed, update, majority), 'matchedCount')) throw blocked();
+                },
+                async allowRecheck() {
+                    if (!one(await store.updateMany(claimed,
+                        { $set: { installRecoveryClaim: { id: value.id, phase: 'retryable' } } }, majority), 'matchedCount')) throw blocked();
                 },
                 async settle(session) {
                     if (!session?.inTransaction() || !one(await store.deleteMany(claimed, { session }), 'deletedCount')) throw blocked();

@@ -395,6 +395,10 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
         put('/usr/sbin/policy-rc.d', b'private containment')
     if scenario == 'trace-config':
         put(h['MAIN'], h['encode'](main_after))
+    if scenario == 'detached-vault-foreign-chap':
+        # Same reserved backupId and terminal package receipt, no manifest,
+        # but the operator restored a pre-Install foreign configuration.
+        put(names['chap'], b'fixture-user * fixture-value *\n')
     if scenario == 'trace-ppp':
         put(h['PPP_PATH'], b'private prerequisite')
     if scenario in ('trace-network', 'cold-network-drift'):
@@ -414,7 +418,7 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
     if scenario in ('cold-ppp', 'warm-vpn'):
         state['vpn'] = True
     if scenario in ('rollback', 'rollback-applying', 'rollback-policy-start', 'rollback-partial', 'rollback-postcondition', 'already-rolled-back',
-                    'drift-rolled-back', 'manifest-lock', 'manifest-node', 'manifest-network', 'rollback-cold'):
+                    'drift-rolled-back', 'rollback-receipt-fsync', 'manifest-lock', 'manifest-node', 'manifest-network', 'rollback-cold'):
         state['unverified'] = scenario in ('rollback-applying', 'rollback-partial', 'rollback-policy-start')
         assert legacy_install()[0] == (70 if state['unverified'] else 0), 'stock control must reach intended phase'
         backup = read_manifest()
@@ -426,7 +430,7 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
             else:
                 backup['before']['installLock'] = [1, 1]
             put(manifest, h['encode'](backup))
-        if scenario in ('already-rolled-back', 'drift-rolled-back'):
+        if scenario in ('already-rolled-back', 'drift-rolled-back', 'rollback-receipt-fsync'):
             rollback_request = dict(action='rollback', machineId=request['machineId'], backupId=request['backupId'],
                                     network=request['network'], baseline=h['digest'](h['encode'](before)))
             assert run_host(legacy, rollback_request)[0] == 0
@@ -464,7 +468,27 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
         payload = {**request, 'nodeId': 'e' * 24}
     if scenario == 'manifest-network':
         payload = {**request, 'network': {**request['network'], 'routeTable': 178}}
-    if scenario == 'concurrent':
+    if scenario == 'rollback-receipt-fsync':
+        # The prior terminal name is visible. A failed directory sync must
+        # prevent an ACK, without replaying any service or file effects.
+        target = physical(token_dir).stat()
+        fsync, faults = os.fsync, []
+
+        def fail_sync(fd):
+            live = os.fstat(fd)
+            if (live.st_dev, live.st_ino) == (target.st_dev, target.st_ino):
+                faults.append(True)
+                raise OSError('injected directory sync failure')
+            return fsync(fd)
+
+        os.fsync = fail_sync
+        try:
+            refusal = run_host(h, payload)
+        finally:
+            os.fsync = fsync
+        assert refusal == (75, '', '') and faults == [True] and snapshot() == preimage and not effects
+        code, out, err = run_host(h, payload)
+    elif scenario == 'concurrent':
         with directory(h['SYSTEM']) as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
             code, out, err = run_host(h, payload)
@@ -532,11 +556,11 @@ with tempfile.TemporaryDirectory(prefix='rebuild-host-recovery-', dir=os.getcwd(
         assert effects.index(('start', NET)) < effects.index(('start', XL))
         assert h['network_projection'](request['network'], new_token, pinned=True)['rule']
         assert h['read_manifest'](new_token)[2]['phase'] == 'installed' and not (root / 'run').exists()
-    elif scenario in ('rollback', 'rollback-applying', 'already-rolled-back'):
+    elif scenario in ('rollback', 'rollback-applying', 'already-rolled-back', 'rollback-receipt-fsync'):
         assert code == 0 and json.loads(out)['result'] == 'rolled_back'
         assert read_manifest()['phase'] == 'rolled-back' and h['read'](h['MAIN']) == before['files']['main']
         assert state['nft'] is None and not state['rule'] and not state['route']
-        if scenario != 'already-rolled-back':
+        if scenario in ('rollback', 'rollback-applying'):
             assert effects
         else:
             assert not effects
