@@ -336,8 +336,8 @@ def probe(case, ports, origins, links, chain=False, matrix=False, staged=False):
             hops = [(ingress, middle), (middle, links[case.edge])] if middle else [(ingress, links[case.edge])]
             checks = [(Path(f"{first['target']}-main.access.log"), tunnel_tag(first, True), tunnel_tag(second, False))
                       for first, second in hops]
-    offsets = [path.stat().st_size if path.exists() else 0 for path, _, _ in checks]
     for _ in range(4):
+        offsets = [access.stat().st_size if access.exists() else 0 for access, _, _ in checks]
         path = f'/proof-{case.portal}-{case.kind}-{secrets.token_hex(12)}'
         res = cmd(['curl', '-q', '--silent', '--show-error', '--fail', '--max-time', '2',
                    '--noproxy', '', '--socks5-hostname', f'{LO}:{sock}', *args,
@@ -356,12 +356,22 @@ def probe(case, ports, origins, links, chain=False, matrix=False, staged=False):
             # relay access log, not just the backend's HTTP marker.
             route_lines = {}
             destinations = (host, GEO) if case.kind == 'sniff' else (host,)
+            deadline = time.monotonic() + 1.0
             for (access, inbound, hop_outbound), offset in zip(checks, offsets, strict=True):
-                with access.open('rb') as log:
-                    log.seek(offset)
-                    routes = [row for row in log.read().decode().splitlines()
+                # Origin data can arrive before Xray's async logger flushes.
+                # Wait only for the evidence, never replay a successful probe.
+                while True:
+                    new_rows = []
+                    if access.exists():
+                        with access.open('rb') as log:
+                            log.seek(offset)
+                            new_rows = log.read().decode().split('\n')[:-1]
+                    routes = [row for row in new_rows
                               if f'[{inbound} ' in row and any(f'accepted tcp:{addr}:{VIRTUAL_PORT} ' in row
                                                               for addr in destinations)]
+                    if routes or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.02)
                 require(routes and all(row.endswith(f'[{inbound} -> {hop_outbound}]') for row in routes),
                         f'{case.name}: {access} expected {inbound} -> {hop_outbound}, got {routes}')
                 route_lines[access.name] = routes
@@ -570,6 +580,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     plan = generated['transition']['plan'] if stage else None
     added = [(step['owner'], step['config']['port']) for step in plan['listeners']] if plan is not None else []
     delivery_owner = ''
+    delivery_rule_tags = []
     if plan is not None:
         transition = generated['transition']
         require([len(plan[key]) for key in ('listeners', 'dialers', 'transit', 'ingress')] == [2, 2, 1, 1],
@@ -586,6 +597,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         switch, = plan['ingress']
         delivery, = plan['transit']
         delivery_owner = delivery['owner']
+        delivery_rule_tags = [rule['ruleTag'] for rule in delivery['append']]
         require(switch['owner'] == 'gateway' and delivery['owner'] == 'tail'
                 and gateway['routing'] == switch['before'] and stock['tail']['routing'] == delivery['before'],
                 'wrong selector preimages')
@@ -606,7 +618,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         dump('staged-routes.json', {'routing': gateway['routing']})
         dump('desired-routes.json', {'routing': desired})
         dump('delivery-before.json', {'routing': delivery['before']})
-        dump('delivery-after.json', {'routing': delivery['after']})
+        dump('delivery-append.json', {'routing': {**delivery['before'], 'rules': delivery['append']}})
+        dump('delivery-appended.json', {'routing': {**delivery['before'], 'rules': [*delivery['before']['rules'], *delivery['append']]}})
         for phase, field in (('listeners', 'inbounds'), ('dialers', 'outbounds')):
             for step in plan[phase]:
                 dump(f'{phase}-{step["channelId"]}.json', {field: [step['config']]})
@@ -715,8 +728,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                     'new channel has a session before its dialer is installed')
             for step in steps['dialers']:
                 api(step['owner'], 'ado', f'dialers-{step["channelId"]}.json')
-            api(delivery_owner, 'adrules', 'delivery-after.json')
-            verify_live_rules(delivery_owner, 'delivery-after.json')
+            api(delivery_owner, 'adrules', '-append', 'delivery-append.json')
+            verify_live_rules(delivery_owner, 'delivery-appended.json')
             wait_until('staged reverse control sockets', children, lambda: all(
                 sockets(ln['port'], children[ln['source']], established=True)
                 for ln in scoped_links if ln['mode'] == 'reverse'), 18)
@@ -741,7 +754,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         if plan is not None:
             api('gateway', 'adrules', 'staged-routes.json')
             verify_live_rules('gateway', 'staged-routes.json')
-            api(delivery_owner, 'adrules', 'delivery-before.json')
+            api(delivery_owner, 'rmrules', *reversed(delivery_rule_tags))
             verify_live_rules(delivery_owner, 'delivery-before.json')
             for step in reversed(plan['dialers']):
                 api(step['owner'], 'rmo', step['tag'])

@@ -151,7 +151,14 @@ function planAdditiveScopedTransition({ before, after, composition }) {
             }
         }
         const staged = { ...original, rules: stageRules };
-        if (transitRules.size) transit.push({ nodeId: id, before: original, after: staged });
+        if (transitRules.size) {
+            // Appending the new policy must be equivalent to its canonical
+            // boot placement. An old rule may not match any new transit
+            // ingress, even if it originally followed the inserted group.
+            requirePlan(oldRules.every(rule => Array.isArray(rule.inboundTag) && rule.inboundTag.length
+                && !rule.inboundTag.some(tag => incoming.has(tag))), 'transit_append_not_disjoint');
+            transit.push({ nodeId: id, before: original, after: staged, append: [...transitRules] });
+        }
         if (portalRules.size) ingress.push({ nodeId: id, before: staged, after: policy });
     }
     requirePlan(equal(final, composed), 'desired_image_mismatch');

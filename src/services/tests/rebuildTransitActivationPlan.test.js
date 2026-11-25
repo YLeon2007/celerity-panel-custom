@@ -41,6 +41,8 @@ test('orders listeners by downstream delivery, not the direction of reverse TCP 
         const op = plan[phase].find(p => p.nodeId === id(node));
         assert.deepEqual(op.before, config(f.before, node).routing);
         assert.deepEqual(op.after, config(f.after, node).routing);
+        if (phase === 'transit') assert.deepEqual(op.append,
+            op.after.rules.filter(r => r.ruleTag?.startsWith('rebuild-policy-transit-')));
     }
     assert.deepEqual(f, snapshot);
 });
@@ -60,6 +62,10 @@ test('refuses a preceding unscoped route, an altered old route, and an incomplet
     config(f.before, 5).routing.rules.unshift(broad);
     config(f.after, 5).routing.rules.unshift(broad);
     assert.throws(() => planAdditiveScopedTransition(f), refused('scoped_rule_shadowed'));
+    const append = fixture();
+    config(append.before, 5).routing.rules.push(broad);
+    config(append.after, 5).routing.rules.push(broad);
+    assert.throws(() => planAdditiveScopedTransition(append), refused('transit_append_not_disjoint'));
     const g = fixture();
     config(g.after, 4).routing.rules.find(r => r.ruleTag === 'rebuild-policy-default').outboundTag = 'block';
     assert.throws(() => planAdditiveScopedTransition(g), refused('existing_rules_changed'));
