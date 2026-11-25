@@ -90,6 +90,21 @@ function fixture(root, journal, actions = {}) {
             assert(effects(root).every(line => p.steps.filter(s => s.phase === 'prepare').some(s => line === `forward:${s.id}`)));
             return actions.prove ? actions.prove() : true;
         },
+        async verifyTerminal(ctx) {
+            if (actions.terminal) {
+                const result = await actions.terminal(ctx);
+                if (result !== true) return result;
+            }
+            const restored = ctx.direction === 'rollback';
+            assert.equal(ctx.confirmed.length, restored ? ctx.restored.length : ctx.plan.steps.length);
+            for (const step of ctx.plan.steps) {
+                const actual = fs.readFileSync(runtime(root, step.id));
+                assert.deepEqual(actual, restored ? beforeImage : Buffer.concat([beforeImage, Buffer.from(step.id)]));
+            }
+            const proof = save(ctx, Buffer.from(ctx.direction));
+            if (actions.beforeTerminalFinish) await actions.beforeTerminalFinish(ctx);
+            return proof;
+        },
         async observe(state) {
             if (!state.pending) return 'unavailable';
             const ctx = { plan: state.plan, ...state.pending };
@@ -143,7 +158,8 @@ if (process.argv[2] === '--cutover-child') {
                     (mode === 'inverse-effect' && ctx.direction === 'rollback')) await pause();
             },
             verified: async ctx => { if (mode === 'lost-ack' && ctx.step.id === 'upstream') await pause(); },
-            beforeCapture: async ctx => { if (mode === 'after-durable-ack' && ctx.step.id === 'relay-selector') await pause(); }
+            beforeCapture: async ctx => { if (mode === 'after-durable-ack' && ctx.step.id === 'relay-selector') await pause(); },
+            beforeTerminalFinish: async ctx => { if (mode === 'after-terminal-proof' && ctx.direction === 'forward') await pause(); }
         });
         const service = createScopedCutoverExecutor(binding);
         try {
@@ -174,6 +190,8 @@ if (process.argv[2] === '--cutover-child') {
         assert.deepEqual(effects(root), plan.steps.map(step => `forward:${step.id}`));
         assert.equal(binding.journal.read(plan.scope).confirmed.length, 4);
         assert.equal(binding.journal.read(plan.scope).proved, true);
+        assert.equal(binding.journal.read(plan.scope).version, 2);
+        assert.match(binding.journal.read(plan.scope).terminalProof?.sha256 ?? '', /^[a-f0-9]{64}$/);
         const file = journalFile(root), bytes = fs.readFileSync(file);
         assert.equal(fs.statSync(file).mode & 0o777, 0o600);
         assert(!bytes.includes(beforeImage.subarray(0, 28)));
@@ -183,6 +201,53 @@ if (process.argv[2] === '--cutover-child') {
         assert.equal((await service.execute(plan)).status, 'already-recorded');
         assert.deepEqual(fs.readFileSync(file), bytes);
     });
+
+    test('a definitive terminal forward mismatch rolls back all acknowledged moves including portals', async t => {
+        const root = scratch(t), rounds = [];
+        const binding = executor(root, { terminal(ctx) {
+            rounds.push({ direction: ctx.direction, effects: effects(root) });
+            return ctx.direction === 'rollback';
+        } });
+        const service = createScopedCutoverExecutor(binding);
+        assert.equal((await service.execute(plan)).status, 'rolled-back');
+        const forward = plan.steps.map(step => `forward:${step.id}`);
+        const inverse = plan.steps.toReversed().map(step => `rollback:${step.id}`);
+        assert.deepEqual(rounds, [{ direction: 'forward', effects: forward },
+            { direction: 'rollback', effects: [...forward, ...inverse] }]);
+        const stored = binding.journal.read(plan.scope);
+        assert.deepEqual(stored.refusal, { step: null, reason: 'terminal-proof' });
+        assert.match(stored.terminalProof.sha256, /^[a-f0-9]{64}$/);
+    });
+
+    for (const mode of ['read-failed', 'invalid-receipt', 'rollback-mismatch', 'fence-lost']) {
+        test(`terminal ${mode} keeps the scope blocked and reconciliation read-only`, async t => {
+            const root = scratch(t);
+            const binding = executor(root, { terminal() {
+                if (mode === 'read-failed') throw new Error('unavailable');
+                if (mode === 'invalid-receipt') return 'truthy';
+                if (mode === 'fence-lost') {
+                    fs.writeFileSync(path.join(root, 'fixture-fence'), randomUUID());
+                    return true;
+                }
+                return false;
+            } });
+            const service = createScopedCutoverExecutor(binding);
+            assert.equal((await service.execute(plan)).status, 'blocked');
+            const stored = binding.journal.read(plan.scope);
+            assert.equal(stored.pending, null);
+            assert.equal(stored.terminalProof, null);
+            assert.equal(stored.terminalFailure.direction, mode === 'rollback-mismatch' ? 'rollback' : 'forward');
+            assert.equal(stored.terminalFailure.reason, mode === 'fence-lost' ? 'fence' : 'proof');
+            const forward = plan.steps.map(step => `forward:${step.id}`);
+            const expected = mode === 'rollback-mismatch' ? [...forward, ...plan.steps.toReversed().map(step => `rollback:${step.id}`)] : forward;
+            assert.deepEqual(effects(root), expected);
+            const record = fs.readFileSync(journalFile(root));
+            assert.equal((await service.reconcile(plan.scope)).retryAllowed, false);
+            assert.equal((await service.execute({ ...plan, operationId: randomUUID() })).status, 'already-recorded');
+            assert.deepEqual(fs.readFileSync(journalFile(root)), record);
+            assert.deepEqual(effects(root), expected);
+        });
+    }
 
     test('definite no handoff unwinds only acknowledged moves, in inverse order', async t => {
         const root = scratch(t), binding = executor(root, { beforeSubmit(ctx) {
@@ -395,5 +460,27 @@ if (process.argv[2] === '--cutover-child') {
         assert.equal(fresh.result.replay.status, 'already-recorded');
         assert.deepEqual(await fresh.exited, [0, null]);
         assert.deepEqual(effects(root), ['forward:downstream', 'forward:upstream']);
+    });
+
+    test('SIGKILL after terminal artifact but before finish cannot certify or replay Apply', { timeout: 10000 }, async t => {
+        const root = scratch(t), { worker, exited, result } = await child(t, root, 'after-terminal-proof');
+        assert.deepEqual(result, { boundary: 'after-terminal-proof' });
+        const journal = fileJournal(root).read(plan.scope);
+        assert.equal(journal.pending, null);
+        assert.equal(journal.status, 'interrupted');
+        assert.equal(journal.terminalProof, null);
+        assert.deepEqual(journal.confirmed.map(c => c.step), plan.steps);
+        const trace = plan.steps.map(step => `forward:${step.id}`);
+        assert.deepEqual(effects(root), trace);
+        const original = fs.readFileSync(journalFile(root));
+        assert(worker.kill('SIGKILL'));
+        assert.deepEqual(await exited, [null, 'SIGKILL']);
+        const fresh = await child(t, root, 'reopen');
+        assert.deepEqual(fresh.result.observation.journal, journal);
+        assert.equal(fresh.result.observation.retryAllowed, false);
+        assert.equal(fresh.result.replay.status, 'already-recorded');
+        assert.deepEqual(await fresh.exited, [0, null]);
+        assert.deepEqual(effects(root), trace);
+        assert.deepEqual(fs.readFileSync(journalFile(root)), original);
     });
 }

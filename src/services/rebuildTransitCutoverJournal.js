@@ -54,15 +54,18 @@ function captured(value) {
 }
 const nextForward = state => state.plan.steps[state.confirmed.length];
 const nextInverse = state => state.confirmed[state.confirmed.length - state.restored.length - 1];
+const forwardComplete = state => !state.refusal && state.proved && !nextForward(state);
+const inverseComplete = state => state.refusal && state.confirmed.length && !nextInverse(state);
 
 // One state machine is used for both the writer and fresh readers. A pending
 // intent, even with a current before-image, can never be turned into an ACK by it.
 function advance(state, event, scope) {
     if (!state) {
-        need(exact(event, ['type', 'version', 'plan']) && event.type === 'start' && event.version === 1);
+        need(exact(event, ['type', 'version', 'plan']) && event.type === 'start' && [1, 2].includes(event.version));
         const plan = checkedPlan(event.plan);
         need(plan.scope === scope);
-        return { plan, status: 'interrupted', proved: false, pending: null,
+        return { plan, version: event.version, status: 'interrupted', proved: false, pending: null,
+            terminalProof: null, terminalFailure: null,
             confirmed: [], restored: [], refusal: null, rollbackRefusal: null };
     }
     need(['interrupted', 'unknown'].includes(state.status) && !state.rollbackRefusal);
@@ -73,7 +76,8 @@ function advance(state, event, scope) {
         break;
     case 'stop':
         need(exact(event, ['type', 'reason']) && !state.pending && !state.refusal);
-        need(['capture', 'fence', 'proof'].includes(event.reason));
+        need(['capture', 'fence', 'proof'].includes(event.reason)
+            || (state.version === 2 && event.reason === 'terminal-proof' && forwardComplete(state)));
         state.refusal = { step: nextForward(state) ?? null, reason: event.reason };
         if (event.reason === 'fence' && state.confirmed.length) state.status = 'blocked';
         break;
@@ -113,13 +117,23 @@ function advance(state, event, scope) {
         state.pending = null;
         break;
     }
-    case 'finish':
-        need(exact(event, ['type', 'status']) && !state.pending);
-        if (event.status === 'applied') need(!state.refusal && state.proved && !nextForward(state));
-        else if (event.status === 'rolled-back') need(state.refusal && state.confirmed.length && !nextInverse(state));
+    case 'terminal-blocked':
+        need(state.version === 2 && !state.pending && exact(event, ['type', 'direction', 'reason'])
+            && ['fence', 'proof'].includes(event.reason)
+            && (event.direction === 'forward' ? forwardComplete(state) : event.direction === 'rollback' && inverseComplete(state)));
+        state.terminalFailure = { direction: event.direction, reason: event.reason };
+        state.status = 'blocked';
+        break;
+    case 'finish': {
+        const requiresProof = state.version === 2 && event.status !== 'not-dispatched';
+        need(!state.pending && exact(event, requiresProof ? ['type', 'status', 'proof'] : ['type', 'status']));
+        if (event.status === 'applied') need(forwardComplete(state));
+        else if (event.status === 'rolled-back') need(inverseComplete(state));
         else need(event.status === 'not-dispatched' && state.refusal && !state.confirmed.length);
+        if (requiresProof) state.terminalProof = pin(event.proof);
         state.status = event.status;
         break;
+    }
     default: throw uncertain();
     }
     return state;
@@ -234,7 +248,7 @@ function createFileCutoverJournal({ directory } = {}) {
                     state = { ...candidate, head };
                     return structuredClone(state);
                 }
-                record({ type: 'start', version: 1, plan });
+                record({ type: 'start', version: 2, plan });
                 return await run({ record, assertCurrent, state: () => structuredClone(state) });
             } finally { fs.closeSync(fd); }
         } finally { fs.closeSync(dir); }
@@ -274,6 +288,12 @@ function frozen(value) {
  *   including the observed generations, or refuse. No target mutations here.
  * - prove({plan, confirmed}): true only after the read-only preparation proof
  *   (including old and new path checks). Called once before selectors or portals.
+ * - verifyTerminal({plan, direction, confirmed, restored, step}): read-only on
+ *   targets. Return an encrypted artifact pin for the complete final wire,
+ *   runtime and boot verification. `step` is the terminal artifact namespace.
+ *   Return false only for a known mismatch; a forward mismatch may reverse ACKs
+ *   under the original fence and native CAS. An unavailable observation (throw),
+ *   a lost fence or unproved restoration retains the scope without replay.
  * - observe(journalState): read-only 'before' | 'after' | 'mixed' | 'unavailable'.
  *   These report observations, never absence of an old in-flight writer.
  *
@@ -283,7 +303,7 @@ function frozen(value) {
  */
 function createScopedCutoverExecutor({ journal, adapter } = {}) {
     const reserve = stores.get(journal);
-    if (!reserve || !['verifyFence', 'capture', 'dispatch', 'verify', 'prove', 'observe']
+    if (!reserve || !['verifyFence', 'capture', 'dispatch', 'verify', 'prove', 'verifyTerminal', 'observe']
         .every(method => typeof adapter?.[method] === 'function')) throw invalid();
     async function checkFence(ctx) {
         try { return await adapter.verifyFence(ctx) === true; } catch { return false; }
@@ -339,7 +359,27 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
 
     async function run(tx, plan) {
         const stop = reason => tx.record({ type: 'stop', reason });
-        const finish = status => { tx.record({ type: 'finish', status }); return outcome(status); };
+        const finish = (status, proof) => {
+            tx.record({ type: 'finish', status, ...(proof && { proof }) });
+            return outcome(status);
+        };
+        async function terminal(direction) {
+            const { confirmed, restored } = tx.state();
+            const ctx = frozen({ plan, step: { id: `terminal-${direction}` }, direction, confirmed, restored });
+            const block = reason => { tx.record({ type: 'terminal-blocked', direction, reason }); return outcome('blocked'); };
+            if (!await checkFence(ctx)) return block('fence');
+            let proof, mismatch = false;
+            try {
+                const observed = await adapter.verifyTerminal(ctx);
+                if (observed === false) mismatch = true;
+                else proof = pin(observed);
+            } catch { /* read/verification failure is not an established mismatch */ }
+            if (!await checkFence(ctx)) return block('fence');
+            if (proof) return finish(direction === 'forward' ? 'applied' : 'rolled-back', proof);
+            if (direction !== 'forward' || !mismatch) return block('proof');
+            stop('terminal-proof');
+            return null;
+        }
         for (;;) {
             const state = tx.state(), step = nextForward(state);
             const ctx = frozen({ plan, step: step ?? null, direction: 'forward' });
@@ -351,7 +391,11 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
                 if (!proved) { stop('proof'); break; }
                 tx.record({ type: 'proved' });
             }
-            if (!step) return finish('applied');
+            if (!step) {
+                const result = await terminal('forward');
+                if (result) return result;
+                break;
+            }
             let artifacts;
             try { artifacts = captured(await adapter.capture(ctx)); } catch { stop('capture'); break; }
             if (!await checkFence(ctx)) { stop('fence'); break; }
@@ -367,7 +411,7 @@ function createScopedCutoverExecutor({ journal, adapter } = {}) {
             const result = await perform(tx, plan, 'rollback', original.step);
             if (result !== 'ack') return outcome(result === 'unknown' ? 'unknown' : 'blocked');
         }
-        return finish('rolled-back');
+        return terminal('rollback');
     }
 
     return Object.freeze({

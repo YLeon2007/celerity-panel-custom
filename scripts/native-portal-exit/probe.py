@@ -807,7 +807,26 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             # Install listeners first into the original processes, then dialers
             # and the downstream policy. Subscriber selectors are still old.
             stage_channels(plan, True)
-            api('gateway', 'adrules', 'desired-routes.json')
+            dump('selector-wire.json', {'port': ports['socks-p1'], **origins.marker})
+            spec = api_actor('gateway', 'journaled selector')
+            selector = ['node', '/scripts/stage-switch.cjs']
+            identity = [str(spec['port']), str(spec['pid']), parent_net, spec['binary']]
+            selector_terminals = []
+            for operation, status, wanted in (('rollback', 'rolled-back', [('forward', 'B'), ('rollback', 'A')]),
+                                               ('apply', 'applied', [('forward', 'B')])):
+                reply = cmd([*selector, operation, *identity])
+                require(reply.returncode == 0 and not reply.stderr, f'journaled selector {operation} failed')
+                outcome = json.loads(reply.stdout)
+                traffic = outcome['wireProofs']
+                require(outcome['status'] == status and [(row['direction'], row['marker']) for row in traffic] == wanted,
+                        f'journaled selector {operation} has an unexpected terminal receipt')
+                with origins.lock:
+                    require(len({row['path'] for row in traffic}) == len(traffic) and all(
+                        origins.receipts.get(row['path']) == [(row['marker'], f'{VIRTUAL_IP}:{VIRTUAL_PORT}')] for row in traffic),
+                        f'journaled selector {operation} lacks exact HTTP origin receipts')
+                selector_terminals.append(outcome)
+            evidence['selector_terminals'] = selector_terminals
+            evidence['api_calls'].append({**spec, 'operations': ['rollback', 'apply']})
             verify_live_rules('gateway', 'desired-routes.json')
             restart_mains(plan['portals'], 'after', [*listens, *added])
             wait_until('original staged process and all listeners retained', children,

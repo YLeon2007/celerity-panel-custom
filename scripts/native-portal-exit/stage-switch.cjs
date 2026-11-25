@@ -14,7 +14,8 @@ const read = fs.readFileSync;
 const need = condition => { if (!condition) throw Error('fixture cutover refused'); };
 const sha = data => createHash('sha256').update(data).digest('hex');
 const json = file => JSON.parse(read(file));
-const directory = '/work/selector-journal';
+const exercise = ['apply', 'rollback'].includes(mode);
+const directory = exercise ? `/work/selector-${mode}-journal` : '/work/selector-journal';
 const scope = 'fixture-gateway';
 const files = { before: 'staged-routes.json', desired: 'desired-routes.json' };
 const bootFile = 'gateway-main.json';
@@ -53,14 +54,17 @@ async function main() {
     process.umask(0o077);
     const net = fs.readlinkSync('/proc/self/ns/net');
     const devices = read('/proc/net/dev', 'utf8').trimEnd().split('\n').slice(2).map(line => line.split(':')[0].trim());
-    need(['lost', 'observe'].includes(mode) && process.cwd() === '/work' && !fs.existsSync('/etc/resolv.conf')
+    need((exercise || ['lost', 'observe'].includes(mode)) && process.cwd() === '/work' && !fs.existsSync('/etc/resolv.conf')
         && equal(devices, ['lo']) && /^net:\[\d+\](?![\s\S])/.test(parentNet) && net !== parentNet
         && /^(?:[1-9]\d{0,4})(?![\s\S])/.test(port) && Number(port) < 65536
         && /^[1-9]\d*(?![\s\S])/.test(pid) && Number(pid) > 1 && binary === '/tools/relay-xray');
     const bind = boundGeneration();
-    const planDigest = sha(JSON.stringify({ ...bind, net }));
+    const wire = exercise ? json('selector-wire.json') : null;
+    if (wire) need(Number.isInteger(wire.port) && wire.port > 0 && wire.port < 65536
+        && typeof wire.A === 'string' && typeof wire.B === 'string' && wire.A !== wire.B);
+    const planDigest = sha(JSON.stringify({ ...bind, net, wire, ...(exercise && { mode }) }));
     need(!equal(rules('before'), rules('desired')));
-    if (mode === 'lost') {
+    if (mode !== 'observe') {
         fs.mkdirSync(directory, { mode: 0o700 });
         // Ensure the journal root itself is durably linked before reserving it.
         const fd = fs.openSync('/work', fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
@@ -70,24 +74,57 @@ async function main() {
     const journal = createFileCutoverJournal({ directory });
     const artifacts = createCutoverArtifactStore({ directory, key: read(keyPath) });
     const checkArtifact = (ctx, side) => need(artifacts.read(ctx, side, ctx.artifacts[side]).equals(read(files[side])));
+    const live = () => ({ generation: boundGeneration(), rules: current() });
+    const bytes = record => Buffer.from(JSON.stringify(record));
+    const wireProofs = [];
+    function probeWire(direction) {
+        const path = `/proof-selector-${randomUUID()}`;
+        const body = call('/usr/bin/curl', ['-q', '--silent', '--show-error', '--fail', '--max-time', '2',
+            '--noproxy', '', '--socks5-hostname', `127.0.0.1:${wire.port}`, `http://127.0.0.42:18080${path}`]);
+        const marker = ['A', 'B'].find(side => wire[side] === body);
+        need(marker);
+        const result = { direction, path, marker };
+        wireProofs.push(result);
+        return result;
+    }
     const executor = createScopedCutoverExecutor({ journal, adapter: {
         verifyFence: ({ plan }) => plan.planDigest === planDigest && equal(boundGeneration(), bind),
         capture: ctx => ({ before: artifacts.seal(ctx, 'before', read(files.before)),
             desired: artifacts.seal(ctx, 'desired', read(files.desired)) }),
         async dispatch(ctx, submit) {
-            need(mode === 'lost' && ctx.direction === 'forward');
+            need(mode === 'lost' || exercise);
             return submit(() => {
                 checkArtifact(ctx, 'before');
                 checkArtifact(ctx, 'desired');
-                need(equal(current(), rules('before')));
-                api('adrules', files.desired);
+                const rollback = ctx.direction === 'rollback';
+                if (rollback) need(exercise && artifacts.read(ctx, 'confirmed', ctx.artifacts.confirmed).equals(bytes(live())));
+                else need(equal(current(), rules('before')));
+                api('adrules', files[rollback ? 'before' : 'desired']);
+                if (exercise) return;
                 // The real Xray action returned. The writer must die before
                 // returning the handoff receipt or looking at live readback.
                 process.kill(process.pid, 'SIGKILL');
             });
         },
-        verify: () => { throw Error('lost reply fixture cannot verify the writer'); },
+        verify(ctx) {
+            need(exercise);
+            const observed = live();
+            need(equal(observed.rules, rules(ctx.direction === 'forward' ? 'desired' : 'before')));
+            return artifacts.seal(ctx, 'confirmed', bytes(observed));
+        },
         prove: () => equal(current(), rules('before')), // Wire proofs were done by the parent.
+        verifyTerminal(ctx) {
+            need(exercise);
+            const observed = live(), forward = ctx.direction === 'forward';
+            const receipt = (forward ? ctx.confirmed : ctx.restored)[0];
+            const pin = forward ? receipt.artifacts.confirmed : receipt.confirmed;
+            need(artifacts.read({ ...ctx, step: receipt.step }, 'confirmed', pin).equals(bytes(observed)));
+            const traffic = probeWire(ctx.direction);
+            // The rollback drill deliberately requires the old wire marker even
+            // after the switch. This is a known mismatch, not a lost response.
+            if (traffic.marker !== (forward && mode === 'apply' ? 'B' : 'A')) return false;
+            return artifacts.seal(ctx, 'confirmed', bytes({ observed, traffic }));
+        },
         observe(state) {
             need(mode === 'observe' && state.pending?.direction === 'forward');
             const ctx = { plan: state.plan, ...state.pending };
@@ -97,11 +134,16 @@ async function main() {
             return ['before', 'desired'].find(side => equal(rows, rules(side)))?.replace('desired', 'after') ?? 'mixed';
         },
     } });
-    if (mode === 'lost') {
-        // Success means this process never produces a reply.
-        await executor.execute({ scope, operationId: randomUUID(), fenceId: randomUUID(), planDigest,
+    if (mode !== 'observe') {
+        const result = await executor.execute({ scope, operationId: randomUUID(), fenceId: randomUUID(), planDigest,
             steps: [{ id: 'switch_ingress', phase: 'selector' }] });
-        throw Error('writer unexpectedly survived');
+        need(exercise && result.status === (mode === 'apply' ? 'applied' : 'rolled-back'));
+        const state = journal.read(scope);
+        need(state.version === 2 && state.status === result.status && state.terminalProof && state.pending === null);
+        const direction = mode === 'apply' ? 'forward' : 'rollback';
+        artifacts.read({ plan: state.plan, step: { id: `terminal-${direction}` } }, 'confirmed', state.terminalProof);
+        process.stdout.write(JSON.stringify({ status: result.status, wireProofs }));
+        return;
     }
     const result = await executor.reconcile(scope);
     need(result.journal?.pending?.step.id === 'switch_ingress' && result.journal.status === 'unknown'
