@@ -246,7 +246,7 @@ async function localizedFrontend(html, expected, { app, headers, csrf }) {
     }
     if (unknown || readCount) {
         install.click(); // Detached after an accepted GET.
-        view.install.click(); // Still refresh-required, even on the new view.
+        if (expected.error.outcome !== 'rolled_back') view.install.click(); // Still refresh-required.
     }
     assert.equal(calls.length, 2 + readCount);
     return { initialText, finalText: status.textContent, disabled: view.install.disabled, refreshHidden: refresh.hidden };
@@ -453,7 +453,7 @@ test('closed diagnostics reach the authenticated API and the localized install c
             assert.equal(finalText, outcome === 'unknown' ? translate('rebuildL2tp.messages.observationTimeout', lang) + note
                 : failed ? stopped(summary) : summary, `${name}: ${lang}`);
             assert.deepEqual(log, actions, name);
-            assert.equal(disabled, ['unknown', 'rolled_back', 'installed'].includes(outcome), name);
+            assert.equal(disabled, ['unknown', 'installed'].includes(outcome), name);
             assert.equal(refreshHidden, !disabled, name);
         }
     }

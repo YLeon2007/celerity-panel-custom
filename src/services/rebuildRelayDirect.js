@@ -174,13 +174,13 @@ const directAlphabet = Array.from({ length: 127 }, (_, i) => i + 1)
     .filter(i => ![10, 13, 26, 34, 39, 92, 127].includes(i)).map(i => String.fromCharCode(i)).join('');
 function encodeDirectBytes(bytes) {
     let packed = '';
-    // 120**29 covers all 25-byte words; larger blocks reduce radix padding
+    // 120**139 covers all 120-byte words; larger blocks reduce radix padding
     // without needing any non-stdlib decoder or changing the SSH frame.
-    for (let i = 0; i < bytes.length; i += 25) {
+    for (let i = 0; i < bytes.length; i += 120) {
         let word = 0n;
-        for (let j = 0; j < 25; j++) word = (word << 8n) | BigInt(bytes[i + j] ?? 0);
+        for (let j = 0; j < 120; j++) word = (word << 8n) | BigInt(bytes[i + j] ?? 0);
         let part = '';
-        for (let j = 0; j < 29; j++) {
+        for (let j = 0; j < 139; j++) {
             part = directAlphabet[Number(word % 120n)] + part;
             word /= 120n;
         }
@@ -208,9 +208,9 @@ function bundleDirectScript() {
     return [
         'import lzma,functools,hashlib,re,sys,types',
         `_c3_digits={c:i for i,c in enumerate("${directAlphabet}")}`,
-        '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(25,"big")',
+        '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(120,"big")',
         `_c3_payload="${encodeDirectBytes(compressed)}"`,
-        `_c3_sources=lzma.decompress(b"".join(_c3_chunk(_c3_payload[i:i+29]) for i in range(0,len(_c3_payload),29))[:${compressed.length}],memlimit=16777216)`,
+        `_c3_sources=lzma.decompress(b"".join(_c3_chunk(_c3_payload[i:i+139]) for i in range(0,len(_c3_payload),139))[:${compressed.length}],memlimit=16777216)`,
         String.raw`_c3_sources=re.sub(rb"\t+",lambda m:b"\n"+b"    "*len(m[0]),_c3_sources)`,
         `_c3_offsets=${JSON.stringify(offsets)}`,
         `_c3_hashes=${JSON.stringify(manifest.sources.map(row => row.sha256))}`,

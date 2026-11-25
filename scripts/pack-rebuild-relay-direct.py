@@ -43,9 +43,10 @@ def main():
     }
     # Reserve space for the bootstrap and shell wrapper with NUL.
     # directCommand also checks the exact argv.
-    encoded_size = (len(packed) + 24) // 25 * 29
+    assert 120**139 >= 256**120
+    encoded_size = (len(packed) + 119) // 120 * 139
     decoded = re.sub(rb'\t+', lambda m: b'\n' + b'    ' * len(m[0]), lzma.decompress(packed, memlimit=16777216))
-    if decoded != source or encoded_size + 2200 >= 131072:
+    if decoded != source or encoded_size + 1900 >= 131072:
         raise SystemExit('DIRECT source mismatch or shell argument too large')
     body = json.dumps(manifest, indent=2) + '\n'
     if args.check:

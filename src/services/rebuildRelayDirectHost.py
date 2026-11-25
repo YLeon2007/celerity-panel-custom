@@ -1496,7 +1496,7 @@ def apply_ppp_preparation(expected):
     return generation
 
 
-def module_boot_owner(backup):
+def module_boot_owner(backup, *, unwritten=False):
     """The private manifest binds one canonical file to this install generation."""
     plan = backup['before'].get('pppModules', {})
     if 'bootFile' not in plan:
@@ -1504,6 +1504,11 @@ def module_boot_owner(backup):
         need('modulePersistence' not in backup and not plan.get('observers'), 'ROLLBACK_DRIFT')
         return None
     images, generation = plan['bootFile'], backup.get('modulePersistence')
+    if unwritten and 'modulePersistence' not in backup:
+        previous = images['before']
+        need(read(PPP_PATH, 4096) == previous['record'] and remove_generation(PPP_PATH) == previous['generation'],
+             'ROLLBACK_DRIFT')
+        return None
     checked = set(plan.get('observers', {}))
     legacy = set(plan['missing']) & set(OBSERVERS)
     # Older receipts checked and persisted only the absent observers. All
@@ -2585,7 +2590,7 @@ def bound_manifest(request):
     path, record, value = read_manifest(request['backupId'])
     need(value['machineId'] == request['machineId'] and value['backupId'] == request['backupId'] and
          value['network'] == request['network'] and digest(encode(value['before'])) == request['baseline']
-         and value['before']['boot'] == boot(), 'ROLLBACK_DRIFT')
+         and value['before'].get('boot') == boot(), 'ROLLBACK_DRIFT')
     return path, record, value
 
 
@@ -2976,7 +2981,7 @@ def cleanup_rollback(request, path, record, backup, fd, *, file_undo=None, file_
     before = backup['before']
     need(install_lock_identity(fd) == before['installLock'] and backup['machineId'] == request['machineId']
          and backup['backupId'] == request['backupId'] and encode(backup['network']) == encode(request['network'])
-         and boot() == before['boot'], 'IN_FLIGHT')
+         and boot() == before.get('boot'), 'IN_FLIGHT')
     CLEANUP_ENTERED = True
     cleanup_no_remove(path)
     package_no_pending()
@@ -3005,10 +3010,15 @@ def cleanup_rollback(request, path, record, backup, fd, *, file_undo=None, file_
     elif not pristine_phase and backup['phase'] != 'projected-rollback':
         # Join stock rollback as before. It proves the projected baseline;
         # publish a distinct phase before attempting to restore foreign bytes.
-        need(backup.get('swanStart'), 'IN_FLIGHT')
+        settled = journal.get('installSettled')
+        need(settled is True or 'installSettled' not in journal and backup.get('swanStart'), 'IN_FLIGHT')
+        if settled is True and backup['phase'] == 'applying':
+            for n in (X, B):
+                expected = journal.get('xrayBirths', {}).get(n, before['units'][n]['InvocationID'])
+                need(unit(n).get('InvocationID') == expected, 'IN_FLIGHT')
         verify_retained_cleanup_edits(backup)
         if journal['xray'] is not None:
-            need(cleanup_xray_identity() == journal.get('installXray'), 'IN_FLIGHT')
+            need(cleanup_xray_identity() == journal.get('installXray', journal['xray']), 'IN_FLIGHT')
         rollback(request, path, record, backup, cleanup=True)
         record = entry(encode(backup))
     if not pristine_phase and file_undo is None:
@@ -3160,6 +3170,7 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
                   after={k: {**r, 'data': digest(raw(r))} for k, r in after.items()},
                   phase='preparing-native' if pending else 'applying')
     if cleanup_edits:
+        need(before.get('boot') == boot(), 'BASELINE_CHANGED')
         backup['phase'] = 'cleaning-foreign'
         xray = cleanup_xray_identity() if any(e[0] in CLEANUP_XRAY_SHA for e in cleanup_edits) else None
         backup['foreignJournal'] = dict(edits=cleanup_edits, editsSha256=digest(encode(cleanup_edits)), done=[], xray=xray)
@@ -3206,9 +3217,37 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
         need({**live, 'foreignCleanup': request['foreignCleanup']} == before
              and candidate(request, live) == after, 'BASELINE_CHANGED')
         backup['phase'] = 'applying'
+        backup['foreignJournal']['installSettled'] = True
         start = entry(encode(backup))
         write(path, old_manifest, start)
         old_manifest = start
+
+    def checkpoint(settled):
+        nonlocal old_manifest
+        if cleanup_edits:
+            # A client can outlive the helper's flock. Require its durable acknowledgement.
+            backup['foreignJournal']['installSettled'] = settled
+            nxt = entry(encode(backup))
+            write(path, old_manifest, nxt)
+            old_manifest = nxt
+
+    def install_service(*args, wait, capture_xray=False, capture_swan=False):
+        nonlocal old_manifest
+        checkpoint(False)
+        sc(*args, wait=wait)
+        if cleanup_edits and capture_xray:
+            journal = backup['foreignJournal']
+            journal.setdefault('xrayBirths', {})[args[1]] = unit(args[1])['InvocationID']
+            if journal['xray'] is not None:
+                journal['installXray'] = cleanup_xray_identity()
+        if capture_swan:
+            backup['swanStart'] = swan_started_units(before)
+            if not cleanup_edits:
+                started = entry(encode(backup))
+                write(path, old_manifest, started)
+                old_manifest = started
+        checkpoint(True)
+
     if pending:
         need(lock_fd is not None and observe_install(request['machineId'], routing(d), before.get('transit'), lock_fd) == before,
              'BASELINE_CHANGED')
@@ -3230,6 +3269,8 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
         if cleanup_edits and 'bootFile' in modules:
             # Rollback owns the receipted boot file, not a newly created parent.
             can_undo_modules = can_undo_modules and recovery_stat(PPP_DIRS[0]) is not None
+        if modules['missing'] or 'bootFile' in modules:
+            checkpoint(False)
         generation = apply_ppp_preparation(modules)
         if 'bootFile' in modules:
             backup['modulePersistence'] = generation
@@ -3262,6 +3303,7 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
         # after the durable host intent and under the reserved host lock.
         command('/usr/sbin/nft', '-c', '-f', '-', data=raw(after['nft']))
         PPP_PREPARING = False
+        checkpoint(True)
     if cleanup_edits:
         old_manifest = cleanup_install_files(request, path, old_manifest, backup, lock_fd, after,
                                              can_undo_modules=can_undo_modules)
@@ -3276,6 +3318,7 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
                 write(paths[key], originals[key], after[key])
     if before.get('installBoot'):
         target = before['units'][XL]['FragmentPath']
+        checkpoint(False)
         enroll_boot(target)
         receipt = boot_link()
         need(receipt and receipt[0] == target, 'ROLLBACK_DRIFT')
@@ -3283,21 +3326,20 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
         current = entry(encode(backup))
         write(path, old_manifest, current)
         old_manifest = current
+        checkpoint(True)
     if request.get('progress') is True:
         install_progress('restart')
-    sc('daemon-reload', wait=12)
+    install_service('daemon-reload', wait=12)
     if 'bridge' in after:
         need(xray_accounts_match(unit(B), before['units'][B]), 'ROLLBACK_DRIFT')
-        sc('restart', B, wait=22)
+        install_service('restart', B, wait=22, capture_xray=True)
     x = unit(X)
     retained_xray_dropin(x, before['units'][X])
     need(xray_accounts_match(x, before['units'][X]), 'ROLLBACK_DRIFT')
-    sc('restart', X, wait=22)
+    install_service('restart', X, wait=22, capture_xray=True)
     if before.get('ikeSockets'):
-        sc('restart', IKE, wait=22)
+        install_service('restart', IKE, wait=22)
     no_jobs(UNITS)
-    if cleanup_edits and backup['foreignJournal']['xray'] is not None:
-        backup['foreignJournal']['installXray'] = cleanup_xray_identity()
     if 'swan' in after:
         check_swan_profile(backup, read(SWAN_PROFILE))
         units = {n: unit(n) for n in SWAN_START_UNITS}
@@ -3313,16 +3355,9 @@ def install(request, before, after, lock_fd=None, *, cleanup_edits=None):
         # Settle the policy start before XL's parallel Requires jobs can start
         # IKE. A failed policy start can then be rolled back without claiming
         # ownership of an unrecorded VPN daemon invocation.
-        sc('start', NET_UNIT, wait=24)
-    sc('start', XL, wait=26)
-    if 'swan' in after:
-        # A successful manager start and fresh, named invocations are distinct
-        # from the full Install receipt. Persist them before later verification.
-        # An uncertain start without this record has no stop authority.
-        backup['swanStart'] = swan_started_units(before)
-        started = entry(encode(backup))
-        write(path, old_manifest, started)
-        old_manifest = started
+        install_service('start', NET_UNIT, wait=24)
+    # A settled start and named invocations must be durable together.
+    install_service('start', XL, wait=26, capture_swan='swan' in after)
     # Type=simple may be active before its API/UDP listeners are present.
     ready_by = min(DEADLINE, time.monotonic() + 6)
     while True:
@@ -3542,7 +3577,8 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
     # Reattestation does not transfer the original Install rollback authority,
     # even if only a service (not the machine boot) changed generation.
     need(not was_installed or 'boot' not in backup['runtime'], 'ROLLBACK_DRIFT')
-    module_owner = module_boot_owner(backup)
+    unwritten = cleanup and not was_installed and backup['foreignJournal'].get('installSettled') is True
+    module_owner = module_boot_owner(backup, unwritten=True) if unwritten else module_boot_owner(backup)
     check_module_boot_owner(module_owner)
     before, d, token = runtime_before(backup), request['network'], request['backupId']
     no_jobs(UNITS)
@@ -3714,13 +3750,17 @@ def rollback(request, path, old_manifest, backup, *, cleanup=False):
         if not directory_absent(p):
             rmdir(p)
     sc('daemon-reload', wait=12)
-    if sidecar and (current['bridge'] != originals['bridge'] or not working(unit(B))):
-        need(xray_accounts_match(unit(B), before['units'][B]), 'ROLLBACK_DRIFT')
-        sc('restart', B, wait=22)
+    if sidecar:
+        b = unit(B)
+        if not working(b) or (current['bridge'] != originals['bridge'] and
+                              (not cleanup or b['InvocationID'] != before['units'][B]['InvocationID'])):
+            need(xray_accounts_match(b, before['units'][B]), 'ROLLBACK_DRIFT')
+            sc('restart', B, wait=22)
     x = unit(X)
     retained_xray_dropin(x, before['units'][X])
     need(xray_accounts_match(x, before['units'][X]), 'ROLLBACK_DRIFT')
-    if current['main'] != before['files']['main'] or not working(x):
+    if not working(x) or (current['main'] != before['files']['main'] and
+                          (not cleanup or x['InvocationID'] != before['units'][X]['InvocationID'])):
         sc('restart', X, wait=22)
     if before.get('ikeSockets'):
         sc('start', IKE, wait=22)
@@ -7539,8 +7579,9 @@ def recovery_manifest(request, scope):
     # The legacy applying manifest precedes all native effects. The flock
     # alone doesn't join an orphaned systemctl client. The stock swanStart
     # receipt is written *after* the last native writer returns.
-    if phase not in ('rolled-back', 'cleaning-foreign', 'projected-rollback'):
-        started = backup['swanStart']
+    if phase == 'installed' or phase == 'applying' and (
+            backup.get('foreignJournal', {}).get('installSettled') is not True or 'swanStart' in backup):
+        started = backup.get('swanStart')
         need(type(started) is list and len(started) == len(SWAN_START_UNITS)
              and all(isinstance(birth, str) and re.fullmatch(r'[a-f0-9]{32}', birth) and int(birth, 16) for birth in started)
              and len(set(started)) == len(started), 'IN_FLIGHT')
@@ -7808,7 +7849,16 @@ def dispatch(request: dict[str, Any]):
             if action == 'install':
                 need(cleanup_observe(request, d, transit, fd) == (before, edits), 'BASELINE_CHANGED')
                 if edits:
-                    install(request, before, after, fd, cleanup_edits=edits)
+                    try:
+                        install(request, before, after, fd, cleanup_edits=edits)
+                    except Refusal as error:
+                        if not CLEANUP_ENTERED or str(error) == 'IN_FLIGHT':
+                            raise
+                        path, record, backup = bound_manifest(request)
+                        need(not installed_phase(backup['phase']), 'IN_FLIGHT')
+                        cleanup_rollback(request, path, record, backup, fd)
+                        CLEANUP_ENTERED = False
+                        raise Refusal('COMMAND_FAILED') from None
                 else:
                     NO_INSTALL_WRITES = False
                     install(request, before, after, fd)

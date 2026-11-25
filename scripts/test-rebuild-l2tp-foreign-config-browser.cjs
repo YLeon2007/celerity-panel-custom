@@ -199,15 +199,16 @@ async function main() {
             { foreignCleanup: { token: fresh, fixXrayUnitMode: false } }]);
         release();
         await browser.wait(`${text(status)}?.includes(${JSON.stringify(words.installChecks.FOREIGN_CONFIG_RESTORED)})`);
-        await browser.wait(visible('[data-refresh]'));
+        await finished();
         assert.equal(await browser.evaluate('window.fixtureSameDocument'), true);
-        assert.equal(await browser.evaluate(`${el(install)}.disabled`), true);
+        assert.equal(await browser.evaluate(visible('[data-refresh]')), false);
+        assert.equal(requests.filter(r => r.method === 'GET' && r.path === '/panel/l2tp').length, 1);
         console.log('drift: fresh explicit consent, distinct nonces, cleanup progress and rollback-restored status');
 
         words = await start('en', challenge([xray], [xray], [], first), { outcome: 'rolled_back', code: 'REBUILD_L2TP_INSTALL_FAILED' });
         await open();
         await browser.click(confirm);
-        await browser.wait(visible('[data-refresh]'));
+        await finished();
         checkPostBodies([{}, { foreignCleanup: { token: first, fixXrayUnitMode: true } }]);
         assert.ok((await browser.evaluate(text(status))).includes(words.messages.installRolledBack));
         assert.ok(!(await browser.evaluate(text(status))).includes(words.installChecks.FOREIGN_CONFIG_RESTORED));

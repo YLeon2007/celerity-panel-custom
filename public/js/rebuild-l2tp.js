@@ -869,7 +869,7 @@
         }
         setActionStatus(message, nodeId);
         if (accepted.includes(result) || result === 'installCleanupFailed' || result === 'installRolledBack') {
-            await finishAcknowledged(csrf, message, !accepted.includes(result), nodeId);
+            await finishAcknowledged(csrf, message, result === 'installCleanupFailed', nodeId);
         } else if (unknown || result === 'uncertain') {
             if (token) {
                 const outcome = await reconcileUnknown(csrf, token, accepted, nodeId);
