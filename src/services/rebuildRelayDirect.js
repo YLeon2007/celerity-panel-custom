@@ -211,7 +211,7 @@ function bundleDirectScript() {
         '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(25,"big")',
         `_c3_payload="${encodeDirectBytes(compressed)}"`,
         `_c3_sources=lzma.decompress(b"".join(_c3_chunk(_c3_payload[i:i+29]) for i in range(0,len(_c3_payload),29))[:${compressed.length}],memlimit=16777216)`,
-        String.raw`_c3_sources=re.sub(rb"(?m)^\t+",lambda m:b"    "*len(m[0]),_c3_sources)`,
+        String.raw`_c3_sources=re.sub(rb"\t+",lambda m:b"\n"+b"    "*len(m[0]),_c3_sources)`,
         `_c3_offsets=${JSON.stringify(offsets)}`,
         `_c3_hashes=${JSON.stringify(manifest.sources.map(row => row.sha256))}`,
         '_c3_bytes=lambda n:_c3_sources[_c3_offsets[n]:_c3_offsets[n+1]]',

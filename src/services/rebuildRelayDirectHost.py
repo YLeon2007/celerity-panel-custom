@@ -296,10 +296,11 @@ def _bounded_child_status(argv, end, maximum, may_write, progress=None, *, stock
     env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'DEBIAN_FRONTEND': 'noninteractive'}
     options = {'start_new_session': True} if stock_stage else {}
     if stock_config is not None:
-        # Launch the downloader itself unprivileged. APT invoked as root
+        # Launch APT itself unprivileged. APT invoked as root
         # can disable its own sandbox when a destination probe fails.
         need(stock_stage and stock_cwd and stock_owner is not None and stock_owner[0] > 0, 'CONFFILE_UNKNOWN')
         env['APT_CONFIG'] = stock_config
+        env['TMPDIR'] = stock_cwd
         options.update(user=stock_owner[0], group=stock_owner[1], extra_groups=[])
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              cwd=stock_cwd or '/', env=env, **options)
@@ -885,12 +886,25 @@ def cleanup_stock_inputs(keys, found, contents):
 def cleanup_stage_stock(wanted, installed):
     bad = 'CONFFILE_UNKNOWN'
     end = min(DEADLINE, time.monotonic() + 28)
-    def run(argv, maximum, *, stderr_ok=False, **options):
+    planner = C3_REPLACEMENT
+    def run(argv, maximum, *, stderr_ok=False, failure='STOCK_CHILD_FAILED', **options):
         rc, out, err = bounded_status(argv, end, maximum, stock_stage=True, **options)
-        need(rc == 0 and (stderr_ok or not err) and time.monotonic() < end, bad)
+        if time.monotonic() >= end:
+            raise subprocess.TimeoutExpired((), 0)
+        planner['need'](rc == 0 and (stderr_ok or not err), failure)
         return out
-    staged = C3_REPLACEMENT['stage_host_stock'](wanted, installed=installed, directory=directory,
-                                               workspace=stock_workspace, run=run)
+    try:
+        staged = planner['stage_host_stock'](wanted, installed=installed, directory=directory,
+                                             workspace=stock_workspace, run=run)
+    except planner['Refusal'] as error:
+        planner['stock_log'](str(error))  # only fixed codes; never child output
+        raise
+    except subprocess.TimeoutExpired:
+        planner['stock_log']('STOCK_STAGE_TIMEOUT')
+        raise
+    except (OSError, ValueError, KeyError, OverflowError):
+        planner['stock_log']('REPLACEMENT_ARCHIVE_IO')
+        raise
     need(staged.keys() == wanted.keys() and time.monotonic() < end, bad)
     if 'STARTER_NOT_STOCK' in staged:
         data = staged['STARTER_NOT_STOCK'].data

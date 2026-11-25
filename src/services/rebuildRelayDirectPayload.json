@@ -17,14 +17,14 @@
     },
     {
       "path": "rebuildRelayReplacement.py",
-      "size": 31341,
-      "sha256": "fc004f12619e46cbed84ec2294b80641740f16901c1efeaf0c0fa439a9d6663e"
+      "size": 34401,
+      "sha256": "aff94ae3efc9888c3a49f763b1d24d0976e90e0a4aff59684a9813ee011caaf5"
     },
     {
       "path": "rebuildRelayDirectHost.py",
-      "size": 410529,
-      "sha256": "98ce4f26c4ff911f5071a70be08d619d40ae3839317ab228fed40c1e650cce24"
+      "size": 411057,
+      "sha256": "6d966c9519d3e0eb78dbd5c8561ccc7c7fd3e6676de922af5b8f45b371af0cd5"
     }
   ],
-  "sha256": "6eba7fa0d512135a2bda0a1f7298c81b5741d095ccd6d8c223fbf17e5225be03"
+  "sha256": "29f37f4173b88126aa9c6ee61257b8a2df12732334c0bba8e35da60cf1caadcc"
 }

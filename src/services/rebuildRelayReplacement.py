@@ -185,12 +185,13 @@ def _installed_identity(package, raw, wanted):
     return package, identity[3].decode('ascii'), identity[2].decode('ascii')
 
 
-def _archive(identity, archives):
+def _archive(identity, archives, *, offline=False):
     bad = 'REPLACEMENT_ARCHIVE_RECORD'
     rows = [row for row in archives if row[:3] == identity]
     need(len(rows) == 1, bad)
     row = rows[0]
-    need(type(row.suite) is str and row.suite in REPOSITORIES and type(row.filename) is str and len(row.filename) <= 512 and
+    need(type(row.suite) is str and (row.suite in REPOSITORIES or offline and row.suite == 'trixie-backports')
+         and type(row.filename) is str and len(row.filename) <= 512 and
          re.fullmatch(r'pool/(?:updates/)?main/(?:[a-zA-Z0-9+.~_\-]+/)+[a-zA-Z0-9+.~_\-]+\.deb', row.filename)
          and not {'.', '..'}.intersection(row.filename.split('/')) and
          row.filename.startswith('pool/updates/') == (row.suite == 'trixie-security') and
@@ -371,6 +372,7 @@ STOCK_LISTS = '/var/lib/apt/lists'
 STOCK_CACHE = '/var/cache/apt/archives'
 KEYRING = '/usr/share/keyrings/debian-archive-keyring.pgp'
 MAX_INDEX = 128 * 1024 * 1024
+APT_ISOLATION = 'Dir::Etc::Parts "/dev/null";\nDir::Etc::Main "/dev/null";\n'
 
 
 def stock_identities(wanted, installed):
@@ -457,18 +459,19 @@ def _stock_fields(raw):
     return fields
 
 
-def _stock_index_release(raw, suite):
+def _stock_index_release(raw, suite, *, fresh):
     bad = 'REPLACEMENT_ARCHIVE_RECORD'
     row = _stock_fields(raw)
-    need(row.get(b'origin') == b'Debian' and row.get(b'codename') == suite.encode(), bad)
+    need(suite in (*REPOSITORIES, 'trixie-backports') and row.get(b'codename') == suite.encode() and
+         row.get(b'origin') == (b'Debian Backports' if suite.endswith('-backports') else b'Debian'), bad)
     now = time.time()
     def date(key):
         value = parsedate_to_datetime(row.get(key, b'').decode('ascii'))
         need(value.tzinfo is not None, bad)
         return value.timestamp()
     need(date(b'date') <= now + 10, bad)
-    if suite != 'trixie' or b'valid-until' in row:
-        need(date(b'valid-until') > now, bad)
+    if fresh and (suite != 'trixie' or b'valid-until' in row):
+        need(date(b'valid-until') > now, 'STOCK_RELEASE_EXPIRED')
     hashes = [line.split() for line in row.get(b'sha256', b'').strip().split(b'\n')]
     need(all(len(line) == 3 for line in hashes) and len({line[2] for line in hashes}) == len(hashes), bad)
     wanted = [(h, s) for h, s, name in hashes if name == b'main/binary-amd64/Packages']
@@ -509,8 +512,11 @@ def stock_verifier(directory):
                 need(stat.S_ISREG(st.st_mode) and st.st_uid == st.st_gid == 0
                      and st.st_mode & 0o100 and not st.st_mode & 0o7022, 'REPLACEMENT_ARCHIVE_IO')
                 return '/usr/bin/' + name
-    syslog.syslog(syslog.LOG_WARNING, 'celerity-rebuild-l2tp: STOCK_SIGNATURE_VERIFIER_MISSING')
     raise Refusal('STOCK_SIGNATURE_VERIFIER_MISSING')
+
+
+def stock_log(code):
+    syslog.syslog(syslog.LOG_WARNING, 'celerity-rebuild-l2tp: ' + code)
 
 
 def verify_stock_release(run, verifier, work, keyring, release):
@@ -530,11 +536,92 @@ def verify_stock_release(run, verifier, work, keyring, release):
         return verified
 
 
+def _stock_index(directory, index, size, sha, work, run, *, compressed_ok=False, **kwargs):
+    raw = _stock_read(directory, index, MAX_INDEX, optional=True, **kwargs) if size else b''
+    if raw is None and compressed_ok:
+        for suffix in ('.lz4', '.xz', '.gz', '.zst', '.bz2', '.lzma'):
+            compressed = _stock_read(directory, index + suffix, MAX_INDEX, optional=True, **kwargs)
+            if compressed is None:
+                continue
+            target = work / ('Packages' + suffix)
+            try:
+                target.write_bytes(compressed)
+                target.chmod(0o644)
+                work.chmod(0o711)
+                raw = run(('/usr/lib/apt/apt-helper', 'cat-file', str(target)), size, stock_cwd=str(work),
+                          stock_config=str(work / 'apt.conf'), stock_owner=apt_stage_user())
+            finally:
+                target.unlink(missing_ok=True)
+            break
+    need(raw is not None and len(raw) == size and sha256(raw) == sha, 'REPLACEMENT_ARCHIVE_RECORD')
+    return raw
+
+
+def _stock_cached(identity, directory):
+    package, version, arch = identity
+    # APT escapes the epoch; also accept the epoch-less download basename.
+    versions = {version.split(':')[-1], version.replace(':', '%3a'), version.replace(':', '%3A')}
+    blobs = [_stock_read(directory, f'{STOCK_CACHE}/{package}_{v}_{arch}.deb', MAX_DEB, optional=True)
+             for v in sorted(versions)]
+    blobs = [blob for blob in blobs if blob is not None]
+    need(len(blobs) <= 1, 'REPLACEMENT_ARCHIVE_RECORD')
+    return blobs[0] if blobs else None
+
+
+def _stock_authenticate(row, blob):
+    need(blob is not None and len(blob) == row.size and sha256(blob) == row.sha256, 'REPLACEMENT_DEB_BYTES')
+    return blob
+
+
+def _stock_offline(blobs, directory, work, verify, run):
+    if not blobs:
+        return {}
+    try:
+        with directory(STOCK_LISTS) as fd:
+            names = os.listdir(fd)
+    except FileNotFoundError:
+        return {}
+    stems = sorted(n.removesuffix('InRelease') for n in names if n.endswith('_InRelease'))
+    need(len(stems) <= 64, 'REPLACEMENT_ARCHIVE_RECORD')
+    verified = {}
+    pending = {i[0]: i for i in blobs}
+    for stem in stems:
+        path = STOCK_LISTS + '/' + stem
+        try:
+            release = verify(_stock_read(directory, path + 'InRelease', MAX_FILE))
+            suite = _stock_fields(release).get(b'codename', b'').decode('ascii')
+            sha, size = _stock_index_release(release, suite, fresh=False)
+            raw = _stock_index(directory, path + 'main_binary-amd64_Packages', size, sha, work, run, compressed_ok=True)
+        except (Refusal, OSError, ValueError):
+            # A foreign or concurrently refreshed list is not cache proof.
+            continue
+        rows = list(_stock_index_records(raw, suite, pending))
+        for identity in {row[:3] for row in rows}:
+            row = _archive(identity, rows, offline=True)
+            verified[identity] = _stock_authenticate(row, blobs[identity])
+            pending.pop(row.package)
+        if not pending:
+            break
+    return verified
+
+
+@contextlib.contextmanager
+def _apt_owned_dir(parent, expected, owner):
+    bad = 'REPLACEMENT_ARCHIVE_IO'
+    need(parent == str(expected), bad)
+    fd = os.open(expected, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        need((st.st_uid, st.st_gid) == owner and stat.S_IMODE(st.st_mode) == 0o700, bad)
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def stage_host_stock(wanted, *, installed, directory, workspace, run):
-    """Consent-only adapter. Never refresh lists or invoke an installer."""
+    """Use signed local cache proof or refresh official indexes in private state."""
     identities = stock_identities(wanted, installed)
     need(identities and all(row[2] == 'amd64' for row in identities.values()), 'REPLACEMENT_INSTALLED_METADATA')
-    bad = 'REPLACEMENT_ARCHIVE_RECORD'
     verifier = stock_verifier(directory)
     key_data = _stock_read(directory, KEYRING, MAX_DEB, optional=True)
     if key_data is None:
@@ -543,83 +630,32 @@ def stage_host_stock(wanted, *, installed, directory, workspace, run):
         keyring = work / 'debian.gpg'
         keyring.write_bytes(key_data)
         keyring.chmod(0o644)
-        lists = work / 'lists'
-        lists.mkdir(mode=0o700)
-        rows = []
-        copied = 0
-        for suite, uri in REPOSITORIES.items():
-            stem = STOCK_LISTS + '/' + uri.split('://', 1)[1].rstrip('/').replace('/', '_') + '_dists_' + suite + '_'
-            release = _stock_read(directory, stem + 'InRelease', MAX_FILE, optional=True)
-            if release is None:
-                continue
-            verified = verify_stock_release(run, verifier, work, keyring, release)
-            sha, size = _stock_index_release(verified, suite)
-            index = stem + 'main_binary-amd64_Packages'
-            raw = _stock_read(directory, index, MAX_INDEX, optional=True)
-            if raw is None:
-                with _stock_file(directory, index + '.lz4', MAX_INDEX, optional=True) as compressed:
-                    if compressed is not None:
-                        # Hold the exact input; the private alias preserves the codec suffix.
-                        link = work / 'Packages.lz4'
-                        link.symlink_to(f'/proc/{os.getpid()}/fd/{compressed.fileno()}')
-                        try:
-                            raw = run(('/usr/lib/apt/apt-helper', 'cat-file', str(link)), size)
-                        finally:
-                            link.unlink()
-            if raw is None and size == 0 and suite != 'trixie':
-                raw = b''
-            need(raw is not None and len(raw) == size and sha256(raw) == sha and (size or suite != 'trixie'), bad)
-            matches = list(_stock_index_records(raw, suite, identities))
-            if matches:
-                need(len(matches) <= len(identities) and copied + size <= MAX_INDEX, bad)
-                rows.extend(matches)
-                copied += size
-                # APT must select from the signed bytes just verified, not a
-                # second lookup in volatile lists or another compression alias.
-                for name, data in ((stem + 'InRelease', release), (index, raw)):
-                    target = lists / os.path.basename(name)
-                    target.write_bytes(data)
-                    target.chmod(0o644)
-        lists.chmod(0o755)
-        def record(identity):
-            exact = [_archive(identity, [r for r in rows if r.suite == suite]) for suite in REPOSITORIES
-                     if any(r[:3] == identity and r.suite == suite for r in rows)]
-            # Point releases may carry the very same binary in two suites.
-            need(exact and len({(r.size, r.sha256) for r in exact}) == 1, bad)
-            return exact[0]
+        config = work / 'apt.conf'
+        config.write_text(APT_ISOLATION, encoding='ascii')
+        config.chmod(0o644)
 
-        records = {identity: record(identity) for identity in identities.values()}
+        def verify(release):
+            return verify_stock_release(run, verifier, work, keyring, release)
 
-        def authenticate(row, blob):
-            need(blob is not None and len(blob) == row.size and sha256(blob) == row.sha256, 'REPLACEMENT_DEB_BYTES')
-            return blob
-
-        def cached(*identity):
-            row = records[identity]
-            package, version, arch = identity
-            # APT escapes the epoch; also accept the epoch-less download basename.
-            versions = {version.split(':')[-1], version.replace(':', '%3a'), version.replace(':', '%3A')}
-            candidates = [_stock_read(directory, f'{STOCK_CACHE}/{package}_{v}_{arch}.deb', row.size, optional=True)
-                          for v in sorted(versions)]
-            blobs = [blob for blob in candidates if blob is not None]
-            need(len(blobs) <= 1, bad)
-            return authenticate(row, blobs[0]) if blobs else None
-
-        def download(*identity):
-            row = records[identity]
-            package, version, arch = identity
-            owner = apt_stage_user()
-            dest = work / 'download'
-            dest.mkdir(mode=0o700)
-            os.chown(dest, *owner)
-            work.chmod(0o711)  # permit traversal and reads of public inputs, not workspace listing
+        blobs = {identity: blob for identity in identities.values()
+                 if (blob := _stock_cached(identity, directory)) is not None}
+        cached = _stock_offline(blobs, directory, work, verify, run)
+        missing = {p: i for p, i in identities.items() if i not in cached}
+        records = {}
+        owner = apt_stage_user() if missing else None
+        if owner is not None:
+            incoming, lists, update = (work / name for name in ('incoming', 'lists', 'update'))
+            for path in (incoming, update):
+                path.mkdir(mode=0o700)
+                os.chown(path, *owner)
+            lists.mkdir(mode=0o755)
+            lists.chmod(0o755)
+            work.chmod(0o711)  # _apt can traverse, not list or edit the workspace
             sources = work / 'sources.list'
-            sources.write_text(f'deb [arch=amd64 signed-by={keyring}] {REPOSITORIES[row.suite]} {row.suite} main\n', encoding='ascii')
+            sources.write_text(''.join(f'deb [arch=amd64 signed-by={keyring}] {uri} {suite} main\n'
+                                       for suite, uri in REPOSITORIES.items()), encoding='ascii')
             sources.chmod(0o644)
-            config = work / 'apt.conf'
-            config.write_text(f'''Dir::Etc::Parts "/dev/null";
-Dir::Etc::Main "/dev/null";
-Dir::Etc::sourcelist "{sources}";
+            config.write_text(APT_ISOLATION + f'''Dir::Etc::sourcelist "{sources}";
 Dir::Etc::sourceparts "/dev/null";
 Dir::Etc::preferences "/dev/null";
 Dir::Etc::preferencesparts "/dev/null";
@@ -627,9 +663,12 @@ Dir::Etc::netrc "/dev/null";
 Dir::Etc::netrcparts "/dev/null";
 Dir::Etc::trusted "/dev/null";
 Dir::Etc::trustedparts "/dev/null";
+Dir::State "{update}/";
+Dir::Cache "{update}/";
 Dir::State::status "/dev/null";
 Dir::State::lists "{lists}/";
 Dir::State::extended_states "/dev/null";
+Dir::Log "{update}/";
 Dir::Cache::pkgcache "";
 Dir::Cache::srcpkgcache "";
 Dir::Cache::archives "/dev/null";
@@ -642,6 +681,18 @@ Acquire::AllowInsecureRepositories "false";
 Acquire::AllowWeakRepositories "false";
 Acquire::AllowDowngradeToInsecureRepositories "false";
 Acquire::Check-Valid-Until "true";
+APT::Update::Error-Mode "any";
+#clear Acquire::IndexTargets;
+Acquire::IndexTargets::deb::Packages {{
+  MetaKey "$(COMPONENT)/binary-$(ARCHITECTURE)/Packages";
+  ShortDescription "Packages";
+  Description "$(RELEASE)/$(COMPONENT) $(ARCHITECTURE) Packages";
+  DefaultEnabled "true";
+  Optional "false";
+  KeepCompressed "false";
+}};
+Acquire::Languages "none";
+Acquire::PDiffs "false";
 Acquire::Retries "0";
 Acquire::EnableSrvRecords "false";
 Acquire::https::Timeout "10";
@@ -651,37 +702,63 @@ Acquire::https::Verify-Peer "true";
 Acquire::https::Verify-Host "true";
 ''', encoding='ascii')
             config.chmod(0o644)
+            run(('/usr/bin/prlimit', f'--fsize={MAX_INDEX}:{MAX_INDEX}', '--', '/usr/bin/apt-get',
+                 'update', '-o', f'Dir::State::lists={incoming}/'), 65536, stock_cwd=str(update),
+                stock_config=str(config), stock_owner=owner, failure='STOCK_APT_UPDATE_FAILED')
+
+            def incoming_dir(parent):
+                return _apt_owned_dir(parent, incoming, owner)
+
+            for suite, uri in REPOSITORIES.items():
+                stem = uri.split('://', 1)[1].rstrip('/').replace('/', '_') + '_dists_' + suite + '_'
+                release = _stock_read(incoming_dir, str(incoming / (stem + 'InRelease')), MAX_FILE, owners=(owner,))
+                sha, size = _stock_index_release(verify(release), suite, fresh=True)
+                index = stem + 'main_binary-amd64_Packages'
+                raw = _stock_index(incoming_dir, str(incoming / index), size, sha, work, run, owners=(owner,))
+                rows = list(_stock_index_records(raw, suite, missing))
+                for identity in {row[:3] for row in rows}:
+                    row = _archive(identity, rows)
+                    prior = records.setdefault(identity, row)
+                    need((row.size, row.sha256) == (prior.size, prior.sha256), 'REPLACEMENT_ARCHIVE_RECORD')
+                if rows:
+                    # Use only verified bytes in the root-owned selection directory.
+                    for name, data in ((stem + 'InRelease', release), (index, raw)):
+                        target = lists / name
+                        target.write_bytes(data)
+                        target.chmod(0o644)
+            need(records.keys() == set(missing.values()), 'STOCK_VERSION_UNAVAILABLE')
+            for identity in records.keys() & blobs.keys():
+                cached[identity] = _stock_authenticate(records[identity], blobs[identity])
+
+        def download(*identity):
+            if owner is None:
+                raise Refusal('REPLACEMENT_DOWNLOAD')
+            row = records[identity]
+            package, version, arch = identity
+            dest = work / 'download'
+            dest.mkdir(mode=0o700)
+            os.chown(dest, *owner)
+            bad = 'REPLACEMENT_DOWNLOAD'
             try:
                 run(('/usr/bin/prlimit', f'--fsize={row.size}:{row.size}', '--', '/usr/bin/apt-get',
                      'download', f'{package}:{arch}={version}'), 65536, stock_cwd=str(dest), stock_config=str(config),
-                    stock_owner=owner)
-                with os.scandir(dest) as entries:
+                    stock_owner=owner, failure='STOCK_APT_DOWNLOAD_FAILED')
+                with _apt_owned_dir(str(dest), dest, owner) as fd, os.scandir(fd) as entries:
                     item = next(entries, None)
-                    if item is None:
+                    if item is None or not re.fullmatch(r'[A-Za-z0-9.+%~_\-]+\.deb', item.name) or next(entries, None) is not None:
                         raise Refusal(bad)
-                    need(re.fullmatch(r'[A-Za-z0-9.+%~_\-]+\.deb', item.name)
-                         and next(entries, None) is None, bad)
-                # Keep the download directory held; it is intentionally _apt-owned.
-                @contextlib.contextmanager
+
                 def download_dir(parent):
-                    need(parent == str(dest), bad)
-                    fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                    try:
-                        st = os.fstat(fd)
-                        need((st.st_uid, st.st_gid) == owner and stat.S_IMODE(st.st_mode) == 0o700, bad)
-                        yield fd
-                    finally:
-                        os.close(fd)
-                return authenticate(row, _stock_read(download_dir, str(dest / item.name), row.size, owners=(owner,)))
+                    return _apt_owned_dir(parent, dest, owner)
+
+                return _stock_authenticate(row, _stock_read(download_dir, str(dest / item.name), row.size, owners=(owner,)))
             finally:
-                # Do not reuse the directory for the other package.
                 shutil.rmtree(dest)
-                work.chmod(0o700)
 
         def decode(blob, flag, maximum):
             with _sealed_stock(blob) as fd:
                 return run(('/usr/bin/dpkg-deb', flag, fd), maximum)
 
-        return stage_installed_stock(wanted, installed=installed, cached_deb=cached, download_deb=download,
+        return stage_installed_stock(wanted, installed=installed, cached_deb=lambda *i: cached.get(i), download_deb=download,
                                      control_tar=lambda blob: decode(blob, '--ctrl-tarfile', MAX_FILE),
                                      data_tar=lambda blob: decode(blob, '--fsys-tarfile', MAX_TAR))
