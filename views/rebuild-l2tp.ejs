@@ -32,7 +32,8 @@ const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLog
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
     'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired', 'runtimeForeignChange', 'runtimeNetworkNotReady',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
-    'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed', 'canInstallAgain', 'installRecoveryUnconfirmed', 'installRecoveryNoState'];
+    'installRefused', 'installBusy', 'installRolledBack', 'installCleanupFailed', 'canInstallAgain', 'installRecoveryUnconfirmed', 'installRecoveryNoState',
+    'installStopped', 'checkingResult'];
 function secretControl(kind, url, index, login) {
     const valueId = `rebuild-l2tp-${kind}-${index}`;
 %>
@@ -165,6 +166,8 @@ function secretControl(kind, url, index, login) {
                                         <span data-relay-control aria-label="<%= l('remove') %>" aria-describedby="relay-refresh-<%= relay.id %>"><a class="btn btn-sm btn-danger" data-remove-link href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a></span>
                                      <% } %>
                                      <% if (validId(relay.id)) { %><small id="relay-refresh-<%= relay.id %>" data-relay-refresh-reason role="status" hidden><%= l('messages.refreshRequired') %></small><% } %>
+                                    <p data-relay-action-status role="status" hidden></p>
+                                    <small data-relay-action-timer aria-hidden="true" hidden></small>
                                 </td>
                             </tr>
                         <% }); %>

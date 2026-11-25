@@ -68,12 +68,14 @@
         }
     }
 
-    async function pollOverview(csrf, token, accept) {
+    async function pollOverview(csrf, token, accept, onTick) {
         const remaining = makeDeadline(observationLimit);
+        onTick?.(remaining());
         let next = observationLimit - interval;
         while (active && next > 0 && remaining() > 0) {
             await new Promise(resolve => setTimeout(resolve, Math.max(0, remaining() - next)));
             if (!active || remaining() <= 0) break;
+            onTick?.(remaining());
             const snapshot = await readOverview(csrf, token, remaining);
             if (snapshot?.current() && accept(snapshot) && remaining() > 0) return true;
             do next -= interval; while (next > remaining());
@@ -259,6 +261,26 @@
     let busy = false, requireRefresh = false;
     let identityReview = false, reviewId = null, flow = null;
     const hex = (value, n) => typeof value === 'string' && value.length === n && /^[a-f0-9]+$/.test(value);
+    const relayResults = new Map();
+    function drawRelayResult(nodeId) {
+        const row = page.querySelector(`#relay-${nodeId}`);
+        const label = row?.querySelector('[data-relay-action-status]');
+        const timer = row?.querySelector('[data-relay-action-timer]');
+        if (!label || !timer) return;
+        const { text = '', clock = '' } = relayResults.get(nodeId) ?? {};
+        if (label.textContent !== text) label.textContent = text;
+        label.hidden = !text;
+        timer.textContent = clock;
+        timer.hidden = !clock;
+    }
+
+    function setActionStatus(text, nodeId, clock = '') {
+        if (status.textContent !== text) status.textContent = text;
+        if (!hex(nodeId, 24)) return;
+        relayResults.set(nodeId, { text, clock });
+        drawRelayResult(nodeId);
+    }
+
     const effectErrors = new Map([
         ['REBUILD_L2TP_IDENTITY_CHANGED', 'identityChanged'], ['REBUILD_L2TP_GRANT_CONFLICT', 'grantConflict'],
         ['REBUILD_L2TP_GRANT_CHANGED', 'grantConflict'],
@@ -329,6 +351,7 @@
         clearSecrets();
         previous.replaceWith(view);
         bindView();
+        for (const nodeId of relayResults.keys()) drawRelayResult(nodeId);
         return true;
     }
 
@@ -337,8 +360,8 @@
         return (snapshot && applyOverview(snapshot)) || pollOverview(csrf, null, applyOverview);
     }
 
-    async function finishAcknowledged(csrf, message, keepLocked = false) {
-        status.textContent = message;
+    async function finishAcknowledged(csrf, message, keepLocked = false, nodeId) {
+        setActionStatus(message, nodeId);
         // Keep the old controls locked until a newer, validated response has
         // replaced the view. A reload is only the fallback if readback fails.
         requireRefresh = true;
@@ -347,11 +370,11 @@
         const refreshed = await refreshAcknowledged(csrf);
         if (!active) return;
         requireRefresh = !refreshed || keepLocked;
-        if (!refreshed) status.textContent += ` ${words.refreshFailed}`;
+        if (!refreshed) setActionStatus(`${message} ${words.refreshFailed}`, nodeId);
         updateMutations();
     }
 
-    async function reconcileUnknown(csrf, token, accepted) {
+    async function reconcileUnknown(csrf, token, accepted, nodeId) {
         requireRefresh = true;
         identityReview = false;
         updateMutations();
@@ -362,7 +385,10 @@
                 return true;
             }
             return false;
-        });
+        }, hex(nodeId, 24) ? remaining => {
+            const seconds = Math.max(0, Math.ceil(remaining / 1000));
+            setActionStatus(words.checkingResult, nodeId, `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`);
+        } : undefined);
         if (!confirmed) return null;
         requireRefresh = false;
         return outcome;
@@ -375,6 +401,8 @@
     }
 
     function installProgress(nodeId, csrf) {
+        const initial = hex(nodeId, 24) && page.querySelector(`[data-install-progress][data-progress-node="${nodeId}"]`);
+        if (initial) initial.hidden = false;
         const progress = new AbortController();
         window.addEventListener('pagehide', () => progress.abort(), { once: true, signal: progress.signal });
         try {
@@ -391,7 +419,11 @@
                 return !!snapshot && !progress.signal.aborted && applyOverview(snapshot);
             },
         } }));
-        return () => { progress.abort(); cancelRead(); };
+        return () => {
+            progress.abort();
+            if (initial) initial.hidden = true;
+            cancelRead();
+        };
     }
 
     let openAdmission;
@@ -465,7 +497,7 @@
                     unknown = false;
                     if (mutating) {
                         dismiss();
-                        await finishAcknowledged(current.csrf, admissionWords[success]);
+                        await finishAcknowledged(current.csrf, admissionWords[success], false, current.nodeId);
                     } else {
                         if (!await refreshAcknowledged(current.csrf)) {
                             if (!active) return;
@@ -474,7 +506,7 @@
                             identityReview = false;
                             draw(null, null);
                             notice.textContent = words.refreshFailed;
-                            status.textContent = words.refreshFailed;
+                            setActionStatus(words.refreshFailed, current.nodeId);
                             return;
                         }
                         if (!active || flow !== current) return;
@@ -499,7 +531,7 @@
                         if (code === 'REBUILD_L2TP_GRANT_CONFLICT') errorText += conflictNote(data.error.conflict);
                         if (reviewable) {
                             errorText += markIdentityReview(current.nodeId);
-                            status.textContent = errorText;
+                            setActionStatus(errorText, current.nodeId);
                         }
                         if (key === 'grantUnavailable') stale = true;
                     }
@@ -511,11 +543,11 @@
                     current.identity = null;
                     draw(null, null);
                     notice.textContent = errorText;
-                    status.textContent = errorText;
-                    const outcome = await reconcileUnknown(current.csrf, token, mutating ? [success] : []);
+                    setActionStatus(errorText, current.nodeId);
+                    const outcome = await reconcileUnknown(current.csrf, token, mutating ? [success] : [], current.nodeId);
                     if (active && outcome) {
                         dismiss();
-                        status.textContent = admissionWords[outcome];
+                        setActionStatus(admissionWords[outcome], current.nodeId);
                     } else if (active) {
                         stale = true;
                         errorText = words.observationTimeout;
@@ -530,11 +562,11 @@
             current.identity = null;
             draw(null, null);
             notice.textContent = errorText;
+            setActionStatus(errorText, current.nodeId);
             if (stale) {
                 requireRefresh = true;
                 identityReview = false;
                 clearSecrets();
-                status.textContent = errorText;
                 updateMutations();
             }
         }
@@ -542,6 +574,10 @@
         openAdmission = button => {
             if (!isCurrent(button) || busy || flow || (requireRefresh && !canReview(button))) return;
             const { admissionAction, admissionUrl, nodeId, nodeName } = button.dataset;
+            if (hex(nodeId, 24)) {
+                relayResults.delete(nodeId);
+                drawRelayResult(nodeId);
+            }
             flow = { nodeId, url: admissionUrl, csrf: page.dataset.csrf, step: null, identity: null };
             field('name').textContent = nodeName;
             draw(admissionAction === 'revoke' ? 'revoke' : null, null);
@@ -639,16 +675,15 @@
     async function mutate(action, url, body, match, nodeId) {
         if (!active || busy || flow || requireRefresh) return;
         lockForAction();
-        status.textContent = words.working;
+        setActionStatus(words.working, nodeId);
         const csrf = page.dataset.csrf, token = nonce();
         let result = 'uncertain', note = '';
         const revocation = action === 'disable' || action === 'delete';
         const accepted = action === 'install' ? [expected[action]] : [expected[action], 'canceled'];
         let unknown = true, endProgress;
         try {
-            const pending = post(url, body, undefined, token, csrf);
             if (action === 'install') endProgress = installProgress(nodeId, csrf);
-            const { response, data } = await pending;
+            const { response, data } = await post(url, body, undefined, token, csrf);
             if (!active) return;
             const { code, outcome, check } = data?.error ?? {};
             const blocked = noRetry(data);
@@ -695,12 +730,16 @@
         } catch { /* A lost response is not proof that the mutation failed. */ }
         finally { endProgress?.(); }
         if (!active) return;
-        status.textContent = (words[result] ?? admissionWords[result]) + note;
+        let message = (words[result] ?? admissionWords[result]) + note;
+        if (action === 'install' && !accepted.includes(result) && !unknown && result !== 'uncertain' && result !== 'installCleanupFailed') {
+            message = words.installStopped.replace('{reason}', () => message);
+        }
+        setActionStatus(message, nodeId);
         if (accepted.includes(result) || result === 'installCleanupFailed' || result === 'installRolledBack') {
-            await finishAcknowledged(csrf, status.textContent, !accepted.includes(result));
+            await finishAcknowledged(csrf, message, !accepted.includes(result), nodeId);
         } else if (unknown || result === 'uncertain') {
-            const outcome = await reconcileUnknown(csrf, token, accepted);
-            if (active) status.textContent = words[outcome ?? 'observationTimeout'] + (outcome ? '' : note);
+            const outcome = await reconcileUnknown(csrf, token, accepted, nodeId);
+            if (active) setActionStatus(words[outcome ?? 'observationTimeout'] + (outcome ? '' : note), nodeId);
         }
         busy = false;
         updateMutations();
@@ -709,7 +748,7 @@
     async function recoverInstall({ installRecoveryUrl, nodeId }) {
         if (!active || busy || flow || requireRefresh) return;
         lockForAction();
-        status.textContent = words.working;
+        setActionStatus(words.working, nodeId);
         const csrf = page.dataset.csrf, token = nonce();
         let message = 'installRecoveryUnconfirmed';
         try {
@@ -722,12 +761,12 @@
             }
         } catch { /* An unconfirmed response is not permission to install. */ }
         if (!active) return;
-        status.textContent = words[message];
+        setActionStatus(words[message], nodeId);
         requireRefresh = true;
-        if (message === 'canInstallAgain') await finishAcknowledged(csrf, status.textContent);
+        if (message === 'canInstallAgain') await finishAcknowledged(csrf, status.textContent, false, nodeId);
         else if (message === 'installRecoveryUnconfirmed') {
-            const outcome = await reconcileUnknown(csrf, token, ['can_install_again']);
-            if (active) status.textContent = words[outcome ? 'canInstallAgain' : 'observationTimeout'];
+            const outcome = await reconcileUnknown(csrf, token, ['can_install_again'], nodeId);
+            if (active) setActionStatus(words[outcome ? 'canInstallAgain' : 'observationTimeout'], nodeId);
         }
         busy = false;
         updateMutations();

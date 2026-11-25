@@ -9,6 +9,8 @@
 
 - После подтверждения допуска обзор L2TP обновляется автоматически. Когда действия заблокированы, причина видна рядом с релеем.
 - The L2TP overview refreshes automatically after admission confirmation. If actions are locked, the affected relay row explains why.
+- Проверка хоста видна сразу после Install. Итоги установки, восстановления и допуска видны и вверху, и в строке релея; при отказе там остаётся причина, при сверке результата — обратный отсчёт.
+- Install shows the host check immediately. Install, recovery and admission results appear at the top and in the relay row, including refusal reasons and the reconciliation countdown.
 
 ## v1.6.38 — Свой выход портала / Per-portal exits
 

@@ -2,6 +2,6 @@
 <div data-install-progress data-progress-node="<%= relay.id %>"
      data-progress-url="<%= relayPath(relay.id) %>/install/progress"
      data-progress-words="<%= JSON.stringify(Object.fromEntries(['preflight', 'reserve', 'preparePackages', 'prepare', 'install', 'restart', 'verify', 'unknown'].map(k => [k,l(`installProgress.${k}`)]))) %>" <%= progress ? '' : 'hidden' %>>
-    <span data-progress-text role="status"><%= progress ? l(`installProgress.${progress.stage}`) : '' %></span>
+    <span data-progress-text role="status"><%= l(`installProgress.${progress?.stage ?? 'preflight'}`) %></span>
     <progress max="100" value="<%= progress?.percent ?? 0 %>" aria-label="<%= l('installProgress.label') %>"></progress>
 </div>

@@ -11,6 +11,7 @@ const { join } = require('node:path');
 const { pathToFileURL } = require('node:url');
 const ejs = require('ejs');
 const { t } = require('../../middleware/i18n');
+const { installCheckIds } = require('../rebuildRelayInstallDiagnostics');
 const State = require('../../modules/relay-l2tp/models/relayL2tpStateModel');
 
 const root = join(__dirname, '../../..');
@@ -34,7 +35,8 @@ const unsafeAccount = { login: hostile, enabled: false, consistent: false, addre
 async function render(lang, overrides) {
     const translate = key => t(key, lang);
     const data = { page: 'l2tp', title: translate('rebuildL2tp.title'), csrfToken: csrf, t: translate, lang,
-        relays: [installed, fresh], accounts: [account, unsafeAccount], canManageAccounts: true, rebuildL2tpScriptVersion, ...overrides };
+        relays: [installed, fresh], accounts: [account, unsafeAccount], canManageAccounts: true, rebuildL2tpScriptVersion,
+        installChecks: Object.fromEntries(installCheckIds.map(key => [key, translate(`rebuildL2tp.installChecks.${key}`)])), ...overrides };
     const content = await ejs.renderFile(join(root, 'views/rebuild-l2tp.ejs'), data);
     const layout = await ejs.renderFile(join(root, 'views/layout.ejs'), { ...data, content });
     return { content, layout };
@@ -344,7 +346,7 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
     install.click();
     await flush();
     params(`${route}/${otherId}/l2tp/install`, {});
-    check(status.textContent === words.messages.rateLimited, 'rate limit was not localized');
+    check(status.textContent === words.messages.installStopped.replace('{reason}', words.messages.rateLimited), 'rate limit was not localized');
     disable.click();
     await flush();
     params(`${route}/l2tp/accounts/disable`, { login: 'alice.test' });
@@ -374,6 +376,7 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
     window.crypto.getRandomValues = rng;
     let expectedMessage = words.messages.uncertain;
     if (terminal === 'uncertainInstall') {
+        expectedMessage = words.messages.checkingResult;
         respond = async () => response({ error: { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN' } }, 409);
         install.click();
         await flush();
@@ -544,6 +547,28 @@ async function admissionVisibility({ route, id, otherId, words, lang, snapshots 
     await flush();
     check(getComputedStyle(dialog).display === 'none' && !visible(review) && !visible($('[data-refresh]')),
         'confirmation did not close the dialog and adopt fresh controls');
+    const relay = $(`#relay-${id}`);
+    const relayStatus = relay.querySelector('[data-relay-action-status]');
+    check(relayStatus?.textContent === words.admission.granted && relayStatus.textContent === $('[data-action-status]').textContent,
+        'admission outcome was lost during the automatic GET');
+    const installAfterConfirm = relay.querySelector('[data-install-url]');
+    const progress = relay.querySelector('[data-install-progress]');
+    installAfterConfirm.click();
+    check(installAfterConfirm.disabled && visible(progress) && progress.querySelector('[data-progress-text]').textContent === words.installProgress.preflight,
+        'Install did not show the host check before receiving the response');
+    await respond(`${route}/${id}/l2tp/install`, { error: { code: 'REBUILD_L2TP_INSTALL_REFUSED',
+        outcome: 'refused', check: 'HOST_BASELINE' } }, false);
+    const expectedRefusal = words.messages.installStopped.replace('{reason}', `${words.messages.installRefused} ${words.installChecks.HOST_BASELINE}`);
+    relayStatus.scrollIntoView({ block: 'center' });
+    const line = relayStatus.getBoundingClientRect(), row = relay.getBoundingClientRect();
+    check(visible(relayStatus) && line.width > 0 && line.height > 0 && line.top >= Math.max(row.top, 0)
+        && line.bottom <= Math.min(row.bottom, innerHeight) && line.left >= row.left && line.right <= row.right,
+        'the refusal is not rendered within the visible relay row');
+    check(relayStatus.textContent === expectedRefusal && $('[data-action-status]').textContent === expectedRefusal,
+        'the refused POST did not display the same localized cause both places');
+    check(!visible(progress) && !installAfterConfirm.disabled && !reads.length && !window.navigation,
+        'a definitive refusal kept progress or disabled Install, or required a GET/reload');
+    check($(`#relay-${otherId} [data-relay-action-status]`).hidden, 'refusal leaked into another relay row');
     const beforeRevoke = $('[data-l2tp-view]');
     click('[data-admission-action="revoke"]');
     check(requests.length === 0, 'revoke preflight issued a POST');
@@ -551,6 +576,7 @@ async function admissionVisibility({ route, id, otherId, words, lang, snapshots 
     click('[data-admission-approve="revoke"]');
     await respond(`${url}/revoke`, { nodeId: id });
     check(!beforeRevoke.isConnected && !dialog.open, 'affirmative revoke did not refresh the overview');
+    check($(`#relay-${id} [data-relay-action-status]`).textContent === words.admission.revoked, 'revoke outcome was lost on refresh');
     const freshInstall = $(`[data-node-id="${id}"][data-install-url]`);
     check(!freshInstall.disabled && !visible($(`#relay-${id} [data-relay-refresh-reason]`)), 'fresh Install not unlocked');
     staleInstall.dispatchEvent(new Event('click'));
@@ -674,7 +700,14 @@ async function refreshMatrix({ terminal, route, id, otherId, csrf, words, snapsh
         // Even a matching-looking terminal row with another request's receipt cannot confirm.
         reads[0].wait.resolve(html(terminal === 'matrixTimeout' ? snapshots.after : snapshots.before, `${'f'.repeat(32)}:${outcome}`));
         await flush();
-        check($('[data-action-status]').textContent === words.messages.uncertain, 'inferred success from an unrelated observation');
+        const checking = terminal === 'matrixDisableLost' ? words.messages.uncertain : words.messages.checkingResult;
+        check($('[data-action-status]').textContent === checking, 'inferred success from an unrelated observation');
+        if (terminal !== 'matrixDisableLost') {
+            const label = $(`#relay-${otherId} [data-relay-action-status]`);
+            const timer = $(`#relay-${otherId} [data-relay-action-timer]`);
+            check(label.textContent === checking && !label.hidden && timer.textContent === '4:58' && !timer.hidden,
+                'missing row-local reconciliation countdown');
+        }
         if (terminal === 'matrixTimeout') {
             await tick(298000);
             check(reads.at(-1).time === 298000, 'wrong last poll slot');
@@ -684,6 +717,8 @@ async function refreshMatrix({ terminal, route, id, otherId, csrf, words, snapsh
             check(lastTable === table(), 'exact-deadline reply was accepted');
             check($('[data-action-status]').textContent === words.messages.observationTimeout && !$('[data-refresh]').hidden,
                 'deadline did not leave the UI locked and unknown');
+            check($(`#relay-${otherId} [data-relay-action-status]`).textContent === words.messages.observationTimeout
+                && $(`#relay-${otherId} [data-relay-action-timer]`).hidden, 'countdown survived reconciliation timeout');
             old.click(); await tick(302000);
             check(calls.length === 1 && reads.at(-1) === last, 'continued observing or replayed after deadline');
             return;
@@ -699,6 +734,11 @@ async function refreshMatrix({ terminal, route, id, otherId, csrf, words, snapsh
         .every(value => value.hidden && !value.textContent), 'refresh exposed secret values');
     check(!$('[data-account-action="disable"][data-login="fixture.after"]').disabled, 'fresh eligible control was not rebound');
     check($('[data-refresh]').hidden && calls.length === 1, 'action replayed or fresh view still marked stale');
+    if (['matrixInstall', 'matrixInstallLost', 'matrixRecover'].includes(terminal)) {
+        const label = $(`#relay-${otherId} [data-relay-action-status]`);
+        check(!label.hidden && label.textContent === $('[data-action-status]').textContent
+            && $(`#relay-${otherId} [data-relay-action-timer]`).hidden, 'final relay result did not survive view replacement');
+    }
     old.dispatchEvent(new Event('click')); check(calls.length === 1, 'detached stale control dispatched');
     $('[data-account-action="disable"][data-login="fixture.after"]').click();
     check(calls.length === 2 && JSON.parse(calls[1].options.body).login === 'fixture.after', 'fresh control did not handle an explicit click');
@@ -721,6 +761,7 @@ for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainIns
             { ...fresh, grantSource: null, canGrant: true },
         ] } : undefined);
         const client = readFileSync(join(root, 'public/js/rebuild-l2tp.js'), 'utf8');
+        const progressClient = readFileSync(join(root, 'public/js/rebuild-l2tp-install-progress.js'), 'utf8');
         const words = require(`../../locales/${lang}.json`).rebuildL2tp;
         const snapshots = matrix ? { before: content,
             progress: (await render(lang, { relays: [installed, { ...fresh, status: 'installing', canInstall: false }] })).content,
@@ -762,7 +803,7 @@ for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainIns
             const scenario = matrix ? refreshMatrix : admission ? admissionVisibility : browserScenario;
             const stylesheet = admission ? `<style>${readFileSync(join(root, 'public/css/style.min.css'), 'utf8')}</style>` : '';
             const inline = `<script>(${scenario})(${input}).then(() => dump('L2TP_UI:OK\\n'),
-                error => dump('L2TP_UI:FAIL ' + error.message + '\\n'));</script><script>((location) => { ${client} })(
+                error => dump('L2TP_UI:FAIL ' + error.message + '\\n'));</script><script>${progressClient}</script><script>((location) => { ${client} })(
                     { origin: 'http://fixture.invalid', assign: path => { window.navigation = path; } });</script>`;
             assert.ok(content.includes(scriptTag));
             writeFileSync(file, '<!doctype html><meta charset="UTF-8">' +
