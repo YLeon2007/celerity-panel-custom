@@ -4,9 +4,13 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const error = code => Object.assign(new Error(code), {code});
 const installOwners = new WeakMap();
 const installOwner = retain => installOwners.get(retain);
+const cutoverOwners = new WeakMap();
+const cutoverOwner = retain => cutoverOwners.get(retain);
 const lockName = 'c3_rebuild_locks';
 const majority = { writeConcern: { w: 'majority' }, timeoutMS: 5000 };
 const lockRead = { readPreference: 'primary', readConcern: { level: 'majority' }, timeoutMS: 5000 };
+const collation = { locale: 'simple' };
+const cutoverWrite = { ...majority, collation }, cutoverRead = { ...lockRead, collation };
 const exactLock = row => ({ _id: rowId, token: row.token, $expr: { $eq: ['$$ROOT', { $literal: row }] } });
 const one = (reply, field) => reply?.acknowledged === true && reply[field] === 1;
 const ownerDigest = token => createHash('sha256').update(token).digest('hex');
@@ -14,6 +18,23 @@ const generation = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f
 const validGeneration = value => typeof value === 'string' && value.length === 36 && generation.test(value);
 const retryableClaim = value => value && Object.getPrototypeOf(value) === Object.prototype
     && Object.keys(value).length === 2 && validGeneration(value.id) && value.phase === 'retryable';
+// Only the nonsecret identity of the file journal's plan, never the plan itself.
+const journalUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const journalIdentityFields = Object.entries({
+    scope: /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,95}$/,
+    operationId: journalUuid,
+    fenceId: journalUuid,
+    planDigest: /^[a-f0-9]{64}$/,
+});
+function journalIdentity(input) {
+    if (!input || Object.getPrototypeOf(input) !== Object.prototype || Reflect.ownKeys(input).length !== journalIdentityFields.length)
+        throw error('REBUILD_LOCK_LOST');
+    return Object.fromEntries(journalIdentityFields.map(([key, syntax]) => {
+        const value = Object.getOwnPropertyDescriptor(input, key)?.value;
+        if (typeof value !== 'string' || !syntax.test(value) || /\s/.test(value)) throw error('REBUILD_LOCK_LOST');
+        return [key, value];
+    }));
+}
 const queues = new Map(), held = new AsyncLocalStorage();
 function nodeLockVerifier(nodeId) {
     const key = String(nodeId), lease = held.getStore()?.get(key);
@@ -51,16 +72,81 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
             }
         } catch(e) { if(e.code===11000)throw error('REBUILD_BUSY'); throw e; }
         active.add(token);let lost=false, heartbeat, reservation, handedBack=false;
-        const verify=async()=>{if(lost || !(await store.findOne({_id:rowId,token})))throw error('REBUILD_LOCK_LOST');};
+        let live=true, lastBeat=row.heartbeat, cutoverPhase, cutoverFilter, checks=0;
+        const canVerifyCutover = () => live && !lost && (cutoverPhase === 'promoted' || cutoverPhase === 'settling');
+        const verifyCutover = async () => {
+            if (!canVerifyCutover()) throw error('REBUILD_LOCK_LOST');
+            checks++;
+            try {
+                if (!await store.findOne(cutoverFilter, cutoverRead) || !canVerifyCutover()) throw error('REBUILD_LOCK_LOST');
+                return true;
+            } catch {
+                lost=true;
+                throw error('REBUILD_LOCK_LOST');
+            } finally { checks--; }
+        };
+        const verify=async()=>{
+            if(cutoverPhase)return verifyCutover();
+            if(!live || lost || !(await store.findOne({_id:rowId,token})) || !live || lost || cutoverPhase)
+                throw error('REBUILD_LOCK_LOST');
+        };
         const timer=setInterval(()=>{
-            if (!heartbeat) heartbeat=store.updateOne({_id:rowId,token},{$set:{heartbeat:beat()}})
-                .then(x=>{if(x.matchedCount!==1)lost=true;},()=>{lost=true;}).finally(()=>{heartbeat=undefined;});
+            if (!heartbeat && !cutoverPhase) {
+                const nextBeat=beat();
+                heartbeat=store.updateOne({_id:rowId,token},{$set:{heartbeat:nextBeat}})
+                    .then(x=>{if(x.matchedCount!==1)lost=true;else lastBeat=nextBeat;},()=>{lost=true;})
+                    .finally(()=>{heartbeat=undefined;});
+            }
         },15000);timer.unref();
         let completed=false, retained=false;
         const retain=()=>{retained=true;};
+        // Use the retain from the original run, including on already-held paths.
+        // promote() is one-shot; only its acknowledged exact readback grants
+        // verify(). settle(prove) takes a trusted original-writer proof callback:
+        // return true only after exact terminal journal, writer drain and any
+        // business settlement proofs. It revokes verify and permits deletion
+        // only on successful outer return. Neither method can adopt an old row.
+        cutoverOwners.set(retain, Object.freeze({
+            async promote(identity) {
+                if (!live || lost || cutoverPhase || retained || reservation || handedBack) throw error('REBUILD_LOCK_LOST');
+                cutoverPhase='promoting'; // suppress ordinary cleanup before any await
+                clearInterval(timer);
+                try {
+                    const cutover=journalIdentity(identity);
+                    await heartbeat;
+                    if (!live || lost || retained) throw error('REBUILD_LOCK_LOST');
+                    const before={...row, heartbeat:lastBeat};
+                    const change={allowStaleUnlock:false, cutover};
+                    const ack=await store.updateMany(exactLock(before), { $set: change }, cutoverWrite);
+                    if (!live || lost || retained || !one(ack,'matchedCount') || ack.modifiedCount!==1)
+                        throw error('REBUILD_LOCK_LOST');
+                    cutoverFilter=exactLock({...before, ...change});
+                    if (!await store.findOne(cutoverFilter, cutoverRead) || !live || lost || retained) throw error('REBUILD_LOCK_LOST');
+                    cutoverPhase='promoted';
+                    return Object.freeze({verify:verifyCutover, async settle(prove) {
+                        if (!live || lost || retained || cutoverPhase!=='promoted') throw error('REBUILD_LOCK_LOST');
+                        cutoverPhase='settling';
+                        try {
+                            if (checks || typeof prove!=='function') throw error('REBUILD_LOCK_LOST');
+                            await verifyCutover();
+                            if (!canVerifyCutover() || retained || await prove()!==true) throw error('REBUILD_LOCK_LOST');
+                            await verifyCutover();
+                            if (!canVerifyCutover() || retained || checks) throw error('REBUILD_LOCK_LOST');
+                            cutoverPhase='settled';
+                        } catch {
+                            lost=true;
+                            throw error('REBUILD_LOCK_LOST');
+                        }
+                    }});
+                } catch {
+                    lost=true;
+                    throw error('REBUILD_LOCK_LOST');
+                }
+            },
+        }));
         if (!row.allowStaleUnlock) installOwners.set(retain, {
             async bind(db, session, receipt) {
-                if (reservation || !session?.inTransaction() || !active.has(token) || !sameDb(db)) throw error('REBUILD_LOCK_LOST');
+                if (cutoverPhase || reservation || !session?.inTransaction() || !active.has(token) || !sameDb(db)) throw error('REBUILD_LOCK_LOST');
                 reservation = { ...receipt, ownerDigest: ownerDigest(token), phase: 'installing' };
                 const bound = await store.updateMany({ _id: rowId, token, allowStaleUnlock: false,
                     installRecovery: { $exists: false } }, { $set: { installRecovery: reservation } }, { session });
@@ -76,13 +162,18 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
             completed=true;
             return result;
         } finally {
+            live=false;
             clearInterval(timer);
+            cutoverOwners.delete(retain);
             installOwners.delete(retain);
             let released=false;
             try {
                 // The exact singleton predicate matches at most one row. Use
                 // the non-retryable MongoDB delete form even on retryWrites clients.
-                if (retained && reservation && handedBack) {
+                if (cutoverPhase) {
+                    if (completed && cutoverPhase==='settled' && !lost && !retained)
+                        released=one(await store.deleteMany(cutoverFilter, cutoverWrite),'deletedCount');
+                } else if (retained && reservation && handedBack) {
                     await heartbeat;
                     if (!lost) await store.updateMany({ _id: rowId, token, allowStaleUnlock: false,
                         installRecovery: reservation }, { $set: { 'installRecovery.phase': 'ready' } }, majority);
@@ -96,13 +187,17 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
             if(completed&&!released)throw error('REBUILD_LOCK_RELEASE_UNCONFIRMED');
         }
     };
-    const status=async()=>{const row=await store.findOne({_id:rowId});return row?{locked:true,
-        ...(row.allowStaleUnlock===true&&{token:row.token}),
-        stale:row.allowStaleUnlock===true&&!active.has(row.token)&&new Date(row.heartbeat).getTime()<=clock()-staleMs}:{locked:false};};
+    const status=async()=>{
+        const row=await store.findOne({_id:rowId});
+        if(!row)return {locked:false};
+        const eligible=row.allowStaleUnlock===true&&!Object.hasOwn(row,'cutover');
+        return {locked:true,...(eligible&&{token:row.token}),
+            stale:eligible&&!active.has(row.token)&&new Date(row.heartbeat).getTime()<=clock()-staleMs};
+    };
     const unlock=async token=>{
         if(typeof token!=='string'||active.has(token))throw error('REBUILD_LOCK_NOT_STALE');
         // Check eligibility inside the delete. An unmarked legacy row could be an unresolved Install.
-        const res=await store.deleteOne({_id:rowId,token,heartbeat:{$lte:new Date(clock()-staleMs)},
+        const res=await store.deleteOne({_id:rowId,token,heartbeat:{$lte:new Date(clock()-staleMs)},cutover:{$exists:false},
             $expr:{$eq:['$allowStaleUnlock',true]}});
         if(res?.acknowledged!==true||res.deletedCount!==1)throw error('REBUILD_LOCK_NOT_STALE');
         return {locked:false};
@@ -118,7 +213,7 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
         const prior = row?.installRecoveryClaim;
         // 8a56425 and pre-handoff crashes have no durable proof the original
         // writer has exited. Neither age nor an empty local active set suffices.
-        if (row?._id !== rowId || row.allowStaleUnlock !== false || !validGeneration(row.token)
+        if (row?._id !== rowId || row.allowStaleUnlock !== false || !validGeneration(row.token) || Object.hasOwn(row, 'cutover')
             || active.has(row.token) || ![1, 2].includes(receipt?.version)
             || receipt.phase !== 'ready' || receipt.nodeId !== nodeId || receipt.actor !== actor
             || receipt.ownerDigest !== ownerDigest(row.token)) throw blocked();
@@ -155,4 +250,4 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
     }
     return {run,status,unlock,readInstallRecovery};
 }
-module.exports={withNode,withNodes,nodeLockVerifier,makeLocks,installOwner};
+module.exports={withNode,withNodes,nodeLockVerifier,makeLocks,installOwner,cutoverOwner};
