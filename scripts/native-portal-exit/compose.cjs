@@ -32,7 +32,9 @@ const links = [
     link(1, 'p2', 'gateway', 100, other),
     link(2, a.chain ? 'tail' : 'gateway', 'A', a.matrix ? 10 : 100),
     link(3, a.chain ? 'tail' : 'gateway', 'B', a.matrix ? 20 : 200, other),
-    link(4, a.chain ? 'tail' : 'gateway', 'A', 50, 'reverse', { enabled: true, domains: ['full:fixture.invalid'] }),
+    link(4, a.chain ? 'tail' : 'gateway', 'A', 50, 'reverse', {
+        enabled: true, domains: ['full:fixture.invalid'], ...(a.matrix && { geoip: ['ru'] }),
+    }),
     link(5, 'p3', a.chain ? 'tail' : 'gateway', 100),
     ...(a.preferred ? [link(6, a.chain ? 'tail' : 'gateway', 'B', 30, 'reverse', { enabled: true, domains: ['full:other.invalid'] })] : []),
     ...(a.chain ? [link(7, 'gateway', 'tail', 100, a.proof || a.matrix ? other : 'reverse'), link(8, 'gateway', 'tail', 200, other)] : []),
@@ -47,9 +49,12 @@ for (const [i, link] of links.entries()) {
     if (link.rebuildExit) descriptions[i].rebuildExit = link.rebuildExit;
 }
 
+// Either endpoint can dial (source in forward, target in reverse), including
+// the endpoints of composer-derived channels. Key by node, not by link.
+const dialerVersions = new Map(labels.map(name => [ids[name], a.versionsByNode[name]]));
 const profiles = composeRebuildProfiles({ nodes, links,
     usersByNode: Object.fromEntries(Object.entries(users).map(([name, user]) => [ids[name], [user]])),
-    dialerVersions: new Map(nodes.map(n => [n._id, n.cascadeRole === 'bridge' ? a.bridgeVersion : a.version])),
+    dialerVersions,
     ...(a.matrix && { controlPlaneAddresses: ['panel.fixture.invalid', ...nodes.map(n => n.ip)],
         followRelayStates: ['gateway', 'island'].map(name => ({ node: ids[name], desiredState: 'installed', status: 'installed',
             tproxyPort: a.ports[`ppp-${name}`], secretRevision: 1, routingMode: 'follow-relay', routingVersion: 1 })) }),
@@ -91,7 +96,8 @@ if (a.proof || a.matrix) {
         proofs = channels.artifacts.map((channel, i) => {
             if (channel.mode !== other) throw new Error('unexpected scoped proof transport');
             const requestPort = a.ports[`proof-request-${i}`], responderPort = a.ports[`proof-origin-${i}`];
-            return { channel: { id: channel.id, mode: channel.mode, physicalId: channel.physicalId }, requestPort, responderPort,
+            return { channel: { id: channel.id, mode: channel.mode, physicalId: channel.physicalId,
+                source: names[channel.source], target: names[channel.target] }, requestPort, responderPort,
                 ...transitProofProfiles({ channel, profiles, requestPort, responderPort }) };
         });
     }

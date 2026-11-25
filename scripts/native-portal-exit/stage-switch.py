@@ -34,12 +34,14 @@ def main():
     if (os.getcwd() != '/work' or Path('/etc/resolv.conf').exists()
             or socket.if_nameindex() != [(1, 'lo')]):
         raise RuntimeError('private fixture required')
-    port, pid, parent_net = sys.argv[1:]
+    port, pid, parent_net, binary = sys.argv[1:]
     net = os.readlink('/proc/self/ns/net')
     if net == parent_net or not port.isascii() or not port.isdecimal() or not 0 < int(port) < 65536:
         raise RuntimeError('invalid fixture endpoint')
     if not pid.isascii() or not pid.isdecimal() or int(pid) <= 1:
         raise RuntimeError('invalid fixture process')
+    if binary not in ('/tools/xray', '/tools/relay-xray') or os.readlink(f'/proc/{pid}/exe') != binary:
+        raise RuntimeError('Xray CLI must match the live API owner')
     start = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()[19]
     intent = {'version': 1, 'step': 'switch_ingress', 'netns': net, 'pid': int(pid), 'started': start,
               'from': digest('staged-routes.json'), 'to': digest('desired-routes.json')}
@@ -48,7 +50,7 @@ def main():
         write_once('switch.intent.json', intent)
     except FileExistsError:
         return 76
-    result = subprocess.run(['/tools/xray', 'api', 'adrules', f'--server=127.0.0.1:{port}', 'desired-routes.json'],
+    result = subprocess.run([binary, 'api', 'adrules', f'--server=127.0.0.1:{port}', 'desired-routes.json'],
                             stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
     if result.returncode != 0 or result.stderr:
         return 75  # The parent may inspect, but may not assume a no-write refusal.

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from hashlib import file_digest
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_network
 import json
 import os
 from pathlib import Path
@@ -23,13 +24,22 @@ VIRTUAL_PORT = 18080
 GEO = 'fixture.invalid'
 OTHER_GEO = 'other.invalid'
 PPP_IP = '198.51.100.42'  # Documentation-only, never bound or sent outside the fixture.
+RU_IP = '198.51.100.43'  # Synthetic RU /32; adjacent PPP_IP is deliberately outside it.
 SNI = 'cover.fixture.invalid'
 XRAY = '/tools/xray'
+RELAY_XRAY = '/tools/relay-xray'
 BRIDGE_XRAY = '/tools/bridge-xray'
 BRIDGES = ('A', 'B')
+PORTALS = ('p1', 'p2', 'p3')
+RELAYS = ('gateway', 'tail', 'island')
+ROLES = {**dict.fromkeys(PORTALS, 'portal'), **dict.fromkeys(RELAYS, 'relay'),
+         **dict.fromkeys(BRIDGES, 'bridge'), 'subscriber': 'subscriber'}
+ROLE_BINARIES = {'portal': XRAY, 'subscriber': XRAY, 'relay': RELAY_XRAY, 'bridge': BRIDGE_XRAY}
 COMPOSER_INPUTS = ('services/rebuildTopologyComposer.js', 'domain/rebuildTopologyCompiler.js',
                    'domain/rebuildPortalExit.js', 'domain/routePolicy.js', 'services/rebuildTransitChannels.js',
-                   'services/l2tpFollowRelay.js')
+                   'services/l2tpFollowRelay.js', '../../services/configGenerator.js', '../../services/rebuildLinkKeys.js',
+                   '../../services/rebuildTunnelTls.js', '../../services/rebuildRealityFingerprint.js',
+                   '../../services/rebuildReverseIdentity.js', '../../utils/cascadeTransport.js')
 
 
 def require(condition, message):
@@ -87,6 +97,53 @@ def source_digests():
     return {leaf: digest(base / leaf) if (base / leaf).is_file() else None for leaf in COMPOSER_INPUTS}
 
 
+def geoip_fixture():
+    # Xray's GeoIPList (field 1: GeoIP), GeoIP (1: country_code, 2: CIDR),
+    # CIDR (1: packed network address, 2: prefix). All values/lengths here
+    # fit in one protobuf varint byte. Do not read any installed geodata.
+    def field(number, value):
+        return bytes([(number << 3) | 2, len(value)]) + value
+
+    entries = {'PRIVATE': '127.0.0.0/8', 'RU': f'{RU_IP}/32'}
+    payload = b''
+    for code, cidr in entries.items():
+        network = ip_network(cidr)
+        subnet = field(1, network.network_address.packed) + bytes([2 << 3, network.prefixlen])
+        payload += field(1, field(1, code.encode('ascii')) + field(2, subnet))
+    path = Path('/work/assets/geoip.dat')
+    with path.open('xb') as stream:
+        stream.write(payload)
+    return {'file': str(path), 'entries': entries, 'sha256': digest(path)}
+
+
+def actor(owner, evidence):
+    role = ROLES[owner]
+    binary = ROLE_BINARIES[role]
+    return {'owner': owner, 'role': role, 'binary': binary, 'version': evidence['xray_binaries'][binary],
+            'sha256': evidence['actors_sha256'][binary]}
+
+
+def test_xray(label, owner, config, evidence):
+    spec = actor(owner, evidence)
+    dump(f'{label}.json', config)
+    res = cmd([spec['binary'], 'run', '-test', '-c', f'{label}.json'])
+    Path(f'{label}.test.log').write_text(res.stdout + res.stderr)
+    evidence['config_tests'][label] = res.returncode
+    evidence['config_test_actors'][label] = spec
+    require(res.returncode == 0, f'{label}: xray run -test failed; see {label}.test.log')
+
+
+def start_xray(stack, label, owner, evidence):
+    spec = actor(owner, evidence)
+    child = start(stack, label, [spec['binary'], 'run', '-c', f'{label}.json'], evidence['reaped'])
+    # Popen returns after exec, so this verifies the actual mounted executable,
+    # including when two mounts refer to the same host inode.
+    exe = os.readlink(f'/proc/{child.pid}/exe')
+    evidence['live_actors'][label] = {**spec, 'pid': child.pid, 'proc_exe': exe}
+    require(exe == spec['binary'], f'{label}: unexpected running binary {exe}')
+    return child
+
+
 def reality_keys(reality_count, cover_port):
     short_ids = set()
     keys = []
@@ -115,7 +172,8 @@ class Origins:
             def do_GET(self):
                 host = self.headers.get('Host')
                 if not self.path.startswith('/proof-') or host not in (GEO, f'{GEO}:{VIRTUAL_PORT}',
-                        f'{OTHER_GEO}:{VIRTUAL_PORT}', f'{VIRTUAL_IP}:{VIRTUAL_PORT}', f'{PPP_IP}:{VIRTUAL_PORT}'):
+                        f'{OTHER_GEO}:{VIRTUAL_PORT}', f'{VIRTUAL_IP}:{VIRTUAL_PORT}', f'{PPP_IP}:{VIRTUAL_PORT}',
+                        f'{RU_IP}:{VIRTUAL_PORT}'):
                     self.send_error(404)
                     return
                 with origins.lock:
@@ -160,7 +218,8 @@ def fixture_config(profile, sink_port, label):
     require(freedom['protocol'] == 'freedom', f'unexpected exit protocol: {label}')
     config['routing'] = {'domainStrategy': 'AsIs', 'rules': [
         {**permits[0], 'port': str(VIRTUAL_PORT), **selector}
-        for selector in ({'domain': [f'full:{GEO}', f'full:{OTHER_GEO}']}, {'ip': [f'{VIRTUAL_IP}/32', f'{PPP_IP}/32']})
+        for selector in ({'domain': [f'full:{GEO}', f'full:{OTHER_GEO}']},
+                         {'ip': [f'{addr}/32' for addr in (VIRTUAL_IP, PPP_IP, RU_IP)]})
     ]}
     freedom['settings'] = {'redirect': f'{LO}:{sink_port}', 'domainStrategy': 'AsIs',
                            'finalRules': [{'action': 'allow', 'ip': [f'{LO}/32']}, {'action': 'block'}]}
@@ -247,7 +306,7 @@ def tunnel_tag(link, incoming):
 
 
 def probe(case, ports, origins, links, chain=False, matrix=False, staged=False):
-    hosts = {'domain': GEO, 'other': OTHER_GEO, 'control': 'panel.fixture.invalid'}
+    hosts = {'domain': GEO, 'other': OTHER_GEO, 'control': 'panel.fixture.invalid', 'geoip-ru': RU_IP}
     ppp = case.portal in ('ppp', 'ppp-island')
     host = hosts.get(case.kind, PPP_IP if ppp else VIRTUAL_IP)
     args = [] if case.kind != 'sniff' else ['--header', f'Host: {GEO}']
@@ -288,25 +347,29 @@ def probe(case, ports, origins, links, chain=False, matrix=False, staged=False):
         attempts.append({'path': path, 'curl_status': res.returncode, 'curl_error': res.stderr, 'sinks': sinks})
         if case.want is None:
             require(res.returncode in (28, 52, 56) and not sinks, f'{case.name}: expected block, got exit {res.returncode} and {sinks}')
-            return {'case': case.name, 'expected': None, 'actual': None, 'attempts': attempts}
+            return {'case': case.name, 'destination': host, 'expected': None, 'actual': None, 'attempts': attempts}
         if res.returncode == 0:
             got = next((name for name, marker in origins.marker.items() if marker == res.stdout), None)
             host_header = GEO if case.kind == 'sniff' else f'{host}:{VIRTUAL_PORT}'
             require(got is not None and sinks == [[got, host_header]], f'{case.name}: missing/invalid origin proof: {sinks}')
             # Distinguish two channels to the same backend using the live
             # relay access log, not just the backend's HTTP marker.
+            route_lines = {}
+            destinations = (host, GEO) if case.kind == 'sniff' else (host,)
             for (access, inbound, hop_outbound), offset in zip(checks, offsets, strict=True):
                 with access.open('rb') as log:
                     log.seek(offset)
                     routes = [row for row in log.read().decode().splitlines()
                               if f'[{inbound} ' in row and any(f'accepted tcp:{addr}:{VIRTUAL_PORT} ' in row
-                                                              for addr in (VIRTUAL_IP, PPP_IP, GEO, OTHER_GEO))]
+                                                              for addr in destinations)]
                 require(routes and all(row.endswith(f'[{inbound} -> {hop_outbound}]') for row in routes),
                         f'{case.name}: {access} expected {inbound} -> {hop_outbound}, got {routes}')
-            return {'case': case.name, 'expected': case.want, 'actual': got, 'egress': tunnel_tag(links[case.edge], False),
-                    'relay_hops': [[p.name, i, o] for p, i, o in checks], 'attempts': attempts}
+                route_lines[access.name] = routes
+            return {'case': case.name, 'destination': host, 'expected': case.want, 'actual': got,
+                    'marker': res.stdout, 'exit_edge': case.edge, 'egress': tunnel_tag(links[case.edge], False),
+                    'relay_hops': [[p.name, i, o] for p, i, o in checks], 'route_lines': route_lines, 'attempts': attempts}
         time.sleep(0.2)
-    return {'case': case.name, 'expected': case.want, 'actual': None, 'attempts': attempts}
+    return {'case': case.name, 'destination': host, 'expected': case.want, 'actual': None, 'attempts': attempts}
 
 
 def scoped_proofs(proofs, cert, cover_port, evidence):
@@ -315,7 +378,7 @@ def scoped_proofs(proofs, cert, cover_port, evidence):
     require(len({p['channel']['physicalId'] for p in proofs}) == 1, 'scoped proofs do not share a physical link')
     answers = {}
     receipt_lock = threading.Lock()
-    reaped = evidence['reaped'] = {}
+    reaped = evidence['reaped']
     results = evidence['scoped_proofs'] = []
     with ExitStack() as stack:
         def handler(channel, key):
@@ -358,11 +421,9 @@ def scoped_proofs(proofs, cert, cover_port, evidence):
             for side in ('request', 'response'):
                 label = f'{channel}-{side}'
                 cfg = {**proof[side], 'log': {'access': f'/work/{label}.access.log', 'loglevel': 'info'}}
-                dump(f'{label}.json', cfg)
-                result = cmd([XRAY, 'run', '-test', '-c', f'{label}.json'])
-                Path(f'{label}.test.log').write_text(result.stdout + result.stderr)
-                require(result.returncode == 0, f'{label}: xray test failed; see private log')
-                children[label] = start(stack, label, [XRAY, 'run', '-c', f'{label}.json'], reaped)
+                owner = proof['channel']['source' if side == 'request' else 'target']
+                test_xray(label, owner, cfg, evidence)
+                children[label] = start_xray(stack, label, owner, evidence)
 
         for proof in proofs:
             channel, mode = proof['channel']['id'], proof['channel']['mode']
@@ -419,6 +480,7 @@ def scoped_proofs(proofs, cert, cover_port, evidence):
             and (label == f'{proofs[0]["channel"]["id"]}-response' or result['early_exit'] is None)
             for label, result in reaped.items()), 'proof child cleanup incomplete')
     require(not checked(['ss', '-Hltun']).strip(), 'proof left listeners behind')
+    require(len(results) == 4 and len(evidence['config_tests']) == 4, 'incomplete scoped wire proof')
 
 
 
@@ -430,18 +492,21 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     if stage:
         evidence['switch_source_sha256'] = digest('/scripts/stage-switch.py')
     if matrix:
-        # Minimal synthetic protobuf GeoIPList with PRIVATE -> 127/8 only.
-        Path('/work/assets/geoip.dat').write_bytes(b'\x0a\x13\x0a\x07PRIVATE\x12\x08\x0a\x04\x7f\0\0\0\x10\x08')
-    evidence['actors_sha256'] = {bin: digest(bin) for bin in (XRAY, BRIDGE_XRAY, '/tools/cover')}
-    vx, vb = version(XRAY), version(BRIDGE_XRAY)
-    print(f'CORE: {vx} | bridges: {vb}')
-    evidence['versions'] = [vx, vb]
-    clients = ['p1', 'p2', 'p3']
-    relays = ('gateway', 'tail', 'island') if matrix else ('gateway', 'tail') if chain else ('gateway',)
-    server_labels = [*clients, *relays, *BRIDGES]
+        evidence['geoip_fixture'] = geoip_fixture()
+    binaries = (XRAY, RELAY_XRAY, BRIDGE_XRAY)
+    evidence['actors_sha256'] = {binary: digest(binary) for binary in (*binaries, '/tools/cover')}
+    evidence['xray_binaries'] = {binary: version(binary) for binary in binaries}
+    for field in ('config_tests', 'config_test_actors', 'live_actors', 'reaped'):
+        evidence[field] = {}
+    evidence['api_calls'] = []
+    evidence['versions'] = [evidence['xray_binaries'][binary] for binary in (XRAY, BRIDGE_XRAY)]
+    for role, binary in ROLE_BINARIES.items():
+        print(f'CORE {role}: {binary} | {evidence["xray_binaries"][binary]}')
+    relays = RELAYS if matrix else RELAYS[:2] if chain else RELAYS[:1]
+    server_labels = [*PORTALS, *relays, *BRIDGES]
     n_links = 9 if chain else 7 if preferred else 6
-    ports = ports_for(['cover', *clients, *relays, *(f'api-{n}' for n in server_labels),
-                       *(f'link-{i}' for i in range(n_links)), *(f'socks-{n}' for n in clients),
+    ports = ports_for(['cover', *PORTALS, *relays, *(f'api-{n}' for n in server_labels),
+                       *(f'link-{i}' for i in range(n_links)), *(f'socks-{n}' for n in PORTALS),
                        *(f'sink-{n}' for n in BRIDGES), *(['ppp-gateway', 'ppp-island'] if matrix else []),
                        *(['stage-p1', 'stage-p2'] if stage else []),
                        *((f'proof-{side}-{i}' for side in ('request', 'origin') for i in range(2)) if proof else ())])
@@ -449,13 +514,19 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     cert, key = '/work/cover.crt', '/work/cover.key'
     checked(['openssl', 'req', '-config', '/dev/null', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', f'/CN={SNI}',
              '-addext', f'subjectAltName=DNS:{SNI}', '-out', cert, '-keyout', key])
-    fixture = dict(ports=ports, version=vx.split()[1], bridgeVersion=vb.split()[1], mode=mode, preferred=preferred,
+    versions_by_node = evidence['dialer_versions_by_node'] = {
+        name: actor(name, evidence)['version'].split()[1] for name in server_labels}
+    fixture = dict(ports=ports, versionsByNode=versions_by_node, mode=mode, preferred=preferred,
                    chain=chain, proof=proof, matrix=matrix,
                    reality=reality_keys(n_links, ports['cover']))
     raw = checked(['node', '/scripts/compose.cjs'], input=json.dumps(fixture))
     Path('composer-output.json').write_text(raw + '\n')
     generated = json.loads(raw)
     evidence['links'] = generated['links']
+    evidence['wire_endpoints'] = {}
+    for ln in generated['links'] + [item['channel'] for item in generated.get('proofs', [])]:
+        listener, dialer = (ln['source'], ln['target']) if ln['mode'] == 'reverse' else (ln['target'], ln['source'])
+        evidence['wire_endpoints'][ln['id']] = {'listener': actor(listener, evidence), 'dialer': actor(dialer, evidence)}
     if proof:
         scoped_proofs(generated['proofs'], cert, ports['cover'], evidence)
         require(evidence['source_sha256'] == source_digests()
@@ -464,7 +535,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         print('PASS 4/4 scoped wire probe receipts (separate fixture processes, not MAIN activation)')
         evidence['result'] = 'PASS'
         return 0
-    configs, run_configs = {}, {}
+    configs, run_configs, config_owners = {}, {}, {}
     for item in generated['profiles']:
         label, profile = item['name'], item['profile']
         key = f'{label}-{profile}'
@@ -472,19 +543,15 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         live = profile == ('bridge' if label in BRIDGES else 'main')
         configs[key] = fixture_config(item['config'], ports[f'sink-{label}'] if live and label in BRIDGES else None,
                                       key) if live else item['config']
+        config_owners[key] = label
         if live:
             run_configs[label] = key
     require(set(run_configs) == set(server_labels) and len(configs) == 2 * len(server_labels), 'incomplete profile roster')
     configs['subscriber'] = subscriber_config(generated['users'], ports)
     run_configs['subscriber'] = 'subscriber'
-    binary = lambda label: BRIDGE_XRAY if label.split('-')[0] in BRIDGES else XRAY
-    evidence['config_tests'] = {}
+    config_owners['subscriber'] = 'subscriber'
     for key, config in configs.items():
-        dump(f'{key}.json', config)
-        res = cmd([binary(key), 'run', '-test', '-c', f'{key}.json'])
-        Path(f'{key}.test.log').write_text(res.stdout + res.stderr)
-        evidence['config_tests'][key] = res.returncode
-        require(res.returncode == 0, f'{key}: xray run -test failed; see {key}.test.log')
+        test_xray(key, config_owners[key], config, evidence)
     if matrix:
         # The emitted TPROXY config above is parsed unchanged. At runtime use a
         # loopback SOCKS adapter at its exact tag/port instead of kernel PPP.
@@ -518,7 +585,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         dump('gateway-main.json', gateway)
         dump('staged-routes.json', {'routing': gateway['routing']})
         dump('desired-routes.json', {'routing': desired})
-    print(f'CONFIG OK {len(configs)}/{len(configs)} (all emitted profiles + synthetic subscriber)')
+    print(f'CONFIG OK {len(evidence["config_tests"])}/{len(configs)} (including bridge fixture redirects and subscriber)')
 
     b = 6 if preferred else 3
     cases = [Probe('p1', 'numeric', 'B', b), Probe('p2', 'numeric', 'B', b),
@@ -526,8 +593,10 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
              Probe('p1', 'sniff', 'A', 4), Probe('p2', 'sniff', 'B', b),
              Probe('p3', 'numeric', 'A', 2), Probe('p3', 'domain', 'A', 4)]
     if matrix:
-        cases = [Probe('p1', 'numeric', 'B', 3), Probe('p1', 'domain', 'A', 4), Probe('p1', 'sniff', 'A', 4),
-                 Probe('p2', 'numeric', 'A', 2), Probe('p2', 'other', 'A', 2), Probe('p2', 'sniff', 'A', 2),
+        cases = [Probe('p1', 'numeric', 'B', 3), Probe('p1', 'geoip-ru', 'A', 4),
+                 Probe('p1', 'domain', 'A', 4), Probe('p1', 'sniff', 'A', 4),
+                 Probe('p2', 'numeric', 'A', 2), Probe('p2', 'geoip-ru', 'A', 2),
+                 Probe('p2', 'other', 'A', 2), Probe('p2', 'sniff', 'A', 2),
                  Probe('p3', 'numeric', 'A', 2), Probe('p3', 'other', 'B', 6),
                  Probe('ppp', 'numeric', 'A', 2), Probe('ppp', 'other', 'B', 6), Probe('ppp', 'control', None, 0),
                  Probe('ppp-island', 'numeric', None, 0)]
@@ -536,18 +605,20 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     links = {link['index']: link for link in generated['links']}
     origins = Origins()
     evidence['probes'] = []
-    reaped = evidence['reaped'] = {}
+    expected_count = len(cases) + (5 if matrix else 0) + (9 if stage else 0)
+    evidence['expected_counts'] = {'config_tests': len(configs), 'http_probes': expected_count,
+                                   'live_xray': len(run_configs), 'children': len(run_configs) + 1}
+    reaped = evidence['reaped']
     with ExitStack() as stack:
         for label in BRIDGES:
             origins.start(stack, label, ports[f'sink-{label}'])
         cover = start(stack, 'cover', ['/tools/cover', str(ports['cover']), cert, '/work/cover.key'], reaped)
         children = {'cover': cover}
         wait_until('cover listener', children, lambda: sockets(ports['cover'], cover), 4)
-        for label in [*relays, *clients, *BRIDGES, 'subscriber']:
-            key = run_configs[label]
-            children[label] = start(stack, key, [binary(key), 'run', '-c', f'{key}.json'], reaped)
+        for label in [*relays, *PORTALS, *BRIDGES, 'subscriber']:
+            children[label] = start_xray(stack, run_configs[label], label, evidence)
         listens = [(ln['source'] if ln['mode'] == 'reverse' else ln['target'], ln['port']) for ln in generated['links']]
-        listens += [(n, ports[n]) for n in clients] + [('subscriber', ports[f'socks-{n}']) for n in clients]
+        listens += [(n, ports[n]) for n in PORTALS] + [('subscriber', ports[f'socks-{n}']) for n in PORTALS]
         if matrix:
             listens += [(node, ports[f'ppp-{node}']) for node in generated['pppTags']]
         if stage:
@@ -569,10 +640,25 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         evidence['reverse_readiness'] = {'socket_paths': [f"{ln['source']}->{ln['target']}" for ln in reverse],
                                          'minimum_auth_records_per_listener_process': reverse_owners}
         print(f'REVERSE READY {len(reverse)}/{len(reverse)}')
+
+        def api_actor(owner, operation):
+            spec = evidence['live_actors'][run_configs[owner]]
+            port = ports[f'api-{owner}']
+            require(sockets(port, children[owner]), f'{operation}: API socket not owned by {owner}')
+            return {**spec, 'operation': operation, 'port': port}
+
+        def api(owner, operation, *args):
+            spec = api_actor(owner, operation)
+            result = cmd([spec['binary'], 'api', operation, f'--server={LO}:{spec["port"]}', *args])
+            evidence['api_calls'].append({**spec, 'status': result.returncode})
+            result.check_returncode()
+            return result.stdout
+
         def verify_case(case, staged=False):
             result = probe(case, ports, origins, links, chain, matrix, staged=staged)
             evidence['probes'].append(result)
-            print(f'{case.name}: HTTP {result["actual"] or "NO MARKER"} (want {case.want})')
+            print(f'{case.name}: HTTP {result["actual"] or "NO MARKER"} (want {case.want})'
+                  + (f' via {result["egress"]}' if 'egress' in result else ''))
             require(result['actual'] == case.want, f'{case.name}: wrong origin')
 
         if stage:
@@ -582,18 +668,16 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
             verify_case(Probe('stage-p1', 'numeric', 'B', 3), staged=True)
             verify_case(Probe('stage-p2', 'other', 'A', 2), staged=True)
-            server = f'--server={LO}:{ports["api-gateway"]}'
-            checked([XRAY, 'api', 'adrules', server, 'desired-routes.json'])
+            api('gateway', 'adrules', 'desired-routes.json')
             wait_until('original staged process and all listeners retained', children,
                        lambda: all(sockets(port, children[owner]) for owner, port in listens), 4)
         for case in cases:
             verify_case(case)
         if stage:
-            server = f'--server={LO}:{ports["api-gateway"]}'
-            checked([XRAY, 'api', 'adrules', server, 'staged-routes.json'])
+            api('gateway', 'adrules', 'staged-routes.json')
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
-            checked([XRAY, 'api', 'adrules', server, 'desired-routes.json'])
+            api('gateway', 'adrules', 'desired-routes.json')
             verify_case(Probe('p1', 'numeric', 'B', 3))
         if matrix:
             # Remove one incoming listener in the actual, still-running MAIN.
@@ -604,8 +688,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             previous, = [row for row in configs[run_configs[owner]]['inbounds'] if row['tag'] == tag]
             require(previous['port'] == cut['port'], 'wrong original channel listener')
             dump('cut-preimage.json', {'inbounds': [previous]})
-            server = f'--server={LO}:{ports[f"api-{owner}"]}'
-            reply = checked([XRAY, 'api', 'rmi', server, tag])
+            reply = api(owner, 'rmi', tag)
             wait_until('cut listener absent, peer listeners retained', children,
                        lambda: not sockets(cut['port'], children[owner]) and all(
                            sockets(port, children[node]) for node, port in listens if port != cut['port']), 4)
@@ -620,7 +703,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             verify_case(Probe('p1', 'cut', None, 0))
             verify_case(Probe('p2', 'numeric', 'A', 2))
             verify_case(Probe('ppp', 'other', 'B', 6))
-            checked([XRAY, 'api', 'adi', server, 'cut-preimage.json'])
+            api(owner, 'adi', 'cut-preimage.json')
             wait_until('restored listener in the original process', children,
                        lambda: sockets(cut['port'], children[owner]) and (
                            cut['mode'] != 'reverse' or sockets(cut['port'], children[owner], established=True)), 18)
@@ -630,18 +713,19 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             # A fresh writer dies after a real routing update. The observer
             # must read the live result and leave the unacknowledged intent;
             # it has no permission to send that write a second time.
-            server = f'--server={LO}:{ports["api-gateway"]}'
-            checked([XRAY, 'api', 'adrules', server, 'staged-routes.json'])
+            api('gateway', 'adrules', 'staged-routes.json')
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
-            before = checked([XRAY, 'api', 'lsrules', server])
+            before = api('gateway', 'lsrules')
+            spec = api_actor('gateway', 'adrules (lost reply)')
             writer = cmd([sys.executable, '-I', '-B', '/scripts/stage-switch.py',
-                          str(ports['api-gateway']), str(children['gateway'].pid), parent_net])
+                          str(spec['port']), str(spec['pid']), parent_net, spec['binary']])
+            evidence['api_calls'].append({**spec, 'writer_status': writer.returncode})
             require(writer.returncode == 77 and not writer.stdout and not writer.stderr, 'expected lost reply after real switch')
             intent = json.loads(Path('switch.intent.json').read_text())
             require(intent == {'version': 1, 'step': 'switch_ingress', 'netns': evidence['netns'],
                     'pid': children['gateway'].pid, 'started': Path(f'/proc/{children["gateway"].pid}/stat').read_text().rsplit(') ', 1)[1].split()[19],
                     'from': digest('staged-routes.json'), 'to': digest('desired-routes.json')}, 'switch intent is not pinned')
-            after = checked([XRAY, 'api', 'lsrules', server])
+            after = api('gateway', 'lsrules')
             require(before != after and all(tag not in before and tag in after for tag in scoped_rule_tags), 'live rule readback did not change')
             verify_case(Probe('p1', 'numeric', 'B', 3))
             require(json.loads(Path('switch.intent.json').read_text()) == intent, 'read-only reconciliation changed intent')
@@ -656,7 +740,6 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     if stage:
         require(evidence['switch_source_sha256'] == digest('/scripts/stage-switch.py'), 'stage writer changed during the run')
     rows = evidence['probes']
-    expected_count = len(cases) + (5 if matrix else 0) + (9 if stage else 0)
     if len(rows) == expected_count and all(row['actual'] == row['expected'] for row in rows):
         print(f'PASS {len(rows)}/{len(rows)} HTTP marker/block checks and exact relay channels')
         evidence['result'] = 'PASS'
