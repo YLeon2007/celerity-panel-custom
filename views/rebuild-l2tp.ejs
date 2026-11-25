@@ -28,7 +28,7 @@ const problemKeys = new Map([
 ]);
 const problemText = problem => l(`admission.${problemKeys.get(problem) ?? 'grantUnavailable'}`);
 const messages = ['working', 'revealFailed', 'copyFailed', 'copied', 'invalidLogin', 'cryptoUnavailable', 'requestFailed',
-    'rateLimited', 'uncertain', 'observationTimeout', 'refreshFailed', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
+    'rateLimited', 'uncertain', 'observationTimeout', 'refreshFailed', 'refreshRequired', 'installed', 'created', 'disabled', 'deleted', 'canceled', 'requestClosures',
     'reconcileSettled', 'reconcileStillPending', 'reconcileUnconfirmed', 'reconcileInspectionUnproved',
     'reconcileManualBlock', 'accountPreEffectBlocked', 'accountReconcileRequired', 'runtimeForeignChange', 'runtimeNetworkNotReady',
     'reconcileHostInspection', 'reconcileChapProjection', 'reconcilePppInspection', 'reconcilePidfdGetfdEperm', 'reconcileInspectReadback',
@@ -55,6 +55,11 @@ function secretControl(kind, url, index, login) {
     #rebuild-l2tp [data-secret-value] { white-space: normal; overflow-wrap: anywhere; }
     #rebuild-l2tp .rebuild-addresses { list-style: none; margin: 0; padding: 0; }
     #rebuild-l2tp [data-action-status]:not(:empty) { margin-bottom: .75rem; }
+    #rebuild-l2tp .btn:is(:disabled, [aria-disabled="true"]) { opacity: .55; cursor: not-allowed; }
+    #rebuild-l2tp [data-relay-control] { display: inline-block; }
+    #rebuild-l2tp [data-relay-control]:has(> :is(:disabled, [aria-disabled="true"])) { cursor: not-allowed; }
+    #rebuild-l2tp [data-relay-control] > :is(:disabled, [aria-disabled="true"]) { pointer-events: none; }
+    #rebuild-l2tp [data-relay-refresh-reason]:not([hidden]) { display: block; margin-top: .35rem; }
     #rebuild-l2tp [data-admission-dialog] { position: fixed; color: inherit; overflow: auto; width: min(37rem, calc(100% - 2rem)); }
     #rebuild-l2tp [data-admission-dialog] code { overflow-wrap: anywhere; }
     #rebuild-l2tp [data-admission-console] pre { white-space: pre-wrap; }
@@ -133,17 +138,17 @@ function secretControl(kind, url, index, login) {
                                 <td>
                                     <% if (canGrant || canReconfirm || canRevoke) { %>
                                         <% for (const [allowed, action] of [[canGrant, 'grant'], [canReconfirm, 'reconfirm'], [canRevoke && !changed, 'revoke']]) { if (allowed) { %>
-                                            <button type="button" class="btn btn-sm btn-secondary" disabled data-admission-action="<%= action %>"
+                                            <span data-relay-control aria-label="<%= l(`admission.${action}`) %>" aria-describedby="relay-refresh-<%= relay.id %>"><button type="button" class="btn btn-sm btn-secondary" disabled data-admission-action="<%= action %>"
                                                     data-admission-url="<%= relayPath(relay.id) %>/admission" data-node-id="<%= relay.id %>"
-                                                    data-node-name="<%= relay.name %>" aria-haspopup="dialog"><%= l(`admission.${action}`) %></button>
+                                                    data-node-name="<%= relay.name %>" aria-haspopup="dialog"><%= l(`admission.${action}`) %></button></span>
                                         <% } } %>
                                     <% } %>
                                     <% if (actionable && !changed && status === 'installing' && relay.canRecoverInstall === true
                                         && typeof canRequestInstallRecovery !== 'undefined' && canRequestInstallRecovery === true) { %>
                                         <p class="text-muted" id="install-recovery-<%= relay.id %>"><%= l('installRecoveryHint') %></p>
-                                        <button type="button" class="btn btn-sm btn-secondary" disabled
-                                                data-install-recovery-url="<%= relayPath(relay.id) %>/install/recover"
-                                                data-node-id="<%= relay.id %>" aria-describedby="install-recovery-<%= relay.id %>"><%= l('recoverInstall') %></button>
+                                        <span data-relay-control aria-label="<%= l('recoverInstall') %>" aria-describedby="relay-refresh-<%= relay.id %>"><button type="button" class="btn btn-sm btn-secondary" disabled
+                                               data-install-recovery-url="<%= relayPath(relay.id) %>/install/recover"
+                                               data-node-id="<%= relay.id %>" aria-describedby="install-recovery-<%= relay.id %>"><%= l('recoverInstall') %></button></span>
                                     <% } %>
                                     <% if (relay.installProgress || (actionable && !changed && status === 'not_installed' && relay.canInstall === true)) { %>
                                         <%- include('partials/rebuild-l2tp-install-progress', {relay, relayPath, l}) %>
@@ -153,12 +158,13 @@ function secretControl(kind, url, index, login) {
                                             <a href="/panel/nodes"><%= t('nodes.title') %></a>
                                         </p>
                                         <% if (source === 'db') { %><p class="text-muted" id="install-packages-<%= relay.id %>"><%= l('installPackageHint') %></p><% } %>
-                                        <button type="button" class="btn btn-sm btn-primary" data-install-url="<%= relayPath(relay.id) %>/install"
-                                                data-node-id="<%= relay.id %>" aria-describedby="install-profile-<%= relay.id %><%= source === 'db' ? ` install-packages-${relay.id}` : '' %>"><%= l('install') %></button>
+                                        <span data-relay-control aria-label="<%= l('install') %>" aria-describedby="relay-refresh-<%= relay.id %>"><button type="button" class="btn btn-sm btn-primary" disabled data-install-url="<%= relayPath(relay.id) %>/install"
+                                                data-node-id="<%= relay.id %>" aria-describedby="install-profile-<%= relay.id %><%= source === 'db' ? ` install-packages-${relay.id}` : '' %>"><%= l('install') %></button></span>
                                     <% } %>
                                     <% if (actionable && !changed && relay.canRemove === true) { %>
-                                        <a class="btn btn-sm btn-danger" data-remove-link href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a>
-                                    <% } %>
+                                        <span data-relay-control aria-label="<%= l('remove') %>" aria-describedby="relay-refresh-<%= relay.id %>"><a class="btn btn-sm btn-danger" data-remove-link href="/panel/nodes/<%= relay.id %>#rebuild-l2tp-remove"><%= l('remove') %></a></span>
+                                     <% } %>
+                                     <% if (validId(relay.id)) { %><small id="relay-refresh-<%= relay.id %>" data-relay-refresh-reason role="status" hidden><%= l('messages.refreshRequired') %></small><% } %>
                                 </td>
                             </tr>
                         <% }); %>

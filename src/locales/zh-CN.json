@@ -295,6 +295,7 @@
       "uncertain": "结果不确定。正在检查当前状态，请勿重试。",
       "observationTimeout": "五分钟内未能确认结果。操作仍处于锁定状态，请勿重试。",
       "refreshFailed": "无法加载当前状态。操作仍处于锁定状态。",
+      "refreshRequired": "请刷新页面后继续。",
       "canceled": "请求的账户更改已取消，未应用。",
       "installed": "L2TP 已安装。",
       "created": "账户已创建。请使用显示按钮查看密码。",

@@ -144,7 +144,10 @@ test('pending page does not POST until click; each outcome requires a fresh view
         }
         assert.equal(calls.filter(call => call.options.method === 'POST').length, recover ? 1 : 0, outcome);
         assert.equal(calls.filter(call => call.options.method === 'GET').length, messageKey === 'reconcileSettled' ? 1 : 0, outcome);
-        assert.equal(refresh.hidden, !messageKey || messageKey === 'reconcileSettled', outcome);
+        // This fixture does not advance poll timers; unresolved automatic
+        // observation is still running, not the manual-refresh fallback.
+        const polling = ['refused', 'unexpected', 'lost'].includes(outcome);
+        assert.equal(refresh.hidden, polling || !messageKey || messageKey === 'reconcileSettled', outcome);
         const message = messageKey ? words.messages[messageKey] ?? words.admission[messageKey] : words.accountsPendingLocked;
         assert.equal(status.textContent, count === undefined ? message : `${message} Подтверждено завершение сеансов этим запросом: ${count}.`, outcome);
         if (messageKey) {
@@ -420,7 +423,7 @@ async function browserScenario({ route, id, otherId, csrf, words, terminal }) {
 const firefox = process.env.REBUILD_L2TP_FIREFOX || 'firefox';
 const browserAvailable = spawnSync(firefox, ['--version'], { timeout: 3000 }).status === 0;
 
-async function admissionVisibility({ route, id, otherId, words, lang }) {
+async function admissionVisibility({ route, id, otherId, words, lang, snapshots }) {
     const $ = selector => document.querySelector(selector);
     const click = selector => $(selector).click();
     const check = (ok, message) => { if (!ok) throw new Error(message); };
@@ -445,11 +448,16 @@ async function admissionVisibility({ route, id, otherId, words, lang }) {
         check(visible(consoleCheck) === (step === 'verify' || step === 'confirm'), 'console command has wrong visibility');
     }
     const flush = () => new Promise(resolve => setTimeout(resolve, 0));
-    const requests = [];
+    const requests = [], reads = [];
     const markup = $('#rebuild-l2tp').outerHTML;
-    window.fetch = (url, options) => options.method === 'GET' ? Promise.resolve({ status: 200,
+    let holdOverview = false;
+    const html = markup => ({ status: 200,
         url: 'http://fixture.invalid/panel/l2tp', headers: new Headers({ 'content-type': 'text/html', 'cache-control': 'no-store' }),
-        text: async () => markup }) : new Promise(resolve => requests.push({ url, options, resolve }));
+        text: async () => markup });
+    let overviewMarkup = markup;
+    window.fetch = (url, options) => options.method === 'GET'
+        ? holdOverview ? new Promise(resolve => reads.push({ url, resolve })) : Promise.resolve(html(overviewMarkup))
+        : new Promise(resolve => requests.push({ url, options, resolve }));
     const respond = async (path, data, ok = true) => {
         const request = requests.shift();
         check(request?.url === path && request.options.method === 'POST', `expected ${path}`);
@@ -498,6 +506,16 @@ async function admissionVisibility({ route, id, otherId, words, lang }) {
     await respond(`${route}/l2tp/accounts/disable`, { error: { code: 'REBUILD_L2TP_IDENTITY_CHANGED', outcome: 'refused', nodeId: id } }, false);
     check(visible(review) && review.getAttribute('href') === `#relay-${id}`, 'identity refusal did not expose scoped review');
     check($(`[data-node-id="${otherId}"][data-admission-action="grant"]`).disabled, 'unrelated grant became enabled');
+    const staleInstall = $(`[data-node-id="${otherId}"][data-install-url]`);
+    check(staleInstall.disabled, 'stale Install is not disabled');
+    check(getComputedStyle(staleInstall).pointerEvents === 'none' && Number(getComputedStyle(staleInstall).opacity) < 1,
+        'disabled Install does not expose a visible explanation target');
+    const wrapper = staleInstall.closest('[data-relay-control]');
+    check(wrapper?.tabIndex === 0 && getComputedStyle(wrapper).cursor === 'not-allowed', 'blocked control cannot be inspected');
+    wrapper.click();
+    const reason = $(`#relay-${otherId} [data-relay-refresh-reason]`);
+    check(reason && visible(reason) && reason.textContent === words.messages.refreshRequired, 'missing row-local refresh reason');
+    check(requests.length === 0, 'disabled click dispatched a POST');
     click('[data-admission-action="reconfirm"]');
     check(dialog.open && visible(dialog), 'reconfirm dialog did not open');
     buttons(null);
@@ -514,9 +532,16 @@ async function admissionVisibility({ route, id, otherId, words, lang }) {
     check(visible($('[data-admission-machine-row]')), 'verification did not expose the machine field');
     check($('[data-admission-machine]').textContent === identified.machineId, 'verification displayed the wrong identity');
     await copyConsole(binding);
+    holdOverview = true;
     click('[data-admission-approve="confirm"]');
     const confirmed = await respond(`${url}/confirm`, identified);
     check(JSON.stringify(confirmed) === JSON.stringify({ challenge: 'd'.repeat(64) }), 'confirm changed its challenge-only payload');
+    check(reads.length === 1 && reads[0].url === '/panel/l2tp' && staleInstall.disabled,
+        'confirmation did not leave Install locked while automatically reading the overview');
+    overviewMarkup = snapshots.after;
+    reads.shift().resolve(html(overviewMarkup));
+    holdOverview = false;
+    await flush();
     check(getComputedStyle(dialog).display === 'none' && !visible(review) && !visible($('[data-refresh]')),
         'confirmation did not close the dialog and adopt fresh controls');
     const beforeRevoke = $('[data-l2tp-view]');
@@ -526,6 +551,12 @@ async function admissionVisibility({ route, id, otherId, words, lang }) {
     click('[data-admission-approve="revoke"]');
     await respond(`${url}/revoke`, { nodeId: id });
     check(!beforeRevoke.isConnected && !dialog.open, 'affirmative revoke did not refresh the overview');
+    const freshInstall = $(`[data-node-id="${id}"][data-install-url]`);
+    check(!freshInstall.disabled && !visible($(`#relay-${id} [data-relay-refresh-reason]`)), 'fresh Install not unlocked');
+    staleInstall.dispatchEvent(new Event('click'));
+    check(requests.length === 0, 'detached Install dispatched a POST');
+    freshInstall.click();
+    await respond(`${route}/${id}/l2tp/install`, { executionMode: 'rebuild', status: 'installed', nodeId: id });
 }
 
 
@@ -694,7 +725,9 @@ for (const [lang, terminal] of [['en', 'uncertainAccount'], ['ru', 'uncertainIns
         const snapshots = matrix ? { before: content,
             progress: (await render(lang, { relays: [installed, { ...fresh, status: 'installing', canInstall: false }] })).content,
             after: (await render(lang, { relays: [installed, { ...fresh, status: 'installed', canInstall: false }],
-                accounts: [{ ...account, login: 'fixture.after' }] })).layout } : null;
+                accounts: [{ ...account, login: 'fixture.after' }] })).layout } : admission ? { after: (await render(lang, { relays: [
+            { ...fresh, id, grantSource: 'db', canReconfirm: true, canRevoke: true }, { ...fresh, grantSource: null, canGrant: true },
+        ] })).content } : null;
         if (terminal.startsWith('matrixRemove')) {
             const card = await ejs.renderFile(join(root, 'views/node-form.ejs'), { t: key => t(key, lang), lang, csrfToken: csrf,
                 node: { _id: id, cascadeRole: 'relay', type: 'xray' }, error: null, groups: [], candidateNodes: [],

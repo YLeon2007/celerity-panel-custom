@@ -5,6 +5,11 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.6.39 — Обновление L2TP / L2TP overview refresh
+
+- После подтверждения допуска обзор L2TP обновляется автоматически. Когда действия заблокированы, причина видна рядом с релеем.
+- The L2TP overview refreshes automatically after admission confirmation. If actions are locked, the affected relay row explains why.
+
 ## v1.6.38 — Свой выход портала / Per-portal exits
 
 - На одном общем Rebuild-релее каждый портал может выбрать свой бридж и решить, использовать ли шлюз РФ. Выбор сохраняется по ноде, а канал определяется приоритетом. [Заметки о выпуске](docs/release-v1.6.38.ru.md).

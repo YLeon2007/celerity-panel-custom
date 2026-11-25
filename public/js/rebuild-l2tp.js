@@ -243,7 +243,7 @@
         return hide;
     }
 
-    let hideSecrets = [], form, installs, installRecoveries, accountButtons, admissionButtons, removeLinks, recover, mutations;
+    let hideSecrets = [], form, installs, installRecoveries, accountButtons, admissionButtons, removeLinks, recover, mutations, relayControls;
     const clearSecrets = () => hideSecrets.forEach(hide => hide());
     window.addEventListener('pagehide', clearSecrets);
 
@@ -290,12 +290,23 @@
     const canReview = button => identityReview && reviewId !== null && button.dataset.admissionAction === 'reconfirm'
         && button.dataset.nodeId === reviewId;
 
+    function updateRelayControls() {
+        for (const { wrapper, control, reason } of relayControls) {
+            const blocked = control.disabled || control.getAttribute('aria-disabled') === 'true';
+            if (blocked) wrapper.tabIndex = 0;
+            else wrapper.removeAttribute('tabindex');
+            reason.hidden = !requireRefresh || !active || busy;
+            if (requireRefresh && !busy) reason.textContent = words.refreshRequired;
+        }
+    }
+
     function updateMutations() {
         const locked = !active || busy || !!flow || requireRefresh;
         for (const button of mutations) button.disabled = locked;
         for (const button of admissionButtons) button.disabled = !active || busy || !!flow || (requireRefresh && !canReview(button));
         for (const link of removeLinks) link.setAttribute('aria-disabled', String(locked));
-        refresh.hidden = !requireRefresh;
+        updateRelayControls();
+        refresh.hidden = !requireRefresh || busy;
         if (review) {
             review.hidden = !identityReview;
             review.href = reviewId === null ? '#rebuild-l2tp-relays' : `#relay-${reviewId}`;
@@ -328,11 +339,16 @@
 
     async function finishAcknowledged(csrf, message, keepLocked = false) {
         status.textContent = message;
+        // Keep the old controls locked until a newer, validated response has
+        // replaced the view. A reload is only the fallback if readback fails.
+        requireRefresh = true;
+        identityReview = false;
+        updateMutations();
         const refreshed = await refreshAcknowledged(csrf);
         if (!active) return;
-        identityReview = false;
         requireRefresh = !refreshed || keepLocked;
         if (!refreshed) status.textContent += ` ${words.refreshFailed}`;
+        updateMutations();
     }
 
     async function reconcileUnknown(csrf, token, accepted) {
@@ -739,6 +755,24 @@
         recover = page.querySelector('[data-reconcile]');
         mutations = [...installs, ...installRecoveries, ...accountButtons,
             ...[form?.querySelector('button[type="submit"]'), recover].filter(Boolean)];
+        relayControls = Array.from(page.querySelectorAll('[data-relay-control]'), wrapper => {
+            const control = wrapper.firstElementChild;
+            const reason = wrapper.parentElement.querySelector('[data-relay-refresh-reason]');
+            const explain = event => {
+                if (!isCurrent(wrapper) || !(control.disabled || control.getAttribute('aria-disabled') === 'true')) return;
+                event.preventDefault();
+                event.stopPropagation();
+                if (!active) return;
+                const message = busy || !requireRefresh ? words.working : words.refreshRequired;
+                reason.textContent = message;
+                reason.hidden = false;
+            };
+            wrapper.addEventListener('click', explain);
+            wrapper.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') explain(event);
+            });
+            return { wrapper, control, reason };
+        });
 
         for (const button of admissionButtons) button.addEventListener('click', () => openAdmission?.(button));
         for (const link of removeLinks) link.addEventListener('click', event => {

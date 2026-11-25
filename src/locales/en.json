@@ -2432,7 +2432,8 @@
       "disabled": "The account was disabled.",
       "deleted": "The account was deleted.",
       "observationTimeout": "The outcome could not be verified within five minutes. Controls remain locked; do not retry the operation.",
-      "refreshFailed": "The current view could not be loaded. Controls remain locked."
+      "refreshFailed": "The current view could not be loaded. Controls remain locked.",
+      "refreshRequired": "Refresh the page to continue."
     },
     "installChecks": {
       "KERNEL_MODULE_BLACKLISTED": "A required kernel network module or one of its dependencies is blacklisted. Ask the relay administrator to review the policy; Install will not bypass it.",
