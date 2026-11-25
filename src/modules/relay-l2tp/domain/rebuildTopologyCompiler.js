@@ -204,13 +204,14 @@ function compileRebuildGraph({ nodes, links, affectedNodeIds }) {
         entry.isExit = entry.role === 'bridge' && entry.incoming.length > 0;
         entry.geoLinks = entry.outgoing.filter(link => link.domains)
             .sort((a, b) => a.priority - b.priority || byId(a, b));
-        entry.defaultLink = selectDefaultLink(entry.outgoing.filter(link => !link.domains && byNodeId.get(link.target).hasExit));
-        const routedLinks = entry.geoLinks.filter(link => byNodeId.get(link.target).hasExit);
-        entry.hasExit = entry.isExit || !!entry.defaultLink || routedLinks.length > 0;
+        entry.defaultLink = selectDefaultLink(entry.outgoing.filter(link => !link.domains
+            && (portalPicks.has(link) || byNodeId.get(link.target).hasExit)));
         if (entry.role === 'portal' && portalPicks.size) {
             const picks = entry.outgoing.filter(link => portalPicks.has(link)).map(link => [link, portalPicks.get(link)]);
             if (picks.length) resolvePortalExits(entry, picks, byNodeId, resolvePath);
         }
+        const routedLinks = entry.geoLinks.filter(link => link.portalExit || byNodeId.get(link.target).hasExit);
+        entry.hasExit = entry.isExit || !!entry.defaultLink || routedLinks.length > 0;
         // Native reverse does not carry route-only sniff metadata. Work out
         // whether a client (or forward-hop) sniff must replace the destination
         // before crossing a reverse edge to a later domain policy.

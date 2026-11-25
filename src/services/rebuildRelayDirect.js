@@ -203,6 +203,11 @@ function bundleDirectScript() {
     requireThat(dictionary.length > 0 && dictionary.length <= 64 && dictionary.every(([key, value]) =>
         /^(?:16[1-9]|17[0-6]|2[2-4]\d|25[0-5])$/.test(key) && typeof value === 'string' && /^[ \n!-~]{1,65}$/.test(value)),
     'DIRECT_BUNDLE_INVALID');
+    // The indent codes are consecutive and their values are derived from the
+    // code itself. Validate that representation before emitting the loader.
+    requireThat(Array.from({ length: 16 }, (_, i) => manifest.dictionary[161 + i] === '\n' + '    '.repeat(i + 1)).every(Boolean),
+        'DIRECT_BUNDLE_INVALID');
+    const words = Object.fromEntries(dictionary.filter(([key]) => Number(key) > 176));
     const offsets = [0];
     const joined = createHash('sha256');
     names.forEach((name, i) => {
@@ -219,7 +224,8 @@ function bundleDirectScript() {
         `_c3_digits={chr(c):i for i,c in enumerate(c for c in range(1,128) if c not in ${JSON.stringify(directExcluded)})}`,
         '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(120,"big")',
         `_c3_sources=lzma.decompress(b"".join(_c3_chunk(_c3_payload[i:i+139]) for i in range(0,len(_c3_payload),139))[:${compressed.length}],memlimit=16777216)`,
-        `_c3_dict={int(k):v.encode() for k,v in ${JSON.stringify(manifest.dictionary)}.items()}`,
+        `_c3_dict={160+i:b"\\n"+b"    "*i for i in range(1,17)}`,
+        `_c3_dict.update((int(k),v.encode()) for k,v in ${JSON.stringify(words)}.items())`,
         '_c3_pattern=bytes(_c3_dict)',
         '_c3_sources=re.sub(b"["+_c3_pattern+b"]",lambda m:_c3_dict[m[0][0]],_c3_sources)',
         `_c3_offsets=${JSON.stringify(offsets)}`,

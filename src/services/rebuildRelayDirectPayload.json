@@ -22,11 +22,11 @@
     },
     {
       "path": "rebuildRelayDirectHost.py",
-      "size": 426090,
-      "sha256": "f934a28c3491d7d597b267763ed3eaf9f579a318b72edaf8772b711956784597"
+      "size": 426383,
+      "sha256": "58461fe3b3e6e756e1c8c332f470edbef1af4c2d129bde2832b3efc94617aeda"
     }
   ],
-  "sha256": "7f6325d1dccb67b301830cf72809333b6cf6e5a75fae639af9f0d65edad8a763",
+  "sha256": "e8a31c62ce6847452f295927211bcb37836f65bb4432092734c6e13861b05bb1",
   "dictionary": {
     "161": "\n    ",
     "162": "\n        ",
@@ -69,14 +69,15 @@
     "233": " and",
     "232": " not",
     "231": "\n\n",
-    "230": "need",
-    "229": "backup[",
-    "228": "paths[",
-    "227": "after",
-    "225": "record",
-    "224": "unit(",
-    "223": "if ",
-    "222": "self.",
-    "221": "raise "
+    "230": "backup[",
+    "229": "paths[",
+    "228": "after",
+    "227": "record",
+    "225": "unit(",
+    "224": "if ",
+    "223": "self.",
+    "222": "raise ",
+    "221": "CANDIDATE_INVALID",
+    "220": "PREREQUISITE"
   }
 }

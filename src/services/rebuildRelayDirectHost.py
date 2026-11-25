@@ -4093,9 +4093,10 @@ def validate_portal_rules(current, rules, shared_scope, targets):
     pending = None
     for rule in rules:
         label = rule['ruleTag']
-        match = re.fullmatch(r'rebuild-policy-portal-([0-9a-f]{8})-(?:default|geo-(?:0|[1-9][0-9]*)-(ip|domain))', label)
+        match = re.fullmatch(r'rebuild-policy-(portal|transit)-([0-9a-f]{8})-(?:default|geo-(?:0|[1-9][0-9]*)-(ip|domain))', label)
         need(match is not None, bad)
-        suffix, geo = match.groups()
+        kind_label, suffix, geo = match.groups()
+        prefix = f'rebuild-policy-{kind_label}-{suffix}-'
         scope, out = rule.get('inboundTag'), rule.get('outboundTag')
         keys = {'type', 'ruleTag', 'inboundTag', 'outboundTag'}
         if geo:
@@ -4103,7 +4104,7 @@ def validate_portal_rules(current, rules, shared_scope, targets):
             values = rule.get(geo)
             need(type(values) is list and values and all(type(v) is str and v for v in values), bad)
         need(rule.get('type') == 'field' and set(rule) == keys and type(scope) is list and len(scope) == 1
-             and scope[0] in shared_scope and type(out) is str and not follow_relay_refs(rule), bad)
+             and (scope[0] in shared_scope) == (kind_label == 'portal') and type(out) is str and not follow_relay_refs(rule), bad)
 
         forward_tag, native_tag = 'fwd-hop-' + suffix, 'rebuild-rp-ingress-' + suffix
         forward = next((i for i in current['inbounds'] if i['tag'] == forward_tag), None)
@@ -4117,6 +4118,9 @@ def validate_portal_rules(current, rules, shared_scope, targets):
             need(scope == [native_tag] and forward is None and all(i['tag'] != native_tag for i in current['inbounds'])
                  and len(native) == 1 and native[0].get('protocol') == 'vless'
                  and native[0]['tag'] == 'rebuild-rp-dial-' + suffix, bad)
+        if kind_label == 'transit':
+            row = forward if forward is not None else native[0]
+            need(row.get('streamSettings', {}).get('network') == 'tcp', bad)
 
         kind = targets.get(out)
         reverse = re.fullmatch(r'rebuild-rp-egress-([0-9a-f]{8})', out)
@@ -4126,9 +4130,9 @@ def validate_portal_rules(current, rules, shared_scope, targets):
              or (kind == 'native' and reverse and any(i['tag'] == 'rebuild-rp-conn-' + reverse[1]
                  and i.get('protocol') == 'vless' and len(i.get('settings', {}).get('clients', [])) == 1
                  and i['settings']['clients'][0].get('reverse', {}).get('tag') == out for i in current['inbounds'])), bad)
-        need(pending in (None, suffix) and label not in seen and f'rebuild-policy-portal-{suffix}-default' not in seen, bad)
+        need(pending in (None, prefix) and label not in seen and prefix + 'default' not in seen, bad)
         seen.add(label)
-        pending = suffix if geo else None
+        pending = prefix if geo else None
     need(pending is None, bad)
 
 
@@ -4194,7 +4198,7 @@ def subtract_follow_relay(main, current, side, node_id, tproxy):
         need(scope == [] or strings(scope), bad)
         label = rule.get('ruleTag', '')
         need(type(label) is str, bad)
-        if label.startswith('rebuild-policy-portal-'):
+        if label.startswith(('rebuild-policy-portal-', 'rebuild-policy-transit-')):
             need(not policy, bad)
             portal.append(rule)
             kept.append(rule)

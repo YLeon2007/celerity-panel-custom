@@ -22,7 +22,8 @@ MANIFEST = SERVICES / 'rebuildRelayDirectPayload.json'
 TOKENS = (b'ROLLBACK_DRIFT', b'IN_FLIGHT', b'RUNTIME_UNPROVED', b'need(', b"['", b"']", b'.get(',
           b' and ', b' is not None', b' is None', b' not ', b'    ', b'None,', b'return ', b'before',
           b'backup', b'def ', b' == ', b' != ', b' or ', b' in ', b' for ', b' and', b' not', b'\n\n',
-          b'need', b'backup[', b'paths[', b'after', b'record', b'unit(', b'if ', b'self.', b'raise ')
+          b'backup[', b'paths[', b'after', b'record', b'unit(', b'if ', b'self.', b'raise ',
+          b'CANDIDATE_INVALID', b'PREREQUISITE')
 INDENT_BASE = 160
 WORD_CODES = (*range(255, 226, -1), *range(225, 219, -1))  # 226 already occurs in UTF-8 source
 

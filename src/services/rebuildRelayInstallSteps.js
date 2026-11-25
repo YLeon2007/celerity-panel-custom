@@ -80,9 +80,10 @@ function validatePortalRules(main, rules, fallback, target, reserved) {
     let pending;
     for (const rule of rules) {
         const label = rule.ruleTag;
-        const match = /^rebuild-policy-portal-([0-9a-f]{8})-(?:default|geo-(?:0|[1-9][0-9]*)-(ip|domain))$/.exec(label);
+        const match = /^rebuild-policy-(portal|transit)-([0-9a-f]{8})-(?:default|geo-(?:0|[1-9][0-9]*)-(ip|domain))$/.exec(label);
         requireThat(match, PROFILE_ERROR);
-        const [, suffix, geo] = match;
+        const [, kindLabel, suffix, geo] = match;
+        const scopedPrefix = `${POLICY_PREFIX}${kindLabel}-${suffix}-`;
         const keys = ['type', 'ruleTag', 'inboundTag', 'outboundTag', ...(geo ? [geo] : [])];
         const [ingress] = rule.inboundTag;
         const forwardTag = `fwd-hop-${suffix}`;
@@ -108,11 +109,12 @@ function validatePortalRules(main, rules, fallback, target, reserved) {
                 && row.settings.clients[0]?.reverse?.tag === out));
         requireThat(rule.type === 'field' && Object.keys(rule).length === keys.length
             && keys.every(key => Object.hasOwn(rule, key)) && rule.inboundTag.length === 1
-            && fallback.inboundTag.includes(ingress) && validIngress && validTarget
+            && (kindLabel === 'portal') === fallback.inboundTag.includes(ingress) && validIngress && validTarget
+            && (kindLabel !== 'transit' || (forward ?? native[0])?.streamSettings?.network === 'tcp')
             && (!geo || (strings(rule[geo]) && !rule[geo].some(reserved)))
-            && (!pending || pending === suffix) && !seen.has(label) && !seen.has(`${PORTAL_PREFIX}${suffix}-default`), PROFILE_ERROR);
+            && (!pending || pending === scopedPrefix) && !seen.has(label) && !seen.has(`${scopedPrefix}default`), PROFILE_ERROR);
         seen.add(label);
-        pending = geo ? suffix : undefined;
+        pending = geo ? scopedPrefix : undefined;
     }
     requireThat(!pending, PROFILE_ERROR);
 }
@@ -126,7 +128,8 @@ function sharedRules(main, bridge) {
                 && !reserved(rule.outboundTag)), PROFILE_ERROR);
     }
     const rules = main.routing.rules;
-    const portal = rule => typeof rule.ruleTag === 'string' && rule.ruleTag.startsWith(PORTAL_PREFIX);
+    const portal = rule => typeof rule.ruleTag === 'string' && (rule.ruleTag.startsWith(PORTAL_PREFIX)
+        || rule.ruleTag.startsWith(`${POLICY_PREFIX}transit-`));
     const first = rules.findIndex(rule => typeof rule.ruleTag === 'string' && rule.ruleTag.startsWith(POLICY_PREFIX) && !portal(rule));
     const fallback = rules.at(-1);
     const inboundTags = main.inbounds.map(row => row.tag);

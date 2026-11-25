@@ -324,7 +324,12 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
                 // Route edits on other rows can invalidate a saved pick. Refuse
                 // from the fresh desired scope before opening host transports.
-                if(links.some(link=>link.rebuildExit!=null))compileRebuildGraph({nodes,links,affectedNodeIds:ids});
+                if(links.some(link=>link.rebuildExit!=null)){
+                    const graph=compileRebuildGraph({nodes,links,affectedNodeIds:ids});
+                    // Keep the graph composer testable without enabling a new
+                    // multi-host cutover on the legacy activation loop.
+                    if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
+                }
                 states=await installedStates(ids);
                 const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
                 let kcpVersions;

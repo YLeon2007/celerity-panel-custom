@@ -331,10 +331,10 @@ test('installed PPP receives byte-identical shared rules and guards, never porta
     }
 });
 
-function installRelay(profile) {
+function installRelay(profile, carryDomain = false, relay = installed) {
     const main = bytes(profile);
     return composeRebuildRelayPair({ main, bridge: null }, {
-        nodeId: id(4), tproxyPort, controlPlaneAddresses: controls, carryDomain: false,
+        nodeId: relay.node, tproxyPort: relay.tproxyPort, controlPlaneAddresses: controls, carryDomain,
         mainSha256: digest(main), bridgeSha256: null,
     });
 }
@@ -346,11 +346,14 @@ function checkDirect(cases) {
 import json, runpy, sys
 h = runpy.run_path(sys.argv[1])
 f = json.load(sys.stdin)
-for name, stock, candidate in f['cases']:
+for name, stock, candidate, *relays in f['cases']:
     try:
         record = {'data': h['b64'](candidate.encode())}
-        clean, _, _ = h['subtract_follow_relay'](record, h['unique_profile'](record), None, f['node'], f['tproxy'])
-        h['transit_inbounds'](h['unique_profile'](record), h['apply_transit'](record))
+        relay = relays[0] if relays else {'node': f['node'], 'tproxyPort': f['tproxy']}
+        clean, _, _ = h['subtract_follow_relay'](record, h['unique_profile'](record), None, relay['node'], relay['tproxyPort'])
+        owned = h['transit_inbounds'](h['unique_profile'](record), h['apply_transit'](record))
+        if name.startswith('chain-'):
+            assert sum(26000 <= port < 32000 for port in owned.values()) == int(name.endswith('-listener')) * 2
         print(name, 'exact' if h['raw'](clean['main']).decode() == stock else 'wrong-inverse')
     except h['Refusal'] as exc:
         print(name, str(exc))
@@ -361,6 +364,90 @@ for name, stock, candidate in f['cases']:
     assert.equal(result.status, 0, result.stderr);
     return result.stdout.trimEnd().split('\n');
 }
+
+const chainFixture = (mode = 'reverse') => {
+    const middle = edge(31, 4, 9, { mode, priority: 1 });
+    const west = edge(32, 9, 5, { priority: 1 });
+    const east = edge(33, 9, 10, { priority: 2 });
+    const ru = edge(34, 9, 6, { ...geo(['full:ru.invalid'], ['ru'], 1), mode: 'forward' });
+    const peers = [...nodes, node(9, 'relay'), node(10, 'bridge'), node(11, 'portal')];
+    const tailIngress = { ...edge(36, 11, 9, { mode: 'forward' }), ...pick(5, false) };
+    return { ...input, nodes: peers, links: [{ ...a, ...pick(10, true) }, { ...b, ...pick(10, false) },
+        { ...c, ...pick(10, true) }, tailIngress, middle, west, east, ru], middle, west, east, ru, tailIngress };
+};
+
+test('scoped TCP channels share only identical suffixes; PPP keeps the base channel', () => {
+    for (const mode of ['reverse', 'forward']) {
+        const fixture = chainFixture(mode);
+        const profiles = composeRebuildProfiles({ ...fixture, followRelayStates: [installed, { ...installed, node: id(9) }] });
+        const head = config(profiles, 4), tail = config(profiles, 9);
+        const [withGeo, withoutGeo, duplicate] = [a, b, c].map(link => route(head, ingressTag({ id: link._id, mode: link.mode ?? 'reverse' })));
+        assert.equal(withGeo, duplicate);
+        assert.notEqual(withGeo, withoutGeo);
+        const shared = route(head, 'rebuild-relay-ingress', 'full:ru.invalid');
+        assert.equal(shared, egressTag({ id: fixture.middle._id, mode }));
+        assert.notEqual(shared, withGeo);
+        assert.notEqual(shared, withoutGeo);
+        const onTail = out => out.replace(/^fwd-/, 'fwd-hop-').replace(/^rebuild-rp-egress-/, 'rebuild-rp-ingress-');
+        const eastTag = egressTag({ id: fixture.east._id, mode: 'reverse' });
+        const ruTag = egressTag({ id: fixture.ru._id, mode: 'forward' });
+        assert.equal(route(tail, onTail(withGeo), 'full:ru.invalid'), ruTag);
+        assert.equal(route(tail, onTail(withGeo), 'geoip:ru'), ruTag);
+        assert.equal(route(tail, onTail(withGeo), 'other'), eastTag);
+        assert.equal(route(tail, onTail(withoutGeo), 'full:ru.invalid'), eastTag);
+        assert.equal(route(tail, onTail(shared), 'full:ru.invalid'), ruTag);
+        assert.equal(route(tail, 'rebuild-relay-ingress', 'full:ru.invalid'), ruTag);
+        assert.equal(route(tail, 'rebuild-relay-ingress', 'other'), egressTag({ id: fixture.west._id, mode: 'reverse' }));
+        assert.equal(route(tail, ingressTag({ id: fixture.tailIngress._id, mode: fixture.tailIngress.mode }), 'full:ru.invalid'),
+            egressTag({ id: fixture.west._id, mode: 'reverse' }));
+        const listeners = (mode === 'reverse' ? head : tail).inbounds.filter(row => /^(?:rebuild-rp-conn|fwd-hop)-/.test(row.tag)
+            && row.port >= 26000 && row.port < 32000);
+        assert.equal(listeners.length, 2);
+        assert.equal(new Set(listeners.map(i => i.settings.clients[0].id)).size, 2);
+        assert.ok(listeners.every(i => i.settings.clients[0].id !== fixture.middle.tunnelUuid));
+        const legacy = composeRebuildProfiles({ ...fixture, links: fixture.links.map(({ rebuildExit, ...link }) => link),
+            followRelayStates: [installed, { ...installed, node: id(9) }] });
+        assert.deepEqual(sharedRules(tail), sharedRules(config(legacy, 9)));
+        const scoped = tail.routing.rules.filter(r => r.ruleTag?.startsWith('rebuild-policy-transit-'));
+        assert.ok(scoped.length > 2 && scoped.every(r => r.inboundTag.length === 1
+            && !sharedRules(tail).some(s => s.inboundTag.includes(r.inboundTag[0]))));
+        const remaining = composeRebuildProfiles({ ...fixture, links: fixture.links.filter(link => link._id !== b._id) });
+        assert.equal(route(config(remaining, 4), ingressTag({ id: a._id, mode: a.mode })), withGeo);
+        const allShared = composeRebuildProfiles({ ...fixture, links: fixture.links.map(link => link.rebuildExit
+            ? { ...link, ...pick(5, true) } : link) });
+        assert.equal(route(config(allShared, 4), ingressTag({ id: a._id, mode: a.mode })), shared);
+        assert.throws(() => composeRebuildProfiles({ ...fixture, links: fixture.links.map(link => link === fixture.middle
+            ? { ...link, tunnelTransport: 'kcp' } : link) }), { code: 'REBUILD_SCOPED_TRANSIT_TCP_REQUIRED' });
+    }
+});
+
+test('a portal Geo pin works even if the shared terminal defaults tie', () => {
+    const { middle, west, east, nodes } = chainFixture();
+    const ingress = { ...a, ...geo(['full:choose.invalid']), ...pick(10, false) };
+    const fixture = { ...input, nodes, links: [ingress, middle, west, { ...east, priority: west.priority }] };
+    for (const links of [fixture.links, [...fixture.links, edge(37, 1, 5)]]) {
+        const profiles = composeRebuildProfiles({ ...fixture, links });
+        assert.equal(route(config(profiles, 1), 'client-1', 'full:choose.invalid'), egressTag({ id: a._id, mode: a.mode }));
+        assert.equal(route(config(profiles, 9), ingressTag({ id: middle._id, mode: middle.mode })), 'block');
+    }
+    const profiles = composeRebuildProfiles({ ...fixture, links: [{ ...a, ...pick(10, false) }, ...fixture.links.slice(1)] });
+    assert.equal(route(config(profiles, 1), 'client-1'), egressTag({ id: a._id, mode: a.mode }));
+});
+
+test('scoped channels consume prepared VLESS parameters without making them enumerable', () => {
+    const fixture = chainFixture('forward');
+    const { buildTransitChannels } = require('../services/rebuildTransitChannels');
+    const encrypted = { ...fixture.middle, tunnelEncryption: 'vless-enc' };
+    const parameters = { decryption: 'fixture-decryption', encryption: 'fixture-encryption' };
+    Object.defineProperty(encrypted, '_rebuildVless', { value: parameters });
+    const linked = { ...fixture, links: fixture.links.map(row => row === fixture.middle ? encrypted : row) };
+    const channels = buildTransitChannels(compileRebuildGraph(linked));
+    assert.equal(channels.artifacts.length, 2);
+    for (const { link } of channels.artifacts) {
+        assert.equal(link._rebuildVless, parameters);
+        assert.equal(Object.keys(link).includes('_rebuildVless'), false);
+    }
+});
 
 const stockCases = () => {
     const closed = edge(35, 4, 9, geo(['full:closed.invalid'], [], 1));
@@ -376,19 +463,58 @@ const stockCases = () => {
         ['closed-geo', renderClosed(), renderClosed([installed])],
         ['parallel-preferred', render(parallel), render(parallel, [installed])],
         ['parallel-fallback', render(fallback), render(fallback, [installed])],
+        ...['reverse', 'forward'].flatMap(mode => {
+            const fixture = chainFixture(mode), graph = compileRebuildGraph(fixture);
+            const relays = [installed, { ...installed, node: id(9) }];
+            const base = composeRebuildProfiles(fixture), live = composeRebuildProfiles({ ...fixture, followRelayStates: relays });
+            return [4, 9].map((n, i) => [`chain-${mode}-${n}-${(mode === 'reverse') === (n === 4) ? 'listener' : 'dialer'}`,
+                config(base, n), config(live, n), graph.byNodeId.get(id(n)).carryDomain, relays[i]]);
+        }),
     ];
 };
 
 test('stock L2TP install matches the composer byte for byte with portal rules', () => {
-    for (const [name, stock, applied] of stockCases()) {
-        assert.deepEqual(installRelay(stock), { main: `${bytes(applied)}\n` }, name);
+    for (const [name, stock, applied, carryDomain, relay] of stockCases()) {
+        assert.deepEqual(installRelay(stock, carryDomain, relay), { main: `${bytes(applied)}\n` }, name);
     }
 });
 
 test('DIRECT Apply/Remove accepts composer portal rules and subtracts to exact stock bytes', () => {
     const cases = stockCases();
-    assert.deepEqual(checkDirect(cases.map(([name, stock, applied]) => [name, `${bytes(stock)}\n`, `${bytes(applied)}\n`])),
+    assert.deepEqual(checkDirect(cases.map(([name, stock, applied, , relay]) =>
+        [name, `${bytes(stock)}\n`, `${bytes(applied)}\n`, ...(relay ? [relay] : [])])),
         cases.map(([name]) => `${name} exact`));
+});
+
+test('install and DIRECT reject a scoped channel joined to shared PPP policy or changed to non-TCP', () => {
+    const cases = [];
+    for (const mode of ['reverse', 'forward']) {
+        const [, stock, applied, carry, relay] = stockCases().find(([name]) => name.startsWith(`chain-${mode}-9-`));
+        const variants = {
+            'joined-shared': (cfg, scope) => {
+                for (const rule of sharedRules(cfg)) rule.inboundTag.splice(
+                    rule.inboundTag.includes('rebuild-relay-ingress') ? -1 : rule.inboundTag.length, 0, scope);
+            },
+            'non-tcp': (cfg, scope) => {
+                const row = [...cfg.inbounds, ...cfg.outbounds].find(i => i.tag === scope || i.settings?.reverse?.tag === scope);
+                row.streamSettings.network = 'kcp';
+            },
+            'portal-label': (_cfg, _scope, rule) => { rule.ruleTag = rule.ruleTag.replace('-transit-', '-portal-'); },
+        };
+        const alter = (source, change) => {
+            const cfg = structuredClone(source);
+            const rule = cfg.routing.rules.find(r => r.ruleTag?.startsWith('rebuild-policy-transit-'));
+            change(cfg, rule.inboundTag[0], rule);
+            return cfg;
+        };
+        for (const [key, change] of Object.entries(variants)) {
+            const name = `${mode}-${key}`;
+            assert.throws(() => installRelay(alter(stock, change), carry, relay),
+                { code: 'REBUILD_L2TP_XRAY_BASELINE_UNSUPPORTED' }, name);
+            cases.push([name, null, bytes(alter(applied, change)), relay]);
+        }
+    }
+    assert.deepEqual(checkDirect(cases), cases.map(([name]) => `${name} CANDIDATE_INVALID`));
 });
 
 test('install and DIRECT reject tampered portal rules without reclassifying them as shared policy', () => {

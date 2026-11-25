@@ -7,6 +7,7 @@ const { assertRealityFingerprint } = require('../../../services/rebuildRealityFi
 const { reverseObservationEmail } = require('../../../services/rebuildReverseIdentity');
 const { CASCADE_TRANSPORTS, isKcpTransport, isKcpSecurity, xrayListenerProtocols } = require('../../../utils/cascadeTransport');
 const { compileRebuildGraph, rebuildId, requireRebuild } = require('../domain/rebuildTopologyCompiler');
+const { buildTransitChannels } = require('./rebuildTransitChannels');
 
 const REBUILD_POLICY_RULE_PREFIX = 'rebuild-policy-';
 const short = entry => entry.id.slice(-8);
@@ -16,10 +17,10 @@ const validPort = port => Number.isSafeInteger(port) && port > 0 && port <= 6553
 const address = node => typeof node.ip === 'string' && /^\S+$/.test(node.ip);
 const encrypted = key => typeof key === 'string' && key.length > 0 && key !== 'none' && !/\s/.test(key);
 
-function projectLinks(graph, options, dialerVersions) {
+function projectLinks(graph, channels, options, dialerVersions) {
     const shortIds = new Set();
     const result = new Map();
-    for (const entry of graph.byLinkId.values()) {
+    for (const entry of [...graph.byLinkId.values(), ...channels.artifacts]) {
         const { link, protocol } = entry;
         const reverse = entry.mode === 'reverse';
         const server = graph.byNodeId.get(reverse ? entry.source : entry.target).node;
@@ -158,7 +159,7 @@ function addPolicy(config, tags, { geoLinks, defaultLink }, graph, prefix) {
         rules.push(rule);
     }
     for (const [index, link] of geoLinks.entries()) {
-        const tag = graph.byNodeId.get(link.target).hasExit ? egressTag(link) : 'block';
+        const tag = link.portalExit || graph.byNodeId.get(link.target).hasExit ? egressTag(link) : 'block';
         if (link.domains.length) add(`geo-${index}-domain`, tag, { domain: link.domains });
         if (link.geoip.length) {
             add(`geo-${index}-ip`, tag, { ip: link.geoip });
@@ -201,13 +202,16 @@ function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}
         && (panelTls.serverName === undefined || typeof panelTls.serverName === 'string'), 'REBUILD_INVALID_PANEL_TLS');
     const options = { panelTls };
     const graph = compileRebuildGraph({ nodes, links, affectedNodeIds });
-    const projected = projectLinks(graph, options, dialerVersions);
+    const channels = buildTransitChannels(graph);
+    const projected = projectLinks(graph, channels, options, dialerVersions);
     const users = collectUsers(usersByNode);
     const profiles = [];
-    for (const [nodeId, entry] of graph.byNodeId) {
+    for (const [nodeId, physical] of graph.byNodeId) {
+        const entry = { ...physical, incoming: [...physical.incoming, ...(channels.incoming.get(nodeId) ?? [])],
+            outgoing: [...physical.outgoing, ...(channels.outgoing.get(nodeId) ?? [])] };
         const { config: main, tags, subscriberDenies } = mainProfile(entry, users.has(nodeId) ? users.get(nodeId) : [], options, bridgesWithClientInbound.has(nodeId));
         const bridge = blackholeProfile();
-        const transit = entry.incoming.map(ingressTag);
+        const transit = physical.incoming.map(ingressTag);
         let sharedPolicy = [];
         if (entry.isExit) {
             bridge.log = generator.buildXrayLogSection(entry.node);
@@ -223,19 +227,15 @@ function composeRebuildProfiles({ nodes, links, dialerVersions, usersByNode = {}
             addLinkArtifacts(main, entry, projected);
             // Only generated client and forward-hop inbounds have sniffing.
             // Leave reverse connectors and non-transit client settings alone.
-            if (entry.carryDomain) {
+            if (entry.carryDomain || channels.carryFrom.size) {
+                const sniff = new Set(entry.incoming.filter(edge => channels.carryFrom.has(edge.id)).map(ingressTag));
                 for (const inbound of main.inbounds) {
-                    if (inbound.sniffing?.enabled) inbound.sniffing.routeOnly = false;
+                    if (inbound.sniffing?.enabled && (entry.carryDomain || sniff.has(inbound.tag))) inbound.sniffing.routeOnly = false;
                 }
             }
-            for (const incoming of entry.incoming) {
-                if (incoming.portalExit) {
-                    // Refuse until scoped transport is prepared. Never emit a
-                    // last-hop outbound tag on the wrong relay.
-                    requireRebuild(incoming.portalExit.path.length === 1, 'REBUILD_PORTAL_EXIT_UNSUPPORTED');
-                    addPolicy(main, [ingressTag(incoming)], incoming.portalExit, graph,
-                        `${REBUILD_POLICY_RULE_PREFIX}portal-${short(incoming)}-`);
-                }
+            for (const { edge, policy } of channels.policies.get(nodeId) ?? []) {
+                const kind = edge.physicalId ? 'transit' : 'portal';
+                addPolicy(main, [ingressTag(edge)], policy, graph, `${REBUILD_POLICY_RULE_PREFIX}${kind}-${short(edge)}-`);
             }
             // Keep the shared rules (including their transit tags) unchanged.
             // In an entirely closed component omit geo DNS; otherwise a dead
