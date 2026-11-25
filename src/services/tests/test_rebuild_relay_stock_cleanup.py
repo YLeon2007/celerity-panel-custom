@@ -1,4 +1,4 @@
-"""Offline stock cleanup: real files, memfds, planning and VAULT; no native children."""
+"""Offline stock cleanup with real files and no native package commands."""
 import contextlib
 import fcntl
 import io
@@ -7,7 +7,9 @@ from pathlib import Path
 import re
 import runpy
 import shutil
+import signal
 import subprocess
+import sys
 import syslog
 import tarfile
 import time
@@ -23,6 +25,16 @@ STOCK = {STARTER: b'config setup\ninclude /etc/ipsec.d/*.conf\n', SECRETS: b'# D
          LNS: b'# default xl2tpd\n'}
 VERSIONS = {'strongswan-starter': '1:6.0.1-6+deb13u7', 'xl2tpd': '1.3.18-1+b1'}
 FORMAT = r'-f=${binary:Package}\t${Status}\t${Architecture}\t${Version}\n${Conffiles}'
+POPEN = subprocess.Popen
+FAKE_APT_DOWNLOAD = '''
+import os, resource, signal, sys
+from pathlib import Path
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
+Path('apt.tmp').write_bytes(b'x' * int(sys.argv[1]))
+os.unlink('apt.tmp')
+Path('fixture.deb').write_bytes(b'x' * int(sys.argv[2]))
+'''
 
 
 def tar(rows):
@@ -40,6 +52,7 @@ class StockCleanup(CLEANUP['Cleanup']):
         super().setUp()
         self.r = self.h['C3_REPLACEMENT']
         self.h['command'] = self.command_stock
+        self.native_child = self.h['bounded_status']
         self.h['bounded_status'] = self.child
         self.h['native_vpn'] = lambda *_: self.native
         self.h['stock_workspace'] = self.workspace
@@ -59,6 +72,7 @@ class StockCleanup(CLEANUP['Cleanup']):
         self.payload = {p: f'modeled deb bytes for {p}'.encode() for p in VERSIONS}
         self.downloaded = dict(self.payload)
         self.child_failure = None
+        self.apt_temp_size = None
         self.refresh_options = {}
         for name, key, package in zip(('starter', 'secrets', 'lns'), STOCK,
                                       ('strongswan-starter', 'strongswan-starter', 'xl2tpd')):
@@ -205,6 +219,17 @@ class StockCleanup(CLEANUP['Cleanup']):
             raise subprocess.TimeoutExpired(argv, 0)
         if self.child_failure == 'apt':
             return 100, b'', b'private apt diagnostics'
+        if self.apt_temp_size is not None:
+            # Run the actual prlimit / pipe / wait path; replace only apt-get
+            # with a fixed local writer. The fixture still models _apt identity.
+            def fake_apt(cmd, **options):
+                self.assertEqual(cmd, argv)
+                self.assertEqual(package, 'xl2tpd')
+                self.apt_process = POPEN((*cmd[:3], sys.executable, '-I', '-B', '-c', FAKE_APT_DOWNLOAD,
+                                         str(self.apt_temp_size), str(len(self.downloaded[package]))), **options)
+                return self.apt_process
+            with patch.object(subprocess, 'Popen', side_effect=fake_apt):
+                return self.native_child(argv, end, maximum, stock_stage=True, stock_cwd=kwargs['stock_cwd'])
         (Path(kwargs['stock_cwd']) / 'fixture.deb').write_bytes(self.downloaded[package])
         if self.child_failure == 'unsandboxed':
             return 0, b'', b'W: Download is performed unsandboxed as root (private diagnostics)'
@@ -373,10 +398,37 @@ class StockCleanup(CLEANUP['Cleanup']):
 
     def test_bad_download_no_extraction(self):
         auth = self.challenge()
-        self.downloaded['strongswan-starter'] = b'x' * len(self.payload['strongswan-starter'])
-        self.refused(auth)
+        original = self.payload['strongswan-starter']
+        for blob in (b'x' * len(original), original + b'x'):
+            with self.subTest(size=len(blob)):
+                self.children.clear()
+                self.downloaded['strongswan-starter'] = blob
+                self.refused(auth)
+                self.assertEqual(self.apt_calls(), ['update', 'download'])
+                self.assertFalse(any(a[0] == '/usr/bin/dpkg-deb' for a in self.children))
+
+    def test_small_download_allows_larger_apt_temporary_file(self):
+        self.seed_cache(self.payload['strongswan-starter'])
+        self.payload['xl2tpd'] = self.downloaded['xl2tpd'] = b'x' * 82680
+        self.apt_temp_size = 140000
+        before = self.snapshot()
+        code, _, err = self.run_host('prepare', network=NETWORK, foreignCleanup=self.challenge())
+        self.assertEqual(self.apt_process.returncode, 0)
+        self.assertEqual((code, err), (0, ''))
         self.assertEqual(self.apt_calls(), ['update', 'download'])
-        self.assertFalse(any(a[0] == '/usr/bin/dpkg-deb' for a in self.children))
+        self.assertEqual(sum(a[:2] == ('/usr/bin/dpkg-deb', '--fsys-tarfile') for a in self.children), 2)
+        self.log.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_sigxfsz_download_logs_failure_not_timeout(self):
+        self.seed_cache(self.payload['strongswan-starter'])
+        self.payload['xl2tpd'] = self.downloaded['xl2tpd'] = b'x' * 82680
+        self.apt_temp_size = 2 * 1024 * 1024
+        self.refused(self.challenge())
+        self.assertEqual(self.apt_process.returncode, -signal.SIGXFSZ)
+        self.assertEqual(self.apt_calls(), ['update', 'download'])
+        self.assertEqual(self.children[-1][4:], ('download', 'xl2tpd:amd64=1.3.18-1+b1'))
+        self.log.assert_called_once_with(syslog.LOG_WARNING, 'celerity-rebuild-l2tp: STOCK_APT_DOWNLOAD_FAILED')
 
     def test_bad_release_index_version_and_unavailable_download_fail_closed(self):
         auth = self.challenge()

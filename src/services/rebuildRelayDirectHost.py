@@ -328,6 +328,8 @@ def _bounded_child_status(argv, end, maximum, may_write, progress=None, *, stock
             status = child.wait(timeout=left())
         left()
         if status < 0:
+            if stock_stage:
+                raise subprocess.CalledProcessError(status, argv)
             raise subprocess.TimeoutExpired((), 0)
         return status, bytes(out), bytes(err)
     except BaseException:
@@ -888,7 +890,10 @@ def cleanup_stage_stock(wanted, installed):
     end = min(DEADLINE, time.monotonic() + 28)
     planner = C3_REPLACEMENT
     def run(argv, maximum, *, stderr_ok=False, failure='STOCK_CHILD_FAILED', **options):
-        rc, out, err = bounded_status(argv, end, maximum, stock_stage=True, **options)
+        try:
+            rc, out, err = bounded_status(argv, end, maximum, stock_stage=True, **options)
+        except subprocess.CalledProcessError:
+            raise planner['Refusal'](failure) from None
         if time.monotonic() >= end:
             raise subprocess.TimeoutExpired((), 0)
         planner['need'](rc == 0 and (stderr_ok or not err), failure)

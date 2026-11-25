@@ -739,8 +739,10 @@ Acquire::https::Verify-Host "true";
             dest.mkdir(mode=0o700)
             os.chown(dest, *owner)
             bad = 'REPLACEMENT_DOWNLOAD'
+            # APT also writes temporary files; the signed size applies only to the .deb.
+            limit = max(row.size, 1 << 20)
             try:
-                run(('/usr/bin/prlimit', f'--fsize={row.size}:{row.size}', '--', '/usr/bin/apt-get',
+                run(('/usr/bin/prlimit', f'--fsize={limit}:{limit}', '--', '/usr/bin/apt-get',
                      'download', f'{package}:{arch}={version}'), 65536, stock_cwd=str(dest), stock_config=str(config),
                     stock_owner=owner, failure='STOCK_APT_DOWNLOAD_FAILED')
                 with _apt_owned_dir(str(dest), dest, owner) as fd, os.scandir(fd) as entries:
