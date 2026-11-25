@@ -188,4 +188,56 @@ function planAdditiveScopedTransition({ before, after, composition, allowMainRes
     return structuredClone({ listeners, dialers, transit, ingress, preparation, portals });
 }
 
-module.exports = { planAdditiveScopedTransition };
+// Each transition is a full proposed MAIN boot image. The adapter must bind
+// these semantics to exact original bytes and the serving generation before
+// dispatch. No RoutingService mutation or BRIDGE restart is required here.
+function planSerialScopedTransition(input) {
+    requirePlan(input?.allowMainRestart === true, 'serial_restart_not_approved');
+    const additive = planAdditiveScopedTransition(input);
+    const graph = compileRebuildGraph(input.composition);
+    const states = collect(input.before, graph), desired = collect(input.after, graph);
+    const steps = [];
+    function add(nodeId, phase, kind, image) {
+        const main = key(nodeId, 'main'), before = states.get(main);
+        requirePlan((graph.byNodeId.get(nodeId).role === 'portal') === (phase === 'portal')
+            && !equal(before, image), 'serial_phase');
+        steps.push({ id: `${kind}-${steps.length + 1}`, nodeId, phase, kind, before, after: image });
+        states.set(main, image);
+    }
+    for (const { nodeId, before, after } of additive.preparation) {
+        requirePlan(equal(states.get(key(nodeId, 'main')), before), 'serial_preimage');
+        add(nodeId, 'prepare', 'sniffing', after);
+    }
+    for (const [kind, field] of [['listeners', 'inbounds'], ['dialers', 'outbounds']]) {
+        const groups = [];
+        // Preserve logical downstream ordering, including reverse channels
+        // whose listener is towards the portal. Coalesce only adjacent peers.
+        for (const { nodeId, tag } of additive[kind]) {
+            if (groups.at(-1)?.nodeId !== nodeId) groups.push({ nodeId, tags: [] });
+            groups.at(-1).tags.push(tag);
+        }
+        for (const { nodeId, tags } of groups) {
+            const main = key(nodeId, 'main'), before = states.get(main);
+            const enabled = new Set([...before[field].map(row => row.tag), ...tags]);
+            const next = desired.get(main)[field].filter(row => enabled.has(row.tag));
+            requirePlan(next.length === enabled.size && before[field].every(row =>
+                equal(row, next.find(candidate => candidate.tag === row.tag))), 'serial_handler_preimage');
+            add(nodeId, 'prepare', kind, { ...before, [field]: next });
+        }
+    }
+    for (const [kind, phase, list] of [['transit', 'prepare', additive.transit], ['selector', 'selector', additive.ingress]]) {
+        for (const { nodeId, before, after } of list) {
+            const image = states.get(key(nodeId, 'main'));
+            requirePlan(equal(image.routing, before), 'serial_route_preimage');
+            add(nodeId, phase, kind, { ...image, routing: after });
+        }
+    }
+    for (const { nodeId, before, after } of additive.portals) {
+        requirePlan(equal(states.get(key(nodeId, 'main')), before), 'serial_preimage');
+        add(nodeId, 'portal', 'portal', after);
+    }
+    requirePlan(graph.nodeIds.every(id => equal(states.get(key(id, 'main')), desired.get(key(id, 'main')))), 'serial_final_image');
+    return structuredClone(steps);
+}
+
+module.exports = { planAdditiveScopedTransition, planSerialScopedTransition };

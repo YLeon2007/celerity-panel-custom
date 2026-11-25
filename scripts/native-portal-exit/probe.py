@@ -496,7 +496,7 @@ def scoped_proofs(proofs, cert, cover_port, evidence):
 
 
 
-def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=False, stage=False):
+def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=False, stage=False, serial=False):
     evidence['netns'] = namespace(parent_net)
     evidence['source_sha256'] = source_digests()
     if proof:
@@ -505,6 +505,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         evidence['switch_source_sha256'] = digest('/scripts/stage-switch.cjs')
         evidence['journal_source_sha256'] = digest('/source/src/services/rebuildTransitCutoverJournal.js')
         evidence['artifacts_source_sha256'] = digest('/source/src/services/rebuildTransitCutoverArtifacts.js')
+    if stage or serial:
         evidence['planner_source_sha256'] = digest('/source/src/services/rebuildTransitActivationPlan.js')
     if matrix:
         evidence['geoip_fixture'] = geoip_fixture()
@@ -523,7 +524,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     ports = ports_for(['cover', *PORTALS, *relays, *(f'api-{n}' for n in server_labels),
                        *(f'link-{i}' for i in range(n_links)), *(f'socks-{n}' for n in PORTALS),
                        *(f'sink-{n}' for n in BRIDGES), *(['ppp-gateway', 'ppp-island'] if matrix else []),
-                       *(['stage-p1', 'stage-p2'] if stage else []),
+                       *(['stage-p1', 'stage-p2'] if stage or serial else []),
                        *((f'proof-{side}-{i}' for side in ('request', 'origin') for i in range(2)) if proof else ())])
     evidence['ports'] = ports
     cert, key = '/work/cover.crt', '/work/cover.key'
@@ -532,7 +533,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     versions_by_node = evidence['dialer_versions_by_node'] = {
         name: actor(name, evidence)['version'].split()[1] for name in server_labels}
     fixture = dict(ports=ports, versionsByNode=versions_by_node, mode=mode, preferred=preferred,
-                   chain=chain, proof=proof, matrix=matrix, stage=stage,
+                   chain=chain, proof=proof, matrix=matrix, stage=stage, serial=serial,
                    reality=reality_keys(n_links, ports['cover']))
     raw = checked(['node', '/scripts/compose.cjs'], input=json.dumps(fixture))
     Path('composer-output.json').write_text(raw + '\n')
@@ -581,8 +582,9 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             ppp.update(tag=tag, listen=LO, port=port, protocol='socks', settings={'auth': 'noauth'})
             dump(f'{node}-main.json', config)
     scoped_rule_tags = []
-    plan = generated['transition']['plan'] if stage else None
-    added = [(step['owner'], step['config']['port']) for step in plan['listeners']] if plan is not None else []
+    transition = generated.get('transition', {})
+    plan = transition.get('plan') if stage else None
+    added = [(step['owner'], step['config']['port']) for step in transition.get('plan', {}).get('listeners', [])]
     delivery_owner = ''
     delivery_rule_tags = []
     restarts = {}
@@ -646,7 +648,58 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         for phase, field in (('listeners', 'inbounds'), ('dialers', 'outbounds')):
             for step in plan[phase]:
                 dump(f'{phase}-{step["channelId"]}.json', {field: [step['config']]})
-    config_count = len(configs) + 2 * len(restarts)
+    serial_steps = transition.get('serial', [])
+    serial_initial, serial_final = {}, {}
+    if serial:
+        evidence['main_restarts'] = []
+        probe_links = {ln['selectedBy']: ln for ln in generated['links'] if 'selectedBy' in ln}
+        require(set(probe_links) == {'p1', 'p2'} and len(added) == 2, 'missing serial fixture channels')
+
+        def serial_image(owner, image):
+            label = run_configs[owner]
+            config = fixture_config(image, None, label)
+            ppp_tag = generated['pppTags'].get(owner)
+            if ppp_tag:
+                ppp, = [row for row in configs[label]['inbounds'] if row['tag'] == ppp_tag]
+                config['inbounds'] = [ppp if row['tag'] == ppp_tag else row for row in config['inbounds']]
+            if owner == 'gateway':
+                # Separate loopback ingress, never used in place of subscriber readback.
+                outbound_tags = {row['tag'] for row in config['outbounds']}
+                outbound_tags.update(c['reverse']['tag'] for row in config['inbounds']
+                                     for c in row.get('settings', {}).get('clients', []) if 'reverse' in c)
+                for portal, ln in probe_links.items():
+                    tag = f'stage-{portal}'
+                    config['inbounds'].append({'tag': tag, 'listen': LO, 'port': ports[tag], 'protocol': 'socks'})
+                    target = tunnel_tag(ln, False)
+                    if target in outbound_tags:
+                        config['routing']['rules'].insert(0, {'type': 'field', 'inboundTag': [tag], 'outboundTag': target})
+            return config
+
+        states = {}
+        for row in transition['before']:
+            owner = row['name']
+            if owner in BRIDGES:
+                continue  # The fixture serves only the BRIDGE sidecar on these nodes.
+            key = run_configs[owner]
+            states[owner] = serial_initial[owner] = serial_image(owner, row['config'])
+            serial_final[owner] = serial_image(owner, configs[key])
+            test_xray(f'{key}-serial-stock', owner, states[owner], evidence)
+            dump(f'{key}.json', states[owner])
+        require(set(states) == set(PORTALS + relays) and serial_steps, 'missing serial MAIN plan')
+        # In mixed mode P2 already has the required sniffing setting. Do not
+        # bounce unchanged portals to manufacture a portal step in that row.
+        expected_portals = ['p2'] if mode == 'reverse' else []
+        require([step['owner'] for step in serial_steps if step['phase'] == 'portal'] == expected_portals
+                and (not expected_portals or serial_steps[-1]['phase'] == 'portal'), 'unexpected serial portal restarts')
+        for step in serial_steps:
+            owner = step['owner']
+            before, after = (serial_image(owner, step[side]) for side in ('before', 'after'))
+            require(states[owner] == before and before != after, 'serial step does not continue the boot image chain')
+            states[owner] = after
+            for side, image in (('before', before), ('after', after)):
+                test_xray(f'{owner}-serial-{step["id"]}-{side}', owner, image, evidence)
+        require(states == serial_final, 'serial plan does not reach the complete desired image')
+    config_count = len(configs) + 2 * len(restarts) + len(serial_initial) + 2 * len(serial_steps)
     print(f'CONFIG OK {len(evidence["config_tests"])}/{config_count} (including fixture boot candidates)')
 
     b = 6 if preferred else 3
@@ -667,8 +720,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     links = {link['index']: link for link in generated['links']}
     origins = Origins()
     evidence['probes'] = []
-    expected_count = len(cases) + (5 if matrix else 0) + (15 if stage else 0)
-    xray_count = len(run_configs) + 3 * len(restarts)
+    expected_count = len(cases) + (5 if matrix and not serial else 0) + (15 if stage else 0) + (8 if serial else 0)
+    xray_count = len(run_configs) + 3 * len(restarts) + 2 * len(serial_steps)
     evidence['expected_counts'] = {'config_tests': config_count, 'http_probes': expected_count,
                                    'live_xray': xray_count, 'children': xray_count + 1}
     reaped = evidence['reaped']
@@ -681,13 +734,13 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         for label in [*relays, *PORTALS, *BRIDGES, 'subscriber']:
             children[label] = start_xray(stack, run_configs[label], label, evidence)
         active_runs = dict(run_configs)
-        initial_links = [ln for ln in generated['links'] if not stage or 'selectedBy' not in ln]
-        scoped_links = [ln for ln in generated['links'] if stage and 'selectedBy' in ln]
+        initial_links = [ln for ln in generated['links'] if not (stage or serial) or 'selectedBy' not in ln]
+        scoped_links = [ln for ln in generated['links'] if (stage or serial) and 'selectedBy' in ln]
         listens = [(ln['source'] if ln['mode'] == 'reverse' else ln['target'], ln['port']) for ln in initial_links]
         listens += [(n, ports[n]) for n in PORTALS] + [('subscriber', ports[f'socks-{n}']) for n in PORTALS]
         if matrix:
             listens += [(node, ports[f'ppp-{node}']) for node in generated['pppTags']]
-        if stage:
+        if stage or serial:
             listens += [('gateway', ports[tag]) for tag in ('stage-p1', 'stage-p2')]
         wait_until('PID-owned tunnel/portal/SOCKS listeners', children,
                    lambda: all(sockets(port, children[owner]) for owner, port in listens), 6)
@@ -743,40 +796,76 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                   + (f' via {result["egress"]}' if 'egress' in result else ''))
             require(result['actual'] == case.want, f'{case.name}: wrong origin')
 
+        def restart_main(owner, direction, source, target, expected_listens, **step):
+            boot = Path(f'{run_configs[owner]}.json')
+            expected = Path(f'{source}.json').read_bytes()
+            candidate = Path(f'{target}.json').read_bytes()
+            require(boot.read_bytes() == expected and candidate != expected, 'MAIN boot preimage changed')
+            stage_file = boot.with_suffix('.next')
+            with stage_file.open('xb') as stream:
+                stream.write(candidate)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(stage_file, boot)
+            directory = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            require(boot.read_bytes() == candidate, 'published MAIN boot bytes differ')
+            retained = {node: proc for node, proc in children.items() if node != owner}
+            old = children[owner]
+            reap(active_runs[owner], old, reaped)
+            label = f'{run_configs[owner]}-start-{len(evidence["main_restarts"])}'
+            children[owner] = start_xray(stack, label, owner, evidence, boot=run_configs[owner])
+            active_runs[owner] = label
+            wait_until('restarted MAIN owns listeners', children, lambda: all(
+                sockets(port, children[node]) for node, port in expected_listens), 6)
+            wait_until('original reverse paths reestablished', children, reverse_ready, 18)
+            require(children[owner].pid != old.pid and all(children[node] is proc and proc.poll() is None
+                    for node, proc in retained.items()) and boot.read_bytes() == candidate, 'MAIN restart generation mismatch')
+            evidence['main_restarts'].append({'owner': owner, 'previous_pid': old.pid,
+                'current_pid': children[owner].pid, 'direction': direction, 'boot_sha256': digest(boot), **step})
+
         def restart_mains(steps, direction, expected_listens):
             ordered = reversed(steps) if direction == 'before' else steps
             for operation in ordered:
                 owner = operation['owner']
                 previous = 'before' if direction == 'after' else 'after'
-                boot = Path(f'{run_configs[owner]}.json')
-                expected = Path(f'{restarts[owner][previous]}.json').read_bytes()
-                candidate = Path(f'{restarts[owner][direction]}.json').read_bytes()
-                require(boot.read_bytes() == expected and candidate != expected, 'MAIN boot preimage changed')
-                stage_file = boot.with_suffix('.next')
-                with stage_file.open('xb') as stream:
-                    stream.write(candidate)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(stage_file, boot)
-                directory = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-                require(boot.read_bytes() == candidate, 'published MAIN boot bytes differ')
-                retained = {node: proc for node, proc in children.items() if node != owner}
-                old = children[owner]
-                reap(active_runs[owner], old, reaped)
-                label = f'{run_configs[owner]}-start-{len(evidence["main_restarts"])}'
-                children[owner] = start_xray(stack, label, owner, evidence, boot=run_configs[owner])
-                active_runs[owner] = label
-                wait_until('restarted MAIN owns listeners', children, lambda: all(
-                    sockets(port, children[node]) for node, port in expected_listens), 6)
-                wait_until('original reverse paths reestablished', children, reverse_ready, 18)
-                require(children[owner].pid != old.pid and all(children[node] is proc and proc.poll() is None
-                        for node, proc in retained.items()) and boot.read_bytes() == candidate, 'MAIN restart generation mismatch')
-                evidence['main_restarts'].append({'owner': owner, 'previous_pid': old.pid,
-                    'current_pid': children[owner].pid, 'direction': direction, 'boot_sha256': digest(boot)})
+                restart_main(owner, direction, restarts[owner][previous], restarts[owner][direction], expected_listens)
+
+        def serial_round(direction, states):
+            inverse = direction == 'before'
+            for step in reversed(serial_steps) if inverse else serial_steps:
+                owner = step['owner']
+                name = f'{owner}-serial-{step["id"]}'
+                previous = 'after' if inverse else 'before'
+                states[owner] = json.loads(Path(f'{name}-{direction}.json').read_bytes())
+                bound = [(node, port) for node, port in added if any(
+                    row['port'] == port for row in states[node]['inbounds'])]
+                if not inverse and step['kind'] == 'dialers':
+                    require(bound == added and all(sockets(port, children[node]) for node, port in added),
+                            'serial dialer dispatched before all listeners were serving')
+                if not inverse and step['kind'] == 'selector':
+                    wait_until('prepared scoped reverse sockets', children, serial_reverse_ready, 18)
+                    verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+                    verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+                    verify_case(Probe('stage-p1', 'numeric', 'B', 3), staged=True)
+                    verify_case(Probe('stage-p2', 'other', 'A', 2), staged=True)
+                restart_main(owner, direction, f'{name}-{previous}', f'{name}-{direction}',
+                             [*listens, *bound], stepId=step['id'], phase=step['phase'])
+                require(all(not sockets(port, children[node]) and not sockets(port, children[node], established=True)
+                            for node, port in added if (node, port) not in bound), 'unexpected live scoped listener or worker')
+
+        def serial_reverse_ready():
+            return all(sockets(ln['port'], children[ln['source']], established=True)
+                       for ln in scoped_links if ln['mode'] == 'reverse')
+
+        def serial_terminal(images):
+            for owner, config in images.items():
+                expected = (json.dumps(config, indent=2) + '\n').encode('utf-8')
+                require(Path(f'{run_configs[owner]}.json').read_bytes() == expected,
+                        'serial terminal boot image mismatch')
 
         def stage_channels(steps, verify_baseline):
             require(all(not sockets(port, children[owner]) and not sockets(port, children[owner], established=True)
@@ -800,6 +889,13 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             verify_case(Probe('stage-p1', 'numeric', 'B', 3), staged=True)
             verify_case(Probe('stage-p2', 'other', 'A', 2), staged=True)
 
+        serial_state = serial_initial.copy()
+        if serial:
+            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+            verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+            serial_round('after', serial_state)
+            serial_terminal(serial_final)
+            wait_until('full chain from boot images', children, serial_reverse_ready, 18)
         if plan is not None:
             verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
             verify_case(Probe('p2', 'other', 'B', 6), staged=True)
@@ -833,6 +929,12 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                        lambda: all(sockets(port, children[owner]) for owner, port in [*listens, *added]), 4)
         for case in cases:
             verify_case(case)
+        if serial:
+            serial_round('before', serial_state)
+            serial_terminal(serial_initial)
+            verify_case(Probe('p1', 'numeric', 'A', 2), staged=True)
+            verify_case(Probe('p2', 'other', 'B', 6), staged=True)
+            require(not evidence['api_calls'], 'serial fixture must use only boot image changes')
         if plan is not None:
             restart_mains(plan['portals'], 'before', [*listens, *added])
             api('gateway', 'adrules', 'staged-routes.json')
@@ -860,7 +962,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             restart_mains(plan['portals'], 'after', [*listens, *added])
             verify_case(Probe('p1', 'numeric', 'B', 3))
             listens.extend(added)
-        if matrix:
+        if matrix and not serial:
             # Remove one incoming listener in the actual, still-running MAIN.
             # Do not remove its route or damage the neighboring/shared policy.
             cut, = [ln for ln in links.values() if ln.get('selectedBy') == 'p1']
@@ -950,6 +1052,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                 'cutover journal changed during the run')
         require(evidence['artifacts_source_sha256'] == digest('/source/src/services/rebuildTransitCutoverArtifacts.js'),
                 'cutover artifact store changed during the run')
+    if stage or serial:
         require(evidence['planner_source_sha256'] == digest('/source/src/services/rebuildTransitActivationPlan.js'), 'planner changed during the run')
     rows = evidence['probes']
     if len(rows) == expected_count and all(row['actual'] == row['expected'] for row in rows):
@@ -970,11 +1073,12 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, stop)
     parent_net, mode, preferred, source, chain = sys.argv[1:]
     evidence = {'source_root': source, 'mode': mode, 'preferred': preferred == 'yes', 'chain_probe': chain == 'yes',
-                'scoped_proof': chain == 'proof', 'scoped_matrix': chain == 'matrix', 'staged_matrix': chain == 'stage'}
+                'scoped_proof': chain == 'proof', 'scoped_matrix': chain == 'matrix',
+                'staged_matrix': chain == 'stage', 'serial_matrix': chain == 'serial'}
     status = 2
     try:
         status = run(parent_net, mode, preferred == 'yes', evidence, chain != 'no',
-                     chain == 'proof', chain in ('matrix', 'stage'), chain == 'stage')
+                     chain == 'proof', chain in ('matrix', 'stage', 'serial'), chain == 'stage', chain == 'serial')
     except (Exception, KeyboardInterrupt) as exc:
         evidence.update(result='INFRA_ERROR', error=str(exc))
         print(f'ERROR: {exc}', file=sys.stderr)

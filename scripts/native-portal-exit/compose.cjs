@@ -93,14 +93,16 @@ if (a.proof || a.matrix) {
         if (new Set(descriptions.slice(-2).map(row => row.id)).size !== 2) throw new Error('shared distinct policies');
     }
 
-    if (a.stage) {
-        const { planAdditiveScopedTransition } = require('/source/src/services/rebuildTransitActivationPlan');
+    if (a.stage || a.serial) {
+        const { planAdditiveScopedTransition, planSerialScopedTransition } = require('/source/src/services/rebuildTransitActivationPlan');
         const before = composeRebuildProfiles({ ...input, links: links.map(({ rebuildExit, ...row }) => row) });
-        const plan = planAdditiveScopedTransition({ before, after: profiles, composition: input, allowMainRestart: true });
-        transition = { before: before.filter(p => p.profile === 'main' && ['gateway', 'tail'].includes(names[p.nodeId]))
+        const opts = { before, after: profiles, composition: input, allowMainRestart: true };
+        const plan = planAdditiveScopedTransition(opts);
+        transition = { before: before.filter(p => p.profile === 'main' && (a.serial || ['gateway', 'tail'].includes(names[p.nodeId])))
             .map(p => ({ ...p, name: names[p.nodeId] })),
         plan: Object.fromEntries(Object.entries(plan).map(([phase, steps]) => [phase,
             steps.map(step => ({ ...step, owner: names[step.nodeId] }))])) };
+        if (a.serial) transition.serial = planSerialScopedTransition(opts).map(step => ({ ...step, owner: names[step.nodeId] }));
     }
     if (a.proof) {
         const { transitProofProfiles } = require('./transit-proof.cjs');
@@ -114,6 +116,6 @@ if (a.proof || a.matrix) {
     }
 }
 process.stdout.write(JSON.stringify({ profiles: profiles.map(p => ({ ...p, name: names[p.nodeId] })),
-    users, links: descriptions, ...(a.proof && { proofs }), ...(a.stage && { transition }), ...(a.matrix && { pppTags: {
+    users, links: descriptions, ...(a.proof && { proofs }), ...((a.stage || a.serial) && { transition }), ...(a.matrix && { pppTags: {
         gateway: `relay-l2tp-${ids.gateway}`, island: `relay-l2tp-${ids.island}`,
     } }) }));

@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { composeRebuildProfiles } = require('../../modules/relay-l2tp/services/rebuildTopologyComposer');
-const { planAdditiveScopedTransition } = require('../rebuildTransitActivationPlan');
+const { planAdditiveScopedTransition, planSerialScopedTransition } = require('../rebuildTransitActivationPlan');
 
 const id = n => n.toString(16).padStart(24, '0');
 const row = (n, cascadeRole) => ({ _id: id(n), cascadeRole, type: 'xray', active: true,
@@ -108,4 +108,59 @@ test('accepts a candidate only if it exactly matches the composed policy and han
     const tag = planAdditiveScopedTransition(g).dialers[0].tag;
     config(g.after, 5).outbounds.find(r => r.tag === tag).streamSettings.security = 'tls';
     assert.throws(() => planAdditiveScopedTransition(g), refused('desired_image_mismatch'));
+});
+
+test('serial MAIN plan has an exact image chain and inverse, with portal restarts last', () => {
+    const f = fixture();
+    const previous = config(f.before, 2).inbounds.find(row => row.tag === 'vless-in');
+    previous.sniffing.routeOnly = !config(f.after, 2).inbounds.find(row => row.tag === previous.tag).sniffing.routeOnly;
+    const copy = structuredClone(f);
+    assert.throws(() => planSerialScopedTransition(f), refused('serial_restart_not_approved'));
+    const steps = planSerialScopedTransition({ ...f, allowMainRestart: true });
+    assert.deepEqual(steps.map(({ nodeId, phase, kind }) => [nodeId, phase, kind]), [
+        [id(4), 'prepare', 'listeners'],
+        [id(5), 'prepare', 'dialers'], [id(3), 'prepare', 'dialers'],
+        [id(5), 'prepare', 'transit'], [id(4), 'prepare', 'transit'],
+        [id(3), 'selector', 'selector'], [id(2), 'portal', 'portal'],
+    ]);
+    assert.equal(new Set(steps.map(step => step.id)).size, steps.length);
+    const main = roster => new Map(roster.filter(row => row.profile === 'main').map(row => [row.nodeId, row.config]));
+    const states = main(f.before);
+    for (const step of steps) {
+        assert.deepEqual(states.get(step.nodeId), step.before);
+        assert.notDeepEqual(step.before, step.after);
+        states.set(step.nodeId, step.after);
+        if (step.kind === 'listeners') {
+            assert.deepEqual(step.before.outbounds, step.after.outbounds);
+            assert.deepEqual(step.before.routing, step.after.routing);
+            assert.equal(step.after.inbounds.length, step.before.inbounds.length + 2);
+        }
+        if (step.kind === 'dialers') {
+            assert.deepEqual(states.get(id(4)).inbounds, steps[0].after.inbounds);
+            assert.deepEqual(step.before.inbounds, step.after.inbounds);
+            assert.deepEqual(step.before.routing, step.after.routing);
+        }
+        if (step.kind === 'transit') {
+            assert.deepEqual(step.before.inbounds, step.after.inbounds);
+            assert.deepEqual(step.before.outbounds, step.after.outbounds);
+        }
+        if (step.phase === 'prepare') assert.deepEqual(states.get(id(3)).routing, config(f.before, 3).routing);
+    }
+    assert.deepEqual(states, main(f.after));
+    for (const step of steps.toReversed()) {
+        assert.deepEqual(states.get(step.nodeId), step.after);
+        states.set(step.nodeId, step.before);
+    }
+    assert.deepEqual(states, main(f.before));
+    assert.deepEqual(f, copy);
+});
+
+test('serial planning preserves the conflict and old policy guards', () => {
+    const f = fixture();
+    const [listener] = planAdditiveScopedTransition(f).listeners;
+    config(f.before, 4, 'bridge').inbounds.push({ ...listener.config, tag: 'foreign-listener' });
+    assert.throws(() => planSerialScopedTransition({ ...f, allowMainRestart: true }), refused('channel_conflict'));
+    const g = fixture();
+    config(g.after, 3).routing.rules.find(r => r.ruleTag === 'rebuild-policy-default').outboundTag = 'block';
+    assert.throws(() => planSerialScopedTransition({ ...g, allowMainRestart: true }), refused('existing_rules_changed'));
 });
