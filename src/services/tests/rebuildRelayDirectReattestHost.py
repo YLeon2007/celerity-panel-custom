@@ -478,6 +478,35 @@ class RuntimeReattest(unittest.TestCase):
         self.physical(path + '.replacement').replace(self.physical(path))
         self.assert_foreign()
 
+    def test_chap_reads_reattest_after_boot_and_invocation_change(self):
+        self.boot = self.old_boot
+        self.manifest['runtime']['invocations'] = [self.units[n]['InvocationID'] for n in self.watch]
+        self.save_manifest()
+        params = dict(currentUsers=[], desiredUsers=[])
+        cases = [('check-chap', params, dict(ok=True, backupId=self.token, changed=False)),
+                 ('read-chap-generation', {}, dict(ok=True, backupId=self.token, generation=None))]
+        stale = (70, '', 'DIRECT_RUNTIME_REATTEST_REQUIRED\n')
+        for transition in ('boot', 'invocation'):
+            if transition == 'boot':
+                self.boot = '12345678-1234-1234-1234-123456789abb'
+            else:
+                self.units[self.watch[1]]['InvocationID'] = 'e' * 32
+            before = self.image()
+            for action, args, _ in cases:
+                with self.subTest(transition=transition, action=action):
+                    self.assertEqual(self.call(action, **args), stale)
+            self.assertEqual(self.call('sync-chap', **params), (70, '', 'DIRECT_CHAP_REFUSED\n'))
+            self.assertEqual(self.image(), before)
+            self.assertEqual(self.reattest(), (0, '{"ok":true,"backupId":"' + self.token + '"}\n', ''))
+            after = self.image()
+            self.assertEqual({p for p in before if before[p] != after[p]}, {self.manifest_path[1:]})
+            for action, args, success in cases:
+                with self.subTest(transition=transition, retry=action):
+                    rc, out, err = self.call(action, **args)
+                    self.assertEqual((rc, err), (0, ''))
+                    self.assertEqual(json.loads(out), success)
+            self.assertEqual(self.image(), after)
+
     def test_chap_writer_preserves_unpinned_neighbors_without_reattesting_them(self):
         h = self.h
         self.boot = self.old_boot

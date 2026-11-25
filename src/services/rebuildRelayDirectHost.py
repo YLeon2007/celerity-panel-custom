@@ -4617,7 +4617,7 @@ def removal_intent_matches(path, expected):
 
 RUNTIME_REATTEST_REQUIRED = 'RUNTIME_REATTEST_REQUIRED'
 RUNTIME_FOREIGN_CHANGE = 'RUNTIME_FOREIGN_CHANGE'
-RUNTIME_EPOCH_READS = ('session-count', 'retirement-count', 'inspect-chap', 'prepare-remove',
+RUNTIME_EPOCH_READS = ('session-count', 'retirement-count', 'inspect-chap', 'check-chap', 'read-chap-generation', 'prepare-remove',
                        'check-apply-network', 'verify-apply-network')
 REATTEST_ENTERED = False
 RUNTIME_UNITS = (X, XL, IKE, NET_UNIT, B)
@@ -7990,6 +7990,7 @@ def dispatch(request: dict[str, Any]):
             if action == 'read-chap-generation':
                 need(set(request) == keys, 'CANDIDATE_INVALID')
                 _, _, backup, _ = owned_installation(request)
+                check_runtime_unit_epoch(backup['runtime'], XL, unit(XL))
                 return {'ok': True, 'backupId': token, 'generation': chap_generation(backup['phase'])}
             keys |= {'currentUsers', 'desiredUsers'}
             optional = {'revokedLogin'}

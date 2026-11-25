@@ -81,6 +81,23 @@ for (const [action, read, success, verifyResult] of [
     });
 }
 
+test('check-chap uses the fresh generation after locked reattestation before any CHAP write', async () => {
+    const generation = '8'.repeat(32);
+    const checks = new Set();
+    const f = fixture((_, sequence) => [required, ack(receipt), ack({ ...receipt, changed: true, generation }),
+        ack({ ...receipt, changed: true })][sequence - 1]);
+    const verifyLock = () => { checks.add(f.actions.length); return true; };
+    assert.deepEqual(await f.remote.checkChap(installation, [], [user], verifyLock), { changed: true });
+    assert.deepEqual(f.names(), ['check-chap', 'reattest-runtime', 'check-chap']);
+    assert.deepEqual(f.actions[0], f.actions[2]);
+    assert.deepEqual(checks, new Set([0, 1, 2, 3]));
+    assert.deepEqual(await f.remote.syncChap(installation, [], [user], verifyLock), { changed: true });
+    assert.equal(f.actions[3].generation, generation);
+    assert.deepEqual(f.names(), ['check-chap', 'reattest-runtime', 'check-chap', 'sync-chap']);
+    assert.deepEqual(f.stats(), [1, 4, 0]);
+    await f.remote.close();
+});
+
 test('only the exact refusal from a completed read grants one reattestation', async () => {
     for (const bad of [{ ...required, code: 75 }, { ...required, stdout: ' ' }, { ...required, stderr: required.stderr + '\n' },
         refuse('SESSION_COUNT_UNPROVED'), { code: 124, stdout: '', stderr: '' },
