@@ -4,9 +4,10 @@
 // and actions, not arbitrary predicates or the full runtime/boot state.
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
-const { createHash, createCipheriv, createDecipheriv, randomBytes, randomUUID } = require('node:crypto');
+const { createHash, randomBytes, randomUUID } = require('node:crypto');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { createFileCutoverJournal, createScopedCutoverExecutor } = require('/source/src/services/rebuildTransitCutoverJournal');
+const { createCutoverArtifactStore } = require('/source/src/services/rebuildTransitCutoverArtifacts');
 
 const [mode, port, pid, parentNet, binary] = process.argv.slice(2);
 const read = fs.readFileSync;
@@ -48,24 +49,6 @@ function boundGeneration() {
     return { pid, start, binary, port, boot: sha(read(bootFile)), before: sha(read(files.before)), desired: sha(read(files.desired)) };
 }
 
-function seal(ctx, side) {
-    const id = randomUUID(), iv = randomBytes(12);
-    const c = createCipheriv('aes-256-gcm', read(keyPath), iv);
-    c.setAAD(Buffer.from(`${ctx.plan.planDigest}:${ctx.plan.operationId}:${ctx.step.id}:${side}:${id}`));
-    const ciphertext = Buffer.concat([c.update(read(files[side])), c.final()]);
-    const packet = Buffer.concat([iv, c.getAuthTag(), ciphertext]);
-    publish(`${directory}/${id}.sealed`, packet);
-    return { id, sha256: sha(packet) };
-}
-function verifyArtifact(ctx, side) {
-    const pin = ctx.artifacts[side], packet = read(`${directory}/${pin.id}.sealed`);
-    need(sha(packet) === pin.sha256);
-    const d = createDecipheriv('aes-256-gcm', read(keyPath), packet.subarray(0, 12));
-    d.setAAD(Buffer.from(`${ctx.plan.planDigest}:${ctx.plan.operationId}:${ctx.step.id}:${side}:${pin.id}`));
-    d.setAuthTag(packet.subarray(12, 28));
-    need(Buffer.concat([d.update(packet.subarray(28)), d.final()]).equals(read(files[side])));
-}
-
 async function main() {
     process.umask(0o077);
     const net = fs.readlinkSync('/proc/self/ns/net');
@@ -85,14 +68,17 @@ async function main() {
         publish(keyPath, randomBytes(32));
     }
     const journal = createFileCutoverJournal({ directory });
+    const artifacts = createCutoverArtifactStore({ directory, key: read(keyPath) });
+    const checkArtifact = (ctx, side) => need(artifacts.read(ctx, side, ctx.artifacts[side]).equals(read(files[side])));
     const executor = createScopedCutoverExecutor({ journal, adapter: {
         verifyFence: ({ plan }) => plan.planDigest === planDigest && equal(boundGeneration(), bind),
-        capture: ctx => ({ before: seal(ctx, 'before'), desired: seal(ctx, 'desired') }),
+        capture: ctx => ({ before: artifacts.seal(ctx, 'before', read(files.before)),
+            desired: artifacts.seal(ctx, 'desired', read(files.desired)) }),
         async dispatch(ctx, submit) {
             need(mode === 'lost' && ctx.direction === 'forward');
             return submit(() => {
-                verifyArtifact(ctx, 'before');
-                verifyArtifact(ctx, 'desired');
+                checkArtifact(ctx, 'before');
+                checkArtifact(ctx, 'desired');
                 need(equal(current(), rules('before')));
                 api('adrules', files.desired);
                 // The real Xray action returned. The writer must die before
@@ -105,8 +91,8 @@ async function main() {
         observe(state) {
             need(mode === 'observe' && state.pending?.direction === 'forward');
             const ctx = { plan: state.plan, ...state.pending };
-            verifyArtifact(ctx, 'before');
-            verifyArtifact(ctx, 'desired');
+            checkArtifact(ctx, 'before');
+            checkArtifact(ctx, 'desired');
             const rows = current();
             return ['before', 'desired'].find(side => equal(rows, rules(side)))?.replace('desired', 'after') ?? 'mixed';
         },

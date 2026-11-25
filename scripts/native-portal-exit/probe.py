@@ -504,6 +504,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
     if stage:
         evidence['switch_source_sha256'] = digest('/scripts/stage-switch.cjs')
         evidence['journal_source_sha256'] = digest('/source/src/services/rebuildTransitCutoverJournal.js')
+        evidence['artifacts_source_sha256'] = digest('/source/src/services/rebuildTransitCutoverArtifacts.js')
         evidence['planner_source_sha256'] = digest('/source/src/services/rebuildTransitActivationPlan.js')
     if matrix:
         evidence['geoip_fixture'] = geoip_fixture()
@@ -907,6 +908,8 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         require(evidence['switch_source_sha256'] == digest('/scripts/stage-switch.cjs'), 'stage writer changed during the run')
         require(evidence['journal_source_sha256'] == digest('/source/src/services/rebuildTransitCutoverJournal.js'),
                 'cutover journal changed during the run')
+        require(evidence['artifacts_source_sha256'] == digest('/source/src/services/rebuildTransitCutoverArtifacts.js'),
+                'cutover artifact store changed during the run')
         require(evidence['planner_source_sha256'] == digest('/source/src/services/rebuildTransitActivationPlan.js'), 'planner changed during the run')
     rows = evidence['probes']
     if len(rows) == expected_count and all(row['actual'] == row['expected'] for row in rows):
