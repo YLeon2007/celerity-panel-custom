@@ -12,7 +12,7 @@ const { CONNECT_TIMEOUT_MS } = require('./rebuildSshLimits');
 const { validCensus, validRetirementCensus } = require('./rebuildRelayCounts');
 const { composeRebuildRelayPair } = require('./rebuildRelayInstallSteps');
 const { isInstallStage, specificHostRefusal, packageWriteCheck, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
-    withInstallCheck } = require('./rebuildRelayInstallDiagnostics');
+    withInstallCheck, freshConflictFromFrame, withFreshConflict } = require('./rebuildRelayInstallDiagnostics');
 const { buildL2tpArtifacts } = require('../modules/relay-l2tp/services/l2tpConfigService');
 const { reconcileChapSecrets } = require('../modules/relay-l2tp/services/l2tpUserSyncService');
 const { reasonFromInspectionFrame } = require('./rebuildRelayInspection');
@@ -175,13 +175,15 @@ const directAlphabet = Array.from({ length: 127 }, (_, i) => i + 1)
     .filter(i => ![10, 13, 26, 34, 39, 92, 127].includes(i)).map(i => String.fromCharCode(i)).join('');
 function encodeDirectBytes(bytes) {
     let packed = '';
-    for (let i = 0; i < bytes.length; i += 6) {
-        let word = 0;
-        for (let j = 0; j < 6; j++) word = word * 256 + (bytes[i + j] ?? 0);
+    // 120**29 covers all 25-byte words; larger blocks reduce radix padding
+    // without needing any non-stdlib decoder or changing the SSH frame.
+    for (let i = 0; i < bytes.length; i += 25) {
+        let word = 0n;
+        for (let j = 0; j < 25; j++) word = (word << 8n) | BigInt(bytes[i + j] ?? 0);
         let part = '';
-        for (let j = 0; j < 7; j++) {
-            part = directAlphabet[word % 120] + part;
-            word = Math.floor(word / 120);
+        for (let j = 0; j < 29; j++) {
+            part = directAlphabet[Number(word % 120n)] + part;
+            word /= 120n;
         }
         packed += part;
     }
@@ -195,10 +197,10 @@ function bundleDirectScript() {
         'rebuildRelayPackageGuard.py', 'rebuildRelayDirectHost.py'].map(path => readFileSync(join(__dirname, path)));
     const offsets = sources.reduce((indexes, source) => [...indexes, indexes.at(-1) + source.length], [0]);
     const joined = Buffer.concat(sources);
-    // Give frequent identifiers and whitespace runs a one-byte representation
+    // Give frequent identifiers and whitespace runs (including newline + indent) a one-byte representation
     // before deflate. Only use byte values absent from the original sources:
     // UTF-8 and all other original bytes must survive without normalization.
-    const text = joined.toString('latin1'), tokens = /\b[A-Za-z_][A-Za-z0-9_]{2,}\b| {2,}/g;
+    const text = joined.toString('latin1'), tokens = /\n *| +|[A-Za-z_][A-Za-z0-9_]+/g;
     const counts = new Map();
     for (const [word] of text.matchAll(tokens)) counts.set(word, (counts.get(word) || 0) + 1);
     const dictionary = {}, codes = new Map();
@@ -210,7 +212,7 @@ function bundleDirectScript() {
             codes.set(word, String.fromCharCode(available[i]));
         });
     const packed = Buffer.from(`${JSON.stringify(dictionary)}\n${text.replace(tokens, word => codes.get(word) ?? word)}`, 'latin1');
-    const compressed = deflateSync(packed, { level: 9 });
+    const compressed = deflateSync(packed, { level: 9, memLevel: 9 });
     const load = (key, index, name, filename) =>
         `${key}={"__name__":"${name}","__file__":"${filename}"};exec(_c3_compile(${index},"${filename}"),${key})`;
     // These are fixed repository sources, not imports from the remote working
@@ -218,9 +220,9 @@ function bundleDirectScript() {
     return [
         'import zlib,functools,json,re',
         `_c3_digits={c:i for i,c in enumerate("${directAlphabet}")}`,
-        '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(6,"big")',
+        '_c3_chunk=lambda chunk:functools.reduce(lambda n,c:n*120+_c3_digits[c],chunk,0).to_bytes(25,"big")',
         `_c3_payload="${encodeDirectBytes(compressed)}"`,
-        `_c3_dict,_,_c3_packed=zlib.decompress(b"".join(_c3_chunk(_c3_payload[i:i+7]) for i in range(0,len(_c3_payload),7))[:${compressed.length}]).partition(b"\\n")`,
+        `_c3_dict,_,_c3_packed=zlib.decompress(b"".join(_c3_chunk(_c3_payload[i:i+29]) for i in range(0,len(_c3_payload),29))[:${compressed.length}]).partition(b"\\n")`,
         '_c3_words={int(k):v.encode("ascii") for k,v in json.loads(_c3_dict).items()}',
         '_c3_sources=re.sub(rb"[\\x80-\\xff]",lambda m:_c3_words.get(m[0][0],m[0]),_c3_packed)',
         `_c3_offsets=${JSON.stringify(offsets)}`,
@@ -367,6 +369,7 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
             if (reattest && !SSH && Transport.execStdinWasNotAttempted(error)) throw fail('SSH_CONNECT_FAILED');
             throw identityRefusal ?? unknown();
         }
+        const conflictFrame = result;
         if (telemetry && result) result = { ...result, stderr: telemetry.strip(result.stderr) };
         try { await checkBinding(); }
         catch (error) { if (write && !isIdentityChanged(error)) throw fail('DIRECT_OUTCOME_UNKNOWN', true); throw error; }
@@ -400,6 +403,13 @@ function createRelayDirect({ node, env = process.env, SSH, fence: authority, ver
                 const reason = !closed && result.code === 70 && result.stdout === '' && reasonFromInspectionFrame(result.stderr);
                 if (!reason) throw unknown();
                 throw Object.assign(fail('DIRECT_INSPECT_UNPROVED'), { inspectionReason: reason });
+            }
+            // Restart progress follows host effects and contradicts a fresh no-write claim.
+            const conflict = !closed && !poisoned && freshConflictFromFrame(action, conflictFrame);
+            if (conflict) {
+                const error = withFreshConflict(fail(conflict.check.slice('L2TP_'.length)), conflict);
+                if (action === 'install') Object.assign(error, { commandSettled: true, noHostChanges: true });
+                throw error;
             }
             const refusal = typeof result.stderr === 'string' && refusalFrame.exec(result.stderr);
             if (result.code !== 70 || result.stdout !== '' || !refusal) throw unknown();

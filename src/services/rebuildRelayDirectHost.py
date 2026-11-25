@@ -113,6 +113,15 @@ NAMES = {
 }
 # Install files in this order; all are joined before daemon-reload or starts.
 ORDER = ('nft', 'net', 'drop', 'ike', 'starter', 'secrets', 'chap', 'options', 'lns', 'main')
+FRESH_VPN_UNITS = (XL, IKE, 'ipsec.service', 'strongswan.service', 'strongswan-swanctl.service',
+                   'charon.service', 'charon-systemd.service', 'charon-nm.service')
+FRESH_VPN_COMM = {name[:-8].encode() for name in FRESH_VPN_UNITS} | {b'starter', b'pluto'}
+FOREIGN_CONFIG = 'L2TP_FOREIGN_CONFIG'
+FRESH_CONFLICTS = (FOREIGN_CONFIG, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE')
+# Canonical wire order; mirror in rebuildRelayInstallDiagnostics.js.
+FOREIGN_REASONS = ('SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'STARTER_NOT_STOCK',
+                   'SECRETS_NOT_EMPTY', 'CHAP_NOT_EMPTY', 'LNS_NOT_STOCK', 'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666',
+                   'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN')
 MAX_FILE = 16 * 1024 * 1024
 MAX_REQUEST = 25 * 1024 * 1024
 HOST_STARTED = time.monotonic()
@@ -145,6 +154,12 @@ MODPROBE = '/usr/sbin/modprobe'
 
 class Refusal(Exception):
     pass
+
+
+class FreshInstallConflict(Refusal):
+    def __init__(self, check, keys=()):
+        super().__init__(check)
+        self.keys = keys
 
 
 class PackageDiagnostic(Refusal):
@@ -531,6 +546,227 @@ def preflight(machine, *, fresh=False):
     if not fresh and units == ['loaded'] * 2:
         require_runtime_packages('PREREQUISITE')
     return dict(machineId=machine_id, ppp=ppp, masked='masked' in units, unitsLoaded=units == ['loaded'] * 2)
+
+
+def fresh_udp_bound():
+    # /proc/net avoids loading udp_diag and includes connected UDP sockets.
+    bound = False
+    for leaf, width in (('udp', 8), ('udp6', 32)):
+        try:
+            with open('/proc/net/' + leaf, 'rb') as stream:
+                data = stream.read(2**20 + 1)
+        except FileNotFoundError:
+            if leaf == 'udp6':  # IPv6 may not be registered.
+                continue
+            raise
+        need(0 < len(data) <= 2**20 and data.endswith(b'\n'), 'PREREQUISITE')
+        header, *rows = data.splitlines()
+        fields = header.split()
+        need(fields[:2] == [b'sl', b'local_address'] and len(fields) >= 4
+             and fields[2] in (b'rem_address', b'remote_address') and fields[3] == b'st', 'PREREQUISITE')
+        for row in rows:
+            match = re.match(rb'\s*[0-9]+:\s+[0-9A-F]{%d}:([0-9A-F]{4})\s' % width, row)
+            need(match is not None, 'PREREQUISITE')
+            bound |= int(match[1], 16) in (500, 4500, 1701)
+    return bound
+
+
+def fresh_runtime_conflict():
+    units = {name: unit(name) for name in FRESH_VPN_UNITS}
+    # Keep the existing rule-220 and unmanaged starter refusals (including the
+    # more specific idle IKE diagnosis). This never authorizes stopping IKE.
+    if units[IKE]['ActiveState'] == 'active':
+        fresh_ike_guard(units[IKE], inspect_runtime=not missing_network_observers())
+    # not-found/inactive includes the stock dangling strongswan.service alias.
+    # A missing fragment is not evidence that a live invocation has stopped.
+    if any(info['ActiveState'] == 'active' for info in units.values()):
+        return 'L2TP_DAEMON_ACTIVE'
+    tasks = command('/usr/bin/ps', '-ww', '-e', '-o', 'pid=', '-o', 'comm=', quiet=True)
+    pairs = [row.strip().split(None, 1) for row in tasks.splitlines()]
+    need(all(len(pair) == 2 and re.fullmatch(rb'[1-9][0-9]*', pair[0]) and pair[1] not in (b'-', b'?')
+             for pair in pairs) and len({pair[0] for pair in pairs}) == len(pairs), 'PREREQUISITE')
+    names = {pair[1] for pair in pairs}
+    need(b'ps' in names, 'PREREQUISITE')
+    if names & FRESH_VPN_COMM:
+        return 'L2TP_DAEMON_ACTIVE'
+    no_jobs(FRESH_VPN_UNITS)
+    need(all(info['ActiveState'] == 'inactive' for info in units.values()), 'PREREQUISITE')
+    if fresh_udp_bound():
+        return 'L2TP_UDP_BOUND'
+    if b'pppd' in names:
+        return 'L2TP_PPP_ACTIVE'
+    # link_type is independent of the interface name (pppd can rename it).
+    links = json.loads(command('/usr/sbin/ip', '-j', '-details', 'link', 'show', quiet=True))
+    need(type(links) is list and all(type(row) is dict and type(row.get('ifname')) is str
+         and type(row.get('link_type')) is str for row in links)
+         and any(row['ifname'] == 'lo' and row['link_type'] == 'loopback' for row in links), 'PREREQUISITE')
+    if any(row['link_type'] == 'ppp' for row in links):
+        return 'L2TP_PPP_ACTIVE'
+    fresh_ike_guard(units[IKE], inspect_runtime=False)
+    return None
+
+
+def foreign_leaf(path, *, folder=False, unit_mode=False):
+    def stamp(st):
+        return [st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_nlink,
+                st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+    parent, name = os.path.split(path)
+    # Use the original trusted ancestor walk; never use this observer for writes.
+    with contextlib.ExitStack() as stack:
+        try:
+            fd = stack.enter_context(directory(parent))
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        mode = stat.S_IMODE(st.st_mode)
+        need(st.st_uid == st.st_gid == 0 and not mode & 0o7000, 'PREREQUISITE')
+        need(stat.S_ISDIR(st.st_mode) if folder else stat.S_ISREG(st.st_mode) and st.st_nlink == 1,
+             'PREREQUISITE')
+        need(unit_mode or not mode & 0o022, 'PREREQUISITE')
+        pin = stamp(st)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_DIRECTORY if folder else 0)
+        leaf = os.open(name, flags, dir_fd=fd)
+        try:
+            need(stamp(os.fstat(leaf)) == pin and not os.listxattr(leaf), 'PREREQUISITE')
+            data = None
+            # A directory and an unsafe non-0666 unit are diagnosis only.
+            # For an ordinary unit there is no reason to read its contents.
+            if not folder and (not unit_mode or mode == 0o666):
+                with os.fdopen(leaf, 'rb', closefd=False) as stream:
+                    data = stream.read(1024 * 1024 + 1)
+                need(len(data) == st.st_size and len(data) <= 1024 * 1024, 'PREREQUISITE')
+            need(stamp(os.fstat(leaf)) == pin and stamp(os.stat(name, dir_fd=fd, follow_symlinks=False)) == pin,
+                 'BASELINE_CHANGED')
+            return mode, pin, data
+        finally:
+            os.close(leaf)
+
+
+def foreign_conffiles(package):
+    output = command('/usr/bin/dpkg-query', '-W', r'-f=${Status}\n${Conffiles}', package, quiet=True, refusal='PREREQUISITE')
+    status, separator, rows = output.partition(b'\n')
+    need(separator and status == b'install ok installed' and len(rows) <= 65536, 'PREREQUISITE')
+    hashes = {}
+    for row in rows.split(b'\n'):
+        if row:
+            match = re.fullmatch(rb' (/[^\s]+) ([a-f0-9]{32})( obsolete)?', row)
+            need(match is not None and match[1] not in hashes, 'PREREQUISITE')
+            hashes[match[1]] = None if match[3] else match[2]
+    return hashes
+
+
+def foreign_config_observation():
+    """Return fixed reasons and a private sample fingerprint, never write authority."""
+    found = {}
+    metadata = {}
+    diagnostic = set()
+
+    def record(reason, path, leaf, stock=None):
+        found[reason] = [path, leaf[1], digest(leaf[2]), stock.decode() if stock else None]
+
+    for reason, path in (('SWAN_PROFILE_PRESENT', SWAN_PROFILE), ('IKE_PROFILE_PRESENT', NAMES['ike']),
+                         ('OPTIONS_PRESENT', NAMES['options']), ('MODULES_LOAD_FOREIGN', '/etc/modules-load.d/c3-l2tp.conf')):
+        leaf = foreign_leaf(path)
+        if leaf is not None:
+            record(reason, path, leaf)
+
+    def included(parent):
+        try:
+            with directory(parent) as fd, os.scandir(fd) as entries:
+                for i, row in enumerate(entries):
+                    need(i < 4096, 'PREREQUISITE')
+                    yield row.name
+        except FileNotFoundError:
+            pass
+
+    # A basename in a glob is not a cleanup candidate. Keep the existing
+    # Debian strongSwan tree proof when there are other inputs in that tree.
+    need(all(name == os.path.basename(NAMES['ike']) or name.startswith('.') or not name.endswith('.conf')
+             for name in included('/etc/ipsec.d')), 'PREREQUISITE')
+    if set(included(SWAN_DIR)) - {os.path.basename(SWAN_PROFILE)} or recovery_stat(SWAN_CONF) is not None:
+        swan_inputs('SWAN_PROFILE_PRESENT' in found, 'PREREQUISITE')
+
+    for reason, name, package in (('STARTER_NOT_STOCK', 'starter', 'strongswan-starter'),
+                                  ('SECRETS_NOT_EMPTY', 'secrets', 'strongswan-starter'),
+                                  ('LNS_NOT_STOCK', 'lns', 'xl2tpd')):
+        path = NAMES[name]
+        leaf = foreign_leaf(path)
+        if leaf is None:
+            continue
+        if package not in metadata:
+            metadata[package] = foreign_conffiles(package)
+        stock = metadata[package].get(path.encode())
+        need(stock is not None, 'PREREQUISITE')
+        data = leaf[2]
+        active = uncomment(data)
+        stock_bytes = hashlib.md5(data, usedforsecurity=False).hexdigest().encode() == stock
+        if name != 'lns':
+            # An include outside the reviewed starter glob is not a known leaf.
+            need(all(line.split(None, 1)[0] != b'include' or name == 'starter' and line == STOCK_IKE_INCLUDE
+                     for line in active), 'PREREQUISITE')
+        if name == 'starter':
+            # Also accept the exact wildcard append performed by install-runtime.sh.
+            append = b'\n' + STOCK_IKE_INCLUDE + b'\n'
+            stock_bytes |= (data.endswith(append) and
+                            hashlib.md5(data[:-len(append)], usedforsecurity=False).hexdigest().encode() == stock)
+        if (bool(active) if name == 'secrets' else not stock_bytes):
+            record(reason, path, leaf, stock)
+
+    path = NAMES['chap']
+    chap = foreign_leaf(path)
+    if chap is not None and any(line.strip() and not line.lstrip().startswith(b'#') for line in chap[2].split(b'\n')):
+        record('CHAP_NOT_EMPTY', path, chap)
+    for reason, name in (('XRAY_UNIT_0666', X), ('XRAY_BRIDGE_UNIT_0666', B)):
+        path = SYSTEM + '/' + name
+        leaf = foreign_leaf(path, unit_mode=True)
+        if leaf is not None and leaf[0] & 0o022:
+            if leaf[0] == 0o666:
+                record(reason, path, leaf)
+            else:
+                diagnostic.add('UNIT_WRITABLE')
+    for reason, path in (('NFT_DIR_PRESENT', NFT_DIR), ('DROPIN_PRESENT', DROP_DIR)):
+        if foreign_leaf(path, folder=True) is not None:
+            diagnostic.add(reason)
+    # These existing legacy vetoes do not identify replaceable inputs.
+    need(all(recovery_stat(path) is None for path in (NET, '/etc/nftables.d/celerity-l2tp.nft')), 'PREREQUISITE')
+    keys = tuple(reason for reason in FOREIGN_REASONS if reason in found or reason in diagnostic)
+    return keys, digest(encode(['foreign-config-v2', found])) if found and not diagnostic else None
+
+
+def fresh_install_conflicts(machine, lock_fd):
+    def scope():
+        need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
+        current = (require_machine(machine), boot(), install_lock_identity(lock_fd))
+        need(bool(current[1]) and time.monotonic() < DEADLINE, 'IN_FLIGHT')
+        return current
+
+    original = scope()
+    def observe_runtime():
+        try:
+            return fresh_runtime_conflict()
+        except Refusal as error:
+            if str(error) in ('IKE_ACTIVE_RULE_220', 'RULE_220_CONFLICT', 'IKE_ACTIVE_UNMANAGED'):
+                need(scope() == original, 'BASELINE_CHANGED')
+            raise
+
+    runtime = observe_runtime()
+    keys = ()
+    if runtime is None:
+        keys, _ = foreign_config_observation()
+        if keys:
+            # Runtime vetoes take precedence even if a daemon/session appeared
+            # during the read. Do not export the fingerprint or any file bytes.
+            runtime = observe_runtime()
+            if runtime is None and 'xfrm_user' not in missing_network_observers():
+                if (command('/usr/sbin/ip', 'xfrm', 'policy', 'list', 'nosock', quiet=True).strip()
+                        or command('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys', quiet=True).strip()):
+                    runtime = 'L2TP_DAEMON_ACTIVE'
+    need(scope() == original, 'BASELINE_CHANGED')
+    if runtime is not None:
+        raise FreshInstallConflict(runtime)
+    if keys:
+        raise FreshInstallConflict(FOREIGN_CONFIG, keys)
 
 
 def stock_runtime_root():
@@ -6054,6 +6290,7 @@ def package_preflight(machine):
     with directory(SYSTEM) as fd:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         package_no_pending()
+        fresh_install_conflicts(machine, fd)
         check_package_observer_policy()
         _, _, commit = package_observation(guard, machine, fd, PackageRunner())
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
@@ -6119,6 +6356,7 @@ def prepare_packages(request):
                 need(applied_main_matches(machine, request['appliedMain']), 'BASELINE_CHANGED')
 
             check_profile()
+            fresh_install_conflicts(machine, fd)
             run = PackageRunner()
             run.check_profile = check_profile
             run.emit_progress = request.get('progress') is True
@@ -6404,6 +6642,7 @@ def reconcile_install(request):
 
 def observe_install(machine, network, transit, lock_fd, *, diagnose_profile_owner=False):
     lock_id = install_lock_identity(lock_fd)
+    fresh_install_conflicts(machine, lock_fd)
     modules = observe_ppp_preparation()
     deferred = tuple(name for name in modules['missing'] if name in OBSERVERS)
     before = observe(machine, network, transit, diagnose_profile_owner=diagnose_profile_owner,
@@ -6445,6 +6684,8 @@ def dispatch(request: dict[str, Any]):
     need(re.fullmatch(r'[a-f0-9]{32}', machine) and action in
          ('preflight', 'prepare', 'check', 'install', 'verify', 'rollback', 'prepare-remove', 'remove')
          + CHAP_ACTIONS + APPLY_NETWORK_ACTIONS, 'PREREQUISITE')
+    if action == 'preflight':
+        need(set(request) == {'action', 'machineId'}, 'CANDIDATE_INVALID')
     NO_INSTALL_WRITES = action == 'install'
     fresh = action in ('preflight', 'prepare', 'check', 'install')
     try:
@@ -6454,6 +6695,11 @@ def dispatch(request: dict[str, Any]):
             return package_preflight(machine)
         raise
     if action == 'preflight':
+        if not ready['masked']:
+            with directory(SYSTEM) as fd:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                package_no_pending()
+                fresh_install_conflicts(machine, fd)
         xl = unit(XL)
         pending = pending_xl(xl)
         if pending:
@@ -6587,7 +6833,7 @@ def main():
         need(0 < len(wire) <= MAX_REQUEST, 'CANDIDATE_INVALID')
         request = json.loads(wire)
         action = request.get('action') if type(request) is dict else None
-        if action in ('prove-applied-main', 'prepare-packages', 'reconcile-install', 'reattest-runtime'):
+        if action in ('preflight', 'prove-applied-main', 'prepare-packages', 'reconcile-install', 'reattest-runtime'):
             need(len(wire) <= 1024, 'CANDIDATE_INVALID')
 
             def unique_fields(pairs):
@@ -6613,6 +6859,17 @@ def main():
             return 75
         if PPP_PREPARING and str(error) not in (PPP_REQUIRED, PPP_CONFLICT, PPP_FAILED, MODULE_BLACKLISTED, OBSERVATION_REQUIRED):
             return 75
+        if isinstance(error, FreshInstallConflict):
+            if time.monotonic() >= DEADLINE:
+                return 75
+            if (action not in ('preflight', 'prepare', 'check', 'install') or str(error) not in FRESH_CONFLICTS
+                    or bool(error.keys) != (str(error) == FOREIGN_CONFIG)
+                    or tuple(k for k in FOREIGN_REASONS if k in error.keys) != error.keys):
+                print('DIRECT_PREREQUISITE', file=sys.stderr)
+                return 70
+            prefix = 'DIRECT_NO_WRITE_' if NO_INSTALL_WRITES else 'DIRECT_'
+            print(prefix + str(error) + (' ' + ','.join(error.keys) if error.keys else ''), file=sys.stderr)
+            return 70
         if isinstance(error, PackageDiagnostic):
             if time.monotonic() >= DEADLINE:
                 return 75

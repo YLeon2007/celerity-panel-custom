@@ -569,6 +569,14 @@ async function admissionVisibility({ route, id, otherId, words, lang, snapshots 
     check(!visible(progress) && !installAfterConfirm.disabled && !reads.length && !window.navigation,
         'a definitive refusal kept progress or disabled Install, or required a GET/reload');
     check($(`#relay-${otherId} [data-relay-action-status]`).hidden, 'refusal leaked into another relay row');
+    for (const reason of ['SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'MODULES_LOAD_FOREIGN']) {
+        installAfterConfirm.click();
+        await respond(`${route}/${id}/l2tp/install`, { error: { code: 'REBUILD_L2TP_FOREIGN_CONFIG',
+            outcome: 'refused', check: 'L2TP_FOREIGN_CONFIG', keys: [reason], detail: 'PRIVATE-FIXTURE' } }, false);
+        check(!relayStatus.hidden && relayStatus.textContent === $('[data-action-status]').textContent
+            && relayStatus.textContent.endsWith(words.installChecks[reason]) && !relayStatus.textContent.includes('PRIVATE-FIXTURE')
+            && !installAfterConfirm.disabled && progress.hidden, `wrong foreign refusal in row for ${reason}`);
+    }
     const beforeRevoke = $('[data-l2tp-view]');
     click('[data-admission-action="revoke"]');
     check(requests.length === 0, 'revoke preflight issued a POST');

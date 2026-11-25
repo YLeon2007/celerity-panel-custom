@@ -13,7 +13,7 @@ const { request } = require('./helpers/rebuildPanelRequest');
 const { createRelayDirect } = require('../rebuildRelayDirect');
 const attested = require('./helpers/rebuildRelayDirectWire');
 const { runFreshRelayInstall } = require('../rebuildRelayInstall');
-const { installCheckIds } = require('../rebuildRelayInstallDiagnostics');
+const { installCheckIds, freshConflictFromFrame } = require('../rebuildRelayInstallDiagnostics');
 const { AcknowledgedCommitCleanupError } = require('../rebuildRelayInstallTransaction');
 const { i18nMiddleware, t: translate } = require('../../middleware/i18n');
 
@@ -214,7 +214,8 @@ async function localizedFrontend(html, expected, { app, headers, csrf }) {
     const initialText = status.textContent;
     let readCount = 0;
     if (unknown) {
-        assert.equal(refresh.hidden, false);
+        // The refresh control remains hidden while automatic readback is busy.
+        assert.equal(refresh.hidden, true);
         await advance(1999);
         assert.equal(calls.length, 2);
         for (const time of [2000, 4000]) {
@@ -416,7 +417,7 @@ test('closed diagnostics reach the authenticated API and the localized install c
     ];
     for (const lang of ['ru', 'en', 'zh-CN']) {
         const words = require(`../../locales/${lang}.json`).rebuildL2tp;
-        if (lang !== 'zh-CN') assert.deepEqual(Object.keys(words.installChecks).sort(), [...installCheckIds].sort());
+        assert.deepEqual(Object.keys(words.installChecks).sort(), [...installCheckIds].sort());
         for (const key of ['REBUILD_LINKS_NOT_APPLIED', 'XRAY_BASELINE_UNSUPPORTED', 'XRAY_PROFILE_OWNER_UNSUPPORTED',
             'XRAY_PROFILE_USERS_UNPROVED', 'XRAY_RUNTIME_UNPROVED']) {
             assert.ok(words.installChecks?.[key], `${lang}: ${key}`);
@@ -437,9 +438,13 @@ test('closed diagnostics reach the authenticated API and the localized install c
             log = [];
             const { initialText, finalText, disabled, refreshHidden } = await localizedFrontend(body, expected, { headers, app, csrf });
             const note = check ? ` ${translate(`rebuildL2tp.installChecks.${check}`, lang)}` : '';
-            assert.equal(initialText, translate(`rebuildL2tp.messages.${message}`, lang) + note, `${name}: ${lang}`);
-            assert.equal(finalText, translate(`rebuildL2tp.messages.${outcome === 'unknown' ? 'observationTimeout' : message}`, lang)
-                + note, `${name}: ${lang}`);
+            const stopped = text => translate('rebuildL2tp.messages.installStopped', lang).replace('{reason}', text);
+            const summary = translate(`rebuildL2tp.messages.${message}`, lang) + note;
+            const failed = ['refused', 'rolled_back', 'busy'].includes(outcome);
+            assert.equal(initialText, outcome === 'unknown' ? translate('rebuildL2tp.messages.checkingResult', lang)
+                : failed ? stopped(summary) : summary, `${name}: ${lang}`);
+            assert.equal(finalText, outcome === 'unknown' ? translate('rebuildL2tp.messages.observationTimeout', lang) + note
+                : failed ? stopped(summary) : summary, `${name}: ${lang}`);
             assert.deepEqual(log, actions, name);
             assert.equal(disabled, ['unknown', 'rolled_back', 'installed'].includes(outcome), name);
             assert.equal(refreshHidden, !disabled, name);
@@ -585,8 +590,9 @@ test('package diagnostics reach the authenticated route and localized Install co
                 log = [];
                 const { initialText, finalText, disabled, refreshHidden } = await localizedFrontend(page.body, expected, { headers, app, csrf });
                 const note = check ? ` ${installChecks[check]}` : '';
-                assert.equal(initialText, (refused ? messages.installRefused : messages.uncertain) + note);
-                assert.equal(finalText, (refused ? messages.installRefused : messages.observationTimeout) + note);
+                const stopped = messages.installStopped.replace('{reason}', messages.installRefused + note);
+                assert.equal(initialText, refused ? stopped : messages.checkingResult);
+                assert.equal(finalText, refused ? stopped : messages.observationTimeout + note);
                 for (const text of [initialText, finalText]) {
                     assert.doesNotMatch(text, /FIXTURE_PRIVATE_VALUE|\/fixture\/|Traceback|PACKAGE_(SOURCES|INDEXES|SERVICES|APT_PLAN)|REBUILD_L2TP_/);
                 }
@@ -595,5 +601,145 @@ test('package diagnostics reach the authenticated route and localized Install co
                 assert.equal(refreshHidden, refused);
             });
         }
+    }
+});
+
+
+const typedForeignKeys = ['SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'STARTER_NOT_STOCK',
+    'SECRETS_NOT_EMPTY', 'CHAP_NOT_EMPTY', 'LNS_NOT_STOCK', 'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666',
+    'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN'];
+
+test('closed foreign-config grammar accepts exactly ordered, bounded diagnostics for fresh actions', () => {
+    const action = 'install';
+    const header = 'DIRECT_NO_WRITE_L2TP_FOREIGN_CONFIG ';
+    const full = `${header}${typedForeignKeys.join(',')}\n`;
+    assert.equal(Buffer.byteLength(full), 261);
+    assert.deepEqual(freshConflictFromFrame(action, refusal(full)), { check: 'L2TP_FOREIGN_CONFIG', keys: typedForeignKeys });
+    for (const id of typedForeignKeys) {
+        const item = refusal(`${header}${id}\n`);
+        assert.deepEqual(freshConflictFromFrame(action, item), { check: 'L2TP_FOREIGN_CONFIG', keys: [id] });
+        for (const other of ['verify', 'rollback', 'prepare-packages', 'prepare-remove']) {
+            assert.equal(freshConflictFromFrame(other, item), undefined);
+        }
+    }
+    for (const bad of [full + '\n', full.replace('\n', '\r\n'), full.replace(',', ', '),
+        `${header}chap-secrets\n`, `${header}/etc/ipsec.conf\n`, `${header}CHAP_NOT_EMPTY,\n`,
+        `${header}CHAP_NOT_EMPTY,CHAP_NOT_EMPTY\n`, `${header}UNIT_WRITABLE\t\n`,
+        'DIRECT_NO_WRITE_CHAP_NOT_EMPTY\n', `${header}__proto__\n`]) {
+        assert.equal(freshConflictFromFrame(action, refusal(bad)), undefined);
+    }
+});
+
+test('fresh L2TP conflicts reach only the authenticated Install refusal envelope', async t => {
+    const keys = typedForeignKeys;
+    const foreign = 'L2TP_FOREIGN_CONFIG';
+    const allowed = [foreign, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE'];
+    const frame = (check, list) => refusal(`DIRECT_${check}${list ? ` ${list}` : ''}\n`);
+    let result, actions;
+    class SSH {
+        connect() {}
+        disconnect() {}
+        async exec(_command, { stdin }, verify) {
+            await verify();
+            actions.push(JSON.parse(stdin).action);
+            return result;
+        }
+    }
+    const { app, auth, csrf } = await diagnosticPanel(t, id => runFreshRelayInstall(id, {
+        authorize: () => true, machineId, inventory: async () => ({ eligible: true, pristine: true }),
+        lock: fn => fn(() => true), connect: async () => createRelayDirect({ node, env, SSH: attested(SSH, machineId) }),
+        reserve: async () => assert.fail('must not reserve'),
+    }));
+    const headers = { ...auth, 'x-csrf-token': csrf };
+    const requestInstall = async () => {
+        actions = [];
+        const reply = await request(app, installUrl, { headers, body: {} });
+        assert.equal(reply.status, 409);
+        assert.equal(reply.headers['cache-control'], 'no-store');
+        assert.deepEqual(actions, ['preflight']);
+        return JSON.parse(reply.body);
+    };
+    for (const check of allowed) {
+        const listing = check === foreign ? keys : undefined;
+        result = frame(check, listing);
+        assert.deepEqual(await requestInstall(), { error: { code: `REBUILD_${check}`, outcome: 'refused', check,
+            ...(listing && { keys: listing }) } });
+    }
+    for (const bad of [frame(foreign), frame(foreign, [keys[0], keys[0]]), frame(foreign, [...keys].reverse()),
+        frame(foreign, [keys[0], marker]), frame(foreign, [keys[0], 'a'.repeat(64)]),
+        frame(`NO_WRITE_${foreign}`, keys), frame('L2TP_UDP_BOUND', keys),
+        { ...frame(foreign, keys), stdout: marker }, { ...frame(foreign, keys), code: 75 },
+        refusal(frame(foreign, keys).stderr + `/${marker}\n`)]) {
+        result = bad;
+        assert.deepEqual(await requestInstall(), { error: { code: 'REBUILD_L2TP_DIRECT_OUTCOME_UNKNOWN', outcome: 'unknown' } });
+    }
+    for (const lang of ['ru', 'en', 'zh-CN']) {
+        const localized = { ...auth, 'accept-language': lang };
+        const page = await request(app, overviewUrl, { method: 'GET', headers: localized });
+        assert.equal(page.status, 200);
+        const copies = require(`../../locales/${lang}.json`).rebuildL2tp.installChecks;
+        for (const id of keys) {
+            assert.ok(copies[id] && page.body.includes(copies[id]), `${lang}: ${id}`);
+        }
+        for (const check of allowed) {
+            const copy = require(`../../locales/${lang}.json`).rebuildL2tp.installChecks[check];
+            assert.ok(copy && page.body.includes(copy));
+            const listing = check === foreign ? keys : undefined;
+            result = frame(check, listing);
+            const expected = { error: { code: `REBUILD_${check}`, outcome: 'refused', check,
+                ...(listing && { keys: listing }) } };
+            const view = await localizedFrontend(page.body, expected, { app, headers: localized, csrf });
+            const detail = [copy, ...(listing ?? []).map(key => copies[key])].join(' ');
+            const stopped = translate('rebuildL2tp.messages.installStopped', lang)
+                .replace('{reason}', `${translate('rebuildL2tp.messages.installRefused', lang)} ${detail}`);
+            assert.equal(view.initialText, stopped);
+            assert.equal(view.finalText, stopped);
+        }
+        assert.doesNotMatch(page.body, /data-(replace|cleanup)-url/);
+    }
+});
+
+
+test('late L2TP conflict preserves Install cleanup authority and never calls rollback', async t => {
+    const snapshot = { ...ready, main, mainSha256: createHash('sha256').update(main).digest('hex'),
+        bridge: null, bridgeSha256: null, baseline: 'd'.repeat(64) };
+    let frame, actions, lostRestore;
+    class SSH {
+        connect() {}
+        disconnect() {}
+        async exec(_command, { stdin }, verify) {
+            await verify();
+            const { action, backupId } = JSON.parse(stdin);
+            actions.push(action);
+            if (action === 'preflight') return ok(ready);
+            if (action === 'prepare') return ok(snapshot);
+            if (action === 'check') return ok({ ok: true, backupId });
+            assert.equal(action, 'install');
+            return frame;
+        }
+    }
+    const { app, auth, csrf } = await diagnosticPanel(t, id => runFreshRelayInstall(id, {
+        authorize: () => true, machineId, inventory: async () => ({ eligible: true, pristine: true }),
+        unifiedIdentity: true, lock: fn => fn(() => true, () => actions.push('retain')),
+        connect: async () => createRelayDirect({ node, env, SSH: attested(SSH, machineId) }),
+        prepare: (_, remote) => remote.prepare({ nodeId, desired, carryDomain: false, controlPlaneAddresses: ['panel.fixture.invalid'] }),
+        reserve: async () => { actions.push('reserve'); return {}; }, verifyReservation: async () => {},
+        restore: async () => { actions.push('restore'); if (lostRestore) throw Error(marker); },
+        finish: async () => assert.fail('must not publish Install'),
+    }));
+    const foreign = 'L2TP_FOREIGN_CONFIG';
+    const late = (prefix = 'NO_WRITE_') => refusal(`DIRECT_${prefix}${foreign} CHAP_NOT_EMPTY\n`);
+    for (const [reply, lost, expected, tail] of [
+        [late(), false, { code: `REBUILD_${foreign}`, outcome: 'refused', check: foreign, keys: ['CHAP_NOT_EMPTY'] }, ['restore']],
+        [late(), true, { code: 'REBUILD_L2TP_ROLLBACK_OUTCOME_UNKNOWN', outcome: 'unknown', check: foreign, retryAllowed: false }, ['restore', 'retain']],
+        [late(''), false, { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false }, ['retain']],
+        [refusal('DIRECT_PROGRESS restart\n' + late().stderr), false,
+            { code: 'REBUILD_L2TP_INSTALL_OUTCOME_UNKNOWN', outcome: 'unknown', retryAllowed: false }, ['retain']],
+    ]) {
+        [frame, lostRestore, actions] = [reply, lost, []];
+        const response = await request(app, installUrl, { headers: { ...auth, 'x-csrf-token': csrf }, body: {} });
+        assert.equal(response.status, 409);
+        assert.deepEqual(JSON.parse(response.body), { error: expected });
+        assert.deepEqual(actions, ['preflight', 'preflight', 'prepare', 'check', 'reserve', 'install', ...tail]);
     }
 });

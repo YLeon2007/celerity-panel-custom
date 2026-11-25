@@ -3,7 +3,7 @@
 const { randomBytes } = require('node:crypto');
 const { AcknowledgedCommitCleanupError, ReservationOutcomeUnknownError } = require('./rebuildRelayInstallTransaction');
 const { classifyInstallFailure, installFailure, hasPackagePreparation, requireInstallHostReady,
-    checkedInstallId } = require('./rebuildRelayInstallDiagnostics');
+    checkedInstallId, freshConflict } = require('./rebuildRelayInstallDiagnostics');
 const { IDENTITY_CHANGED, isIdentityChanged } = require('./rebuildRelayEffectAuthority');
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -119,10 +119,10 @@ async function runFreshRelayInstall(id, deps) {
                 }
 
                 if (!preparePackages) await progress('prepare', 50);
-                const rollback = async (code, { noHostChanges = false, check } = {}) => {
+                const rollback = async (code, { noHostChanges = false, check, conflict } = {}) => {
                     // Not even a no-write Install refusal establishes that the
                     // earlier package phase was undone. Retain the reservation.
-                    if (preparePackages) throw installFailure(code, 'unknown', check, { retryAllowed: false });
+                    if (preparePackages) throw installFailure(conflict ? UNKNOWN : code, 'unknown', check, { retryAllowed: false });
                     try {
                         await guard();
                         if (!noHostChanges && await remote.rollback(plan, guard) !== true) throw fail(ROLLBACK_UNKNOWN);
@@ -134,7 +134,7 @@ async function runFreshRelayInstall(id, deps) {
                         throw installFailure(error instanceof AcknowledgedCommitCleanupError
                             ? 'REBUILD_L2TP_ROLLBACK_CLEANUP_FAILED' : ROLLBACK_UNKNOWN, 'unknown', check);
                     }
-                    throw installFailure(code, noHostChanges ? 'refused' : 'rolled_back', check);
+                    throw installFailure(code, noHostChanges ? 'refused' : 'rolled_back', check, { conflict });
                 };
 
                 let installResult;
@@ -154,8 +154,9 @@ async function runFreshRelayInstall(id, deps) {
                     // A thrown error is ambiguous unless the direct driver has
                     // explicit proof that all dispatched mutations have settled.
                     // Do not infer settlement from errno, timeout or SSH close.
-                    if (error?.commandSettled === true) await rollback('REBUILD_L2TP_INSTALL_FAILED', {
-                        noHostChanges: error.noHostChanges === true, check,
+                    const conflict = freshConflict(error);
+                    if (error?.commandSettled === true) await rollback(conflict ? `REBUILD_${conflict.check}` : 'REBUILD_L2TP_INSTALL_FAILED', {
+                        noHostChanges: error.noHostChanges === true, check, conflict,
                     });
                     throw fail(UNKNOWN);
                 }
@@ -189,7 +190,8 @@ async function runFreshRelayInstall(id, deps) {
                 else await progressTail;
                 if (deps.unifiedIdentity && unsettled) {
                     retainLock?.();
-                    primary = installFailure(primary.code, 'unknown', checkedInstallId(primary), { retryAllowed: false });
+                    primary = installFailure(freshConflict(primary) ? UNKNOWN : primary.code, 'unknown',
+                        checkedInstallId(primary), { retryAllowed: false });
                 } else if (deps.unifiedIdentity && primary.outcome === 'installed') {
                     primary = installFailure(primary.code, 'installed', undefined, { retryAllowed: false });
                 }

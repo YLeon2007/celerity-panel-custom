@@ -27,6 +27,8 @@ INIT = '#!/bin/sh\nexit 0\n'
 GENERATOR = 'synthetic systemd 257.8 generator; never executed\n'
 GENERATOR_PATH = '/usr/lib/systemd/system-generators/systemd-sysv-generator'
 LNS = '; synthetic package conffile\n[global]\n'
+STARTER = 'config setup\n'
+SECRETS = '# synthetic empty conffile\n'
 APT_UPDATE = ('/usr/bin/apt-get', '--error-on=any', 'update')
 
 
@@ -105,8 +107,8 @@ class JoinedPackages(Host):
         old = self.installed.copy()
         super()._install()
         if 'strongswan-starter' not in old and 'strongswan-starter' in self.installed:
-            self.put('/etc/ipsec.conf', 'config setup\n\ninclude /etc/ipsec.d/*.conf\n')
-            self.put('/etc/ipsec.secrets', '# synthetic empty conffile\n', 0o600)
+            self.put('/etc/ipsec.conf', STARTER + '\ninclude /etc/ipsec.d/*.conf\n')
+            self.put('/etc/ipsec.secrets', SECRETS, 0o600)
         if 'xl2tpd' in old or 'xl2tpd' not in self.installed:
             return
         assert self.p('/etc/init.d/xl2tpd').read_text() == INIT
@@ -144,6 +146,7 @@ def attach(root, state, scenario, h, request, assert_host_lock):
     h['STOCK_XL_DEFAULT_SHA'], md5 = sums(DEFAULTS)
     h['STOCK_XL_DEFAULT_MD5'] = md5.encode()
     state['lnsMd5'] = sums(LNS)[1]
+    state['starterMd5'] = {'/etc/ipsec.conf': sums(STARTER)[1], '/etc/ipsec.secrets': sums(SECRETS)[1]}
 
     def run(argv, end, maximum, *, may_write=False, progress=None):
         try:

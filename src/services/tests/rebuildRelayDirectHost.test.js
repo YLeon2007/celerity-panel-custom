@@ -58,7 +58,7 @@ test('DIRECT unit reader preserves the real three-row managed oneshot ExecStart 
 // in-worktree root. Runtime facts and privileged UID are modeled; no host
 // commands, sockets, or service manager are called by this harness.
 const harness = String.raw`
-import contextlib, json, os, pathlib, runpy, sys
+import contextlib, hashlib, json, os, pathlib, runpy, sys
 source, root, scenario = sys.argv[1:]
 network_fixture = runpy.run_path(str(pathlib.Path(source).parent / 'tests/helpers/rebuildRelayNetworkFixture.py'))
 os.umask(0o077)
@@ -77,7 +77,7 @@ for key, p in names.items():
         pathlib.Path(p).parent.mkdir(parents=True, exist_ok=True)
 pathlib.Path(h['VAULT']).parent.mkdir(parents=True, exist_ok=True)
 for k in ('main', 'lns', 'starter', 'secrets', 'chap'):
-    pathlib.Path(names[k]).write_bytes(b'original-' + k.encode())
+    pathlib.Path(names[k]).write_bytes(b'# original-' + k.encode() + b'\n')
 
 real_os = os
 class FixtureStat:
@@ -91,6 +91,9 @@ class FixtureOS:
         return getattr(real_os, name)
     def fstat(self, fd):
         return FixtureStat(real_os.fstat(fd))
+    def stat(self, path, **kwargs):
+        assert kwargs.get('dir_fd') is not None
+        return FixtureStat(real_os.stat(path, **kwargs))
     def fchown(self, fd, uid, gid):
         assert uid == gid == 0 and os.readlink('/proc/self/fd/' + str(fd)).startswith(str(root) + '/')
     def geteuid(self):
@@ -98,6 +101,8 @@ class FixtureOS:
 h['os'] = FixtureOS()
 @contextlib.contextmanager
 def directory(path, private=False):
+    if path in ('/etc', '/etc/ipsec.d', '/etc/strongswan.d', '/etc/nftables.d', '/etc/modules-load.d'):
+        path = str(root) + path
     assert pathlib.Path(path).is_relative_to(root)
     fd = os.open(path, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY)
     try:
@@ -121,7 +126,9 @@ units[X].update(ActiveState='active', SubState='running', MainPID='1', Invocatio
 original_units = {k: dict(v) for k, v in units.items()}
 before = dict(boot='boot-fixture', files={k: h['read'](p) for k, p in names.items()},
               units=original_units, bridge=None, globalFiles={}, sockets=[['tcp', '127.0.0.1', 8080]])
-h['unit'] = lambda name: dict(units[name])
+h['unit'] = lambda name: (dict(units[name]) if name in units else
+                          dict(LoadState='not-found', ActiveState='inactive'))
+h['fresh_udp_bound'] = lambda: False
 h['observe'] = lambda machine, d, transit, **kw: before
 # Already-prepared PPP; the joined fixture exercises actual preparation.
 h['observe_ppp_preparation'] = lambda *, fresh=True: dict(missing=[], persist=False, builtin=[], policy='fixture')
@@ -161,6 +168,16 @@ def sc(*args, **kw):
 h['sc'] = sc
 
 def command(*args, **kw):
+    if args == ('/usr/bin/ps', '-ww', '-e', '-o', 'pid=', '-o', 'comm='):
+        return b'1 systemd\n200 ps\n'
+    if args == ('/usr/sbin/ip', '-j', '-details', 'link', 'show'):
+        return b'[{"ifname":"lo","link_type":"loopback"}]'
+    if args in (('/usr/sbin/ip', '-j', '-N', '-4', 'rule', 'show'), ('/usr/sbin/ip', '-j', '-N', '-6', 'rule', 'show')):
+        return b'[]'
+    if args[:3] == ('/usr/bin/dpkg-query', '-W', r'-f=${'$'}{Status}\n${'$'}{Conffiles}'):
+        paths = {'xl2tpd': ['lns'], 'strongswan-starter': ['starter', 'secrets']}[args[3]]
+        return b'install ok installed\n' + b''.join(
+            b' %s %s\n' % (names[k].encode(), hashlib.md5(b'# original-' + k.encode() + b'\n').hexdigest().encode()) for k in paths)
     commands.append(args)
     if args[:3] == ('/usr/sbin/ip', '-4', 'rule'):
         policy['rule'] = False

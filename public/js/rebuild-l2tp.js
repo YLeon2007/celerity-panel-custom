@@ -717,6 +717,12 @@
                     && (check === undefined || (typeof check === 'string' && Object.hasOwn(installChecks, check)))) {
                     result = installOutcomes.get(outcome);
                     if (check !== undefined) note = ` ${installChecks[check]}`;
+                    const keys = data.error.keys;
+                    if (code === 'REBUILD_L2TP_FOREIGN_CONFIG' && outcome === 'refused' && check === 'L2TP_FOREIGN_CONFIG'
+                        && Array.isArray(keys) && keys.length > 0 && keys.length <= 16 && new Set(keys).size === keys.length
+                        && keys.every(key => typeof key === 'string' && Object.hasOwn(installChecks, key))) {
+                        note += ` ${keys.map(key => installChecks[key]).join(' ')}`;
+                    }
                     if (outcome === 'installed' || outcome === 'rolled_back') {
                         requireRefresh = true;
                         clearSecrets();

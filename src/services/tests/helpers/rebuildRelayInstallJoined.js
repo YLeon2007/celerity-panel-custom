@@ -277,6 +277,10 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
                 : ['ppp-l2tp', 'ppp-load-failure', 'ppp-load-timeout', 'ppp-no-readback', 'ppp-lost-ack'].includes(scenario)
                 ? ['ppp_generic'] : ['ppp_generic', 'l2tp_ppp'],
             running: { [x]: main, ...(bridgeActive && { [b]: bridge }) }, nextPid: 300, charonPid: '201', ikeConnection: false,
+            starterMd5: Object.fromEntries(['/etc/ipsec.conf', '/etc/ipsec.secrets'].flatMap(path => {
+                const file = join(root, path);
+                return fs.existsSync(file) ? [[path, createHash('md5').update(fs.readFileSync(file)).digest('hex')]] : [];
+            })),
             lnsMd5: createHash('md5').update(lns).digest('hex'), effects: [], rule: null, route: null, nft: null, foreign,
             stockRules: [[0, 255], [32766, 254], [32767, 253]].map(([priority, table]) => ({ priority, src: 'all', table: String(table) })),
             rules6: [[0, 255], [32766, 254], ...(scenario === 'foreign-rpdb6' ? [[220, 220]] : [])]
@@ -561,6 +565,33 @@ module.exports = ({ fixture, sessionFixture, accountIntentFixture, id, oid, mach
         const create = overrides => build({ createRelayDirect: undefined, ...overrides });
         return Object.assign(f, seeded, { create });
     }
+
+    test('joined fresh Install refuses each exact foreign file before reservation', async t => {
+        for (const [key, path] of [
+            ['SWAN_PROFILE_PRESENT', '/etc/strongswan.d/celerity-rebuild-l2tp.conf'],
+            ['IKE_PROFILE_PRESENT', '/etc/ipsec.d/celerity-rebuild-l2tp.conf'],
+            ['OPTIONS_PRESENT', '/etc/ppp/options.xl2tpd'],
+            ['MODULES_LOAD_FOREIGN', '/etc/modules-load.d/c3-l2tp.conf'],
+        ]) {
+            await t.test(key, async test => {
+                const f = host(test, 'ppp-ready');
+                const file = join(f.root, path);
+                fs.writeFileSync(file, '# legacy fixture\n', { flag: 'wx', mode: 0o600 });
+                const original = fs.statSync(file, { bigint: true });
+                let status, result;
+                const res = { status(value) { status = value; return this; }, json(value) { result = value; } };
+                await installHandler(f.create)({ params: { id }, body: {} }, res);
+                assert.equal(status, 409, diagnostic(f));
+                assert.deepEqual(result, { error: { code: 'REBUILD_L2TP_FOREIGN_CONFIG', outcome: 'refused',
+                    check: 'L2TP_FOREIGN_CONFIG', keys: [key] } });
+                assert.deepEqual(f.actions, ['preflight']);
+                assert.deepEqual([f.events, f.states, f.records().effects], [[], [], []]);
+                const after = fs.statSync(file, { bigint: true });
+                assert.deepEqual([after.ino, after.mode, after.ctimeNs], [original.ino, original.mode, original.ctimeNs]);
+                assert.equal(fs.readFileSync(file, 'utf8'), '# legacy fixture\n');
+            });
+        }
+    });
 
     for (const [scenario, expected, loads, retained] of [
         ['ppp-both', 'installed', ['ppp_generic', 'l2tp_ppp']],

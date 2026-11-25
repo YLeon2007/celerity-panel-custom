@@ -1,5 +1,7 @@
 """Offline DIRECT admission regression; only the observations are modeled."""
 import contextlib
+import hashlib
+import os
 import io
 import json
 from pathlib import Path
@@ -51,6 +53,12 @@ class IkeAdmission(unittest.TestCase):
             ('/usr/sbin/ip', 'xfrm', 'policy', 'list'): b'',
             ('/usr/sbin/ip', 'xfrm', 'state', 'list', 'nokeys'): b'foreign-state' if xfrm else b'',
             ('/usr/bin/systemctl', '--no-pager', 'show-environment'): b'',
+            ('/usr/bin/ps', '-ww', '-e', '-o', 'pid=', '-o', 'comm='): b'1 systemd\n500 ps\n',
+            ('/usr/sbin/ip', '-j', '-details', 'link', 'show'): b'[{"ifname":"lo","link_type":"loopback"}]',
+            **{('/usr/bin/dpkg-query', '-W', r'-f=${Status}\n${Conffiles}', package): b'install ok installed\n' + b''.join(
+                f' {path} {hashlib.md5(h["raw"](files[path]), usedforsecurity=False).hexdigest()}\n'.encode()
+                for name in names for path in (h['NAMES'][name],))
+               for package, names in [('xl2tpd', ('lns',)), ('strongswan-starter', ('starter', 'secrets'))]},
         }
         calls, forbidden = [], []
 
@@ -64,10 +72,16 @@ class IkeAdmission(unittest.TestCase):
 
         self.addCleanup(self.assertEqual, forbidden, [])
         h.update(command=command, sc=unexpected, install=unexpected, write=unexpected, mkdir=unexpected,
-                 rmdir=unexpected, enroll_boot=unexpected, no_jobs=lambda _: None, unit=lambda n: units[n].copy(),
+                 rmdir=unexpected, enroll_boot=unexpected, no_jobs=lambda _: None,
+                 require_machine=lambda machine: machine, package_no_pending=lambda: None,
+                 fresh_udp_bound=lambda: False, missing_network_observers=lambda: (),
+                 unit=lambda n: units.get(n, {'LoadState': 'not-found', 'ActiveState': 'inactive'}).copy(),
                  os=SimpleNamespace(geteuid=lambda: 0, umask=lambda _: None,
                                     fstat=lambda _: SimpleNamespace(st_dev=1, st_ino=17),
-                                    path=SimpleNamespace(lexists=lambda _: False)),
+                                     stat=lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError()),
+                                    path=SimpleNamespace(lexists=lambda _: False, split=os.path.split,
+                                                         basename=os.path.basename),
+                                    scandir=lambda _: contextlib.nullcontext(iter(()))),
                  directory=lambda _: contextlib.nullcontext(17), fcntl=SimpleNamespace(flock=lambda *_: None,
                             LOCK_EX=1, LOCK_NB=2), directory_absent=lambda _: True, read=lambda p, *_, **__: files.get(p),
                  preflight=lambda machine, *, fresh=False: dict(machineId=machine, ppp=True, unitsLoaded=True, masked=False),
@@ -75,6 +89,7 @@ class IkeAdmission(unittest.TestCase):
                  require_network_observers=lambda: None,
                  ike_include_matches=lambda *_: True, xray_users=lambda *_: [['tcp', '127.0.0.1', 8080]],
                  swan_inputs=lambda *_: 'fixture-tree', nft_tables=lambda: [], ppp_empty=lambda: True,
+                 remove_generation=lambda path: None if path == h['BRIDGE'] else unexpected(path),
                  in_cgroup=lambda pid, _: pid == '13', boot=lambda: 'fixture-boot',
                  sock_rows=lambda: [('udp', '0.0.0.0', p, ['99' if bad_sockets else '13']) for p in (500, 4500)] if active else [])
         return h, calls

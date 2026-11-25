@@ -116,7 +116,7 @@ class LocalOS:
     def __getattr__(self, name):
         assert name in ('O_RDONLY', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_WRONLY', 'O_CREAT', 'O_EXCL', 'O_DIRECTORY',
                         'fdopen', 'listxattr', 'mkdir', 'rmdir', 'fsync', 'close', 'fchmod', 'link',
-                        'replace', 'unlink', 'listdir', 'umask', 'major', 'minor', 'symlink', 'uname', 'getpid',
+                        'replace', 'unlink', 'listdir', 'scandir', 'umask', 'major', 'minor', 'symlink', 'uname', 'getpid',
                         'get_blocking', 'set_blocking', 'write'), name
         return getattr(os, name)
 
@@ -214,6 +214,8 @@ def stock_open(path, mode='r'):
     facts = {'/etc/machine-id': s['machine'] + '\n', '/proc/devices': 'Character devices:\n' +
              ('108 ppp\n' if 'ppp_generic' in s['modules'] else '') + 'Block devices:\n',
              '/proc/net/dev': 'header\nheader\n eth0: 0\n',
+             '/proc/net/udp': 'sl local_address rem_address st\n',
+             '/proc/net/udp6': 'sl local_address remote_address st\n',
              '/proc/sys/kernel/random/boot_id': '12345678-1234-1234-1234-123456789abc\n' if package_stock else 'fixture-boot\n',
              '/proc/999/cgroup': '0::/system.slice/foreign.service\n',
              '/proc/modules': ''.join(f'{name} 4096 0 - Live 0x0\n' for name in modules),
@@ -420,6 +422,8 @@ def run(argv, **kwargs):
             elif native_stock and rest[2] in (XL, XL_ALIAS) and (stock_ctl or s['units'][XL]['LoadState'] != 'loaded'
                                                                   or s['units'][XL]['FragmentPath'] == XL_GENERATED):
                 info = stock_unit_properties(rest[2])
+            elif rest[2] in h.get('FRESH_VPN_UNITS', ()) and rest[2] not in s['units']:
+                info = {'LoadState': 'not-found', 'ActiveState': 'inactive'}
             else:
                 info = s['units'][rest[2]]
             rows = []
@@ -490,6 +494,15 @@ def run(argv, **kwargs):
             raise AssertionError('unexpected manager mutation: ' + action)
         return reply()
     if prog == '/usr/bin/dpkg-query':
+        if len(v) == 3 and v[:2] == ['-W', r'-f=${Status}\n${Conffiles}']:
+            if package_stock and v[2] not in packages.installed:
+                return reply('', 1)
+            if v[2] == 'strongswan-starter':
+                data = s['starterMd5']
+                return reply('install ok installed\n' + ''.join(f' {path} {value}\n' for path, value in data.items()))
+            assert v[2] == 'xl2tpd'
+            return reply('install ok installed\n' + (package_stock_conffiles() if package_stock else
+                         ' /etc/xl2tpd/xl2tpd.conf ' + s['lnsMd5'] + '\n'))
         if native_stock:
             if v == ['-S', SYSV_GENERATOR]:
                 assert backing(SYSV_GENERATOR).is_file()
@@ -511,10 +524,14 @@ def run(argv, **kwargs):
             s.setdefault('packageChecks', []).append(v[2])
         missing = v[2] not in packages.installed if package_stock else v[2] in s.get('missingPackages', ())
         return reply('' if missing else 'ii ', int(missing))
+    if prog == '/usr/bin/ps' and v == ['-ww', '-e', '-o', 'pid=', '-o', 'comm=']:
+        return reply('1 systemd\n500 ps\n')
     if prog == '/usr/bin/ss' and v == ['-H', '-lntup']:
         observe_net('inet_diag', 'tcp_diag', 'udp_diag')
         return reply(''.join(f'{p} LISTEN 0 0 {a}:{n} *:* users:(("fixture",pid={pid},fd=3))\n' for p, a, n, pid in sockets()))
     if prog == '/usr/sbin/ip':
+        if v == ['-j', '-details', 'link', 'show']:
+            return js([{'ifname': 'lo', 'link_type': 'loopback'}])
         if v == ['-j', '-N', '-4', 'rule', 'show']:
             return js(s['stockRules'] + s['foreign']['rules'] + ([s['rule']] if s['rule'] else []))
         if v == ['-j', '-N', '-6', 'rule', 'show']:

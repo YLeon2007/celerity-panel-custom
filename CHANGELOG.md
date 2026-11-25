@@ -5,6 +5,11 @@
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
+## v1.6.40 — Проверки L2TP / L2TP install checks
+
+- Установка показывает конкретные несовместимые настройки хоста. Работающий VPN, занятые L2TP/IPsec-порты и активные PPP-сессии блокируют установку отдельно. Диагностика не удаляет файлы.
+- Install reports specific conflicting host settings. Active VPN, occupied L2TP/IPsec UDP ports and active PPP sessions block Install separately. Diagnosis never removes files.
+
 ## v1.6.39 — Обновление L2TP / L2TP overview refresh
 
 - После подтверждения допуска обзор L2TP обновляется автоматически. Когда действия заблокированы, причина видна рядом с релеем.

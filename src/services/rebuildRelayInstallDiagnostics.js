@@ -2,7 +2,7 @@
 
 // DIRECT wire suffix -> public check. List only fixed helper emissions here.
 // An alias is an explicit entry, not a prefix/pattern match. New entries
-// must have RU/EN copy for the public check. This table grants no write proof.
+// must have RU/EN/zh-CN copy for the public check. This table grants no write proof.
 const hostChecks = new Map([
     ['XRAY_DROPIN_UNSUPPORTED', 'XRAY_DROPIN_UNSUPPORTED'],
     ['PPP_MODULES_REQUIRED', 'PPP_MODULES_REQUIRED', 'shared-prerequisite'],
@@ -10,9 +10,9 @@ const hostChecks = new Map([
     ['PPP_MODULES_LOAD_FAILED', 'PPP_MODULES_LOAD_FAILED', 'shared-prerequisite'],
     ['KERNEL_MODULE_BLACKLISTED', 'KERNEL_MODULE_BLACKLISTED', 'shared-prerequisite'],
     ['NETWORK_OBSERVATION_REQUIRED', 'NETWORK_OBSERVATION_REQUIRED', 'shared-prerequisite'],
-    ['IKE_ACTIVE_RULE_220', 'IKE_ACTIVE_RULE_220', 'pre-write-only'],
-    ['RULE_220_CONFLICT', 'RULE_220_CONFLICT', 'pre-write-only'],
-    ['IKE_ACTIVE_UNMANAGED', 'IKE_ACTIVE_UNMANAGED', 'pre-write-only'],
+    ['IKE_ACTIVE_RULE_220', 'IKE_ACTIVE_RULE_220', 'fresh-pre-write'],
+    ['RULE_220_CONFLICT', 'RULE_220_CONFLICT', 'fresh-pre-write'],
+    ['IKE_ACTIVE_UNMANAGED', 'IKE_ACTIVE_UNMANAGED', 'fresh-pre-write'],
     ['XL2TPD_CONFIG_MISSING', 'XL2TPD_CONFIG_MISSING'],
     ['XRAY_CONFIG_WRITABLE', 'XRAY_CONFIG_WRITABLE'],
     ['XRAY_PROFILE_OWNER_UNSUPPORTED', 'XRAY_PROFILE_OWNER_UNSUPPORTED', 'prepare-only'],
@@ -48,9 +48,39 @@ function packageWriteCheck(result) {
     if (result.code === 70) return packageRefusals.get(result.stderr);
     if (result.code === 75) return packageUncertain.get(result.stderr);
 }
-const checks = new Set([...packageChecks, ...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
+// Only these keys may cross the authenticated DIRECT and public Install boundaries.
+// Canonical wire order; mirror FOREIGN_REASONS in rebuildRelayDirectHost.py.
+const foreignKeys = ['SWAN_PROFILE_PRESENT', 'IKE_PROFILE_PRESENT', 'OPTIONS_PRESENT', 'STARTER_NOT_STOCK',
+    'SECRETS_NOT_EMPTY', 'CHAP_NOT_EMPTY', 'LNS_NOT_STOCK', 'XRAY_UNIT_0666', 'XRAY_BRIDGE_UNIT_0666',
+    'UNIT_WRITABLE', 'NFT_DIR_PRESENT', 'DROPIN_PRESENT', 'MODULES_LOAD_FOREIGN'];
+const foreignCheck = 'L2TP_FOREIGN_CONFIG';
+const maxConflictFrame = `DIRECT_NO_WRITE_${foreignCheck} ${foreignKeys.join(',')}\n`.length;
+const freshConflicts = new Set([foreignCheck, 'L2TP_DAEMON_ACTIVE', 'L2TP_UDP_BOUND', 'L2TP_PPP_ACTIVE']);
+const conflictCodes = new Set([...freshConflicts].map(check => `REBUILD_${check}`));
+const conflicts = new WeakMap();
+function freshConflictFromFrame(action, result) {
+    if (!isInstallStage(action) || result?.code !== 70 || result.stdout !== '' || typeof result.stderr !== 'string'
+        || result.stderr.length > maxConflictFrame) return undefined;
+    const prefix = action === 'install' ? 'DIRECT_NO_WRITE_' : 'DIRECT_';
+    if (!result.stderr.startsWith(prefix) || !result.stderr.endsWith('\n')) return undefined;
+    const [check, items, ...extra] = result.stderr.slice(prefix.length, -1).split(' ');
+    if (!freshConflicts.has(check) || extra.length) return undefined;
+    if (check !== foreignCheck) return items === undefined ? { check } : undefined;
+    if (!items) return undefined;
+    const keys = items.split(',');
+    if (foreignKeys.filter(key => keys.includes(key)).join(',') !== items) return undefined;
+    return { check, keys: Object.freeze(keys) };
+}
+function withFreshConflict(error, proof) {
+    conflicts.set(error, proof);
+    return withInstallCheck(error, proof.check);
+}
+const freshConflict = error => conflicts.get(error);
+const checks = new Set([...freshConflicts, ...packageChecks, ...Array.from(hostChecks.values(), ({ check }) => check), ...stages.values(),
     ...profileChecks.values(), 'VPN_UNITS_MASKED', 'VPN_UNITS_NOT_LOADED']);
-const installCheckIds = Object.freeze([...checks]);
+// The view uses the same localized map for the headline and list items.
+// List item IDs are not valid top-level checks.
+const installCheckIds = Object.freeze([...checks, ...foreignKeys]);
 const isInstallCheck = check => checks.has(check);
 const isInstallStage = action => stages.has(action);
 function specificHostRefusal(action, suffix, noWrite) {
@@ -102,6 +132,7 @@ const failed = 'REBUILD_L2TP_INSTALL_FAILED';
 // can have a different outcome depending on rollback and reservation cleanup.
 const codeOutcomes = new Map([
     ['REBUILD_INVALID_REQUEST', 'refused'],
+    ...Array.from(conflictCodes, code => [code, 'refused']),
     ['REBUILD_BUSY', 'busy'],
     ['REBUILD_LOCK_LOST', 'unknown'],
     ['REBUILD_LOCK_RELEASE_UNCONFIRMED', 'unknown'],
@@ -136,7 +167,7 @@ function withInstallCheck(error, check) {
 const checkedInstallId = error => checkedIds.get(error);
 
 const failures = new WeakSet();
-function installFailure(code, outcome, check, { retryAllowed } = {}) {
+function installFailure(code, outcome, check, { retryAllowed, conflict } = {}) {
     if (!codeOutcomes.has(code) || !outcomes.has(outcome)) {
         code = failed;
         outcome = 'unknown';
@@ -144,6 +175,7 @@ function installFailure(code, outcome, check, { retryAllowed } = {}) {
     }
     const error = withInstallCheck(Object.assign(new Error(code), { code, outcome,
         ...(retryAllowed === false && { retryAllowed: false }) }), check);
+    if (outcome === 'refused' && conflict?.check === check) conflicts.set(error, conflict);
     failures.add(error);
     return Object.freeze(error);
 }
@@ -151,17 +183,22 @@ function installFailure(code, outcome, check, { retryAllowed } = {}) {
 function classifyInstallFailure(error) {
     if (failures.has(error)) return error;
     const code = error?.code;
-    const outcome = codeOutcomes.get(code);
+    const conflict = freshConflict(error);
+    const outcome = (conflict || !conflictCodes.has(code)) ? codeOutcomes.get(code) : undefined;
     const retryAllowed = error?.retryAllowed === false ? false : undefined;
-    const check = checkedInstallId(error) ?? profileChecks.get(code);
+    const check = conflict?.check ?? checkedInstallId(error) ?? profileChecks.get(code);
     return installFailure(outcome ? code : failed,
-        error?.outcome === 'unknown' ? 'unknown' : outcome ?? 'unknown', check, { retryAllowed });
+        error?.outcome === 'unknown' ? 'unknown' : outcome ?? 'unknown', check, { retryAllowed, conflict });
 }
 
 function publicInstallFailure(error) {
-    const { code, outcome, check, retryAllowed } = classifyInstallFailure(error);
-    return { code, outcome, ...(check !== undefined && { check }), ...(retryAllowed === false && { retryAllowed }) };
+    const classified = classifyInstallFailure(error);
+    const { code, outcome, check, retryAllowed } = classified;
+    const keys = freshConflict(classified)?.keys;
+    return { code, outcome, ...(check !== undefined && { check }), ...(keys && { keys }),
+        ...(retryAllowed === false && { retryAllowed }) };
 }
 
 module.exports = { installCheckIds, isInstallStage, specificHostRefusal, packageWriteCheck, prerequisiteCheck, hasNativePreparation, hasPackagePreparation, requireInstallHostReady,
-    withInstallCheck, checkedInstallId, installFailure, classifyInstallFailure, publicInstallFailure };
+    withInstallCheck, checkedInstallId, freshConflictFromFrame, freshConflict, withFreshConflict,
+    installFailure, classifyInstallFailure, publicInstallFailure };
