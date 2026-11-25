@@ -80,7 +80,9 @@ def profile(api, user_port, target):
                           'settings': {'decryption': 'none', 'clients': []}}],
             'outbounds': [{'tag': name, 'protocol': 'blackhole'} for name in ('a', 'b')],
             'routing': {'rules': [{'type': 'field', 'ruleTag': 'api', 'inboundTag': ['local-api'], 'outboundTag': 'api'},
-                                  {'type': 'field', 'ruleTag': 'select', 'inboundTag': [TAG], 'outboundTag': target}]}}
+                                  {'type': 'field', 'ruleTag': 'select', 'inboundTag': [TAG],
+                                   'domain': ['full:exit-choice.example.invalid'], 'outboundTag': target},
+                                  {'type': 'field', 'ruleTag': 'default', 'inboundTag': [TAG], 'outboundTag': 'a'}]}}
 
 
 class Native(System):
@@ -91,15 +93,20 @@ class Native(System):
         self.agent = None
         self.logs = {}
         self.stop_timeout = False
+        self.fail_start = False
         self.root.mkdir(exist_ok=True)
         self.start_agent()
 
-    def start_agent(self):
+    def start_agent(self, *, expect_failure=False):
         log = self.root / ('agent-' + self.inv + '.log')
         self.logs[self.inv] = log
         with log.open('x') as output:
             self.agent = subprocess.Popen([AGENT], stdout=output, stderr=output, stdin=subprocess.DEVNULL,
                                           start_new_session=True)
+        if expect_failure:
+            assert self.agent.wait(timeout=4) == 1
+            assert '[main] Failed to load config:' in log.read_text()
+            return
         self.ready()
 
     def call(self, path, method='GET', data=None):
@@ -154,6 +161,13 @@ class Native(System):
         if argv[1] == 'start':
             super().__call__(argv, timeout)
             self.inv = uuid.uuid4().hex
+            if self.fail_start:
+                # Fault only the disposable daemon's config. Let the genuine
+                # stock process fail its startup on its normal entry path.
+                publish_bytes(CONF, b'{')
+                self.start_agent(expect_failure=True)
+                self.active = False
+                raise subprocess.CalledProcessError(1, argv)
             self.start_agent()
             return ''
         raise AssertionError('unexpected command')
@@ -209,9 +223,11 @@ def main():
                 time.sleep(.05)
         raise AssertionError('fixture HandlerService not ready')
 
-    def route():
+    def assert_routes(expected):
         out = subprocess.check_output([XRAY, 'api', 'lsrules', f'--server=127.0.0.1:{api}', '-t=1'], timeout=3)
-        return json.loads(out)['rules'][1]['tag']
+        assert [row['tag'] for row in json.loads(out)['rules']] == ['api', expected, 'a']
+        out = subprocess.check_output(['/tools/routes', str(api)], timeout=3)
+        assert json.loads(out) == [expected, 'a'], 'planned and fallback TestRoute contexts disagree'
 
     def disk():
         return m.parse_json(BOOT.read_bytes())
@@ -225,7 +241,8 @@ def main():
     mgr = None
     core = start_core()
     try:
-        assert observed() == [] and route() == 'a'
+        assert observed() == []
+        assert_routes('a')
         cgroot = ROOT / 'fake-system.slice'
         cgroot.mkdir()
         mgr = Native(cgroot, agent_port, lambda: core)
@@ -246,7 +263,8 @@ def main():
                 mgr.agent.returncode = os.waitstatus_to_exitcode(status)
                 raise AssertionError('fixture agent exited before Stop timeout test')
             assert pid == mgr.agent.pid
-        assert mode in ('full', 'timeout')
+        assert mode in ('full', 'timeout', 'start-failed')
+        mgr.fail_start = mode == 'start-failed'
 
         def image(data):
             return {'raw': data.hex(), 'topology': hashlib.sha256(m.topology_bytes(m.parse_json(data), managed)).hexdigest()}
@@ -296,7 +314,8 @@ def main():
                 stop_core(core)
                 prev, core = core, start_core()
                 mgr.xray_generation += 1
-                assert core.pid != prev.pid and observed() == identities and route() == tag
+                assert core.pid != prev.pid and observed() == identities
+                assert_routes(tag)
                 wnd.join_xray_restart()
             elif action == 'agent-start':
                 wnd.resume()
@@ -305,7 +324,8 @@ def main():
                     wnd.wait_reconciled()
                 assert wnd.phase == 'reconciled'
                 assert_profile(target)
-                assert observed() == identities and route() == tag
+                assert observed() == identities
+                assert_routes(tag)
                 assert mgr.call('/info')['users_count'] == len(identities)
                 verified = snapshot()
                 if action == 'terminal' and tag == 'b':
@@ -313,13 +333,21 @@ def main():
                     wnd = m.AgentWindow(mgr, cgroup_root=cgroot)
                 return verified
             elif action == 'observe':
-                assert timeout and wnd.phase == 'stop-unconfirmed' and snapshot() == original and route() == 'a'
-                return 'before'
+                if timeout:
+                    assert wnd.phase == 'stop-unconfirmed' and snapshot() == original
+                    assert_routes('a')
+                    return 'before'
+                assert mgr.fail_start and wnd.phase == 'start-unconfirmed'
+                assert mgr.agent is not None and mgr.agent.poll() == 1
+                assert_profile(goal)
+                assert core.poll() is None and observed() == identities
+                assert_routes('b')
+                return 'mixed'
             else:
                 raise AssertionError('unexpected fixture action')
             return True
 
-        with subprocess.Popen(['/tools/node', '/scripts/main-window-journal.cjs', 'timeout' if timeout else 'rollback'],
+        with subprocess.Popen(['/tools/node', '/scripts/main-window-journal.cjs', mode],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE) as worker:
             reader, writer = worker.stdout, worker.stdin
             assert reader is not None and writer is not None
@@ -328,12 +356,13 @@ def main():
                 for frame in iter(lambda: reader.readline(16384), b''):
                     f = json.loads(frame)
                     if f['action'] == 'done':
-                        assert f['status'] == ('unknown' if timeout else 'rolled-back')
+                        assert f['status'] == ('rolled-back' if mode == 'full' else 'unknown')
                         break
                     try:
                         reply = {'ok': True, 'value': handle(f)}
                     except m.WindowError as e:
-                        if not (timeout and f['action'] == 'agent-stop' and e.code == 'REBUILD_AGENT_STOP_UNCONFIRMED'):
+                        if not (timeout and f['action'] == 'agent-stop' and e.code == 'REBUILD_AGENT_STOP_UNCONFIRMED'
+                                or mgr.fail_start and f['action'] == 'agent-start' and e.code == 'REBUILD_AGENT_START_UNCONFIRMED'):
                             raise
                         reply = {'ok': False}
                     writer.write(json.dumps(reply).encode() + b'\n')
@@ -349,6 +378,10 @@ def main():
         if timeout:
             assert [action for action, _ in trace] == ['manifest', 'capture', 'agent-stop', 'observe']
             print('PASS retained stop phase, no publication or restart and no replay', flush=True)
+        elif mgr.fail_start:
+            assert [action for action, _ in trace] == ['manifest', 'capture', 'agent-stop', 'drained-capture',
+                                                      'main-publication', 'xray-restart', 'agent-start', 'observe']
+            print('PASS stock agent startup failed; retained start phase, mixed readback and no replay', flush=True)
         else:
             assert [tag for action, tag in trace if action == 'agent-reconcile'] == ['b', 'a']
             print('PASS journalled A→B→A with real agent drain, post-resume checks and new user retained', flush=True)

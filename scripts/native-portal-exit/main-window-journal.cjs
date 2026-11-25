@@ -42,7 +42,7 @@ async function main() {
         .map(line => line.split(':')[0].trim()), ['lo']);
     assert(!fs.existsSync('/etc/resolv.conf') && !fs.existsSync('/run/systemd/private'));
     const mode = process.argv[2];
-    assert(['rollback', 'timeout'].includes(mode));
+    assert(['full', 'timeout', 'start-failed'].includes(mode));
     fs.mkdirSync(directory, { mode: 0o700 });
     syncDir('/work');
     const key = randomBytes(32);
@@ -106,11 +106,11 @@ async function main() {
     } });
     const result = await executor.execute(plan);
     assert.equal(result.retryAllowed, false);
-    if (mode === 'timeout') {
+    if (mode !== 'full') {
         assert.equal(result.status, 'unknown');
         const observed = await executor.reconcile(scope);
-        assert.equal(observed.observation, 'before');
-        assert.equal(observed.journal.pending.checkpoint, 'agent-stop');
+        assert.equal(observed.observation, mode === 'timeout' ? 'before' : 'mixed');
+        assert.equal(observed.journal.pending.checkpoint, mode === 'timeout' ? 'agent-stop' : 'agent-start');
         assert.equal(observed.journal.confirmed.length, 0);
         assert.equal(observed.retryAllowed, false);
         assert.equal((await executor.execute(plan)).status, 'already-recorded');
