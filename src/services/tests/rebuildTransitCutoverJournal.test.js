@@ -126,7 +126,13 @@ function executor(root, actions) {
 if (process.argv[2] === '--cutover-child') {
     const [root, mode] = process.argv.slice(3);
     process.once('message', async p => {
-        const pause = async () => { process.send({ boundary: mode }); await hold(); };
+        const pause = async () => {
+            // Removing the once('message') listener can unref Node's IPC
+            // channel; a pending Promise alone cannot keep the process alive.
+            process.channel.ref();
+            process.send({ boundary: mode });
+            await hold();
+        };
         const binding = executor(root, {
             beforeSubmit: async ctx => {
                 if (mode === 'before-submit' && ctx.step.id === 'upstream') await pause();
