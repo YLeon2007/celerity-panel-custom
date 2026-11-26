@@ -235,12 +235,13 @@ class HostMainWire:
     A refusal or missing acknowledgement is not no-effect or replay authority.
     """
 
-    def __init__(self, session_factory, *, on_read=None, on_capture=None, on_reconcile=None, on_verify=None):
+    def __init__(self, session_factory, *, on_read=None, on_capture=None, on_reconcile=None, on_verify=None, on_discard=None):
         self._factory = session_factory
         self._on_read = on_read
         self._on_capture = on_capture
         self._on_reconcile = on_reconcile
         self._on_verify = on_verify
+        self._on_discard = on_discard
         self._admission = Lock()
 
     def _settle(self, channel, session, callback, snapshot):
@@ -260,6 +261,9 @@ class HostMainWire:
 
         first = channel.request('stop', 'discard-read') if held else channel.request('stop')
         if first['action'] == 'discard-read':
+            if self._on_discard is not None:
+                channel.remaining()
+                require(self._on_discard(session, channel.deadline) is True, SETTLEMENT)
             return False
         session.stop()
         channel.ok()

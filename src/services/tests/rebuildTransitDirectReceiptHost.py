@@ -22,7 +22,7 @@ from rebuildTransitMainWindowHost import System
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rebuildTransitDirectReceipt import DirectReceipt, direct_main_wire, FINAL, LEGACY_NET, UNCONFIRMED, WRITERS
-from rebuildTransitMainSession import HostMainSession, WindowError
+from rebuildTransitMainSession import HostMainFlock, HostMainSession, WindowError
 import rebuildTransitMainWindow as window
 from rebuildTransitMainWindow import XRAY_PROPS
 
@@ -121,10 +121,10 @@ class ReceiptFixture(unittest.TestCase):
         self.proofs.append('independent')
         return self.permit_final and final.main.data == self.loaded
 
-    def session(self):
+    def session(self, flock=None):
         return HostMainSession(self.run_model, lambda: True, self.runtime, frozenset({'client'}),
                                main=self.main, cgroup_root=self.cg, lock_dir=self.lock,
-                               clock=lambda: self.manager.now, sleep=self.manager.sleep)
+                               clock=lambda: self.manager.now, sleep=self.manager.sleep, flock=flock)
 
     def capture(self, session, **overrides):
         baseline = session.read()
@@ -156,6 +156,75 @@ class ReceiptFixture(unittest.TestCase):
 
 
 class ReceiptHost(ReceiptFixture):
+    def test_one_wire_discards_read_then_advances_forward_and_inverse_under_original_flock(self):
+        deadline = time.monotonic() + 10
+        namespace = SimpleNamespace(**(self.h | {'DEADLINE': deadline}))
+        wire = direct_main_wire(lambda _, flock: self.session(flock), direct=namespace, machine_id=self.f.machine,
+                                backup_id=self.f.token, node_id=self.f.node, network=self.f.network,
+                                verify_writers=lambda: True, prove_final=lambda final, _: self.final_proof(final))
+        query, tx = os.pipe()
+        rx, reply = os.pipe()
+        result = []
+
+        def server():
+            try:
+                result.append(wire.serve_held(query, reply, deadline=deadline,
+                                              lock_factory=lambda: HostMainFlock(self.lock), verify_hold=lambda _: True))
+            finally:
+                os.close(query)
+                os.close(reply)
+
+        thread = threading.Thread(target=server, daemon=True)
+        thread.start()
+        try:
+            with os.fdopen(tx, 'wb', buffering=0) as send, os.fdopen(rx, 'rb') as recv:
+                def request(action, **fields):
+                    send.write(json.dumps(dict(action=action, **fields)).encode('ascii') + b'\n')
+                    response = json.loads(recv.readline())
+                    self.assertIs(response['ok'], True, response.get('reason'))
+                    return response['value']
+
+                def still_held():
+                    request('check')
+                    with open_lock(self.lock) as contender, self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                request('hold')
+                before = self.manifest()
+                request('read')
+                request('discard-read')
+                still_held()
+                self.assertEqual(self.manifest(), before)
+                self.assertEqual(self.effects(), [])
+                for step, target in enumerate((self.candidate, self.original), start=1):
+                    request('read')
+                    request('stop')
+                    pair = request('capture', target=base64.b64encode(target).decode('ascii'))
+                    compact = json.dumps(pair['before'], separators=(',', ':')).encode('ascii')
+                    request('publish', beforeSha256=hashlib.sha256(compact).hexdigest(),
+                            desiredSha256=hashlib.sha256(base64.b64decode(pair['desired'])).hexdigest())
+                    request('restart')
+                    request('start')
+                    final = request('reconcile')
+                    self.assertEqual(self.manifest(), before)
+                    self.assertEqual(request('verify'), final)
+                    before = self.manifest()
+                    self.assertEqual(before['currentApply']['files']['main'],
+                                     self.h['file_pin'](*self.h['apply_profile_read'](self.h['MAIN'])))
+                    self.assertEqual(self.write_calls, step)
+                    still_held()
+                request('release')
+                send.close()
+                self.assertEqual(recv.read(), b'')
+        finally:
+            thread.join(timeout=11)
+        self.assertEqual(result, [0])
+        with open_lock(self.lock) as contender:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertEqual(self.effects(), ['stop', 'restart', 'start'] * 2)
+        self.assertEqual(self.main.read_bytes(), self.original)
+        self.call('reattest-runtime')
+
     def drive_wire(self, final_ok):
         deadline = time.monotonic() + 5
         namespace = SimpleNamespace(**(self.h | {'DEADLINE': deadline}))

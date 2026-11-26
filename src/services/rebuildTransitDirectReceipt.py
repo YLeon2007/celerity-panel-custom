@@ -332,10 +332,24 @@ def direct_main_wire(session_factory, *, direct, machine_id, backup_id, node_id,
         return True
 
     def finish(final, deadline):
+        nonlocal receipt
         current = receipt
         if current is None or direct.time.monotonic() >= deadline:
             raise WindowError(FINAL)
         current.advance(final, prove_final=lambda snapshot: prove_final(snapshot, deadline))
+        receipt = None  # The next step must pin the new exact durable predecessor.
         return True
 
-    return HostMainWire(session_factory, on_read=pin_baseline, on_capture=pin_drained, on_verify=finish)
+    def discard(session, deadline):
+        nonlocal receipt
+        current = receipt
+        require(current is not None and current._session is session and current._publication is None
+                and session._state == 'ready' and direct.time.monotonic() < deadline, UNPROVED)
+        with session._action(('ready',)):
+            # Only a read capture was armed. There is no staged receipt or
+            # request to compensate; discard this process-local capability.
+            current._authority()
+            receipt = None
+        return True
+
+    return HostMainWire(session_factory, on_read=pin_baseline, on_capture=pin_drained, on_verify=finish, on_discard=discard)
