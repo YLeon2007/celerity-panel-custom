@@ -138,6 +138,36 @@ class RuntimeHost(unittest.TestCase):
         self.assertEqual(self.calls[0]['routes'][0]['context']['targetIP'], '192.0.2.2')
         self.assertNotIn('targetDomain', self.calls[0]['routes'][0]['context'])
 
+    def test_one_wire_deadline_clips_both_children_and_refuses_late_receipt(self):
+        snap = self.snapshot()
+        now = 10
+        budgets = []
+        deadline = 11
+
+        def manager(argv, timeout):
+            nonlocal now
+            budgets.append(('unit', timeout))
+            now += 0.25
+            return self.manager(argv, runtime.SHOW_TIMEOUT)
+
+        def proof(argv, data, *, timeout, limit, end):
+            nonlocal now
+            self.assertEqual((argv, limit), ((str(self.proof),), runtime.RECEIPT_LIMIT))
+            self.assertEqual(end, deadline)
+            self.assertEqual(len(json.loads(data)['routes']), 1)
+            budgets.append(('proof', timeout))
+            now = deadline
+            return json.dumps(self.receipt()).encode('ascii')
+
+        observer = runtime.MainRuntimeObserver({'vless-in', 'extra'}, lambda *_: ROUTES, deadline=deadline,
+                                                _fixture_paths=(self.proof, self.xray, self.main), _fixture_show=manager)
+        with patch.object(runtime.time, 'monotonic', side_effect=lambda: now), \
+             patch.object(runtime, '_process', return_value=self.proc), \
+             patch.object(runtime, '_exchange', side_effect=proof):
+            self.refused(lambda: observer('baseline', snap))
+            self.refused(lambda: observer('baseline', snap))
+        self.assertEqual(budgets, [('unit', 1), ('unit', 0.75), ('proof', 0.5)])
+
     def test_private_callback_error_is_not_attached_to_public_failure(self):
         snapshot = self.snapshot()
         with patch.object(self.observer, '_routes', side_effect=ValueError(SENTINEL)):
@@ -276,6 +306,13 @@ class ChildPipes(unittest.TestCase):
     def test_early_stdin_close_cannot_yield_a_success_receipt(self):
         with self.assertRaises((WindowError, BrokenPipeError)):
             self.exchange("import os; os.close(0); print('ok')", b'x' * 200000)
+
+    def test_expiry_after_budget_calculation_does_not_spawn(self):
+        with patch.object(runtime.time, 'monotonic', side_effect=(10, 11)), \
+             patch.object(runtime.subprocess, 'Popen') as spawn:
+            with self.assertRaises(WindowError):
+                runtime._exchange(['/usr/bin/false'], b'', timeout=25, limit=64, end=11)
+            spawn.assert_not_called()
 
     def test_unknown_sigchld_handling_does_not_launch(self):
         with patch.object(runtime.signal, 'getsignal', return_value=runtime.signal.SIG_IGN), \

@@ -12,6 +12,7 @@ TestRoute contexts. It says nothing about anonymous accounts, UUID-validator
 state, untested predicates, the dispatcher's default or actual client egress.
 """
 import json
+import math
 import os
 import re
 import select
@@ -20,6 +21,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -186,13 +188,16 @@ def _remaining(deadline):
     return remaining
 
 
-def _exchange(argv, data, *, timeout, limit):
+def _exchange(argv, data, *, timeout, limit, end=None):
     """One child, exact stdin + EOF, bounded pipes; no shell or inherited env."""
     # A caller reaping this child elsewhere (including ignored SIGCHLD) can
     # make Popen report 0 on ECHILD rather than the original exit status.
     _need(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL)
-    deadline = time.monotonic() + timeout
-    io_end = deadline - min(0.5, timeout / 2)
+    since = time.monotonic()
+    deadline = min(since + timeout, end) if end is not None else since + timeout
+    _need(deadline > since)
+    io_end = deadline - min(0.5, (deadline - since) / 2)
+    _remaining(io_end)  # Never start after the original deadline.
     child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              close_fds=True, env={'LC_ALL': 'C'}, cwd='/', bufsize=0)
     try:
@@ -240,7 +245,13 @@ def _exchange(argv, data, *, timeout, limit):
             try:
                 child.kill()  # Only the child just created, never Xray or systemd.
             finally:
-                child.wait(timeout=max(0, deadline - time.monotonic()))
+                # Reaping is cleanup, not extra execution authority. Keep
+                # ownership of the PID if a forced exit is slow to arrive.
+                try:
+                    child.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    threading.Thread(target=child.wait, daemon=True).start()
+                    raise
 
 
 def _bounded_read(path, limit):
@@ -343,13 +354,17 @@ class MainRuntimeObserver:
     an immutable tuple of RouteCheck values for this phase. Neither it nor
     the constructor is a request decoder. The caller holds its independent
     authority/fence across the callback; no retry, fallback or repair here.
+    `deadline`, when supplied, is the original absolute monotonic deadline
+    of the held wire. It is never refreshed by another observation or child.
     It must also leave waits for the observer's own children to the observer.
     _fixture_paths and _fixture_show are trusted in-process test seams only.
     """
 
-    def __init__(self, managed, routes_for, *, _fixture_paths=None, _fixture_show=None):
+    def __init__(self, managed, routes_for, *, deadline=None, _fixture_paths=None, _fixture_show=None):
         _need(type(managed) in (set, frozenset) and 0 < len(managed) <= MAX_INBOUNDS
               and all(_tag(tag) for tag in managed) and callable(routes_for))
+        _need(deadline is None or type(deadline) in (int, float) and math.isfinite(deadline))
+        self._deadline = deadline
         self._managed, self._routes = frozenset(managed), routes_for
         self._production = _fixture_paths is None
         self._proof, self._xray, self._main = (PROOF, XRAY_BIN, MAIN) if self._production else map(Path, _fixture_paths)
@@ -360,10 +375,19 @@ class MainRuntimeObserver:
         self._fixture_show = _fixture_show
         self._files = AgentWindow(None, main=self._main)
 
+    def _budget(self, limit):
+        return limit if self._deadline is None else min(limit, _remaining(self._deadline))
+
+    def _native(self, argv, data, timeout, limit):
+        end = {} if self._deadline is None else {'end': self._deadline}
+        return _exchange(argv, data, timeout=self._budget(timeout), limit=limit, **end)
+
     def _unit(self, target):
         command = ['/usr/bin/systemctl', 'show', '--all', *('--property=' + k for k in XRAY_PROPS), '--', XRAY]
-        raw = (_exchange(command, b'', timeout=SHOW_TIMEOUT, limit=16384).decode('utf-8')
-               if self._fixture_show is None else self._fixture_show(command, SHOW_TIMEOUT))
+        budget = self._budget(SHOW_TIMEOUT)
+        raw = (self._native(command, b'', budget, 16384).decode('utf-8')
+               if self._fixture_show is None else self._fixture_show(command, budget))
+        self._budget(SHOW_TIMEOUT)
         _need(type(raw) is str and raw.endswith('\n'))
         unit = _state_fields(raw, XRAY_PROPS, XRAY)
         _need(_generation(unit) and XrayGeneration(int(unit['MainPID']), unit['InvocationID']) == target)
@@ -382,6 +406,7 @@ class MainRuntimeObserver:
         return _process(snapshot.xray.pid, pidfd, unit[1], self._xray, image, self._production)
 
     def _observe(self, phase, snapshot):
+        self._budget(PROOF_TIMEOUT)
         _need(type(phase) is str and phase in ('baseline', 'capture', 'restart', 'reconcile') and type(snapshot) is MainSnapshot
               and type(snapshot.main) is MainImage and type(snapshot.main.data) is bytes
               and 0 < len(snapshot.main.data) <= MAX_MAIN and type(snapshot.xray) is XrayGeneration
@@ -397,12 +422,13 @@ class MainRuntimeObserver:
         try:
             before = self._sample(snapshot, pidfd, unit)
             _need(_exec_identity(self._proof, self._production) == proof)
-            reply = _exchange((str(self._proof),), frame, timeout=PROOF_TIMEOUT, limit=RECEIPT_LIMIT)
+            reply = self._native((str(self._proof),), frame, PROOF_TIMEOUT, RECEIPT_LIMIT)
             _need(self._unit(snapshot.xray) == unit and self._sample(snapshot, pidfd, unit) == before
                   and _exec_identity(self._proof, self._production) == proof)
             _receipt(reply, counts, len(routes))
         finally:
             os.close(pidfd)
+        self._budget(PROOF_TIMEOUT)
 
     def __call__(self, phase, snapshot):
         try:

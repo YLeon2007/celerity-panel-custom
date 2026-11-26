@@ -9,6 +9,7 @@ only releases its descriptor; it never retries, restores MAIN or starts a unit.
 """
 import fcntl
 import json
+import math
 import os
 import stat
 import subprocess
@@ -142,6 +143,9 @@ class _HeldWindow(AgentWindow):
             self._session._check_authority()
         super()._check_main_dir(parent)
 
+    def _guard_main_rename(self):
+        self._session._check_deadline()
+
 
 class HostMainSession:
     """Use one lexical context on one thread, with exactly one AgentWindow.
@@ -170,12 +174,14 @@ class HostMainSession:
 
     def __init__(self, run, verify_authority, verify_runtime, managed, *,
                  main=MAIN, cgroup_root=CGROUP_ROOT, lock_dir=DIRECT_LOCK,
-                 clock=time.monotonic, sleep=time.sleep, flock=None):
+                 clock=time.monotonic, sleep=time.sleep, flock=None, deadline=None):
         require(all(callable(f) for f in (run, verify_authority, verify_runtime)), STATE)
         require(type(managed) in (set, frozenset) and managed
                 and all(type(tag) is str and TAG.fullmatch(tag) for tag in managed),
                 'REBUILD_AGENT_MANAGED_PROFILE_UNPROVED')
         self._managed = frozenset(managed)
+        require(deadline is None or type(deadline) in (int, float) and math.isfinite(deadline), AUTHORITY)
+        self._clock, self._deadline = clock, deadline
         self._runner = run
         self._authority = verify_authority
         self._runtime = verify_runtime
@@ -242,10 +248,15 @@ class HostMainSession:
         return fd
 
     def _check_authority(self):
+        self._check_deadline()
         self._check_lock()
         allowed = self._authority()
         self._check_lock()
+        self._check_deadline()
         require(allowed is True, AUTHORITY)
+
+    def _check_deadline(self):
+        require(self._deadline is None or self._clock() < self._deadline, AUTHORITY)
 
     @contextmanager
     def _action(self, allowed, advance=None):

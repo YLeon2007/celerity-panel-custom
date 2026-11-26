@@ -343,6 +343,9 @@ class AgentWindow:
         except OSError:
             raise WindowError(MAIN_DRIFT) from None
 
+    def _guard_main_rename(self):
+        """No I/O here; a held session checks its absolute time budget."""
+
     def publish_main(self, before, desired):
         """One exact-generation CAS using reopened, journal-bound image bytes.
 
@@ -377,6 +380,7 @@ class AgentWindow:
                     self.require_quiet()
                     self._check_main_dir(parent)
                     require(_read_main(parent, scratch) == staged and _read_main(parent, name) == before, MAIN_DRIFT)
+                    self._guard_main_rename()
                     renamed = True
                     os.replace(scratch, name, src_dir_fd=parent, dst_dir_fd=parent)
                     os.fsync(parent)

@@ -14,6 +14,7 @@ from rebuildTransitMainWindowHost import System, profile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from rebuildTransitMainSession import DIRECT_LOCK, HostMainSession, WindowError
+import rebuildTransitMainWindow as window
 
 
 # Same directory-flock syscall and flags as DIRECT, in a fresh process that
@@ -91,10 +92,10 @@ class Host(unittest.TestCase):
             self.manager.cg.rmdir()
         return result
 
-    def session(self):
+    def session(self, *, deadline=None):
         return HostMainSession(self.run_model, self.authority, self.runtime, frozenset({'vless-in'}),
                                main=self.main, cgroup_root=self.cg, lock_dir=self.lock,
-                               clock=lambda: self.manager.now, sleep=self.manager.sleep)
+                               clock=lambda: self.manager.now, sleep=self.manager.sleep, deadline=deadline)
 
     def competitor_args(self, path, mode):
         return [sys.executable, '-BI', '-c', COMPETITOR, str(path), mode]
@@ -239,6 +240,25 @@ class Host(unittest.TestCase):
             twin.chmod(0o640)
             twin.replace(self.main)
             self.assert_sticky(session, 'REBUILD_MAIN_CAS_UNPROVED', lambda: session.publish(*p))
+        self.assertEqual(self.effects(), ['stop'])
+
+    def test_deadline_at_the_final_read_never_renames(self):
+        deadline = self.manager.now + 120
+        read = window._read_main
+        with self.session(deadline=deadline) as session:
+            p = self.capture(session)
+
+            def after_last_read(parent, name):
+                result = read(parent, name)
+                if name == self.main.name and any(n.startswith('.c3-main-') for n in os.listdir(parent)):
+                    self.manager.now = deadline
+                return result
+
+            with patch.object(window, '_read_main', side_effect=after_last_read):
+                self.assert_sticky(session, 'REBUILD_MAIN_AUTHORITY_UNPROVED', lambda: session.publish(*p))
+            self.assertEqual(self.manager.now, deadline)
+            self.assertEqual(self.main.read_bytes(), p.before.data)
+            self.assertFalse(list(self.main.parent.glob('.c3-main-*')))
         self.assertEqual(self.effects(), ['stop'])
 
     def test_post_replace_directory_sync_ack_loss_is_not_replayed(self):
