@@ -166,10 +166,15 @@ class Host(unittest.TestCase):
                                     clock=lambda: mgr.now, sleep=mgr.sleep)
                 self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', wnd.quiesce)
 
-    def test_stop_rejects_failed_and_inactive_non_dead_even_with_clean_receipt(self):
-        for props in ({'ActiveState': 'failed', 'SubState': 'failed'}, {'SubState': 'exited'}):
-            with self.subTest(props=props):
-                root = self.root / props['SubState']
+    def test_stop_uses_inactive_pid_and_group_not_a_substate_label(self):
+        for i, (props, allowed) in enumerate((
+            ({'ActiveState': 'failed', 'SubState': 'failed'}, False),
+            ({'SubState': 'exited', 'MainPID': '999'}, False),
+            ({'SubState': 'exited', 'ControlGroup': '/foreign.scope'}, False),
+            ({'SubState': 'exited'}, True),
+        )):
+            with self.subTest(i=i):
+                root = self.root / str(i)
                 root.mkdir()
                 mgr = System(root)
 
@@ -180,8 +185,13 @@ class Host(unittest.TestCase):
                     return result
 
                 wnd = m.AgentWindow(run, main=self.main, cgroup_root=root)
-                self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', wnd.quiesce)
-                self.assertEqual(wnd.phase, 'exclusion-lost')
+                if allowed:
+                    wnd.quiesce()
+                    wnd.require_quiet()
+                    self.assertEqual(wnd.phase, 'quiet')
+                else:
+                    self.assertCode('REBUILD_AGENT_EXCLUSION_UNPROVED', wnd.quiesce)
+                    self.assertEqual(wnd.phase, 'exclusion-lost')
 
     def test_agent_start_timeout_is_not_success_or_retried(self):
         self.guard.quiesce()

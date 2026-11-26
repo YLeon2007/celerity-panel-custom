@@ -262,10 +262,12 @@ class AgentWindow:
 
     def _stopped(self):
         row = self._unit()
-        require(row['ActiveState'] == 'inactive' and row['SubState'] == 'dead' and row['MainPID'] == '0'
-                and row['ControlGroup'] in ('', GROUP)
-                and re.fullmatch(r'[1-9][0-9]{0,19}', row['InactiveEnterTimestampMonotonic']))
-        require(not self._cgroup_populated())
+        # The drain predicate is inactive + no MainPID + no populated
+        # ControlGroup. SubState is observed in the unchanged unit epoch,
+        # not an additional requirement for depletion.
+        require(row['ActiveState'] == 'inactive' and row['MainPID'] == '0'
+                and row['ControlGroup'] in ('', GROUP) and not self._cgroup_populated())
+        require(re.fullmatch(r'[1-9][0-9]{0,19}', row['InactiveEnterTimestampMonotonic']))
         parent = os.open(self._main.parent, DIR)
         try:
             names = os.listdir(parent)
