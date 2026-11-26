@@ -42,6 +42,7 @@ _FIELDS = {
     'read': (), 'stop': (), 'capture': ('target',),
     'publish': ('beforeSha256', 'desiredSha256'),
     'restart': (), 'start': (), 'reconcile': (), 'verify': (),
+    'hold': (), 'check': (), 'discard-read': (), 'release': (),
 }
 _SHA256 = re.compile(r'[0-9a-f]{64}')
 _SMALL_FRAME = 1024  # including LF
@@ -89,7 +90,7 @@ def _request(line, expected):
         raise WindowError(REQUEST)
     fields = _FIELDS[action]
     require(obj.keys() == {'action', *fields} and all(type(obj[key]) is str for key in fields), REQUEST)
-    require(action == expected, PHASE)
+    require(action in expected, PHASE)
     return obj
 
 
@@ -159,8 +160,8 @@ class _Channel:
         require(pending is None, PHASE)
         self.remaining()
 
-    def request(self, action):
-        limit = _CAPTURE_FRAME if action == 'capture' else _SMALL_FRAME
+    def request(self, *actions):
+        limit = _CAPTURE_FRAME if actions == ('capture',) else _SMALL_FRAME
         line = bytearray()
         while len(line) < limit:
             chunk = self._read_wait(min(_CHUNK, limit - len(line)))
@@ -171,7 +172,7 @@ class _Channel:
                 continue
             require(end == len(chunk) - 1, PHASE)
             line.extend(chunk[:end])
-            result = _request(line, action)
+            result = _request(line, actions)
             # The caller must wait for this phase's reply, including verify.
             # Check already available bytes/EOF before dispatch, without waiting.
             self._peer_waiting()
@@ -251,13 +252,15 @@ class HostMainWire:
             require(session.read() == snapshot, MAIN_DRIFT)
         channel.ok(_snapshot(snapshot))
 
-    def _exchange(self, channel, session):
+    def _exchange(self, channel, session, *, held=False):
         baseline = session.read()
         if self._on_read is not None:
             require(self._on_read(session, baseline, channel.deadline) is True, SETTLEMENT)
         channel.ok(_snapshot(baseline))
 
-        channel.request('stop')
+        first = channel.request('stop', 'discard-read') if held else channel.request('stop')
+        if first['action'] == 'discard-read':
+            return False
         session.stop()
         channel.ok()
 
@@ -290,9 +293,59 @@ class HostMainWire:
         verified = session.read()
         require(verified == reconciled, MAIN_DRIFT)
         self._settle(channel, session, self._on_verify, verified)
-        channel.terminal_eof()
+        if not held:
+            channel.terminal_eof()
+        return True
+
+    def _held_exchange(self, channel, lock_factory, verify_hold):
+        channel.request('hold')
+        with lock_factory() as flock:
+            def confirm():
+                channel.remaining()
+                flock.check()
+                require(verify_hold(channel.deadline) is True, 'REBUILD_MAIN_AUTHORITY_UNPROVED')
+                flock.check()
+                channel.remaining()
+
+            confirm()
+            channel.ok()
+            steps = 0
+            while True:
+                action = channel.request('read', 'check', 'release')['action']
+                confirm()
+                if action == 'read':
+                    steps += 1
+                    require(steps <= 256, LIMIT)
+                    # The original flock survives step cleanup, later steps,
+                    # journal ACK, graph COMMIT and exact panel readback.
+                    with self._factory(channel.deadline, flock) as session:
+                        complete = self._exchange(channel, session, held=True)
+                    confirm()
+                    if not complete:
+                        channel.ok()
+                    continue
+                channel.ok()
+                if action == 'release':
+                    # A release reply is only intent. Clean EOF and exit zero
+                    # after the original FD closes is the release receipt.
+                    channel.terminal_eof()
+                    confirm()
+                    return
+
+    def serve_held(self, read_fd, write_fd, *, deadline, lock_factory, verify_hold):
+        """Serve one operation; the trusted factory takes (deadline, flock).
+
+        Hold before the first read; check at idle between completed steps;
+        discard-read is available only before stop. Explicit release, then
+        EOF/exit zero, is the sole success path. Any interrupted step revokes
+        this transport; there is no automatic compensation or new holder.
+        """
+        return self._serve(read_fd, write_fd, deadline, lock_factory, verify_hold)
 
     def serve(self, read_fd, write_fd, *, deadline):
+        return self._serve(read_fd, write_fd, deadline, None, None)
+
+    def _serve(self, read_fd, write_fd, deadline, lock_factory, verify_hold):
         if not self._admission.acquire(blocking=False):  # deliberately never reopened
             return 1
         try:
@@ -305,10 +358,13 @@ class HostMainWire:
                         restore.callback(os.set_blocking, fd, True)
                 channel = _Channel(read_fd, write_fd, deadline)
                 try:
-                    channel.request('read')
-                    with self._factory(deadline) as session:
-                        channel.remaining()
-                        self._exchange(channel, session)
+                    if lock_factory is None:
+                        channel.request('read')
+                        with self._factory(deadline) as session:
+                            channel.remaining()
+                            self._exchange(channel, session)
+                    else:
+                        self._held_exchange(channel, lock_factory, verify_hold)
                 except _TransportLost:
                     return 1
                 except Exception as error:

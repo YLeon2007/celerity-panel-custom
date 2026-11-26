@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 import rebuildTransitMainSessionHost as model
-from rebuildTransitMainSession import HostMainSession, WindowError
+from rebuildTransitMainSession import HostMainFlock, HostMainSession, WindowError
 from rebuildTransitMainWire import HostMainWire
 from rebuildTransitMainWindow import MAX_MAIN
 
@@ -32,7 +32,7 @@ def target(data):
     return base64.b64encode(data).decode('ascii')
 
 
-def fixture(root, fault, seconds):
+def fixture(root, fault, seconds, held=False):
     main, cgroup, lock = (root / name for name in ('MAIN', 'slice', 'lock'))
     manager = model.System(cgroup)
     deadline = time.monotonic() + seconds
@@ -68,21 +68,22 @@ def fixture(root, fault, seconds):
             user = {'id': 'drained'}
             if os.environ.get('C3_SYNTHETIC_SYNC_USERS') == '1':
                 user['email'] = 'fixture@example.invalid'
-            stage.write_bytes(model.config(users=[user]))
+            route = json.loads(main.read_bytes())['routing']['rules'][0]['outboundTag']
+            stage.write_bytes(model.config(route, [user]))
             stage.chmod(0o640)
             stage.replace(main)
         if command in ('stop', 'start'):
             record(command)
         return result
 
-    def factory(end):
+    def factory(end, flock=None):
         assert end == deadline
         record('factory')
         if fault == 'unsafe-refusal':
             raise WindowError('REBUILD_AGENT_EXCLUSION_UNPROVED private path or config')
         return HostMainSession(runner, lambda: time.monotonic() < end,
                                lambda phase, snap: snap.main.data == main.read_bytes(), {'vless-in'},
-                               main=main, cgroup_root=cgroup, lock_dir=lock,
+                               main=main, cgroup_root=cgroup, lock_dir=lock, flock=flock,
                                clock=lambda: manager.now, sleep=manager.sleep)
 
     def settlement(action, snapshot, end):
@@ -99,7 +100,10 @@ def fixture(root, fault, seconds):
     wire = HostMainWire(factory,
                         on_reconcile=lambda *args: settlement('settle-reconcile', *args),
                         on_verify=lambda *args: settlement('settle-verify', *args))
-    if fault == 'publication-ack':
+    if held:
+        result = wire.serve_held(0, 1, deadline=deadline, lock_factory=lambda: HostMainFlock(lock),
+                                 verify_hold=lambda end: end == deadline and time.monotonic() < end)
+    elif fault == 'publication-ack':
         fsync = os.fsync
         with patch.object(os, 'fsync', lose_publication_ack):
             result = wire.serve(0, 1, deadline=deadline)
@@ -110,7 +114,7 @@ def fixture(root, fault, seconds):
 
 
 class Wire(unittest.TestCase):
-    def open(self, fault='', seconds=6.0, initial=None):
+    def open(self, fault='', seconds=6.0, initial=None, held=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = root = Path(tmp.name)
@@ -121,7 +125,8 @@ class Wire(unittest.TestCase):
         self.lock = root / 'lock'
         self.lock.mkdir()
         (root / 'slice').mkdir()
-        self.child = child = subprocess.Popen([sys.executable, '-B', __file__, '--fixture', str(root), fault, str(seconds)],
+        self.child = child = subprocess.Popen([sys.executable, '-B', __file__, '--fixture', str(root), fault, str(seconds),
+                                               *(['held'] if held else [])],
                                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                               bufsize=0)
         assert child.stdin is not None and child.stdout is not None and child.stderr is not None
@@ -427,7 +432,47 @@ class Wire(unittest.TestCase):
         self.assertEqual(self.trace(), ['factory'])
 
 
+    def test_operation_hold_spans_forward_inverse_and_final_release(self):
+        self.open(held=True)
+        self.assertIsNone(self.ok('hold'))
+        self.assert_lock(True)
+        self.ok('read')
+        self.assertIsNone(self.ok('discard-read'))
+        self.assertNotIn('stop', self.trace())
+        self.assert_lock(True)
+        for route in ('b', 'a'):
+            self.ok('read')
+            self.ok('stop')
+            capture = self.ok('capture', target=target(model.config(route, [{'id': 'other'}])))
+            self.ok('publish', **self.publication(capture))
+            self.ok('restart')
+            self.ok('start')
+            self.assertEqual(self.ok('reconcile'), self.ok('verify'))
+            self.assertIsNone(self.ok('check'))  # step disposed; operation FD still held
+            self.assert_lock(True)
+            self.assertEqual(json.loads(self.main.read_bytes()), model.profile(route, [{'id': 'drained'}]))
+        self.assertEqual(self.trace().count('stop'), 2)
+        self.assertIsNone(self.ok('release'))
+        self.assert_lock(True)
+        self.finish(0)
+
+    def test_idle_flock_drift_latches_refusal(self):
+        self.open(held=True)
+        self.ok('hold')
+        retired = self.root / 'retired'
+        self.lock.rename(retired)
+        self.lock.mkdir()
+        self.refuse('REBUILD_MAIN_LOCK_UNPROVED', self.send('check'))
+        self.assertEqual(self.trace(), [])
+
+    def test_held_channel_requires_explicit_release(self):
+        self.open(held=True)
+        self.ok('hold')
+        self.input.close()
+        self.refuse('REBUILD_MAIN_WIRE_EOF')
+
+
 if __name__ == '__main__':
     if sys.argv[1:2] == ['--fixture']:
-        raise SystemExit(fixture(Path(sys.argv[2]), sys.argv[3], float(sys.argv[4])))
+        raise SystemExit(fixture(Path(sys.argv[2]), sys.argv[3], float(sys.argv[4]), sys.argv[5:] == ['held']))
     unittest.main()

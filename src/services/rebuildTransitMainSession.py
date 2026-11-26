@@ -49,6 +49,76 @@ class MainPublication(NamedTuple):
     desired: bytes
 
 
+class HostMainFlock:
+    """Operation-scoped DIRECT flock. A step borrows but never releases it."""
+    def __init__(self, path=DIRECT_LOCK):
+        self.path = Path(path)
+        require(self.path.is_absolute(), LOCK)
+        self._fd = None
+        self._owner = None
+        self._borrowed = False
+        self._lost = False
+
+    def __enter__(self):
+        require(self._owner is None, LOCK)
+        self._owner = (os.getpid(), threading.get_ident())
+        try:
+            self._fd = os.open(self.path, DIR)
+            info = os.fstat(self._fd)
+            self._identity = (info.st_dev, info.st_ino)
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.check()
+            return self
+        except BaseException as error:
+            self._dispose(error)
+            if isinstance(error, OSError):
+                raise WindowError(LOCK) from None
+            raise
+
+    def check(self):
+        fd = self._fd
+        if fd is None or self._lost or self._owner != (os.getpid(), threading.get_ident()):
+            raise WindowError(LOCK)
+        try:
+            held, named = os.fstat(fd), self.path.lstat()
+            require(stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(named.st_mode)
+                    and (held.st_dev, held.st_ino) == self._identity == (named.st_dev, named.st_ino), LOCK)
+        except (OSError, WindowError):
+            self._lost = True
+            raise WindowError(LOCK) from None
+
+    @contextmanager
+    def borrow(self):
+        self.check()
+        require(not self._borrowed, LOCK)
+        self._borrowed = True
+        try:
+            yield self
+            self.check()
+        finally:
+            self._borrowed = False
+
+    def _dispose(self, error):
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                if error is None:
+                    raise WindowError(LOCK) from None
+                error.add_note('REBUILD_MAIN_LOCK_CLOSE_UNCONFIRMED')
+
+    def __exit__(self, exc_type, error, traceback):
+        require(not self._borrowed and self._owner == (os.getpid(), threading.get_ident()), LOCK)
+        try:
+            if error is None:
+                self.check()
+        except BaseException as lock_error:
+            self._dispose(lock_error)
+            raise
+        self._dispose(error)
+
+
 def _generation(row):
     return XrayGeneration(int(row['MainPID']), row['InvocationID'])
 
@@ -100,7 +170,7 @@ class HostMainSession:
 
     def __init__(self, run, verify_authority, verify_runtime, managed, *,
                  main=MAIN, cgroup_root=CGROUP_ROOT, lock_dir=DIRECT_LOCK,
-                 clock=time.monotonic, sleep=time.sleep):
+                 clock=time.monotonic, sleep=time.sleep, flock=None):
         require(all(callable(f) for f in (run, verify_authority, verify_runtime)), STATE)
         require(type(managed) in (set, frozenset) and managed
                 and all(type(tag) is str and TAG.fullmatch(tag) for tag in managed),
@@ -109,10 +179,10 @@ class HostMainSession:
         self._runner = run
         self._authority = verify_authority
         self._runtime = verify_runtime
-        self._lock = Path(lock_dir)
-        require(self._lock.is_absolute(), LOCK)
-        self._fd = None
-        self._identity = None
+        self._flock = HostMainFlock(lock_dir) if flock is None else flock
+        require(type(self._flock) is HostMainFlock, LOCK)
+        self._lock_context = self._flock if flock is None else flock.borrow()
+        self._lock_entered = False
         self._owner = None
         self._state = 'new'
         self._busy = False
@@ -127,13 +197,8 @@ class HostMainSession:
         self._state = 'entering'
         self._owner = (os.getpid(), threading.get_ident())
         try:
-            try:
-                self._fd = os.open(self._lock, DIR)
-                info = os.fstat(self._fd)
-                self._identity = (info.st_dev, info.st_ino)
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                raise WindowError(LOCK) from None
+            self._lock_context.__enter__()
+            self._lock_entered = True
             self._check_authority()
             self._state = 'ready'
             return self
@@ -154,25 +219,27 @@ class HostMainSession:
 
     def _close(self, error):
         self._state = 'closed'
-        fd, self._fd = self._fd, None
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                if error is None:
-                    raise WindowError(LOCK) from None
-                error.add_note('REBUILD_MAIN_LOCK_CLOSE_UNCONFIRMED')
+        if self._lock_entered:
+            self._lock_entered = False
+            if self._lock_context is self._flock:
+                # __exit__ already checked lock identity on a clean step.
+                self._flock._dispose(error)
+            else:
+                self._lock_context.__exit__(type(error) if error is not None else None, error,
+                                            error.__traceback__ if error is not None else None)
 
     def _check_lock(self):
-        fd = self._fd
-        if fd is None or self._state in ('failed', 'closed'):
-            raise WindowError(STATE)
-        try:
-            held, named = os.fstat(fd), self._lock.lstat()
-            require(stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(named.st_mode)
-                    and (held.st_dev, held.st_ino) == self._identity == (named.st_dev, named.st_ino), LOCK)
-        except OSError:
-            raise WindowError(LOCK) from None
+        require(self._lock_entered and self._state not in ('failed', 'closed'), STATE)
+        self._flock.check()
+
+    @property
+    def _fd(self):
+        # DIRECT verifies this very same FD before its receipt CAS.
+        self._check_lock()
+        fd = self._flock._fd
+        if fd is None:
+            raise WindowError(LOCK)
+        return fd
 
     def _check_authority(self):
         self._check_lock()

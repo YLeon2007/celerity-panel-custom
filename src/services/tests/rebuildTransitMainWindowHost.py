@@ -95,8 +95,8 @@ class System:
             if self.start_error:
                 raise subprocess.TimeoutExpired(argv, timeout)
             self.active = True
-            self.inv = 'b' * 32
             self.generation += 1
+            self.inv = f'{self.generation + 600:032x}'
             self.events.write_text('populated 1\nfrozen 0\n')
             return ''
         raise AssertionError(argv)
