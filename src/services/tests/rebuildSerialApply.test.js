@@ -31,8 +31,9 @@ const unknown = { code: 'REBUILD_MAIN_CUTOVER_UNRESOLVED', retryAllowed: false }
 test.after(() => require.cache[require.resolve('../sshPoolService')]?.exports.closeAll());
 
 // Real service, planner, adapter, local locks, journal, artifacts and BSON.
-// Native-host observation and Mongo storage/driver replies are modeled.
-function fixture(t, fault) {
+// Native-host observation is modeled. Optional native store executes the exact
+// transaction, command and BSON CAS against a disposable real replica set.
+function fixture(t, fault, native) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'c3-panel-serial.'));
     t.after(() => fs.rmSync(root, { recursive: true }));
     for (const dir of ['journal', 'artifacts']) fs.mkdirSync(path.join(root, dir), { mode: 0o700 });
@@ -181,14 +182,46 @@ function fixture(t, fault) {
         assert(await verifyPayload(n, users)); assert(await verifyPayload(n, users));
         return { added: 0, removed: 0, errors: 0, total: users.length };
     } };
-    const make = serialMainAuthority => createRebuildService({ Link, Node: { db, find: () => query(nodes) }, State: { db, find: () => query([]) },
-        L2tpUser: { db }, sync, locks, env: { C3_REBUILD_ENABLED: 'true' }, assertNoRelayAccountIntent: async () => {},
+    const selectedDb = native?.db ?? db;
+    const make = serialMainAuthority => createRebuildService({ Link: native ?? Link,
+        Node: { db: selectedDb, find: () => query(nodes) }, State: { db: selectedDb, find: () => query([]) },
+        L2tpUser: { db: selectedDb }, sync, locks, env: { C3_REBUILD_ENABLED: 'true' }, assertNoRelayAccountIntent: async () => {},
         connect() { assert.fail('ordinary SSH must not enter'); }, serialMainAuthority,
         cache: { async invalidateAllSubscriptions() { assert(fenced()); counts.invalidate++; events.push('invalidate'); } },
     });
     return { service: make(authority), ordinary: make(), current, after, counts, events, state, artifacts,
         lock: () => lock, stored: () => stored.map(clone) };
 }
+
+test('real replica set accepts exact wire BSON and one raw majority COMMIT', { skip: !process.env.C3_MONGOD }, async t => {
+    const mongo = require('../../modules/relay-l2tp/tests/helpers/installedEditMongoFixture').fixture();
+    t.after(() => mongo.stop());
+    await mongo.start();
+    const realLink = mongo.models.CascadeLink;
+    const collection = realLink.collection;
+    const seed = links.map(clone);
+    seed[0].foreign.typeWitness = new BSON.Long(7);
+    await collection.insertMany(seed, { writeConcern: { w: 'majority' } });
+    const f = fixture(t, undefined, realLink);
+    const countBefore = mongo.commands.length;
+    assert.equal((await f.service.applySerialMain(anchor)).status, 'applied');
+    assert.equal(f.lock(), null);
+    const calls = mongo.commands.slice(countBefore);
+    const writes = calls.filter(c => c.name === 'update' && c.collection === collection.collectionName);
+    assert.equal(writes.length, links.length);
+    const commit = calls.filter(c => c.name === 'commitTransaction');
+    assert.equal(commit.length, 1);
+    assert.equal(commit[0].writeConcern.w, 'majority');
+    assert(writes.every(c => c.lsid === commit[0].lsid && c.txnNumber === commit[0].txnNumber && c.autocommit === false));
+    assert.equal(calls.filter(c => c.name === 'abortTransaction').length, 0);
+    const stored = await collection.find({}, { readPreference: 'primary', readConcern: { level: 'majority' }, promoteValues: false })
+        .sort({ _id: 1 }).toArray();
+    assert.equal(stored[0].foreign.typeWitness._bsontype, 'Long');
+    for (const row of stored) {
+        assert.equal(row.rebuildAppliedMainSha256, sha(Buffer.from(f.current.get(String(row.portalNode)).data, 'base64')));
+        assert.equal(Object.hasOwn(row, 'rebuildDesiredEdited'), false);
+    }
+});
 
 test('default factory has no serial entry; ordinary Apply retains the guard even with a private provider', async t => {
     const f = fixture(t);
