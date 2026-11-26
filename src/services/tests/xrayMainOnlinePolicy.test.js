@@ -241,6 +241,21 @@ test('mounted Rebuild Preview is policy-only; installed relay, bridge and subscr
     const protectedDigests = Object.fromEntries(candidates.filter(p => !isClientMain(p)).map(p => {
         const legacy = structuredClone(p.config);
         if (p.profile === 'main' && legacy.api) assert.equal(legacy.api.services.pop(), 'RoutingService');
+        if (key(p) === 'relay/main') {
+            // The loopback API rule now precedes both pairs of PPP guards.
+            // Restore only its historical position for comparison with 1fb0f3e.
+            const rules = legacy.routing.rules;
+            assert.deepEqual(rules[0], { inboundTag: ['API_INBOUND'], outboundTag: 'API', type: 'field' });
+            const scopes = ['rebuild-relay-ingress', `relay-l2tp-${group._id}`];
+            const guards = scopes.flatMap(tag => ['domain', 'ip'].map(selector => ({ tag, selector })));
+            for (const [index, { tag, selector }] of guards.entries()) {
+                const rule = rules[index + 1];
+                assert.deepEqual(rule.inboundTag, [tag]);
+                assert.equal(rule.outboundTag, 'rebuild-l2tp-block');
+                assert.ok(rule[selector]?.length > 0);
+            }
+            rules.splice(guards.length, 0, rules.shift());
+        }
         return [key(p), profileSha256(profileBytes(legacy))];
     }));
     const bodyDigests = Object.fromEntries(Object.entries(beforeBodies).map(([format, bytes]) => [format, profileSha256(bytes)]));

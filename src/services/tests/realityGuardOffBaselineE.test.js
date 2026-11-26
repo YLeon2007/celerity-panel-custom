@@ -1,8 +1,8 @@
 'use strict';
 
 // (e): synthetic byte oracle from release 2946de17231502807150b3ecc1939614390807fe.
-// Generated with Node v22.23.1 against the release's stock modules. The only
-// allowed config change since that baseline is statsUserOnline on client MAIN.
+// Generated with Node v22.23.1 against the release's stock modules. Assert and
+// strip only the intended MAIN additions: RoutingService and client online stats.
 // No panel bootstrap, listeners, persistence, cron or transport is needed.
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -82,16 +82,21 @@ function request(app, format, token) {
 function configBaselineBytes(bytes, { role, profile, serialize, name }) {
     const config = JSON.parse(bytes);
     const level = config.policy?.levels?.['0'];
-    const clientMain = profile === 'main' && ['portal', 'standalone'].includes(role);
-    if (!clientMain) {
-        assert.equal(Object.hasOwn(level ?? {}, 'statsUserOnline'), false, name);
-        return Buffer.from(bytes);
-    }
-    assert.equal(level?.statsUserOnline, true, `${name}: client MAIN must enable online stats`);
-    // Check exact serialization first, so projection cannot hide whitespace or
-    // duplicate keys. After deleting the field, all remaining bytes are pinned.
     assert.ok(serialize(config) === bytes, `${name}: noncanonical config bytes`);
-    delete level.statsUserOnline;
+    if (profile === 'main') {
+        assert.deepEqual(config.api?.services, ['HandlerService', 'StatsService', 'RoutingService'], name);
+        const listeners = config.inbounds.filter(inbound => inbound.tag === 'API_INBOUND');
+        assert.equal(listeners.length, 1, name);
+        assert.equal(listeners[0].listen, '127.0.0.1', name);
+        assert.deepEqual(config.routing.rules[0], { inboundTag: ['API_INBOUND'], outboundTag: 'API', type: 'field' }, name);
+        config.api.services.pop();
+    }
+    const clientMain = profile === 'main' && ['portal', 'standalone'].includes(role);
+    if (clientMain) {
+        assert.equal(level?.statsUserOnline, true, `${name}: client MAIN must enable online stats`);
+        delete level.statsUserOnline;
+    } else assert.equal(Object.hasOwn(level ?? {}, 'statsUserOnline'), false, name);
+    // All remaining bytes stay pinned to the original oracle.
     return Buffer.from(serialize(config));
 }
 
