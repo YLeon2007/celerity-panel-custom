@@ -269,6 +269,46 @@ test('fence loss with POST outstanding invalidates even a correct ACK without re
     assert.equal(state.requests.length, 1);
 });
 
+test('exact-mode /sync refuses a rotated UUID at the same email before the POST', async () => {
+    const { state, scoped, sync } = fixture();
+    state.users = [{ enabled: true, nodes: [nodeId], userId: 'existing', xrayUuid: uid(2) }];
+    let proved = 0;
+    await scoped(() => assert.rejects(sync(nodeId, { verifyFence: () => true, verifyPayload(target, users) {
+        assert.deepEqual(target, exactTarget);
+        assert.deepEqual(users.map(({ id, email }) => [id, email]), [[uid(2), 'existing']]);
+        proved++;
+        return users[0].id === uid(1);
+    } }), safe('REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED')));
+    assert.equal(proved, 1);
+    assert.deepEqual(state.requests, []);
+});
+
+test('exact-mode /sync binds the original immutable payload before and after the only dispatch', async () => {
+    const { state, scoped, sync } = fixture();
+    state.users = [{ enabled: true, nodes: [nodeId], userId: 'retained', xrayUuid: uid(1) }];
+    let proved = 0, original;
+    const noDelta = ack(1, { added: 0, removed: 0 });
+    const verifyPayload = (target, users) => {
+        assert.deepEqual(target, exactTarget);
+        assert(Object.isFrozen(users) && Object.isFrozen(users[0]));
+        if (proved++ % 2 === 0) original = users;
+        else assert.equal(users, original);
+        return true;
+    };
+    state.reply = request => {
+        assert.equal(request.data.users, original);
+        assert(Object.isFrozen(request.data));
+        return noDelta;
+    };
+    const opts = { verifyFence: () => true, verifyPayload };
+    assert.deepEqual(await scoped(() => sync(nodeId, opts)), JSON.parse(noDelta.data));
+    assert.equal(proved, 2);
+    state.reply = () => ack(1, { added: 1, removed: 0 });
+    await scoped(() => assert.rejects(sync(nodeId, opts), safe(unconfirmed)));
+    assert.equal(proved, 3);
+    assert.equal(state.requests.length, 2);
+});
+
 for (const [name, reply] of [
     ['HTTP refusal', () => ({ status: 503, data: fixtureMarker })],
     ['redirect', () => ({ status: 307, data: fixtureMarker })],

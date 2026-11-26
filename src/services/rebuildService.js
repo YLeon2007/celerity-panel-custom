@@ -69,6 +69,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     L2tpUser=require('../modules/relay-l2tp/models/l2tpUserModel'),
     createRelayDirect=options=>require('./rebuildRelayDirect').createRelayDirect(options),
     assertNoRelayAccountIntent=()=>assertNoPendingRelayAccounts(L2tpUser.db),
+    serialMainAuthority,
     grantDb=env===process.env?L2tpUser.db:undefined,
     relayGrantStore=grantDb&&{snapshot:()=>require('./rebuildRelayGrantStore').createRelayGrantStore({db:grantDb,env}).snapshot()}}={}){
     const gate=()=>{if(!isRebuildEnabled(env))throw fail('REBUILD_DISABLED');};
@@ -107,9 +108,14 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const underApply=(alreadyHeld,fn)=>alreadyHeld===undefined?guardedLocks.run(fn):
         checked(heldVerifiers.has(alreadyHeld)?alreadyHeld:undefined,fn);
     const panelTLS=()=>{const cert=require('./configGenerator').buildPanelInlineCertificate();return {...cert,serverName:cert?.domain||env.PANEL_DOMAIN};};
-    async function installedStates(ids){
+    async function installedStates(ids, readOptions){
         const states=new Map(), seen=new Set();
-        const records=await State.find({node:{$in:ids}}).select('node status desiredState routingMode routingVersion routeGroup activePathKey clientCidr tproxyPort fwmark routeTable backupId secretRevision +rebuildMachineId +rebuildInstallToken').lean();
+        const query=State.find({node:{$in:ids}}).select('node status desiredState routingMode routingVersion routeGroup activePathKey clientCidr tproxyPort fwmark routeTable backupId secretRevision +rebuildMachineId +rebuildInstallToken');
+        if(readOptions){
+            if(readOptions.session)query.session(readOptions.session);
+            else query.read('primary').readConcern('majority');
+        }
+        const records=await query.lean();
         for(const row of records){
             const id=String(row.node);
             if(seen.has(id))throw fail('REBUILD_L2TP_STATE_TRANSITION');
@@ -510,7 +516,16 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const relayRetire=createRebuildRelayRetire({Link,Node,State,L2tpUser,env,sync,relayGrantStore,locks:guardedLocks,gate,
         retireGraph,checkRetireExits,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
+    // No HTTP/MCP caller binds this private constructor dependency. In
+    // particular, execute() cannot enter it, even on the same service.
+    const serial=typeof serialMainAuthority==='function' && require('./rebuildSerialApply').createSerialApply({
+        Link,Node,State,env,locks:guardedLocks,gate,compose,readStates:(ids,session)=>installedStates(ids,{session}),
+        syncNodeUsers:(id,options)=>sync.syncRebuildNodeUsersAfterResume(id,options),
+        publishedKeyMismatch:inconsistentPublishedKey,admit:serialMainAuthority,
+        async invalidate(){await cache.invalidateAllSubscriptions();await require('./cascadeService')._invalidateTopologyCache();},
+    });
     return {execute,retireGraph,verifyDraftKcp,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,recoverRelayInstall,...relayRemoval,...relayRetire,
+        ...(serial&&{applySerialMain:serial}),
         createRelayAccount: input=>relayAccounts().create(input),
         disableRelayAccount: input=>relayAccounts().disable(input),
         deleteRelayAccount: input=>relayAccounts().delete(input),

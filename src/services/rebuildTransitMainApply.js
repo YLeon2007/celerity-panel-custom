@@ -17,6 +17,12 @@ const error = code => Object.assign(new Error(code), { code });
 const need = (okay, code = 'REBUILD_MAIN_PROOF_UNCONFIRMED') => { if (!okay) throw error(code); };
 const unresolved = failure => Object.assign(error('REBUILD_MAIN_CUTOVER_UNRESOLVED'), { failure: failure ?? null, retryAllowed: false });
 const drift = 'REBUILD_MAIN_CAS_UNPROVED';
+const directReceiptReasons = [
+    'REBUILD_DIRECT_RECEIPT_UNPROVED', 'REBUILD_DIRECT_RECEIPT_LAYOUT_UNSUPPORTED',
+    'REBUILD_DIRECT_RECEIPT_REQUIRES_NETWORK', 'REBUILD_DIRECT_RECEIPT_MAIN_DRIFT',
+    'REBUILD_DIRECT_RECEIPT_WRITER_EXCLUSION_UNPROVED', 'REBUILD_DIRECT_RECEIPT_FINAL_UNPROVED',
+    'REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED',
+];
 const json = data => JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data));
 function raw(data) {
     need(typeof data === 'string' && 0 < data.length && data.length <= 4 * Math.ceil(MAX / 3));
@@ -32,7 +38,8 @@ function image(value, withRuntime) {
     need(Array.isArray(generation) && generation.length === 3 && generation.every(n => match(/^(0|[1-9][0-9]{0,24})(?![\s\S])/, n)));
     if (withRuntime) need(Array.isArray(xray) && xray.length === 2 && Number.isSafeInteger(xray[0]) && xray[0] > 0 &&
         match(/^[a-f0-9]{32}(?![\s\S])/, xray[1]) && !/^0+$/.test(xray[1]));
-    return { data, metadata, generation, ...(withRuntime ? { xray } : {}) };
+    return Object.freeze({ data, metadata: Object.freeze([...metadata]), generation: Object.freeze([...generation]),
+        ...(withRuntime ? { xray: Object.freeze([...xray]) } : {}) });
 }
 function separated(data, managed) {
     const topology = json(data), byTag = new Map();
@@ -55,6 +62,8 @@ const alwaysUnknown = new Set([
     'REBUILD_MAIN_RUNTIME_UNPROVED', 'REBUILD_MAIN_LOCK_UNPROVED', 'REBUILD_MAIN_AUTHORITY_UNPROVED',
     'REBUILD_MAIN_WIRE_SETTLEMENT', 'REBUILD_CUTOVER_ARTIFACT_UNPROVED',
     'REBUILD_NODE_USER_SYNC_UNCONFIRMED', 'REBUILD_NODE_USER_SYNC_PREPARE_FAILED', 'REBUILD_NODE_USER_SYNC_FENCE_UNPROVED', drift,
+    'REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED',
+    ...directReceiptReasons,
 ]);
 async function request(channel, action, fields) {
     const response = await channel.request({ action, ...fields });
@@ -70,10 +79,10 @@ async function request(channel, action, fields) {
 // evidence; a wire reply alone cannot ACK. `settle` publishes graph state only
 // for an applied terminal proof and must not replay ambiguous commits.
 async function runJournaledMainApply({ journal, artifacts, retain, transitions, verifyFence,
-    openWindow, verifySnapshot, verifyAgentEndpoint, syncNodeUsers, prove, verifyTerminal, settle, observe }) {
+    openWindow, verifySnapshot, verifyAgentEndpoint, verifyUserPayload, syncNodeUsers, prove, verifyTerminal, settle, observe }) {
     const owner = cutoverOwner(retain);
     need(owner && Array.isArray(transitions) && transitions.length > 0 && transitions.length <= 128 &&
-        [verifyFence, openWindow, verifySnapshot, verifyAgentEndpoint, syncNodeUsers, prove, verifyTerminal, settle, observe]
+        [verifyFence, openWindow, verifySnapshot, verifyAgentEndpoint, verifyUserPayload, syncNodeUsers, prove, verifyTerminal, settle, observe]
             .every(fn => typeof fn === 'function'), 'REBUILD_MAIN_AUTHORITY_UNPROVED');
     const rows = new Map(), nodeFences = new Map(), steps = [];
     let rank = 0;
@@ -219,10 +228,21 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
                                 await fenced(current) && await verifyAgentEndpoint(nodeId, target, settled, current) === true &&
                                 await fenced(current) && journal.read(plan.scope)?.head === state.head;
                         };
-                        const ack = await syncNodeUsers(nodeId, { verifyFence: verifySyncFence });
-                        need(own(ack, ['added', 'removed', 'errors', 'total']) && ack.errors === 0 &&
-                            Object.values(ack).every(value => Number.isSafeInteger(value) && value >= 0) && ack.added <= ack.total,
-                        'REBUILD_NODE_USER_SYNC_UNCONFIRMED');
+                        let payloadProofs = 0, provedUsers;
+                        const ack = await syncNodeUsers(nodeId, { verifyFence: verifySyncFence,
+                            async verifyPayload(target, users) {
+                                if (!Array.isArray(users) || !Object.isFrozen(users) || !users.every(Object.isFrozen) ||
+                                    payloadProofs > 1 || (payloadProofs === 1 && provedUsers !== users) || !await verifySyncFence(target)) return false;
+                                const okay = await verifyUserPayload(nodeId, target, settled, users, active.row.managed, current) === true;
+                                if (!okay || !await verifySyncFence(target)) return false;
+                                provedUsers = users;
+                                payloadProofs++;
+                                return true;
+                            },
+                        });
+                        need(payloadProofs === 2 && own(ack, ['added', 'removed', 'errors', 'total']) && ack.errors === 0 &&
+                            ack.added === 0 && ack.removed === 0 && ack.total === provedUsers.length,
+                            'REBUILD_NODE_USER_SYNC_UNCONFIRMED');
                         verified = image(await send(current, 'agent-reconcile', 'verify'), true);
                         need(equal(verified, settled), drift);
                         await active.channel.finish();

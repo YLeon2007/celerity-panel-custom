@@ -1602,8 +1602,16 @@
           "REBUILD_MAIN_CAS_UNPROVED": "Не удалось подтвердить ожидаемое состояние профиля MAIN.",
           "REBUILD_NODE_USER_SYNC_UNCONFIRMED": "Синхронизация пользователей не подтверждена.",
           "REBUILD_NODE_USER_SYNC_PREPARE_FAILED": "Не удалось подготовить синхронизацию пользователей.",
+          "REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED": "Не удалось подтвердить, что список пользователей совпадает с уже загруженным на узле. Запрос синхронизации не отправлен.",
           "REBUILD_NODE_USER_SYNC_FENCE_UNPROVED": "Не удалось подтвердить исключительное право на синхронизацию пользователей.",
-          "REBUILD_MAIN_PROOF_UNCONFIRMED": "Не удалось завершить обязательную проверку переключения."
+          "REBUILD_MAIN_PROOF_UNCONFIRMED": "Не удалось завершить обязательную проверку переключения.",
+          "REBUILD_DIRECT_RECEIPT_UNPROVED": "Не удалось подтвердить квитанцию установки DIRECT.",
+          "REBUILD_DIRECT_RECEIPT_LAYOUT_UNSUPPORTED": "Эта схема установки DIRECT не поддерживает переключение MAIN.",
+          "REBUILD_DIRECT_RECEIPT_REQUIRES_NETWORK": "Текущая служба сети DIRECT остановится при перезапуске MAIN.",
+          "REBUILD_DIRECT_RECEIPT_MAIN_DRIFT": "Состояние MAIN больше не совпадает с квитанцией DIRECT.",
+          "REBUILD_DIRECT_RECEIPT_WRITER_EXCLUSION_UNPROVED": "Не удалось подтвердить исключительный доступ для обновления квитанции DIRECT.",
+          "REBUILD_DIRECT_RECEIPT_FINAL_UNPROVED": "Финальная проверка MAIN не пройдена; квитанция DIRECT не обновлена.",
+          "REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED": "Обновление квитанции DIRECT не подтверждено."
         }
       },
       "mainRestartCount": "Перезапусков MAIN по плану: {count}",

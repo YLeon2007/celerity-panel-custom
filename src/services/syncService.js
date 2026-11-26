@@ -609,11 +609,12 @@ class SyncService {
      * This method neither acquires nor releases a lock. Its ACK is a stock HTTP
      * acknowledgement, not a durable receipt or permission to replay a POST.
      */
-    async syncRebuildNodeUsersAfterResume(nodeId, { verifyFence } = {}) {
+    async syncRebuildNodeUsersAfterResume(nodeId, { verifyFence, verifyPayload } = {}) {
         const rebuildEnabled = require('./rebuildMode').isRebuildEnabled;
         const fenceError = () => rebuildUserSyncError('REBUILD_NODE_USER_SYNC_FENCE_UNPROVED');
         const prepareError = () => rebuildUserSyncError('REBUILD_NODE_USER_SYNC_PREPARE_FAILED');
-        if (!rebuildEnabled() || typeof verifyFence !== 'function') throw fenceError();
+        if (!rebuildEnabled() || typeof verifyFence !== 'function' ||
+            (verifyPayload !== undefined && typeof verifyPayload !== 'function')) throw fenceError();
         if (typeof nodeId !== 'string' || nodeId.length !== 24 || !/^[a-f0-9]+$/.test(nodeId)) throw prepareError();
         const ownsNode = require('./rebuildLocks').nodeLockVerifier(nodeId);
         if (!ownsNode()) throw fenceError();
@@ -637,7 +638,7 @@ class SyncService {
         };
         await verify();
 
-        let users;
+        let payload;
         try {
             // One authoritative query for the complete union. Separate reads can
             // miss someone moving between explicit and inherited assignment.
@@ -647,20 +648,36 @@ class SyncService {
             // Match the HyNode defaults used by the hydrated legacy path,
             // without applying HyUser defaults (in particular, minting a UUID).
             const { security = 'reality', transport = 'tcp', flow } = node.xray;
-            users = xrayUserSyncPayload(rows, security, transport, flow);
+            const users = xrayUserSyncPayload(rows, security, transport, flow);
+            payload = Object.freeze({ users: Object.freeze(users.map(Object.freeze)) });
         } catch { throw prepareError(); }
         await verify();
+        const verifyUsers = async () => {
+            if (!verifyPayload) return;
+            // Pass the exact immutable body used by this dispatch; a second
+            // DB read or the agent's counters can't prove this was a no-op.
+            try {
+                if (ownsNode() && await verifyPayload(target, payload.users) === true && ownsNode()) return;
+            } catch { /* Keep the snapshot private. */ }
+            throw rebuildUserSyncError('REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED');
+        };
+        if (verifyPayload) {
+            await verifyUsers();
+            await verify();
+        }
 
         try {
             // _agentRequest may acquire the per-node lock. This caller already
             // owns it, so dispatch once through the underlying stock transport.
-            const response = await this._sendAgentRequest(node, 'POST', '/sync', { users },
+            const response = await this._sendAgentRequest(node, 'POST', '/sync', payload,
                 { timeout: REBUILD_USER_SYNC_TIMEOUT_MS });
             const ack = response.status === 200 && typeof response.data === 'string' && JSON.parse(response.data);
             if (ack && Object.keys(ack).length === 4
                 && ['added', 'removed', 'errors', 'total'].every(key =>
                     Object.hasOwn(ack, key) && Number.isSafeInteger(ack[key]) && ack[key] >= 0)
-                && ack.errors === 0 && ack.total === users.length && ack.added <= ack.total) {
+                && ack.errors === 0 && ack.total === payload.users.length && ack.added <= ack.total &&
+                (!verifyPayload || (ack.added === 0 && ack.removed === 0))) {
+                await verifyUsers();
                 await verify();
                 return Object.freeze(ack);
             }

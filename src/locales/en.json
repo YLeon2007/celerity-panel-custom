@@ -1602,8 +1602,16 @@
           "REBUILD_MAIN_CAS_UNPROVED": "The expected MAIN profile state could not be verified.",
           "REBUILD_NODE_USER_SYNC_UNCONFIRMED": "User synchronization was not confirmed.",
           "REBUILD_NODE_USER_SYNC_PREPARE_FAILED": "Preparation for user synchronization failed.",
+          "REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED": "The requested user list could not be verified against the users already loaded on the node. No sync was sent.",
           "REBUILD_NODE_USER_SYNC_FENCE_UNPROVED": "Exclusive authority for user synchronization could not be verified.",
-          "REBUILD_MAIN_PROOF_UNCONFIRMED": "Required cutover verification could not be completed."
+          "REBUILD_MAIN_PROOF_UNCONFIRMED": "Required cutover verification could not be completed.",
+          "REBUILD_DIRECT_RECEIPT_UNPROVED": "The DIRECT installation receipt could not be verified.",
+          "REBUILD_DIRECT_RECEIPT_LAYOUT_UNSUPPORTED": "This DIRECT installation layout does not support MAIN cutover.",
+          "REBUILD_DIRECT_RECEIPT_REQUIRES_NETWORK": "The existing DIRECT network unit would stop during the MAIN restart.",
+          "REBUILD_DIRECT_RECEIPT_MAIN_DRIFT": "MAIN no longer matches the DIRECT receipt.",
+          "REBUILD_DIRECT_RECEIPT_WRITER_EXCLUSION_UNPROVED": "Exclusive access for the DIRECT receipt update could not be verified.",
+          "REBUILD_DIRECT_RECEIPT_FINAL_UNPROVED": "Final MAIN verification failed before the DIRECT receipt could be updated.",
+          "REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED": "The DIRECT receipt update could not be confirmed."
         }
       },
       "mainRestartCount": "MAIN restarts in plan: {count}",

@@ -1749,8 +1749,16 @@
           "REBUILD_MAIN_CAS_UNPROVED": "无法验证 MAIN 配置是否处于预期状态。",
           "REBUILD_NODE_USER_SYNC_UNCONFIRMED": "未确认用户同步已完成。",
           "REBUILD_NODE_USER_SYNC_PREPARE_FAILED": "无法完成用户同步的准备工作。",
+          "REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED": "无法确认待同步用户列表与节点已加载的用户一致。未发送同步请求。",
           "REBUILD_NODE_USER_SYNC_FENCE_UNPROVED": "无法验证用户同步的独占执行权限。",
-          "REBUILD_MAIN_PROOF_UNCONFIRMED": "无法完成切换所需的验证。"
+          "REBUILD_MAIN_PROOF_UNCONFIRMED": "无法完成切换所需的验证。",
+          "REBUILD_DIRECT_RECEIPT_UNPROVED": "无法验证 DIRECT 安装凭据。",
+          "REBUILD_DIRECT_RECEIPT_LAYOUT_UNSUPPORTED": "此 DIRECT 安装布局不支持 MAIN 切换。",
+          "REBUILD_DIRECT_RECEIPT_REQUIRES_NETWORK": "重启 MAIN 时，现有 DIRECT 网络服务会停止。",
+          "REBUILD_DIRECT_RECEIPT_MAIN_DRIFT": "MAIN 状态已与 DIRECT 凭据不符。",
+          "REBUILD_DIRECT_RECEIPT_WRITER_EXCLUSION_UNPROVED": "无法确认更新 DIRECT 凭据所需的独占访问权限。",
+          "REBUILD_DIRECT_RECEIPT_FINAL_UNPROVED": "MAIN 未通过最终验证，未更新 DIRECT 凭据。",
+          "REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED": "未确认 DIRECT 凭据已更新。"
         }
       },
       "mainRestartCount": "计划重启 MAIN 次数：{count}",

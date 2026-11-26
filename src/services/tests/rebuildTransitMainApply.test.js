@@ -102,11 +102,22 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false } = {})
             return fs.readFileSync(main).equals(Buffer.from(snap.data, 'base64'));
         },
         async verifyAgentEndpoint(node, target) { return node === id && target === id && verifyLock(); },
-        async syncNodeUsers(node, { verifyFence }) {
+        async verifyUserPayload(node, target, snapshot, users, managed) {
+            assert(verifyLock());
+            assert.equal(node, id);
+            assert.equal(target, id);
+            assert.deepEqual(managed, ['vless-in']);
+            assert.deepEqual(JSON.parse(Buffer.from(snapshot.data, 'base64')).inbounds[0].settings.clients, users);
+            return true;
+        },
+        async syncNodeUsers(node, { verifyFence, verifyPayload }) {
             assert.equal(node, id);
             assert(await verifyFence(id));
+            const users = Object.freeze([Object.freeze({ id: 'drained' })]);
+            assert(await verifyPayload(id, users));
             events.push('sync');
             if (loseSync) throw Object.assign(new Error('fixture-private'), { code: 'REBUILD_NODE_USER_SYNC_UNCONFIRMED' });
+            assert(await verifyPayload(id, users));
             assert(await verifyFence(id));
             return { added: 0, removed: 0, total: 1, errors: 0 };
         },
