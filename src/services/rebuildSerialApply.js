@@ -110,11 +110,11 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 const authority = await admit({ ids: Object.freeze([...ids]), nodes: nodes.map(copy),
                     links: links.map(copy), states: new Map([...states].map(([n, row]) => [n, copy(row)])), verify: locked });
                 const { before, profiles, peers, journal, artifacts, verifyFence, openWindow, verifySnapshot,
-                    verifyAgentEndpoint, verifyUserPayload, prove, verifyTerminal, observe } = authority ?? {};
+                    verifyAgentEndpoint, readAgentManagedFlows, prove, verifyTerminal, observe } = authority ?? {};
                 need(journal && artifacts && peers instanceof Map && peers.size === ids.length &&
                     ids.every(n => isSha(peers.get(n)?.authoritySha256) && typeof peers.get(n)?.verify === 'function') &&
                     new Set(ids.map(n => peers.get(n).authoritySha256)).size === ids.length &&
-                    [verifyFence, openWindow, verifySnapshot, verifyAgentEndpoint, verifyUserPayload, syncNodeUsers,
+                    [verifyFence, openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers,
                         prove, verifyTerminal, observe].every(fn => typeof fn === 'function'));
                 const pinned = new Map(ids.map(n => {
                     const peer = peers.get(n);
@@ -159,7 +159,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 await locked();
                 let terminal, consumed = false, published = false;
                 const result = await runJournaledMainApply({ journal, artifacts, transitions, retain, verifyFence: fenced,
-                    openWindow, verifySnapshot, verifyAgentEndpoint, verifyUserPayload, syncNodeUsers, prove, observe,
+                    openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers, prove, observe,
                     async verifyTerminal(ctx, latest) {
                         terminal = undefined;
                         // A verifier gets a copy, not the snapshots the adapter

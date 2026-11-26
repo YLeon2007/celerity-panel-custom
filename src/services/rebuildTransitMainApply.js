@@ -56,6 +56,34 @@ function separated(data, managed) {
 function sameTopology(a, b, managed) {
     return equal(separated(a, managed).topology, separated(b, managed).topology);
 }
+
+// cc-agent's persister renders the pinned per-inbound Flow, not User.Flow
+// from the panel request. Compare every managed array to the exact submitted
+// roster before relying on stock /sync's zero-delta ACK.
+function stockSyncIsNoop(data, managed, flows, users) {
+    if (!(flows instanceof Map) || flows.size !== managed.length) return false;
+    const expect = new Map();
+    const ids = new Set();
+    for (const user of users) {
+        if (!own(user, ['id', 'email', 'flow']) || typeof user.email !== 'string' || user.email.length === 0 ||
+            typeof user.id !== 'string' || user.id.length === 0 || typeof user.flow !== 'string' ||
+            expect.has(user.email) || ids.has(user.id)) return false;
+        expect.set(user.email, user.id);
+        ids.add(user.id);
+    }
+    return separated(data, managed).clients.every((rows, i) => {
+        const flow = flows.get(managed[i]);
+        if (typeof flow !== 'string' || rows.length !== expect.size) return false;
+        const seen = new Set();
+        for (const row of rows) {
+            if (!row || typeof row.email !== 'string' || typeof row.id !== 'string' || !expect.has(row.email) ||
+                expect.get(row.email) !== row.id || seen.has(row.email) ||
+                (Object.hasOwn(row, 'flow') ? row.flow : '') !== flow) return false;
+            seen.add(row.email);
+        }
+        return true;
+    });
+}
 const alwaysUnknown = new Set([
     'REBUILD_AGENT_STOP_UNCONFIRMED', 'REBUILD_AGENT_EXCLUSION_UNPROVED', 'REBUILD_AGENT_START_UNCONFIRMED',
     'REBUILD_AGENT_RECONCILE_UNPROVED', 'REBUILD_MAIN_PUBLICATION_UNCONFIRMED', 'REBUILD_MAIN_RESTART_UNCONFIRMED',
@@ -76,13 +104,16 @@ async function request(channel, action, fields) {
 // never request arguments. `openWindow` must attach the exact admitted node to
 // HostMainWire under one pinned SSH connection and verify before each write.
 // `verifySnapshot` independently binds live host/agent identity and profile
-// evidence; a wire reply alone cannot ACK. `settle` publishes graph state only
+// evidence; a wire reply alone cannot ACK. `readAgentManagedFlows` returns
+// the independently verified per-tag flow of the exact running agent for this
+// snapshot; a config read without process/endpoint proof does not qualify.
+// `settle` publishes graph state only
 // for an applied terminal proof and must not replay ambiguous commits.
 async function runJournaledMainApply({ journal, artifacts, retain, transitions, verifyFence,
-    openWindow, verifySnapshot, verifyAgentEndpoint, verifyUserPayload, syncNodeUsers, prove, verifyTerminal, settle, observe }) {
+    openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers, prove, verifyTerminal, settle, observe }) {
     const owner = cutoverOwner(retain);
     need(owner && Array.isArray(transitions) && transitions.length > 0 && transitions.length <= 128 &&
-        [verifyFence, openWindow, verifySnapshot, verifyAgentEndpoint, verifyUserPayload, syncNodeUsers, prove, verifyTerminal, settle, observe]
+        [verifyFence, openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers, prove, verifyTerminal, settle, observe]
             .every(fn => typeof fn === 'function'), 'REBUILD_MAIN_AUTHORITY_UNPROVED');
     const rows = new Map(), nodeFences = new Map(), steps = [];
     let rank = 0;
@@ -233,8 +264,9 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
                             async verifyPayload(target, users) {
                                 if (!Array.isArray(users) || !Object.isFrozen(users) || !users.every(Object.isFrozen) ||
                                     payloadProofs > 1 || (payloadProofs === 1 && provedUsers !== users) || !await verifySyncFence(target)) return false;
-                                const okay = await verifyUserPayload(nodeId, target, settled, users, active.row.managed, current) === true;
-                                if (!okay || !await verifySyncFence(target)) return false;
+                                const flows = await readAgentManagedFlows(nodeId, target, settled, current);
+                                if (!stockSyncIsNoop(raw(settled.data), active.row.managed, flows, users) ||
+                                    !await verifySyncFence(target)) return false;
                                 provedUsers = users;
                                 payloadProofs++;
                                 return true;

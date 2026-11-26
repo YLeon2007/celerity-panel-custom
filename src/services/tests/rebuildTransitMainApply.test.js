@@ -15,7 +15,7 @@ const { runJournaledMainApply } = require('../rebuildTransitMainApply');
 
 const id = '0'.repeat(24), hash = input => createHash('sha256').update(input).digest('hex');
 const config = (route, user) => ({ inbounds: [
-    { tag: 'vless-in', protocol: 'vless', settings: { decryption: 'none', clients: [{ id: user }] } },
+    { tag: 'vless-in', protocol: 'vless', settings: { decryption: 'none', clients: [{ id: user, email: 'fixture@example.invalid' }] } },
     { tag: 'transit', protocol: 'vless', settings: { clients: [{ id: 'static' }] } },
 ], routing: { rules: [{ inboundTag: ['transit'], outboundTag: route }] }, outbounds: [{ tag: 'a' }, { tag: 'b' }] });
 
@@ -45,7 +45,7 @@ function lockStore() {
     };
 }
 
-function fixture(t, { fault = '', loseSync = false, rejectBefore = false } = {}) {
+function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotated = false, changedFlow = false } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'c3-main-join.'));
     const journalPath = path.join(root, 'journal'), artifactPath = path.join(root, 'artifacts');
     const main = path.join(root, 'MAIN');
@@ -70,7 +70,7 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false } = {})
             assert.equal(target, id);
             assert(verifyLock());
             const child = spawn('/usr/bin/python3', ['-B', path.join(__dirname, 'rebuildTransitMainWireHost.py'), '--fixture', root, fault, '10'],
-                { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin', TMPDIR: root, HOME: root } });
+                { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin', TMPDIR: root, HOME: root, C3_SYNTHETIC_SYNC_USERS: '1' } });
             const done = once(child, 'close');
             children.push({ child, done });
             child.stderr.on('data', chunk => savedError.push(chunk.toString()));
@@ -102,19 +102,18 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false } = {})
             return fs.readFileSync(main).equals(Buffer.from(snap.data, 'base64'));
         },
         async verifyAgentEndpoint(node, target) { return node === id && target === id && verifyLock(); },
-        async verifyUserPayload(node, target, snapshot, users, managed) {
+        async readAgentManagedFlows(node, target, snapshot) {
             assert(verifyLock());
             assert.equal(node, id);
             assert.equal(target, id);
-            assert.deepEqual(managed, ['vless-in']);
-            assert.deepEqual(JSON.parse(Buffer.from(snapshot.data, 'base64')).inbounds[0].settings.clients, users);
-            return true;
+            assert(fs.readFileSync(main).equals(Buffer.from(snapshot.data, 'base64')));
+            return new Map([['vless-in', changedFlow ? 'xtls-rprx-vision' : '']]);
         },
         async syncNodeUsers(node, { verifyFence, verifyPayload }) {
             assert.equal(node, id);
             assert(await verifyFence(id));
-            const users = Object.freeze([Object.freeze({ id: 'drained' })]);
-            assert(await verifyPayload(id, users));
+            const users = Object.freeze([Object.freeze({ id: rotated ? 'rotated' : 'drained', email: 'fixture@example.invalid', flow: '' })]);
+            if (!await verifyPayload(id, users)) throw Object.assign(new Error('refused before POST'), { code: 'REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED' });
             events.push('sync');
             if (loseSync) throw Object.assign(new Error('fixture-private'), { code: 'REBUILD_NODE_USER_SYNC_UNCONFIRMED' });
             assert(await verifyPayload(id, users));
@@ -142,6 +141,13 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false } = {})
 }
 
 const complete = ['read', 'stop', 'capture', 'publish', 'restart', 'start', 'reconcile'];
+for (const changed of ['rotated', 'changedFlow']) test(`joined MAIN wire: ${changed} cannot be admitted as no-op sync`, async t => {
+    const f = fixture(t, { [changed]: true });
+    await assert.rejects(f.run(), { code: 'REBUILD_MAIN_CUTOVER_UNRESOLVED', retryAllowed: false,
+        failure: { phase: 'agent-reconcile', reason: 'REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED' } });
+    assert.deepEqual(f.events, complete);
+    assert.equal(f.store.copy().allowStaleUnlock, false);
+});
 test('joined MAIN wire: panel ACK and exact final pin follow one fenced sync, not the candidate hash', async t => {
     const f = fixture(t);
     assert.deepEqual(await f.run(), { status: 'applied', retryAllowed: false, failure: null });

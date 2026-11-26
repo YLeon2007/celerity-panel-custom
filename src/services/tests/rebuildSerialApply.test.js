@@ -134,7 +134,7 @@ function fixture(t, fault, native) {
                     const snap = current.get(n);
                     if (action === 'stop') {
                         const config = JSON.parse(bytes(snap.data));
-                        clientList(config).splice(0, Infinity, { id: 'drained-fixture-user' });
+                        clientList(config).splice(0, Infinity, { id: 'drained-fixture-user', email: 'fixture@example.invalid' });
                         snap.data = json(config).toString('base64');
                     }
                     if (action === 'capture') {
@@ -160,8 +160,10 @@ function fixture(t, fault, native) {
             },
             async verifySnapshot(n, phase, snap) { return fenced() && snap.data === current.get(n).data; },
             async verifyAgentEndpoint(n, target) { return fenced() && n === target; },
-            async verifyUserPayload(n, target, snap, users) {
-                return n === target && JSON.stringify(users) === JSON.stringify(clientList(JSON.parse(bytes(snap.data))));
+            async readAgentManagedFlows(n, target, snap) {
+                assert.equal(n, target);
+                assert.equal(snap.data, current.get(n).data);
+                return new Map([[managed, '']]);
             },
             async syncNodeUsers() { assert.fail('host authority must not supply the panel sync dispatcher'); },
             async prove() { return fenced() && fault !== 'rollback'; },
@@ -178,7 +180,7 @@ function fixture(t, fault, native) {
     };
     const sync = { async syncRebuildNodeUsersAfterResume(n, { verifyFence, verifyPayload }) {
         assert(await verifyFence(n));
-        const users = Object.freeze(clientList(JSON.parse(bytes(current.get(n).data))).map(Object.freeze));
+        const users = Object.freeze(clientList(JSON.parse(bytes(current.get(n).data))).map(row => Object.freeze({ ...row, flow: '' })));
         assert(await verifyPayload(n, users)); assert(await verifyPayload(n, users));
         return { added: 0, removed: 0, errors: 0, total: users.length };
     } };

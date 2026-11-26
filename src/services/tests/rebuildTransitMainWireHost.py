@@ -65,7 +65,10 @@ def fixture(root, fault, seconds):
             manager.cg.rmdir()
             # Simulate the old writer winning with a final client-only change.
             stage = root / 'agent-stage'
-            stage.write_bytes(model.config(users=[{'id': 'drained'}]))
+            user = {'id': 'drained'}
+            if os.environ.get('C3_SYNTHETIC_SYNC_USERS') == '1':
+                user['email'] = 'fixture@example.invalid'
+            stage.write_bytes(model.config(users=[user]))
             stage.chmod(0o640)
             stage.replace(main)
         if command in ('stop', 'start'):
