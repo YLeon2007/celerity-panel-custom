@@ -60,7 +60,8 @@ function fixture() {
             });
         } },
         './rebuildMode': { isRebuildEnabled: () => state.mode },
-        './rebuildLocks': { ...locks, withNode(id, fn) { state.lockEntries.push(id); return withNode(id, fn); } },
+        './rebuildLocks': { ...locks, withNode(id, fn) { state.lockEntries.push(id); return withNode(id, fn); },
+            async assertAgentWriterAllowed(id) { assert(locks.nodeLockVerifier(id)()); } },
         './topologyConfigOwnership': { usesTestTopologyConfig: () => false },
         '../../config': {},
         '../utils/logger': { info() {}, error() {} },

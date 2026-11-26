@@ -289,7 +289,11 @@ class SyncService {
      */
     async _agentRequest(node, method, path, body = null) {
         if (require('./rebuildMode').isRebuildEnabled() && method !== 'GET') {
-            return require('./rebuildLocks').withNode(node._id, () => this._sendAgentRequest(node, method, path, body));
+            const { withNode, assertAgentWriterAllowed } = require('./rebuildLocks');
+            return withNode(node._id, async () => {
+                await assertAgentWriterAllowed(node._id);
+                return this._sendAgentRequest(node, method, path, body);
+            });
         }
         return this._sendAgentRequest(node, method, path, body);
     }

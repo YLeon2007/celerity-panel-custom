@@ -142,7 +142,7 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
     const { steps: _, ...identity } = plan;
     const ownsNodes = () => [...nodeFences.values()].every(owns => owns());
     need(ownsNodes() && await verifyFence(plan) === true && ownsNodes(), 'REBUILD_MAIN_AUTHORITY_UNPROVED');
-    const reservation = await owner.promote(identity);
+    const reservation = await owner.promote(identity, roster);
     let active, failure, terminal;
     const fact = (state, ctx) => state && equal(state.plan, plan) && equal(ctx.plan, plan);
     function current(ctx) {

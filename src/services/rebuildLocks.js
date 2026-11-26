@@ -35,6 +35,12 @@ function journalIdentity(input) {
         return [key, value];
     }));
 }
+const cutoverNodeId = /^[a-f0-9]{24}(?![\s\S])/;
+function writerRoster(ids) {
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 128 || new Set(ids).size !== ids.length ||
+        ids.some(id => typeof id !== 'string' || !cutoverNodeId.test(id))) throw error('REBUILD_LOCK_LOST');
+    return [...ids].sort();
+}
 const queues = new Map(), held = new AsyncLocalStorage();
 function nodeLockVerifier(nodeId) {
     const key = String(nodeId), lease = held.getStore()?.get(key);
@@ -107,16 +113,17 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
         // business settlement proofs. It revokes verify and permits deletion
         // only on successful outer return. Neither method can adopt an old row.
         cutoverOwners.set(retain, Object.freeze({
-            async promote(identity) {
+            async promote(identity, nodeIds) {
                 if (!live || lost || cutoverPhase || retained || reservation || handedBack) throw error('REBUILD_LOCK_LOST');
                 cutoverPhase='promoting'; // suppress ordinary cleanup before any await
                 clearInterval(timer);
                 try {
                     const cutover=journalIdentity(identity);
+                    const roster=nodeIds === undefined ? {} : { cutoverNodes: writerRoster(nodeIds) };
                     await heartbeat;
                     if (!live || lost || retained) throw error('REBUILD_LOCK_LOST');
                     const before={...row, heartbeat:lastBeat};
-                    const change={allowStaleUnlock:false, cutover};
+                    const change={allowStaleUnlock:false, cutover, ...roster};
                     const ack=await store.updateMany(exactLock(before), { $set: change }, cutoverWrite);
                     if (!live || lost || retained || !one(ack,'matchedCount') || ack.modifiedCount!==1)
                         throw error('REBUILD_LOCK_LOST');
@@ -248,6 +255,18 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
             };
         } };
     }
-    return {run,status,unlock,readInstallRecovery};
+    async function assertAgentWriterAllowed(nodeId) {
+        // Check inside the same local queue, never before taking the lease.
+        const ownsNode = nodeLockVerifier(nodeId);
+        const blocked = () => error('REBUILD_AGENT_WRITER_BLOCKED');
+        if (!ownsNode()) throw blocked();
+        try {
+            const row = await store.findOne({ _id: rowId, cutover: { $exists: true } },
+                { ...lockRead, projection: { _id: 0, cutoverNodes: 1 } });
+            if (!ownsNode() || (row !== null && writerRoster(row?.cutoverNodes).includes(String(nodeId)))) throw blocked();
+        } catch { throw blocked(); }
+    }
+    return {run,status,unlock,readInstallRecovery,assertAgentWriterAllowed};
 }
-module.exports={withNode,withNodes,nodeLockVerifier,makeLocks,installOwner,cutoverOwner};
+const assertAgentWriterAllowed = async nodeId => makeLocks().assertAgentWriterAllowed(nodeId);
+module.exports={withNode,withNodes,nodeLockVerifier,makeLocks,installOwner,cutoverOwner,assertAgentWriterAllowed};

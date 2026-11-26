@@ -82,6 +82,7 @@ test('Rebuild node lock holds panel user mutations until the agent is back', { t
         else process.env.C3_REBUILD_ENABLED = old;
     });
     const { withNodes } = require('../rebuildLocks');
+    t.mock.method(require('mongoose').connection, 'collection', () => ({ async findOne() { return null; } }));
     let agentBack = false;
     const requests = [];
     await withAgent(t, req => {
@@ -110,6 +111,53 @@ test('Rebuild node lock holds panel user mutations until the agent is back', { t
         }
         assert.deepEqual(await Promise.all(effects), [true, true]);
         assert.deepEqual(requests.slice(1), [['POST', '/users', true], ['DELETE', '/users/cutover-fixture', true]]);
+    });
+});
+
+test('a retained cutover blocks only its panel agent writers after local lease release', { timeout: 10000 }, async t => {
+    const old = process.env.C3_REBUILD_ENABLED;
+    process.env.C3_REBUILD_ENABLED = 'true';
+    t.after(() => {
+        if (old === undefined) delete process.env.C3_REBUILD_ENABLED;
+        else process.env.C3_REBUILD_ENABLED = old;
+    });
+    const { makeLocks, withNodes, cutoverOwner, nodeLockVerifier } = require('../rebuildLocks');
+    let row;
+    const blocked = { code: 'REBUILD_AGENT_WRITER_BLOCKED' };
+    const requests = [];
+    await withAgent(t, req => { requests.push(req.method); return 200; }, async node => {
+        const store = {
+            async insertOne(value) { row = structuredClone(value); return { acknowledged: true }; },
+            async updateMany(filter, update) {
+                assert.deepEqual(row, filter.$expr.$eq[1].$literal);
+                Object.assign(row, update.$set);
+                return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
+            },
+            async findOne(filter, options) {
+                if (filter.$expr) assert.deepEqual(row, filter.$expr.$eq[1].$literal);
+                else {
+                    assert.deepEqual(filter, { _id: 'apply', cutover: { $exists: true } });
+                    assert.equal(options.readConcern.level, 'majority');
+                    assert.equal(options.readPreference, 'primary');
+                    assert.deepEqual(options.projection, { _id: 0, cutoverNodes: 1 });
+                }
+                return structuredClone(row);
+            },
+        };
+        const failure = new Error('modeled controller loss after durable promotion');
+        await assert.rejects(makeLocks(store).run((_, retain) => withNodes([node._id], async () => {
+            await cutoverOwner(retain).promote({ scope: 'fixture-scope', operationId: '11111111-1111-4111-8111-111111111111',
+                fenceId: '22222222-2222-4222-8222-222222222222', planDigest: 'a'.repeat(64) }, [node._id]);
+            throw failure;
+        })), error => error === failure);
+        assert.equal(nodeLockVerifier(node._id)(), false);
+        t.mock.method(require('mongoose').connection, 'collection', () => store);
+        await assert.rejects(syncService._agentRequest(node, 'POST', '/users', {}), blocked);
+        await assert.rejects(syncService._agentRequest(node, 'DELETE', '/users/fixture'), blocked);
+        await syncService._agentRequest(node, 'GET', '/info');
+        await syncService._agentRequest({ ...node, _id: '507f1f77bcf86cd799439012' }, 'POST', '/users', {});
+        assert.deepEqual(requests, ['GET', 'POST']);
+        assert.equal(row.allowStaleUnlock, false);
     });
 });
 
