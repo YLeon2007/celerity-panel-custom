@@ -18,7 +18,7 @@ const sha = data => createHash('sha256').update(data).digest('hex');
 const json = data => Buffer.from(JSON.stringify(data));
 const clone = value => BSON.deserialize(BSON.serialize(value));
 const nodes = ['portal', 'relay', 'relay', 'bridge', 'bridge'].map((cascadeRole, i) => ({ _id: oid(i + 1), cascadeRole,
-    type: 'xray', active: true, ip: `192.0.2.${i + 1}`, port: 22001 + i, xray: { security: 'none', apiPort: 23001 + i } }));
+    type: 'xray', active: true, ip: `192.0.2.${i + 1}`, port: 22001 + i, xray: { security: 'none', apiPort: 61000 } }));
 const links = [1, 2, 3, 4].map(n => ({ _id: oid(100 + n), portalNode: oid(n === 4 ? 3 : n), bridgeNode: oid(n + 1), active: true,
     priority: n, mode: n === 2 ? 'forward' : 'reverse', tunnelProtocol: 'vless', tunnelTransport: 'tcp', tunnelPort: 24000 + n,
     tunnelUuid: `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`, tunnelEncryption: 'none',
@@ -50,7 +50,9 @@ function fixture(t, fault, native, mounted = false) {
         },
         async findOne(q) { return match(q) ? clone(lock) : null; },
         async updateMany(q, { $set }) {
-            assert(match(q)); Object.assign(lock, $set); return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
+            assert(match(q)); Object.assign(lock, $set);
+            scope ??= lock.cutover?.scope;
+            return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
         },
         async deleteMany(q) {
             assert(match(q));
@@ -191,34 +193,38 @@ function fixture(t, fault, native, mounted = false) {
         };
     };
     const sync = { async _getUsersForNode() { assert(mounted); return []; }, async syncRebuildNodeUsersAfterResume(n, { verifyFence, verifyPayload }) {
-        assert(await verifyFence(n));
+        const target = mounted === 'stock' ? { nodeId: n, ip: nodes.find(row => String(row._id) === n).ip, agentTls: true, agentPort: 62080 } : n;
+        assert(await verifyFence(target));
         const users = Object.freeze(clientList(JSON.parse(bytes(current.get(n).data))).map(row => Object.freeze({ ...row, flow: '' })));
-        assert(await verifyPayload(n, users)); assert(await verifyPayload(n, users));
+        assert(await verifyPayload(target, users)); assert(await verifyPayload(target, users));
         return { added: 0, removed: 0, errors: 0, total: users.length };
     } };
     const selectedDb = native?.db ?? db;
-    const make = serialMainAuthority => createRebuildService({ Link: native ?? Link,
+    function reader(node) {
+        assert(mounted, 'ordinary SSH must not enter');
+        const n = String(node._id);
+        return { async requireSupportedCore() {}, async close() {
+            if (fault === 'reader-close' && n === String(nodes[0]._id) && counts.closeArmed) throw new Error('modeled reader close');
+        },
+            async read(profile) {
+                if (profile === 'main') return JSON.parse(bytes(current.get(n).data));
+                return structuredClone(before.find(p => p.nodeId === n && p.profile === profile).config);
+            },
+            async checkMainRoutingService() { return true; },
+            async stagePair() { assert.fail('scoped MAIN must never enter legacy staging'); },
+            async putPair() { assert.fail('scoped MAIN must never enter legacy activation'); },
+        };
+    }
+    const make = (serialMainAuthority, factory = createRebuildService, overrides = {}) => factory({ Link: native ?? Link,
         Node: { db: selectedDb, find: () => query(nodes) }, State: { db: selectedDb, find: () => query([]) },
         L2tpUser: { db: selectedDb }, sync, locks, env: { C3_REBUILD_ENABLED: 'true',
             ...(mounted && serialMainAuthority && { C3_REBUILD_CHAIN_APPLY: '1' }) }, assertNoRelayAccountIntent: async () => {},
-        connect(node) {
-            assert(mounted, 'ordinary SSH must not enter');
-            const n = String(node._id);
-            return { async requireSupportedCore() {}, async close() {
-                if (fault === 'reader-close' && n === String(nodes[0]._id) && counts.closeArmed) throw new Error('modeled reader close');
-            },
-                async read(profile) {
-                    if (profile === 'main') return JSON.parse(bytes(current.get(n).data));
-                    return structuredClone(before.find(p => p.nodeId === n && p.profile === profile).config);
-                },
-                async checkMainRoutingService() { return true; },
-                async stagePair() { assert.fail('scoped MAIN must never enter legacy staging'); },
-                async putPair() { assert.fail('scoped MAIN must never enter legacy activation'); },
-            };
-        }, serialMainAuthority,
+        connect: reader, serialMainAuthority,
         cache: { async invalidateAllSubscriptions() { assert(fenced()); counts.invalidate++; events.push('invalidate'); } },
+        ...overrides,
     });
-    return { service: make(authority), ordinary: make(), current, after, counts, events, state, artifacts,
+    return { service: make(authority), ordinary: make(), current, after, counts, events, state, artifacts, journal,
+        make, reader, authority, db: selectedDb,
         lock: () => lock, stored: () => stored.map(clone) };
 }
 
@@ -283,6 +289,103 @@ test('ordinary Apply drains Preview readers before it can dispatch a held write'
     assert.equal(f.state(), undefined);
     assert.equal(f.counts.open, 0);
     assert.equal(f.lock(), null);
+});
+
+test('stock Preview and confirmed Apply use one SSH owner per node and only planned writers', async t => {
+    const f = fixture(t, undefined, undefined, 'stock');
+    const cards = nodes.map(node => ({ ...clone(node), xray: { ...node.xray, agentToken: 'fixture-agent-token' } }));
+    cards[0].ssh = { hostKeySha256: 'a'.repeat(64) };
+    cards[3].ssh = { machineId: 'b'.repeat(32) };
+    const env = { C3_REBUILD_ENABLED: 'true', ENCRYPTION_KEY: 'fixture-artifact-key'.repeat(3) };
+    const roster = new Map(), writers = new Set(), observations = new Set(), fingerprints = new Set();
+    const transport = require('../rebuildTransport');
+    const readOnly = node => {
+        const n = String(node._id), reader = f.reader(node);
+        assert(!roster.has(n));
+        roster.set(n, reader);
+        return reader;
+    };
+    const receiver = await f.authority({ ids: cards.map(node => String(node._id)), async verify() {} });
+    t.mock.method(transport, 'createTransport', readOnly);
+    t.mock.method(transport, 'createMainApplyTransport', (node, identity, verify) => {
+        const n = String(node._id), reader = readOnly(node), read = reader.read;
+        assert.deepEqual(identity, { machineId: n === id(4) ? 'b'.repeat(32) : null,
+            sshHostKeySha256: n === id(1) ? 'a'.repeat(64) : null });
+        let live = false;
+        return Object.assign(reader, {
+            async attest() { assert(!live); await verify(); live = true; },
+            async verifyMainConnection() { assert(live); await verify(); return true; },
+            async read(profile) { assert(live); return read(profile); },
+            async readMainSha256() {
+                assert(live); fingerprints.add(n);
+                return sha(Buffer.from(f.current.get(n).data, 'base64'));
+            },
+            async observeMain() {
+                assert(live); observations.add(n);
+                const { data, xray, metadata, generation } = f.current.get(n);
+                return { code: 0, stderr: '', stdout: JSON.stringify({ xray, metadata, generation,
+                    main: sha(Buffer.from(data, 'base64')), agent: [xray[0] + 100, xray[1], 100],
+                    agentConfig: ['5','6','7'], token: sha(node.xray.agentToken), tls: true, flows: [['vless-in', '']] }) };
+            },
+            async openMainWindow(options) {
+                assert(live && roster.get(n) === reader && !writers.has(n) && await options.verifyOwner());
+                assert.deepEqual(options.bootstrap.managed, ['vless-in']);
+                assert.equal(options.bootstrap.direct, null);
+                writers.add(n);
+                return receiver.openWindow(n, options);
+            },
+            async close() { live = false; },
+        });
+    });
+    t.mock.method(require('../rebuildTransitCutoverJournal'), 'createFileCutoverJournal', () => f.journal);
+    t.mock.method(require('../rebuildTransitCutoverArtifacts'), 'createCutoverArtifactStore', () => f.artifacts);
+    const fresh = name => {
+        const key = require.resolve(name), previous = require.cache[key];
+        delete require.cache[key];
+        t.after(() => { if (previous) require.cache[key] = previous; else delete require.cache[key]; });
+        return require(name);
+    };
+    fresh('../rebuildMainAuthority');
+    const { createRebuildService: factory } = fresh('../rebuildService');
+    const Node = { db: f.db, find: () => query(cards), findOne({ _id }) {
+        const row = cards.find(node => String(node._id) === _id);
+        return { select(fields) {
+            const picked = { _id: row._id };
+            for (const field of fields.split(' ')) {
+                const [key, child] = field.split('.');
+                if (!child && Object.hasOwn(row, key)) picked[key] = row[key];
+                if (child && Object.hasOwn(row[key] ?? {}, child)) (picked[key] ??= {})[child] = row[key][child];
+            }
+            return { ...query([]), lean: async () => clone(picked) };
+        } };
+    } };
+    const stock = f.make(undefined, factory, { env, connect: undefined, Node });
+    const service = f.make(undefined, factory, { env, connect: undefined, Node, allowStockSerial: true });
+    assert.equal(service.applySerialMain, undefined);
+    const off = await service.execute({ linkId: anchor, preview: true });
+    assert.equal(off.allowed, false);
+    assert.equal(off.transitBlocked, true);
+    roster.clear();
+    await assert.rejects(service.execute({ linkId: anchor, expectedPreview: off.previewId }),
+        { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
+    assert.equal(roster.size, 0);
+    env.C3_REBUILD_CHAIN_APPLY = '1';
+    await assert.rejects(stock.execute({ linkId: anchor, expectedPreview: off.previewId }),
+        { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
+    assert.equal(roster.size, 0);
+    const preview = await service.execute({ linkId: anchor, preview: true });
+    assert.equal(preview.allowed, true);
+    assert.equal(writers.size, 0);
+    assert.equal(observations.size, 0);
+    roster.clear();
+    await assert.rejects(service.execute({ linkId: anchor, expectedPreview: off.previewId }), { code: 'REBUILD_PREVIEW_CHANGED' });
+    assert.equal(writers.size, 0);
+    roster.clear();
+    assert.equal((await service.execute({ linkId: anchor, expectedPreview: preview.previewId })).allowed, true);
+    assert.deepEqual(writers, new Set(preview.nodes.filter(row => row.mainRestartCount).map(row => row.nodeId)));
+    assert.deepEqual(observations, writers);
+    assert.deepEqual(fingerprints, new Set(cards.map(node => String(node._id)).filter(n => !writers.has(n))));
+    assert.equal(f.counts.commit, 1);
 });
 
 for (const outer of [false, true]) test(`ordinary Apply classifies lost lock handback after verified commit (outer=${outer})`, async t => {

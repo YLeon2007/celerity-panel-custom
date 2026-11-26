@@ -294,6 +294,96 @@ function bundledMainFingerprintCommand() {
     return command;
 }
 
+const mainModuleNames = ['rebuildTransitMainWindow', 'rebuildTransitMainSession', 'rebuildTransitMainRuntime',
+    'rebuildTransitMainHost', 'rebuildTransitMainWire', 'rebuildTransitDirectReceipt', 'rebuildTransitMainReceiver'];
+const directModuleNames = ['c3_stock_ensure', 'c3_stock_runtime', 'c3_package_guard', 'c3_foreign_replacement', 'c3_direct_host'];
+const shaBundle = data => createHash('sha256').update(data).digest('hex');
+let mainWriterBundle;
+function readMainWriterBundle() {
+    if (mainWriterBundle) return mainWriterBundle;
+    const manifest = require('./rebuildRelayDirectPayload.json');
+    const payload = readFileSync(join(__dirname, 'rebuildRelayDirectPayload.xz'));
+    const { directSize, main } = manifest;
+    requireThat(Number.isSafeInteger(directSize) && directSize > 0 && directSize + main?.size === payload.length,
+        'DIRECT_BUNDLE_INVALID');
+    const directPacked = payload.subarray(0, directSize), mainPacked = payload.subarray(directSize);
+    requireThat(shaBundle(directPacked) === manifest.sha256 && shaBundle(mainPacked) === main.sha256,
+        'DIRECT_BUNDLE_INVALID');
+    const checked = (sources, names, expected) => {
+        requireThat(sources?.length === names.length, 'DIRECT_BUNDLE_INVALID');
+        return names.map((name, i) => {
+            const row = sources[i];
+            requireThat(row.path === expected[i], 'DIRECT_BUNDLE_INVALID');
+            const data = readFileSync(join(__dirname, row.path));
+            requireThat(data.length === row.size && shaBundle(data) === row.sha256, 'DIRECT_BUNDLE_INVALID');
+            return [name, row.path, row.size, row.sha256];
+        });
+    };
+    const mainRows = checked(main.sources, mainModuleNames, mainModuleNames.map(name => `${name}.py`));
+    const directRows = checked(manifest.sources, directModuleNames, ['../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py',
+        'rebuildRelayStockRuntime.py', 'rebuildRelayPackageGuard.py', 'rebuildRelayReplacement.py', 'rebuildRelayDirectHost.py']);
+    mainWriterBundle = { manifest, directPacked, mainPacked, mainRows, directRows };
+    return mainWriterBundle;
+}
+
+// Only pinned application bytes enter the loader. The exact binary preamble
+// precedes NDJSON on the original held exec, never a second command or SFTP.
+function bundledMainReceiverCommand(bootstrap, proof) {
+    requireThat(Buffer.isBuffer(proof) && proof.length > 64 && proof.length <= 16 * 1024 * 1024 &&
+        proof.subarray(0, 6).equals(Buffer.from([127, 69, 76, 70, 2, 1])), 'REBUILD_MAIN_AUTHORITY_UNPROVED');
+    const { manifest, directPacked, mainPacked, mainRows, directRows } = readMainWriterBundle();
+    const direct = bootstrap?.direct != null;
+    const args = Buffer.from(JSON.stringify(bootstrap));
+    requireThat(args.length > 0 && args.length <= 16384, 'REBUILD_MAIN_AUTHORITY_UNPROVED');
+    const data = direct ? [mainPacked, directPacked, proof] : [mainPacked, proof];
+    const encoded = value => Buffer.from(JSON.stringify(value)).toString('base64');
+    const script = [
+        'import base64,hashlib,json,lzma,os,select,sys,time,types',
+        'start=time.monotonic()',
+        'def need(v):',
+        ' if not v: raise ValueError()',
+        'def sha(b): return hashlib.sha256(b).hexdigest()',
+        'def obj(b): return json.loads(base64.b64decode(b,validate=True))',
+        'def take(n,h):',
+        ' b=bytearray()',
+        ' while len(b)<n:',
+        '  left=start+45-time.monotonic()',
+        '  need(left>0 and select.select([0],[],[],left)[0])',
+        '  p=os.read(0,min(65536,n-len(b)));need(p);b.extend(p)',
+        ' need(sha(b)==h)',
+        ' return bytes(b)',
+        'def unpack(data,rows):',
+        ' offset=0;out=[]',
+        ' for name,path,n,h in rows:',
+        '  b=data[offset:offset+n];offset+=n;need(len(b)==n and sha(b)==h)',
+        '  m=types.ModuleType(name);m.__file__="/__c3_bundle__/services/"+path;sys.modules[name]=m',
+        '  out.append((m,compile(b,m.__file__,"exec")))',
+        ' need(offset==len(data));return out',
+        'try:',
+        ' need(os.geteuid()==0)',
+        ` p=take(${mainPacked.length},"${manifest.main.sha256}")`,
+        ...(direct ? [
+            ` d=take(${directPacked.length},"${manifest.sha256}")`,
+            ` table={int(k):v.encode() for k,v in obj("${encoded(manifest.dictionary)}").items()}`,
+            ` stock=unpack(b"".join(table.get(i,bytes([i])) for i in lzma.decompress(d,memlimit=16777216)),obj("${encoded(directRows)}"))`,
+            ' for m,code in stock[:-1]: exec(code,m.__dict__)',
+            ' host,code=stock[-1]',
+            ' for k,(m,_) in zip(("C3_STOCK_ENSURE","C3_STOCK_RUNTIME","C3_PACKAGE_GUARD","C3_REPLACEMENT"),stock[:-1]): host.__dict__[k]=m.__dict__',
+            ' exec(code,host.__dict__)',
+        ] : [' host=None']),
+        ` proof=take(${proof.length},"${shaBundle(proof)}")`,
+        ` for m,code in unpack(lzma.decompress(p,memlimit=16777216),obj("${encoded(mainRows)}")): exec(code,m.__dict__)`,
+        ` boot=obj("${args.toString('base64')}")`,
+        ' rc=sys.modules["rebuildTransitMainReceiver"].serve(boot,proof,host,deadline=start+1800)',
+        'except Exception:',
+        ' rc=75',
+        'sys.exit(rc)',
+    ].join('\n');
+    const command = `exec /usr/bin/env -i LC_ALL=C /usr/bin/python3 -I -B -c '${script}'`;
+    requireThat(Buffer.byteLength(command) + 1 <= 128 * 1024, 'DIRECT_COMMAND_TOO_LARGE');
+    return { command, preamble: Buffer.concat(data) };
+}
+
 const recoveryUnsent = new WeakSet();
 const installRecoveryWasNotSent = error => recoveryUnsent.has(error);
 
@@ -870,4 +960,4 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
     return reply.proof;
 }
 
-module.exports = { createRelayDirect, applyRelayNetwork, installRecoveryWasNotSent, bundledMainFingerprintCommand };
+module.exports = { createRelayDirect, applyRelayNetwork, installRecoveryWasNotSent, bundledMainFingerprintCommand, bundledMainReceiverCommand };

@@ -50,10 +50,9 @@ function publication(link, roles, pins) {
     return { $set, $unset };
 }
 
-// Construction-time, in-process seam only. No ordinary SSH connector or route
-// can supply admission. The authority provider must hold independently pinned
-// peers for the entire roster, including untouched peers, and prove preserved
-// routes/user reconciliation. No provider is installed by the shipped panel.
+// In-process seam only. Ordinary Apply joins its already admitted transports;
+// untouched peers supply read-only identity and MAIN digests, never a writer.
+// The provider proves preserved routes and agent reconciliation on touched MAINs.
 function createSerialApply({ Link, Node, State, env, locks, gate, compose, readStates, publishedKeyMismatch, invalidate, admit, syncNodeUsers }) {
     return async (linkId, joined) => {
         gate();
@@ -105,8 +104,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 need(prepared.every((link, i) => !Object.hasOwn(link, '_rebuildVless') || Object.hasOwn(links[i], keyEnvelopeField)), unavailable);
                 const nodeFences = ids.map(nodeLockVerifier);
                 const locked = async () => {
-                    await verify();
-                    need(nodeFences.every(owns => owns()) && env.ENCRYPTION_KEY === root);
+                    need(await verify() !== false && nodeFences.every(owns => owns()) && env.ENCRYPTION_KEY === root);
                 };
                 await locked();
                 const copy = row => unpack(BSON.serialize(row));

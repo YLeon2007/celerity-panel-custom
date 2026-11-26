@@ -191,6 +191,14 @@ function ensureBlock(config) {
     }
 }
 
+function prependMainGuards(main, rules) {
+    // These PPP-only rules must not displace the loopback API's first rule.
+    const first = main.routing.rules[0];
+    const apiFirst = first?.type === 'field' && first.outboundTag === main.api?.tag &&
+        isDeepStrictEqual(first.inboundTag, ['API_INBOUND']);
+    main.routing.rules.splice(apiFirst ? 1 : 0, 0, ...rules);
+}
+
 function replacePppRouting(main, tag, groupId, pathKey, port, guard) {
     removeOwnedRules(main, tag, [BLOCK_TAG, FOLLOW_RELAY_OUTBOUND_TAG]);
     main.routing.rules = withoutIngress(main.routing.rules, tag);
@@ -211,7 +219,7 @@ function replacePppRouting(main, tag, groupId, pathKey, port, guard) {
             && !main.routing.rules.some(rule => rule.outboundTag === row.tag)));
     ensureBlock(main);
     if (port !== undefined) main.outbounds.push(socksOutbound(FOLLOW_RELAY_OUTBOUND_TAG, port));
-    main.routing.rules.unshift(...guard(tag));
+    prependMainGuards(main, guard(tag));
     // Existing global blackholes preceding any generic forwarding still apply
     // to PPP (e.g. IPv6). The generic/default egress itself never applies to PPP.
     const generic = main.routing.rules.findIndex(rule => !rule.inboundTag?.length && !isBlock(main, rule.outboundTag));
@@ -282,7 +290,7 @@ function attachLocalFollowRelay({ nodeId, state, main, bridge, policy, controlPl
     main.inbounds.push({ tag, port, protocol: 'socks', listen: LOOPBACK,
         settings: { auth: 'noauth', udp: true, ip: LOOPBACK },
         sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: !carryDomain } });
-    main.routing.rules.unshift(...guard(tag));
+    prependMainGuards(main, guard(tag));
     // replacePppRouting retains the ordinary shared rule objects when this
     // fresh graph does not yet contain the transparent ingress tag.
     for (const rule of policy) rule.inboundTag.push(tag);

@@ -20,6 +20,7 @@ SOURCES = (
     'rebuildTransitMainHost.py',
     'rebuildTransitMainWire.py',
     'rebuildTransitDirectReceipt.py',
+    'rebuildTransitMainReceiver.py',
 )
 DIRECT_COUNT = 5
 PAYLOAD = SERVICES / 'rebuildRelayDirectPayload.xz'

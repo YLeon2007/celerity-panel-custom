@@ -11,6 +11,7 @@ Success witnesses the scoped VLESS *named email index* and only the selected
 TestRoute contexts. It says nothing about anonymous accounts, UUID-validator
 state, untested predicates, the dispatcher's default or actual client egress.
 """
+import ipaddress
 import json
 import math
 import os
@@ -21,6 +22,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -34,6 +36,8 @@ from rebuildTransitMainWindow import (
 )
 
 PROOF = Path('/usr/local/libexec/celerity/rebuild-main-proof')
+_RUN = Path('/run')
+MAX_PROOF = 32 << 20
 XRAY_BIN = Path('/usr/local/bin/xray')
 VERSION = 'native-xray-main-proof/v1'
 API_PORT = 61000
@@ -87,7 +91,7 @@ def _plan(data, managed, routes):
           and all(type(s) is str for s in services)
           and {'HandlerService', 'RoutingService'} <= set(services))
     strategy = router.get('domainStrategy', 'AsIs')
-    _need(strategy in ('AsIs', 'IPOnDemand') and router.get('balancers', []) == [])
+    _need(strategy in ('AsIs', 'IPOnDemand', 'IPIfNonMatch') and router.get('balancers', []) == [])
     rules = router.get('rules')
     if type(rules) is not list or not rules:
         raise WindowError(RUNTIME)
@@ -153,14 +157,17 @@ def _plan(data, managed, routes):
               and type(route.target_port) is int and 0 < route.target_port <= 65535)
         context = dict(inboundTag=route.inbound_tag, network=route.network, targetPort=route.target_port)
         _need(route.target_domain is not None or route.target_ip is not None)
-        # Xray's IPOnDemand resolver tries the domain *before* using a
-        # supplied IP. Only literal-IP contexts are read-only here: do not
-        # cause DNS traffic or make the proof depend on resolver state.
-        _need(strategy != 'IPOnDemand' or (route.target_domain is None and route.target_ip is not None))
+        # Both resolving strategies can query DNS when a domain is present,
+        # even with a supplied IP. A literal-only context has no DNS name.
+        _need(strategy == 'AsIs' or (route.target_domain is None and route.target_ip is not None))
         for key, value, limit in (('targetDomain', route.target_domain, 253), ('targetIP', route.target_ip, 45)):
             if value is not None:
                 _need(type(value) is str and 0 < len(value) <= limit and value.isascii())
                 context[key] = value
+        if route.target_ip is not None:
+            ip = ipaddress.ip_address(route.target_ip)
+            _need(str(ip) == route.target_ip and '%' not in route.target_ip
+                  and getattr(ip, 'ipv4_mapped', None) is None)
         contexts.append(dict(context=context, outboundTag=route.outbound_tag))
     frame = json.dumps(dict(version=VERSION, namedInbounds=named, routes=contexts),
                        separators=(',', ':')).encode('ascii')
@@ -300,6 +307,49 @@ def _exec_identity(path, production):
     return _file_generation(info), _file_metadata(info)
 
 
+def _run_identity(path, *, private=False):
+    info = path.lstat()
+    _need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+          and (not private or stat.S_IMODE(info.st_mode) == 0o700))
+    return _id(info)
+
+
+class _PackagedProof:
+    """Only the same-exec authenticated ELF, never a caller-selected path."""
+
+    def __init__(self, data):
+        # The SSH bootstrap validates the exact hash and static ELF. This is
+        # not a second executable admission path or an ELF parser.
+        _need(type(data) is bytes and 4 < len(data) <= MAX_PROOF and data.startswith(b'\x7fELF'))
+        self._data = data
+
+    def execute(self, native, frame, deadline):
+        _remaining(deadline)
+        root = _run_identity(Path('/'))
+        run = _run_identity(_RUN)
+        with tempfile.TemporaryDirectory(prefix='celerity-main-', dir=_RUN) as scratch:
+            parent = Path(scratch)
+            identity = _run_identity(parent, private=True)
+            path = parent / 'proof'
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            with os.fdopen(fd, 'wb') as output:
+                _need(output.write(self._data) == len(self._data))
+                output.flush()
+                os.fchmod(fd, 0o700)
+                info = os.fstat(fd)
+                _need(info.st_nlink == 1 and info.st_size == len(self._data) and info.st_uid == 0
+                      and stat.S_IMODE(info.st_mode) == 0o700)
+                pin = _file_generation(info), _file_metadata(info)
+            def check():
+                _need(_run_identity(Path('/')) == root and _run_identity(_RUN) == run
+                      and _run_identity(parent, private=True) == identity and _exec_identity(path, True) == pin)
+            check()
+            reply = native((str(path),), frame, PROOF_TIMEOUT, RECEIPT_LIMIT)
+            check()
+        _remaining(deadline)
+        return reply
+
+
 def _alive(pidfd):
     poll = select.poll()
     poll.register(pidfd, select.POLLIN)
@@ -360,11 +410,14 @@ class MainRuntimeObserver:
     _fixture_paths and _fixture_show are trusted in-process test seams only.
     """
 
-    def __init__(self, managed, routes_for, *, deadline=None, _fixture_paths=None, _fixture_show=None):
+    def __init__(self, managed, routes_for, *, deadline=None, packaged_proof=None, _fixture_paths=None, _fixture_show=None):
         _need(type(managed) in (set, frozenset) and 0 < len(managed) <= MAX_INBOUNDS
               and all(_tag(tag) for tag in managed) and callable(routes_for))
         _need(deadline is None or type(deadline) in (int, float) and math.isfinite(deadline))
+        _need(packaged_proof is None or (type(packaged_proof) is _PackagedProof and deadline is not None
+                                        and _fixture_paths is None and _fixture_show is None))
         self._deadline = deadline
+        self._packaged_proof = packaged_proof
         self._managed, self._routes = frozenset(managed), routes_for
         self._production = _fixture_paths is None
         self._proof, self._xray, self._main = (PROOF, XRAY_BIN, MAIN) if self._production else map(Path, _fixture_paths)
@@ -416,15 +469,18 @@ class MainRuntimeObserver:
             _need(type(values) is tuple and len(values) == 3 and all(type(v) is int for v in values))
         routes = self._routes(phase, snapshot)
         frame, counts = _plan(snapshot.main.data, self._managed, routes)
-        proof = _exec_identity(self._proof, self._production)
+        proof = _exec_identity(self._proof, self._production) if self._packaged_proof is None else None
         unit = self._unit(snapshot.xray)
         pidfd = os.pidfd_open(snapshot.xray.pid)
         try:
             before = self._sample(snapshot, pidfd, unit)
-            _need(_exec_identity(self._proof, self._production) == proof)
-            reply = self._native((str(self._proof),), frame, PROOF_TIMEOUT, RECEIPT_LIMIT)
+            if self._packaged_proof is None:
+                _need(_exec_identity(self._proof, self._production) == proof)
+                reply = self._native((str(self._proof),), frame, PROOF_TIMEOUT, RECEIPT_LIMIT)
+            else:
+                reply = self._packaged_proof.execute(self._native, frame, self._deadline)
             _need(self._unit(snapshot.xray) == unit and self._sample(snapshot, pidfd, unit) == before
-                  and _exec_identity(self._proof, self._production) == proof)
+                  and (self._packaged_proof is not None or _exec_identity(self._proof, self._production) == proof))
             _receipt(reply, counts, len(routes))
         finally:
             os.close(pidfd)

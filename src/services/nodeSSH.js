@@ -128,6 +128,12 @@ class NodeSSH {
         return this.#connectDirectOnce(timeout, true);
     }
 
+    // Ordinary MAIN Apply retains the same card-based authentication policy
+    // as legacy Apply. If its caller provided a DB pin it still governs KEX.
+    async connectApplyOnce(timeout) {
+        return this.#connectDirectOnce(timeout, false, undefined, true);
+    }
+
     // Health checks on ordinary cards use the existing node credential policy,
     // but never use pooled credentials, retry authentication, or submit stdin.
     async connectObserverOnce(allow) {
@@ -138,7 +144,7 @@ class NodeSSH {
         return command => exec(command, { timeout: 8500, maxOutputBytes: 8192 });
     }
 
-    async #connectDirectOnce(timeout, requirePin, allow) {
+    async #connectDirectOnce(timeout, requirePin, allow, hold = requirePin) {
         sshPool.hostKeyOptions(this.node, this.#hostKeyOptions);
         if (this.usePool || (requirePin && !this.#hostKeyOptions) || this.#pendingDirect || this.directClient) {
             throw new Error(requirePin ? 'SSH one-shot admission requires a fresh pinned direct client'
@@ -182,13 +188,14 @@ class NodeSSH {
                 }
             };
             const exec = (command, options, verify) => this.#exec(command, options, verify, assertConnection);
-            if (requirePin) {
+            if (hold) {
+                Object.defineProperty(exec, 'verifyConnection', { value() { assertConnection(); return true; } });
                 let heldUsed = false;
                 Object.defineProperty(exec, 'openHeld', {
                     value: async (command, options) => {
                         const limits = heldOptions(command, options);
                         assertConnection();
-                        if (!socket || heldUsed) throw new Error('SSH held exec requires an unused pinned socket');
+                        if (!socket || heldUsed) throw new Error('SSH held exec requires an unused original socket');
                         heldUsed = true;
                         const controller = this.#pendingHeld = new AbortController();
                         return openHeldExec(command, limits, {

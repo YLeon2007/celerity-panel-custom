@@ -18,27 +18,28 @@ function deferred() {
 }
 
 function heldOptions(command, options) {
-    const { timeout, maxFrameBytes, verifyBeforeFrame } = options ?? {};
+    const { timeout, maxFrameBytes, verifyBeforeFrame, preamble } = options ?? {};
     if (typeof command !== 'string' || !command || !Number.isInteger(timeout) || timeout < 1 || timeout > 0x7fffffff
         || !Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 2 || maxFrameBytes > constants.MAX_LENGTH
-        || typeof verifyBeforeFrame !== 'function') {
+        || typeof verifyBeforeFrame !== 'function' || (preamble !== undefined &&
+            (!Buffer.isBuffer(preamble) || preamble.length < 1 || preamble.length > 17 * 1024 * 1024))) {
         throw error('OPTIONS', 'requires a command, finite timeout, frame byte limit and verifier');
     }
-    return { timeout, maxFrameBytes, verifyBeforeFrame };
+    return { timeout, maxFrameBytes, verifyBeforeFrame, ...(preamble !== undefined && { preamble }) };
 }
 
 // The caller owns the pin and gives us the original client/socket pair, not a
 // way to dial. A failed exchange is terminal, not evidence of no remote effect.
 // The lifetime budget starts at open, and the frame limit includes its LF.
 // stderr is not a side channel: any bytes there invalidate the exchange.
-function openHeldExec(command, { timeout, maxFrameBytes, verifyBeforeFrame }, {
+function openHeldExec(command, { timeout, maxFrameBytes, verifyBeforeFrame, preamble }, {
     client, socket, assertConnection, signal, onTerminal,
 }) {
     const deadline = performance.now() + timeout;
     const opened = deferred();
     const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
     const unlisten = [];
-    let phase = 'opening', terminalError, stream, timer, pending;
+    let phase = 'opening', terminalError, stream, timer, startupTimer, pending;
     let input, used = 0;
     let stdoutEnded = false, stderrEnded = false, channelClosed = false, eofWritten = false;
 
@@ -63,6 +64,7 @@ function openHeldExec(command, { timeout, maxFrameBytes, verifyBeforeFrame }, {
         phase = 'done';
         terminalError = failure || revoked();
         clearTimeout(timer);
+        clearTimeout(startupTimer);
         signal.removeEventListener('abort', abort);
         drainErrors(stream);
         for (const detach of unlisten.splice(0)) detach();
@@ -202,6 +204,7 @@ function openHeldExec(command, { timeout, maxFrameBytes, verifyBeforeFrame }, {
     }
 
     timer = setTimeout(() => stop(timedOut()), timeout);
+    if (preamble !== undefined) startupTimer = setTimeout(() => stop(timedOut()), Math.min(timeout, 44000));
     try {
         signal.addEventListener('abort', abort, { once: true });
         for (const event of ['end', 'close', 'error']) {
@@ -232,10 +235,21 @@ function openHeldExec(command, { timeout, maxFrameBytes, verifyBeforeFrame }, {
             listen(stream.stderr, 'end', () => end('stderr'));
             listen(stream.stderr, 'data', bytes => { if (bytes.length) stop(protocol()); });
             listen(stream, 'data', stdout);
-            queueMicrotask(() => {
+            const ready = () => {
                 if (!writable()) return;
                 phase = 'idle';
                 opened.resolve(Object.freeze({ request, finish, abort }));
+            };
+            queueMicrotask(() => {
+                if (!writable()) return;
+                if (preamble === undefined) return ready();
+                try {
+                    stream.write(preamble, failure => {
+                        clearTimeout(startupTimer);
+                        if (failure) return stop(io());
+                        ready();
+                    });
+                } catch { stop(io()); }
             });
         });
     } catch { stop(io()); }

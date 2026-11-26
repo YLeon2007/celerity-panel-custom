@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Перед первым Apply цепочки Rebuild обновите MAIN узлов, отмеченных в Preview, обычным Apply: он включает проверку маршрутов в локальном Xray API. Синхронизация только пользователей MAIN не обновляет.
+- Для цепочек Rebuild каждому узлу MAIN нужен один обычный Apply после обновления; панель подскажет в предпросмотре. Запись цепочек в штатной панели пока закрыта: проверка области изменений systemd не проходит на штатных зависимостях Debian 13.
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 

@@ -8,7 +8,7 @@ const {composeRebuildProfiles}=require('../modules/relay-l2tp/services/rebuildTo
 const {compileRebuildGraph}=require('../modules/relay-l2tp/domain/rebuildTopologyCompiler');
 const {buildTransitChannels}=require('../modules/relay-l2tp/services/rebuildTransitChannels');
 const {planSerialScopedTransition}=require('./rebuildTransitActivationPlan');
-const {createTransport,createBoundRelayTransport,profileBytes,profileSha256}=require('./rebuildTransport');
+const {createTransport,createBoundRelayTransport,createMainApplyTransport,profileBytes,profileSha256}=require('./rebuildTransport');
 const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {assertRealityFingerprint,realityEndpoints}=require('./rebuildRealityFingerprint');
 const {readKcpAdmission,kcpListenerId,hasDirectLifecycle,assertKcpVersionsUnchanged}=require('./rebuildKcpAdmission');
@@ -69,7 +69,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     L2tpUser=require('../modules/relay-l2tp/models/l2tpUserModel'),
     createRelayDirect=options=>require('./rebuildRelayDirect').createRelayDirect(options),
     assertNoRelayAccountIntent=()=>assertNoPendingRelayAccounts(L2tpUser.db),
-    serialMainAuthority,
+    serialMainAuthority, allowStockSerial=false,
     grantDb=env===process.env?L2tpUser.db:undefined,
     relayGrantStore=grantDb&&{snapshot:()=>require('./rebuildRelayGrantStore').createRelayGrantStore({db:grantDb,env}).snapshot()}}={}){
     const gate=()=>{if(!isRebuildEnabled(env))throw fail('REBUILD_DISABLED');};
@@ -127,8 +127,20 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         }
         return states;
     }
-    async function openTransports(nodes,states,transports,bindings,verifyLock,preflight=(_,fn)=>fn()){
+    async function openTransports(nodes,states,transports,bindings,verifyLock,preflight=(_,fn)=>fn(),mainApply=false){
         await verifyLock();
+        const cards=mainApply?require('./rebuildMainAuthority'):undefined;
+        const readMainCard=id=>Node.findOne({_id:id,active:true,type:'xray'}).select(cards.MAIN_CARD_SELECT)
+            .read('primary').readConcern('majority').lean();
+        const cardCheck=node=>{
+            const id=String(node._id), original=cards.mainCardBinding(node);
+            return async()=>{
+                await verifyLock();
+                const fresh=await readMainCard(id);
+                if(!fresh||!isDeepStrictEqual(cards.mainCardBinding(fresh),original))throw fail('REBUILD_MAIN_AUTHORITY_UNPROVED');
+                await verifyLock();
+            };
+        };
         // Resolve the whole component before choosing a transport. The Install
         // flag can deny use of a grant, but cannot prove a relay has no grant.
         const effectStore=states.size || nodes.some(node=>node.cascadeRole==='relay')
@@ -142,6 +154,10 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             // When a receipt exists it must agree with the operator binding.
             if(state?.rebuildMachineId!=null && state.rebuildMachineId!==binding.binding.machineId){
                 throw binding.merged?identityChanged():fail('REBUILD_L2TP_BINDING_MISMATCH');
+            }
+            if(cards){
+                const {machineId}=cards.mainCardIdentity(node);
+                if(machineId!==null&&machineId!==binding.binding.machineId)throw fail('REBUILD_MAIN_AUTHORITY_UNPROVED');
             }
             bindings.set(id,binding);
         }
@@ -161,11 +177,22 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             // Old route-group rows without a DIRECT receipt are not eligible
             // for the owned-unit transition. Keep their existing Apply path.
             const direct=hasDirectLifecycle(state);
-            const transport=createBoundRelayTransport(node,binding,verifyLock,direct?state:undefined,()=>verifyBinding(id,binding));
+            const checkCard=cards&&cardCheck(node);
+            const transport=createBoundRelayTransport(node,binding,verifyLock,direct?state:undefined,async()=>{
+                await checkCard?.();
+                return verifyBinding(id,binding);
+            },mainApply);
             transports.set(id,transport);
             await preflight(id,()=>transport.attest());
         }
-        for(const node of nodes){const id=String(node._id);if(!bindings.has(id))transports.set(id,await preflight(id,()=>connect(node)));}
+        for(const node of nodes){
+            const id=String(node._id);
+            if(bindings.has(id))continue;
+            if(!mainApply){transports.set(id,await preflight(id,()=>connect(node)));continue;}
+            const transport=createMainApplyTransport(node,cards.mainCardIdentity(node),cardCheck(node));
+            transports.set(id,transport);
+            await preflight(id,()=>transport.attest());
+        }
         return verifyBinding;
     }
     async function usingTransports(transports,fn){
@@ -255,7 +282,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     }
     async function runGraph(req,alreadyHeld,retire=false){
         gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock,verifyBinding,settlementSession,retainApply;
-        const serialEligible=env.C3_REBUILD_CHAIN_APPLY==='1'&&!!serial&&!retire&&!req.remove&&(req.preview===true||req.expectedPreview?.length===128);
+        const serialEligible=env.C3_REBUILD_CHAIN_APPLY==='1'&&(!!serial||stockSerialAvailable)&&!retire&&!req.remove&&(req.preview===true||req.expectedPreview?.length===128);
+        let stockInputs;
         const baseline=new Map(), inventoryNames=new Map();
         let kcpAdmission;
         const keyRoot=retire?env.ENCRYPTION_KEY:undefined;
@@ -335,13 +363,16 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
                 // Route edits on other rows can invalidate a saved pick. Refuse
                 // from the fresh desired scope before opening host transports.
+                let multiHop=false;
                 if(links.some(link=>link.rebuildExit!=null)){
                     const graph=compileRebuildGraph({nodes,links,affectedNodeIds:ids});
+                    multiHop=[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1);
                     // Keep the graph composer testable without enabling a new
                     // multi-host cutover on the legacy activation loop.
-                    if(!req.preview&&!serialEligible&&env.C3_REBUILD_CHAIN_APPLY!=='1'&&[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
+                    if(!req.preview&&!serialEligible&&multiHop)throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
                 }
-                states=await installedStates(ids);
+                const stockMain=multiHop&&serialEligible&&!serial;
+                states=await installedStates(ids,stockMain?{}:undefined);
                 const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
                 let kcpVersions;
                 if(kcpLinks.length){
@@ -351,7 +382,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                         await readKcpAdmission(Node,kcpLinks,nodes,await installedStates(ids)));
                 }
                 if(retire&&!req.preview&&states.has(req.nodeId))throw fail('REBUILD_L2TP_STATE_TRANSITION');
-                verifyBinding=await openTransports(nodes,states,transports,bindings,verifyLock,preflight);
+                verifyBinding=await openTransports(nodes,states,transports,bindings,verifyLock,preflight,stockMain);
                 // Read peers before the core helper (which deliberately
                 // collapses execution errors and malformed banners together).
                 if(retire)for(const id of ids){
@@ -390,6 +421,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     if(hasProtectedClientInbound(main,node.xray?.inboundTag||'vless-in'))bridgesWithClientInbound.add(id);
                 }
                 const composition={nodes,links:prepared,dialerVersions:endpointVersions,affectedNodeIds:ids,usersByNode,bridgesWithClientInbound,panelTls,followRelayStates,controlPlaneAddresses};
+                if(stockMain&&!req.preview)stockInputs={env,transports,bindings,composition,admittedNodes:nodes,admittedStates:states,verifyApply};
                 const candidates=compose(composition);
                 if(retire&&candidates.some(p=>p.profile==='bridge'
                     &&profilePreview(baseline.get(p.nodeId).bridge??emptyBridge,p.config,'main').protectedChanged)){
@@ -450,10 +482,15 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             }}),
             async activateSerial(confirmation,verify){
                 if(!serialEligible||verify!==verifyApply||typeof retainApply!=='function')throw fail('REBUILD_LOCK_LOST');
-                // These are only the Preview readers. Dispose them before
-                // dispatch; the authority opens its own pinned held peers.
-                await closeTransports(transports);
-                return serial(req.linkId,{confirmation,run:fn=>withHeldLock(verifyLock,retainApply,()=>fn(verify,retainApply))});
+                const joined={confirmation,run:fn=>withHeldLock(verifyLock,retainApply,()=>fn(verify,retainApply))};
+                if(serial){
+                    // The explicit constructor seam supplies its own readers.
+                    await closeTransports(transports);
+                    return serial(req.linkId,joined);
+                }
+                if(!stockInputs)throw fail('REBUILD_MAIN_AUTHORITY_UNPROVED');
+                const provider=require('./rebuildMainAuthority').createSerialMainAuthority({...stockInputs,confirmation});
+                return makeSerial(provider)(req.linkId,joined);
             },
             async checkActivation(ids,retirement,{transitBlocked=false}={}){
                 if(retire)await checkLinks(retirement);
@@ -543,14 +580,17 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const relayRetire=createRebuildRelayRetire({Link,Node,State,L2tpUser,env,sync,relayGrantStore,locks:guardedLocks,gate,
         retireGraph,checkRetireExits,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
-    // No HTTP/MCP request binds this private constructor dependency. The
-    // default factory stays guarded until a trusted provider is installed.
-    const serial=typeof serialMainAuthority==='function' && require('./rebuildSerialApply').createSerialApply({
+    // The production provider can only join a confirmed ordinary Apply. Keep
+    // the default entry closed until stock systemd can establish a bounded
+    // transaction scope without pulling in unrelated boot units.
+    const stockSerialAvailable=allowStockSerial===true&&serialMainAuthority===undefined&&connect===createTransport;
+    const makeSerial=admit=>require('./rebuildSerialApply').createSerialApply({
         Link,Node,State,env,locks:guardedLocks,gate,compose,readStates:(ids,session)=>installedStates(ids,{session}),
         syncNodeUsers:(id,options)=>sync.syncRebuildNodeUsersAfterResume(id,options),
-        publishedKeyMismatch:inconsistentPublishedKey,admit:serialMainAuthority,
+        publishedKeyMismatch:inconsistentPublishedKey,admit,
         async invalidate(){await cache.invalidateAllSubscriptions();await require('./cascadeService')._invalidateTopologyCache();},
     });
+    const serial=typeof serialMainAuthority==='function'&&makeSerial(serialMainAuthority);
     return {execute,retireGraph,verifyDraftKcp,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,recoverRelayInstall,...relayRemoval,...relayRetire,
         ...(serial&&{applySerialMain:linkId=>serial(linkId)}),
         createRelayAccount: input=>relayAccounts().create(input),
