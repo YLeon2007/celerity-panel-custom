@@ -12,6 +12,7 @@ const { routerForRebuild } = require('../cascadeRebuild');
 const Link = require('../../models/cascadeLinkModel');
 const Node = require('../../models/hyNodeModel');
 const { createRebuildService } = require('../../services/rebuildService');
+const { ingressTag, egressTag } = require('../../modules/relay-l2tp/services/rebuildTopologyComposer');
 
 const ids = Object.fromEntries(['portal', 'relay', 'bridge', 'otherBridge', 'portalLink', 'exit', 'otherExit']
     .map((name, i) => [name, (i + 1).toString(16).padStart(24, '0')]));
@@ -19,7 +20,7 @@ const choose = (nodeId, relayGeo = true) => ({ nodeId, relayGeo });
 const bson = value => BSON.deserialize(BSON.serialize(value));
 const create = { name: 'Portal tunnel', portalNodeId: ids.portal, bridgeNodeId: ids.relay, tunnelSecurity: 'none' };
 
-function fixture(t, { transport = false, createRelayDirect } = {}) {
+function fixture(t, { transport = false, createRelayDirect, serialMainAuthority } = {}) {
     const nodes = ['portal', 'relay', 'bridge', 'otherBridge'].map((name, i) => ({
         _id: new ObjectId(ids[name]), type: 'xray', active: true, name, cascadeRole: name.endsWith('Bridge') ? 'bridge' : name,
         ip: `192.0.2.${i + 1}`, port: 42000 + i,
@@ -43,7 +44,7 @@ function fixture(t, { transport = false, createRelayDirect } = {}) {
             try { return await fn(async () => assert.ok(held), () => assert.fail('retained lock')); }
             finally { held = false; }
         } },
-        env, createRelayDirect,
+        env, createRelayDirect, serialMainAuthority,
         assertNoRelayAccountIntent: async () => {},
         cache: { invalidateAllSubscriptions: async () => {} },
         sync: { _getUsersForNode: async () => [] },
@@ -55,6 +56,7 @@ function fixture(t, { transport = false, createRelayDirect } = {}) {
             return { async requireSupportedCore() {}, async close() {},
                 async read(profile, expectedMainSha256) {
                     const snapshot = structuredClone(pair[profile]);
+                    if (expectedMainSha256) effects.push('readback');
                     if (failReadback && expectedMainSha256) snapshot.log = { loglevel: 'debug' };
                     return snapshot;
                 },
@@ -86,7 +88,7 @@ function fixture(t, { transport = false, createRelayDirect } = {}) {
         t.mock.method(model.collection, 'findOne', async (f, o) => read(docs, f, o)[0] ?? null);
     }
     const sessionDB = new class FixtureTransaction {}();
-    t.mock.method(Link.db, 'transaction', fn => fn(sessionDB));
+    t.mock.method(Link.db, 'transaction', fn => { effects.push('finish'); return fn(sessionDB); });
     t.mock.method(Link.collection, 'deleteMany', async (filter, options) => {
         assert.ok(held); assert.equal(options.session, sessionDB);
         const deleted = rows.filter(row => matches(row, filter));
@@ -429,6 +431,71 @@ test('mounted Preview reports known default exit changes from MAIN, never from a
     assert.ok(unknown.json.nodes.every(n => !Object.hasOwn(n, 'portalExitChange')));
     assert.ok(!effects.some(effect => ['stage', 'activate'].includes(effect)));
 });
+
+for (const chainApply of [false, true]) {
+    test(`mounted routing-only two-relay exit applies and clears with chain flag ${chainApply ? 'on' : 'off'}`, async t => {
+        const { send, nodes, rows, profiles, effects, env } = fixture(t, { transport: true,
+            serialMainAuthority: async () => assert.fail('shared channels must use ordinary Apply') });
+        if (chainApply) env.C3_REBUILD_CHAIN_APPLY = '1';
+        nodes.find(node => String(node._id) === ids.otherBridge).cascadeRole = 'relay';
+        rows[0].portalNode = new ObjectId(ids.otherBridge); // b → b6
+        // rows[1] already connects r → b. Apply all physical links first.
+        const saved = await send('POST', '/links', { ...create, tunnelEncryption: 'none' });
+        assert.equal(saved.status, 200);
+        const { linkId } = saved.json;
+        const path = `/links/${linkId}`;
+        const preview = async () => {
+            const { status, json } = await send('POST', '/rebuild/preview', { linkId });
+            assert.equal(status, 200);
+            assert.equal(json.allowed, true, JSON.stringify(json.nodes.map(({ nodeId, profiles }) => ({ nodeId, profiles }))));
+            assert.equal(json.transitBlocked, undefined);
+            assert.ok(json.nodes.every(node => node.mainRestartCount === undefined));
+            return json;
+        };
+        const apply = async report => {
+            effects.length = 0;
+            const result = await send('POST', `${path}/deploy`, { expectedPreview: report.previewId });
+            assert.equal(result.status, 200, JSON.stringify(result.json));
+            assert.deepEqual(effects.filter(effect => effect !== 'connect'), [
+                ...Array(4).fill('stage'), ...Array(4).fill('activate'), ...Array(4).fill('readback'), 'finish',
+            ]);
+        };
+        await apply(await preview());
+        assert.equal(rows.length, 3);
+        assert.ok(rows.every(row => row.rebuildApplied));
+        const shared = structuredClone(profiles);
+        const portal = rows.find(row => String(row._id) === linkId);
+        const pick = choose(ids.bridge, false);
+        const routeOnly = report => assert.deepEqual(report.nodes.flatMap(({ nodeId, profiles }) => profiles
+            .filter(profile => profile.change !== 'unchanged').map(({ profile, sections }) => [nodeId, profile, sections])),
+        [[ids.relay, 'main', ['routing']]]);
+
+        assert.equal((await send('PUT', path, { rebuildExit: pick })).status, 200);
+        const selected = await preview();
+        routeOnly(selected);
+        assert.deepEqual(selected.nodes.find(node => node.nodeId === ids.portal).portalExitPath.after.map(hop => hop.nodeId),
+            [ids.relay, ids.otherBridge, ids.bridge]);
+        await apply(selected);
+        assert.deepEqual(portal.rebuildAppliedExit, choose(new ObjectId(ids.bridge), false));
+        const rule = (id, tag) => profiles.get(id).main.routing.rules.find(r => r.ruleTag === tag);
+        const ingress = { id: linkId, mode: portal.mode };
+        const mid = { id: ids.otherExit, mode: rows[1].mode };
+        const tail = { id: ids.exit, mode: rows[0].mode };
+        assert.deepEqual(rule(ids.relay, `rebuild-policy-portal-${linkId.slice(-8)}-default`), {
+            type: 'field', ruleTag: `rebuild-policy-portal-${linkId.slice(-8)}-default`,
+            inboundTag: [ingressTag(ingress)], outboundTag: egressTag(mid),
+        });
+        assert.equal(rule(ids.otherBridge, 'rebuild-policy-default').outboundTag, egressTag(tail));
+        assert.deepEqual(profiles.get(ids.otherBridge), shared.get(ids.otherBridge));
+
+        assert.equal((await send('PUT', path, { rebuildExit: null })).status, 200);
+        const clear = await preview();
+        routeOnly(clear);
+        await apply(clear);
+        assert.equal(portal.rebuildAppliedExit, null);
+        assert.deepEqual(profiles, shared);
+    });
+}
 
 test('joined core: mounted draft → Preview/Apply → map and MCP readback preserve the old pin until clear is applied', async t => {
     assert.ok(Link.schema.path('rebuildExit') && Link.schema.path('rebuildAppliedExit'), 'joined core and applied-exit schema required');

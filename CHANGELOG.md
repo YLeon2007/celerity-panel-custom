@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Apply цепочек Rebuild включается отдельно (`C3_REBUILD_CHAIN_APPLY=1`). Для цепочек каждому узлу MAIN нужен один обычный Apply после обновления; панель подскажет в предпросмотре.
+- Выбор выхода Rebuild по существующим общим каналам работает через обычный Apply, без флага. Установка новых выделенных межрелейных каналов требует `C3_REBUILD_CHAIN_APPLY=1`. Для неё каждому узлу MAIN нужен один обычный Apply после обновления; панель подскажет в предпросмотре.
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 

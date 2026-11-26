@@ -11,6 +11,8 @@ const { makeLocks, nodeLockVerifier } = require('../rebuildLocks');
 const { createFileCutoverJournal } = require('../rebuildTransitCutoverJournal');
 const { createCutoverArtifactStore } = require('../rebuildTransitCutoverArtifacts');
 const { composeRebuildProfiles } = require('../../modules/relay-l2tp/services/rebuildTopologyComposer');
+const { compileRebuildGraph } = require('../../modules/relay-l2tp/domain/rebuildTopologyCompiler');
+const { buildTransitChannels } = require('../../modules/relay-l2tp/services/rebuildTransitChannels');
 
 const id = n => n.toString(16).padStart(24, '0');
 const oid = n => new ObjectId(id(n));
@@ -33,14 +35,14 @@ test.after(() => require.cache[require.resolve('../sshPoolService')]?.exports.cl
 // Real service, planner, adapter, local locks, journal, artifacts and BSON.
 // Native-host observation is modeled. Optional native store executes the exact
 // transaction, command and BSON CAS against a disposable real replica set.
-function fixture(t, fault, native, mounted = false) {
+function fixture(t, fault, native, mounted = false, { cards = nodes, desired = links } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'c3-panel-serial.'));
     t.after(() => fs.rmSync(root, { recursive: true }));
     for (const dir of ['journal', 'artifacts']) fs.mkdirSync(path.join(root, dir), { mode: 0o700 });
     const journal = createFileCutoverJournal({ directory: path.join(root, 'journal') });
     const artifacts = createCutoverArtifactStore({ directory: path.join(root, 'artifacts'), key: randomBytes(32) });
     const events = [], counts = { open: 0, begin: 0, write: 0, commit: 0, abort: 0, invalidate: 0 };
-    let lock, stored = links.map(clone), scope;
+    let lock, stored = desired.map(clone), scope;
     const match = q => lock && Object.entries(q).every(([k, v]) => k === '$expr' ?
         (assert.equal(v.$eq[0], '$$ROOT'), BSON.serialize(lock).equals(BSON.serialize(v.$eq[1].$literal))) : lock[k] === v);
     const locks = makeLocks({
@@ -65,7 +67,7 @@ function fixture(t, fault, native, mounted = false) {
     });
     const state = () => scope && journal.read(scope);
     const fenced = () => lock?.cutover?.scope === scope && lock?.allowStaleUnlock === false &&
-        nodes.every(({ _id }) => nodeLockVerifier(String(_id))());
+        cards.every(({ _id }) => nodeLockVerifier(String(_id))());
     class Session {
         transaction = { transition: value => { assert.equal(value, 'TRANSACTION_COMMITTED'); this.active = false; } };
         startTransaction(opts) {
@@ -117,8 +119,8 @@ function fixture(t, fault, native, mounted = false) {
             return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
         },
     } };
-    const before = composeRebuildProfiles({ nodes, links: links.map(({ rebuildExit, ...link }) => link) });
-    const after = composeRebuildProfiles({ nodes, links });
+    const before = composeRebuildProfiles({ nodes: cards, links: desired.map(({ rebuildExit, ...link }) => link) });
+    const after = composeRebuildProfiles({ nodes: cards, links: desired });
     const current = new Map(before.filter(row => row.profile === 'main').map(({ nodeId, config }) =>
         [nodeId, { data: Buffer.from(JSON.stringify(config, null, 2)).toString('base64'), metadata: [0, 0, 416],
             generation: ['1', '1', '1'], xray: [10, '1'.repeat(32)] }]));
@@ -216,7 +218,7 @@ function fixture(t, fault, native, mounted = false) {
         };
     }
     const make = (serialMainAuthority, factory = createRebuildService, overrides = {}) => factory({ Link: native ?? Link,
-        Node: { db: selectedDb, find: () => query(nodes) }, State: { db: selectedDb, find: () => query([]) },
+        Node: { db: selectedDb, find: () => query(cards) }, State: { db: selectedDb, find: () => query([]) },
         L2tpUser: { db: selectedDb }, sync, locks, env: { C3_REBUILD_ENABLED: 'true',
             ...(mounted && serialMainAuthority && { C3_REBUILD_CHAIN_APPLY: '1' }) }, assertNoRelayAccountIntent: async () => {},
         connect: reader, serialMainAuthority,
@@ -278,6 +280,36 @@ test('ordinary Apply consumes the same preview and uses only the joined MAIN pat
     assert.equal((await f.service.execute({ linkId: anchor, expectedPreview: preview.previewId })).previewId, preview.previewId);
     assert.equal(f.state().status, 'applied');
     assert.equal(f.counts.commit, 1);
+    assert.equal(f.lock(), null);
+});
+
+test('two portals on the same relay hop with different terminal exits still use serial Apply', async t => {
+    const cards = [...nodes, { ...nodes[0], _id: oid(6), ip: '192.0.2.6', port: 22006 }];
+    const shared = { ...links[0], _id: oid(106), portalNode: oid(6), tunnelPort: 24006,
+        tunnelUuid: '00000000-0000-4000-8000-000000000006', rebuildExit: { nodeId: oid(4), relayGeo: false } };
+    const desired = [...links, shared];
+    const before = desired.map(({ rebuildExit, ...link }) => link);
+    const channels = rows => buildTransitChannels(compileRebuildGraph({ nodes: cards, links: rows }));
+    assert.deepEqual(channels(before).artifacts, []);
+    const { artifacts, policies } = channels(desired);
+    assert.equal(artifacts.length, 1);
+    assert.equal(artifacts[0].physicalId, String(links[1]._id));
+    assert.deepEqual(policies.get(id(2)).map(({ policy }) => policy.defaultLink.id), [artifacts[0].id, String(links[1]._id)]);
+
+    const f = fixture(t, undefined, undefined, true, { cards, desired });
+    const off = await f.ordinary.execute({ linkId: anchor, preview: true });
+    assert.equal(off.transitBlocked, true);
+    await assert.rejects(f.ordinary.execute({ linkId: anchor, expectedPreview: off.previewId }),
+        { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
+    const preview = await f.service.execute({ linkId: anchor, preview: true });
+    assert.equal(preview.allowed, true);
+    assert.ok(preview.nodes.some(node => node.mainRestartCount > 0));
+    assert.equal(f.counts.open, 0);
+    const applied = await f.service.execute({ linkId: anchor, expectedPreview: preview.previewId });
+    assert.equal(applied.allowed, true);
+    assert.equal(f.state().status, 'applied');
+    assert.equal(f.counts.commit, 1);
+    assert.ok(f.counts.open > 0);
     assert.equal(f.lock(), null);
 });
 

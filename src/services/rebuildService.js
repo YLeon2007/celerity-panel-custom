@@ -363,15 +363,18 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 for(const node of nodes)roles.set(String(node._id),node.role??node.cascadeRole);
                 // Route edits on other rows can invalidate a saved pick. Refuse
                 // from the fresh desired scope before opening host transports.
-                let multiHop=false;
+                let transit;
                 if(links.some(link=>link.rebuildExit!=null)){
                     const graph=compileRebuildGraph({nodes,links,affectedNodeIds:ids});
-                    multiHop=[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1);
-                    // Keep the graph composer testable without enabling a new
-                    // multi-host cutover on the legacy activation loop.
-                    if(!req.preview&&!serialEligible&&multiHop)throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
+                    if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1)){
+                        const after=buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}));
+                        // A multi-hop route over the shared policy does not
+                        // require installing a scoped listener/dialer pair.
+                        transit={multiHop:true,blocked:after.length>0,after};
+                    }
                 }
-                const stockMain=multiHop&&serialEligible&&!serial;
+                if(!req.preview&&!serialEligible&&transit?.blocked)throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
+                const stockMain=transit?.blocked&&serialEligible&&!serial;
                 states=await installedStates(ids,stockMain?{}:undefined);
                 const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
                 let kcpVersions;
@@ -429,23 +432,19 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 }
                 await verifyTunnelTrust(prepared,panelTls,transports);
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
-                let transit;
-                if((req.preview||serialEligible||env.C3_REBUILD_CHAIN_APPLY==='1')&&prepared.some(link=>link.rebuildExit!=null)){
-                    const graph=compileRebuildGraph({nodes,links:prepared,affectedNodeIds:ids});
-                    if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1)){
-                        const keysSettled=prepared.every((link,i)=>!Object.hasOwn(link,'_rebuildVless')||Object.hasOwn(links[i],keyEnvelopeField));
-                        transit={multiHop:true,blocked:true,serial:serialEligible&&keysSettled,after:buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}))};
-                        if(!retire&&!req.remove)transit.planRestarts=before=>{
-                            try {
-                                return planSerialScopedTransition({before,after:candidates,composition,allowMainRestart:true});
-                            } catch(error) {
-                                // This describes a plan, not live/boot attestation. Unsupported
-                                // transitions must not invent a schedule or weaken the refusal.
-                                if(error.code==='REBUILD_SCOPE_STAGE_UNPROVED')return [];
-                                throw error;
-                            }
-                        };
-                    }
+                if(transit?.blocked){
+                    const keysSettled=prepared.every((link,i)=>!Object.hasOwn(link,'_rebuildVless')||Object.hasOwn(links[i],keyEnvelopeField));
+                    transit.serial=serialEligible&&keysSettled;
+                    if(!retire&&!req.remove)transit.planRestarts=before=>{
+                        try {
+                            return planSerialScopedTransition({before,after:candidates,composition,allowMainRestart:true});
+                        } catch(error) {
+                            // This describes a plan, not live/boot attestation. Unsupported
+                            // transitions must not invent a schedule or weaken the refusal.
+                            if(error.code==='REBUILD_SCOPE_STAGE_UNPROVED')return [];
+                            throw error;
+                        }
+                    };
                 }
                 return {coreIdentities,kcpVersions,transit,candidates:candidates.map(p=>p.profile==='main'&&mismatched.has(p.nodeId)?{...p,publishedKeyMismatch:true}:p)};
             },
