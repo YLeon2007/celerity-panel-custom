@@ -4986,6 +4986,23 @@ def apply_bridge_state(info, active):
     return file_pin(*apply_profile_read(SYSTEM + '/' + B))
 
 
+def classic_bridge_pin(info, original):
+    bad = BRIDGE_PLACEHOLDER_UNPROVED
+    # The old Install projection did not retain jobs, cgroup or reload state.
+    need(type(original) is dict and info.get('LoadState') == 'loaded' and info.get('DropInPaths') == ''
+         and all(type(original.get(k)) is str and info.get(k) == original[k] for k in INSTALL_UNIT_FIELDS)
+         and xray_accounts_match(info, original) and info.get('Job') == ''
+         and info.get('ControlGroup') == '', bad)
+    # Dependency links need not appear in either the fragment or DropInPaths.
+    need(set(info['Requires'].split()) <= {'sysinit.target', 'system.slice', '-.mount'}
+         and not any(info[k] for k in ('Wants', 'BindsTo', 'Upholds')), bad)
+    need(rollback_quiescent(info) and info['UnitFileState'] == 'disabled'
+         and info['FragmentPath'] == SYSTEM + '/' + B and info.get('NeedDaemonReload') == 'no', bad)
+    pin = apply_bridge_state(info, False)
+    need(pin[0]['data'] == APPLY_BRIDGE_UNIT_SHA, bad)
+    return pin
+
+
 def apply_tcp_pin(rows, *units):
     # UDP SS rows may be outbound ephemeral sockets. The managed fixed VPN,
     # TPROXY and SOCKS UDP endpoints are separately proved by their consumers.
@@ -5037,9 +5054,11 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     global NETWORK_UPGRADE_ENTERED
     bad = 'ROLLBACK_DRIFT'
     after, runtime = backup['after'], backup['runtime']
+    original = backup['before']
+    original_unit = original['units'].get(B)
     installed = backup.get('currentApply')
     before, replacements, plan = {}, {}, {}
-    placeholder = False
+    placeholder = classic = False
     for key, target in (('main', MAIN), ('bridge', BRIDGE)):
         unpinned = installed is None and key not in after
         try:
@@ -5052,16 +5071,17 @@ def publish_apply_profiles(request, path, manifest, backup, live):
             expected = installed['files'][key] if installed is not None else [after[key], runtime['files'][key]]
             need(encode(file_pin(record, generation)) == encode(expected), bad)
         elif key == 'bridge':
-            original = backup['before']
             pinned = 'emptyBridgeGeneration' in original
             if record is not None or original['bridge'] is not None or pinned:
                 need(generation is not None and record == original['bridge'] and canonical_empty_bridge(record),
                      BRIDGE_PLACEHOLDER_UNPROVED)
-                # v1.4.1 recorded the canonical file and the absent unit, but
-                # not the original inode. Attest the live generation only for
-                # this publication; never add a historical generation pin.
-                need(generation == original['emptyBridgeGeneration'] if pinned
-                     else bridge_unit_absent_pin(original['units'].get(B)), BRIDGE_PLACEHOLDER_UNPROVED)
+                # Never infer a historical generation pin from a live file.
+                if pinned:
+                    need(generation == original['emptyBridgeGeneration'], BRIDGE_PLACEHOLDER_UNPROVED)
+                else:
+                    classic = not bridge_unit_absent_pin(original_unit)
+                    if classic:
+                        need(encode(record) == encode(original['bridge']), BRIDGE_PLACEHOLDER_UNPROVED)
                 placeholder = True
         else:
             raise Refusal(bad)
@@ -5081,11 +5101,23 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     active = bool(side['inbounds'] or any(o.get('protocol') == 'vless' and o.get('settings', {}).get('reverse', {}).get('tag')
                                          for o in side['outbounds']))
     info = unit(B)
-    if placeholder:
-        need(bridge_unit_absent(info), BRIDGE_PLACEHOLDER_UNPROVED)
-    need(xray_accounts_match(info, backup['before']['units'][B]), bad)
-    old_unit = apply_bridge_state(info, installed is not None and installed['bridgeActive'])
-    need(old_unit == (None if installed is None else installed['bridgeUnit']), bad)
+    if classic:
+        old_unit = classic_bridge_pin(info, original_unit)
+    else:
+        if placeholder:
+            need(bridge_unit_absent(info), BRIDGE_PLACEHOLDER_UNPROVED)
+        need(xray_accounts_match(info, original['units'][B]), bad)
+        old_unit = apply_bridge_state(info, installed is not None and installed['bridgeActive'])
+        need(old_unit == (None if installed is None else installed['bridgeUnit']), bad)
+    bridge_unchanged = classic and not active
+    if bridge_unchanged:
+        need(replacements['bridge'] == before['bridge'][0], BRIDGE_PLACEHOLDER_UNPROVED)
+        plan['bridge'] = file_pin(*before['bridge'])
+
+    def same_placeholder():
+        info = unit(B)
+        return classic_bridge_pin(info, original_unit) == old_unit if classic else bridge_unit_absent(info)
+
     unit_path = SYSTEM + '/' + B
     new_unit = entry(request['bridgeUnit'].encode(), 0o644) if active and old_unit is None else None
     need(new_unit is None or digest(raw(new_unit)) == APPLY_BRIDGE_UNIT_SHA, bad)
@@ -5097,14 +5129,17 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     proof = entry(encode(journal))
     generation = remove_generation(path)
     if placeholder:
-        need(bridge_unit_absent(unit(B)) and apply_profile_read(BRIDGE) == before['bridge'], BRIDGE_PLACEHOLDER_UNPROVED)
+        need(same_placeholder() and apply_profile_read(BRIDGE) == before['bridge'], BRIDGE_PLACEHOLDER_UNPROVED)
     need(generation is not None and len(raw(proof)) <= 2 * MAX_FILE and time.monotonic() < DEADLINE, bad)
     NETWORK_UPGRADE_ENTERED = True
     journal_generation = write(path, manifest, proof, generation=generation, witness=True)
     for key, target in (('bridge', BRIDGE), ('main', MAIN)):
         record, generation = before[key]
         if placeholder and key == 'bridge':
-            need(bridge_unit_absent(unit(B)) and time.monotonic() < DEADLINE, bad)
+            need(same_placeholder() and time.monotonic() < DEADLINE, bad)
+            if bridge_unchanged:
+                need(apply_profile_read(target) == before[key], bad)
+                continue
         observed = write(target, record, replacements[key], generation=generation, witness=True)
         pending['files'][key] = file_pin(replacements[key], observed)
     if new_unit is not None:
@@ -5113,7 +5148,7 @@ def publish_apply_profiles(request, path, manifest, backup, live):
     read_apply_profiles(pending['files'])
     need(time.monotonic() < DEADLINE, 'IN_FLIGHT')
     write(path, proof, final, generation=journal_generation)
-    return final
+    return final, bridge_unchanged
 
 
 def apply_network(request, action):
@@ -5160,8 +5195,9 @@ def apply_network(request, action):
     proof = digest(encode([digest(raw(manifest)), generation, stable]))
     if finalizing or action in ('verify-apply-network', 'restart-apply-network', 'publish-apply-profiles'):
         need(not legacy and proof == request['proof'], 'RUNTIME_UNPROVED')
+    bridge_unchanged = False
     if action == 'publish-apply-profiles':
-        manifest = publish_apply_profiles(request, path, manifest, backup, main_invocation)
+        manifest, bridge_unchanged = publish_apply_profiles(request, path, manifest, backup, main_invocation)
         proof = digest(encode([digest(raw(manifest)), generation, stable]))
     if action == 'restart-apply-network':
         # Final effective-graph observation and the actual restart share the
@@ -5212,7 +5248,7 @@ def apply_network(request, action):
         replacement = entry(encode(finished))
         need(len(raw(replacement)) <= 2 * MAX_FILE, 'ROLLBACK_DRIFT')
         write(path, manifest, replacement, generation=manifest_generation)
-    return {'ok': True, 'backupId': token, 'proof': proof}
+    return {'ok': True, 'backupId': token, 'proof': proof, **({'bridgeUnchanged': True} if bridge_unchanged else {})}
 
 
 def file_pin(record: Any, generation):

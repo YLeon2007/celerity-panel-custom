@@ -22,12 +22,12 @@
     },
     {
       "path": "rebuildRelayDirectHost.py",
-      "size": 426495,
-      "sha256": "9f8e492e544a005f8cf69891b789638b57161a11a484db20c20aed1c721c3929"
+      "size": 428291,
+      "sha256": "80f9cd7f13ee652a74f6501729dfc257d3a81063833d473f56c5afb0bb621399"
     }
   ],
-  "sha256": "ed7427b88865cf781301952da2bea232f2b1fe8fd3e0123c1c57b013a957ecec",
-  "directSize": 111720,
+  "sha256": "b00b6e46a6ad1f7f630eb0597fbffc7c0d7f78cec1c6054e0621e5fd83b2f360",
+  "directSize": 111544,
   "main": {
     "sources": [
       {
@@ -120,6 +120,15 @@
     "223": "self.",
     "222": "raise ",
     "221": "CANDIDATE_INVALID",
-    "220": "PREREQUISITE"
+    "220": "PREREQUISITE",
+    "219": "generation",
+    "218": "request",
+    "217": "PACKAGE_",
+    "216": "Refusal(",
+    "215": "data",
+    "214": "encode(",
+    "213": "observ",
+    "212": "remove_generation",
+    "211": "value"
   }
 }

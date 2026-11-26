@@ -260,17 +260,20 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
     }
     async function putPair(){
         if(staged.size!==2)throw fail('REBUILD_PAIR_NOT_STAGED');
+        const side=staged.get('bridge');
+        let bridgeUnchanged=false;
         if(authority?.installation){
             if(!networkProof)throw fail('REBUILD_L2TP_APPLY_NETWORK_REFUSED');
             await relayNetwork('verify_before_restart',networkProof);
-            networkProof=await relayNetwork('publish',networkProof,{publication:{nodeId:String(node._id),stageId:token,
+            const published=await relayNetwork('publish',networkProof,{publication:{nodeId:String(node._id),stageId:token,
                 profiles:Object.fromEntries(['main','bridge'].map(key=>[key,staged.get(key).sha256])),
-                bridgeUnit:generateBridgeSystemdService()}});
+                bridgeUnit:generateBridgeSystemdService(),bridgeActive:side.active}});
+            networkProof=published.proof;
+            bridgeUnchanged=published.bridgeUnchanged===true;
         }
         // Release the previous socket owner before moving any listener between
         // services; enable both effective profiles for a normal unattended boot.
-        const side=staged.get('bridge');
-        if(side.state==='loaded')await check('systemctl stop xray-bridge.service',undefined,true);
+        if(side.state==='loaded'&&!bridgeUnchanged)await check('systemctl stop xray-bridge.service',undefined,true);
         for(const profile of authority?.installation ? [] : ['bridge','main']){
             const path=paths[profile], f=temp(profile);
             // Keep an existing profile's service readability and privileges;
@@ -289,7 +292,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             await relayNetwork('restart',networkProof);
         }else await check('systemctl enable xray.service && systemctl restart xray.service && systemctl is-active --quiet xray.service',undefined,true);
         if(side.active)await check('systemctl enable xray-bridge.service && systemctl restart xray-bridge.service && systemctl is-active --quiet xray-bridge.service',undefined,true);
-        else if(side.state==='loaded') await check('systemctl disable xray-bridge.service',undefined,true);
+        else if(side.state==='loaded'&&!bridgeUnchanged) await check('systemctl disable xray-bridge.service',undefined,true);
         if(authority?.installation)await relayNetwork('verify_after_restart',networkProof);
     }
     async function checkMainRoutingService(config){

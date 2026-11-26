@@ -523,7 +523,7 @@ class RuntimeReattest(unittest.TestCase):
         self.boot = '12345678-1234-1234-1234-123456789abb'
         self.assert_foreign()
 
-    def apply_fixture(self, *, bridge=False):
+    def apply_fixture(self, *, bridge=False, classic=False):
         if self.boot != self.old_boot:
             self.boot = self.old_boot
             self.manifest['runtime']['invocations'] = [self.units[n]['InvocationID'] for n in self.watch]
@@ -549,17 +549,133 @@ class RuntimeReattest(unittest.TestCase):
         side = dict(inbounds=[dict(tag='bridge-test', protocol='vless', listen='127.0.0.1', port=9443)] if bridge else [],
                     outbounds=[], routing=dict(rules=[]))
         for key, data in [('main', profile), ('bridge', side)]:
-            wire = h['encode'](data)
+            wire = h['EMPTY_BRIDGE_BYTES'] if classic and key == 'bridge' and not bridge else h['encode'](data)
             self.put(targets[key] + '.rebuild-' + stage_id + '.json', wire, 0o600)
             stages[key] = h['digest'](wire)
         self.request.pop('nodeId')
-        before = self.call('prepare-apply-network')
-        self.assertEqual((before[0], before[2]), (0, ''))
         source = SOURCE.with_name('configGenerator.js').read_text()
         bridge_unit = source.split('function generateBridgeSystemdService() {', 1)[1].split('`', 2)[1]
+        if classic:
+            b, target = h['B'], h['BRIDGE']
+            fragment = h['SYSTEM'] + '/' + b
+            self.units[b].update(LoadState='loaded', UnitFileState='disabled', FragmentPath=fragment,
+                                 User='nobody', Job='', ControlGroup='', InvocationID='0' * 32,
+                                 Requires='-.mount sysinit.target system.slice',
+                                 ExecStart=f'{{ path={h["XRAY"]} ; argv[]={h["XRAY"]} run -config {target} ; }}')
+            self.put(fragment, bridge_unit.encode(), 0o644)
+            self.put(target, h['EMPTY_BRIDGE_BYTES'], 0o640)
+            with self.physical(target).open('rb') as stream:
+                h['os'].fchown(stream.fileno(), 0, h['grp'].getgrnam('nogroup').gr_gid)
+            self.manifest['before']['bridge'] = h['read'](target)
+            self.manifest['before']['units'][b] = h['install_unit_pins'](self.units)[b]
+            self.save_manifest()
+        before = self.call('prepare-apply-network')
+        self.assertEqual((before[0], before[2]), (0, ''))
         params = dict(nodeId=self.node, stageId=stage_id, profiles=stages, bridgeUnit=bridge_unit,
                       proof=json.loads(before[1])['proof'])
         return params, port
+
+    def check_classic_bridge_apply(self, active):
+        params, port = self.apply_fixture(bridge=active, classic=True)
+        h, b = self.h, self.h['B']
+        fragment = h['SYSTEM'] + '/' + b
+        unit_before, profile_before = (h['apply_profile_read'](p) for p in (fragment, h['BRIDGE']))
+        original = self.manifest['before']
+        self.assertNotIn('emptyBridgeGeneration', original)
+        self.assertNotIn('bridge', self.manifest['after'])
+        self.assertFalse({'Job', 'ControlGroup', 'NeedDaemonReload'} & original['units'][b].keys())
+        self.assertTrue(h['canonical_empty_bridge'](profile_before[0]))
+        params['bridgeUnit'] = 'never replace the existing unit'
+        rc, out, err = self.call('publish-apply-profiles', **params)
+        self.assertEqual((rc, err), (0, ''))
+        reply = json.loads(out)
+        self.assertEqual(reply.get('bridgeUnchanged', False), not active)
+        proof = reply['proof']
+        pending = h['read_manifest'](self.token)[2]['applyPending']
+        self.assertEqual(pending['bridgeUnit'], h['file_pin'](*unit_before))
+        self.assertEqual(h['apply_profile_read'](fragment), unit_before)
+        if not active:
+            self.assertEqual(h['apply_profile_read'](h['BRIDGE']), profile_before)
+
+        self.model_apply_main_restart(port)
+        self.assertEqual(self.call('restart-apply-network', proof=proof)[0], 0)
+        if active:
+            self.units[b].update(ActiveState='active', SubState='running', UnitFileState='enabled', MainPID='22',
+                                 InvocationID='3' * 32, ModelCgroup=['22'])
+            self.starts['22'] = 202
+            self.rows.append(('tcp', '127.0.0.1', 9443, ['22']))
+        self.assertEqual(self.call('finalize-apply-profiles', proof=proof)[0], 0)
+        finished = h['read_manifest'](self.token)[2]
+        self.assertEqual(finished['before'], original)
+        self.assertEqual(finished['currentApply']['bridgeActive'], active)
+        self.assertEqual(finished['currentApply']['bridgeUnit'], h['file_pin'](*unit_before))
+        self.assertEqual(h['apply_profile_read'](fragment), unit_before)
+
+    def test_apply_classic_empty_bridge_stays_untouched(self):
+        self.check_classic_bridge_apply(False)
+
+    def test_apply_classic_empty_bridge_reuses_unit_when_activated(self):
+        self.check_classic_bridge_apply(True)
+
+    def test_apply_classic_empty_bridge_requires_exact_stock_proof(self):
+        params, _ = self.apply_fixture(bridge=True, classic=True)
+        h, b = self.h, self.h['B']
+        unit = self.units[b].copy()
+        original = self.manifest['before']['bridge'].copy()
+        for key in ('Requires', 'Wants', 'BindsTo', 'Upholds', 'mode'):
+            with self.subTest(key=key):
+                self.units[b] = unit.copy()
+                self.manifest['before']['bridge'] = original.copy()
+                if key == 'mode':
+                    self.manifest['before']['bridge']['mode'] = float(original['mode'])
+                else:
+                    self.units[b][key] = (unit[key] + ' ' if unit[key] else '') + 'foreign.service'
+                self.save_manifest()
+                rc, out, err = self.call('prepare-apply-network')
+                self.assertEqual((rc, err), (0, ''))
+                params['proof'] = json.loads(out)['proof']
+                before = self.image()
+                self.assertEqual(self.call('publish-apply-profiles', **params),
+                                 (70, '', 'DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n'))
+                self.assertEqual(self.image(), before)
+
+    def test_apply_classic_empty_bridge_refuses_unproved_preimage(self):
+        params, _ = self.apply_fixture(classic=True)
+        h, b = self.h, self.h['B']
+        fragment = h['SYSTEM'] + '/' + b
+        stock = self.physical(fragment).read_bytes()
+        snapshot = self.units[b].copy()
+        original = self.manifest['before']
+        retired = {'LoadState': 'masked', 'UnitFileState': 'enabled', 'ActiveState': 'active', 'SubState': 'running',
+                   'DropInPaths': fragment + '.d/override.conf', 'FragmentPath': '/run/systemd/system/' + b,
+                   'MainPID': '22', 'InvocationID': '1' * 32, 'User': '', 'Group': 'nogroup'}
+        cases = [('current', key, value) for key, value in retired.items() if key != 'LoadState']
+        cases += [('current', 'Job', '7'), ('current', 'ControlGroup', '/system.slice/' + b),
+                  ('current', 'NeedDaemonReload', 'yes'), ('current', 'sha', None), ('both', 'profile', None)]
+        cases += [('install', key, value) for key, value in retired.items()]
+        for where, key, value in cases:
+            with self.subTest(where=where, key=key):
+                self.units[b] = snapshot.copy()
+                original['units'][b] = h['install_unit_pins'](self.units)[b]
+                self.physical(fragment).write_bytes(stock)
+                self.physical(h['BRIDGE']).write_bytes(h['EMPTY_BRIDGE_BYTES'])
+                if key == 'sha':
+                    self.physical(fragment).write_bytes(stock + b'# other bytes\n')
+                elif key == 'profile':
+                    self.physical(h['BRIDGE']).write_bytes(b'{"inbounds":[{}]}')
+                else:
+                    (self.units[b] if where == 'current' else original['units'][b])[key] = value
+                original['bridge'] = h['read'](h['BRIDGE'])
+                self.save_manifest()
+                prep = self.call('prepare-apply-network')
+                if prep[0] == 0:
+                    params['proof'] = json.loads(prep[1])['proof']
+                before = self.image()
+                rc, out, err = self.call('publish-apply-profiles', **params)
+                self.assertEqual((rc, out), (70, ''))
+                self.assertIn(err, ('DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n', 'DIRECT_ROLLBACK_DRIFT\n',
+                                    'DIRECT_RUNTIME_UNPROVED\n'))
+                self.assertEqual(self.image(), before)
 
     def model_apply_main_restart(self, port):
         h, x = self.h, self.watch[0]

@@ -206,7 +206,7 @@ function bundleDirectScript() {
     requireThat(manifest.sources.length === names.length && sha(compressed) === manifest.sha256, 'DIRECT_BUNDLE_INVALID');
     const dictionary = Object.entries(manifest.dictionary ?? {});
     requireThat(dictionary.length > 0 && dictionary.length <= 64 && dictionary.every(([key, value]) =>
-        /^(?:16[1-9]|17[0-6]|2[2-4]\d|25[0-5])$/.test(key) && typeof value === 'string' && /^[ \n!-~]{1,65}$/.test(value)),
+        /^(?:16[1-9]|17[0-6]|21[1-9]|2[2-4]\d|25[0-5])$/.test(key) && typeof value === 'string' && /^[ \n!-~]{1,65}$/.test(value)),
     'DIRECT_BUNDLE_INVALID');
     // The indent codes are consecutive and their values are derived from the
     // code itself. Validate that representation before emitting the loader.
@@ -951,13 +951,14 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
         if (finalizing) throw unknown();
         throw fail('APPLY_NETWORK_REFUSED');
     }
-    if (result?.code !== 0 || result.stderr !== '' || typeof result.stdout !== 'string' || result.stdout.length > 140) throw unknown();
+    if (result?.code !== 0 || result.stderr !== '' || typeof result.stdout !== 'string' || result.stdout.length > (publishing ? 163 : 140)) throw unknown();
     let reply;
     try { reply = JSON.parse(result.stdout); } catch { throw unknown(); }
+    const bridgeUnchanged = publishing && publication.bridgeActive === false && reply?.bridgeUnchanged === true;
     if (reply?.ok !== true || reply.backupId !== backupId || reply.proof?.length !== 64 || !tokenMatches(PIN, reply.proof)
-        || result.stdout !== `${JSON.stringify({ ok: true, backupId, proof: reply.proof })}\n`
+        || result.stdout !== `${JSON.stringify({ ok: true, backupId, proof: reply.proof, ...(bridgeUnchanged && { bridgeUnchanged }) })}\n`
         || (proof !== undefined && (publishing ? proof === reply.proof : proof !== reply.proof))) throw unknown();
-    return reply.proof;
+    return publishing ? reply : reply.proof;
 }
 
 module.exports = { createRelayDirect, applyRelayNetwork, installRecoveryWasNotSent, bundledMainFingerprintCommand, bundledMainReceiverCommand };
