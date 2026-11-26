@@ -274,7 +274,9 @@ for (const mode of ['reverse', 'forward']) {
         assert.equal(listener.after, null);
         const refused = await preview.confirm(inlet, result.previewId);
         assert.equal(refused.status, 409);
-        assert.deepEqual(JSON.parse(refused.body), { error: { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' }, preview: result });
+        assert.deepEqual(JSON.parse(refused.body), { error: { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE',
+            outcome: 'not-dispatched', reason: 'guarded-preflight', retryAllowed: false,
+            message: require('../../locales/ru.json').network.rebuildPreview.mainCutover.guardedPreflight }, preview: result });
     });
 }
 

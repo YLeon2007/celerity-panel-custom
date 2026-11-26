@@ -8,6 +8,7 @@ const previewKeys = [
     'mainRestartCount', 'mainRestartWarning',
 ];
 const previewLabels = Object.fromEntries(previewKeys.map(key => [key, t('network.rebuildPreview.' + key)]));
+previewLabels.mainCutover = typeof locales !== 'undefined' ? locales?.network?.rebuildPreview?.mainCutover : undefined;
 for (const key of ['noPortalExit', 'unknownPortalExit']) previewLabels[key] = t('network.rebuildPreview.' + key);
 previewLabels.portalExitChannelChange = t('network.rebuildPreview.portalExitChange');
 const geoKey = 'network.rebuildPreview.portalExitGeo';
@@ -77,4 +78,4 @@ previewLabels.close = t('common.close');
 <script>
 window._networkRebuildPreviewI18n = <%- JSON.stringify(previewLabels).replace(/</g, '\\u003c') %>;
 </script>
-<script src="/js/rebuild-preview.js?v=810114c463443169"></script>
+<script src="/js/rebuild-preview.js?v=39dd993477966118"></script>

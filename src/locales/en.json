@@ -1576,6 +1576,36 @@
       "transitReplace": "replace profile",
       "transitListeners": "TCP tunnel listener",
       "transitBlocked": "The path is valid, but safe activation of multi-relay exits is not available. No profiles were changed.",
+      "mainCutover": {
+        "title": "Rebuild outcome unknown",
+        "unknown": "The MAIN cutover could not be confirmed. Nodes may have changed; neither successful application nor rollback was confirmed. Do not retry. Check node and link status before any further action.",
+        "guardedPreflight": "Preflight blocked Apply: safe activation of multi-relay exits is not available. No node profiles were changed.",
+        "phase": {
+          "agent-stop": "Pending phase: stopping the agent.",
+          "main-publication": "Pending phase: publishing the MAIN profile.",
+          "xray-restart": "Pending phase: restarting MAIN Xray.",
+          "agent-start": "Pending phase: starting the agent.",
+          "agent-reconcile": "Pending phase: reconciling the agent and its users."
+        },
+        "reason": {
+          "REBUILD_AGENT_STOP_UNCONFIRMED": "The agent stop was not confirmed.",
+          "REBUILD_AGENT_EXCLUSION_UNPROVED": "Exclusive access while the agent was stopped could not be verified.",
+          "REBUILD_AGENT_START_UNCONFIRMED": "The agent start was not confirmed.",
+          "REBUILD_AGENT_RECONCILE_UNPROVED": "Agent reconciliation could not be verified.",
+          "REBUILD_MAIN_PUBLICATION_UNCONFIRMED": "Publication of the MAIN profile was not confirmed.",
+          "REBUILD_MAIN_RESTART_UNCONFIRMED": "The MAIN Xray restart was not confirmed.",
+          "REBUILD_MAIN_RUNTIME_UNPROVED": "The MAIN Xray runtime could not be verified.",
+          "REBUILD_MAIN_LOCK_UNPROVED": "The cutover lock could not be verified.",
+          "REBUILD_MAIN_AUTHORITY_UNPROVED": "Authority to complete the cutover could not be verified.",
+          "REBUILD_MAIN_WIRE_SETTLEMENT": "Completion of the host session could not be confirmed.",
+          "REBUILD_CUTOVER_ARTIFACT_UNPROVED": "The saved cutover evidence could not be verified.",
+          "REBUILD_MAIN_CAS_UNPROVED": "The expected MAIN profile state could not be verified.",
+          "REBUILD_NODE_USER_SYNC_UNCONFIRMED": "User synchronization was not confirmed.",
+          "REBUILD_NODE_USER_SYNC_PREPARE_FAILED": "Preparation for user synchronization failed.",
+          "REBUILD_NODE_USER_SYNC_FENCE_UNPROVED": "Exclusive authority for user synchronization could not be verified.",
+          "REBUILD_MAIN_PROOF_UNCONFIRMED": "Required cutover verification could not be completed."
+        }
+      },
       "mainRestartCount": "MAIN restarts in plan: {count}",
       "mainRestartWarning": "Active connections will be interrupted on the listed nodes if the plan is applied or rolled back. MAIN services restart one at a time; affected portals are switched last on Apply.",
       "portalExitGeo": "Geo routes",

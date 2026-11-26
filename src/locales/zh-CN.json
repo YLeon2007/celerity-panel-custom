@@ -1723,6 +1723,36 @@
       "transitReplace": "替换配置",
       "transitListeners": "TCP 隧道监听端口",
       "transitBlocked": "路径有效，但尚不能安全切换多级中继出口。未更改配置。",
+      "mainCutover": {
+        "title": "重建结果未知",
+        "unknown": "无法确认 MAIN 切换结果。节点状态可能已改变，无法确认应用成功或回滚。请勿重试；在执行其他操作前请检查节点和链路状态。",
+        "guardedPreflight": "预检已阻止应用：目前无法安全启用多级中继出口。未更改任何节点配置。",
+        "phase": {
+          "agent-stop": "待确认阶段：停止代理程序。",
+          "main-publication": "待确认阶段：发布 MAIN 配置。",
+          "xray-restart": "待确认阶段：重启 MAIN Xray。",
+          "agent-start": "待确认阶段：启动代理程序。",
+          "agent-reconcile": "待确认阶段：核对代理程序及其用户状态。"
+        },
+        "reason": {
+          "REBUILD_AGENT_STOP_UNCONFIRMED": "未确认代理程序已停止。",
+          "REBUILD_AGENT_EXCLUSION_UNPROVED": "无法验证代理程序停止期间的独占访问权。",
+          "REBUILD_AGENT_START_UNCONFIRMED": "未确认代理程序已启动。",
+          "REBUILD_AGENT_RECONCILE_UNPROVED": "无法验证代理程序状态核对结果。",
+          "REBUILD_MAIN_PUBLICATION_UNCONFIRMED": "未确认 MAIN 配置已发布。",
+          "REBUILD_MAIN_RESTART_UNCONFIRMED": "未确认 MAIN Xray 已重启。",
+          "REBUILD_MAIN_RUNTIME_UNPROVED": "无法验证 MAIN Xray 的运行状态。",
+          "REBUILD_MAIN_LOCK_UNPROVED": "无法验证切换操作锁。",
+          "REBUILD_MAIN_AUTHORITY_UNPROVED": "无法验证完成切换所需的权限。",
+          "REBUILD_MAIN_WIRE_SETTLEMENT": "无法确认节点会话已完成。",
+          "REBUILD_CUTOVER_ARTIFACT_UNPROVED": "无法验证已保存的切换凭据。",
+          "REBUILD_MAIN_CAS_UNPROVED": "无法验证 MAIN 配置是否处于预期状态。",
+          "REBUILD_NODE_USER_SYNC_UNCONFIRMED": "未确认用户同步已完成。",
+          "REBUILD_NODE_USER_SYNC_PREPARE_FAILED": "无法完成用户同步的准备工作。",
+          "REBUILD_NODE_USER_SYNC_FENCE_UNPROVED": "无法验证用户同步的独占执行权限。",
+          "REBUILD_MAIN_PROOF_UNCONFIRMED": "无法完成切换所需的验证。"
+        }
+      },
       "mainRestartCount": "计划重启 MAIN 次数：{count}",
       "mainRestartWarning": "应用或回滚此计划时，所列节点的现有连接会中断。MAIN 服务逐个重启；应用时，受影响的门户最后切换。",
       "portalExitGeo": "地理路由",

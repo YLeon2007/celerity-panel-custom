@@ -4,7 +4,7 @@ const openMap = typeof nodesMapQuery !== 'undefined' && Boolean(nodesMapQuery);
 const rebuildClassicMap = typeof c3Rebuild !== 'undefined' && c3Rebuild && !modernMap && openMap;
 const panelToken = typeof csrfToken === 'string' ? csrfToken : '';
 const canManageLinks = Boolean(modernMap && typeof c3Rebuild !== 'undefined' && c3Rebuild === true && panelToken);
-const mapAssetRevision = 'f3fb571129ebf9a0';
+const mapAssetRevision = 'fb378b4054c7de16';
 const nodeMetaLabels = {
     transportTitle: t('nodes.nodeMetaTransport'),
     securityTitle: t('nodes.nodeMetaSecurity'),
@@ -1400,7 +1400,7 @@ function loadNetworkScripts() {
         'https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js',
         'https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js',
         'https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js',
-        window._c3Rebuild ? '/js/network.js?v=371eed3375809a4b' : '/js/network.min.js?v=ceb598cb633c877f'
+        window._c3Rebuild ? '/js/network.js?v=8469233c557ede9d' : '/js/network.min.js?v=ceb598cb633c877f'
     ];
 
     let idx = 0;

@@ -4,12 +4,16 @@
 // Exercise the real entry, inspector, store and actions. The separately owned
 // form is replaced at its export boundary; no server, renderer or browser I/O.
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
+const ejs = require('ejs');
+const { getLocale, t: translate } = require('../src/middleware/i18n');
 
 const src = path.resolve(__dirname, '../public/js/network/src');
+const dist = path.resolve(src, '../dist');
 const model = require(path.join(src, 'core/model.js'));
 const source = '1'.repeat(24), target = '2'.repeat(24), linkId = '3'.repeat(24);
 const edgeId = `link-${linkId}`;
@@ -29,21 +33,25 @@ class Element {
             add: cls => { this.className += ` ${cls}`; },
             remove: cls => { this.className = this.className.split(' ').filter(x => x !== cls).join(' '); },
             contains: cls => this.className.split(' ').includes(cls),
+            toggle: (cls, on) => on ? this.classList.add(cls) : this.classList.remove(cls),
         };
     }
     appendChild(el) { this.children.push(el); }
-    append(...els) { this.children.push(...els); }
+    append(...els) { this.children.push(...els.map(el => el instanceof Element ? el : new Element('#text', String(el)))); }
+    replaceChildren(...els) { this.children = []; this.append(...els); }
     removeChild(el) { this.children.splice(this.children.indexOf(el), 1); }
     get firstChild() { return this.children[0]; }
     get textContent() { return this.text + this.children.map(el => el.textContent).join(''); }
+    set textContent(text) { this.text = String(text); this.children.length = 0; }
     get descendants() { return this.children.flatMap(el => [el, ...el.descendants]); }
     setAttribute(k, v) { this.attrs[k] = v; }
     querySelector(cls) { return this.descendants.find(el => el.classList.contains(cls.slice(1))); }
+    querySelectorAll(cls) { return this.descendants.filter(el => el.classList.contains(cls.slice(1))); }
     addEventListener(evt, fn) { (this.events[evt] ||= []).push(fn); }
-    click() { return this.hidden || this.disabled ? [] : (this.events.click || []).map(fn => fn()); }
+    click() { return this.hidden || this.disabled ? [] : (this.events.click || []).map(fn => fn({ target: this, stopPropagation() {} })); }
 }
 
-async function boot({ authorized = true, showButton = authorized } = {}) {
+async function boot({ authorized = true, showButton = authorized, shipped = false, lang = 'en', send } = {}) {
     const root = new Element(), view = new Element(), toolbar = new Element();
     const add = new Element('button'), refresh = new Element('button');
     const inspector = new Element('aside');
@@ -70,6 +78,23 @@ async function boot({ authorized = true, showButton = authorized } = {}) {
     let store, poll;
     let topology = { nodes: [source, target].map((id, i) => ({ data: { id, type: 'xray', label: `Node ${i + 1}` } })), edges: [] };
     const window = {}, opens = [], requests = [], focuses = [];
+    let rendered;
+    if (shipped) {
+        window._networkCsrfToken = 'a'.repeat(43);
+        rendered = await ejs.renderFile(path.resolve(__dirname, '../views/nodes.ejs'), {
+            lang, locales: getLocale(lang), t: key => translate(key, lang), nodes: [], groups: [], linksCount: 0,
+            useModernMap: true, c3Rebuild: true, csrfToken: window._networkCsrfToken, loadBalancingEnabled: false,
+        });
+        for (const [, id] of rendered.matchAll(/\bid="(rebuildPreview[\w]*)"/g)) elements[id] = new Element();
+        const dialog = elements.rebuildPreview;
+        dialog.showModal = () => { dialog.open = true; };
+        dialog.close = () => { dialog.open = false; dialog.onclose?.(); };
+        elements.networkI18n = new Element('script', rendered.match(/<script type="application\/json" id="networkI18n">([^<]*)<\/script>/)[1]);
+        document.documentElement = { lang };
+        document.createElementNS = (_, tag) => new Element(tag);
+        topology.nodes.forEach(({ data }, i) => { data.cascadeRole = i ? 'bridge' : 'portal'; });
+        topology.edges.push({ data: { id: edgeId, source, target, status: 'pending', mode: 'forward', label: 'Shipped link' } });
+    }
     function renderCreateForm(container, opts) {
         const form = new Element('form'), entry = new Element('input'), status = new Element('p');
         const cancel = new Element('button');
@@ -78,15 +103,36 @@ async function boot({ authorized = true, showButton = authorized } = {}) {
         container.append(form);
         opens.push({ opts, form, entry, status, cancel });
     }
-    const context = vm.createContext({ document, window, Node: Element, navigator: {}, AbortController,
+    const origin = 'https://fixture.invalid';
+    window.location = { origin };
+    const context = vm.createContext({ document, window, Node: Element, navigator: {}, AbortController, URL, location: { origin },
         setTimeout: () => 1, clearTimeout() {}, setInterval: fn => { poll = fn; return 2; },
-        fetch: async (url, { method }) => {
-            requests.push([method, url]);
+        requestAnimationFrame() {},
+        fetch: async (url, init) => {
+            const { method } = init;
+            const pathname = new URL(url, origin).pathname;
+            requests.push([method, pathname]);
+            if (send) {
+                const response = await send(pathname, init, topology);
+                Object.defineProperty(response, 'url', { value: new URL(url, origin).href });
+                return response;
+            }
             assert.equal(method, 'GET');
             assert.equal(url, '/api/cascade/topology');
             return { ok: true, json: () => topology };
         },
     });
+    if (shipped) {
+        const labels = rendered.match(/<script>\s*(window\._networkRebuildPreviewI18n = [^\n]+)\n<\/script>/)[1];
+        const asset = rendered.match(/src="\/js\/rebuild-preview\.js\?v=([a-f0-9]+)"/)[1];
+        const entry = rendered.match(/\/js\/network\/dist\/index\.js\?v=([a-f0-9]+)/)[1];
+        const digest = data => createHash('sha256').update(data).digest('hex').slice(0, 16);
+        const shared = readFileSync(path.resolve(src, '../../rebuild-preview.js'), 'utf8');
+        assert.equal(asset, digest(shared));
+        assert.equal(entry, digest(readFileSync(path.join(dist, 'index.js'))));
+        vm.runInContext(labels, context);
+        vm.runInContext(shared, context);
+    }
     const stubs = {
         'core/model.js': { default: model },
         'ui/create-form.js': { renderCreateForm },
@@ -99,7 +145,7 @@ async function boot({ authorized = true, showButton = authorized } = {}) {
     const modules = new Map();
     function load(filename) {
         if (modules.has(filename)) return modules.get(filename);
-        const exports = stubs[path.relative(src, filename)];
+        const exports = !shipped && stubs[path.relative(src, filename)];
         const mod = exports
             ? new vm.SyntheticModule(Object.keys(exports), function () {
                 for (const [key, val] of Object.entries(exports)) this.setExport(key, val);
@@ -116,11 +162,11 @@ async function boot({ authorized = true, showButton = authorized } = {}) {
         return mod;
     }
     const link = (specifier, from) => load(path.resolve(path.dirname(from.identifier), specifier));
-    const entry = load(path.join(src, 'index.js'));
+    const entry = load(path.join(shipped ? dist : src, 'index.js'));
     await entry.link(link);
     await entry.evaluate();
     await tick();
-    return { store, add, refresh, view, window, inspector, requests, opens, focuses, modules, poll,
+    return { root, elements, store, add, refresh, view, window, inspector, requests, opens, focuses, modules, poll,
         addLinkToTopology: () => { topology = { ...topology, edges: [{ data: {
             id: edgeId, source, target, label: 'Saved link fixture', status: 'pending',
         } }] }; },
@@ -209,5 +255,61 @@ test('read-only mount never loads the editor or renders existing-link actions', 
         assert.equal(ui.inspector.querySelector('.nm-link-actions'), undefined);
         assert.equal(ui.modules.has(path.join(src, 'ui/create-form.js')), false);
         assert.deepEqual(ui.opens, []);
+    }
+});
+
+test('shipped modern Rebuild reads fresh node/link status without clearing its close-only warning', async () => {
+    const preview = '/api/cascade/rebuild/preview', deploy = `/api/cascade/links/${linkId}/deploy`, read = '/api/cascade/topology';
+    const previewId = 'b'.repeat(64), phase = 'xray-restart', reason = 'REBUILD_MAIN_RESTART_UNCONFIRMED';
+    for (const lang of ['en', 'ru', 'zh-CN']) {
+        let deployed = false, started = 0;
+        const old = Promise.withResolvers(), status = Promise.withResolvers();
+        const ui = await boot({ shipped: true, lang, send(url, init, topology) {
+            const result = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+            if (url === read) {
+                if (++started === 2) return old.promise;
+                if (!deployed) return result(topology);
+                return status.promise.then(() => {
+                    const current = structuredClone(topology);
+                    current.nodes[0].data.label = 'Read back node';
+                    current.edges[0].data.status = 'offline';
+                    return result(current);
+                });
+            }
+            if (url === preview) return result({ allowed: true, previewId, nodes: [{ nodeId: source, profiles: ['main', 'bridge']
+                .map(profile => ({ profile, change: 'unchanged', protectedChanged: false, sections: [] })) }] });
+            assert.equal(url, deploy);
+            assert.deepEqual(JSON.parse(init.body), { expectedPreview: previewId });
+            deployed = true;
+            return result({ error: { code: 'REBUILD_MAIN_CUTOVER_UNRESOLVED', outcome: 'unknown', retryAllowed: false,
+                message: '<private-wire>', failure: { phase, reason, trace: '<private-wire>' } } }, 409);
+        } });
+        const get = suffix => ui.elements['rebuildPreview' + suffix];
+        ui.root.descendants.find(el => el.dataset.link === edgeId).click();
+        const apply = ui.inspector.querySelector('.nm-link-actions').querySelector('.primary');
+        assert.ok(apply, 'modern inspector rendered the actual Rebuild control');
+        const [action] = apply.click();
+        await tick();
+        assert.equal(get('Apply').hidden, false);
+        const oldRefresh = ui.refresh.click();
+        get('Apply').onclick();
+        await tick();
+        const labels = getLocale(lang).network.rebuildPreview.mainCutover;
+        assert.equal(get('Title').textContent, labels.title);
+        assert.equal(get('Warning').textContent, [labels.unknown, labels.phase[phase], labels.reason[reason]].join(' '));
+        assert.equal(get('Apply').hidden, true);
+        apply.click(); // Busy while the outcome remains open; no second Preview or Apply.
+        old.resolve(new Response(JSON.stringify({ nodes: [], edges: [] })));
+        await Promise.all(oldRefresh);
+        status.resolve();
+        await tick();
+        assert.equal(started, 3);
+        assert.match(ui.inspector.textContent, /Read back node/);
+        assert.ok(ui.inspector.textContent.includes(translate('network.map.alert.linkOffline', lang)));
+        assert.ok(get('').open);
+        assert.equal(get('Title').textContent, labels.title);
+        get('Cancel').onclick();
+        assert.equal(await action, false);
+        assert.deepEqual(ui.requests.filter(([method]) => method === 'POST').map(([, url]) => url), [preview, deploy]);
     }
 });

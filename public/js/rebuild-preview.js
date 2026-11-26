@@ -165,10 +165,27 @@
         return true;
     }
 
-    async function showRefusal(message) {
+    // Use page-local copy only. Never render an HTTP message or a raw enum.
+    function describeApplyFailure(status, error) {
+        const labels = window._networkRebuildPreviewI18n;
+        const copy = labels?.mainCutover;
+        if (status !== 409 || !copy) return null;
+        if (error?.code === 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE') {
+            return { title: labels.refused, message: copy.guardedPreflight };
+        }
+        if (error?.code !== 'REBUILD_MAIN_CUTOVER_UNRESOLVED') return null;
+        const lookup = (map, key) => typeof key === 'string' && Object.hasOwn(map, key) ? map[key] : '';
+        // Older servers may send just the error code. That is still unknown,
+        // but no phase or reason is attributable without the typed envelope.
+        const detail = error.outcome === 'unknown' && error.retryAllowed === false ? error.failure : null;
+        return { title: copy.title, message: [copy.unknown, lookup(copy.phase, detail?.phase),
+            lookup(copy.reason, detail?.reason)].filter(Boolean).join(' ') };
+    }
+
+    async function showRefusal(message, title) {
         const labels = window._networkRebuildPreviewI18n;
         if (!labels) return;
-        await showRebuildPreview({ title: labels.refused, warning: message || labels.unavailable,
+        await showRebuildPreview({ title: title || labels.refused, warning: message || labels.unavailable,
             details: '', allowed: false, applyLabel: labels.apply }, labels);
     }
 
@@ -194,5 +211,5 @@
         return allowed && accepted === true ? previewId : stop(allowed ? labels.cancelled : title);
     }
 
-    window.C3RebuildPreview = Object.freeze({ confirmReport, showRefusal });
+    window.C3RebuildPreview = Object.freeze({ confirmReport, showRefusal, describeApplyFailure });
 })();

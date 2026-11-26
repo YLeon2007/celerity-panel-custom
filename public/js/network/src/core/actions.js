@@ -31,7 +31,7 @@ function validReport(report) {
 
 function allowsApply(report) {
     const clear = obj => !Object.hasOwn(obj, 'protectedChanged') || obj.protectedChanged === false;
-    return report.allowed === true && clear(report)
+    return report.allowed === true && report.transitBlocked !== true && clear(report)
         && report.nodes.every(node => clear(node) && node.profiles.every(p => p.protectedChanged === false));
 }
 
@@ -40,6 +40,10 @@ function refusalInfo(err, editing = false) {
     const code = error?.code;
     if (err instanceof SessionChanged || err instanceof RebuildRequestError && err.status === 403) {
         return { message: t('map.rebuild.sessionChanged'), notSaved: err instanceof SessionChanged || err.csrfRejected };
+    }
+    if (err instanceof RebuildRequestError) {
+        const failure = window.C3RebuildPreview?.describeApplyFailure?.(err.status, error);
+        if (failure) return failure;
     }
     if (err instanceof RebuildRequestError && err.status === 409 && kcpRefusals.has(code)) {
         // This route publishes localized plain text for typed mKCP refusals.
@@ -88,10 +92,10 @@ function portalNames(error, details) {
     return [...new Set(names)].slice(0, 10).join(', ');
 }
 
-async function showRefusal(message) {
+async function showRefusal(message, title) {
     const dialog = window.C3RebuildPreview;
     if (typeof dialog?.showRefusal === 'function') {
-        try { await dialog.showRefusal(message); return; } catch (_) { /* Fall back to the map toast. */ }
+        try { await dialog.showRefusal(message, title); return; } catch (_) { /* Fall back to the map toast. */ }
     }
     toast(message, 'error');
 }
@@ -115,7 +119,7 @@ export function createActions(store) {
             return store.refreshAfterWrite();
         };
         // Start readback even if the operator leaves the refusal dialog open.
-        const refuse = message => Promise.all([refresh(), showRefusal(message)]);
+        const refuse = (message, title) => Promise.all([refresh(), showRefusal(message, title)]);
         try {
             return await task(() => { needsRefresh = true; }, refuse);
         } finally {
@@ -180,7 +184,8 @@ export function createActions(store) {
             report = await client.preview(linkId, removing);
             client.assertSession();
         } catch (err) {
-            await refuse(refusalInfo(err).message || t('map.rebuild.previewUnavailable'));
+            const info = refusalInfo(err);
+            await refuse(info.message || t('map.rebuild.previewUnavailable'), info.title);
             return false;
         }
         if (!validReport(report)) {
@@ -216,7 +221,8 @@ export function createActions(store) {
                 throw new Error('Unconfirmed Rebuild write');
             }
         } catch (err) {
-            await refuse(refusalInfo(err).message || t('map.rebuild.writeUnconfirmed'));
+            const info = refusalInfo(err);
+            await refuse(info.message || t('map.rebuild.writeUnconfirmed'), info.title);
             return false;
         }
         toast(removing ? t('map.rebuild.removed') : t('map.rebuild.applied'));
@@ -270,7 +276,7 @@ export function createActions(store) {
                     if (stillEditable()) openedEdit = binding;
                 } catch (_) { /* A changed session always needs a fresh load. */ }
             } else if (binding) openedEdit = null;
-            await refuse(info.message || t('map.rebuild.saveUnconfirmed'));
+            await refuse(info.message || t('map.rebuild.saveUnconfirmed'), info.title);
             if (linkId) toast(t('map.rebuild.draftSaved'), 'warning');
             return linkId ? draftResult('saved', linkId) : draftResult(info.notSaved ? 'not_saved' : 'unknown');
         }

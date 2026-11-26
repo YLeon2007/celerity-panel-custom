@@ -1,9 +1,10 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
-const { IncomingMessage, ServerResponse } = require('node:http');
+const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
+const { IncomingMessage, ServerResponse, request: httpRequest } = require('node:http');
 const { Socket } = require('node:net');
+const { tmpdir } = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
@@ -123,13 +124,13 @@ function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () =>
         },
     };
     if (!useModernMap) tags.get('btnAddLink').parentElement = element();
-    const handlers = {};
+    const handlers = {}, drawn = [];
     const emptyEdge = Object.assign([], { filter: () => emptyEdge });
     const cytoscape = () => ({
         on(event, query, cb) { handlers[event + query] = cb; },
         edges: () => emptyEdge, nodes: () => [], getElementById: () => emptyEdge,
         elements: () => ({ remove() {}, unselect() {} }),
-        add() {}, fit() {},
+        add(elements) { drawn.push(elements); }, fit() {},
     });
     const context = vm.createContext({ document, URL, AbortController, setTimeout() {}, clearTimeout() {}, setInterval() {},
         MutationObserver: class { observe() {} },
@@ -155,7 +156,7 @@ function mount(view, lang, csrfToken, rebuild, send, { onDialog, confirm = () =>
         else if (code.includes('_networkCsrfToken') || code.includes('_networkRebuildPreviewI18n')) vm.runInContext(code, context);
     }
     const openEdge = () => handlers.tapedge({ target: { data: () => ({ linkId, label: 'Graph fixture' }) } });
-    return { context, document, requests, resources, openEdge, confirmations, alerts, html,
+    return { context, document, requests, resources, openEdge, confirmations, alerts, html, drawn,
         refresh: () => document.getElementById('btnRefresh').listeners.click(),
         toast: () => document.getElementById('toast')?.textContent };
 }
@@ -465,6 +466,165 @@ test('bridge placeholder refusal: actual Deploy toast uses localized guidance on
             assert.deepEqual(app.calls.map(call => call.preview), [true, false]);
         }
     }
+});
+
+const mainUnresolved = 'REBUILD_MAIN_CUTOVER_UNRESOLVED';
+const transitGuard = 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE';
+const privateText = '<private-host-wire>/etc/fixture';
+const cutoverFault = (failure, code = mainUnresolved) => Object.assign(new Error(privateText), {
+    code, failure, retryAllowed: true, outcome: 'rolled-back', stderr: privateText, preview: { raw: privateText },
+});
+const checkpointFailures = [
+    ['agent-stop', 'REBUILD_AGENT_STOP_UNCONFIRMED'],
+    ['main-publication', 'REBUILD_MAIN_PUBLICATION_UNCONFIRMED'],
+    ['xray-restart', 'REBUILD_MAIN_RESTART_UNCONFIRMED'],
+    ['agent-start', 'REBUILD_AGENT_START_UNCONFIRMED'],
+    ['agent-reconcile', 'REBUILD_NODE_USER_SYNC_UNCONFIRMED'],
+];
+
+test('Rebuild cutover HTTP projects only public fields; the guard is a distinct preflight refusal', async t => {
+    let failure;
+    const service = { async execute() { throw failure; } };
+    const app = express(), session = { authenticated: true };
+    const token = issuePanelCsrfToken({ session });
+    app.use(express.json(), (req, res, next) => { req.session = session; next(); });
+    app.use('/api/cascade', auth, routerForRebuild({ service, Link: {}, Node: {} }));
+    // Exercise actual HTTP parsing/writing without binding an IP listener.
+    const dir = mkdtempSync(path.join(tmpdir(), 'rebuild-http-'));
+    const socketPath = path.join(dir, 'http.sock');
+    const server = app.listen(socketPath);
+    t.after(async () => {
+        await new Promise(resolve => server.close(resolve));
+        rmSync(dir, { recursive: true, force: true });
+    });
+    await require('node:events').once(server, 'listening');
+    const post = async (lang, path = deployPath) => {
+        const { res, text } = await new Promise((resolve, reject) => {
+            const req = httpRequest({ socketPath, path, method: 'POST', agent: false, headers: {
+                host: hostname, origin: `http://${hostname}`, 'content-type': 'application/json',
+                'x-csrf-token': token, 'accept-language': lang,
+            } }, res => {
+                let text = '';
+                res.setEncoding('utf8').on('data', chunk => { text += chunk; });
+                res.once('error', reject).once('end', () => resolve({ res, text }));
+            });
+            req.once('error', reject).end(JSON.stringify({ linkId, expectedPreview: previewId }));
+        });
+        assert.equal(res.statusCode, 409);
+        assert.ok(!text.includes(privateText));
+        return JSON.parse(text);
+    };
+    failure = cutoverFault({ phase: 'xray-restart', reason: checkpointFailures[2][1] });
+    assert.equal((await post('en')).error.outcome, 'unknown');
+    for (const lang of ['en', 'ru', 'zh-CN']) {
+        const labels = require(`../../locales/${lang}.json`).network.rebuildPreview.mainCutover;
+        for (const [phase, reason] of checkpointFailures) {
+            failure = cutoverFault({ phase, reason, raw: privateText });
+            assert.deepEqual(await post(lang), { error: { code: mainUnresolved, outcome: 'unknown', retryAllowed: false,
+                failure: { phase, reason }, message: [labels.unknown, labels.phase[phase], labels.reason[reason]].join(' ') } });
+        }
+        for (const [reason, message] of Object.entries(labels.reason)) {
+            failure = cutoverFault({ phase: null, reason });
+            assert.deepEqual(await post(lang), { error: { code: mainUnresolved, outcome: 'unknown', retryAllowed: false,
+                failure: { phase: null, reason }, message: `${labels.unknown} ${message}` } });
+        }
+        failure = cutoverFault({ phase: 'agent-start', reason: privateText });
+        assert.deepEqual(await post(lang), { error: { code: mainUnresolved, outcome: 'unknown', retryAllowed: false,
+            failure: { phase: 'agent-start', reason: null }, message: [labels.unknown, labels.phase['agent-start']].join(' ') } });
+        let accessorReads = 0;
+        for (const detail of [null, { phase: 'not-dispatched', reason: '__proto__' },
+            Object.create({ phase: 'agent-start', reason: checkpointFailures[3][1] }),
+            new Proxy({}, { getOwnPropertyDescriptor() { throw new Error(privateText); } }),
+            { get phase() { accessorReads++; }, get reason() { accessorReads++; } }]) {
+            failure = cutoverFault(detail);
+            assert.deepEqual(await post(lang), { error: { code: mainUnresolved, outcome: 'unknown', retryAllowed: false,
+                failure: { phase: null, reason: null }, message: labels.unknown } });
+        }
+        assert.equal(accessorReads, 0);
+        failure = cutoverFault({ phase: 'xray-restart', reason: checkpointFailures[2][1] }, transitGuard);
+        assert.deepEqual(await post(lang, previewPath), { error: { code: transitGuard, outcome: 'not-dispatched',
+            reason: 'guarded-preflight', retryAllowed: false, message: labels.guardedPreflight } });
+    }
+});
+
+for (const lang of ['en', 'ru', 'zh-CN']) test(`rendered Rebuild (${lang}): unknown cutover is close-only through fresh readback`, async () => {
+    const [phase, reason] = checkpointFailures[4];
+    const app = makeApp(undefined, cutoverFault({ phase, reason, raw: privateText }));
+    const confirm = Promise.withResolvers(), refused = Promise.withResolvers(), reading = Promise.withResolvers();
+    const topology = Promise.withResolvers();
+    const source = '2'.repeat(24), target = '3'.repeat(24);
+    let opened = 0;
+    const ui = mount('nodes', lang, app.stale, true, async call => {
+        if (call.pathname === '/api/cascade/topology') {
+            reading.resolve();
+            await topology.promise;
+            return response(call.url, {
+                nodes: [source, target].map(id => ({ data: { id, label: 'Read back node' }, position: { x: 0, y: 0 } })),
+                edges: [{ data: { id: 'link-' + linkId, linkId, source, target, mode: 'forward', status: 'offline' } }],
+            });
+        }
+        return dispatch(app, call);
+    }, { onDialog: dialog => (++opened === 1 ? confirm : refused).resolve(dialog) });
+    const get = suffix => ui.document.getElementById('rebuildPreview' + suffix);
+    ui.openEdge();
+    const button = ui.document.getElementById('nodeInfoBody').innerHTML.match(/onclick="(window\._cascadeDeploy\('[a-f0-9]+'\))"/);
+    assert.ok(button, 'Expected a rendered Rebuild button');
+    const action = vm.runInContext(button[1], ui.context);
+    await openedBy({ ...ui, opened: confirm.promise }, action);
+    get('Apply').onclick();
+    const dialog = await openedBy({ ...ui, opened: refused.promise }, action);
+    await reading.promise;
+    const labels = require(`../../locales/${lang}.json`).network.rebuildPreview.mainCutover;
+    assert.equal(get('Title').textContent, labels.title);
+    assert.equal(get('Warning').textContent, [labels.unknown, labels.phase[phase], labels.reason[reason]].join(' '));
+    assert.equal(get('Warning').innerHTML, undefined);
+    assert.equal(get('Apply').hidden, true);
+    get('Apply').onclick();
+    assert.ok(dialog.open);
+    topology.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ui.drawn.at(-1).find(item => item.data.id === source).data.displayLabel, 'Read back node');
+    assert.equal(ui.drawn.at(-1).find(item => item.data.linkId === linkId).data.status, 'offline');
+    assert.ok(dialog.open);
+    assert.equal(get('Title').textContent, labels.title);
+    get('Cancel').onclick();
+    await action;
+    assert.deepEqual(ui.requests.map(call => call.pathname), [previewPath, deployPath, '/api/cascade/topology', '/api/cascade/links']);
+    assert.deepEqual(app.calls.map(call => call.preview), [true, false]);
+});
+
+test('shipped preview does not render unknown enums, arbitrary messages, or old envelope details', () => {
+    const ui = mount('nodes', 'en', 'fixture', true, () => assert.fail('presentation must not fetch'));
+    const { describeApplyFailure } = ui.context.C3RebuildPreview;
+    const labels = require('../../locales/en.json').network.rebuildPreview.mainCutover;
+    for (const error of [
+        { code: mainUnresolved },
+        { code: mainUnresolved, outcome: 'rolled-back', retryAllowed: true, failure: { phase: 'agent-start' } },
+        { code: mainUnresolved, outcome: 'unknown', retryAllowed: false, failure: { phase: 'constructor', reason: privateText } },
+    ]) {
+        const result = describeApplyFailure(409, { ...error, message: privateText });
+        assert.equal(result.title, labels.title);
+        assert.equal(result.message, labels.unknown);
+    }
+    assert.equal(describeApplyFailure(409, { code: 'REBUILD_L2TP_APPLY_BRIDGE_PLACEHOLDER_UNPROVED' }), null);
+});
+
+test('Rebuild guard at preview stays close-only and never submits Apply', async () => {
+    const lang = 'ru';
+    const opened = Promise.withResolvers();
+    const app = makeApp(cutoverFault(null, transitGuard));
+    const ui = mount('nodes', lang, app.stale, true, call => dispatch(app, call), { onDialog: opened.resolve });
+    const action = ui.context._cascadeDeploy(linkId);
+    const dialog = await openedBy({ ...ui, opened: opened.promise }, action);
+    const get = suffix => ui.document.getElementById('rebuildPreview' + suffix);
+    assert.equal(get('Warning').textContent, t('network.rebuildPreview.mainCutover.guardedPreflight', lang));
+    assert.equal(get('Apply').hidden, true);
+    get('Apply').onclick();
+    assert.ok(dialog.open);
+    get('Cancel').onclick();
+    await action;
+    assert.deepEqual(ui.requests.map(call => call.pathname), [previewPath]);
+    assert.deepEqual(app.calls.map(call => call.preview), [true]);
 });
 
 const portalId = 'c'.repeat(24), gatewayId = 'd'.repeat(24), relayId = 'e'.repeat(24), unknownId = 'f'.repeat(24);

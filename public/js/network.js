@@ -236,6 +236,7 @@
 
     class TopologyCsrfRejection extends Error {}
     class RebuildPreviewStopped extends Error {}
+    class RebuildApplyStopped extends Error {}
     class RebuildFingerprintRefusal extends Error {}
 
     // /api/nodes normally holds the numeric version extracted by the agent.
@@ -359,6 +360,11 @@
                 headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }, sessionToken);
             report = await response.json().catch(() => null);
             if (!response.ok) {
+                const failure = preview.describeApplyFailure?.(response.status, report?.error);
+                if (failure) {
+                    await preview.showRefusal(failure.message, failure.title);
+                    throw new RebuildApplyStopped();
+                }
                 const neighbor = neighborRefusal(response.status, report?.error);
                 if (neighbor) {
                     await preview.showRefusal(neighbor);
@@ -525,6 +531,7 @@
 
     async function handleDraftMutationResponse(response, expectedKind, expectedLinkId) {
         const payload = await response.json().catch(() => ({}));
+        await stopOnApplyFailure(response, payload);
         const refusal = fingerprintRefusal(response.status, payload);
         const neighbor = neighborRefusal(response.status, payload?.error);
         const errorMessage = (payload.desiredSaved === true
@@ -1769,6 +1776,7 @@
                 try {
                     await deployTopology(snapshot.linkId, undefined, snapshot.preview, sessionToken);
                 } catch (error) {
+                    if (error instanceof RebuildApplyStopped) return;
                     if (error instanceof RebuildFingerprintRefusal) {
                         showToast((fingerprintLabels?.savedNotApplied || i18n.csrfSavedDraft || 'The link was saved.') + ' ' + error.message, 'error');
                         return;
@@ -1949,6 +1957,7 @@
             await loadTopology();
             await handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true, sessionToken);
         } catch (err) {
+            if (err instanceof RebuildApplyStopped) return;
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
             linkFormWrites.delete('main');
@@ -1985,6 +1994,17 @@
         if (el) el.remove();
     }
 
+    async function stopOnApplyFailure(response, payload) {
+        if (!rebuild || response.ok) return;
+        const preview = window.C3RebuildPreview;
+        const failure = preview?.describeApplyFailure?.(response.status, payload?.error);
+        if (!failure) return;
+        // A fresh map observation does not settle the cutover. Keep the
+        // warning open independently of when readback completes.
+        await Promise.all([loadTopology(), preview.showRefusal(failure.message, failure.title)]);
+        throw new RebuildApplyStopped();
+    }
+
     async function deployTopology(linkId, domainLinkId, report, sessionToken = csrfToken) {
         const payload = { expectedTopologyRevision: topologyRevision };
         if (linkId) payload.linkId = linkId;
@@ -2001,6 +2021,7 @@
             body: JSON.stringify(payload),
         }, sessionToken);
         const data = await res.json().catch(() => ({}));
+        await stopOnApplyFailure(res, data);
         if (res.status === 409) {
             await loadTopology();
         }
@@ -2127,7 +2148,7 @@
 
         const edge = cy.edges().filter(e => e.data('linkId') === linkId);
         const prev = edge.length ? edge.data('status') : null;
-        if (edge.length) edge.data('status', 'syncing');
+        if (!rebuild && edge.length) edge.data('status', 'syncing');
 
         try {
             const result = await deployTopology(linkId);
@@ -2135,7 +2156,8 @@
             loadTopology();
             closeInfoModal();
         } catch (err) {
-            if (edge.length && prev) edge.data('status', prev);
+            if (err instanceof RebuildApplyStopped) return;
+            if (!rebuild && edge.length && prev) edge.data('status', prev);
             if (err instanceof RebuildPreviewStopped) return showToast(err.message, 'info');
             showToast((i18n.deployFailed || 'Failed') + ': ' + err.message, 'error');
         } finally { resetActionLoading(); }
@@ -2151,7 +2173,7 @@
         setActionLoading(escHtml(i18n.syncingAppliedDomain || 'Синхронизация применённого домена...'));
 
         const edge = cy.edges().filter(e => e.data('linkId') === linkId);
-        if (edge.length) edge.data('status', 'syncing');
+        if (!rebuild && edge.length) edge.data('status', 'syncing');
 
         try {
             const result = await deployTopology(null, linkId);
@@ -2159,6 +2181,7 @@
             loadTopology();
             closeInfoModal();
         } catch (err) {
+            if (err instanceof RebuildApplyStopped) return;
             showToast((i18n.appliedDomainSyncFailed || 'Не удалось синхронизировать применённый домен') + ': ' + err.message, 'error');
             loadTopology();
         } finally { resetActionLoading(); }
@@ -2174,6 +2197,7 @@
             showToast(deployResultMessage(result, i18n));
             loadTopology();
         } catch (err) {
+            if (err instanceof RebuildApplyStopped) return;
             showToast((i18n.chainDeployFailed || 'Full sync failed') + ': ' + err.message, 'error');
             loadTopology();
         } finally { resetActionLoading(); }
@@ -2249,6 +2273,7 @@
             await loadTopology();
             closeInfoModal();
         } catch (err) {
+            if (err instanceof RebuildApplyStopped) return;
             if (err instanceof RebuildPreviewStopped) return showToast(err.message, 'info');
             if (err instanceof RebuildFingerprintRefusal) return showToast(err.message, 'error');
             if (!(err instanceof TopologyCsrfRejection) && (!response || response.ok || response.status >= 500)) {
@@ -2687,6 +2712,7 @@
             await loadTopology();
             await handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true, sessionToken);
         } catch (err) {
+            if (err instanceof RebuildApplyStopped) return;
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
             linkFormWrites.delete('quick');

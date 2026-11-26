@@ -12,13 +12,43 @@ const {saveRebuildDraft}=require('../services/rebuildDraftLink');
 const {exitRefusalForError,PORTAL_EXIT_INVALID}=require('../services/rebuildExit');
 const fail=code=>Object.assign(new Error(code),{code});
 const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
+const ownValue=(obj,key)=>Object.getOwnPropertyDescriptor(obj,key)?.value;
 const objectId=id=>typeof id==='string'&&/^[a-f\d]{24}(?![\s\S])/i.test(id);
+// Public projection of rebuildTransitMainApply's failure, not of its wire,
+// journal record, or nested exception. Missing details never change outcome.
+const mainCutoverPhases=new Set(['agent-stop','main-publication','xray-restart','agent-start','agent-reconcile']);
+const mainCutoverReasons=new Set([
+    'REBUILD_AGENT_STOP_UNCONFIRMED','REBUILD_AGENT_EXCLUSION_UNPROVED','REBUILD_AGENT_START_UNCONFIRMED',
+    'REBUILD_AGENT_RECONCILE_UNPROVED','REBUILD_MAIN_PUBLICATION_UNCONFIRMED','REBUILD_MAIN_RESTART_UNCONFIRMED',
+    'REBUILD_MAIN_RUNTIME_UNPROVED','REBUILD_MAIN_LOCK_UNPROVED','REBUILD_MAIN_AUTHORITY_UNPROVED',
+    'REBUILD_MAIN_WIRE_SETTLEMENT','REBUILD_CUTOVER_ARTIFACT_UNPROVED','REBUILD_MAIN_CAS_UNPROVED',
+    'REBUILD_NODE_USER_SYNC_UNCONFIRMED','REBUILD_NODE_USER_SYNC_PREPARE_FAILED','REBUILD_NODE_USER_SYNC_FENCE_UNPROVED',
+    'REBUILD_MAIN_PROOF_UNCONFIRMED',
+]);
+function formatTransitRefusal(req,res,error,code){
+    if(code!=='REBUILD_MAIN_CUTOVER_UNRESOLVED'&&code!=='REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE')return;
+    const lang=res.locals.lang||detectLanguage(req);
+    const copy=key=>t(`network.rebuildPreview.mainCutover.${key}`,lang);
+    if(code==='REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE')return {
+        code,outcome:'not-dispatched',reason:'guarded-preflight',retryAllowed:false,message:copy('guardedPreflight'),
+    };
+    let phase=null,reason=null;
+    try {
+        const failure=ownValue(error,'failure');
+        if(failure){
+            const rawPhase=ownValue(failure,'phase'),rawReason=ownValue(failure,'reason');
+            phase=mainCutoverPhases.has(rawPhase)?rawPhase:null;
+            reason=mainCutoverReasons.has(rawReason)?rawReason:null;
+        }
+    }catch{/* Unreadable metadata still means an unknown outcome. */}
+    return {code,outcome:'unknown',retryAllowed:false,failure:{phase,reason},
+        message:[copy('unknown'),phase&&copy(`phase.${phase}`),reason&&copy(`reason.${reason}`)].filter(Boolean).join(' ')};
+}
 // Do not echo arbitrary fingerprint input or any transport diagnostics. This
 // is the public label vocabulary, not the version-specific acceptance policy.
 const publicFingerprints=new Set(['chrome','firefox','safari','ios','android','edge','360','qq','random','randomized']);
 function fingerprintIssueForError(error,code){
     if(code!=='REBUILD_REALITY_FINGERPRINT_UNSUPPORTED')return;
-    const ownValue=(obj,key)=>Object.getOwnPropertyDescriptor(obj,key)?.value;
     try{
         const issue=ownValue(error,'fingerprintIssue');
         const endpointId=ownValue(issue,'endpointId'),endpointRole=ownValue(issue,'endpointRole');
@@ -68,8 +98,8 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
     const outcome={};
     try{res.json(await fn(req,outcome));}catch(e){
         const rawCode=errorField(e,'code');
-        const refusal=exitRefusalForError(e)??formatOperationRefusal(req,res,e)??neighborRefusalForError(e);
         const code=rawCode===INVALID_KCP_LINK_SETTINGS?rawCode:typeof rawCode==='string'&&rawCode!=='REBUILD_RETIRE_NEIGHBOR_REFUSED'&&/^(?:REBUILD_|L2TP_FOLLOW_RELAY_)[A-Z0-9_]+(?![\s\S])/.test(rawCode)?rawCode:'REBUILD_FAILED';
+        const refusal=formatTransitRefusal(req,res,e,code)??exitRefusalForError(e)??formatOperationRefusal(req,res,e)??neighborRefusalForError(e);
         const preview=previewForError(e);
         const fingerprintIssue=fingerprintIssueForError(e,code);
         res.status(code==='REBUILD_PREVIEW_REQUIRED'?428:code==='REBUILD_LINK_NOT_FOUND'?404:(['REBUILD_INVALID_REQUEST',PORTAL_EXIT_INVALID,INVALID_KCP_LINK_SETTINGS].includes(code))?400:409)
