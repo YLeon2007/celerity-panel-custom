@@ -126,6 +126,18 @@ class RuntimeHost(unittest.TestCase):
         self.refused(lambda: runtime.MainRuntimeObserver({'vless-in'}, lambda *_: ROUTES, _fixture_show=self.manager))
         self.assertEqual(self.unit_reads, 0)
 
+    def test_ip_on_demand_checks_literal_ips_only(self):
+        self.cfg['routing']['domainStrategy'] = 'IPOnDemand'
+        snapshot = self.snapshot()
+        self.routes = (ROUTES[0]._replace(target_ip='192.0.2.2'),)
+        self.refused(lambda: self.observe(snapshot))  # IP + domain still causes DNS.
+        self.assertEqual(self.unit_reads, 0)
+        self.assertEqual(self.calls, [])
+        self.routes = (self.routes[0]._replace(target_domain=None),)
+        self.assertIs(self.observe(snapshot), True)
+        self.assertEqual(self.calls[0]['routes'][0]['context']['targetIP'], '192.0.2.2')
+        self.assertNotIn('targetDomain', self.calls[0]['routes'][0]['context'])
+
     def test_private_callback_error_is_not_attached_to_public_failure(self):
         snapshot = self.snapshot()
         with patch.object(self.observer, '_routes', side_effect=ValueError(SENTINEL)):

@@ -176,6 +176,15 @@ def check_core(version, core, proof, work):
         observe('changed-predicate-matches-new-plan', p.pid, 0,
                 routes=(routes[0]._replace(outbound_tag='default'), routes[1]._replace(outbound_tag='selected'), *routes[2:]))
 
+    geo = reference.config()
+    geo['routing']['domainStrategy'] = 'IPOnDemand'
+    ip_routes = tuple(row._replace(target_domain=None) for row in route_plan() if row.target_ip is not None)
+    with daemon('ip-on-demand', geo) as p:
+        observe('ip-on-demand-literal-v4-v6-fallback', p.pid, 0, routes=ip_routes)
+        observe('ip-on-demand-outbound-mismatch', p.pid, 1, want=False,
+                routes=(ip_routes[0]._replace(outbound_tag='default'), *ip_routes[1:]))
+        observe('ip-on-demand-domain-with-ip-refused', p.pid, want=False, routes=route_plan()[3:])
+
     stock = reference.config(routing_api=False)
     stock['api']['services'].append('StatsService')
     with daemon('stock', stock) as p:
@@ -205,7 +214,7 @@ def check_core(version, core, proof, work):
                 foreign_socket.listen()
                 observe(name, p.pid, want=False)
 
-    assert len(cases) == len(set(cases)) == len(native_statuses) == 15 and waits == [0] * 7
+    assert len(cases) == len(set(cases)) == len(native_statuses) == 18 and waits == [0] * 8
     print(json.dumps({'core': version, 'checks': cases, 'count': len(cases), 'proofWaits': native_statuses,
                       'xrayWaits': waits}), flush=True)
 

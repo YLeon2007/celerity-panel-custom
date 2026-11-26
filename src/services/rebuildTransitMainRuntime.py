@@ -84,7 +84,8 @@ def _plan(data, managed, routes):
     _need(_tag(api_tag) and 'listen' not in api and type(services) is list
           and all(type(s) is str for s in services)
           and {'HandlerService', 'RoutingService'} <= set(services))
-    _need(router.get('domainStrategy', 'AsIs') == 'AsIs' and router.get('balancers', []) == [])
+    strategy = router.get('domainStrategy', 'AsIs')
+    _need(strategy in ('AsIs', 'IPOnDemand') and router.get('balancers', []) == [])
     rules = router.get('rules')
     if type(rules) is not list or not rules:
         raise WindowError(RUNTIME)
@@ -150,6 +151,10 @@ def _plan(data, managed, routes):
               and type(route.target_port) is int and 0 < route.target_port <= 65535)
         context = dict(inboundTag=route.inbound_tag, network=route.network, targetPort=route.target_port)
         _need(route.target_domain is not None or route.target_ip is not None)
+        # Xray's IPOnDemand resolver tries the domain *before* using a
+        # supplied IP. Only literal-IP contexts are read-only here: do not
+        # cause DNS traffic or make the proof depend on resolver state.
+        _need(strategy != 'IPOnDemand' or (route.target_domain is None and route.target_ip is not None))
         for key, value, limit in (('targetDomain', route.target_domain, 253), ('targetIP', route.target_ip, 45)):
             if value is not None:
                 _need(type(value) is str and 0 < len(value) <= limit and value.isascii())
