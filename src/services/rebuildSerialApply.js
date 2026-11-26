@@ -4,7 +4,7 @@ const { createHash, randomBytes } = require('node:crypto');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { mongo: { BSON }, Types: { ObjectId } } = require('mongoose');
 const { withNodes, nodeLockVerifier } = require('./rebuildLocks');
-const { componentFor, profilePreview } = require('./rebuildCoordinator');
+const { componentFor, fingerprintLinks, profilePreview } = require('./rebuildCoordinator');
 const { prepareLinks } = require('./rebuildLinkKeys');
 const { keyEnvelopeField } = require('./rebuildLinkSnapshot');
 const { appliedLink } = require('./rebuildAppliedLink');
@@ -54,7 +54,7 @@ function publication(link, roles, pins) {
 // peers for the entire roster, including untouched peers, and prove preserved
 // routes/user reconciliation. No provider is installed by the shipped panel.
 function createSerialApply({ Link, Node, State, env, locks, gate, compose, readStates, publishedKeyMismatch, invalidate, admit, syncNodeUsers }) {
-    return async linkId => {
+    return async (linkId, joined) => {
         gate();
         need(typeof linkId === 'string' && id.test(linkId), 'REBUILD_INVALID_REQUEST');
         need(Link.db && Link.db === Node.db && Link.db === State.db, unavailable);
@@ -77,12 +77,16 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
             need(ids.length <= MAX && ids.every(n => id.test(n)) && rows.length <= MAX, unavailable);
             return { ids, rows };
         };
-        return locks.run(async (verify, retain) => {
+        const own = joined ? joined.run : fn => locks.run(fn, { allowStaleUnlock: false });
+        return own(async (verify, retain) => {
             const { ids } = await scope();
             return withNodes(ids, async () => {
                 const original = await scope();
                 need(equal(original.ids, ids), changed);
                 const links = original.rows.map(({ row }) => row);
+                const confirmation = joined?.confirmation;
+                if (confirmation) need(equal(confirmation.ids, ids) &&
+                    fingerprintLinks(links) === confirmation.linkVersion, changed);
                 // The serial planner is additive, TCP, MAIN-only. Do not
                 // combine it with tombstone deletion, new link keys or L2TP
                 // route-mode migration; those have different write contracts.
@@ -123,6 +127,14 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 }));
                 const composition = { ...profiles, nodes, links: prepared, affectedNodeIds: ids, followRelayStates: [...states.values()] };
                 const after = compose(composition);
+                if (confirmation) {
+                    const configs = rows => new Map(rows.map(p => [`${p.nodeId}:${p.profile}`, p.config]));
+                    need(Array.isArray(before) && before.length === confirmation.before.length &&
+                        after.length === confirmation.after.length && equal(configs(before), configs(confirmation.before)) &&
+                        equal(configs(after), configs(confirmation.after)) &&
+                        (!confirmation.coreIdentities?.size || equal(authority.coreIdentities, confirmation.coreIdentities)),
+                    'REBUILD_PREVIEW_CHANGED');
+                }
                 const steps = planSerialScopedTransition({ before, after, composition, allowMainRestart: true });
                 need(steps.length > 0 && steps.length <= MAX && !after.some(row => profilePreview(
                     before.find(p => p.nodeId === row.nodeId && p.profile === row.profile)?.config, row.config, row.profile, true).protectedChanged), unavailable);
@@ -236,7 +248,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 need(result.status !== 'applied' || published, 'REBUILD_MAIN_CUTOVER_UNRESOLVED');
                 return result;
             });
-        }, { allowStaleUnlock: false });
+        });
     };
 }
 

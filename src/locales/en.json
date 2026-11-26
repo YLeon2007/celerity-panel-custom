@@ -1580,6 +1580,8 @@
         "title": "Rebuild outcome unknown",
         "unknown": "The MAIN cutover could not be confirmed. Nodes may have changed; neither successful application nor rollback was confirmed. Do not retry. Check node and link status before any further action.",
         "guardedPreflight": "Preflight blocked Apply: safe activation of multi-relay exits is not available. No node profiles were changed.",
+        "rolledBack": "Apply did not complete. Verification confirmed that the previous MAIN configuration was restored. Check node status before starting a new Apply.",
+        "notDispatched": "Apply stopped before dispatch. No node profiles were changed. Check the refusal reason before starting a new Apply.",
         "phase": {
           "agent-stop": "Pending phase: stopping the agent.",
           "main-publication": "Pending phase: publishing the MAIN profile.",

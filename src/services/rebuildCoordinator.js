@@ -203,13 +203,17 @@ async function runGraph(d, req, retire = false) {
                 }
                 report.push({nodeId,profiles});
             }
-            const transitBlocked=!!transit?.blocked||!!observedMain&&hasObservedScopedTransit(observedMain);
             const protectedChanged=report.some(n=>n.profiles.some(p=>p.protectedChanged));
+            let mainSteps=[];
             if(transitPreimages&&!protectedChanged){
                 const counts=new Map();
-                for(const {nodeId} of transit.planRestarts(transitPreimages))counts.set(nodeId,(counts.get(nodeId)||0)+1);
+                mainSteps=transit.planRestarts(transitPreimages);
+                for(const {nodeId} of mainSteps)counts.set(nodeId,(counts.get(nodeId)||0)+1);
                 for(const entry of report)if(counts.has(entry.nodeId))entry.mainRestartCount=counts.get(entry.nodeId);
             }
+            const serial=transit?.serial===true && !!d.activateSerial && !removed.length && !kcpVersions?.length && mainSteps.length>0;
+            const transitBlocked=!serial&&(!!transit?.blocked||!!observedMain&&hasObservedScopedTransit(observedMain));
+            if(serial)fingerprint.update(JSON.stringify(['scoped-main-v1',mainSteps.map(({nodeId,phase,kind})=>[nodeId,phase,kind])]));
             const result={allowed:!transitBlocked&&!protectedChanged,nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
             if(transitBlocked)result.transitBlocked=true;
             if(survivor)result.survivorPreview=linkVersion+survivor.digest('hex');
@@ -226,7 +230,7 @@ async function runGraph(d, req, retire = false) {
             }
             if(req.preview){
                 await checkKcpSnapshot();
-                if(d.checkActivation){await verify(); await d.checkActivation(nodes,retirement,{transitBlocked});}
+                if(d.checkActivation){await verify(); await d.checkActivation(nodes,retirement,{transitBlocked:transitBlocked||serial});}
                 await checkKcpSnapshot();
                 return result;
             }
@@ -234,6 +238,13 @@ async function runGraph(d, req, retire = false) {
             if(stale&&kcpVersions?.length)refuseStaleKcpPreview();
             if(stale)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();
+            if(serial){
+                if(!confirmedLinks)throw fail('REBUILD_PREVIEW_REQUIRED');
+                const outcome=await d.activateSerial({ids:nodes,linkVersion,before:transitPreimages,after:candidates,coreIdentities},verify);
+                // Return even a confirmed inverse normally through the owning
+                // lock callback. The route classifies it only after handback.
+                return outcome.status==='applied'?result:{...result,allowed:false,status:outcome.status,failure:outcome.failure};
+            }
             await checkKcpSnapshot();
             await d.checkActivation?.(nodes,retirement);
             // Re-read after potentially slow host checks, before stage writes.

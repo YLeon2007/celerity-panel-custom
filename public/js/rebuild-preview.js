@@ -173,8 +173,12 @@
         if (error?.code === 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE') {
             return { title: labels.refused, message: copy.guardedPreflight };
         }
+        const lookup = (map, key) => map && typeof key === 'string' && Object.hasOwn(map, key) ? map[key] : '';
+        const settled = error?.code === 'REBUILD_MAIN_CUTOVER_ROLLED_BACK' && error.outcome === 'rolled-back' ? copy.rolledBack
+            : error?.code === 'REBUILD_MAIN_CUTOVER_NOT_DISPATCHED' && error.outcome === 'not-dispatched' ? copy.notDispatched : null;
+        if (settled && error.retryAllowed === false) return { title: labels.refused,
+            message: [settled, lookup(copy.reason, error.failure?.reason)].filter(Boolean).join(' ') };
         if (error?.code !== 'REBUILD_MAIN_CUTOVER_UNRESOLVED') return null;
-        const lookup = (map, key) => typeof key === 'string' && Object.hasOwn(map, key) ? map[key] : '';
         // Older servers may send just the error code. That is still unknown,
         // but no phase or reason is attributable without the typed envelope.
         const detail = error.outcome === 'unknown' && error.retryAllowed === false ? error.failure : null;

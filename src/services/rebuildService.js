@@ -105,8 +105,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         scope.fence=fence;
         try{return await fn();}finally{delete scope.fence;}
     });
-    const underApply=(alreadyHeld,fn)=>alreadyHeld===undefined?guardedLocks.run(fn):
-        checked(heldVerifiers.has(alreadyHeld)?alreadyHeld:undefined,fn);
+    const underApply=(alreadyHeld,fn,options)=>alreadyHeld===undefined?guardedLocks.run(fn,options):
+        checked(heldVerifiers.has(alreadyHeld)?alreadyHeld:undefined,verify=>fn(verify,heldVerifiers.get(verify)?.retain));
     const panelTLS=()=>{const cert=require('./configGenerator').buildPanelInlineCertificate();return {...cert,serverName:cert?.domain||env.PANEL_DOMAIN};};
     async function installedStates(ids, readOptions){
         const states=new Map(), seen=new Set();
@@ -254,7 +254,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         return runGraph({nodeId,mode,preview,expectedPreview,finish,beforeEffects,onEffect,onCommit},heldVerify,true);
     }
     async function runGraph(req,alreadyHeld,retire=false){
-        gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock,verifyBinding,settlementSession;
+        gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock,verifyBinding,settlementSession,retainApply;
+        const serialEligible=!!serial&&!retire&&!req.remove&&(req.preview===true||req.expectedPreview?.length===128);
         const baseline=new Map(), inventoryNames=new Map();
         let kcpAdmission;
         const keyRoot=retire?env.ENCRYPTION_KEY:undefined;
@@ -301,10 +302,11 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             if(retire&&env.ENCRYPTION_KEY!==keyRoot)throw fail('REBUILD_LINK_KEY_UNAVAILABLE');
         };
         const checkLinks=(retirement,session)=>verifyRetireLinks(req.nodeId,retirement.version,session);
-        const result=await (retire?runRetireGraph:runRebuild)({global:fn=>underApply(alreadyHeld,verify=>{
+        const result=await (retire?runRetireGraph:runRebuild)({global:fn=>underApply(alreadyHeld,(verify,retain)=>{
             verifyLock=verify;
+            retainApply=retain;
             return fn(verifyApply);
-        }),withNodes:(ids,fn)=>withNodes(ids,()=>usingTransports(transports,fn)),
+        },serialEligible&&!req.preview?{allowStaleUnlock:false}:undefined),withNodes:(ids,fn)=>withNodes(ids,()=>usingTransports(transports,fn)),
             links:retire?observedLinks:()=>Link.find({$or:[{active:true},{rebuildDelete:true}]},null,fullLinkRead).lean(),
             assertExitsUnused:checkExitRemoval,
             async build(ids,links,retirement){
@@ -337,7 +339,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     const graph=compileRebuildGraph({nodes,links,affectedNodeIds:ids});
                     // Keep the graph composer testable without enabling a new
                     // multi-host cutover on the legacy activation loop.
-                    if(!req.preview&&[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
+                    if(!req.preview&&!serialEligible&&[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
                 }
                 states=await installedStates(ids);
                 const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
@@ -396,10 +398,10 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 await verifyTunnelTrust(prepared,panelTls,transports);
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
                 let transit;
-                if(req.preview&&prepared.some(link=>link.rebuildExit!=null)){
+                if((req.preview||serialEligible)&&prepared.some(link=>link.rebuildExit!=null)){
                     const graph=compileRebuildGraph({nodes,links:prepared,affectedNodeIds:ids});
                     if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1)){
-                        transit={multiHop:true,blocked:true,after:buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}))};
+                        transit={multiHop:true,blocked:true,serial:serialEligible,after:buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}))};
                         if(!retire&&!req.remove)transit.planRestarts=before=>{
                             try {
                                 return planSerialScopedTransition({before,after:candidates,composition,allowMainRestart:true});
@@ -428,6 +430,10 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             persistKeys:retire?undefined:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
             markDelete:async id=>{if(bindings.size)await verifyApply();const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
             checkKcpAdmission:()=>kcpAdmission(),
+            async activateSerial(confirmation,verify){
+                if(!serialEligible||verify!==verifyApply||typeof retainApply!=='function')throw fail('REBUILD_LOCK_LOST');
+                return serial(req.linkId,{confirmation,run:fn=>withHeldLock(verifyLock,retainApply,()=>fn(verify,retainApply))});
+            },
             async checkActivation(ids,retirement,{transitBlocked=false}={}){
                 if(retire)await checkLinks(retirement);
                 for(const id of ids)await preflight(id,()=>transports.get(id).verifyIdentity?.());
@@ -516,8 +522,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const relayRetire=createRebuildRelayRetire({Link,Node,State,L2tpUser,env,sync,relayGrantStore,locks:guardedLocks,gate,
         retireGraph,checkRetireExits,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
-    // No HTTP/MCP caller binds this private constructor dependency. In
-    // particular, execute() cannot enter it, even on the same service.
+    // No HTTP/MCP request binds this private constructor dependency. The
+    // default factory stays guarded until a trusted provider is installed.
     const serial=typeof serialMainAuthority==='function' && require('./rebuildSerialApply').createSerialApply({
         Link,Node,State,env,locks:guardedLocks,gate,compose,readStates:(ids,session)=>installedStates(ids,{session}),
         syncNodeUsers:(id,options)=>sync.syncRebuildNodeUsersAfterResume(id,options),
@@ -525,7 +531,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
         async invalidate(){await cache.invalidateAllSubscriptions();await require('./cascadeService')._invalidateTopologyCache();},
     });
     return {execute,retireGraph,verifyDraftKcp,verifyDraftTls,verifyDraftRealityFingerprint,locks:guardedLocks,installRelay,recoverRelayInstall,...relayRemoval,...relayRetire,
-        ...(serial&&{applySerialMain:serial}),
+        ...(serial&&{applySerialMain:linkId=>serial(linkId)}),
         createRelayAccount: input=>relayAccounts().create(input),
         disableRelayAccount: input=>relayAccounts().disable(input),
         deleteRelayAccount: input=>relayAccounts().delete(input),

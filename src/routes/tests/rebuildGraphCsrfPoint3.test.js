@@ -483,8 +483,8 @@ const checkpointFailures = [
 ];
 
 test('Rebuild cutover HTTP projects only public fields; the guard is a distinct preflight refusal', async t => {
-    let failure;
-    const service = { async execute() { throw failure; } };
+    let failure, settled;
+    const service = { async execute() { if (settled) return settled; throw failure; } };
     const app = express(), session = { authenticated: true };
     const token = issuePanelCsrfToken({ session });
     app.use(express.json(), (req, res, next) => { req.session = session; next(); });
@@ -544,6 +544,13 @@ test('Rebuild cutover HTTP projects only public fields; the guard is a distinct 
         failure = cutoverFault({ phase: 'xray-restart', reason: checkpointFailures[2][1] }, transitGuard);
         assert.deepEqual(await post(lang, previewPath), { error: { code: transitGuard, outcome: 'not-dispatched',
             reason: 'guarded-preflight', retryAllowed: false, message: labels.guardedPreflight } });
+        for (const [status, suffix, label] of [['rolled-back', 'ROLLED_BACK', 'rolledBack'], ['not-dispatched', 'NOT_DISPATCHED', 'notDispatched']]) {
+            const reason = 'REBUILD_MAIN_CAS_UNPROVED';
+            settled = { status, failure: { phase: null, reason }, raw: privateText };
+            assert.deepEqual(await post(lang), { error: { code: `REBUILD_MAIN_CUTOVER_${suffix}`, outcome: status, retryAllowed: false,
+                failure: { phase: null, reason }, message: `${labels[label]} ${labels.reason[reason]}` } });
+        }
+        settled = undefined;
     }
 });
 

@@ -30,7 +30,10 @@ const mainCutoverReasons=new Set([
     'REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED',
 ]);
 function formatTransitRefusal(req,res,error,code){
-    if(code!=='REBUILD_MAIN_CUTOVER_UNRESOLVED'&&code!=='REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE')return;
+    const outcomes={REBUILD_MAIN_CUTOVER_UNRESOLVED:['unknown','unknown'],
+        REBUILD_MAIN_CUTOVER_ROLLED_BACK:['rolled-back','rolledBack'],
+        REBUILD_MAIN_CUTOVER_NOT_DISPATCHED:['not-dispatched','notDispatched']};
+    if(!Object.hasOwn(outcomes,code)&&code!=='REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE')return;
     const lang=res.locals.lang||detectLanguage(req);
     const copy=key=>t(`network.rebuildPreview.mainCutover.${key}`,lang);
     if(code==='REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE')return {
@@ -45,8 +48,9 @@ function formatTransitRefusal(req,res,error,code){
             reason=mainCutoverReasons.has(rawReason)?rawReason:null;
         }
     }catch{/* Unreadable metadata still means an unknown outcome. */}
-    return {code,outcome:'unknown',retryAllowed:false,failure:{phase,reason},
-        message:[copy('unknown'),phase&&copy(`phase.${phase}`),reason&&copy(`reason.${reason}`)].filter(Boolean).join(' ')};
+    const [outcome,label]=outcomes[code];
+    return {code,outcome,retryAllowed:false,failure:{phase,reason},
+        message:[copy(label),outcome==='unknown'&&phase&&copy(`phase.${phase}`),reason&&copy(`reason.${reason}`)].filter(Boolean).join(' ')};
 }
 // Do not echo arbitrary fingerprint input or any transport diagnostics. This
 // is the public label vocabulary, not the version-specific acceptance policy.
@@ -133,7 +137,14 @@ function routerForRebuild({service=createRebuildService(),Link=require('../model
  router.get('/rebuild/lock',requireScope('nodes:write'),wrap(()=>service.locks.status()));
  router.post('/rebuild/unlock',...write,wrap(req=>service.locks.unlock(req.body?.token)));
  router.post('/rebuild/preview',...write,wrap(req=>run(req,true,req.body?.remove===true)));
- for(const p of ['/topology/deploy','/links/:id/deploy','/chain/deploy'])router.post(p,...write,wrap(async req=>({executionMode:'rebuild',status:'succeeded',...(await run(req))})));
+ for(const p of ['/topology/deploy','/links/:id/deploy','/chain/deploy'])router.post(p,...write,wrap(async req=>{
+    const result=await run(req);
+    // Also outside the owning callback for unscoped Apply.
+    if(result.status==='rolled-back'||result.status==='not-dispatched'){
+        throw Object.assign(fail(result.status==='rolled-back'?'REBUILD_MAIN_CUTOVER_ROLLED_BACK':'REBUILD_MAIN_CUTOVER_NOT_DISPATCHED'),{failure:result.failure});
+    }
+    return {executionMode:'rebuild',status:'succeeded',...result};
+ }));
  router.delete('/links/:id',...write,wrap(async req=>({executionMode:'rebuild',deleted:req.params.id,...(await run(req,false,true))})));
  const save=editing=>(req,outcome)=>saveRebuildDraft({service,Link,Node,
     linkId:editing?req.params.id:undefined,body:req.body??{},preview:true},outcome);

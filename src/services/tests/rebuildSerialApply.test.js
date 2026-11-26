@@ -33,7 +33,7 @@ test.after(() => require.cache[require.resolve('../sshPoolService')]?.exports.cl
 // Real service, planner, adapter, local locks, journal, artifacts and BSON.
 // Native-host observation is modeled. Optional native store executes the exact
 // transaction, command and BSON CAS against a disposable real replica set.
-function fixture(t, fault, native) {
+function fixture(t, fault, native, mounted = false) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'c3-panel-serial.'));
     t.after(() => fs.rmSync(root, { recursive: true }));
     for (const dir of ['journal', 'artifacts']) fs.mkdirSync(path.join(root, dir), { mode: 0o700 });
@@ -124,7 +124,8 @@ function fixture(t, fault, native) {
         const peers = new Map(ids.map(n => [n, { authoritySha256: sha(n), managed: [managed], async verify(target, digest) {
             assert.equal(target, n); assert.equal(digest, sha(n)); return !(fault === 'peer' && n === id(1));
         } }]));
-        return { before, peers, journal, artifacts,
+        return { before: fault === 'admission-profile' ? before.map((p, i) => i ? p :
+            { ...p, config: { ...p.config, log: { loglevel: 'error' } } }) : before, peers, journal, artifacts,
             async verifyFence(plan) { scope = plan.scope; return true; },
             async openWindow(n, { verifyBeforeFrame }) {
                 assert(fenced()); counts.open++;
@@ -182,7 +183,7 @@ function fixture(t, fault, native) {
             async observe() { assert.fail('must not auto-reconcile'); },
         };
     };
-    const sync = { async syncRebuildNodeUsersAfterResume(n, { verifyFence, verifyPayload }) {
+    const sync = { async _getUsersForNode() { assert(mounted); return []; }, async syncRebuildNodeUsersAfterResume(n, { verifyFence, verifyPayload }) {
         assert(await verifyFence(n));
         const users = Object.freeze(clientList(JSON.parse(bytes(current.get(n).data))).map(row => Object.freeze({ ...row, flow: '' })));
         assert(await verifyPayload(n, users)); assert(await verifyPayload(n, users));
@@ -192,7 +193,18 @@ function fixture(t, fault, native) {
     const make = serialMainAuthority => createRebuildService({ Link: native ?? Link,
         Node: { db: selectedDb, find: () => query(nodes) }, State: { db: selectedDb, find: () => query([]) },
         L2tpUser: { db: selectedDb }, sync, locks, env: { C3_REBUILD_ENABLED: 'true' }, assertNoRelayAccountIntent: async () => {},
-        connect() { assert.fail('ordinary SSH must not enter'); }, serialMainAuthority,
+        connect(node) {
+            assert(mounted, 'ordinary SSH must not enter');
+            const n = String(node._id);
+            return { async requireSupportedCore() {}, async close() {},
+                async read(profile) {
+                    if (profile === 'main') return JSON.parse(bytes(current.get(n).data));
+                    return structuredClone(before.find(p => p.nodeId === n && p.profile === profile).config);
+                },
+                async stagePair() { assert.fail('scoped MAIN must never enter legacy staging'); },
+                async putPair() { assert.fail('scoped MAIN must never enter legacy activation'); },
+            };
+        }, serialMainAuthority,
         cache: { async invalidateAllSubscriptions() { assert(fenced()); counts.invalidate++; events.push('invalidate'); } },
     });
     return { service: make(authority), ordinary: make(), current, after, counts, events, state, artifacts,
@@ -229,11 +241,50 @@ test('real replica set accepts exact wire BSON and one raw majority COMMIT', { s
     }
 });
 
-test('default factory has no serial entry; ordinary Apply retains the guard even with a private provider', async t => {
+test('request flags cannot install serial authority or bypass confirmation', async t => {
     const f = fixture(t);
     assert.equal(f.ordinary.applySerialMain, undefined);
-    await assert.rejects(f.service.execute({ linkId: anchor, serialMainAuthority: true }), { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
+    await assert.rejects(f.ordinary.execute({ linkId: anchor, serialMainAuthority: true }), { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
     assert.equal(f.counts.open, 0); assert.equal(f.counts.begin, 0);
+});
+
+test('ordinary Apply consumes the same preview and uses only the joined MAIN path with trusted admission', async t => {
+    const f = fixture(t, undefined, undefined, true);
+    const preview = await f.service.execute({ linkId: anchor, preview: true });
+    assert.equal(preview.allowed, true);
+    assert(preview.nodes.some(node => node.mainRestartCount > 0));
+    assert.equal(f.counts.open, 0);
+    await assert.rejects(f.service.execute({ linkId: anchor, serialMainAuthority: true }), { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
+    await assert.rejects(f.service.execute({ linkId: anchor, expectedPreview: preview.previewId.slice(0, 64) + 'd'.repeat(64) }),
+        { code: 'REBUILD_PREVIEW_CHANGED' });
+    assert.equal(f.counts.open, 0); assert.equal(f.counts.begin, 0);
+    assert.equal((await f.service.execute({ linkId: anchor, expectedPreview: preview.previewId })).previewId, preview.previewId);
+    assert.equal(f.state().status, 'applied');
+    assert.equal(f.counts.commit, 1);
+    assert.equal(f.lock(), null);
+});
+
+test('ordinary Apply rebinds the authority baseline before opening the journaled writer', async t => {
+    const f = fixture(t, 'admission-profile', undefined, true);
+    const { previewId: expectedPreview } = await f.service.execute({ linkId: anchor, preview: true });
+    await assert.rejects(f.service.execute({ linkId: anchor, expectedPreview }), { code: 'REBUILD_PREVIEW_CHANGED' });
+    assert.equal(f.counts.open, 0);
+    assert.equal(f.lock(), null);
+});
+
+test('ordinary Apply under the original outer owner reports inverse only after successful handback', async t => {
+    const f = fixture(t, 'rollback', undefined, true);
+    const { previewId: expectedPreview } = await f.service.execute({ linkId: anchor, preview: true });
+    const result = await f.service.locks.run(async verify => {
+        const outcome = await f.service.execute({ linkId: anchor, expectedPreview }, verify);
+        assert(f.lock()?.cutover);
+        return outcome;
+    });
+    assert.equal(result.status, 'rolled-back');
+    assert.equal(result.allowed, false);
+    assert.equal(f.state().status, 'rolled-back');
+    assert.equal(f.counts.commit, 0);
+    assert.equal(f.lock(), null);
 });
 
 test('serial settlement publishes independently confirmed changed and unchanged MAIN pins in one transaction', async t => {
