@@ -85,6 +85,9 @@ func TestNativeCutoverPersisterBoundary(t *testing.T) {
 	t.Run("joined-stop-drains-the-same-pending-publish", func(t *testing.T) {
 		cutoverPersisterCase(t, core, "stopped")
 	})
+	t.Run("same-email-sync-zero-counts-can-change-main", func(t *testing.T) {
+		cutoverPersisterCase(t, core, "same-email-sync")
+	})
 }
 
 func cutoverPersisterCase(t *testing.T, core, mode string) {
@@ -228,6 +231,59 @@ func cutoverPersisterCase(t *testing.T, core, mode string) {
 	}
 	expected := map[string]recoveryIdentity{email: {id: id}}
 	old, candidate := image("exit-a", nil), image("exit-b", []*User{{ID: userID, Email: email}})
+	if mode == "same-email-sync" {
+		publish(image("exit-b", nil))
+		proc, _ := start()
+		verifyLive(proc, "exit-b", map[string]recoveryIdentity{})
+		addUser()
+		<-p.dirty // Consume the original add notification, not either test sync.
+		if _, err := p.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		baseline := readBoot()
+		pin, err := os.Stat(boot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		syncUser := func(id string) {
+			payload := cutoverTestJSON(t, map[string]any{"users": []*User{{ID: id, Email: email}}})
+			req := httptest.NewRequest(http.MethodPost, "/sync", bytes.NewReader(payload))
+			req.Header.Set("Authorization", "Bearer "+cfg.Token)
+			res := httptest.NewRecorder()
+			mux.ServeHTTP(res, req)
+			var ack map[string]int
+			if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &ack) != nil ||
+				!reflect.DeepEqual(ack, map[string]int{"added": 0, "removed": 0, "errors": 0, "total": 1}) {
+				t.Fatal("stock /sync did not return the exact zero-delta ACK")
+			}
+			if current, err := os.Stat(boot); err != nil || !os.SameFile(current, pin) || !bytes.Equal(readBoot(), baseline) {
+				t.Fatal("MAIN already differed at the synchronous ACK")
+			}
+			verifyLive(proc, "exit-b", expected)
+			select {
+			case <-p.dirty: // Run the scheduled flush explicitly, after the ACK, without sleeps.
+			default:
+				t.Fatal("stock handler did not schedule a persister flush")
+			}
+			if _, err := p.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		syncUser(userID)
+		if current, err := os.Stat(boot); err != nil || !os.SameFile(current, pin) || !bytes.Equal(readBoot(), baseline) {
+			t.Fatal("exact no-op /sync did not preserve the MAIN pin")
+		}
+		const replacement = "6887ca96-6e19-46f5-8647-9a64d87bc03a"
+		syncUser(replacement)
+		rewritten := readBoot()
+		if current, err := os.Stat(boot); err != nil || os.SameFile(current, pin) ||
+			!bytes.Equal(project(rewritten), project(baseline)) || !bytes.Contains(rewritten, []byte(replacement)) ||
+			bytes.Contains(rewritten, []byte(userID)) {
+			t.Fatal("zero-delta ACK did not expose the delayed exact-pin change")
+		}
+		verifyLive(proc, "exit-b", expected)
+		return
+	}
 	if mode == "clients" {
 		publish(image("exit-b", nil))
 		proc, _ := start()
