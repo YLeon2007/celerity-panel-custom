@@ -128,9 +128,13 @@ function fixture(t, fault, native) {
             async verifyFence(plan) { scope = plan.scope; return true; },
             async openWindow(n, { verifyBeforeFrame }) {
                 assert(fenced()); counts.open++;
-                let staged;
+                let staged, held = false, releasing = false;
                 return { async request({ action, target, desiredSha256 }) {
                     assert(await verifyBeforeFrame());
+                    if (action === 'hold') { assert(!held); held = true; return frame(null); }
+                    assert(held && !releasing);
+                    if (action === 'release') { releasing = true; return frame(null); }
+                    if (['check', 'discard-read'].includes(action)) return frame(null);
                     const snap = current.get(n);
                     if (action === 'stop') {
                         const config = JSON.parse(bytes(snap.data));
@@ -156,7 +160,7 @@ function fixture(t, fault, native) {
                         snap.xray = [pid, pid.toString(16).padStart(32, '0')];
                     }
                     return frame(['stop', 'start'].includes(action) ? null : snap);
-                }, async finish() { assert(fenced()); }, abort() {} };
+                }, async finish() { assert(fenced() && held && releasing); held = false; }, abort() { held = false; } };
             },
             async verifySnapshot(n, phase, snap) { return fenced() && snap.data === current.get(n).data; },
             async verifyAgentEndpoint(n, target) { return fenced() && n === target; },

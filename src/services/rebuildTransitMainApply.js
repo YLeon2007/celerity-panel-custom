@@ -101,26 +101,31 @@ async function request(channel, action, fields) {
 }
 
 // Private panel-side composition. All callbacks are trusted, bounded bindings,
-// never request arguments. `openWindow` must attach the exact admitted node to
-// HostMainWire under one pinned SSH connection and verify before each write.
+// never request arguments. `openWindow` must attach each exact admitted node to
+// an operation-scoped HostMainWire under one pinned SSH connection and verify
+// before each write. A step may dispose its own session but never the flock.
 // `verifySnapshot` independently binds live host/agent identity and profile
 // evidence; a wire reply alone cannot ACK. `readAgentManagedFlows` returns
 // the independently verified per-tag flow of the exact running agent for this
 // snapshot; a config read without process/endpoint proof does not qualify.
 // `settle` publishes graph state only
 // for an applied terminal proof and must not replay ambiguous commits.
-async function runJournaledMainApply({ journal, artifacts, retain, transitions, verifyFence,
+async function runJournaledMainApply({ journal, artifacts, retain, transitions, heldNodeIds, verifyFence,
     openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers, prove, verifyTerminal, settle, observe }) {
     const owner = cutoverOwner(retain);
     need(owner && Array.isArray(transitions) && transitions.length > 0 && transitions.length <= 128 &&
         [verifyFence, openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers, prove, verifyTerminal, settle, observe]
             .every(fn => typeof fn === 'function'), 'REBUILD_MAIN_AUTHORITY_UNPROVED');
-    const rows = new Map(), nodeFences = new Map(), steps = [];
+    need(Array.isArray(heldNodeIds) && heldNodeIds.length > 0 && heldNodeIds.length <= 128 &&
+        new Set(heldNodeIds).size === heldNodeIds.length && heldNodeIds.every(id => match(/^[a-f0-9]{24}(?![\s\S])/, id)),
+        'REBUILD_MAIN_AUTHORITY_UNPROVED');
+    const roster = [...heldNodeIds].sort();
+    const rows = new Map(), nodeFences = new Map(roster.map(id => [id, nodeLockVerifier(id)])), steps = [];
     let rank = 0;
     for (const { id, nodeId, phase, before, after, managed, authoritySha256 } of transitions) {
         const next = phases.indexOf(phase);
         need(match(/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,95}(?![\s\S])/, id) && !rows.has(id) && next >= rank &&
-            match(/^[a-f0-9]{24}(?![\s\S])/, nodeId) && match(SHA, authoritySha256) &&
+            nodeFences.has(nodeId) && match(SHA, authoritySha256) &&
             Array.isArray(managed) && managed.length > 0 && managed.length <= 64 && new Set(managed).size === managed.length &&
             managed.every(tag => match(/^[A-Za-z0-9_.:-]{1,128}(?![\s\S])/, tag)));
         rank = next;
@@ -128,13 +133,12 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
         need([row.before, row.after].every(data => data.length > 0 && data.length <= MAX));
         need(!sameTopology(row.before, row.after, row.managed));
         rows.set(id, row);
-        nodeFences.set(nodeId, nodeLockVerifier(nodeId));
         steps.push(Object.freeze({ id, phase, window: 'main-agent' }));
     }
     const operationId = randomUUID(), fenceId = randomUUID();
     const plan = Object.freeze({ scope: operationId, operationId, fenceId, steps: Object.freeze(steps),
-        planDigest: sha(bytes([...rows.values()].map(({ id, nodeId, phase, before, after, managed, authoritySha256 }) =>
-            [id, nodeId, phase, sha(before), sha(after), managed, authoritySha256]))) });
+        planDigest: sha(bytes([roster, [...rows.values()].map(({ id, nodeId, phase, before, after, managed, authoritySha256 }) =>
+            [id, nodeId, phase, sha(before), sha(after), managed, authoritySha256])])) });
     const { steps: _, ...identity } = plan;
     const ownsNodes = () => [...nodeFences.values()].every(owns => owns());
     need(ownsNodes() && await verifyFence(plan) === true && ownsNodes(), 'REBUILD_MAIN_AUTHORITY_UNPROVED');
@@ -159,32 +163,75 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
     function readConfirmed(entry) {
         return image(json(reopen({ plan, step: entry.step }, 'confirmed', entry.confirmed ?? entry.artifacts?.confirmed)), true);
     }
-    function discard() {
+    const hosts = new Map();
+    let acquired;
+    const lockError = 'REBUILD_MAIN_LOCK_UNPROVED';
+    async function frame(host, ctx, action, fields, checkpoint) {
+        need(host.channel && !host.closed && !host.failed && !host.flight, lockError);
+        const flight = host.flight = { ctx, action, checkpoint };
+        try { return await request(host.channel, action, fields); }
+        catch (err) { host.failed = true; throw err; }
+        finally { if (host.flight === flight) host.flight = undefined; }
+    }
+    const control = async (host, action, ctx = { plan }) => need(await frame(host, ctx, action) === null, lockError);
+    function acquire(ctx) {
+        return acquired ??= (async () => {
+            for (const nodeId of roster) {
+                need(await fenced(ctx), lockError);
+                const host = { nodeId };
+                hosts.set(nodeId, host);
+                host.channel = await openWindow(nodeId, { maxFrameBytes: MAX_FRAME, plan,
+                    verifyOwner: () => fenced(ctx), async verifyBeforeFrame() {
+                        const flight = host.flight;
+                        if (!flight || host.failed || host.closed) return false;
+                        const { ctx: next, checkpoint } = flight;
+                        const state = current(next);
+                        const pending = state.pending;
+                        if (checkpoint && (active?.host !== host || pending?.step.id !== next.step.id ||
+                            pending.direction !== next.direction || pending.checkpoint !== checkpoint)) return false;
+                        return await fenced(next) && host.flight === flight && current(next).head === state.head;
+                    },
+                });
+                await control(host, 'hold', ctx);
+            }
+            return true;
+        })();
+    }
+    async function confirmHolds(ctx = { plan }) {
+        need(hosts.size === roster.length && !active && await fenced(ctx), lockError);
+        await confirmIdlePeers(ctx);
+        need(await fenced(ctx), lockError);
+        return true;
+    }
+    async function confirmIdlePeers(ctx) {
+        // The active peer checks its original flock inside each phase. Never
+        // interleave a check frame into that peer's step state machine.
+        for (const host of hosts.values()) if (active?.host !== host) await control(host, 'check', ctx);
+    }
+    async function releaseHolds() {
+        await confirmHolds();
+        for (const host of hosts.values()) {
+            await control(host, 'release');
+            await host.channel.finish();
+            host.closed = true;
+        }
+        return true;
+    }
+    async function discardRead() {
+        if (!active) return;
         const prior = active;
+        need(prior.readAcknowledged && !prior.stopSent, lockError);
+        await control(prior.host, 'discard-read', prior.ctx);
         active = undefined;
-        if (prior && !prior.closed) prior.channel.abort();
     }
     async function open(ctx) {
-        const row = rows.get(ctx.step.id);
-        need(!active && row);
-        const local = { row, ctx, frameCtx: ctx, closed: false };
-        const verifyBeforeFrame = async () => {
-            if (active !== local || local.closed) return false;
-            const frameCtx = local.frameCtx;
-            const state = current(frameCtx);
-            const pending = state.pending;
-            // Read before the forward step intent (or in its inverse intent)
-            // has no host effects. Every other frame requires a durable phase.
-            if (local.action !== 'read' && (pending?.step.id !== ctx.step.id || pending.direction !== ctx.direction ||
-                pending.checkpoint !== local.checkpoint)) return false;
-            return await fenced(frameCtx) && active === local && !local.closed && local.frameCtx === frameCtx &&
-                current(frameCtx).head === state.head;
-        };
-        const channel = await openWindow(row.nodeId, { verifyBeforeFrame, maxFrameBytes: MAX_FRAME, plan, step: ctx.step, direction: ctx.direction });
-        active = Object.assign(local, { channel });
+        const row = rows.get(ctx.step.id), host = hosts.get(row?.nodeId);
+        need(!active && row && host);
+        active = { row, host, ctx };
         const baseline = image(await send(ctx, undefined, 'read'), true);
+        active.readAcknowledged = true;
         const latest = history(ctx, row);
-        if (latest) need(equal(baseline.xray, latest.xray) && equal(baseline.metadata, latest.metadata), drift);
+        if (latest) need(equal(baseline, latest), drift);
         const expected = ctx.direction === 'rollback' ? raw(latest?.data) : row.before;
         need(sameTopology(raw(baseline.data), expected, row.managed), drift);
         need(await verifySnapshot(row.nodeId, 'before', baseline, ctx) === true);
@@ -193,8 +240,8 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
     }
     async function send(ctx, checkpoint, action, fields) {
         need(active && active.ctx.step.id === ctx.step.id && active.ctx.direction === ctx.direction);
-        Object.assign(active, { frameCtx: ctx, checkpoint, action });
-        return request(active.channel, action, fields);
+        if (action === 'stop') active.stopSent = true;
+        return frame(active.host, ctx, action, fields, checkpoint);
     }
     function remember(ctx, err) {
         if (failure) return;
@@ -204,20 +251,26 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
     }
     let verified;
     const executor = createScopedCutoverExecutor({ journal, adapter: {
-        verifyFence: fenced,
+        async verifyFence(ctx) {
+            if (!await fenced(ctx)) return false;
+            try {
+                await acquire(ctx);
+                await confirmIdlePeers(ctx);
+                return await fenced(ctx);
+            } catch (err) {
+                remember(ctx, err);
+                return false;
+            }
+        },
         async capture(ctx) {
             try {
                 const baseline = await open(ctx);
                 return { before: seal(ctx, 'before', bytes(baseline)), desired: seal(ctx, 'desired', active.row.after) };
-            } catch (err) { try { remember(ctx, err); } finally { discard(); } throw err; }
+            } catch (err) { remember(ctx, err); await discardRead(); throw err; }
         },
         async captureMainPublication(ctx) {
-            const back = ctx.direction === 'rollback';
-            const original = back ? ctx.history.confirmed.find(entry => entry.step.id === ctx.step.id) : null;
-            const target = back
-                ? raw(json(reopen(ctx, 'publication-forward-before', original.publication.before)).data)
-                : reopen(ctx, 'desired', ctx.artifacts.desired);
-            if (!back) need(equal(active.baseline, image(json(reopen(ctx, 'before', ctx.artifacts.before)), true)), drift);
+            const target = active?.target;
+            need(target, drift);
             const capture = await send(ctx, 'agent-stop', 'capture', { target: target.toString('base64') });
             need(own(capture, ['before', 'desired']));
             const before = image(capture.before, false), desired = raw(capture.desired), { managed } = active.row;
@@ -228,7 +281,17 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
         async dispatch(ctx, submit) {
             verified = undefined;
             try {
-                if (ctx.direction === 'rollback') await open(ctx);
+                if (ctx.direction === 'rollback') {
+                    const original = ctx.history.confirmed.find(entry => entry.step.id === ctx.step.id);
+                    const target = image(json(reopen(ctx, 'publication-forward-before', original?.publication?.before)), false);
+                    await open(ctx);
+                    active.target = raw(target.data);
+                    need(sameTopology(active.target, active.row.before, active.row.managed), drift);
+                } else {
+                    need(equal(active.baseline, image(json(reopen(ctx, 'before', ctx.artifacts.before)), true)), drift);
+                    active.target = reopen(ctx, 'desired', ctx.artifacts.desired);
+                    need(active.target.equals(active.row.after), drift);
+                }
                 return await submit(async checkpoint => {
                     let written, restarted;
                     let prev = await checkpoint('agent-stop', null, async current =>
@@ -277,25 +340,34 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
                             'REBUILD_NODE_USER_SYNC_UNCONFIRMED');
                         verified = image(await send(current, 'agent-reconcile', 'verify'), true);
                         need(equal(verified, settled), drift);
-                        await active.channel.finish();
-                        active.closed = true;
+                        const host = active.host;
+                        active = undefined;
+                        // The idle check joins local step disposal but does not
+                        // release the operation's original host flock.
+                        await control(host, 'check', current);
                         return verified;
                     });
                 });
-            } catch (err) { remember(ctx, err); throw err; }
-            finally { discard(); }
+            } catch (err) {
+                remember(ctx, err);
+                if (active && !active.stopSent) await discardRead();
+                throw err;
+            }
         },
         async verify(ctx, reply) {
-            need(verified && reply === verified && await verifySnapshot(rows.get(ctx.step.id).nodeId, 'after', verified, ctx) === true);
+            need(verified && reply === verified && await confirmHolds(ctx) &&
+                await verifySnapshot(rows.get(ctx.step.id).nodeId, 'after', verified, ctx) === true && await confirmHolds(ctx));
             return seal(ctx, 'confirmed', bytes(verified));
         },
-        async prove(ctx) { return await prove(ctx) === true; },
+        async prove(ctx) { return await confirmHolds(ctx) && await prove(ctx) === true && await confirmHolds(ctx); },
         async verifyTerminal(ctx) {
             const latest = new Map();
             for (const entry of [...ctx.confirmed, ...ctx.restored]) {
                 latest.set(rows.get(entry.step.id).nodeId, readConfirmed(entry));
             }
+            await confirmHolds(ctx);
             const evidence = await verifyTerminal(ctx, latest);
+            await confirmHolds(ctx);
             if (evidence === false) return false;
             need(Buffer.isBuffer(evidence) && evidence.length > 0);
             const pin = seal(ctx, 'confirmed', evidence);
@@ -305,22 +377,26 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
         observe,
     } });
     try {
-        let result;
-        try { result = await executor.execute(plan); } finally { discard(); }
+        const result = await executor.execute(plan);
         const final = current({ plan });
         if (result.status === 'applied' || result.status === 'rolled-back') {
             need(terminal && equal(final.terminalProof, terminal.pin) && final.status === result.status && !final.pending);
             need(await fenced({ plan }));
             const pins = new Map([...terminal.latest].map(([node, snapshot]) => [node, sha(raw(snapshot.data))]));
-            need(await settle(result.status, pins, plan) === true);
-            await reservation.settle(async () => await fenced({ plan }) && current({ plan }).head === final.head);
+            need(await confirmHolds() && await settle(result.status, pins, plan, confirmHolds) === true && await confirmHolds());
+            await reservation.settle(async () => await releaseHolds() && await fenced({ plan }) && current({ plan }).head === final.head);
         } else if (result.status === 'not-dispatched' && final.status === 'not-dispatched' && !final.pending && !final.confirmed.length) {
-            await reservation.settle(async () => await fenced({ plan }) && current({ plan }).head === final.head);
+            await discardRead();
+            await reservation.settle(async () => await releaseHolds() && await fenced({ plan }) && current({ plan }).head === final.head);
         } else throw unresolved(failure);
         return { ...result, failure: failure ?? null };
     } catch (err) {
         remember({ plan }, err);
         throw unresolved(failure);
+    } finally {
+        for (const host of hosts.values()) if (!host.closed) {
+            try { host.channel?.abort(); } catch { /* no authority to resume or clear fence */ }
+        }
     }
 }
 

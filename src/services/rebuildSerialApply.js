@@ -158,7 +158,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 await checkStates();
                 await locked();
                 let terminal, consumed = false, published = false;
-                const result = await runJournaledMainApply({ journal, artifacts, transitions, retain, verifyFence: fenced,
+                const result = await runJournaledMainApply({ journal, artifacts, transitions, heldNodeIds: ids, retain, verifyFence: fenced,
                     openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers, prove, observe,
                     async verifyTerminal(ctx, latest) {
                         terminal = undefined;
@@ -185,12 +185,12 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                     },
                     // The only caller is this invocation's real journaled
                     // adapter, after a durable terminal record and drained writer.
-                    async settle(status, changedPins, plan) {
+                    async settle(status, changedPins, plan, verifyHolds) {
                         need(!consumed && terminal && equal(terminal.ctx.plan, plan));
                         consumed = true; // before any await; no settlement replay
                         const final = journal.read(plan.scope);
                         const terminalFence = async (all = true) => {
-                            if (all) await fenced(plan);
+                            if (all) { await fenced(plan); need(await verifyHolds() === true); }
                             else await locked();
                             const live = journal.read(plan.scope);
                             need(live && equal(live.plan, plan) && live.status === status && live.head === final?.head &&
@@ -236,7 +236,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 need(result.status !== 'applied' || published, 'REBUILD_MAIN_CUTOVER_UNRESOLVED');
                 return result;
             });
-        });
+        }, { allowStaleUnlock: false });
     };
 }
 

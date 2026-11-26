@@ -45,7 +45,7 @@ function lockStore() {
     };
 }
 
-function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotated = false, changedFlow = false } = {}) {
+function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotated = false, changedFlow = false, replaceBeforeInverse = false } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'c3-main-join.'));
     const journalPath = path.join(root, 'journal'), artifactPath = path.join(root, 'artifacts');
     const main = path.join(root, 'MAIN');
@@ -63,13 +63,13 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotate
     const state = () => journal.read(scope);
     const verifyLock = () => nodeLockVerifier(id)() && store.copy()?.cutover?.scope === scope;
     const opts = {
-        journal, artifacts, transitions: [{ id: 'relay-a', nodeId: id, phase: 'prepare', before: config('a', 'initial'),
+        journal, artifacts, heldNodeIds: [id], transitions: [{ id: 'relay-a', nodeId: id, phase: 'prepare', before: config('a', 'initial'),
             after: config('b', 'obsolete'), managed: ['vless-in'], authoritySha256: 'c'.repeat(64) }],
         async verifyFence(plan) { scope = plan.scope; return nodeLockVerifier(id)(); },
         async openWindow(target, { verifyBeforeFrame }) {
             assert.equal(target, id);
             assert(verifyLock());
-            const child = spawn('/usr/bin/python3', ['-B', path.join(__dirname, 'rebuildTransitMainWireHost.py'), '--fixture', root, fault, '10'],
+            const child = spawn('/usr/bin/python3', ['-B', path.join(__dirname, 'rebuildTransitMainWireHost.py'), '--fixture', root, fault, '10', 'held'],
                 { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin', TMPDIR: root, HOME: root, C3_SYNTHETIC_SYNC_USERS: '1' } });
             const done = once(child, 'close');
             children.push({ child, done });
@@ -81,8 +81,10 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotate
                 async request(frame) {
                     assert(await verifyBeforeFrame());
                     assert(verifyLock());
-                    assert.equal(state().pending?.checkpoint, phases[frame.action]);
-                    events.push(frame.action);
+                    if (Object.hasOwn(phases, frame.action) || frame.action === 'read') {
+                        assert.equal(state().pending?.checkpoint ?? undefined, phases[frame.action]);
+                        events.push(frame.action);
+                    }
                     child.stdin.write(`${JSON.stringify(frame)}\n`);
                     const next = await lines.next();
                     assert.equal(next.done, false, savedError.join(''));
@@ -120,7 +122,15 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotate
             assert(await verifyFence(id));
             return { added: 0, removed: 0, total: 1, errors: 0 };
         },
-        async prove() { return verifyLock(); },
+        async prove() {
+            if (replaceBeforeInverse) {
+                const other = `${main}.identical`;
+                fs.copyFileSync(main, other);
+                fs.renameSync(other, main);
+                return false; // known transit proof failure calls for inverse
+            }
+            return verifyLock();
+        },
         async verifyTerminal(ctx, latest) {
             assert(verifyLock());
             assert.equal(ctx.direction, 'forward');
@@ -132,6 +142,9 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotate
             assert.equal(status, 'applied');
             assert.equal(pins.get(id), hash(fs.readFileSync(main)));
             assert.notEqual(pins.get(id), hash(JSON.stringify(config('b', 'obsolete'))));
+            assert.equal(state().confirmed.length, 1);
+            const contender = spawn('/usr/bin/flock', ['--nonblock', path.join(root, 'lock'), '/usr/bin/true'], { stdio: 'ignore' });
+            assert.deepEqual(await once(contender, 'close'), [1, null]);
             events.push('settle');
             return true;
         },
@@ -171,6 +184,15 @@ test('joined MAIN wire: no-effect refusal before stop releases the promoted owne
     assert.deepEqual(f.events, ['read']);
     assert.equal(f.state().status, 'not-dispatched');
     assert.equal(f.store.copy(), null);
+});
+test('joined MAIN wire: inverse refuses a byte-identical replacement before its second stop', async t => {
+    const f = fixture(t, { replaceBeforeInverse: true });
+    await assert.rejects(f.run(), { code: 'REBUILD_MAIN_CUTOVER_UNRESOLVED', retryAllowed: false,
+        failure: { phase: null, reason: 'REBUILD_MAIN_CAS_UNPROVED' } });
+    assert.deepEqual(f.events, [...complete, 'sync', 'verify', 'read']);
+    assert.equal(f.state().confirmed.length, 1);
+    assert.equal(f.state().restored.length, 0);
+    assert.equal(f.store.copy().allowStaleUnlock, false);
 });
 test('joined MAIN wire: a restart timeout after native effect remains pending without start or promotion cleanup', async t => {
     const f = fixture(t, { fault: 'restart-ack' });
