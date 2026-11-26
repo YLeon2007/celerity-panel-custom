@@ -27,6 +27,43 @@
     }
   ],
   "sha256": "ed7427b88865cf781301952da2bea232f2b1fe8fd3e0123c1c57b013a957ecec",
+  "directSize": 111720,
+  "main": {
+    "sources": [
+      {
+        "path": "rebuildTransitMainWindow.py",
+        "size": 20816,
+        "sha256": "b1ad275fbd76b7fae5832c49e7a556e0b041e6f8d5c0756e9369ac45f037fd89"
+      },
+      {
+        "path": "rebuildTransitMainSession.py",
+        "size": 16034,
+        "sha256": "6fa6319373c59bc0e7166ea301ed28f4a69a7215a577840e105ccb2b0a504de6"
+      },
+      {
+        "path": "rebuildTransitMainRuntime.py",
+        "size": 21113,
+        "sha256": "f4aa487c6c6758c4e123f023635ddc6d6830a39252879f867feb307e703b9d45"
+      },
+      {
+        "path": "rebuildTransitMainHost.py",
+        "size": 3444,
+        "sha256": "47e9a8efef69510e071cbcf700198ae43637177cd0025d5159ff1a19087da356"
+      },
+      {
+        "path": "rebuildTransitMainWire.py",
+        "size": 15376,
+        "sha256": "eff320fdc7eec574db9746b30bbb438052b35ba28176b6a29c5f2e3a952cf7ca"
+      },
+      {
+        "path": "rebuildTransitDirectReceipt.py",
+        "size": 20384,
+        "sha256": "dbb0e782e9da49d7f05cd36283778ef5cc0fe453353815fcd7c33af61d7a09f8"
+      }
+    ],
+    "sha256": "9cbaff0b8c5d068f3932a5948c7cc1a7c7074d2b4e051fb01e0e9815c9653de0",
+    "size": 24388
+  },
   "dictionary": {
     "161": "\n    ",
     "162": "\n        ",

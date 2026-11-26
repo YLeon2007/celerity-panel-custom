@@ -197,7 +197,12 @@ function bundleDirectScript() {
     const names = ['../modules/relay-l2tp/node-artifacts/l2tp/ensure-xl2tpd-unit.py', 'rebuildRelayStockRuntime.py',
         'rebuildRelayPackageGuard.py', 'rebuildRelayReplacement.py', 'rebuildRelayDirectHost.py'];
     const manifest = require('./rebuildRelayDirectPayload.json');
-    const compressed = readFileSync(join(__dirname, 'rebuildRelayDirectPayload.xz'));
+    const payload = readFileSync(join(__dirname, 'rebuildRelayDirectPayload.xz'));
+    // The legacy SSH exec argument keeps its exact original section. The
+    // extra MAIN section is not encoded into that length-limited argument.
+    requireThat(Number.isSafeInteger(manifest.directSize) && manifest.directSize > 0 &&
+        manifest.directSize + manifest.main?.size === payload.length, 'DIRECT_BUNDLE_INVALID');
+    const compressed = payload.subarray(0, manifest.directSize);
     requireThat(manifest.sources.length === names.length && sha(compressed) === manifest.sha256, 'DIRECT_BUNDLE_INVALID');
     const dictionary = Object.entries(manifest.dictionary ?? {});
     requireThat(dictionary.length > 0 && dictionary.length <= 64 && dictionary.every(([key, value]) =>

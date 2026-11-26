@@ -14,7 +14,14 @@ SOURCES = (
     'rebuildRelayPackageGuard.py',
     'rebuildRelayReplacement.py',
     'rebuildRelayDirectHost.py',
+    'rebuildTransitMainWindow.py',
+    'rebuildTransitMainSession.py',
+    'rebuildTransitMainRuntime.py',
+    'rebuildTransitMainHost.py',
+    'rebuildTransitMainWire.py',
+    'rebuildTransitDirectReceipt.py',
 )
+DIRECT_COUNT = 5
 PAYLOAD = SERVICES / 'rebuildRelayDirectPayload.xz'
 MANIFEST = SERVICES / 'rebuildRelayDirectPayload.json'
 # Reversible, fixed byte dictionary; the checked manifest carries the table
@@ -37,7 +44,8 @@ def main():
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     files = [(SERVICES / path).read_bytes() for path in SOURCES]
-    source = b''.join(files)
+    source = b''.join(files[:DIRECT_COUNT])
+    main_source = b''.join(files[DIRECT_COUNT:])
     table = {i: b'\n' + b'    ' * (i - INDENT_BASE) for i in range(INDENT_BASE + 1, INDENT_BASE + 17)}
     table.update(zip(WORD_CODES[:len(TOKENS)], TOKENS, strict=True))
     if set(source) & table.keys():
@@ -46,12 +54,24 @@ def main():
     transformed = re.sub(indent, lambda m: bytes([INDENT_BASE + (len(m[0]) - 1) // 4]), source)
     for code, token in zip(WORD_CODES, TOKENS):
         transformed = transformed.replace(token, bytes([code]))
-    packed = PAYLOAD.read_bytes() if args.check else lzma.compress(
-        transformed, filters=[dict(id=lzma.FILTER_LZMA2, preset=9 | lzma.PRESET_EXTREME,
-                                  dict_size=2**20, pb=0, nice_len=273)])
+    if args.check:
+        existing = json.loads(MANIFEST.read_text())
+        payload = PAYLOAD.read_bytes()
+        length = existing['directSize']
+        if type(length) is not int or not 0 < length < len(payload):
+            raise SystemExit('DIRECT payload section size is invalid')
+        packed, main_packed = payload[:length], payload[length:]
+    else:
+        packed = lzma.compress(transformed, filters=[dict(id=lzma.FILTER_LZMA2, preset=9 | lzma.PRESET_EXTREME,
+                                                       dict_size=2**20, pb=0, nice_len=273)])
+        main_packed = lzma.compress(main_source, preset=6)
+    rows = [{'path': path, 'size': len(data), 'sha256': sha(data)}
+            for path, data in zip(SOURCES, files, strict=True)]
     manifest = {
-        'sources': [{'path': path, 'size': len(data), 'sha256': sha(data)} for path, data in zip(SOURCES, files)],
+        'sources': rows[:DIRECT_COUNT],
         'sha256': sha(packed),
+        'directSize': len(packed),
+        'main': {'sources': rows[DIRECT_COUNT:], 'sha256': sha(main_packed), 'size': len(main_packed)},
         'dictionary': {str(k): v.decode('ascii') for k, v in table.items()},
     }
     # Reserve space for the bootstrap and shell wrapper with NUL.
@@ -61,14 +81,17 @@ def main():
     decoded = b''.join(table.get(b, bytes([b])) for b in lzma.decompress(packed, memlimit=16777216))
     if decoded != source or encoded_size + 1660 > 131072:
         raise SystemExit('DIRECT source mismatch or shell argument too large')
+    if lzma.decompress(main_packed, memlimit=16777216) != main_source:
+        raise SystemExit('MAIN payload source mismatch')
     body = json.dumps(manifest, indent=2) + '\n'
     if args.check:
         if MANIFEST.read_text() != body:
             raise SystemExit('DIRECT payload manifest is stale')
     else:
-        PAYLOAD.write_bytes(packed)
+        PAYLOAD.write_bytes(packed + main_packed)
         MANIFEST.write_text(body)
-    print(f'DIRECT exact sources={len(files)} encoded bytes={encoded_size}')
+    print(f'DIRECT exact sources={DIRECT_COUNT} encoded bytes={encoded_size}; '
+          f'MAIN exact sources={len(files) - DIRECT_COUNT} packed bytes={len(main_packed)}')
 
 
 if __name__ == '__main__':
