@@ -212,9 +212,13 @@ async function runGraph(d, req, retire = false) {
                 for(const entry of report)if(counts.has(entry.nodeId))entry.mainRestartCount=counts.get(entry.nodeId);
             }
             const serial=transit?.serial===true && !!d.activateSerial && !removed.length && !kcpVersions?.length && mainSteps.length>0;
+            const routingRequired=transitPreimages&&!protectedChanged&&d.checkSerialRouting
+                ? await d.checkSerialRouting(transitPreimages,candidates,mainSteps) : [];
+            const routingNodes=new Set(routingRequired);
+            for(const entry of report)if(routingNodes.has(entry.nodeId))entry.routingServiceRequired=true;
             const transitBlocked=!serial&&(!!transit?.blocked||!!observedMain&&hasObservedScopedTransit(observedMain));
             if(serial)fingerprint.update(JSON.stringify(['scoped-main-v1',mainSteps.map(({nodeId,phase,kind})=>[nodeId,phase,kind])]));
-            const result={allowed:!transitBlocked&&!protectedChanged,nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
+            const result={allowed:!transitBlocked&&!protectedChanged&&!routingNodes.size,nodes:report,previewId:linkVersion+fingerprint.digest('hex')};
             if(transitBlocked)result.transitBlocked=true;
             if(survivor)result.survivorPreview=linkVersion+survivor.digest('hex');
             const stale=req.expectedPreview!==undefined && req.expectedPreview!==result.previewId;
@@ -234,7 +238,8 @@ async function runGraph(d, req, retire = false) {
                 await checkKcpSnapshot();
                 return result;
             }
-            if(!result.allowed)throw previewRefusal(transitBlocked?'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE':'REBUILD_CLIENT_CHANGE',result);
+            if(!result.allowed)throw previewRefusal(routingNodes.size?'REBUILD_MAIN_ROUTING_SERVICE_REQUIRED':
+                transitBlocked?'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE':'REBUILD_CLIENT_CHANGE',result);
             if(stale&&kcpVersions?.length)refuseStaleKcpPreview();
             if(stale)throw previewRefusal('REBUILD_PREVIEW_CHANGED',result);
             await verify();

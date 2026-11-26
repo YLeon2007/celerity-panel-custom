@@ -49,6 +49,7 @@
             protectedChanged ||= settingsChanged;
             const lines = [name + ' — ' + labels[role] + ': ' + summary,
                 settingsChanged ? labels.settingsChanged : labels.settingsUnchanged];
+            if (node.routingServiceRequired === true && labels.routingServiceRequired) lines.push(labels.routingServiceRequired);
             if (labels.mainRestartCount && Number.isSafeInteger(node.mainRestartCount) && node.mainRestartCount > 0) {
                 mainRestart = true;
                 lines.push(labels.mainRestartCount.replace('{count}', node.mainRestartCount));
@@ -170,6 +171,9 @@
         const labels = window._networkRebuildPreviewI18n;
         const copy = labels?.mainCutover;
         if (status !== 409 || !copy) return null;
+        if (error?.code === 'REBUILD_MAIN_ROUTING_SERVICE_REQUIRED' && error.retryAllowed === false) {
+            return { title: labels.refused, message: labels.routingServiceRequired };
+        }
         if (error?.code === 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE') {
             return { title: labels.refused, message: copy.guardedPreflight };
         }
@@ -209,7 +213,8 @@
         const { previewId } = report;
         const text = rebuildPreviewText(report.nodes, removing, lookupNode, labels, report.transitBlocked === true);
         if (report.transitBlocked === true) text.warning = [text.warning, labels.transitBlocked].filter(Boolean).join('\n\n');
-        const allowed = report.allowed && !text.protectedChanged && report.transitBlocked !== true;
+        const allowed = report.allowed && !text.protectedChanged && report.transitBlocked !== true &&
+            !report.nodes.some(node => node.routingServiceRequired === true);
         if (allowed && (typeof previewId !== 'string' || ![64, 128].includes(previewId.length) || /[^a-f0-9]/.test(previewId))) {
             return stop(labels.unavailable);
         }

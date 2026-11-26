@@ -40,10 +40,16 @@ test('generated MAIN enables level 0 online only for explicit Xray client roles'
         assert.deepEqual(config.policy.system, {
             statsInboundUplink: true, statsInboundDownlink: true, statsOutboundUplink: true, statsOutboundDownlink: true,
         });
-        assert.deepEqual(config.api.services, ['HandlerService', 'StatsService']);
+        assert.deepEqual(config.api.services, ['HandlerService', 'StatsService', 'RoutingService']);
         assert.deepEqual(config.stats, {});
         assert.equal(config.inbounds.find(i => i.tag === 'client').settings.clients[0].id, user.xrayUuid);
-        if (!eligible) baselines[role] = profileSha256(bytes);
+        assert.equal(config.inbounds.find(i => i.tag === 'API_INBOUND').listen, '127.0.0.1');
+        assert.deepEqual(config.routing.rules[0], { inboundTag: ['API_INBOUND'], outboundTag: 'API', type: 'field' });
+        if (!eligible) {
+            const legacy = structuredClone(config);
+            legacy.api.services.pop(); // The only intentional change to these MAINs.
+            baselines[role] = profileSha256(JSON.stringify(legacy, null, 2));
+        }
         assert.equal(usesOnline(JSON.parse(generator.generateXrayConfig(node, [user]))), undefined);
         const profiles = composeRebuildProfiles({ nodes: [asInventory(node)], links: [],
             usersByNode: { [String(node._id)]: [user] } });
@@ -232,7 +238,11 @@ test('mounted Rebuild Preview is policy-only; installed relay, bridge and subscr
     const afterBodies = await render();
     assert.equal(renders, 4, 'each snapshot is a fresh generation, not a cache hit');
     assert.deepEqual(afterBodies, beforeBodies);
-    const protectedDigests = Object.fromEntries(candidates.filter(p => !isClientMain(p)).map(p => [key(p), profileSha256(profileBytes(p.config))]));
+    const protectedDigests = Object.fromEntries(candidates.filter(p => !isClientMain(p)).map(p => {
+        const legacy = structuredClone(p.config);
+        if (p.profile === 'main' && legacy.api) assert.equal(legacy.api.services.pop(), 'RoutingService');
+        return [key(p), profileSha256(profileBytes(legacy))];
+    }));
     const bodyDigests = Object.fromEntries(Object.entries(beforeBodies).map(([format, bytes]) => [format, profileSha256(bytes)]));
 
     for (const node of result.nodes) for (const p of node.profiles) {

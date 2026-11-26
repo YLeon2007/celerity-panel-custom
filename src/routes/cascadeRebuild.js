@@ -31,6 +31,8 @@ const mainCutoverReasons=new Set([
     'REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED',
 ]);
 function formatTransitRefusal(req,res,error,code){
+    if(code==='REBUILD_MAIN_ROUTING_SERVICE_REQUIRED')return {code,outcome:'not-dispatched',retryAllowed:false,
+        message:t('network.rebuildPreview.routingServiceRequired',res.locals.lang||detectLanguage(req))};
     if(code==='REBUILD_LOCK_RELEASE_UNCONFIRMED'&&settledMain(error)){
         const lang=res.locals.lang||detectLanguage(req);
         return {code:'REBUILD_MAIN_CUTOVER_HANDBACK_UNCONFIRMED',outcome:'handback-unconfirmed',retryAllowed:false,

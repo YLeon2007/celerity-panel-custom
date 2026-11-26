@@ -943,7 +943,7 @@ function applyXrayApi(config, apiPort, { statsUserOnline = false } = {}) {
         throw new TypeError('applyXrayApi requires a valid loopback API port');
     }
     config.api = {
-        services: ['HandlerService', 'StatsService'],
+        services: ['HandlerService', 'StatsService', 'RoutingService'],
         tag: 'API',
     };
     config.stats = {};

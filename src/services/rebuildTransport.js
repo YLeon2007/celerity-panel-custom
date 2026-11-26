@@ -266,12 +266,28 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         else if(side.state==='loaded') await check('systemctl disable xray-bridge.service',undefined,true);
         if(authority?.installation)await relayNetwork('verify_after_restart',networkProof);
     }
+    async function checkMainRoutingService(config){
+        const api=config?.inbounds?.filter(row=>row.tag==='API_INBOUND');
+        const port=api?.length===1&&api[0].listen==='127.0.0.1'&&api[0].protocol==='dokodemo-door'&&api[0].port;
+        const first=config?.routing?.rules?.[0];
+        if(!Number.isInteger(port)||port<1||port>65535||!config.api?.services?.includes('RoutingService')||
+            !config.api.tag||first?.outboundTag!==config.api.tag||first.type!=='field'||
+            first.inboundTag?.length!==1||first.inboundTag[0]!=='API_INBOUND')return false;
+        const result=await run(`/usr/local/bin/xray api lsrules --server=127.0.0.1:${port} --timeout=3`,{timeout:5000});
+        if(result?.code!==0||result.stderr!=='')return false;
+        try {
+            const reply=JSON.parse(result.stdout);
+            // Both supported cores return {} when there are no tagged rules.
+            return !!reply&&Object.getPrototypeOf(reply)===Object.prototype&&
+                (Object.keys(reply).length===0||Array.isArray(reply.rules));
+        } catch {return false;}
+    }
     async function close(){
         if(closed)return;
         try{if(connected&&attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`,undefined,true);}
         finally{closed=true;if(connected||attestationStarted)ssh.disconnect();}
     }
-    return {read,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,
+    return {read,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,checkMainRoutingService,
         ...(authority&&{attest}),
         ...(authority?.verifyMainBinding&&{openMainWindow}),
         ...(authority?.merged&&{verifyIdentity}),

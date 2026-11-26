@@ -339,7 +339,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                     const graph=compileRebuildGraph({nodes,links,affectedNodeIds:ids});
                     // Keep the graph composer testable without enabling a new
                     // multi-host cutover on the legacy activation loop.
-                    if(!req.preview&&!serialEligible&&[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
+                    if(!req.preview&&!serialEligible&&env.C3_REBUILD_CHAIN_APPLY!=='1'&&[...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1))throw fail('REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE');
                 }
                 states=await installedStates(ids);
                 const kcpLinks=links.filter(link=>link.tunnelTransport==='kcp');
@@ -398,7 +398,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 await verifyTunnelTrust(prepared,panelTls,transports);
                 const mismatched=new Set(nodes.filter(inconsistentPublishedKey).map(n=>String(n._id)));
                 let transit;
-                if((req.preview||serialEligible)&&prepared.some(link=>link.rebuildExit!=null)){
+                if((req.preview||serialEligible||env.C3_REBUILD_CHAIN_APPLY==='1')&&prepared.some(link=>link.rebuildExit!=null)){
                     const graph=compileRebuildGraph({nodes,links:prepared,affectedNodeIds:ids});
                     if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1)){
                         const keysSettled=prepared.every((link,i)=>!Object.hasOwn(link,'_rebuildVless')||Object.hasOwn(links[i],keyEnvelopeField));
@@ -431,6 +431,23 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             persistKeys:retire?undefined:verify=>prepareLinks(Link,prepared,{env,persist:true,verify}),
             markDelete:async id=>{if(bindings.size)await verifyApply();const result=await Link.updateOne({_id:id,rebuildDelete:{$ne:true}},{$set:{rebuildDelete:true}});if(result.matchedCount!==1)throw fail('REBUILD_LINK_CHANGED');},
             checkKcpAdmission:()=>kcpAdmission(),
+            ...(env.C3_REBUILD_CHAIN_APPLY==='1'&&!retire&&!req.remove&&{async checkSerialRouting(before,after,steps){
+                const planned=new Set(steps.map(step=>step.nodeId)), missing=[];
+                for(const row of before){
+                    if(row.profile!=='main')continue;
+                    const candidate=after.find(p=>p.nodeId===row.nodeId&&p.profile==='main')?.config;
+                    // The additive planner rejects changes to API settings.
+                    // Compare the non-API image only to identify nodes for
+                    // migration when that difference prevents a schedule.
+                    const withoutApi=({api,...profile}={})=>profile;
+                    if(!planned.has(row.nodeId)&&(planned.size||!candidate||!row.config||
+                        isDeepStrictEqual(withoutApi(row.config),withoutApi(candidate))))continue;
+                    await verifyApply();
+                    if(await transports.get(row.nodeId).checkMainRoutingService?.(row.config)!==true)missing.push(row.nodeId);
+                }
+                await verifyApply();
+                return missing;
+            }}),
             async activateSerial(confirmation,verify){
                 if(!serialEligible||verify!==verifyApply||typeof retainApply!=='function')throw fail('REBUILD_LOCK_LOST');
                 // These are only the Preview readers. Dispose them before

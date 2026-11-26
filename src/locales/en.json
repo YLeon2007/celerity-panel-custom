@@ -1618,6 +1618,7 @@
         }
       },
       "mainRestartCount": "MAIN restarts in plan: {count}",
+      "routingServiceRequired": "Run a regular sync or Apply on this node to enable route checks.",
       "mainRestartWarning": "Active connections will be interrupted on the listed nodes if the plan is applied or rolled back. MAIN services restart one at a time; affected portals are switched last on Apply.",
       "portalExitGeo": "Geo routes",
       "noPortalExit": "no exit",
