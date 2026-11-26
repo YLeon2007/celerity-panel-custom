@@ -1,8 +1,11 @@
 # Changelog
 
-## Unreleased
+## v1.6.42 — Цепочки релеев / Relay chains
 
-- Выбор выхода Rebuild по существующим общим каналам работает через обычный Apply, без флага. Установка новых выделенных межрелейных каналов требует `C3_REBUILD_CHAIN_APPLY=1`. Для неё каждому узлу MAIN нужен один обычный Apply после обновления; панель подскажет в предпросмотре.
+- В Rebuild можно связать несколько релеев в цепочку и выбрать для каждого портала свой конечный бридж. Предпросмотр показывает путь и предупреждает, если применить его нельзя.
+- После перезагрузки релея панель снова может проверять учётки L2TP. Создавать их заново не нужно.
+- После обновления каждому узлу с основным профилем Xray (MAIN) в цепочке нужен один обычный Apply. Предпросмотр подскажет, какие узлы ещё не обновлены.
+- Выбор выхода по существующим общим каналам работает без флага. Применение цепочки с новыми выделенными межрелейными каналами требует `C3_REBUILD_CHAIN_APPLY=1`; по умолчанию оно выключено. [Памятка оператора](docs/release-v1.6.42.ru.md).
 - Xray setup fails if the final authenticated agent probe confirms the runtime API is down after a requested restart. No cascade redeploy or wizard completion follows that failure. Setup without a restart can still complete while Xray is offline.
 - Missing or unusable Xray health proof is reported as `unknown`, not as an outage. Setup reports an explicit warning; the node does not show as online, its online-user count is cleared, and no `node.offline` webhook is emitted for an unsupported or invalid probe.
 
