@@ -65,7 +65,7 @@ def main():
         packed, main_packed = payload[:length], payload[length:]
     else:
         packed = lzma.compress(transformed, filters=[dict(id=lzma.FILTER_LZMA2, preset=9 | lzma.PRESET_EXTREME,
-                                                       dict_size=2**20, pb=0, nice_len=273)])
+                                                       dict_size=2**20, pb=0, nice_len=120)])
         main_packed = lzma.compress(main_source, preset=6)
     rows = [{'path': path, 'size': len(data), 'sha256': sha(data)}
             for path, data in zip(SOURCES, files, strict=True)]

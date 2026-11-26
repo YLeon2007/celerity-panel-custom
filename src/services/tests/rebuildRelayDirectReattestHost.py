@@ -20,6 +20,26 @@ SOURCE = (Path(sys.argv.pop(1)) if len(sys.argv) > 1 and not sys.argv[1].startsw
           else Path(__file__).resolve().parents[1] / 'rebuildRelayDirectHost.py')
 NETWORK_FIXTURE = runpy.run_path(str(Path(__file__).with_name('helpers') / 'rebuildRelayNetworkFixture.py'))
 
+# Exact generateBridgeSystemdService() output at 4615c511, including its single final LF.
+CLASSIC_BRIDGE_426 = b'''[Unit]
+Description=Xray Bridge (Cascade Tunnel)
+After=network.target nss-lookup.target
+
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Type=simple
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray-bridge/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+'''
+
 
 def deny_native(event, _):
     if event in ('os.system', 'os.exec', 'os.posix_spawn', 'os.kill', 'subprocess.Popen') or event.startswith('socket.'):
@@ -523,7 +543,7 @@ class RuntimeReattest(unittest.TestCase):
         self.boot = '12345678-1234-1234-1234-123456789abb'
         self.assert_foreign()
 
-    def apply_fixture(self, *, bridge=False, classic=False):
+    def apply_fixture(self, *, bridge=False, classic=False, classic_fragment=CLASSIC_BRIDGE_426):
         if self.boot != self.old_boot:
             self.boot = self.old_boot
             self.manifest['runtime']['invocations'] = [self.units[n]['InvocationID'] for n in self.watch]
@@ -560,9 +580,9 @@ class RuntimeReattest(unittest.TestCase):
             fragment = h['SYSTEM'] + '/' + b
             self.units[b].update(LoadState='loaded', UnitFileState='disabled', FragmentPath=fragment,
                                  User='nobody', Job='', ControlGroup='', InvocationID='0' * 32,
-                                 Requires='-.mount sysinit.target system.slice',
+                                 Requires='sysinit.target system.slice',
                                  ExecStart=f'{{ path={h["XRAY"]} ; argv[]={h["XRAY"]} run -config {target} ; }}')
-            self.put(fragment, bridge_unit.encode(), 0o644)
+            self.put(fragment, classic_fragment, 0o644)
             self.put(target, h['EMPTY_BRIDGE_BYTES'], 0o640)
             with self.physical(target).open('rb') as stream:
                 h['os'].fchown(stream.fileno(), 0, h['grp'].getgrnam('nogroup').gr_gid)
@@ -575,8 +595,8 @@ class RuntimeReattest(unittest.TestCase):
                       proof=json.loads(before[1])['proof'])
         return params, port
 
-    def check_classic_bridge_apply(self, active):
-        params, port = self.apply_fixture(bridge=active, classic=True)
+    def check_classic_bridge_apply(self, active, **fixture):
+        params, port = self.apply_fixture(bridge=active, classic=True, **fixture)
         h, b = self.h, self.h['B']
         fragment = h['SYSTEM'] + '/' + b
         unit_before, profile_before = (h['apply_profile_read'](p) for p in (fragment, h['BRIDGE']))
@@ -616,6 +636,11 @@ class RuntimeReattest(unittest.TestCase):
 
     def test_apply_classic_empty_bridge_reuses_unit_when_activated(self):
         self.check_classic_bridge_apply(True)
+
+    def test_apply_classic_empty_bridge_accepts_current_stock_fragment(self):
+        source = SOURCE.with_name('configGenerator.js').read_bytes()
+        fragment = source.split(b'function generateBridgeSystemdService() {', 1)[1].split(b'`', 2)[1]
+        self.check_classic_bridge_apply(False, classic_fragment=fragment)
 
     def test_apply_classic_empty_bridge_requires_exact_stock_proof(self):
         params, _ = self.apply_fixture(bridge=True, classic=True)
@@ -660,7 +685,7 @@ class RuntimeReattest(unittest.TestCase):
                 self.physical(fragment).write_bytes(stock)
                 self.physical(h['BRIDGE']).write_bytes(h['EMPTY_BRIDGE_BYTES'])
                 if key == 'sha':
-                    self.physical(fragment).write_bytes(stock + b'# other bytes\n')
+                    self.physical(fragment).write_bytes(stock.replace(b'RestartSec=5', b'RestartSec=6', 1))
                 elif key == 'profile':
                     self.physical(h['BRIDGE']).write_bytes(b'{"inbounds":[{}]}')
                 else:
@@ -673,6 +698,8 @@ class RuntimeReattest(unittest.TestCase):
                 before = self.image()
                 rc, out, err = self.call('publish-apply-profiles', **params)
                 self.assertEqual((rc, out), (70, ''))
+                if key == 'sha':
+                    self.assertEqual(err, 'DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n')
                 self.assertIn(err, ('DIRECT_BRIDGE_PLACEHOLDER_UNPROVED\n', 'DIRECT_ROLLBACK_DRIFT\n',
                                     'DIRECT_RUNTIME_UNPROVED\n'))
                 self.assertEqual(self.image(), before)
@@ -852,9 +879,11 @@ class RuntimeReattest(unittest.TestCase):
         params, port = self.apply_fixture(bridge=True)
         h, b = self.h, self.h['B']
         unit_path = h['SYSTEM'] + '/' + b
-        self.assertEqual(self.call('publish-apply-profiles', **{**params, 'bridgeUnit': 'arbitrary fragment'}),
-                         (70, '', 'DIRECT_ROLLBACK_DRIFT\n'))
-        self.assertFalse(self.physical(unit_path).exists())
+        for fragment in ('arbitrary fragment', CLASSIC_BRIDGE_426.decode('ascii')):
+            before = self.image()
+            self.assertEqual(self.call('publish-apply-profiles', **{**params, 'bridgeUnit': fragment}),
+                             (70, '', 'DIRECT_ROLLBACK_DRIFT\n'))
+            self.assertEqual(self.image(), before)
         rc, out, err = self.call('publish-apply-profiles', **params)
         self.assertEqual((rc, err), (0, ''))
         proof = json.loads(out)['proof']

@@ -3419,9 +3419,10 @@ CHAP_GENERATION_PREFIX = 'installed-chap-v2:'
 APPLY_NETWORK_ACTIONS = ('check-apply-network', 'prepare-apply-network', 'verify-apply-network', 'restart-apply-network',
                          'publish-apply-profiles', 'finalize-apply-profiles')
 APPLY_PROFILES_PHASE = 'apply-profiles-pending'
-# Exact fragment from generateBridgeSystemdService; stdin cannot select a
-# different privileged service definition.
+# generateBridgeSystemdService at 5adbf1e5 (427 bytes): only this exact fragment may be created.
 APPLY_BRIDGE_UNIT_SHA = '8419e3b8dc8345ed8f7c1ce585a1e8bd6300134d040fef2de70535aee773696a'
+# generateBridgeSystemdService at 4615c511 (426 bytes): recognize existing units only.
+LEGACY_BRIDGE_UNIT_SHA_426 = 'e3e4a2fc725adb19510cbc971cd9e20c87813850b359a97eb0fc506a89c1e14c'
 CHAP_BEGIN = b'# BEGIN CELERITY MANAGED L2TP USERS'
 CHAP_END = b'# END CELERITY MANAGED L2TP USERS'
 CHAP_LOGIN = rb'[A-Za-z0-9._@-]{1,64}'
@@ -4999,7 +5000,7 @@ def classic_bridge_pin(info, original):
     need(rollback_quiescent(info) and info['UnitFileState'] == 'disabled'
          and info['FragmentPath'] == SYSTEM + '/' + B and info.get('NeedDaemonReload') == 'no', bad)
     pin = apply_bridge_state(info, False)
-    need(pin[0]['data'] == APPLY_BRIDGE_UNIT_SHA, bad)
+    need(pin[0]['data'] in {APPLY_BRIDGE_UNIT_SHA, LEGACY_BRIDGE_UNIT_SHA_426}, bad)
     return pin
 
 
