@@ -5,11 +5,13 @@ const {generateBridgeSystemdService}=require('./configGenerator');
 const {READ_CHAIN,VERIFY_CHAIN}=require('./rebuildTunnelTls');
 const {identityChanged,isIdentityChanged,isGrantAuthorityError}=require('./rebuildRelayEffectAuthority');
 const {CONNECT_TIMEOUT_MS}=require('./rebuildSshLimits');
+const {heldOptions}=require('./sshHeldExec');
 const fail=code=>Object.assign(new Error(code),{code});
 const profileBytes=config=>JSON.stringify(config);
 const profileSha256=bytes=>createHash('sha256').update(bytes).digest('hex');
 const paths={main:MAIN,bridge:BRIDGE},services={main:'xray',bridge:'xray-bridge'};
 const readMachineId='/usr/bin/head -c 34 /etc/machine-id';
+const mainReceiver='exec /usr/bin/python3 -I -B /usr/local/libexec/celerity/rebuild-main-receiver.py';
 const applyActions={check:'check-apply-network',prepare:'prepare-apply-network',
     verify_before_restart:'verify-apply-network',publish:'publish-apply-profiles',
     restart:'restart-apply-network',verify_after_restart:'finalize-apply-profiles'};
@@ -26,7 +28,7 @@ function guardMutation(machineId,command){
 function createTransport(node, SSH=require('./nodeSSH'), authority) {
     const ssh=new SSH(node,authority?.sshOptions), token=randomUUID(), staged=new Map();
     let connected=false, attemptedStage=false, attestationStarted=false, attested=false, closed=false;
-    let execPinned, runtimeUnsafe=false;
+    let execPinned, runtimeUnsafe=false, mainWindowUsed=false;
     // A pooled channel can reconnect between commands. A bound transport keeps
     // one direct client from machine-ID attestation through cleanup, with no replay.
     if(authority)ssh.usePool=false;
@@ -62,6 +64,37 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         await authority.verify();
         await attestMachine();
         await authority.verify();
+    }
+    async function openMainWindow(options){
+        const live=()=>{
+            if(closed||!connected||!attested||runtimeUnsafe||typeof execPinned?.openHeld!=='function'){
+                throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
+            }
+        };
+        live();
+        if(mainWindowUsed)throw fail('REBUILD_MAIN_WINDOW_USED');
+        const {timeout,maxFrameBytes,verifyOwner,verifyBeforeFrame}=options??{};
+        if(typeof verifyOwner!=='function'||typeof verifyBeforeFrame!=='function')throw fail('REBUILD_MAIN_AUTHORITY_UNPROVED');
+        const verify=async frame=>{
+            live();
+            let owned;
+            try{owned=await verifyOwner();}catch{ /* A missing owner proof is a refusal. */ }
+            if(owned!==true)throw fail('REBUILD_MAIN_AUTHORITY_UNPROVED');
+            if(frame&&await verifyBeforeFrame()!==true)return false;
+            live();
+            await authority.verifyMainBinding();
+            live();
+            return true;
+        };
+        // Opening needs its own owner fence: the phase verifier may only be
+        // usable once the caller has installed the returned channel.
+        const limits=heldOptions(mainReceiver,{timeout,maxFrameBytes,verifyBeforeFrame:()=>verify(true)});
+        // Reserve before awaiting authority; no retry, including after a lost
+        // exec acknowledgement. The pinned executor has no way to reconnect.
+        mainWindowUsed=true;
+        await verify(false);
+        live();
+        return execPinned.openHeld(mainReceiver,limits);
     }
     async function run(command,options,write=false,onExec,execute){
         if(closed || runtimeUnsafe || authority && !attested)throw fail('REBUILD_L2TP_TRANSPORT_NOT_ATTESTED');
@@ -240,6 +273,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
     }
     return {read,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,
         ...(authority&&{attest}),
+        ...(authority?.verifyMainBinding&&{openMainWindow}),
         ...(authority?.merged&&{verifyIdentity}),
         ...(authority?.installation&&{checkActivation:options=>relayNetwork('check',undefined,options),prepareActivation}),
         readTunnelCertificate:()=>check(READ_CHAIN),verifyTunnelCertificate:input=>check(VERIFY_CHAIN,input)};
@@ -250,7 +284,10 @@ function createBoundRelayTransport(node,fence,verifyLock,installation,verifyBind
     // Same binding as DIRECT. In list mode, use the operator endpoint and
     // take only authentication material from the corroborating card.
     const target={_id:nodeId,name:nodeId,ip,ssh:{port,username,password:node.ssh.password,privateKey:node.ssh.privateKey}};
+    const revalidate=async()=>{if(await verifyLock()===false)throw fail('REBUILD_LOCK_LOST');return verifyBinding();};
     return createTransport(target,undefined,{machineId,installation,merged:fence.merged,sshOptions:{expectedHostKeySha256:sshHostKeySha256,
-        expectedEndpoint:{ip,port,username}},async verify(){if(await verifyLock()===false)throw fail('REBUILD_LOCK_LOST');await verifyBinding();}});
+        expectedEndpoint:{ip,port,username}},async verify(){await revalidate();},async verifyMainBinding(){
+        if(await revalidate()===false)throw fence.merged?identityChanged():fail('REBUILD_L2TP_BINDING_MISMATCH');
+    }});
 }
 module.exports={createTransport,createBoundRelayTransport,profileBytes,profileSha256};
