@@ -19,7 +19,8 @@ const users = Object.fromEntries(labels.filter(name => role(name) === 'portal')
     .map(name => [name, { userId: `synthetic-${name}`, xrayUuid: randomUUID() }]));
 const descriptions = [];
 function link(n, source, target, priority, mode = 'reverse', geoRouting) {
-    const _id = (n + 8).toString(16).repeat(24);
+    const hex = (n + 8).toString(16);
+    const _id = hex.repeat(a.serial ? 24 / hex.length : 24);
     const tunnelPort = a.ports[`link-${n}`];
     descriptions.push({ index: n, id: _id, source, target, mode, port: tunnelPort });
     return { _id, portalNode: ids[source], bridgeNode: ids[target], mode, priority, active: true,
@@ -102,7 +103,19 @@ if (a.proof || a.matrix) {
             .map(p => ({ ...p, name: names[p.nodeId] })),
         plan: Object.fromEntries(Object.entries(plan).map(([phase, steps]) => [phase,
             steps.map(step => ({ ...step, owner: names[step.nodeId] }))])) };
-        if (a.serial) transition.serial = planSerialScopedTransition(opts).map(step => ({ ...step, owner: names[step.nodeId] }));
+        if (a.serial) {
+            transition.serial = planSerialScopedTransition(opts).map(step => ({ ...step, owner: names[step.nodeId] }));
+            // Do not claim an installed DIRECT relay to ordinary Apply. Pair
+            // its canonical MAINs with the matrix's synthetic serving images.
+            const panelInput = { ...input, nodes: nodes.filter(n => n._id !== ids.island), followRelayStates: [] };
+            const panelBefore = composeRebuildProfiles({ ...panelInput, links: links.map(({ rebuildExit, ...row }) => row) });
+            const panelAfter = composeRebuildProfiles(panelInput);
+            const panelSteps = planSerialScopedTransition({ before: panelBefore, after: panelAfter, composition: panelInput, allowMainRestart: true });
+            const roster = steps => steps.map(({ id, nodeId, phase, kind }) => [id, nodeId, phase, kind]);
+            require('node:assert/strict').deepEqual(roster(panelSteps), roster(transition.serial));
+            transition.panel = { nodes: panelInput.nodes, links, before: panelBefore,
+                steps: panelSteps.map(step => ({ ...step, owner: names[step.nodeId] })) };
+        }
     }
     if (a.proof) {
         const { transitProofProfiles } = require('./transit-proof.cjs');

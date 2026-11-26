@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 usage() {
-    printf 'Usage: %s --xray PATH --cover PATH [--root SOURCE] [--relay-xray PATH] [--bridge-xray PATH] [--mode reverse|mixed] [--without-preferred | --chain-probe | --scoped-proof | --scoped-matrix | --staged-matrix | --serial-matrix]\n' "$0"
+    printf 'Usage: %s --xray PATH --cover PATH [--root SOURCE] [--relay-xray PATH] [--bridge-xray PATH] [--mode reverse|mixed] [--without-preferred | --chain-probe | --scoped-proof | --scoped-matrix | --staged-matrix | --serial-matrix --mongod PATH]\n' "$0"
     printf 'Set TMPDIR to a scratch directory for private evidence. The cover binary accepts: port cert key (loopback TLS 1.3/H2).\n'
 }
 scripts=$(realpath -e -- "$(dirname -- "$0")")
@@ -11,12 +11,13 @@ xray=
 relay_xray=
 bridge_xray=
 cover=
+mongod=
 mode=reverse
 preferred=yes
 chain=no
 while (($#)); do
     case "$1" in
-        --root|--xray|--relay-xray|--bridge-xray|--cover|--mode)
+        --root|--xray|--relay-xray|--bridge-xray|--cover|--mode|--mongod)
             (($# >= 2)) || { usage >&2; exit 2; }
             case "$1" in
                 --root) root=$2;;
@@ -24,6 +25,7 @@ while (($#)); do
                 --relay-xray) relay_xray=$2;;
                 --bridge-xray) bridge_xray=$2;;
                 --cover) cover=$2;;
+                --mongod) mongod=$2;;
                 --mode) mode=$2;;
             esac
             shift 2;;
@@ -40,6 +42,12 @@ done
 [[ -n $root && -n $xray && -n $cover && ($mode == reverse || $mode == mixed) ]] || { usage >&2; exit 2; }
 [[ $chain == no || $preferred == yes ]] || { usage >&2; exit 2; }
 [[ $chain != proof || -z $bridge_xray ]] || { usage >&2; exit 2; }
+if [[ $chain == serial ]]; then
+    [[ -n $mongod && -x $mongod ]] || { usage >&2; exit 2; }
+    mongod=$(realpath -e -- "$mongod")
+else
+    [[ -z $mongod ]] || { usage >&2; exit 2; }
+fi
 root=$(realpath -e -- "$root")
 xray=$(realpath -e -- "$xray")
 relay_xray=$(realpath -e -- "${relay_xray:-$xray}")
@@ -55,8 +63,15 @@ parent_net=$(readlink /proc/self/ns/net)
 # The only writable host mount is the per-run scratch directory. There is no
 # host /etc, HOME or /run in the sandbox, and no inherited proxy/env settings.
 exec /usr/bin/env -i PATH=/usr/bin:/usr/sbin /usr/bin/unshare -Urn --fork --kill-child=SIGKILL \
-    /bin/sh -ec '
+    /bin/bash -ec '
     /usr/sbin/ip link set dev lo up
+    mongo_args=()
+    if [[ -n ${14} ]]; then
+        mongo_args=(--ro-bind "${14}" /tools/mongod --setenv C3_MONGOD /tools/mongod
+            --bind "$8/tmp" /home/leon/.hermes/cache/scratch/matrix-db
+            --setenv PANEL_DOMAIN panel.fixture.invalid --setenv ACME_EMAIL fixture@example.invalid
+            --setenv ENCRYPTION_KEY synthetic-fixture-only-never-a-key --setenv SESSION_SECRET synthetic-fixture-only)
+    fi
     exec /usr/bin/bwrap --unshare-pid --die-with-parent --new-session \
         --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
         --symlink usr/bin /bin --symlink usr/sbin /sbin --dev /dev --proc /proc \
@@ -67,6 +82,6 @@ exec /usr/bin/env -i PATH=/usr/bin:/usr/sbin /usr/bin/unshare -Urn --fork --kill
         --ro-bind "$6" /tools/cover --ro-bind "$7" /scripts --bind "$8" /work \
         --bind "$8/tmp" /tmp --chdir /work --clearenv --setenv PATH /tools:/usr/bin:/usr/sbin \
         --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LC_ALL C \
-        --setenv XRAY_LOCATION_ASSET /work/assets --setenv GODEBUG netdns=go \
+        --setenv XRAY_LOCATION_ASSET /work/assets --setenv GODEBUG netdns=go "${mongo_args[@]}" \
         -- /usr/bin/python3 -I -B -u /scripts/probe.py "$9" "${10}" "${11}" "$1" "${12}"
-' verify-portal-exits "$root" "$deps" "$node" "$xray" "$bridge_xray" "$cover" "$scripts" "$work" "$parent_net" "$mode" "$preferred" "$chain" "$relay_xray"
+' verify-portal-exits "$root" "$deps" "$node" "$xray" "$bridge_xray" "$cover" "$scripts" "$work" "$parent_net" "$mode" "$preferred" "$chain" "$relay_xray" "$mongod"

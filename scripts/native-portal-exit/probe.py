@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run only through verify-portal-exits.sh, inside its private namespaces."""
+from base64 import b64decode, b64encode
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
-from hashlib import file_digest
+from hashlib import file_digest, sha256
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_network
@@ -651,6 +652,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                 dump(f'{phase}-{step["channelId"]}.json', {field: [step['config']]})
     serial_steps = transition.get('serial', [])
     serial_initial, serial_final = {}, {}
+    panel_initial, panel_steps = {}, {}
     if serial:
         evidence['main_restarts'] = []
         probe_links = {ln['selectedBy']: ln for ln in generated['links'] if 'selectedBy' in ln}
@@ -700,6 +702,15 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             for side, image in (('before', before), ('after', after)):
                 test_xray(f'{owner}-serial-{step["id"]}-{side}', owner, image, evidence)
         require(states == serial_final, 'serial plan does not reach the complete desired image')
+        # Store the exact bytes consumed by Apply separately from the effective
+        # fixture boot images. The latter include the pre-existing log, scoped
+        # probes and synthetic follow-relay/exit adapters.
+        names = {row['nodeId']: row['name'] for row in generated['profiles']}
+        panel_initial = {names[row['nodeId']]: json.dumps(row['config'], separators=(',', ':')).encode()
+                         for row in transition['panel']['before'] if row['profile'] == 'main'}
+        panel_steps = {row['id']: row for row in transition['panel']['steps']}
+        for owner, data in panel_initial.items():
+            Path(f'{owner}-panel-main.json').write_bytes(data)
     config_count = len(configs) + 2 * len(restarts) + len(serial_initial) + 2 * len(serial_steps)
     print(f'CONFIG OK {len(evidence["config_tests"])}/{config_count} (including fixture boot candidates)')
 
@@ -798,10 +809,7 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             require(result['actual'] == case.want, f'{case.name}: wrong origin')
             return result
 
-        def restart_main(owner, direction, source, target, expected_listens, **step):
-            boot = Path(f'{run_configs[owner]}.json')
-            expected = Path(f'{source}.json').read_bytes()
-            candidate = Path(f'{target}.json').read_bytes()
+        def publish_boot(boot, expected, candidate):
             require(boot.read_bytes() == expected and candidate != expected, 'MAIN boot preimage changed')
             stage_file = boot.with_suffix('.next')
             with stage_file.open('xb') as stream:
@@ -815,6 +823,12 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
             finally:
                 os.close(directory)
             require(boot.read_bytes() == candidate, 'published MAIN boot bytes differ')
+
+        def restart_main(owner, direction, source, target, expected_listens, **step):
+            boot = Path(f'{run_configs[owner]}.json')
+            expected = Path(f'{source}.json').read_bytes()
+            candidate = Path(f'{target}.json').read_bytes()
+            publish_boot(boot, expected, candidate)
             retained = {node: proc for node, proc in children.items() if node != owner}
             old = children[owner]
             reap(active_runs[owner], old, reaped)
@@ -864,22 +878,31 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
         def serial_run(operation):
             states = serial_initial.copy()
             by_id = {step['id']: step for step in serial_steps}
-            manifest = {'initial': {owner: serial_snapshot(owner) for owner in run_configs}, 'steps': []}
-            for step in serial_steps:
-                name = f'{step["owner"]}-serial-{step["id"]}'
-                manifest['steps'].append({k: step[k] for k in ('id', 'owner', 'phase')} |
-                                         {side: digest(f'{name}-{side}.json') for side in ('before', 'after')})
+            panel_bytes = panel_initial.copy()
+            versions = {owner: [versions_by_node[owner], actor(owner, evidence)['sha256']] for owner in panel_initial}
+
+            def panel_snapshot(owner):
+                path = Path(f'{owner}-panel-main.json')
+                process = serial_snapshot(owner)
+                info = path.stat()
+                data = path.read_bytes()
+                # Reading a newly written file may update atime; bind the
+                # content to the same inode/ctime instead.
+                after = path.stat()
+                require((info.st_dev, info.st_ino, info.st_ctime_ns) ==
+                        (after.st_dev, after.st_ino, after.st_ctime_ns) and data == panel_bytes[owner],
+                        'canonical MAIN changed')
+                generation = sha256(f'{process["pid"]}:{process["start"]}'.encode()).hexdigest()[:32]
+                return {'data': b64encode(data).decode(), 'metadata': [info.st_uid, info.st_gid, info.st_mode & 0o777],
+                        'generation': [str(info.st_dev), str(info.st_ino), str(info.st_ctime_ns)],
+                        'xray': [process['pid'], generation]}
 
             def handle(frame):
                 action = frame['action']
                 if action == 'manifest':
-                    return manifest
-                if action == 'fence':
-                    # Only this parent can mutate serving state in the fixture;
-                    # this is not a claim about a product/remote writer fence.
-                    return all(p.poll() is None for p in children.values())
+                    return {'versions': versions}
                 if action == 'snapshot':
-                    return serial_snapshot(frame['owner'])
+                    return panel_snapshot(frame['owner'])
                 if action == 'prepared':
                     wait_until('prepared scoped reverse sockets', children, serial_reverse_ready, 18)
                     for case in (Probe('p1', 'numeric', 'A', 2), Probe('p2', 'other', 'B', 6),
@@ -890,6 +913,11 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                 require(inverse or frame['direction'] == 'forward', 'unknown serial direction')
                 if action == 'terminal':
                     serial_terminal(serial_initial if inverse else serial_final)
+                    for owner, before in panel_initial.items():
+                        data = b64decode(panel_snapshot(owner)['data'], validate=True)
+                        last = next((s for s in reversed(panel_steps.values()) if s['owner'] == owner), None)
+                        require(data == before if inverse or last is None else json.loads(data) == last['after'],
+                                'terminal canonical MAIN mismatch')
                     if not inverse:
                         wait_until('full chain from boot images', children, serial_reverse_ready, 18)
                     terminal = ([Probe('p1', 'numeric', 'A', 2), Probe('p2', 'other', 'B', 6)] if inverse else
@@ -898,48 +926,73 @@ def run(parent_net, mode, preferred, evidence, chain=False, proof=False, matrix=
                     return [{k: row[k] for k in ('case', 'expected', 'actual')} |
                             {'receipts': [a['path'] for a in row['attempts']], 'hops': row.get('relay_hops', [])}
                             for row in records]
-                require(action == 'restart', 'unknown serial action')
-                step = by_id[frame['id']]
+                require(action in ('publish', 'restart'), 'unknown serial action')
+                step = by_id[frame['step']]
                 owner = step['owner']
+                require(owner == frame['owner'], 'wrong serial step owner')
                 name = f'{owner}-serial-{step["id"]}'
                 previous, direction = ('after', 'before') if inverse else ('before', 'after')
+                canonical = panel_steps[step['id']]
+                if action == 'publish':
+                    before = panel_snapshot(owner)
+                    del before['xray']
+                    candidate = b64decode(frame['desired'], validate=True)
+                    require(frame['before'] == before and json.loads(panel_bytes[owner]) == canonical[previous]
+                            and json.loads(candidate) == canonical[direction], 'canonical publication differs from planned step')
+                    publish_boot(Path(f'{owner}-panel-main.json'), panel_bytes[owner], candidate)
+                    panel_bytes[owner] = candidate
+                    return panel_snapshot(owner)
+                require(json.loads(panel_bytes[owner]) == canonical[direction], 'restart before canonical publication')
                 states[owner] = json.loads(Path(f'{name}-{direction}.json').read_bytes())
                 bound = [(node, port) for node, port in added if any(
                     row['port'] == port for row in states[node]['inbounds'])]
                 if not inverse and step['kind'] == 'dialers':
                     require(bound == added and all(sockets(port, children[node]) for node, port in added),
                             'serial dialer dispatched before all listeners were serving')
-                require(digest(f'{name}-{direction}.json') == frame['target']
-                        and serial_snapshot(owner) == frame['before'], 'serial handoff precondition changed')
                 restart_main(owner, direction, f'{name}-{previous}', f'{name}-{direction}',
-                             [*listens, *bound], stepId=step['id'], phase=step['phase'], operation=operation)
+                             [*listens, *bound], stepId=step['id'], phase=step['phase'], operation=operation,
+                             panel_main_sha256=digest(f'{owner}-panel-main.json'))
                 require(all(not sockets(port, children[node]) and not sockets(port, children[node], established=True)
                             for node, port in added if (node, port) not in bound), 'unexpected live scoped listener or worker')
-                return True
+                return panel_snapshot(owner)
 
-            worker = sp.Popen(['node', '/scripts/serial-journal.cjs', operation, parent_net],
-                              stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE)
-            tx, rx, err = worker.stdin, worker.stdout, worker.stderr
-            assert tx is not None and rx is not None and err is not None
+            limit = 256 * 1024
+            read_fd, write_fd = os.pipe()
+            log = Path(f'panel-{operation}-worker.log')
+            with os.fdopen(read_fd, 'rb') as rx, os.fdopen(write_fd, 'wb') as response, log.open('xb') as logs:
+                worker = sp.Popen(['node', '/scripts/serial-journal.cjs', operation, parent_net, str(write_fd)],
+                                  stdin=sp.PIPE, stdout=logs, stderr=sp.STDOUT, pass_fds=(write_fd,))
+                response.close()
+                return drive_serial_worker(worker, rx, handle, limit, log)
+
+        def drive_serial_worker(worker, rx, handle, limit, log):
+            tx = worker.stdin
+            assert tx is not None
             try:
                 while True:
-                    require(select([rx], [], [], 10)[0], 'serial journal worker did not respond')
-                    row = rx.readline(4097)
-                    require(row.endswith(b'\n') and len(row) <= 4096, 'serial journal worker refused or invalid response')
+                    require(select([rx], [], [], 45)[0], 'serial Apply worker did not respond')
+                    row = rx.readline(limit + 1)
+                    if not row:
+                        raise RuntimeError(f'serial Apply worker exited {worker.wait(timeout=3)} without settlement; see {log}')
+                    require(row.endswith(b'\n') and len(row) <= limit, 'serial Apply worker refused or invalid response')
                     frame = json.loads(row)
                     if frame['action'] == 'done':
                         tx.close()
-                        require(worker.wait(timeout=3) == 0 and not rx.read() and not err.read(),
-                                'serial journal worker did not exit successfully')
-                        return frame
-                    tx.write((json.dumps(handle(frame)) + '\n').encode())
+                        status = worker.wait(timeout=3)
+                        require(status == 0 and not rx.read(), f'serial Apply worker did not exit successfully; see {log}')
+                        return {**frame, 'worker_exit': status}
+                    reply = (json.dumps(handle(frame)) + '\n').encode()
+                    require(len(reply) <= limit, 'serial Apply response too large')
+                    tx.write(reply)
                     tx.flush()
             finally:
+                tx.close()
                 if worker.poll() is None:
-                    worker.kill()
-                    worker.wait(timeout=3)
-                for stream in (tx, rx, err):
-                    stream.close()
+                    try:
+                        worker.wait(timeout=3)
+                    except sp.TimeoutExpired:
+                        worker.kill()
+                        worker.wait(timeout=3)
 
         def stage_channels(steps, verify_baseline):
             require(all(not sockets(port, children[owner]) and not sockets(port, children[owner], established=True)
