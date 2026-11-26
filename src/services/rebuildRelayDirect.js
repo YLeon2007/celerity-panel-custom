@@ -260,6 +260,40 @@ function directCommand(limits) {
     return command;
 }
 
+let mainFingerprintCommand;
+function bundledMainFingerprintCommand() {
+    if (mainFingerprintCommand) return mainFingerprintCommand;
+    const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+    const manifest = require('./rebuildRelayDirectPayload.json');
+    const payload = readFileSync(join(__dirname, 'rebuildRelayDirectPayload.xz'));
+    const { directSize, main } = manifest;
+    requireThat(Number.isSafeInteger(directSize) && directSize > 0 &&
+        Number.isSafeInteger(main?.size) && main.size > 0 && directSize + main.size === payload.length, 'DIRECT_BUNDLE_INVALID');
+    const packed = payload.subarray(directSize);
+    const file = 'rebuildTransitMainWindow.py'; // first entry; no import from the host
+    const source = readFileSync(join(__dirname, file));
+    const entry = main.sources?.[0];
+    requireThat(sha(packed) === main.sha256 && entry?.path === file &&
+        entry.size === source.length && entry.sha256 === sha(source), 'DIRECT_BUNDLE_INVALID');
+    const script = [
+        'import base64,hashlib,lzma,sys,types',
+        'try:',
+        ` p=base64.b64decode("${packed.toString('base64')}",validate=True)`,
+        ` if hashlib.sha256(p).hexdigest()!="${main.sha256}": sys.exit(75)`,
+        ` b=lzma.decompress(p,memlimit=16777216)[:${source.length}]`,
+        ` if hashlib.sha256(b).hexdigest()!="${entry.sha256}": sys.exit(75)`,
+        ' m=types.ModuleType("rebuildTransitMainWindow");sys.modules[m.__name__]=m',
+        ' exec(compile(b,"<MAIN window>","exec"),m.__dict__)',
+        ' print(hashlib.sha256(m.AgentWindow(None).read_main().data).hexdigest())',
+        'except Exception:',
+        ' sys.exit(75)',
+    ].join('\n');
+    const command = `/usr/bin/timeout 5s /usr/bin/python3 -I -B -c '${script}'`;
+    requireThat(Buffer.byteLength(command) + 1 <= 128 * 1024, 'DIRECT_COMMAND_TOO_LARGE');
+    mainFingerprintCommand = command;
+    return command;
+}
+
 const recoveryUnsent = new WeakSet();
 const installRecoveryWasNotSent = error => recoveryUnsent.has(error);
 
@@ -836,4 +870,4 @@ async function applyRelayNetwork(run, machineId, state, action, proof, merged = 
     return reply.proof;
 }
 
-module.exports = { createRelayDirect, applyRelayNetwork, installRecoveryWasNotSent };
+module.exports = { createRelayDirect, applyRelayNetwork, installRecoveryWasNotSent, bundledMainFingerprintCommand };

@@ -255,7 +255,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     }
     async function runGraph(req,alreadyHeld,retire=false){
         gate();const transports=new Map(), bindings=new Map(), roles=new Map();let prepared,states,verifyLock,verifyBinding,settlementSession,retainApply;
-        const serialEligible=!!serial&&!retire&&!req.remove&&(req.preview===true||req.expectedPreview?.length===128);
+        const serialEligible=env.C3_REBUILD_CHAIN_APPLY==='1'&&!!serial&&!retire&&!req.remove&&(req.preview===true||req.expectedPreview?.length===128);
         const baseline=new Map(), inventoryNames=new Map();
         let kcpAdmission;
         const keyRoot=retire?env.ENCRYPTION_KEY:undefined;

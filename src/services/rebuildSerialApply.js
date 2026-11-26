@@ -124,7 +124,8 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 const pinned = new Map(ids.map(n => {
                     const peer = peers.get(n);
                     return [n, { digest: peer.authoritySha256, verify: peer.verify.bind(peer),
-                        managed: Array.isArray(peer.managed) ? [...peer.managed] : undefined }];
+                        managed: Array.isArray(peer.managed) ? [...peer.managed] : undefined,
+                        readMainSha256: typeof peer.readMainSha256 === 'function' ? peer.readMainSha256.bind(peer) : undefined }];
                 }));
                 const composition = { ...profiles, nodes, links: prepared, affectedNodeIds: ids, followRelayStates: [...states.values()] };
                 const after = compose(composition);
@@ -143,12 +144,26 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                     managed: pinned.get(step.nodeId).managed }));
                 const touched = new Set(steps.map(step => step.nodeId));
                 const untouched = ids.filter(node => !touched.has(node));
+                const untouchedPins = new Map();
+                for (const node of untouched) {
+                    const peer = pinned.get(node);
+                    need(await peer.verify(node, peer.digest) === true);
+                    const pin = await peer.readMainSha256?.();
+                    need(isSha(pin));
+                    untouchedPins.set(node, pin);
+                }
+                await locked();
                 const fenced = async plan => {
                     await locked();
                     need(await verifyFence(plan) === true);
                     for (const [node, peer] of pinned) need(await peer.verify(node, peer.digest, plan) === true);
                     await locked();
                     return true;
+                };
+                const verifyUntouched = async plan => {
+                    await fenced(plan);
+                    for (const [node, expected] of untouchedPins) need(await pinned.get(node).readMainSha256() === expected);
+                    await locked();
                 };
                 const checkScope = async (expected, session) => {
                     const fresh = await scope(session);
@@ -175,6 +190,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                     openWindow, verifySnapshot, verifyAgentEndpoint, readAgentManagedFlows, syncNodeUsers, prove, observe,
                     async verifyTerminal(ctx, latest) {
                         terminal = undefined;
+                        await verifyUntouched(ctx.plan);
                         // A verifier gets a copy, not the snapshots the adapter
                         // will hash. Missing unchanged-host evidence is unknown,
                         // not affirmative mismatch or permission to invert.
@@ -184,7 +200,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                         const unchanged = proof.unchangedMainPins;
                         let confirmed;
                         if (ctx.direction === 'forward') {
-                            need(unchanged instanceof Map && unchanged.size === untouched.length && untouched.every(n => isSha(unchanged.get(n))) &&
+                            need(unchanged instanceof Map && equal(unchanged, untouchedPins) &&
                                 latest.size === touched.size && [...touched].every(n => latest.has(n)));
                             confirmed = new Map([...latest].map(([n, snap]) => [n, digest(Buffer.from(snap.data, 'base64'))]));
                         }
@@ -201,6 +217,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                     async settle(status, changedPins, plan, verifyHolds) {
                         need(!consumed && terminal && equal(terminal.ctx.plan, plan));
                         consumed = true; // before any await; no settlement replay
+                        await verifyUntouched(plan);
                         const final = journal.read(plan.scope);
                         const terminalFence = async (all = true) => {
                             if (all) { await fenced(plan); need(await verifyHolds() === true); }

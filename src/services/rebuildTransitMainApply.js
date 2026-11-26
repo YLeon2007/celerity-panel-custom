@@ -136,6 +136,10 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
         steps.push(Object.freeze({ id, phase, window: 'main-agent' }));
     }
     const operationId = randomUUID(), fenceId = randomUUID();
+    // The panel fences the complete roster. Only nodes with a MAIN step
+    // enter the host writer protocol; the caller observes the remaining peers.
+    const writerNodes = new Set([...rows.values()].map(row => row.nodeId));
+    const writerRoster = roster.filter(nodeId => writerNodes.has(nodeId));
     const plan = Object.freeze({ scope: operationId, operationId, fenceId, steps: Object.freeze(steps),
         planDigest: sha(bytes([roster, [...rows.values()].map(({ id, nodeId, phase, before, after, managed, authoritySha256 }) =>
             [id, nodeId, phase, sha(before), sha(after), managed, authoritySha256])])) });
@@ -176,7 +180,7 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
     const control = async (host, action, ctx = { plan }) => need(await frame(host, ctx, action) === null, lockError);
     function acquire(ctx) {
         return acquired ??= (async () => {
-            for (const nodeId of roster) {
+            for (const nodeId of writerRoster) {
                 need(await fenced(ctx), lockError);
                 const host = { nodeId };
                 hosts.set(nodeId, host);
@@ -198,7 +202,7 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
         })();
     }
     async function confirmHolds(ctx = { plan }) {
-        need(hosts.size === roster.length && !active && await fenced(ctx), lockError);
+        need(hosts.size === writerRoster.length && !active && await fenced(ctx), lockError);
         await confirmIdlePeers(ctx);
         need(await fenced(ctx), lockError);
         return true;

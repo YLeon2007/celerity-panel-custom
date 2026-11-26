@@ -1765,7 +1765,7 @@
         }
       },
       "mainRestartCount": "计划重启 MAIN 次数：{count}",
-      "routingServiceRequired": "请对该节点执行常规同步或应用，以启用路由检查。",
+      "routingServiceRequired": "请对该节点执行更新 MAIN 的常规应用，以启用路由检查。仅同步用户无法启用此功能。",
       "mainRestartWarning": "应用或回滚此计划时，所列节点的现有连接会中断。MAIN 服务逐个重启；应用时，受影响的门户最后切换。",
       "portalExitGeo": "地理路由",
       "noPortalExit": "无出口",

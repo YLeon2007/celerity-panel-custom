@@ -125,6 +125,14 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
             return result;
         }},paths[profile],{allowAbsent:profile==='bridge'});
     }
+    async function readMainSha256(){
+        const command=require('./rebuildRelayDirect').bundledMainFingerprintCommand();
+        const result=await run(command,{timeout:7000,maxOutputBytes:65},false,undefined,authority?execPinned:undefined);
+        if(result?.code!==0||result.stderr!==''||typeof result.stdout!=='string'||
+            !/^[a-f0-9]{64}\n(?![\s\S])/.test(result.stdout))throw fail('REBUILD_MAIN_AUTHORITY_UNPROVED');
+        if(authority)await authority.verify();
+        return result.stdout.slice(0,64);
+    }
     async function requireSupportedCoreIdentity(){
         // Probe the exact binary used by the checked units, not a cached DB
         // value or the agent's PATH. Do not include remote output in errors.
@@ -287,7 +295,7 @@ function createTransport(node, SSH=require('./nodeSSH'), authority) {
         try{if(connected&&attemptedStage)await check(`rm -f -- ${temp('main')} ${temp('bridge')}`,undefined,true);}
         finally{closed=true;if(connected||attestationStarted)ssh.disconnect();}
     }
-    return {read,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,checkMainRoutingService,
+    return {read,readMainSha256,requireSupportedCore,requireSupportedCoreIdentity,stagePair,putPair,close,checkMainRoutingService,
         ...(authority&&{attest}),
         ...(authority?.verifyMainBinding&&{openMainWindow}),
         ...(authority?.merged&&{verifyIdentity}),

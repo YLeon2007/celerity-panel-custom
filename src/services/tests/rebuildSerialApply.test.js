@@ -126,13 +126,15 @@ function fixture(t, fault, native, mounted = false) {
     const clientList = config => config.inbounds.find(i => i.tag === managed).settings.clients;
     const authority = async ({ ids, verify }) => {
         await verify();
-        const peers = new Map(ids.map(n => [n, { authoritySha256: sha(n), managed: [managed], async verify(target, digest) {
+        const peers = new Map(ids.map(n => [n, { authoritySha256: sha(n), managed: [managed],
+            async readMainSha256() { return sha(bytes(current.get(n).data)); }, async verify(target, digest) {
             assert.equal(target, n); assert.equal(digest, sha(n)); return !(fault === 'peer' && n === id(1));
         } }]));
         return { before: fault === 'admission-profile' ? before.map((p, i) => i ? p :
             { ...p, config: { ...p.config, log: { loglevel: 'error' } } }) : before, peers, journal, artifacts,
             async verifyFence(plan) { scope = plan.scope; return true; },
             async openWindow(n, { verifyBeforeFrame }) {
+                assert.notEqual(n, id(1), 'untouched portal must not have a writer');
                 assert(fenced()); counts.open++;
                 let staged, held = false, releasing = false;
                 return { async request({ action, target, desiredSha256 }) {
@@ -197,7 +199,8 @@ function fixture(t, fault, native, mounted = false) {
     const selectedDb = native?.db ?? db;
     const make = serialMainAuthority => createRebuildService({ Link: native ?? Link,
         Node: { db: selectedDb, find: () => query(nodes) }, State: { db: selectedDb, find: () => query([]) },
-        L2tpUser: { db: selectedDb }, sync, locks, env: { C3_REBUILD_ENABLED: 'true' }, assertNoRelayAccountIntent: async () => {},
+        L2tpUser: { db: selectedDb }, sync, locks, env: { C3_REBUILD_ENABLED: 'true',
+            ...(mounted && serialMainAuthority && { C3_REBUILD_CHAIN_APPLY: '1' }) }, assertNoRelayAccountIntent: async () => {},
         connect(node) {
             assert(mounted, 'ordinary SSH must not enter');
             const n = String(node._id);
@@ -208,6 +211,7 @@ function fixture(t, fault, native, mounted = false) {
                     if (profile === 'main') return JSON.parse(bytes(current.get(n).data));
                     return structuredClone(before.find(p => p.nodeId === n && p.profile === profile).config);
                 },
+                async checkMainRoutingService() { return true; },
                 async stagePair() { assert.fail('scoped MAIN must never enter legacy staging'); },
                 async putPair() { assert.fail('scoped MAIN must never enter legacy activation'); },
             };

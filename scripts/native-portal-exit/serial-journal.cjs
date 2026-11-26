@@ -86,7 +86,7 @@ async function run(operation, mongo) {
             async lean() { return nodes.filter(n => $in.some(id => n._id.equals(id))).map(clone); } };
     } }, State: { db: Link.db, find() {
         return { select() { return this; }, read() { return this; }, readConcern() { return this; }, session() { return this; }, async lean() { return []; } };
-    } }, L2tpUser: { db: Link.db }, locks, sync, env: { C3_REBUILD_ENABLED: 'true', PANEL_DOMAIN: 'panel.fixture.invalid' },
+    } }, L2tpUser: { db: Link.db }, locks, sync, env: { C3_REBUILD_ENABLED: 'true', C3_REBUILD_CHAIN_APPLY: '1', PANEL_DOMAIN: 'panel.fixture.invalid' },
     assertNoRelayAccountIntent: async () => {}, cache: { async invalidateAllSubscriptions() { invalidated++; } },
     connect(node) {
         openReaders++;
@@ -94,6 +94,7 @@ async function run(operation, mongo) {
         return { async requireSupportedCoreIdentity() { return { version, buildDigest }; }, async close() { openReaders--; },
             async read(profile) { return profile === 'main' ? JSON.parse(bytes(snapshot(id))) :
                 structuredClone(before.find(p => p.nodeId === id && p.profile === profile).config); },
+            async checkMainRoutingService() { return true; }, // modeled transport; native route checks run in probe.py
             async stagePair() { assert.fail('legacy staging entered'); },
             async putPair() { assert.fail('legacy activation entered'); },
         };
@@ -105,7 +106,8 @@ async function run(operation, mongo) {
         const owns = new Map(ids.map(id => [id, nodeLockVerifier(id)]));
         const peers = new Map(ids.map(id => {
             const pin = sha(Buffer.from(JSON.stringify([id, initial.get(id)])));
-            return [id, { authoritySha256: pin, managed, async verify(n, digest) { return n === id && digest === pin && owns.get(id)(); } }];
+            return [id, { authoritySha256: pin, managed, async readMainSha256() { return sha(bytes(snapshot(id))); },
+                async verify(n, digest) { return n === id && digest === pin && owns.get(id)(); } }];
         }));
         return { before: before.map(row => row.profile === 'main' ? { ...row, config: JSON.parse(bytes(snapshot(row.nodeId))) } : row),
             coreIdentities, profiles: { dialerVersions, usersByNode, controlPlaneAddresses: ['panel.fixture.invalid', '127.0.0.1'] }, peers, journal, artifacts,
@@ -115,6 +117,7 @@ async function run(operation, mongo) {
                 return equal(plan, candidate) && [...owns.values()].every(check => check());
             },
             async openWindow(id, { verifyOwner, verifyBeforeFrame }) {
+                assert(steps.some(step => step.nodeId === id), 'untouched peer acquired a writer');
                 assert(await verifyOwner());
                 opened++;
                 let held = false, releasing = false, staged;
@@ -190,7 +193,7 @@ async function run(operation, mongo) {
     assert.equal(result.status, restored ? 'rolled-back' : undefined);
     assert.equal(await store.findOne({ _id: 'apply' }), null);
     assert.equal(openReaders, 0);
-    assert.equal(opened, cards.length);
+    assert.equal(opened, new Set(steps.map(s => s.nodeId)).size);
     assert.equal(closed, opened);
     const state = journal.read(plan.scope);
     assert.equal(state.status, restored ? 'rolled-back' : 'applied');
