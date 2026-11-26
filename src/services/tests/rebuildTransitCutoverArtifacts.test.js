@@ -98,3 +98,23 @@ test('post-drain artifacts bind marked step, direction and side without changing
     assert.throws(() => fresh.read(f.ctx, 'publication-forward-before', pin), refused);
     assert.throws(() => fresh.seal({ ...ctx, plan: { ...ctx.plan, steps: [] } }, 'publication-forward-before', bytes), refused);
 });
+
+test('the maximum raw MAIN fits its authenticated before and confirmed snapshots', t => {
+    const f = fixture(t);
+    const step = { ...f.ctx.step, phase: 'selector', window: 'main-agent' };
+    const ctx = { plan: { ...f.ctx.plan, steps: [step] }, step };
+    const raw = Buffer.alloc(8 * 1024 * 1024, 0x61);
+    const image = { data: raw.toString('base64'), metadata: [0o640, 0, 0], generation: ['123', '456', '789'] };
+    const snapshot = Buffer.from(JSON.stringify({ ...image, xray: [1234, '1'.repeat(32)] }));
+    const drained = Buffer.from(JSON.stringify(image));
+    const fresh = createCutoverArtifactStore({ directory: f.directory, key: f.key });
+    for (const [side, data] of [['before', snapshot], ['publication-forward-before', drained],
+        ['confirmed', snapshot], ['publication-rollback-before', drained], ['desired', raw]]) {
+        const pin = f.store.seal(ctx, side, data);
+        assert(fresh.read(ctx, side, pin).equals(data));
+        if (side === 'before' || side === 'confirmed') assert.throws(() => fresh.read(f.ctx, side, pin), refused);
+    }
+    assert.throws(() => f.store.seal(ctx, 'desired', snapshot), refused);
+    assert.throws(() => f.store.seal(f.ctx, 'before', snapshot), refused);
+    assert.throws(() => f.store.seal(ctx, 'before', Buffer.alloc(4 * Math.ceil(raw.length / 3) + 1025)), refused);
+});

@@ -6,6 +6,9 @@ const { createHash, createCipheriv, createDecipheriv, randomBytes, randomUUID } 
 const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_DIRECTORY, O_NONBLOCK } = fs.constants;
 
 const MAX_BYTES = 8 * 1024 * 1024;
+// Only snapshots of v3 MAIN steps wrap the full raw image in base64 plus
+// metadata and generations. Keep the raw and legacy artifact limits intact.
+const MAX_MAIN_SNAPSHOT = 4 * Math.ceil(MAX_BYTES / 3) + 1024;
 const IV_BYTES = 12, TAG_BYTES = 16, OVERHEAD = IV_BYTES + TAG_BYTES;
 const stat = { bigint: true };
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/;
@@ -19,6 +22,11 @@ const owner = (row, mode) => row.uid === BigInt(process.geteuid()) && (row.mode 
 const privateFile = row => row.isFile() && owner(row, 0o600n) && row.nlink === 1n;
 const refused = () => Object.assign(new Error('REBUILD_CUTOVER_ARTIFACT_UNPROVED'), { code: 'REBUILD_CUTOVER_ARTIFACT_UNPROVED' });
 const need = condition => { if (!condition) throw refused(); };
+const mainStep = ({ plan, step }) => step.window === 'main-agent' &&
+    plan.steps?.some(entry => entry.id === step.id && entry.window === step.window);
+const byteLimit = (ctx, side) => mainStep(ctx) &&
+    ['before', 'confirmed', 'publication-forward-before', 'publication-rollback-before'].includes(side)
+    ? MAX_MAIN_SNAPSHOT : MAX_BYTES;
 
 function associatedData({ plan, step }, side, id) {
     need(valid(LABEL, plan.scope) && valid(UUID, plan.operationId) && valid(UUID, plan.fenceId)
@@ -29,7 +37,7 @@ function associatedData({ plan, step }, side, id) {
     }
     // Opened by capture, handoff, and crash observation. A rollback publication
     // must not adopt the logically adjacent forward publication or its receipt.
-    need(step.window === 'main-agent' && plan.steps?.some(entry => entry.id === step.id && entry.window === step.window)
+    need(mainStep({ plan, step })
         && valid(/^publication-(forward|rollback)-(before|desired)(?![\s\S])/, side));
     return Buffer.from(JSON.stringify(['rebuild-cutover-publication-v1', plan.scope, plan.operationId,
         plan.fenceId, plan.planDigest, step.id, step.window, side, id]));
@@ -56,11 +64,11 @@ function createCutoverArtifactStore({ directory, key } = {}) {
         } catch { throw refused(); }
     }
     const at = (fd, id) => `/proc/self/fd/${fd}/${id}.sealed`;
-    function readPacket(file, written) {
+    function readPacket(file, limit, written) {
         const reader = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
         try {
             const before = fs.fstatSync(reader, stat);
-            need(privateFile(before) && before.size >= OVERHEAD && before.size <= MAX_BYTES + OVERHEAD
+            need(privateFile(before) && before.size >= OVERHEAD && before.size <= limit + OVERHEAD
                 && (!written || unchanged(before, written)));
             const bytes = Buffer.alloc(Number(before.size));
             for (let offset = 0; offset < bytes.length;) {
@@ -77,7 +85,8 @@ function createCutoverArtifactStore({ directory, key } = {}) {
     return Object.freeze({
         seal(ctx, side, bytes) {
             return useDir(dir => {
-                need(Buffer.isBuffer(bytes) && bytes.length <= MAX_BYTES);
+                const limit = byteLimit(ctx, side);
+                need(Buffer.isBuffer(bytes) && bytes.length <= limit);
                 const id = randomUUID(), iv = randomBytes(IV_BYTES);
                 const cipher = createCipheriv('aes-256-gcm', secret, iv);
                 cipher.setAAD(associatedData(ctx, side, id));
@@ -93,7 +102,7 @@ function createCutoverArtifactStore({ directory, key } = {}) {
                     need(privateFile(written) && written.size === BigInt(packet.length));
                 } finally { fs.closeSync(fd); }
                 fs.fsyncSync(dir);
-                need(readPacket(file, written).equals(packet));
+                need(readPacket(file, limit, written).equals(packet));
                 return { id, sha256: hash(packet) };
             });
         },
@@ -102,7 +111,7 @@ function createCutoverArtifactStore({ directory, key } = {}) {
                 const { id, sha256 } = pin;
                 need(valid(SHA, sha256));
                 const aad = associatedData(ctx, side, id);
-                const packet = readPacket(at(dir, id));
+                const packet = readPacket(at(dir, id), byteLimit(ctx, side));
                 need(hash(packet) === sha256);
                 const decoder = createDecipheriv('aes-256-gcm', secret, packet.subarray(0, IV_BYTES));
                 decoder.setAAD(aad);
