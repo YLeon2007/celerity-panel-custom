@@ -2,6 +2,7 @@
 
 const { createHash, randomBytes } = require('node:crypto');
 const { isDeepStrictEqual: equal } = require('node:util');
+const { PRIVATE_KEY_SELECT } = require('../utils/vlessEncryption');
 const { mongo: { BSON }, Types: { ObjectId } } = require('mongoose');
 const { withNodes, nodeLockVerifier } = require('./rebuildLocks');
 const { componentFor, fingerprintLinks, profilePreview } = require('./rebuildCoordinator');
@@ -92,7 +93,7 @@ function createSerialApply({ Link, Node, State, env, locks, gate, compose, readS
                 // route-mode migration; those have different write contracts.
                 need(links.every(row => row.active === true && !row.rebuildDelete && !row.lifecycle && !isKcp(row) &&
                     [row._id, row.portalNode, row.bridgeNode].every(value => value instanceof ObjectId)), unavailable);
-                const nodes = await Node.find({ _id: { $in: ids } }).select('+xray.manualKey').read('primary').readConcern('majority').lean();
+                const nodes = await Node.find({ _id: { $in: ids } }).select(`+xray.manualKey ${PRIVATE_KEY_SELECT}`).read('primary').readConcern('majority').lean();
                 need(nodes.length === ids.length && nodes.every(node => node.active === true && node.type === 'xray' &&
                     !node.useCustomConfig && !publishedKeyMismatch(node)), unavailable);
                 const roles = new Map(nodes.map(node => [String(node._id), node.role ?? node.cascadeRole]));

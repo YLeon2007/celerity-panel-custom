@@ -53,7 +53,12 @@ function fixture(t, fault, native, mounted = false) {
             assert(match(q)); Object.assign(lock, $set); return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
         },
         async deleteMany(q) {
-            assert(match(q)); if (lock.cutover) events.push('release'); lock = null; return { acknowledged: true, deletedCount: 1 };
+            assert(match(q));
+            if (lock.cutover) {
+                events.push('release');
+                if (fault === 'release-ack') return { acknowledged: false };
+            }
+            lock = null; return { acknowledged: true, deletedCount: 1 };
         },
     });
     const state = () => scope && journal.read(scope);
@@ -196,7 +201,9 @@ function fixture(t, fault, native, mounted = false) {
         connect(node) {
             assert(mounted, 'ordinary SSH must not enter');
             const n = String(node._id);
-            return { async requireSupportedCore() {}, async close() {},
+            return { async requireSupportedCore() {}, async close() {
+                if (fault === 'reader-close' && n === String(nodes[0]._id) && counts.closeArmed) throw new Error('modeled reader close');
+            },
                 async read(profile) {
                     if (profile === 'main') return JSON.parse(bytes(current.get(n).data));
                     return structuredClone(before.find(p => p.nodeId === n && p.profile === profile).config);
@@ -262,6 +269,29 @@ test('ordinary Apply consumes the same preview and uses only the joined MAIN pat
     assert.equal(f.state().status, 'applied');
     assert.equal(f.counts.commit, 1);
     assert.equal(f.lock(), null);
+});
+
+test('ordinary Apply drains Preview readers before it can dispatch a held write', async t => {
+    const f = fixture(t, 'reader-close', undefined, true);
+    const { previewId: expectedPreview } = await f.service.execute({ linkId: anchor, preview: true });
+    f.counts.closeArmed = true;
+    await assert.rejects(f.service.execute({ linkId: anchor, expectedPreview }), { code: 'REBUILD_TRANSPORT_CLEANUP_FAILED' });
+    assert.equal(f.state(), undefined);
+    assert.equal(f.counts.open, 0);
+    assert.equal(f.lock(), null);
+});
+
+for (const outer of [false, true]) test(`ordinary Apply classifies lost lock handback after verified commit (outer=${outer})`, async t => {
+    const f = fixture(t, 'release-ack', undefined, true);
+    const { previewId: expectedPreview } = await f.service.execute({ linkId: anchor, preview: true });
+    const apply = verify => f.service.execute({ linkId: anchor, expectedPreview }, verify);
+    await assert.rejects(outer ? f.service.locks.run(apply) : apply(),
+        { code: 'REBUILD_LOCK_RELEASE_UNCONFIRMED', settledMain: true });
+    assert.equal(f.state().status, 'applied');
+    assert.equal(f.counts.commit, 1);
+    assert.equal(f.lock()?.allowStaleUnlock, false);
+    await assert.rejects(apply(), { code: 'REBUILD_BUSY' });
+    assert.equal(f.counts.commit, 1);
 });
 
 test('ordinary Apply rebinds the authority baseline before opening the journaled writer', async t => {

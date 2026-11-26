@@ -191,7 +191,11 @@ function makeLocks(store=mongoStore(), clock=Date.now) {
             } catch {
                 // Do not expose DB details or replace a primary callback refusal.
             } finally { active.delete(token); }
-            if(completed&&!released)throw error('REBUILD_LOCK_RELEASE_UNCONFIRMED');
+            if(completed&&!released){
+                const failure=error('REBUILD_LOCK_RELEASE_UNCONFIRMED');
+                if(cutoverPhase==='settled')failure.settledMain=true;
+                throw failure;
+            }
         }
     };
     const status=async()=>{

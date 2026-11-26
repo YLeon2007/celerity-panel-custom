@@ -13,6 +13,7 @@ const {exitRefusalForError,PORTAL_EXIT_INVALID}=require('../services/rebuildExit
 const fail=code=>Object.assign(new Error(code),{code});
 const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
 const ownValue=(obj,key)=>Object.getOwnPropertyDescriptor(obj,key)?.value;
+const settledMain=error=>{try{return ownValue(error,'settledMain')===true;}catch{return false;}};
 const objectId=id=>typeof id==='string'&&/^[a-f\d]{24}(?![\s\S])/i.test(id);
 // Public projection of rebuildTransitMainApply's failure, not of its wire,
 // journal record, or nested exception. Missing details never change outcome.
@@ -30,6 +31,11 @@ const mainCutoverReasons=new Set([
     'REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED',
 ]);
 function formatTransitRefusal(req,res,error,code){
+    if(code==='REBUILD_LOCK_RELEASE_UNCONFIRMED'&&settledMain(error)){
+        const lang=res.locals.lang||detectLanguage(req);
+        return {code:'REBUILD_MAIN_CUTOVER_HANDBACK_UNCONFIRMED',outcome:'handback-unconfirmed',retryAllowed:false,
+            message:t('network.rebuildPreview.mainCutover.handbackUnconfirmed',lang)};
+    }
     const outcomes={REBUILD_MAIN_CUTOVER_UNRESOLVED:['unknown','unknown'],
         REBUILD_MAIN_CUTOVER_ROLLED_BACK:['rolled-back','rolledBack'],
         REBUILD_MAIN_CUTOVER_NOT_DISPATCHED:['not-dispatched','notDispatched']};

@@ -173,6 +173,10 @@
         if (error?.code === 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE') {
             return { title: labels.refused, message: copy.guardedPreflight };
         }
+        if (error?.code === 'REBUILD_MAIN_CUTOVER_HANDBACK_UNCONFIRMED' &&
+            error.outcome === 'handback-unconfirmed' && error.retryAllowed === false) {
+            return { title: labels.refused, message: copy.handbackUnconfirmed };
+        }
         const lookup = (map, key) => map && typeof key === 'string' && Object.hasOwn(map, key) ? map[key] : '';
         const settled = error?.code === 'REBUILD_MAIN_CUTOVER_ROLLED_BACK' && error.outcome === 'rolled-back' ? copy.rolledBack
             : error?.code === 'REBUILD_MAIN_CUTOVER_NOT_DISPATCHED' && error.outcome === 'not-dispatched' ? copy.notDispatched : null;

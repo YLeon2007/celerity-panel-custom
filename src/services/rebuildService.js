@@ -13,7 +13,7 @@ const {verifyTunnelTrust}=require('./rebuildTunnelTls');
 const {assertRealityFingerprint,realityEndpoints}=require('./rebuildRealityFingerprint');
 const {readKcpAdmission,kcpListenerId,hasDirectLifecycle,assertKcpVersionsUnchanged}=require('./rebuildKcpAdmission');
 const {prepareLinks}=require('./rebuildLinkKeys');
-const {fullLinkRead}=require('./rebuildLinkSnapshot');
+const {fullLinkRead,keyEnvelopeField}=require('./rebuildLinkSnapshot');
 const {createRebuildRelayBackend}=require('./rebuildRelayBackend');
 const {createRebuildRelayRemove}=require('./rebuildRelayRemove');
 const {createRebuildRelayRetire}=require('./rebuildRelayRetire');
@@ -401,7 +401,8 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
                 if((req.preview||serialEligible)&&prepared.some(link=>link.rebuildExit!=null)){
                     const graph=compileRebuildGraph({nodes,links:prepared,affectedNodeIds:ids});
                     if([...graph.byLinkId.values()].some(edge=>edge.portalExit?.path.length>1)){
-                        transit={multiHop:true,blocked:true,serial:serialEligible,after:buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}))};
+                        const keysSettled=prepared.every((link,i)=>!Object.hasOwn(link,'_rebuildVless')||Object.hasOwn(links[i],keyEnvelopeField));
+                        transit={multiHop:true,blocked:true,serial:serialEligible&&keysSettled,after:buildTransitChannels(graph).artifacts.map(({id,source,target,mode})=>({id,source,target,mode}))};
                         if(!retire&&!req.remove)transit.planRestarts=before=>{
                             try {
                                 return planSerialScopedTransition({before,after:candidates,composition,allowMainRestart:true});
@@ -432,6 +433,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
             checkKcpAdmission:()=>kcpAdmission(),
             async activateSerial(confirmation,verify){
                 if(!serialEligible||verify!==verifyApply||typeof retainApply!=='function')throw fail('REBUILD_LOCK_LOST');
+                // These are only the Preview readers. Dispose them before
+                // dispatch; the authority opens its own pinned held peers.
+                await closeTransports(transports);
                 return serial(req.linkId,{confirmation,run:fn=>withHeldLock(verifyLock,retainApply,()=>fn(verify,retainApply))});
             },
             async checkActivation(ids,retirement,{transitBlocked=false}={}){

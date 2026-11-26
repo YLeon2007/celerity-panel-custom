@@ -551,6 +551,9 @@ test('Rebuild cutover HTTP projects only public fields; the guard is a distinct 
                 failure: { phase: null, reason }, message: `${labels[label]} ${labels.reason[reason]}` } });
         }
         settled = undefined;
+        failure = Object.assign(new Error(privateText), { code: 'REBUILD_LOCK_RELEASE_UNCONFIRMED', settledMain: true });
+        assert.deepEqual(await post(lang), { error: { code: 'REBUILD_MAIN_CUTOVER_HANDBACK_UNCONFIRMED',
+            outcome: 'handback-unconfirmed', retryAllowed: false, message: labels.handbackUnconfirmed } });
     }
 });
 
@@ -614,6 +617,8 @@ test('shipped preview does not render unknown enums, arbitrary messages, or old 
         assert.equal(result.message, labels.unknown);
     }
     assert.equal(describeApplyFailure(409, { code: 'REBUILD_L2TP_APPLY_BRIDGE_PLACEHOLDER_UNPROVED' }), null);
+    const handback = { code: 'REBUILD_MAIN_CUTOVER_HANDBACK_UNCONFIRMED', outcome: 'handback-unconfirmed', retryAllowed: false, message: privateText };
+    assert.equal(describeApplyFailure(409, handback).message, labels.handbackUnconfirmed);
 });
 
 test('Rebuild guard at preview stays close-only and never submits Apply', async () => {
