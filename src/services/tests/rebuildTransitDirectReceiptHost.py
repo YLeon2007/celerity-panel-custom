@@ -1,10 +1,14 @@
 """Real MAIN/DIRECT file generations and writes, with modeled native observers."""
 import copy
+import base64
 import fcntl
+import hashlib
 import json
 import os
 import stat
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +21,7 @@ with patch.object(sys, 'argv', sys.argv[:1]):
 from rebuildTransitMainWindowHost import System
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from rebuildTransitDirectReceipt import DirectReceipt, FINAL, LEGACY_NET, UNCONFIRMED, WRITERS
+from rebuildTransitDirectReceipt import DirectReceipt, direct_main_wire, FINAL, LEGACY_NET, UNCONFIRMED, WRITERS
 from rebuildTransitMainSession import HostMainSession, WindowError
 import rebuildTransitMainWindow as window
 from rebuildTransitMainWindow import XRAY_PROPS
@@ -152,6 +156,74 @@ class ReceiptFixture(unittest.TestCase):
 
 
 class ReceiptHost(ReceiptFixture):
+    def drive_wire(self, final_ok):
+        deadline = time.monotonic() + 5
+        namespace = SimpleNamespace(**(self.h | {'DEADLINE': deadline}))
+        def prove(snapshot, end):
+            self.assertEqual(end, deadline)
+            return final_ok and self.final_proof(snapshot)
+
+        wire = direct_main_wire(lambda _: self.session(), direct=namespace, machine_id=self.f.machine,
+                                backup_id=self.f.token, node_id=self.f.node, network=self.f.network,
+                                verify_writers=lambda: self.permit_writers, prove_final=prove)
+        query, tx = os.pipe()
+        rx, reply = os.pipe()
+        result = []
+
+        def server():
+            try:
+                result.append(wire.serve(query, reply, deadline=deadline))
+            finally:
+                os.close(query)
+                os.close(reply)
+
+        thread = threading.Thread(target=server, daemon=True)
+        before = self.manifest()
+        thread.start()
+        try:
+            with os.fdopen(tx, 'wb', buffering=0) as send, os.fdopen(rx, 'rb') as recv:
+                def frame(action, **fields):
+                    send.write(json.dumps(dict(action=action, **fields)).encode('ascii') + b'\n')
+                    return json.loads(recv.readline())
+
+                def request(action, **fields):
+                    response = frame(action, **fields)
+                    self.assertIs(response['ok'], True, response.get('reason'))
+                    return response['value']
+
+                request('read')
+                request('stop')
+                pair = request('capture', target=base64.b64encode(self.candidate).decode('ascii'))
+                compact = json.dumps(pair['before'], separators=(',', ':')).encode('ascii')
+                request('publish', beforeSha256=hashlib.sha256(compact).hexdigest(),
+                        desiredSha256=hashlib.sha256(base64.b64decode(pair['desired'])).hexdigest())
+                request('restart')
+                request('start')
+                final = request('reconcile')
+                self.assertEqual(self.manifest(), before)
+                with open_lock(self.lock) as contender, self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if final_ok:
+                    self.assertEqual(request('verify'), final)
+                    self.assertEqual(self.manifest()['currentApply']['files']['main'],
+                                     self.h['file_pin'](*self.h['apply_profile_read'](self.h['MAIN'])))
+                    self.assertEqual(self.write_calls, 1)
+                else:
+                    self.assertEqual(frame('verify'), {'ok': False, 'reason': FINAL})
+                    self.assertEqual(self.manifest(), before)
+                    self.assertEqual(self.write_calls, 0)
+        finally:
+            thread.join(timeout=6)
+        self.assertEqual(result, [0 if final_ok else 1])
+        self.assertEqual(self.effects(), ['stop', 'restart', 'start'])
+
+    def test_wire_advances_receipt_before_verify_ack_on_original_lock(self):
+        self.drive_wire(True)
+        self.call('reattest-runtime')
+
+    def test_wire_failed_final_proof_cannot_advance_receipt(self):
+        self.drive_wire(False)
+
     def test_real_producer_then_forward_inverse_consumer(self):
         h, f = self.h, self.f
         before = f.image()

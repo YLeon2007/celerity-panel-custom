@@ -27,6 +27,10 @@ UNKNOWN = 'REBUILD_MAIN_WIRE_UNCONFIRMED'
 # request data, or an unexpected exception message escape on a refusal.
 _REASONS = frozenset({
     REQUEST, PHASE, EOF, LIMIT, SETTLEMENT, MAIN_DRIFT,
+    'REBUILD_DIRECT_RECEIPT_UNPROVED', 'REBUILD_DIRECT_RECEIPT_LAYOUT_UNSUPPORTED',
+    'REBUILD_DIRECT_RECEIPT_REQUIRES_NETWORK', 'REBUILD_DIRECT_RECEIPT_MAIN_DRIFT',
+    'REBUILD_DIRECT_RECEIPT_WRITER_EXCLUSION_UNPROVED', 'REBUILD_DIRECT_RECEIPT_FINAL_UNPROVED',
+    'REBUILD_DIRECT_RECEIPT_WRITE_UNCONFIRMED',
     'REBUILD_MAIN_LOCK_UNPROVED', 'REBUILD_MAIN_AUTHORITY_UNPROVED',
     'REBUILD_MAIN_RUNTIME_UNPROVED', 'REBUILD_MAIN_SESSION_STATE',
     'REBUILD_MAIN_PUBLICATION_UNCONFIRMED', 'REBUILD_MAIN_RESTART_UNCONFIRMED',
@@ -206,12 +210,13 @@ class HostMainWire:
     FDs are exclusively borrowed raw pipes/stream descriptors (no buffered
     peers on this side). The embedder closes them and propagates the returned
     exit status. The single absolute time.monotonic() deadline is supplied to
-    session_factory(deadline) and both optional settlement callbacks. The
-    trusted factory/runner must clip native waits and tie its live authority
-    checks to that end; the receiver cannot interrupt synchronous host work
-    safely, but never acknowledges a late result. Settlement hooks take
-    (MainSnapshot, deadline), must return True, and are followed by a fresh
-    exact read on the original held session before acknowledgement.
+    session_factory(deadline) and all optional hooks. The trusted factory and
+    runner must clip native waits; the receiver cannot safely interrupt
+    synchronous host work, but never acknowledges a late result. Read and
+    capture hooks take (session, observation, deadline) and must return True
+    before stop or publish respectively. Settlement hooks take (MainSnapshot,
+    deadline), must return True, and are followed by a fresh exact read on
+    the original held session before acknowledgement.
 
     Requests/replies are one UTF-8 JSON object per LF-terminated line. Request
     keys are action only, except capture adds target (canonical base64) and
@@ -229,8 +234,10 @@ class HostMainWire:
     A refusal or missing acknowledgement is not no-effect or replay authority.
     """
 
-    def __init__(self, session_factory, *, on_reconcile=None, on_verify=None):
+    def __init__(self, session_factory, *, on_read=None, on_capture=None, on_reconcile=None, on_verify=None):
         self._factory = session_factory
+        self._on_read = on_read
+        self._on_capture = on_capture
         self._on_reconcile = on_reconcile
         self._on_verify = on_verify
         self._admission = Lock()
@@ -238,6 +245,7 @@ class HostMainWire:
     def _settle(self, channel, session, callback, snapshot):
         channel.remaining()
         if callback is not None:
+            channel._peer_waiting()
             require(callback(snapshot, channel.deadline) is True, SETTLEMENT)
             channel.remaining()
             require(session.read() == snapshot, MAIN_DRIFT)
@@ -245,6 +253,8 @@ class HostMainWire:
 
     def _exchange(self, channel, session):
         baseline = session.read()
+        if self._on_read is not None:
+            require(self._on_read(session, baseline, channel.deadline) is True, SETTLEMENT)
         channel.ok(_snapshot(baseline))
 
         channel.request('stop')
@@ -254,6 +264,8 @@ class HostMainWire:
         target = _target(channel.request('capture')['target'])
         channel.remaining()
         capture = session.capture(baseline, target)
+        if self._on_capture is not None:
+            require(self._on_capture(session, capture, channel.deadline) is True, SETTLEMENT)
         del baseline, target
         before = _image(capture.before)
         channel.ok({'before': before, 'desired': _b64(capture.desired)})

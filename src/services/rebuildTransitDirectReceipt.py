@@ -301,3 +301,41 @@ class DirectReceipt:
             if isinstance(error, WindowError):
                 raise
             raise WindowError(UNPROVED) from None
+
+
+def direct_main_wire(session_factory, *, direct, machine_id, backup_id, node_id, network, verify_writers, prove_final):
+    """Use the same held session for the wire and the owned DIRECT receipt.
+
+    Installation binding and both proof callbacks are trusted host inputs,
+    never wire values. `prove_final(snapshot, deadline)` is a read-only proof
+    of the settled MAIN/runtime; it must not send or retry an agent request.
+    """
+    from rebuildTransitMainWire import HostMainWire
+
+    receipt: DirectReceipt | None = None
+
+    def pin_baseline(session, baseline, deadline):
+        nonlocal receipt
+        require(receipt is None and direct.time.monotonic() < deadline <= direct.DEADLINE, UNPROVED)
+        def fence():
+            return direct.time.monotonic() < deadline and verify_writers() is True and direct.time.monotonic() < deadline
+        receipt = DirectReceipt.capture(session, baseline, direct=direct, machine_id=machine_id,
+                                        backup_id=backup_id, node_id=node_id, network=network,
+                                        verify_writers=fence)
+        return True
+
+    def pin_drained(session, publication, deadline):
+        current = receipt
+        if current is None or current._session is not session or direct.time.monotonic() >= deadline:
+            raise WindowError(UNPROVED)
+        current.check_drained(publication)
+        return True
+
+    def finish(final, deadline):
+        current = receipt
+        if current is None or direct.time.monotonic() >= deadline:
+            raise WindowError(FINAL)
+        current.advance(final, prove_final=lambda snapshot: prove_final(snapshot, deadline))
+        return True
+
+    return HostMainWire(session_factory, on_read=pin_baseline, on_capture=pin_drained, on_verify=finish)
