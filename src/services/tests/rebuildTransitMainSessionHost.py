@@ -121,6 +121,15 @@ class Host(unittest.TestCase):
                 retry()
         self.assertEqual(self.manager.trace, trace)
 
+    def test_unproved_live_baseline_refuses_before_stop(self):
+        original = self.main.read_bytes()
+        with self.session() as session:
+            self.allow_runtime = False
+            self.assert_sticky(session, 'REBUILD_MAIN_RUNTIME_UNPROVED', session.read)
+        self.assertEqual(self.runtime_proofs, ['baseline'])
+        self.assertEqual(self.effects(), [])
+        self.assertEqual(self.main.read_bytes(), original)
+
     def test_one_directory_flock_spans_all_phases(self):
         self.assertEqual(DIRECT_LOCK, pathlib.Path('/etc/systemd/system'))
         self.assertEqual(self.competitor(), 0)

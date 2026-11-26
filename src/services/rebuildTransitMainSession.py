@@ -162,7 +162,7 @@ class HostMainSession:
     (including managed tags), and the operation's current fence (including
     durable intent before any mutation). verify_runtime(phase, snapshot) must
     return True only after independent read-only verification of
-    the scoped runtime against the snapshot ('capture', 'restart', 'reconcile').
+    the scoped runtime against the snapshot ('baseline', 'capture', 'restart', 'reconcile').
     Callbacks must be bounded, not reenter the session or retain its authority.
     No callback or returned snapshot replaces durable intent/artifact proofs.
     Path/clock overrides are for trusted fixtures, not request parameters.
@@ -310,7 +310,7 @@ class HostMainSession:
         require(allowed is True, RUNTIME)
         if phase == 'reconcile':
             self._check_started()
-        else:
+        elif phase != 'baseline':
             self._window.require_quiet()
         require(self._sample(xray=self._window._xray, main=snapshot.main) == snapshot, RUNTIME)
 
@@ -320,7 +320,11 @@ class HostMainSession:
                 self._check_started()
                 return self._sample(xray=self._window._xray, main=self._written)
             baseline = self._sample()
-            self._baseline_topology = topology_bytes(parse_json(baseline.main.data), self._managed)
+            topology = topology_bytes(parse_json(baseline.main.data), self._managed)
+            # A missing live proof must refuse before stop. Capture repeats
+            # it against the drained image, including any late clients.
+            self._prove_runtime('baseline', baseline)
+            self._baseline_topology = topology
             self._baseline = baseline
             return baseline
 

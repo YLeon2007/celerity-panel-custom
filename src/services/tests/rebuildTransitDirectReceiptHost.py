@@ -64,6 +64,7 @@ class ReceiptFixture(unittest.TestCase):
         f.request['nodeId'] = f.node
         self.call('reattest-runtime')
         self.original = self.main.read_bytes()
+        self.loaded = self.original
         cfg = json.loads(self.original)
         cfg['inbounds'][0]['port'] = 444
         self.candidate = h['encode'](cfg)

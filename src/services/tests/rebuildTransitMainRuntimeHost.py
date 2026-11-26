@@ -106,9 +106,9 @@ class RuntimeHost(unittest.TestCase):
 
     def test_callback_projects_only_named_fields_and_trusted_routes(self):
         snapshot = self.snapshot()
-        for phase in ('capture', 'restart', 'reconcile'):
+        for phase in ('baseline', 'capture', 'restart', 'reconcile'):
             self.assertIs(self.observe(snapshot, phase=phase), True)
-        self.assertEqual(self.unit_reads, 12)
+        self.assertEqual(self.unit_reads, 16)
         self.assertEqual(self.calls, [{
             'version': runtime.VERSION,
             'namedInbounds': [{'tag': 'extra', 'users': []}, {'tag': 'vless-in', 'users': [
@@ -116,7 +116,7 @@ class RuntimeHost(unittest.TestCase):
             ]}],
             'routes': [{'context': {'inboundTag': 'vless-in', 'network': 'tcp', 'targetPort': 443,
                                     'targetDomain': 'choice.example.invalid'}, 'outboundTag': 'blocked'}],
-        }] * 3)
+        }] * 4)
 
     def test_default_binding_is_fixed_and_does_not_observe_on_construction(self):
         observer = runtime.MainRuntimeObserver({'vless-in'}, lambda *_: ROUTES)

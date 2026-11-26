@@ -136,7 +136,7 @@ def check_core(version, core, proof, work):
         with patch.object(rt.subprocess, 'Popen', side_effect=only_proof), \
              patch.object(rt, '_exchange', side_effect=receipt_boundary):
             try:
-                assert observer('capture', snapshot) is True
+                assert observer('baseline', snapshot) is True
             except WindowError as e:
                 assert not want and e.code == rt.RUNTIME and e.__context__ is None, name
             else:

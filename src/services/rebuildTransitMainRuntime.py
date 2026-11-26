@@ -377,7 +377,7 @@ class MainRuntimeObserver:
         return _process(snapshot.xray.pid, pidfd, unit[1], self._xray, image, self._production)
 
     def _observe(self, phase, snapshot):
-        _need(type(phase) is str and phase in ('capture', 'restart', 'reconcile') and type(snapshot) is MainSnapshot
+        _need(type(phase) is str and phase in ('baseline', 'capture', 'restart', 'reconcile') and type(snapshot) is MainSnapshot
               and type(snapshot.main) is MainImage and type(snapshot.main.data) is bytes
               and 0 < len(snapshot.main.data) <= MAX_MAIN and type(snapshot.xray) is XrayGeneration
               and type(snapshot.xray.pid) is int and 0 < snapshot.xray.pid <= _PID_MAX
