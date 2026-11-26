@@ -6,13 +6,14 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import rebuildTransitMainHost as host
 from rebuildTransitMainRuntime import MainRuntimeObserver
 from rebuildTransitMainSession import AUTHORITY, START, STOP, RESTART, HostMainFlock
-from rebuildTransitMainWindow import PROPERTIES, UNIT, XRAY, XRAY_PROPS, WindowError
+from rebuildTransitMainWindow import ManagerScopeError, PROPERTIES, UNIT, XRAY, XRAY_PROPS, WindowError
 
 
 class NativeRunnerHost(unittest.TestCase):
@@ -81,6 +82,70 @@ class NativeRunnerHost(unittest.TestCase):
                         self.assertEqual(err.exception.code, AUTHORITY)
                 exchange.assert_not_called()
                 flock.check()
+
+    def test_fixed_commands_check_jobs_states_and_other_invocations_before_ack(self):
+        for verb, fault in [(STOP, ''), (RESTART, ''), (START, ''), (STOP, 'changed'),
+                            (RESTART, 'disappeared'), (START, 'new unit'), (START, 'jobs'),
+                            (STOP, 'failed state'), (RESTART, 'unreadable before')]:
+            with self.subTest(verb=verb[1], fault=fault), tempfile.TemporaryDirectory() as tmp, \
+                 HostMainFlock(Path(tmp)) as flock, patch.object(host, 'DIRECT_LOCK', Path(tmp)):
+                committed = False
+                reads = 0
+                initial = verb == STOP
+                expected = verb == START
+                end = time.monotonic() + 5
+                other = 'xray-bridge.service'
+
+                def manager(args, data, *, timeout, limit, end):
+                    nonlocal committed, reads
+                    if args == verb:
+                        self.assertFalse(committed)
+                        self.assertEqual(reads, 1)
+                        committed = True
+                        return b''
+                    if args == host._JOBS:
+                        return b'1 fixture.service start waiting\n' if committed and fault == 'jobs' else b''
+                    agent = expected if committed else initial
+                    state = 'failed' if committed and fault == 'failed state' else 'active' if agent else 'inactive'
+                    if args == host._ACTIVE_SHOW:
+                        reads += 1
+                        if fault == 'unreadable before':
+                            return b'Id=incomplete.service\n'
+                        active = {XRAY: ('b' if committed and verb == RESTART else 'a') * 32,
+                                  'sysinit.target': '', other: ('e' if committed and fault == 'changed' else 'd') * 32}
+                        if agent:
+                            active[UNIT] = 'c' * 32
+                        if committed and fault == 'new unit':
+                            active['unexpected.service'] = 'f' * 32
+                        if committed and fault == 'disappeared':
+                            del active[other]
+                        items = list(active.items())
+                        if committed:
+                            items.reverse()  # output order is not part of a generation
+                        return '\n'.join(f'Id={name}\nInvocationID={inv}\nLoadState=loaded\nActiveState=active\n'
+                                         for name, inv in items).encode()
+                    name = args[-1]
+                    self.assertIn(args, (host._show(UNIT, PROPERTIES), host._show(XRAY, XRAY_PROPS)))
+                    props = PROPERTIES if name == UNIT else XRAY_PROPS
+                    fields = dict(Id=name, LoadState='loaded', NeedDaemonReload='no', ActiveState=state if name == UNIT else 'active')
+                    return ''.join(f'{key}={fields.get(key, "")}\n' for key in props).encode()
+
+                with patch.object(host, '_exchange', side_effect=manager):
+                    session = host.create_main_session(end, flock, managed={'vless-in'}, routes_for=lambda *_: (),
+                                                       verify_authority=lambda: True, verify_manager_scope=lambda _: True)
+                    session._window = SimpleNamespace(_unit=lambda: 'agent', _old='agent', _quiet='agent',
+                                                      _main_unit=lambda: 'xray', _xray='xray')
+                    if fault:
+                        with self.assertRaises(ManagerScopeError) as refusal:
+                            session._runner(verb, host._LIMITS[verb][0])
+                        self.assertEqual(refusal.exception.checks, [{
+                            'jobs': 'list-jobs', 'failed state': f'{UNIT}:ActiveState',
+                        }.get(fault, 'active-invocations')])
+                    else:
+                        self.assertEqual(session._runner(verb, host._LIMITS[verb][0]), '')
+                        self.assertEqual(reads, 2)
+                    self.assertEqual(committed, fault != 'unreadable before')
+                    flock.check()
 
 
 if __name__ == '__main__':

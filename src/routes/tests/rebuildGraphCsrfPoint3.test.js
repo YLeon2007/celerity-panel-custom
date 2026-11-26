@@ -482,6 +482,38 @@ const checkpointFailures = [
     ['agent-reconcile', 'REBUILD_NODE_USER_SYNC_UNCONFIRMED'],
 ];
 
+test('Rebuild cutover response appends only allowlisted authority check IDs', async () => {
+    const phase = 'agent-stop', reason = 'REBUILD_MAIN_AUTHORITY_UNPROVED';
+    const checks = ['cc-agent.service:OnFailure', 'xray.service:ConflictedBy', 'list-jobs'];
+    const labels = require('../../locales/en.json').network.rebuildPreview.mainCutover;
+    let accessorReads = 0;
+    for (const [why, detail, suffix] of [
+        [reason, { checks }, ` (${checks.join(', ')})`],
+        [reason, { checks: [...checks, privateText] }, ''],
+        [reason, { checks: ['other.service:OnFailure'] }, ''],
+        [reason, { checks: [Object.assign(Object.create(null), { token: 'list-jobs' })] }, ''],
+        [reason, { checks: [checks[0], , checks[2]] }, ''],
+        [reason, { get checks() { accessorReads++; return checks; } }, ''],
+        [checkpointFailures[0][1], { checks }, ''],
+    ]) {
+        const app = makeApp(undefined, cutoverFault(
+            Object.defineProperties({ phase, reason: why, raw: privateText }, Object.getOwnPropertyDescriptors(detail))));
+        const res = await app.request(deployPath, { method: 'POST', headers: {
+            cookie: 'fixture=session', origin, 'content-type': 'application/json',
+            'x-csrf-token': app.stale, 'accept-language': 'en',
+        }, body: JSON.stringify({ linkId, expectedPreview: previewId }) });
+        assert.equal(res.status, 409);
+        const body = await res.json();
+        assert.deepEqual(body, { error: { code: mainUnresolved, outcome: 'unknown', retryAllowed: false,
+            failure: { phase, reason: why, ...(suffix && { checks }) },
+            message: `${labels.unknown} ${labels.phase[phase]} ${labels.reason[why]}${suffix}` } });
+        const ui = mount('nodes', 'en', 'fixture', true, () => assert.fail('presentation must not fetch'));
+        const { describeApplyFailure } = ui.context.C3RebuildPreview;
+        assert.equal(describeApplyFailure(409, { ...body.error, message: privateText }).message, body.error.message);
+    }
+    assert.equal(accessorReads, 0);
+});
+
 test('Rebuild cutover HTTP projects only public fields; the guard is a distinct preflight refusal', async t => {
     let failure, settled;
     const service = { async execute() { if (settled) return settled; throw failure; } };

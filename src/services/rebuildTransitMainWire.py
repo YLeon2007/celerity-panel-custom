@@ -15,7 +15,7 @@ import select
 from threading import Lock
 import time
 
-from rebuildTransitMainWindow import MAIN_DRIFT, MAX_MAIN, WindowError, require
+from rebuildTransitMainWindow import MAIN_DRIFT, MAX_MAIN, ManagerScopeError, WindowError, require
 
 REQUEST = 'REBUILD_MAIN_WIRE_REQUEST'
 PHASE = 'REBUILD_MAIN_WIRE_PHASE'
@@ -373,7 +373,10 @@ class HostMainWire:
                     return 1
                 except Exception as error:
                     code = error.code if isinstance(error, WindowError) else None
-                    channel.send({'ok': False, 'reason': code if type(code) is str and code in _REASONS else UNKNOWN})
+                    refusal = {'ok': False, 'reason': code if type(code) is str and code in _REASONS else UNKNOWN}
+                    if isinstance(error, ManagerScopeError):
+                        refusal['checks'] = error.checks  # fixed property identifiers, not systemctl values
+                    channel.send(refusal)
                     return 1
             channel.remaining()
             return 0

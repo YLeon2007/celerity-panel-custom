@@ -79,9 +79,11 @@ class System:
                        ExecMainCode='0' if self.active else '1', ExecMainStatus='0',
                        InactiveEnterTimestampMonotonic=str(self.generation * 1000),
                        Conflicts='shutdown.target', ConflictedBy='', Requires='system.slice sysinit.target',
+                       BindsTo='', Wants='',
                        FragmentPath='/etc/systemd/system/cc-agent.service') | self.agent_props
             keys = [a.removeprefix('--property=') for a in argv if a.startswith('--property=')]
-            return ''.join(f'{key}={row[key]}\n' for key in keys)
+            return ''.join(f'{key}={row[key]}\n' for key in keys if row[key] or key not in {
+                'ExecCondition', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost'})
         if cmd == 'stop':
             if self.stop_error:
                 self.job = '18'

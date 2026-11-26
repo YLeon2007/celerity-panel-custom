@@ -69,7 +69,7 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     L2tpUser=require('../modules/relay-l2tp/models/l2tpUserModel'),
     createRelayDirect=options=>require('./rebuildRelayDirect').createRelayDirect(options),
     assertNoRelayAccountIntent=()=>assertNoPendingRelayAccounts(L2tpUser.db),
-    serialMainAuthority, allowStockSerial=false,
+    serialMainAuthority,
     grantDb=env===process.env?L2tpUser.db:undefined,
     relayGrantStore=grantDb&&{snapshot:()=>require('./rebuildRelayGrantStore').createRelayGrantStore({db:grantDb,env}).snapshot()}}={}){
     const gate=()=>{if(!isRebuildEnabled(env))throw fail('REBUILD_DISABLED');};
@@ -580,10 +580,9 @@ function createRebuildService({Link=require('../models/cascadeLinkModel'),Node=r
     const relayRetire=createRebuildRelayRetire({Link,Node,State,L2tpUser,env,sync,relayGrantStore,locks:guardedLocks,gate,
         retireGraph,checkRetireExits,verifyLinks:verifyRetireLinks,sameProtectedTarget,removal:relayRemoval,guard:guardRetireRemove});
     const relayAccounts=()=>createRebuildRelayAccounts({Node,State,L2tpUser,locks,env,relayGrantStore,resolveRelayBinding,createRelayDirect});
-    // The production provider can only join a confirmed ordinary Apply. Keep
-    // the default entry closed until stock systemd can establish a bounded
-    // transaction scope without pulling in unrelated boot units.
-    const stockSerialAvailable=allowStockSerial===true&&serialMainAuthority===undefined&&connect===createTransport;
+    // The stock provider only joins a confirmed ordinary Apply and does not
+    // register a separate public dispatcher. The env opt-in gates runGraph.
+    const stockSerialAvailable=serialMainAuthority===undefined&&connect===createTransport;
     const makeSerial=admit=>require('./rebuildSerialApply').createSerialApply({
         Link,Node,State,env,locks:guardedLocks,gate,compose,readStates:(ids,session)=>installedStates(ids,{session}),
         syncNodeUsers:(id,options)=>sync.syncRebuildNodeUsersAfterResume(id,options),

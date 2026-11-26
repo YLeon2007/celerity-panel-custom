@@ -15,8 +15,8 @@ import time
 from rebuildTransitMainRuntime import MainRuntimeObserver, _exchange
 from rebuildTransitMainSession import AUTHORITY, DIRECT_LOCK, LOCK, START, STOP, RESTART, HostMainFlock, HostMainSession
 from rebuildTransitMainWindow import (
-    AGENT_EMPTY, EXPECTED_EXEC, INVOCATION, PROPERTIES, SMALL_FILE, UNIT, XRAY, XRAY_EXEC, XRAY_PROPS,
-    WindowError, _file_generation, _file_metadata, _state_fields, require,
+    AGENT_EMPTY, EXPECTED_EXEC, INVOCATION, MAIN_SYSTEMD_DEPENDENCIES, PROPERTIES, SMALL_FILE, UNIT, XRAY,
+    XRAY_EXEC, XRAY_PROPS, ManagerScopeError, WindowError, _file_generation, _file_metadata, _state_fields, require,
 )
 
 
@@ -24,27 +24,29 @@ def _show(unit, properties):
     return ('/usr/bin/systemctl', 'show', '--all', *('--property=' + key for key in properties), '--', unit)
 
 
-_SCOPE_EMPTY = tuple(('Requisite RequisiteOf RequiredBy BindsTo BoundBy PartOf ConsistsOf '
-                      'PropagatesStopTo StopPropagatedFrom Upholds UpheldBy Triggers TriggeredBy '
-                      'OnFailure OnSuccess ExecCondition ExecStartPre ExecStartPost ExecStop ExecStopPost '
+_EDGE_EMPTY = tuple(('RequiredBy RequisiteOf BoundBy UpheldBy ConsistsOf TriggeredBy PropagatesStopTo '
+                     'PropagatesReloadTo StopPropagatedFrom OnSuccess OnFailure PartOf Triggers Upholds Requisite').split())
+_SCOPE_EMPTY = tuple(('ExecCondition ExecStartPre ExecStartPost ExecStop ExecStopPost '
                       'ExecReload Environment EnvironmentFiles PassEnvironment UnsetEnvironment RootDirectory '
                       'RootImage SourcePath').split())
 _SCOPE_NONE = ('FailureAction', 'SuccessAction', 'StartLimitAction', 'JobTimeoutAction')
+_SCOPE_NO = ('StopWhenUnneeded', 'RefuseManualStart', 'RefuseManualStop')
+_PULLS = ('Requires', 'BindsTo', 'Wants')
 _SCOPE_PROPS = ('Id', 'LoadState', 'NeedDaemonReload', 'Job', 'ActiveState', 'SubState', 'MainPID', 'InvocationID',
-                'Requires', 'Wants', 'Conflicts', 'ConflictedBy', 'Type', 'KillMode', 'ExecStart', 'FragmentPath',
-                'DropInPaths', 'PrivateNetwork', 'WorkingDirectory', 'StopWhenUnneeded', 'ControlPID')
-_SCOPE_PROPS += _SCOPE_EMPTY + _SCOPE_NONE
-_ANCHORS = frozenset(('-.mount', 'system.slice', 'sysinit.target', 'basic.target', 'network-online.target'))
+                'Conflicts', 'ConflictedBy', 'Type', 'KillMode', 'ExecStart', 'FragmentPath',
+                'DropInPaths', 'PrivateNetwork', 'WorkingDirectory', 'ControlPID')
+_SCOPE_PROPS += _PULLS + _EDGE_EMPTY + _SCOPE_EMPTY + _SCOPE_NONE + _SCOPE_NO
 _SHUTDOWN = 'shutdown.target'
-_PULLS = ('Requires', 'Wants', 'Requisite', 'BindsTo', 'Upholds')
-_STOP_EDGES = ('RequiredBy', 'BoundBy', 'ConsistsOf', 'PropagatesStopTo')
-_ANCHOR_PROPS = ('Id', 'LoadState', 'NeedDaemonReload', 'Job', 'ActiveState', 'StopWhenUnneeded', 'Conflicts',
-                 'ConflictedBy', 'OnFailure', 'OnSuccess', *_PULLS, *_STOP_EDGES)
+_DEPENDENCY_PROPS = ('Id', 'LoadState', 'NeedDaemonReload', 'Job', 'ActiveState')
+_ACTIVE_PROPS = ('Id', 'LoadState', 'ActiveState', 'InvocationID')
+# systemctl show with a glob matches loaded manager units, not unit files.
+_ACTIVE_SHOW = ('/usr/bin/systemctl', 'show', '--all', '--state=active', '--no-pager',
+                *('--property=' + key for key in _ACTIVE_PROPS), '--', '*')
 _MANAGER_UNIT = re.compile(r'(?:[A-Za-z0-9_.:@-]|\\x[0-9a-f]{2}){1,240}\.(?:service|mount|automount|target|slice|socket|device|swap|path|timer|scope)')
-_MAX_DEPENDENCIES = 96
 _JOBS = ('/usr/bin/systemctl', 'list-jobs', '--no-legend', '--plain', '--no-pager')
 _SHOW = frozenset((_show(UNIT, PROPERTIES), _show(XRAY, XRAY_PROPS), _show(UNIT, _SCOPE_PROPS),
-                   _show(XRAY, _SCOPE_PROPS), *(_show(name, _ANCHOR_PROPS) for name in _ANCHORS | {_SHUTDOWN})))
+                   _show(XRAY, _SCOPE_PROPS), *(_show(name, _DEPENDENCY_PROPS)
+                                              for name in MAIN_SYSTEMD_DEPENDENCIES | {_SHUTDOWN})))
 _UNIT_DIR = Path('/etc/systemd/system')
 _XRAY_DROP = '10-donot_touch_single_conf.conf'
 _SETUP_DROPS = {
@@ -56,21 +58,14 @@ _INVOCATION = '_SYSTEMD_INVOCATION_ID='
 _LIMITS = {STOP: (25, 0), RESTART: (25, 0), START: (15, 0)}
 
 
-def _dependencies_show(names):
-    return (*_show('', _ANCHOR_PROPS)[:-1], *names)
-
-
 def _command(argv):
     args = tuple(argv)
     if args in _LIMITS:
         return args, _LIMITS[args]
     if args in _SHOW:
         return args, (4, 16384)
-    prefix = _dependencies_show(())
-    names = args[len(prefix):]
-    if (args[:len(prefix)] == prefix and 0 < len(names) <= 32 and len(set(names)) == len(names)
-            and all(_MANAGER_UNIT.fullmatch(name) for name in names)):
-        return args, (4, 256 << 10)
+    if args == _ACTIVE_SHOW:
+        return args, (4, 1 << 20)
     if args == _JOBS:
         return args, (4, 16384)
     if (len(args) == len(_JOURNAL) + 1 and args[:-1] == _JOURNAL and args[-1].startswith(_INVOCATION)
@@ -119,7 +114,6 @@ def _layout(name, row):
     _trusted_file(fragment, 16384)
     if name == UNIT:
         require(not row['DropInPaths'] and EXPECTED_EXEC.fullmatch(row['ExecStart'])
-                and not row['Wants'] and set(row['Requires'].split()) <= {'system.slice', 'sysinit.target'}
                 and not any(row[k] for k in AGENT_EMPTY if k in row), AUTHORITY)
         return
     require(XRAY_EXEC.fullmatch(row['ExecStart']), AUTHORITY)
@@ -150,36 +144,13 @@ def _layout(name, row):
                     == [b'[Service]', b'ExecStart=', b'ExecStart=' + argv], AUTHORITY)
 
 
-def _check_dependencies(deadline, anchors):
-    # An already-active target can still have pull-ins of its own. Follow
-    # only manager-reported forward edges of these named dependencies, never
-    # a peer pattern, and refuse any transaction that could start a new unit.
-    seen = set()
-    todo = set(anchors) | {_SHUTDOWN}
-    while todo:
-        require(len(seen | todo) <= _MAX_DEPENDENCIES, AUTHORITY)
-        batch = sorted(todo)[:32]
-        todo.difference_update(batch)
-        seen.update(batch)
-        raw = _run(deadline, _dependencies_show(batch), 4)
-        require(raw.endswith('\n'), AUTHORITY)
-        found = set()
-        for block in raw.rstrip('\n').split('\n\n'):
-            ids = [line[3:] for line in block.split('\n') if line.startswith('Id=')]
-            require(len(ids) == 1 and ids[0] in batch and ids[0] not in found, AUTHORITY)
-            name = ids[0]
-            found.add(name)
-            row = _state_fields(block, _ANCHOR_PROPS, name)
-            require(row['ActiveState'] == ('inactive' if name == _SHUTDOWN else 'active'), AUTHORITY)
-            if name == _SHUTDOWN:
-                require(not any(row[key] for key in (*_STOP_EDGES, 'OnFailure', 'OnSuccess')), AUTHORITY)
-                continue  # Already-inactive stock conflict; not a start edge.
-            conflicts = set(row['Conflicts'].split()) | set(row['ConflictedBy'].split())
-            pulls = {unit for prop in _PULLS for unit in row[prop].split()}
-            require(row['StopWhenUnneeded'] == 'no' and not row['OnSuccess'] and not row['OnFailure']
-                    and conflicts <= {_SHUTDOWN} and not pulls & {_SHUTDOWN, UNIT, XRAY}, AUTHORITY)
-            todo.update(pulls - seen)
-        require(found == set(batch), AUTHORITY)
+def _require_idle(deadline):
+    if _run(deadline, _JOBS, 4) != '':
+        raise ManagerScopeError(('list-jobs',))
+
+
+def _unit(deadline, name, props):
+    return _state_fields(_run(deadline, _show(name, props), 4), props, name)
 
 
 def verify_manager_scope(deadline):
@@ -190,33 +161,83 @@ def verify_manager_scope(deadline):
     These observations do not lock systemd or an independent administrator.
     """
     try:
-        def unit(name, props):
-            return _state_fields(_run(deadline, _show(name, props), 4), props, name)
-
-        require(_run(deadline, _JOBS, 4) == '', AUTHORITY)
-        rows = {name: unit(name, _SCOPE_PROPS) for name in (UNIT, XRAY)}
-        anchors = set()
+        _require_idle(deadline)
+        rows = {name: _unit(deadline, name, _SCOPE_PROPS) for name in (UNIT, XRAY)}
+        dependencies = {}
+        issues = set()
+        conflicts = set()
         for name, row in rows.items():
-            _layout(name, row)
-            require(row['Type'] == 'simple' and row['KillMode'] == 'control-group' and row['ControlPID'] == '0'
-                    and row['PrivateNetwork'] == row['StopWhenUnneeded'] == 'no'
-                    and row['WorkingDirectory'] in ('', '/')
-                    and not any(row[k] for k in _SCOPE_EMPTY)
-                    and all(row[k] == 'none' for k in _SCOPE_NONE)
-                    and all(set(row[k].split()) <= {_SHUTDOWN} for k in ('Conflicts', 'ConflictedBy')), AUTHORITY)
+            issues.update(f'{name}:{k}' for k in _EDGE_EMPTY if row[k])
+            issues.update(f'{name}:{k}' for k in _SCOPE_NO if row[k] != 'no')
+            for key in ('Conflicts', 'ConflictedBy'):
+                values = set(row[key].split())
+                if values - {_SHUTDOWN}:
+                    issues.add(f'{name}:{key}')
+                conflicts.update(values & {_SHUTDOWN})
+            for key in _PULLS:
+                values = set(row[key].split())
+                if values - MAIN_SYSTEMD_DEPENDENCIES:
+                    issues.add(f'{name}:{key}')
+                for dependency in values & MAIN_SYSTEMD_DEPENDENCIES:
+                    dependencies.setdefault(dependency, set()).add(f'{name}:{key}')
             running = (row['ActiveState'], row['SubState']) == ('active', 'running')
             # AgentWindow joins the cgroup and successful shutdown separately.
             # An inactive service can have a manager-specific SubState.
-            require(running or (name == UNIT and row['ActiveState'] == 'inactive' and row['MainPID'] == '0'), AUTHORITY)
-            pull = set(row['Requires'].split()) | set(row['Wants'].split())
-            require(pull <= _ANCHORS, AUTHORITY)
-            anchors.update(pull)
-        _check_dependencies(deadline, anchors)
-        require(all(unit(name, _SCOPE_PROPS) == row for name, row in rows.items())
-                and _run(deadline, _JOBS, 4) == '', AUTHORITY)
+            if not (running or (name == UNIT and row['ActiveState'] == 'inactive' and row['MainPID'] == '0')):
+                issues.add(f'{name}:ActiveState')
+        if issues:
+            raise ManagerScopeError(issues)
+        # Observe only direct dependencies' state. Never traverse sysinit's
+        # Wants, emergency conflicts, conditions or any other boot edges.
+        for name, checks in sorted(dependencies.items()):
+            if _unit(deadline, name, _DEPENDENCY_PROPS)['ActiveState'] != 'active':
+                issues.update(checks)
+        if conflicts and _unit(deadline, _SHUTDOWN, _DEPENDENCY_PROPS)['ActiveState'] != 'inactive':
+            issues.add('shutdown.target:ActiveState')
+        if issues:
+            raise ManagerScopeError(issues)
+        for name, row in rows.items():
+            _layout(name, row)
+            require(row['Type'] == 'simple' and row['KillMode'] == 'control-group' and row['ControlPID'] == '0'
+                    and row['PrivateNetwork'] == 'no' and row['WorkingDirectory'] in ('', '/')
+                    and not any(row[k] for k in _SCOPE_EMPTY)
+                    and all(row[k] == 'none' for k in _SCOPE_NONE), AUTHORITY)
+            require(_unit(deadline, name, _SCOPE_PROPS) == row, AUTHORITY)
+        _require_idle(deadline)
+    except ManagerScopeError:
+        raise
     except (OSError, subprocess.SubprocessError, UnicodeError, WindowError):
         raise WindowError(AUTHORITY) from None
     return rows[UNIT]
+
+
+def _active_invocations(deadline, states, *, changed):
+    """A bounded, read-only roster; no unrelated unit names leave the host."""
+    try:
+        text = _run(deadline, _ACTIVE_SHOW, 4)
+        require(text.endswith('\n'), AUTHORITY)
+        active = {}
+        seen = set()
+        for block in text.rstrip('\n').split('\n\n'):
+            row = {}
+            for line in block.split('\n'):
+                key, sep, value = line.partition('=')
+                require(sep and key in _ACTIVE_PROPS and key not in row, AUTHORITY)
+                row[key] = value
+            require(row.keys() == set(_ACTIVE_PROPS), AUTHORITY)
+            name, invocation, load = row['Id'], row['InvocationID'], row['LoadState']
+            require(_MANAGER_UNIT.fullmatch(name) and name not in seen and row['ActiveState'] == 'active'
+                    and (not invocation or INVOCATION.fullmatch(invocation)), AUTHORITY)
+            seen.add(name)
+            if load == 'loaded':
+                active[name] = invocation
+            else:
+                require(load in ('stub', 'not-found', 'bad-setting', 'error', 'merged', 'masked'), AUTHORITY)
+        require(all((name in active) == expected for name, expected in states.items()), AUTHORITY)
+        active.pop(changed, None)
+        return active
+    except (OSError, subprocess.SubprocessError, UnicodeError, WindowError):
+        raise ManagerScopeError(('active-invocations',)) from None
 
 
 def create_main_session(deadline, flock, *, managed, verify_authority, verify_manager_scope, routes_for,
@@ -228,18 +249,30 @@ def create_main_session(deadline, flock, *, managed, verify_authority, verify_ma
     flock.check()
 
     def run(argv, timeout):
-        if tuple(argv) in _LIMITS:
-            # Stock argv does not itself restrict the systemd transaction.
-            # Prove all units affected by the proposed window and exclude
-            # outside activation, including a side unit with PartOf=.
-            require(verify_manager_scope(deadline) is True and verify_authority() is True, AUTHORITY)
-            # The potentially longer dependency observation must not rebase
-            # the window onto a replacement invocation before native handoff.
-            window = session._window
-            require(window._unit() == (window._old if tuple(argv) == STOP else window._quiet)
-                    and window._main_unit() == window._xray, AUTHORITY)
-            flock.check()
-        return _run(deadline, argv, timeout)
+        action = tuple(argv)
+        if action not in _LIMITS:
+            return _run(deadline, argv, timeout)
+        changed = XRAY if action == RESTART else UNIT
+        require(verify_manager_scope(deadline) is True and verify_authority() is True, AUTHORITY)
+        before = _active_invocations(deadline, {UNIT: action == STOP, XRAY: True}, changed=changed)
+        # Do not rebase onto a replacement invocation after the scope read.
+        window = session._window
+        require(window._unit() == (window._old if action == STOP else window._quiet)
+                and window._main_unit() == window._xray, AUTHORITY)
+        _require_idle(deadline)
+        flock.check()
+        result = _run(deadline, argv, timeout)
+        _require_idle(deadline)
+        expected = 'active' if action == START else 'inactive'
+        checks = [f'{name}:ActiveState' for name, props, state in ((UNIT, PROPERTIES, expected), (XRAY, XRAY_PROPS, 'active'))
+                  if _unit(deadline, name, props)['ActiveState'] != state]
+        if checks:
+            raise ManagerScopeError(checks)
+        after = _active_invocations(deadline, {UNIT: action == START, XRAY: True}, changed=changed)
+        if after != before:
+            raise ManagerScopeError(('active-invocations',))
+        _require_idle(deadline)
+        return result
 
     observer = MainRuntimeObserver(managed, routes_for, deadline=deadline, packaged_proof=packaged_proof)
     session = HostMainSession(run, verify_authority, observer, managed, flock=flock, deadline=deadline)

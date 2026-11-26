@@ -45,7 +45,8 @@ function lockStore() {
     };
 }
 
-function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotated = false, changedFlow = false, replaceBeforeInverse = false } = {}) {
+function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotated = false, changedFlow = false,
+    replaceBeforeInverse = false, refusalAction = 'stop', refusalReply } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'c3-main-join.'));
     const journalPath = path.join(root, 'journal'), artifactPath = path.join(root, 'artifacts');
     const main = path.join(root, 'MAIN');
@@ -85,6 +86,7 @@ function fixture(t, { fault = '', loseSync = false, rejectBefore = false, rotate
                         assert.equal(state().pending?.checkpoint ?? undefined, phases[frame.action]);
                         events.push(frame.action);
                     }
+                    if (frame.action === refusalAction && refusalReply) return refusalReply;
                     child.stdin.write(`${JSON.stringify(frame)}\n`);
                     const next = await lines.next();
                     assert.equal(next.done, false, savedError.join(''));
@@ -184,6 +186,38 @@ test('joined MAIN wire: no-effect refusal before stop releases the promoted owne
     assert.deepEqual(f.events, ['read']);
     assert.equal(f.state().status, 'not-dispatched');
     assert.equal(f.store.copy(), null);
+});
+test('joined MAIN wire: only exact authority refusal frames carry manager check IDs', async t => {
+    const reason = 'REBUILD_MAIN_AUTHORITY_UNPROVED';
+    const checks = ['cc-agent.service:RequiredBy', 'xray.service:ActiveState', 'list-jobs',
+        'active-invocations', 'shutdown.target:ActiveState'];
+    for (const [refusalReply, expected] of [
+        [{ ok: false, reason, checks }, { reason, checks }],
+        [{ ok: false, reason }, { reason }],
+        ...[
+            { ok: false, reason, checks: [...checks, 'xray.service:Requires=private.target'] },
+            { ok: false, reason, checks: ['list-jobs\n'] },
+            { ok: false, reason, checks: [] },
+            { ok: false, reason, checks, stderr: '/etc/private' },
+            { ok: false, reason: 'REBUILD_AGENT_STOP_UNCONFIRMED', checks },
+        ].map(reply => [reply, { reason: 'REBUILD_MAIN_PROOF_UNCONFIRMED' }]),
+    ]) {
+        const f = fixture(t, { refusalReply });
+        await assert.rejects(f.run(), { code: 'REBUILD_MAIN_CUTOVER_UNRESOLVED', retryAllowed: false,
+            failure: { phase: 'agent-stop', ...expected } });
+        assert.deepEqual(f.events, ['read', 'stop']);
+        assert.equal(f.state().status, 'unknown');
+        assert.equal(f.store.copy().allowStaleUnlock, false);
+    }
+});
+test('joined MAIN wire: initial hold refusal keeps checks without claiming settled handback', async t => {
+    const reason = 'REBUILD_MAIN_AUTHORITY_UNPROVED', checks = ['xray.service:PartOf'];
+    const f = fixture(t, { refusalAction: 'hold', refusalReply: { ok: false, reason, checks } });
+    await assert.rejects(f.run(), { code: 'REBUILD_MAIN_CUTOVER_UNRESOLVED', retryAllowed: false,
+        failure: { phase: null, reason, checks } });
+    assert.deepEqual(f.events, []);
+    assert.equal(f.state().status, 'not-dispatched');
+    assert.equal(f.store.copy().allowStaleUnlock, false);
 });
 test('joined MAIN wire: inverse refuses a byte-identical replacement before its second stop', async t => {
     const f = fixture(t, { replaceBeforeInverse: true });

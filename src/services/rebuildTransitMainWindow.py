@@ -22,9 +22,14 @@ GROUP = '/system.slice/' + UNIT
 MAIN = pathlib.Path('/usr/local/etc/xray/config.json')
 CGROUP_ROOT = pathlib.Path('/sys/fs/cgroup/system.slice')
 AGENT_EMPTY = tuple('DropInPaths SourcePath ExecCondition ExecStartPre ExecStartPost ExecStop ExecStopPost '
-                    'TriggeredBy Triggers BindsTo BoundBy PartOf ConsistsOf PropagatesStopTo StopPropagatedFrom '
-                    'Upholds UpheldBy Wants'.split())
-PROPERTIES = tuple('Id LoadState NeedDaemonReload Type KillMode ExecStart FragmentPath Requires Conflicts ConflictedBy '
+                    'TriggeredBy Triggers BoundBy PartOf ConsistsOf PropagatesStopTo StopPropagatedFrom '
+                    'Upholds UpheldBy'.split())
+# systemctl 257 does not print these empty arrays even with --all. ExecStart
+# remains mandatory: it is the executable identity, not an optional hook.
+OMITTED_IF_EMPTY = frozenset(('ExecCondition', 'ExecStartPre', 'ExecStartPost', 'ExecStop',
+                              'ExecStopPost', 'ExecReload', 'EnvironmentFiles'))
+MAIN_SYSTEMD_DEPENDENCIES = frozenset(('sysinit.target', 'system.slice', '-.mount', 'network-online.target', 'network.target'))
+PROPERTIES = tuple('Id LoadState NeedDaemonReload Type KillMode ExecStart FragmentPath Requires BindsTo Wants Conflicts ConflictedBy '
                    'ActiveState SubState Job ControlGroup MainPID InvocationID Result '
                    'ExecMainCode ExecMainStatus InactiveEnterTimestampMonotonic'.split()) + AGENT_EMPTY
 XRAY_PROPS = tuple('Id LoadState NeedDaemonReload ActiveState SubState Job MainPID InvocationID ExecStart'.split())
@@ -51,6 +56,12 @@ class WindowError(RuntimeError):
     def __init__(self, code):
         self.code = code
         super().__init__(code)
+
+
+class ManagerScopeError(WindowError):
+    def __init__(self, checks):
+        super().__init__('REBUILD_MAIN_AUTHORITY_UNPROVED')
+        self.checks = sorted(set(checks))
 
 
 def require(ok, code='REBUILD_AGENT_EXCLUSION_UNPROVED'):
@@ -143,7 +154,10 @@ def _state_fields(text, props, service):
         k, separator, v = line.partition('=')
         require(separator and k in props and k not in data)
         data[k] = v
-    require(data.keys() == set(props) and data['Id'] == service and data['LoadState'] == 'loaded'
+    missing = set(props) - data.keys()
+    require(missing <= OMITTED_IF_EMPTY)
+    data.update(dict.fromkeys(missing, ''))
+    require(data['Id'] == service and data['LoadState'] == 'loaded'
             and data['NeedDaemonReload'] == 'no' and data['Job'] in ('', '0'))
     return data
 
@@ -216,7 +230,7 @@ class AgentWindow:
         require(row['FragmentPath'] == '/etc/systemd/system/' + UNIT
                 and row['Type'] == 'simple' and row['KillMode'] == 'control-group'
                 and not any(row[k] for k in AGENT_EMPTY)
-                and set(row['Requires'].split()) <= {'system.slice', 'sysinit.target'}
+                and all(set(row[k].split()) <= MAIN_SYSTEMD_DEPENDENCIES for k in ('Requires', 'BindsTo', 'Wants'))
                 and all(set(row[k].split()) <= {'shutdown.target'} for k in ('Conflicts', 'ConflictedBy'))
                 and EXPECTED_EXEC.fullmatch(row['ExecStart']))
         return row
@@ -419,6 +433,8 @@ class AgentWindow:
             require(_running(row) and self._old is not None
                     and row['InvocationID'] != self._old['InvocationID'] and self._cgroup_populated()
                     and self._main_unit() == self._xray)
+        except ManagerScopeError:
+            raise
         except (OSError, UnicodeError, subprocess.SubprocessError, WindowError):
             raise WindowError('REBUILD_AGENT_START_UNCONFIRMED') from None
         self._new = row

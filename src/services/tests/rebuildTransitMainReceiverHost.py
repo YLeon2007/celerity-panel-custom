@@ -17,7 +17,7 @@ import rebuildTransitMainReceiver as receiver
 import rebuildTransitMainRuntime as runtime
 from rebuildTransitMainRuntimeHost import profile
 from rebuildTransitMainSession import AUTHORITY
-from rebuildTransitMainWindow import UNIT, XRAY, WindowError
+from rebuildTransitMainWindow import UNIT, XRAY, ManagerScopeError, WindowError
 
 ELF = b'\x7fELFprivate-fixture'
 ROUTE = dict(inboundTag='vless-in', network='tcp', targetPort=443, outboundTag='selected', targetIP='127.0.0.1')
@@ -26,8 +26,12 @@ ROUTE = dict(inboundTag='vless-in', network='tcp', targetPort=443, outboundTag='
 def scope_row(name, props, **values):
     baseline = dict(Id=name, LoadState='loaded', NeedDaemonReload='no', ActiveState='active', SubState='running',
                     Type='simple', KillMode='control-group', PrivateNetwork='no', StopWhenUnneeded='no', ControlPID='0',
+                    RefuseManualStart='no', RefuseManualStop='no',
                     **dict.fromkeys(host._SCOPE_NONE, 'none'))
-    return ''.join(f'{key}={values.get(key, baseline.get(key, ""))}\n' for key in props)
+    # Debian 13 systemctl --all omits the empty hook/file arrays.
+    omitted = {'ExecCondition', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'ExecReload', 'EnvironmentFiles'}
+    fields = {key: values.get(key, baseline.get(key, '')) for key in props}
+    return ''.join(f'{key}={value}\n' for key, value in fields.items() if value or key not in omitted)
 
 
 class PackagedReceiver(unittest.TestCase):
@@ -51,8 +55,7 @@ class PackagedReceiver(unittest.TestCase):
 
                 # This scope check doesn't replace AgentWindow's separate
                 # exact cgroup, invocation, and successful-shutdown checks.
-                with patch.object(host, '_run', side_effect=run), patch.object(host, '_layout'), \
-                     patch.object(host, '_check_dependencies'):
+                with patch.object(host, '_run', side_effect=run), patch.object(host, '_layout'):
                     if allowed:
                         self.assertEqual(host.verify_manager_scope(deadline)['SubState'], substate)
                     else:
@@ -85,12 +88,11 @@ class PackagedReceiver(unittest.TestCase):
             with self.assertRaisesRegex(WindowError, '^' + AUTHORITY + '$'):
                 granted.check()
 
-    def test_scope_checks_jobs_and_activating_neighbors_including_indirect_edges(self):
+    def test_scope_checks_named_units_without_expanding_the_debian_boot_graph(self):
         seen = []
         deadline = time.monotonic() + 5
-        for fault in ('', 'queued', 'PartOf', 'ConsistsOf', 'OnSuccess', 'inactive dependency',
-                      'shutdown propagation', 'Debian sysinit conflicts', 'Debian firstboot skipped',
-                      'Debian local-fs failure hook'):
+        for fault in ('', 'queued', 'two reverse edges', 'OnSuccess', 'inactive dependency',
+                      'foreign dependency', 'RefuseManualStart', 'shutdown active'):
             with self.subTest(fault=fault):
                 def run(end, args, timeout):
                     self.assertEqual((end, timeout), (deadline, 4))
@@ -99,42 +101,40 @@ class PackagedReceiver(unittest.TestCase):
                     if args == host._JOBS:
                         return '2 foreign.service start waiting\n' if fault == 'queued' else ''
                     if args == host._show(UNIT, host._SCOPE_PROPS):
-                        fields = {fault: 'foreign.service'} if fault in ('PartOf', 'ConsistsOf', 'OnSuccess') else {}
-                        return scope_row(UNIT, host._SCOPE_PROPS, Requires='sysinit.target', **fields)
+                        fields = {'RequiredBy': 'foreign.service', 'PropagatesReloadTo': 'another.service'} if fault == 'two reverse edges' else {}
+                        if fault == 'OnSuccess':
+                            fields[fault] = 'foreign.service'
+                        if fault == 'RefuseManualStart':
+                            fields[fault] = 'yes'
+                        return scope_row(UNIT, host._SCOPE_PROPS, Requires='sysinit.target', Conflicts='shutdown.target', **fields)
                     if args == host._show(XRAY, host._SCOPE_PROPS):
-                        return scope_row(XRAY, host._SCOPE_PROPS, Requires='-.mount system.slice')
-                    props = host._ANCHOR_PROPS
-                    roster = {name: scope_row(name, props) for name in ('-.mount', 'system.slice')}
-                    roster['sysinit.target'] = scope_row('sysinit.target', props, Wants='stock.service')
-                    roster['stock.service'] = scope_row('stock.service', props,
-                                                        ActiveState='inactive' if fault == 'inactive dependency' else 'active')
-                    # Independent cases from the Debian 13 vendor boot graph.
-                    # Model `show`, never start a manager or any of these units.
-                    if fault == 'Debian sysinit conflicts':
-                        roster['sysinit.target'] = scope_row('sysinit.target', props,
-                            Wants='stock.service', Conflicts='emergency.service emergency.target')
-                    if fault == 'Debian firstboot skipped':
-                        roster['sysinit.target'] = scope_row('sysinit.target', props, Wants='systemd-firstboot.service')
-                        roster['systemd-firstboot.service'] = scope_row('systemd-firstboot.service', props,
-                            ActiveState='inactive', Wants='first-boot-complete.target')
-                    if fault == 'Debian local-fs failure hook':
-                        roster['sysinit.target'] = scope_row('sysinit.target', props, Wants='local-fs.target')
-                        roster['local-fs.target'] = scope_row('local-fs.target', props,
-                            Conflicts='shutdown.target', OnFailure='emergency.target')
-                    roster['shutdown.target'] = scope_row('shutdown.target', props, ActiveState='inactive',
-                        PropagatesStopTo='foreign.service' if fault == 'shutdown propagation' else '')
-                    return '\n'.join(roster[name] for name in args[args.index('--') + 1:])
+                        return scope_row(XRAY, host._SCOPE_PROPS, Requires='-.mount system.slice',
+                            BindsTo='foreign.service' if fault == 'foreign dependency' else 'network.target')
+                    name = args[-1]
+                    self.assertIn(name, ('-.mount', 'system.slice', 'sysinit.target', 'network.target', 'shutdown.target'))
+                    # The Debian sysinit dependencies are deliberately NOT read.
+                    self.assertEqual(args, host._show(name, host._DEPENDENCY_PROPS))
+                    inactive = (name == 'system.slice' and fault == 'inactive dependency'
+                                or name == 'shutdown.target' and fault != 'shutdown active')
+                    state = 'inactive' if inactive else 'active'
+                    return scope_row(name, host._DEPENDENCY_PROPS, ActiveState=state)
 
                 seen.clear()
                 with patch.object(host, '_run', side_effect=run), patch.object(host, '_layout'):
                     if fault:
-                        with self.assertRaisesRegex(WindowError, '^REBUILD_MAIN_AUTHORITY_UNPROVED$'):
+                        with self.assertRaisesRegex(ManagerScopeError, '^REBUILD_MAIN_AUTHORITY_UNPROVED$') as refusal:
                             host.verify_manager_scope(deadline)
+                        self.assertEqual(set(refusal.exception.checks), set({
+                            'queued': ['list-jobs'], 'two reverse edges': [f'{UNIT}:RequiredBy', f'{UNIT}:PropagatesReloadTo'],
+                            'OnSuccess': [f'{UNIT}:OnSuccess'], 'inactive dependency': [f'{XRAY}:Requires'],
+                            'foreign dependency': [f'{XRAY}:BindsTo'], 'RefuseManualStart': [f'{UNIT}:RefuseManualStart'],
+                            'shutdown active': ['shutdown.target:ActiveState'],
+                        }[fault]))
                         self.assertTrue(all(args == host._JOBS or args[1] == 'show' for args in seen))
                     else:
                         self.assertEqual(host.verify_manager_scope(deadline)['Id'], UNIT)
                         self.assertEqual(seen[-1], host._JOBS)
-                        self.assertIn(host._dependencies_show(['stock.service']), seen)
+                        self.assertIn(host._show('sysinit.target', host._DEPENDENCY_PROPS), seen)
 
     def test_bootstrap_uses_existing_machine_authority_and_one_absolute_deadline(self):
         ordinary = dict(machineId=None, managed=['vless-in'], direct=None, routes=[ROUTE])

@@ -3,6 +3,7 @@ const { createHash, randomUUID } = require('node:crypto');
 const { isDeepStrictEqual: equal, TextDecoder } = require('node:util');
 const { createScopedCutoverExecutor } = require('./rebuildTransitCutoverJournal');
 const { cutoverOwner, nodeLockVerifier } = require('./rebuildLocks');
+const { authorityReason, projectManagerChecks } = require('./rebuildMainManagerChecks');
 
 const MAX = 8 * 1024 * 1024;
 const MAX_FRAME = 8 * Math.ceil(MAX / 3) + 1024;
@@ -87,15 +88,24 @@ function stockSyncIsNoop(data, managed, flows, users) {
 const alwaysUnknown = new Set([
     'REBUILD_AGENT_STOP_UNCONFIRMED', 'REBUILD_AGENT_EXCLUSION_UNPROVED', 'REBUILD_AGENT_START_UNCONFIRMED',
     'REBUILD_AGENT_RECONCILE_UNPROVED', 'REBUILD_MAIN_PUBLICATION_UNCONFIRMED', 'REBUILD_MAIN_RESTART_UNCONFIRMED',
-    'REBUILD_MAIN_RUNTIME_UNPROVED', 'REBUILD_MAIN_LOCK_UNPROVED', 'REBUILD_MAIN_AUTHORITY_UNPROVED',
+    'REBUILD_MAIN_RUNTIME_UNPROVED', 'REBUILD_MAIN_LOCK_UNPROVED', authorityReason,
     'REBUILD_MAIN_WIRE_SETTLEMENT', 'REBUILD_CUTOVER_ARTIFACT_UNPROVED',
     'REBUILD_NODE_USER_SYNC_UNCONFIRMED', 'REBUILD_NODE_USER_SYNC_PREPARE_FAILED', 'REBUILD_NODE_USER_SYNC_FENCE_UNPROVED', drift,
     'REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED',
     ...directReceiptReasons,
 ]);
+const wireChecks = new WeakMap();
 async function request(channel, action, fields) {
     const response = await channel.request({ action, ...fields });
     if (own(response, ['ok', 'reason']) && response.ok === false && alwaysUnknown.has(response.reason)) throw error(response.reason);
+    if (own(response, ['ok', 'reason', 'checks']) && response.ok === false && response.reason === authorityReason) {
+        const checks = projectManagerChecks(response.checks);
+        if (checks) {
+            const refusal = error(authorityReason);
+            wireChecks.set(refusal, checks);
+            throw refusal;
+        }
+    }
     need(own(response, ['ok', 'value']) && response.ok === true);
     return response.value;
 }
@@ -174,7 +184,12 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
         need(host.channel && !host.closed && !host.failed && !host.flight, lockError);
         const flight = host.flight = { ctx, action, checkpoint };
         try { return await request(host.channel, action, fields); }
-        catch (err) { host.failed = true; throw err; }
+        catch (err) {
+            host.failed = true;
+            // The journal may reduce a failed check to its outcome without the exception.
+            if (wireChecks.has(err)) remember(ctx, err);
+            throw err;
+        }
         finally { if (host.flight === flight) host.flight = undefined; }
     }
     const control = async (host, action, ctx = { plan }) => need(await frame(host, ctx, action) === null, lockError);
@@ -251,7 +266,9 @@ async function runJournaledMainApply({ journal, artifacts, retain, transitions, 
         if (failure) return;
         let phase = null;
         try { phase = current(ctx).pending?.checkpoint ?? null; } catch { /* Journal authority lost. */ }
-        failure = Object.freeze({ phase, reason: alwaysUnknown.has(err?.code) ? err.code : 'REBUILD_MAIN_PROOF_UNCONFIRMED' });
+        const reason = alwaysUnknown.has(err?.code) ? err.code : 'REBUILD_MAIN_PROOF_UNCONFIRMED';
+        const checks = reason === authorityReason && wireChecks.get(err);
+        failure = Object.freeze({ phase, reason, ...(checks && { checks }) });
     }
     let verified;
     const executor = createScopedCutoverExecutor({ journal, adapter: {

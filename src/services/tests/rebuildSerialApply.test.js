@@ -359,8 +359,7 @@ test('stock Preview and confirmed Apply use one SSH owner per node and only plan
             return { ...query([]), lean: async () => clone(picked) };
         } };
     } };
-    const stock = f.make(undefined, factory, { env, connect: undefined, Node });
-    const service = f.make(undefined, factory, { env, connect: undefined, Node, allowStockSerial: true });
+    const service = f.make(undefined, factory, { env, connect: undefined, Node });
     assert.equal(service.applySerialMain, undefined);
     const off = await service.execute({ linkId: anchor, preview: true });
     assert.equal(off.allowed, false);
@@ -370,9 +369,6 @@ test('stock Preview and confirmed Apply use one SSH owner per node and only plan
         { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
     assert.equal(roster.size, 0);
     env.C3_REBUILD_CHAIN_APPLY = '1';
-    await assert.rejects(stock.execute({ linkId: anchor, expectedPreview: off.previewId }),
-        { code: 'REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE' });
-    assert.equal(roster.size, 0);
     const preview = await service.execute({ linkId: anchor, preview: true });
     assert.equal(preview.allowed, true);
     assert.equal(writers.size, 0);

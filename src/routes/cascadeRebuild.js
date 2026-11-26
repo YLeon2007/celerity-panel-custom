@@ -10,6 +10,7 @@ const {detectLanguage,t}=require('../middleware/i18n');
 const {INVALID_KCP_LINK_SETTINGS}=require('../services/cascadeDraftTransport');
 const {saveRebuildDraft}=require('../services/rebuildDraftLink');
 const {exitRefusalForError,PORTAL_EXIT_INVALID}=require('../services/rebuildExit');
+const {authorityReason,projectManagerChecks}=require('../services/rebuildMainManagerChecks');
 const fail=code=>Object.assign(new Error(code),{code});
 const errorField=(error,key)=>{try{return error?.[key];}catch{return undefined;}};
 const ownValue=(obj,key)=>Object.getOwnPropertyDescriptor(obj,key)?.value;
@@ -21,7 +22,7 @@ const mainCutoverPhases=new Set(['agent-stop','main-publication','xray-restart',
 const mainCutoverReasons=new Set([
     'REBUILD_AGENT_STOP_UNCONFIRMED','REBUILD_AGENT_EXCLUSION_UNPROVED','REBUILD_AGENT_START_UNCONFIRMED',
     'REBUILD_AGENT_RECONCILE_UNPROVED','REBUILD_MAIN_PUBLICATION_UNCONFIRMED','REBUILD_MAIN_RESTART_UNCONFIRMED',
-    'REBUILD_MAIN_RUNTIME_UNPROVED','REBUILD_MAIN_LOCK_UNPROVED','REBUILD_MAIN_AUTHORITY_UNPROVED',
+    'REBUILD_MAIN_RUNTIME_UNPROVED','REBUILD_MAIN_LOCK_UNPROVED',authorityReason,
     'REBUILD_MAIN_WIRE_SETTLEMENT','REBUILD_CUTOVER_ARTIFACT_UNPROVED','REBUILD_MAIN_CAS_UNPROVED',
     'REBUILD_NODE_USER_SYNC_UNCONFIRMED','REBUILD_NODE_USER_SYNC_PREPARE_FAILED','REBUILD_NODE_USER_SYNC_FENCE_UNPROVED',
     'REBUILD_NODE_USER_SYNC_PAYLOAD_UNPROVED','REBUILD_MAIN_PROOF_UNCONFIRMED',
@@ -47,18 +48,20 @@ function formatTransitRefusal(req,res,error,code){
     if(code==='REBUILD_SCOPED_TRANSIT_APPLY_UNAVAILABLE')return {
         code,outcome:'not-dispatched',reason:'guarded-preflight',retryAllowed:false,message:copy('guardedPreflight'),
     };
-    let phase=null,reason=null;
+    let phase=null,reason=null,checks;
     try {
         const failure=ownValue(error,'failure');
         if(failure){
             const rawPhase=ownValue(failure,'phase'),rawReason=ownValue(failure,'reason');
             phase=mainCutoverPhases.has(rawPhase)?rawPhase:null;
             reason=mainCutoverReasons.has(rawReason)?rawReason:null;
+            if(reason===authorityReason)checks=projectManagerChecks(ownValue(failure,'checks'));
         }
     }catch{/* Unreadable metadata still means an unknown outcome. */}
     const [outcome,label]=outcomes[code];
-    return {code,outcome,retryAllowed:false,failure:{phase,reason},
-        message:[copy(label),outcome==='unknown'&&phase&&copy(`phase.${phase}`),reason&&copy(`reason.${reason}`)].filter(Boolean).join(' ')};
+    return {code,outcome,retryAllowed:false,failure:{phase,reason,...(checks&&{checks})},
+        message:[copy(label),outcome==='unknown'&&phase&&copy(`phase.${phase}`),reason&&copy(`reason.${reason}`),
+            checks&&`(${checks.join(', ')})`].filter(Boolean).join(' ')};
 }
 // Do not echo arbitrary fingerprint input or any transport diagnostics. This
 // is the public label vocabulary, not the version-specific acceptance policy.

@@ -166,7 +166,22 @@
         return true;
     }
 
-    // Use page-local copy only. Never render an HTTP message or a raw enum.
+    const managerProperties = new Set([
+        'RequiredBy', 'RequisiteOf', 'BoundBy', 'UpheldBy', 'ConsistsOf', 'TriggeredBy',
+        'PropagatesStopTo', 'PropagatesReloadTo', 'StopPropagatedFrom', 'OnSuccess', 'OnFailure',
+        'StopWhenUnneeded', 'RefuseManualStop', 'RefuseManualStart', 'Requires', 'BindsTo',
+        'Wants', 'Conflicts', 'ConflictedBy', 'ActiveState', 'PartOf', 'Triggers', 'Upholds', 'Requisite',
+    ]);
+    const managerChecks = new Set(['list-jobs', 'active-invocations', 'shutdown.target:ActiveState',
+        ...['cc-agent.service', 'xray.service'].flatMap(unit => [...managerProperties].map(key => `${unit}:${key}`))]);
+    function describeManagerChecks(detail) {
+        if (detail?.reason !== 'REBUILD_MAIN_AUTHORITY_UNPROVED' || !Array.isArray(detail.checks) ||
+            !detail.checks.length || detail.checks.length > managerChecks.size) return '';
+        const checks = [...new Set(detail.checks)];
+        return checks.every(check => managerChecks.has(check)) ? `(${checks.join(', ')})` : '';
+    }
+
+    // Use page-local copy and fixed check IDs only, never the HTTP message.
     function describeApplyFailure(status, error) {
         const labels = window._networkRebuildPreviewI18n;
         const copy = labels?.mainCutover;
@@ -185,13 +200,13 @@
         const settled = error?.code === 'REBUILD_MAIN_CUTOVER_ROLLED_BACK' && error.outcome === 'rolled-back' ? copy.rolledBack
             : error?.code === 'REBUILD_MAIN_CUTOVER_NOT_DISPATCHED' && error.outcome === 'not-dispatched' ? copy.notDispatched : null;
         if (settled && error.retryAllowed === false) return { title: labels.refused,
-            message: [settled, lookup(copy.reason, error.failure?.reason)].filter(Boolean).join(' ') };
+            message: [settled, lookup(copy.reason, error.failure?.reason), describeManagerChecks(error.failure)].filter(Boolean).join(' ') };
         if (error?.code !== 'REBUILD_MAIN_CUTOVER_UNRESOLVED') return null;
         // Older servers may send just the error code. That is still unknown,
         // but no phase or reason is attributable without the typed envelope.
         const detail = error.outcome === 'unknown' && error.retryAllowed === false ? error.failure : null;
         return { title: copy.title, message: [copy.unknown, lookup(copy.phase, detail?.phase),
-            lookup(copy.reason, detail?.reason)].filter(Boolean).join(' ') };
+            lookup(copy.reason, detail?.reason), describeManagerChecks(detail)].filter(Boolean).join(' ') };
     }
 
     async function showRefusal(message, title) {
